@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          COMMIT_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          VERSION="$(date -u +%Y.%m.%d)-${SHORT_SHA}"
+          CPLT_VERSION="$VERSION" cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../cplt-${{ matrix.target }}.tar.gz cplt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: cplt-${{ matrix.target }}.${{ matrix.archive }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cplt-${{ matrix.target }}
+          path: cplt-${{ matrix.target }}.${{ matrix.archive }}
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum cplt-* > SHA256SUMS
+
+      - name: Determine version
+        id: version
+        run: |
+          COMMIT_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          DATE=$(date -u +%Y.%m.%d)
+          echo "tag=${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "title=cplt ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
+          echo "sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --unreleased --tag ${{ steps.version.outputs.tag }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ steps.version.outputs.sha }}
+          name: ${{ steps.version.outputs.title }}
+          body: ${{ steps.changelog.outputs.content }}
+          make_latest: true
+          files: |
+            artifacts/cplt-*
+            artifacts/SHA256SUMS
