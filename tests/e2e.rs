@@ -33,12 +33,33 @@ mod e2e_tests {
             .unwrap_or(false)
     }
 
+    /// Check if sandbox-exec can apply a trivial profile.
+    /// Returns false when running inside an existing sandbox (nested sandbox-exec is denied).
+    fn sandbox_exec_available() -> bool {
+        Command::new("sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     /// Skip guard — call at the top of tests that need Copilot CLI.
     /// Returns true if the test should be skipped.
     macro_rules! require_copilot {
         () => {
             if !copilot_cli_available() {
                 eprintln!("SKIPPED: copilot CLI not found in PATH");
+                return;
+            }
+        };
+    }
+
+    /// Skip guard — call at the top of tests that invoke sandbox-exec.
+    /// Skips when already inside a sandbox (nested sandbox-exec is denied by macOS).
+    macro_rules! require_sandbox {
+        () => {
+            if !sandbox_exec_available() {
+                eprintln!("SKIPPED: sandbox-exec not available (likely already sandboxed)");
                 return;
             }
         };
@@ -51,6 +72,7 @@ mod e2e_tests {
     #[test]
     fn e2e_copilot_version_inside_sandbox() {
         require_copilot!();
+        require_sandbox!();
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate", "--", "--version"])
             .current_dir(project_dir())
@@ -74,6 +96,7 @@ mod e2e_tests {
     #[test]
     fn e2e_sandbox_validation_passes() {
         require_copilot!();
+        require_sandbox!();
         let output = Command::new(binary_path())
             .args(["--yes", "--", "--version"])
             .current_dir(project_dir())
@@ -95,6 +118,7 @@ mod e2e_tests {
     #[test]
     fn e2e_proxy_starts_with_version() {
         require_copilot!();
+        require_sandbox!();
         // Use a high unique port to avoid collisions
         let port = 19200 + (std::process::id() % 800) as u16;
 
@@ -128,6 +152,7 @@ mod e2e_tests {
     #[test]
     fn e2e_show_denials_doesnt_crash() {
         require_copilot!();
+        require_sandbox!();
         let output = Command::new(binary_path())
             .args([
                 "--yes",
@@ -489,6 +514,7 @@ mod e2e_tests {
     #[ignore = "requires Copilot auth and network — run with: cargo test --test e2e -- --ignored"]
     fn e2e_live_prompt_responds() {
         require_copilot!();
+        require_sandbox!();
         let output = Command::new(binary_path())
             .args([
                 "--yes",
@@ -518,6 +544,7 @@ mod e2e_tests {
     #[ignore = "requires Copilot auth and network — run with: cargo test --test e2e -- --ignored"]
     fn e2e_live_prompt_with_proxy() {
         require_copilot!();
+        require_sandbox!();
         let port = 19300 + (std::process::id() % 700) as u16;
 
         let output = Command::new(binary_path())

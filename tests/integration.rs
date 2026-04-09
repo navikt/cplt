@@ -12,6 +12,26 @@ mod macos_tests {
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    /// Check if sandbox-exec can apply a trivial profile.
+    /// Returns false when running inside an existing sandbox (nested sandbox-exec is denied).
+    fn sandbox_exec_available() -> bool {
+        Command::new("sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Skip guard — call at the top of tests that invoke sandbox-exec.
+    macro_rules! require_sandbox {
+        () => {
+            if !sandbox_exec_available() {
+                eprintln!("SKIPPED: sandbox-exec not available (likely already sandboxed)");
+                return;
+            }
+        };
+    }
+
     /// Path to the built binary.
     fn binary_path() -> PathBuf {
         PathBuf::from(env!("CARGO_BIN_EXE_cplt"))
@@ -133,6 +153,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_allows_project_file_read() {
+        require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let profile = write_test_profile(&project.to_string_lossy(), false);
 
@@ -147,6 +168,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_allows_project_file_write() {
+        require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let profile = write_test_profile(&project.to_string_lossy(), false);
 
@@ -165,6 +187,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_blocks_ssh_read() {
+        require_sandbox!();
         let home = home_dir();
         let ssh_dir = home.join(".ssh");
         if !ssh_dir.exists() {
@@ -186,6 +209,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_blocks_kube_read() {
+        require_sandbox!();
         let home = home_dir();
         let kube_dir = home.join(".kube");
         if !kube_dir.exists() {
@@ -207,6 +231,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_blocks_docker_read() {
+        require_sandbox!();
         let home = home_dir();
         let docker_dir = home.join(".docker");
         if !docker_dir.exists() {
@@ -228,6 +253,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_blocks_aws_read() {
+        require_sandbox!();
         let home = home_dir();
         let aws_dir = home.join(".aws");
         if !aws_dir.exists() {
@@ -249,6 +275,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_allows_copilot_config() {
+        require_sandbox!();
         let home = home_dir();
         let copilot_dir = home.join(".copilot");
         if !copilot_dir.exists() {
@@ -275,6 +302,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_blocks_outbound_network() {
+        require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let profile = write_test_profile(&project.to_string_lossy(), true);
 
@@ -292,6 +320,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_allows_process_execution() {
+        require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let profile = write_test_profile(&project.to_string_lossy(), false);
 
@@ -303,6 +332,7 @@ mod macos_tests {
 
     #[test]
     fn sandbox_allows_temp_write() {
+        require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let profile = write_test_profile(&project.to_string_lossy(), false);
 
