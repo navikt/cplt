@@ -1,0 +1,96 @@
+# cplt default domain blocklist
+#
+# These domains are commonly used as exfiltration endpoints, C2 infrastructure,
+# and reverse shell tunnels in real-world supply chain attacks (2025-2026).
+#
+# Sources:
+#   - LOTS Project (Living Off Trusted Sites): https://lots-project.com/
+#   - Socket: 60 malicious npm packages (2025)
+#   - Mend.io: Shai-Hulud npm worm analysis (2025)
+#   - Wiz: Shai-Hulud 2.0 — 25K+ repos exposed
+#   - ReversingLabs: npm reverse shell malware
+#   - Oligo: npm supply chain risks with AI agents
+#
+# Usage:
+#   cplt --with-proxy --blocked-domains /path/to/blocked-domains.txt
+#
+# Or set in ~/.config/cplt/config.toml:
+#   [proxy]
+#   blocked_domains = "~/.config/cplt/blocked-domains.txt"
+#
+# This file is re-read on every proxy request — edit it live without restarting.
+
+# ── Webhook and request capture services ──────────────────────────
+# Primary exfiltration channel in observed npm/PyPI attacks.
+# Attackers POST stolen credentials to disposable endpoints.
+webhook.site
+pipedream.com
+requestbin.com
+requestbin.net
+hookbin.com
+beeceptor.com
+requestcatcher.com
+
+# ── Paste sites ───────────────────────────────────────────────────
+# Used to stage stolen credentials for later retrieval.
+pastebin.com
+paste.ee
+hastebin.com
+dpaste.org
+pastie.org
+ghostbin.com
+rentry.co
+paste.mozilla.org
+
+# ── File sharing services ─────────────────────────────────────────
+# Used to exfiltrate SSH keys, .env files, and source code.
+transfer.sh
+file.io
+0x0.st
+catbox.moe
+temp.sh
+filedrop.io
+gofile.io
+tempsend.com
+sendgb.com
+
+# ── Tunneling and reverse shell services ──────────────────────────
+# Used to establish reverse shells through NAT/firewall boundaries.
+# The sandbox kernel-blocks direct TCP, but block these at proxy too.
+ngrok.io
+ngrok-free.app
+localtunnel.me
+serveo.net
+localhost.run
+bore.digital
+telebit.cloud
+loca.lt
+
+# ── IP reconnaissance ────────────────────────────────────────────
+# Used by malware to fingerprint victim networks before exfiltration.
+ipinfo.io
+ifconfig.me
+checkip.amazonaws.com
+icanhazip.com
+ipify.org
+api.ipify.org
+wtfismyip.com
+ipecho.net
+myexternalip.com
+
+# ── Messaging platforms used as C2 ───────────────────────────────
+# Discord webhooks are the #1 observed C2 channel in npm attacks.
+# Telegram bot API is write-only and hard to detect.
+#
+# NOTE: These are aggressive blocks. Uncomment ONLY if your workflow
+# does not require these services from within the sandbox.
+#
+# discord.com
+# api.telegram.org
+
+# ── Generic cloud platforms used for C2 hosting ──────────────────
+# Attackers host C2 on free-tier cloud to evade IP blocklists.
+# These are very broad — uncomment only if you want strict lockdown.
+#
+# workers.dev
+# herokuapp.com

@@ -1,0 +1,66 @@
+[tools]
+rust = "1.94"
+
+[tasks.version]
+description = "Generate version string (YYYYMMDD-gitsha)"
+run = "echo $(date +%Y.%m.%d)-$(date +%H.%M)-$(git rev-parse --short HEAD)"
+
+[tasks.fmt]
+description = "Format code with rustfmt"
+run = "cargo fmt"
+
+[tasks."fmt:check"]
+description = "Check code formatting"
+run = "cargo fmt -- --check"
+
+[tasks.clippy]
+description = "Run Clippy linter"
+run = "cargo clippy -- -D warnings"
+
+[tasks.build]
+description = "Build debug binary"
+run = "cargo build"
+
+[tasks."build:release"]
+description = "Build optimized release binary"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run all tests with verbose output"
+run = "cargo test --verbose"
+
+[tasks."test:unit"]
+description = "Run unit tests only"
+run = "cargo test --test unit_tests --verbose"
+
+[tasks."test:integration"]
+description = "Run integration tests (macOS only)"
+run = "cargo test --test integration --verbose"
+
+[tasks."test:e2e"]
+description = "Run E2E tests (requires macOS + Copilot CLI)"
+run = "cargo test --test e2e --verbose"
+
+[tasks."test:e2e-live"]
+description = "Run live E2E tests that hit Copilot API (requires auth)"
+run = "cargo test --test e2e --verbose -- --ignored"
+
+[tasks."test:short"]
+description = "Run tests without verbose output"
+run = "cargo test"
+
+[tasks.check]
+description = "Run all checks (fmt, clippy, test)"
+depends = ["fmt:check", "clippy", "test:short"]
+
+[tasks.all]
+description = "Run all checks and build release"
+depends = ["check", "build:release"]
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "cargo clean"
+
+[tasks.run]
+description = "Build and run copilot --version inside sandbox"
+run = "cargo run -- -- --version"

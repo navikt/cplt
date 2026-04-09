@@ -1,0 +1,9 @@
+# Domains to block from the sandboxed agent.
+# One domain per line. Subdomains are automatically blocked.
+# Lines starting with # are comments.
+# Edit this file while the proxy is running — changes take effect immediately.
+#
+# Examples:
+# pastebin.com
+# evil.example.com
+# transfer.sh

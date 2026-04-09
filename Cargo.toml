@@ -1,0 +1,16 @@
+[package]
+name = "cplt"
+version = "0.1.0"
+edition = "2024"
+description = "macOS Seatbelt sandbox wrapper for GitHub Copilot CLI"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+strip = true
+lto = true
