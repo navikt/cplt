@@ -64,6 +64,7 @@ const TOOL_READ_DIRS: &[&str] = &[
     "/usr/lib",
     "/usr/local",
     "/opt/homebrew",
+    "/Library/Developer/CommandLineTools",
 ];
 
 /// Environment variables safe to pass through to the sandboxed process.
