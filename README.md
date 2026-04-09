@@ -1,27 +1,42 @@
 # cplt
 
+[![CI](https://github.com/navikt/cplt/actions/workflows/ci.yml/badge.svg)](https://github.com/navikt/cplt/actions/workflows/ci.yml)
+[![Release](https://github.com/navikt/cplt/actions/workflows/release.yml/badge.svg)](https://github.com/navikt/cplt/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+
 macOS Seatbelt sandbox wrapper for GitHub Copilot CLI. Runs Copilot inside Apple's kernel-level sandbox (`sandbox-exec`) so the agent can work on your project but cannot access your secrets.
 
-![ccplt banner](./assets/cplt.png)
+![cplt banner](./assets/cplt.png)
 
 > **macOS only** — uses Apple's Seatbelt framework (the same mechanism App Store apps run under).
 
-## Philosophy
+## Table of contents
 
-In a world of vibe-coded AI tools, this project chooses a different path. We don't do magic. We don't do clever. We do honest, auditable security that you can read, understand, and verify in minutes.
+- [Quick start](#quick-start)
+- [Install](#install)
+- [What it does](#what-it-does)
+- [Usage](#usage)
+- [Configuration file](#configuration-file)
+- [Architecture](#architecture)
+- [Security](#security)
+- [Known impacts](#known-impacts)
+- [Limitations](#limitations)
+- [Contributing](#contributing)
+- [References](#references)
 
-The sandbox is ~2500 lines of Rust that generates a Seatbelt profile, auto-discovers your environment, and optionally runs a CONNECT proxy. Four dependencies (clap, libc, serde, toml) — no runtime services, no telemetry. Every security boundary is kernel-enforced and tested. Every design decision is documented with the threat it mitigates and the prior art it builds on.
+## Quick start
 
-**Our priorities, in order:**
+```bash
+# Install
+brew install navikt/tap/cplt
 
-1. **Correct** — every claim is tested, every edge case has a CVE or research reference
-2. **Transparent** — read [SECURITY.md](SECURITY.md), it hides nothing
-3. **Simple** — single static binary, zero config required, sane defaults
-4. **Useful** — get out of the way and let Copilot do its job, safely
+# Check your environment
+cplt --doctor
 
-We'd rather ship something small that actually works than something impressive that doesn't.
-
-## What it does
+# Run Copilot in sandbox
+cplt -- -p "fix the tests"
+```
 
 **Primary control: filesystem isolation.** The sandbox blocks access to credentials and secrets at the kernel level. All restrictions apply to Copilot and every process it spawns.
 
@@ -99,24 +114,7 @@ Or with [mise](https://mise.jdx.dev):
 mise run install
 ```
 
-## Quick start
-
-```bash
-# Run Copilot in sandbox (credentials protected, network allowed)
-cplt -- -p "fix the tests"
-
-# Check your environment before running
-cplt --doctor
-
-# Verify the sandbox works
-cplt -- --version
-
-# Enable proxy for connection logging
-cplt --with-proxy -- -p "fix the tests"
-
-# Create config file with defaults
-cplt --init-config
-```
+## What it does
 
 ## Usage
 
@@ -295,7 +293,18 @@ CPLT_CONFIG=/path/to/custom.toml cplt -- --version
 
 **Security model**: deny-by-default filesystem with kernel enforcement. Network is restricted to port 443 (HTTPS) by default (use `--allow-port` for extras). SSH agent access and localhost outbound are blocked at the kernel level. The profile generator auto-discovers your environment (`--doctor`) and only includes tool directories that actually exist on disk — fewer rules means a tighter sandbox. See [SECURITY.md](SECURITY.md) for the full threat model, defense layers, and honest gaps.
 
-## Security trade-offs
+## Security
+
+~2500 lines of Rust. Four dependencies (clap, libc, serde, toml). No runtime services, no telemetry. Every security boundary is kernel-enforced and tested. Every design decision is documented with the threat it mitigates and the prior art it builds on.
+
+**Our priorities, in order:**
+
+1. **Correct** — every claim is tested, every edge case has a CVE or research reference
+2. **Transparent** — read [SECURITY.md](SECURITY.md), it hides nothing
+3. **Simple** — single static binary, zero config required, sane defaults
+4. **Useful** — get out of the way and let Copilot do its job, safely
+
+For the full security model, threat analysis, and test strategy, see **[SECURITY.md](SECURITY.md)**.
 
 ### `~/.config/gh/hosts.yml` is readable
 
@@ -436,6 +445,18 @@ Only port 443 is allowed by default. Services on other ports need `--allow-port`
 
 For known attack vectors, out-of-scope threats, and prior art, see [SECURITY.md](SECURITY.md).
 
+## Contributing
+
+Contributions are welcome! To get started:
+
+```bash
+git clone https://github.com/navikt/cplt.git && cd cplt
+git config core.hooksPath hack    # enables pre-commit fmt + clippy checks
+mise run check                    # runs fmt, clippy, and tests
+```
+
+Please open an issue before starting large changes. All PRs must pass CI (fmt, clippy, tests).
+
 ## References
 
 - [SECURITY.md](SECURITY.md) — Full security model, threat analysis, test strategy, and prior art
@@ -443,3 +464,7 @@ For known attack vectors, out-of-scope threats, and prior art, see [SECURITY.md]
 - [Chromium Seatbelt V2 Design](https://chromium.googlesource.com/chromium/src/sandbox/+show/refs/heads/main/mac/seatbelt_sandbox_design.md)
 - [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
 - [michaelneale/agent-seatbelt-sandbox](https://github.com/michaelneale/agent-seatbelt-sandbox)
+
+## License
+
+[MIT](LICENSE)
