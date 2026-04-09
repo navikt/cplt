@@ -1,3 +1,7 @@
 [tasks.install]
 description = "Build and install cplt to /usr/local/bin"
 run = "cargo build --release && sudo cp target/release/cplt /usr/local/bin/cplt"
+
+[tasks.setup-hooks]
+description = "Install git pre-commit hook"
+run = "git config core.hooksPath hack && echo 'Git hooks path set to hack/.'"
