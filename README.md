@@ -59,7 +59,13 @@ For the full security model, threat analysis, and test strategy, see **[SECURITY
 
 ## Install
 
-### Pre-compiled binary (recommended)
+### Homebrew (recommended)
+
+```bash
+brew install navikt/tap/cplt
+```
+
+### Pre-compiled binary
 
 Download the latest release for your Mac:
 
@@ -82,9 +88,15 @@ gh attestation verify cplt -o navikt
 ### Build from source
 
 ```bash
-cd experimental/cplt
-mise install           # Install Rust toolchain
-mise run build:release
+git clone https://github.com/navikt/cplt.git && cd cplt
+cargo build --release
+sudo cp target/release/cplt /usr/local/bin/
+```
+
+Or with [mise](https://mise.jdx.dev):
+
+```bash
+mise run install
 ```
 
 ## Quick start
