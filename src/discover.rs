@@ -593,6 +593,6 @@ mod tests {
         let project = std::env::current_dir().unwrap();
         let paths = discover_paths(&home, &project);
         // Just verify it doesn't panic and returns plausible results
-        assert!(paths.copilot_dir_exists || !paths.copilot_dir_exists);
+        let _ = paths.copilot_dir_exists;
     }
 }
