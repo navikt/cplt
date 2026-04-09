@@ -566,6 +566,10 @@ pub fn exec(
     let mut cmd = std::process::Command::new("sandbox-exec");
     cmd.arg("-f").arg(profile_path).arg("copilot");
 
+    // Prevent Copilot from trying to auto-update inside the sandbox
+    // (writes to ~/.copilot/pkg are denied, so it would fail anyway).
+    cmd.arg("--no-auto-update");
+
     for arg in copilot_args {
         cmd.arg(arg);
     }
