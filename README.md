@@ -2,6 +2,8 @@
 
 macOS Seatbelt sandbox wrapper for GitHub Copilot CLI. Runs Copilot inside Apple's kernel-level sandbox (`sandbox-exec`) so the agent can work on your project but cannot access your secrets.
 
+![ccplt banner](./assets/cplt.png)
+
 > **macOS only** — uses Apple's Seatbelt framework (the same mechanism App Store apps run under).
 
 ## Philosophy
@@ -23,33 +25,33 @@ We'd rather ship something small that actually works than something impressive t
 
 **Primary control: filesystem isolation.** The sandbox blocks access to credentials and secrets at the kernel level. All restrictions apply to Copilot and every process it spawns.
 
-| Resource | Status | Notes |
-|---|---|---|
-| Read/write project directory | ✅ Allowed | |
-| Read `.env*`, `.pem`, `.key` in project | 🔒 Kernel-blocked | Prevents secret exfiltration; `--allow-env-files` to override |
-| Write `.git/hooks`, `.git/config`, `.gitmodules` | 🔒 Kernel-blocked | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking |
-| Execute from `/tmp`, `/var/folders` | 🔒 Kernel-blocked | Prevents write-then-exec; interpreter-based exec not blocked (see SECURITY.md) |
-| Modify `.vscode/tasks.json`, `launch.json` | ⚠️ Allowed — known risk | IDE trust boundary; see SECURITY.md for mitigations |
-| Read/write `~/.copilot` (auth, settings) | ✅ Allowed | Includes `file-map-executable` for `keytar.node`, `pty.node`, `computer.node` |
-| Write `~/.copilot/pkg` (native modules) | 🔒 Kernel-blocked | Prevents persistence via native module replacement |
-| Environment variables | 🔒 Sanitized | Only safe allowlist passes through; `--pass-env VAR` to add extras |
-| Read `~/.config/gh/hosts.yml` + `config.yml` | ✅ Allowed (read-only) | Only these two files — rest of `.config/gh` is blocked |
-| Read `~/.config/mise` | ✅ Allowed (read-only) | Tool versions and PATH — no secrets |
-| Read `~/.gitconfig`, `~/.config/git/config` | ✅ Allowed (read-only) | |
-| Read `~/Library/Application Support/Microsoft` | ✅ Allowed (read-only) | Device ID for telemetry |
-| Access macOS Keychain | ✅ Allowed (read+write) | Security framework locks db during access; Copilot uses `keytar.node` for token storage |
-| Outbound network (port 443) | ✅ Allowed | All other ports blocked — use `--allow-port` to add extras |
-| Localhost outbound | 🔒 Kernel-blocked | Prevents local service access; inbound still works for proxy |
-| SSH agent (unix socket) | 🔒 Kernel-blocked | Prevents signing git operations or SSH to hosts |
-| Developer tools (`~/.cargo`, `~/.mise`, `~/.gradle`, `~/.m2`, `~/.sdkman`, etc.) | ✅ Allowed (read+write for caches) | Only dirs that exist on disk; tightened at runtime via `--doctor` |
-| Go source code (`~/go/src`) | 🔒 Kernel-blocked | Only `~/go/bin` and `~/go/pkg` are readable |
-| Read `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure` | 🔒 Kernel-blocked | |
-| Read `~/.kube`, `~/.docker`, `~/.nais` | 🔒 Kernel-blocked | |
-| Read `~/.password-store`, `~/.terraform.d` | 🔒 Kernel-blocked | |
-| Read `~/.config/gcloud`, `~/.config/op` | 🔒 Kernel-blocked | |
-| Read `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.vault-token` | 🔒 Kernel-blocked | |
-| Read `~/.gem/credentials` | 🔒 Kernel-blocked | |
-| Child process inheritance | ✅ All restrictions apply to subprocesses | |
+| Resource                                                                         | Status                                   | Notes                                                                                   |
+| -------------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------- |
+| Read/write project directory                                                     | ✅ Allowed                                |                                                                                         |
+| Read `.env*`, `.pem`, `.key` in project                                          | 🔒 Kernel-blocked                         | Prevents secret exfiltration; `--allow-env-files` to override                           |
+| Write `.git/hooks`, `.git/config`, `.gitmodules`                                 | 🔒 Kernel-blocked                         | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking             |
+| Execute from `/tmp`, `/var/folders`                                              | 🔒 Kernel-blocked                         | Prevents write-then-exec; interpreter-based exec not blocked (see SECURITY.md)          |
+| Modify `.vscode/tasks.json`, `launch.json`                                       | ⚠️ Allowed — known risk                   | IDE trust boundary; see SECURITY.md for mitigations                                     |
+| Read/write `~/.copilot` (auth, settings)                                         | ✅ Allowed                                | Includes `file-map-executable` for `keytar.node`, `pty.node`, `computer.node`           |
+| Write `~/.copilot/pkg` (native modules)                                          | 🔒 Kernel-blocked                         | Prevents persistence via native module replacement                                      |
+| Environment variables                                                            | 🔒 Sanitized                              | Only safe allowlist passes through; `--pass-env VAR` to add extras                      |
+| Read `~/.config/gh/hosts.yml` + `config.yml`                                     | ✅ Allowed (read-only)                    | Only these two files — rest of `.config/gh` is blocked                                  |
+| Read `~/.config/mise`                                                            | ✅ Allowed (read-only)                    | Tool versions and PATH — no secrets                                                     |
+| Read `~/.gitconfig`, `~/.config/git/config`                                      | ✅ Allowed (read-only)                    |                                                                                         |
+| Read `~/Library/Application Support/Microsoft`                                   | ✅ Allowed (read-only)                    | Device ID for telemetry                                                                 |
+| Access macOS Keychain                                                            | ✅ Allowed (read+write)                   | Security framework locks db during access; Copilot uses `keytar.node` for token storage |
+| Outbound network (port 443)                                                      | ✅ Allowed                                | All other ports blocked — use `--allow-port` to add extras                              |
+| Localhost outbound                                                               | 🔒 Kernel-blocked                         | Prevents local service access; inbound still works for proxy                            |
+| SSH agent (unix socket)                                                          | 🔒 Kernel-blocked                         | Prevents signing git operations or SSH to hosts                                         |
+| Developer tools (`~/.cargo`, `~/.mise`, `~/.gradle`, `~/.m2`, `~/.sdkman`, etc.) | ✅ Allowed (read+write for caches)        | Only dirs that exist on disk; tightened at runtime via `--doctor`                       |
+| Go source code (`~/go/src`)                                                      | 🔒 Kernel-blocked                         | Only `~/go/bin` and `~/go/pkg` are readable                                             |
+| Read `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`                                  | 🔒 Kernel-blocked                         |                                                                                         |
+| Read `~/.kube`, `~/.docker`, `~/.nais`                                           | 🔒 Kernel-blocked                         |                                                                                         |
+| Read `~/.password-store`, `~/.terraform.d`                                       | 🔒 Kernel-blocked                         |                                                                                         |
+| Read `~/.config/gcloud`, `~/.config/op`                                          | 🔒 Kernel-blocked                         |                                                                                         |
+| Read `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.vault-token`                       | 🔒 Kernel-blocked                         |                                                                                         |
+| Read `~/.gem/credentials`                                                        | 🔒 Kernel-blocked                         |                                                                                         |
+| Child process inheritance                                                        | ✅ All restrictions apply to subprocesses |                                                                                         |
 
 This table is a summary. The sandbox also allows access to system files (SSL certs, `/etc/hosts`), temp directories (read/write but no exec), and system tool paths (`/usr/bin`, `/opt/homebrew`). Run `cplt --print-profile` to see the complete SBPL rules.
 
@@ -116,24 +118,24 @@ Everything after `--` is passed directly to the `copilot` command.
 
 The project directory is the primary writable workspace, plus a narrow allowlist required for auth, runtime, and tooling (see capability table above). Everything else (SSH keys, cloud credentials, etc.) is blocked by the kernel.
 
-| Flag | What it does |
-|---|---|
-| `-d, --project-dir <DIR>` | Which directory Copilot can work in. Defaults to the current git repo root. |
-| `--allow-read <PATH>` | Let Copilot read (read-only) files outside the project (e.g. shared libraries, docs). Can be repeated. |
-| `--allow-write <PATH>` | Let Copilot read AND write outside the project. Use carefully. Can be repeated. |
-| `--deny-path <PATH>` | Block a path that would otherwise be allowed. Deny always wins. Can be repeated. |
-| `--allow-port <PORT>` | Allow outbound TCP on an extra port (default: only 443). Can be repeated. |
-| `--allow-localhost <PORT>` | Allow outbound to `localhost` on a specific port (localhost is blocked by default). Use for MCP servers or dev servers. Can be repeated. |
-| `--allow-localhost-any` | Allow outbound to `localhost` on **all** ports. Needed for build tools like Turbopack (Next.js) and Vite that use random ephemeral ports for IPC. |
+| Flag                       | What it does                                                                                                                                      |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-d, --project-dir <DIR>`  | Which directory Copilot can work in. Defaults to the current git repo root.                                                                       |
+| `--allow-read <PATH>`      | Let Copilot read (read-only) files outside the project (e.g. shared libraries, docs). Can be repeated.                                            |
+| `--allow-write <PATH>`     | Let Copilot read AND write outside the project. Use carefully. Can be repeated.                                                                   |
+| `--deny-path <PATH>`       | Block a path that would otherwise be allowed. Deny always wins. Can be repeated.                                                                  |
+| `--allow-port <PORT>`      | Allow outbound TCP on an extra port (default: only 443). Can be repeated.                                                                         |
+| `--allow-localhost <PORT>` | Allow outbound to `localhost` on a specific port (localhost is blocked by default). Use for MCP servers or dev servers. Can be repeated.          |
+| `--allow-localhost-any`    | Allow outbound to `localhost` on **all** ports. Needed for build tools like Turbopack (Next.js) and Vite that use random ephemeral ports for IPC. |
 
 ### Environment variables
 
 By default, `cplt` sanitizes the child environment — only safe variables pass through (see `ENV_ALLOWLIST` in `sandbox.rs`). Cloud credentials, database URLs, and package tokens are stripped.
 
-| Flag | What it does |
-|---|---|
-| `--pass-env <VAR>` | Explicitly pass an environment variable through to Copilot. Can be repeated. |
-| `--inherit-env` | ⚠️ **Dangerous.** Inherit the full parent environment (only strips `NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`). Use only for debugging. |
+| Flag               | What it does                                                                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--pass-env <VAR>` | Explicitly pass an environment variable through to Copilot. Can be repeated.                                                                            |
+| `--inherit-env`    | ⚠️ **Dangerous.** Inherit the full parent environment (only strips `NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`). Use only for debugging. |
 
 ### Proxy (optional)
 
@@ -142,25 +144,25 @@ The proxy is **disabled by default**. Copilot CLI connects directly to its APIs 
 - **Connection logging** — see what domains tools like `gh` and `curl` connect to
 - **Domain blocking** — block known exfiltration infrastructure (paste sites, webhook services, etc.)
 
-| Flag | What it does |
-|---|---|
-| `--with-proxy` | Start a localhost CONNECT proxy that logs connections. |
-| `--no-proxy` | Disable the proxy, even if your config file enables it. |
-| `--proxy-port <PORT>` | Which port the proxy listens on (default: 18080). |
+| Flag                       | What it does                                                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------------------ |
+| `--with-proxy`             | Start a localhost CONNECT proxy that logs connections.                                           |
+| `--no-proxy`               | Disable the proxy, even if your config file enables it.                                          |
+| `--proxy-port <PORT>`      | Which port the proxy listens on (default: 18080).                                                |
 | `--blocked-domains <FILE>` | A text file with domains to block, one per line (e.g. `pastebin.com`). Re-read on every request. |
 
 > **Why doesn't the proxy intercept Copilot traffic?** Copilot CLI is a Node.js application. Node.js does not natively use `http_proxy`/`https_proxy` env vars. Setting these vars actually *breaks* Copilot's auth flow with `api.business.githubcopilot.com`. Go-based tools like `gh` do respect proxy env vars and will be logged.
 
 ### Debugging
 
-| Flag | What it does |
-|---|---|
-| `--doctor` | Run environment diagnostics: checks auth, Copilot install, tools, and sandbox paths. Exits 0 if all critical checks pass. |
-| `--print-profile` | Print the generated sandbox profile (SBPL) and exit. |
-| `--show-denials` | Stream macOS sandbox denial logs in real time. |
-| `--no-validate` | Skip the startup check that verifies sandbox restrictions are active. |
-| `-y, --yes` | Skip the interactive confirmation prompt. The configuration summary is still printed for auditability. Required when stdin is not a TTY (CI, scripts). |
-| `--init-config` | Create a starter config file at `~/.config/cplt/config.toml` and exit. |
+| Flag              | What it does                                                                                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--doctor`        | Run environment diagnostics: checks auth, Copilot install, tools, and sandbox paths. Exits 0 if all critical checks pass.                              |
+| `--print-profile` | Print the generated sandbox profile (SBPL) and exit.                                                                                                   |
+| `--show-denials`  | Stream macOS sandbox denial logs in real time.                                                                                                         |
+| `--no-validate`   | Skip the startup check that verifies sandbox restrictions are active.                                                                                  |
+| `-y, --yes`       | Skip the interactive confirmation prompt. The configuration summary is still printed for auditability. Required when stdin is not a TTY (CI, scripts). |
+| `--init-config`   | Create a starter config file at `~/.config/cplt/config.toml` and exit.                                                                                 |
 
 ### Examples
 
@@ -330,12 +332,12 @@ The blocklist covers webhook capture services, paste sites, file sharing, tunnel
 
 Copilot CLI 1.0.21 connects directly to these endpoints (empirically verified):
 
-| Endpoint | Purpose |
-|---|---|
-| `api.github.com` | GitHub API (user info, token validation) |
-| `api.githubcopilot.com` | Copilot API |
-| `api.business.githubcopilot.com` | Copilot Business API (enterprise users) |
-| `proxy.business.githubcopilot.com` | Copilot Business proxy |
+| Endpoint                           | Purpose                                  |
+| ---------------------------------- | ---------------------------------------- |
+| `api.github.com`                   | GitHub API (user info, token validation) |
+| `api.githubcopilot.com`            | Copilot API                              |
+| `api.business.githubcopilot.com`   | Copilot Business API (enterprise users)  |
+| `proxy.business.githubcopilot.com` | Copilot Business proxy                   |
 
 ## Known impacts
 
@@ -345,16 +347,16 @@ The sandbox is kernel-enforced — **all restrictions apply to every process spa
 
 `.env*`, `.pem`, `.key`, `.p12`, `.pfx`, `.jks` files in the project directory are **blocked from reading** by default. This prevents a rogue agent from exfiltrating secrets, but has side effects:
 
-| Operation | Impact | Why |
-|---|---|---|
-| `npm install` | ✅ Works | Does not read `.env` files |
-| `cargo build`, `go build` | ✅ Works | Does not read `.env` files |
-| `next build` / `next dev` | ⚠️ May fail | Next.js auto-loads `.env`, `.env.local`, `.env.production` at startup |
-| `npm run dev` (Node.js) | ⚠️ May fail | Apps using `dotenv` to load config will get `undefined` env vars |
-| `npm test` / `vitest` | ⚠️ May fail | Tests that depend on `.env` for config won't find the values |
-| TLS dev servers (`.pem` certs) | ⚠️ Blocked | Local HTTPS certs in `.pem`/`.key` files can't be read |
-| `.env.example` | ⚠️ Blocked | Matches `.env.*` pattern — use `--allow-env-files` if needed |
-| Writing `.env` files | ✅ Works | Only read is denied; Copilot can create `.env` from templates |
+| Operation                      | Impact     | Why                                                                   |
+| ------------------------------ | ---------- | --------------------------------------------------------------------- |
+| `npm install`                  | ✅ Works    | Does not read `.env` files                                            |
+| `cargo build`, `go build`      | ✅ Works    | Does not read `.env` files                                            |
+| `next build` / `next dev`      | ⚠️ May fail | Next.js auto-loads `.env`, `.env.local`, `.env.production` at startup |
+| `npm run dev` (Node.js)        | ⚠️ May fail | Apps using `dotenv` to load config will get `undefined` env vars      |
+| `npm test` / `vitest`          | ⚠️ May fail | Tests that depend on `.env` for config won't find the values          |
+| TLS dev servers (`.pem` certs) | ⚠️ Blocked  | Local HTTPS certs in `.pem`/`.key` files can't be read                |
+| `.env.example`                 | ⚠️ Blocked  | Matches `.env.*` pattern — use `--allow-env-files` if needed          |
+| Writing `.env` files           | ✅ Works    | Only read is denied; Copilot can create `.env` from templates         |
 
 **Fix:** Use `--allow-env-files` when working on projects that need env file loading:
 
@@ -373,17 +375,17 @@ allow_env_files = true
 
 Localhost outbound is blocked by default, which prevents sandboxed processes from connecting to local services:
 
-| Operation | Impact | Why |
-|---|---|---|
-| `npm install` (registry) | ✅ Works | Uses HTTPS to `registry.npmjs.org:443` |
-| `gradle build` (Maven Central) | ✅ Works | Uses HTTPS to `repo1.maven.org:443` |
-| Local PostgreSQL (`:5432`) | ❌ Blocked | Use `--allow-localhost 5432` |
-| Local Redis (`:6379`) | ❌ Blocked | Use `--allow-localhost 6379` |
-| Local Kafka (`:9092`) | ❌ Blocked | Use `--allow-localhost 9092` |
-| MCP servers | ❌ Blocked | Use `--allow-localhost 3000` |
-| Local API/dev server | ❌ Blocked | Use `--allow-localhost 8080` |
-| Spring Boot (`:8080`) | ❌ Blocked | Use `--allow-localhost 8080` |
-| Next.js/Turbopack build | ❌ Workers blocked | Use `--allow-localhost-any` (random ephemeral ports) |
+| Operation                      | Impact            | Why                                                  |
+| ------------------------------ | ----------------- | ---------------------------------------------------- |
+| `npm install` (registry)       | ✅ Works           | Uses HTTPS to `registry.npmjs.org:443`               |
+| `gradle build` (Maven Central) | ✅ Works           | Uses HTTPS to `repo1.maven.org:443`                  |
+| Local PostgreSQL (`:5432`)     | ❌ Blocked         | Use `--allow-localhost 5432`                         |
+| Local Redis (`:6379`)          | ❌ Blocked         | Use `--allow-localhost 6379`                         |
+| Local Kafka (`:9092`)          | ❌ Blocked         | Use `--allow-localhost 9092`                         |
+| MCP servers                    | ❌ Blocked         | Use `--allow-localhost 3000`                         |
+| Local API/dev server           | ❌ Blocked         | Use `--allow-localhost 8080`                         |
+| Spring Boot (`:8080`)          | ❌ Blocked         | Use `--allow-localhost 8080`                         |
+| Next.js/Turbopack build        | ❌ Workers blocked | Use `--allow-localhost-any` (random ephemeral ports) |
 
 **Fix:** Use `--allow-localhost <PORT>` for specific services, or `--allow-localhost-any` for build tools that use random ports (Next.js, Vite, esbuild).
 
