@@ -2,8 +2,8 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use super::policy::{
-    DENIED_DOTFILES, DENIED_FILES, HOME_TOOL_DIRS, HomeToolDir, SENSITIVE_PROJECT_PATTERNS,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS,
+    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, HOME_TOOL_DIRS, HomeToolDir,
+    SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
 };
 
 /// Options for generating an SBPL sandbox profile.
@@ -287,6 +287,39 @@ fn emit_tool_dirs(sb: &mut String, home: &str, existing_home_tool_dirs: Option<&
             writeln!(sb, "(deny file-map-executable (subpath \"{home}/{p}\"))").unwrap();
         }
     }
+
+    // Deny non-dev cache dirs under ~/Library/Caches/ (browsers, system apps).
+    // Uses prefix matching on reverse-domain bundle IDs — stable across versions.
+    // Dev tool caches (go-build, pip, etc.) don't use these prefixes, so they
+    // pass through automatically without needing an explicit allowlist.
+    // Xcode dev tools (com.apple.dt.*) are re-allowed after the broad com.apple. deny.
+    writeln!(sb, ";; Non-dev cache dirs denied (browsers, system apps)").unwrap();
+    for prefix in DENIED_CACHE_PREFIXES {
+        // Escape dots for SBPL regex
+        let escaped = prefix.replace('.', r"\.");
+        writeln!(
+            sb,
+            "(deny file-read* (regex #\"^{home}/Library/Caches/{escaped}\"))"
+        )
+        .unwrap();
+        writeln!(
+            sb,
+            "(deny file-write* (regex #\"^{home}/Library/Caches/{escaped}\"))"
+        )
+        .unwrap();
+    }
+    // Re-allow Xcode dev tools (com.apple.dt.Xcode, com.apple.dt.xcodebuild)
+    writeln!(
+        sb,
+        "(allow file-read* (regex #\"^{home}/Library/Caches/com\\.apple\\.dt\\.\"))"
+    )
+    .unwrap();
+    writeln!(
+        sb,
+        "(allow file-write* (regex #\"^{home}/Library/Caches/com\\.apple\\.dt\\.\"))"
+    )
+    .unwrap();
+
     // Copilot CLI v1.0.22+ stores native modules and helper binaries in
     // ~/Library/Caches/copilot/pkg/. The Library/Caches deny above blocks
     // process-exec and file-map-executable broadly. These carve-outs re-enable:

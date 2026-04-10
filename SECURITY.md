@@ -34,7 +34,7 @@ cplt assumes Copilot CLI is an **untrusted agent** executing arbitrary code sugg
 - **`~/.config/gh/hosts.yml` token** — contains the user's GitHub OAuth token. Copilot needs *a* GitHub token to function (via env var or this file). The token is readable inside the sandbox. If this is a concern, set `GH_TOKEN` env var (passes through allowlist) and add `--deny-path ~/.config/gh` to block the file.
 - **Interpreter-based temp execution** — the sandbox blocks *direct* exec from `/tmp` (Mach-O binaries, dlopen), but cannot block `bash /tmp/evil.sh` or `node /tmp/evil.js` because the exec target is the interpreter (`/bin/bash`, `/usr/bin/node`), not the script file. Sandboxing interpreters would break Copilot.
 - **`.vscode/` project configs** — the agent can write `.vscode/tasks.json`, `launch.json`, and `settings.json` which VS Code may auto-execute outside the sandbox. This is an IDE trust boundary issue, not a sandbox scope issue. Mitigation: review `.vscode/` changes in `git diff` before committing; set `"task.autoRunTasks": "off"` in VS Code.
-- **Write+exec in home cache dirs** — `~/Library/Caches`, `~/.gradle`, `~/.m2`, `~/Library/pnpm` have both write and exec permissions. Build tools need write for dependency downloads and exec for build plugins. A rogue agent could write a malicious JAR to `~/.m2` or a Gradle plugin to `~/.gradle`, but the executed code would still be sandboxed.
+- **Write+exec in home cache dirs** — `~/.gradle`, `~/.m2`, `~/Library/pnpm` have both write and exec permissions. Build tools need write for dependency downloads and exec for build plugins. A rogue agent could write a malicious JAR to `~/.m2` or a Gradle plugin to `~/.gradle`, but the executed code would still be sandboxed. `~/Library/Caches` is broadly allowed for dev tool caches (go-build, Homebrew, pip, etc.), but browser and app caches (Chrome, Firefox, Discord, etc.) are denied via regex prefix rules — no allowlist maintenance needed for new dev tools.
 - **Project build scripts** — the agent can modify `Makefile`, `package.json` scripts, `build.gradle`, `.github/workflows/`, etc. These are legitimate Copilot targets and cannot be blocked. The risk is mitigated by code review (git diff) before running builds or committing.
 - **POSIX shared memory** — `ipc-posix-shm-*` is allowed because Node.js needs it for DNS and system queries. An agent could theoretically use SHM as an IPC channel to processes outside the sandbox, but this requires a cooperating process already running on the machine.
 - **DNS tunneling** — DNS queries go through macOS mDNSResponder Unix socket. Seatbelt offers no per-query filtering; it's all-or-nothing. Blocking DNS breaks everything. Bandwidth is ~15 KB/s max, requires attacker-controlled authoritative DNS, and is detectable with network monitoring.
@@ -136,6 +136,10 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 **Project source code is readable and writable.** The agent needs read/write access to the project directory — that's its job. A compromised agent could exfiltrate source code via HTTPS on port 443.
 
 *Possible mitigation:* A read-only project mode (`--read-only-project`) for review-only workflows where the agent should not modify files. Outbound bandwidth tracking could detect bulk exfiltration (large POSTs relative to Copilot's normal API pattern), but would require deep packet inspection.
+
+**`~/.copilot/` session history is broadly accessible.** The sandbox grants read/write to all of `~/.copilot/`, which includes the session store database (`session-store.db`) containing all past conversation history, and `session-state/` with per-session artifacts. Copilot's runtime manages these files from inside the sandbox and requires access to function. A compromised agent could read all past conversations to extract business logic, architecture decisions, or referenced credentials.
+
+*Possible mitigation:* Users concerned about session history exposure can use `--deny-path ~/.copilot/session-state` to block access to other sessions' artifacts (accepting loss of cross-session features). Scoping session store access to the current session only would require changes to Copilot's runtime (the session store database is a single SQLite file).
 
 Since credentials are inaccessible inside the sandbox (both at filesystem and environment level), network-based exfiltration can only leak project source code and `~/.config/gh` tokens — a much smaller blast radius than full credential theft.
 
@@ -244,11 +248,11 @@ Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permissio
 | `.local`, `.mise`, `.nvm`, `.pyenv`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
 | `.gradle`, `.m2`, `.konan`, `go/pkg` | ❌ | ✅ | varies | JNI/cgo/Kotlin native libs loaded via dlopen, no direct executables |
 | `.yarn` | ❌ | ❌ | ✅ | Yarn Berry global cache — JavaScript packages only, no native binaries |
-| `Library/Caches` | ❌ | ❌* | ✅ | Build caches only — no exec of any kind (RAT staging risk; see axios case study) |
+| `Library/Caches` | ❌ | ❌* | ✅ | Broad allow for dev tool caches; browser/app caches denied via regex prefix rules (com.apple.*, com.google.*, org.mozilla.*, etc.) — Xcode dev tools (com.apple.dt.*) re-allowed |
 
 \* Exception: `~/Library/Caches/copilot/pkg/` has `file-map-executable` and `process-exec` for Copilot's native modules and helper binaries (`pty.node`, `spawn-helper`, `rg`). A `file-write*` deny prevents write-then-exec attacks. These carve-outs are placed after the broader deny rules (SBPL last-match-wins).
 
-**Security principle:** Every writable+executable directory is a potential binary-drop staging path. By denying both `process-exec` and `file-map-executable` on `~/Library/Caches`, this vector is eliminated at the kernel level.
+**Security principle:** Every writable+executable directory is a potential binary-drop staging path. By denying both `process-exec` and `file-map-executable` on `~/Library/Caches`, this vector is eliminated at the kernel level. Non-dev caches (browsers, system apps, communication tools) are denied via `DENIED_CACHE_PREFIXES` regex rules in the SBPL profile — new dev tools auto-work without code changes because their cache dirs don't use these prefixes.
 
 #### Scratch directory
 

@@ -205,7 +205,10 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
 
     let existing_home_tool_dirs: Vec<String> = HOME_TOOL_DIRS
         .iter()
-        .filter(|d| home_dir.join(d.path).exists())
+        // Writable cache dirs are always included: tools create them on first use,
+        // and the profile must permit the write that creates the directory.
+        // Non-writable dirs (tool runtimes) are pruned to existing only.
+        .filter(|d| d.write || home_dir.join(d.path).exists())
         .map(|d| d.path.to_string())
         .collect();
 

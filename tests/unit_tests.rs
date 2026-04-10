@@ -730,8 +730,8 @@ fn profile_allows_env_files_when_flag_set() {
         allow_tmp_exec: false,
     });
     assert!(
-        !p.contains("deny file-read* (regex"),
-        "should NOT deny any files when allow_env_files is true: {p}"
+        !p.contains(r#"deny file-read* (regex #"/projects/app/"#),
+        "should NOT deny project env files when allow_env_files is true"
     );
 }
 
@@ -1110,6 +1110,44 @@ fn profile_library_caches_no_exec() {
     assert!(
         p.contains("(deny file-map-executable (subpath \"/Users/test/Library/Caches\"))"),
         "Library/Caches must have explicit file-map-executable DENY"
+    );
+}
+
+#[test]
+fn profile_denies_non_dev_cache_dirs() {
+    let p = default_profile();
+    // Browser and system app caches must be denied
+    assert!(
+        p.contains(r#"(deny file-read* (regex #"^/Users/test/Library/Caches/com\.apple\."))"#),
+        "Profile must deny com.apple.* caches"
+    );
+    assert!(
+        p.contains(r#"(deny file-read* (regex #"^/Users/test/Library/Caches/com\.google\."))"#),
+        "Profile must deny com.google.* caches"
+    );
+    assert!(
+        p.contains(r#"(deny file-read* (regex #"^/Users/test/Library/Caches/org\.mozilla\."))"#),
+        "Profile must deny org.mozilla.* caches"
+    );
+    assert!(
+        p.contains(r#"(deny file-read* (regex #"^/Users/test/Library/Caches/Firefox"))"#),
+        "Profile must deny Firefox caches"
+    );
+    // Xcode dev tools must be re-allowed
+    assert!(
+        p.contains(r#"(allow file-read* (regex #"^/Users/test/Library/Caches/com\.apple\.dt\."))"#),
+        "Profile must re-allow Xcode dev tool caches"
+    );
+    // Xcode re-allow must come AFTER the com.apple. deny
+    let deny_pos = p
+        .find(r#"(deny file-read* (regex #"^/Users/test/Library/Caches/com\.apple\."))"#)
+        .expect("com.apple deny must exist");
+    let allow_pos = p
+        .find(r#"(allow file-read* (regex #"^/Users/test/Library/Caches/com\.apple\.dt\."))"#)
+        .expect("Xcode re-allow must exist");
+    assert!(
+        allow_pos > deny_pos,
+        "Xcode re-allow must come AFTER com.apple deny (last-match-wins)"
     );
 }
 

@@ -43,6 +43,31 @@ pub(super) const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     r"\.jks$",
 ];
 
+/// Prefixes of ~/Library/Caches/ subdirectories to deny (non-dev caches).
+/// Uses reverse-domain bundle IDs which are stable across app versions.
+/// Dev tool caches (go-build, pip, Homebrew, etc.) are NOT prefixed this way,
+/// so they pass through automatically — no allowlist maintenance needed.
+pub(super) const DENIED_CACHE_PREFIXES: &[&str] = &[
+    // macOS system apps (Xcode dev tools exempted via com.apple.dt.)
+    "com.apple.",
+    // Browsers and personal apps
+    "com.google.",
+    "com.hnc.", // Discord
+    "com.figma.",
+    "com.electron.", // Electron app auto-updaters
+    "org.mozilla.",  // Firefox
+    "org.gpgtools.",
+    "org.whispersystems.", // Signal
+    "us.zoom.",
+    "at.obdev.", // Little Snitch
+    // Non-prefixed personal apps
+    "Firefox",
+    "Google",
+    "Mozilla",
+    "Chrome",
+    "Safari",
+];
+
 /// System files that tools commonly need (SSL certs, resolv.conf, etc.)
 pub(super) const SYSTEM_READ_FILES: &[&str] = &[
     "/private/etc/ssl",
@@ -312,7 +337,9 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: false,
         write: true,
     },
-    // Build caches: downloads, intermediate artifacts — NO exec (RAT staging risk)
+    // Build caches: broad access with deny rules for non-dev caches.
+    // Non-dev cache dirs (browsers, system apps) are denied in the generated
+    // profile using DENIED_CACHE_PREFIXES regex patterns. NO exec (RAT staging risk).
     HomeToolDir {
         path: "Library/Caches",
         process_exec: false,
