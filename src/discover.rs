@@ -10,6 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::sandbox::{DENIED_DOTFILES, DENIED_FILES};
+
 // ── Result types ────────────────────────────────────────────────
 
 /// Overall discovery result from all probes.
@@ -179,7 +181,9 @@ pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
 
 // ── Tool discovery ──────────────────────────────────────────────
 
-const TOOLS_TO_CHECK: &[&str] = &["gh", "git", "node", "mise", "cargo"];
+const TOOLS_TO_CHECK: &[&str] = &[
+    "gh", "git", "node", "mise", "cargo", "python3", "java", "go", "gradle", "yarn", "pnpm",
+];
 
 use crate::sandbox::HOME_TOOL_DIRS;
 
@@ -213,30 +217,6 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
 }
 
 // ── Path discovery ──────────────────────────────────────────────
-
-/// Must match sandbox.rs DENIED_DOTFILES.
-const DENIED_DOTFILES: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".azure",
-    ".kube",
-    ".docker",
-    ".nais",
-    ".password-store",
-    ".config/gcloud",
-    ".config/op",
-    ".terraform.d",
-];
-
-/// Must match sandbox.rs DENIED_FILES.
-const DENIED_FILES: &[&str] = &[
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".gem/credentials",
-    ".vault-token",
-];
 
 pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
     let existing_denied_dirs: Vec<String> = DENIED_DOTFILES

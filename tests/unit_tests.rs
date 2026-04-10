@@ -846,6 +846,45 @@ fn profile_denies_write_to_copilot_pkg() {
     );
 }
 
+#[test]
+fn home_tool_dirs_has_all_runtime_entries() {
+    use cplt::sandbox::HOME_TOOL_DIRS;
+
+    let paths: Vec<&str> = HOME_TOOL_DIRS.iter().map(|d| d.path).collect();
+
+    // Executables: full exec
+    for expected in &[
+        ".local", ".mise", ".nvm", ".pyenv", ".cargo", ".rustup", ".sdkman", "go/bin",
+    ] {
+        assert!(
+            paths.contains(expected),
+            "HOME_TOOL_DIRS missing {expected}"
+        );
+    }
+
+    // Dependency stores: map_exec only
+    for expected in &[".gradle", ".m2", ".konan", "go/pkg"] {
+        assert!(
+            paths.contains(expected),
+            "HOME_TOOL_DIRS missing {expected}"
+        );
+    }
+
+    // Write-only caches
+    for expected in &[".yarn", "Library/Caches"] {
+        assert!(
+            paths.contains(expected),
+            "HOME_TOOL_DIRS missing {expected}"
+        );
+    }
+
+    // pnpm with full exec+write
+    assert!(
+        paths.contains(&"Library/pnpm"),
+        "HOME_TOOL_DIRS missing Library/pnpm"
+    );
+}
+
 // ============================================================
 // Environment variable allowlist
 // ============================================================
@@ -906,6 +945,24 @@ fn env_allowlist_excludes_dangerous_vars() {
     assert!(!ENV_PREFIX_ALLOWLIST.contains(&"AWS_"));
     assert!(!ENV_PREFIX_ALLOWLIST.contains(&"AZURE_"));
     assert!(!ENV_PREFIX_ALLOWLIST.contains(&"VAULT_"));
+}
+
+#[test]
+fn env_allowlist_includes_new_runtime_vars() {
+    use cplt::sandbox::{ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST};
+
+    // Python
+    assert!(ENV_ALLOWLIST.contains(&"PYENV_ROOT"));
+    assert!(ENV_ALLOWLIST.contains(&"PYTHONDONTWRITEBYTECODE"));
+    assert!(ENV_ALLOWLIST.contains(&"VIRTUAL_ENV"));
+
+    // pnpm
+    assert!(ENV_ALLOWLIST.contains(&"PNPM_HOME"));
+
+    // Prefixes
+    assert!(ENV_PREFIX_ALLOWLIST.contains(&"PYENV_"));
+    assert!(ENV_PREFIX_ALLOWLIST.contains(&"YARN_"));
+    assert!(ENV_PREFIX_ALLOWLIST.contains(&"COREPACK_"));
 }
 
 // ============================================================
@@ -1113,6 +1170,65 @@ fn profile_m2_has_map_exec_only() {
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.m2\"))"),
         ".m2 should have file-map-executable for JNI native libs"
+    );
+}
+
+#[test]
+fn profile_pyenv_has_exec() {
+    let p = default_profile();
+    assert!(
+        p.contains("(allow process-exec (subpath \"/Users/test/.pyenv\"))"),
+        ".pyenv should have process-exec for python shims and interpreters"
+    );
+    assert!(
+        p.contains("(allow file-map-executable (subpath \"/Users/test/.pyenv\"))"),
+        ".pyenv should have file-map-executable for native extensions"
+    );
+}
+
+#[test]
+fn profile_yarn_is_write_only() {
+    let p = default_profile();
+    assert!(
+        p.contains("(allow file-write* (subpath \"/Users/test/.yarn\"))"),
+        ".yarn should have file-write* for global cache"
+    );
+    assert!(
+        !p.contains("(allow process-exec (subpath \"/Users/test/.yarn\"))"),
+        ".yarn should NOT have process-exec (JS-only packages)"
+    );
+    assert!(
+        !p.contains("(allow file-map-executable (subpath \"/Users/test/.yarn\"))"),
+        ".yarn should NOT have file-map-executable"
+    );
+    assert!(
+        p.contains("(deny process-exec (subpath \"/Users/test/.yarn\"))"),
+        ".yarn should have explicit process-exec DENY (writable dir)"
+    );
+    assert!(
+        p.contains("(deny file-map-executable (subpath \"/Users/test/.yarn\"))"),
+        ".yarn should have explicit file-map-executable DENY (writable dir)"
+    );
+}
+
+#[test]
+fn profile_konan_has_map_exec_only() {
+    let p = default_profile();
+    assert!(
+        !p.contains("(allow process-exec (subpath \"/Users/test/.konan\"))"),
+        ".konan should NOT have process-exec"
+    );
+    assert!(
+        p.contains("(deny process-exec (subpath \"/Users/test/.konan\"))"),
+        ".konan should have explicit process-exec DENY (writable dir)"
+    );
+    assert!(
+        p.contains("(allow file-map-executable (subpath \"/Users/test/.konan\"))"),
+        ".konan should have file-map-executable for Kotlin Native libs"
+    );
+    assert!(
+        p.contains("(allow file-write* (subpath \"/Users/test/.konan\"))"),
+        ".konan should have file-write* for compilation artifacts"
     );
 }
 

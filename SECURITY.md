@@ -241,8 +241,9 @@ Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permissio
 
 | Directory | process-exec | file-map-executable | file-write | Rationale |
 |---|---|---|---|---|
-| `.local`, `.mise`, `.nvm`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
-| `.gradle`, `.m2`, `go/pkg` | ❌ | ✅ | varies | JNI/cgo native libs loaded via dlopen, no direct executables |
+| `.local`, `.mise`, `.nvm`, `.pyenv`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
+| `.gradle`, `.m2`, `.konan`, `go/pkg` | ❌ | ✅ | varies | JNI/cgo/Kotlin native libs loaded via dlopen, no direct executables |
+| `.yarn` | ❌ | ❌ | ✅ | Yarn Berry global cache — JavaScript packages only, no native binaries |
 | `Library/Caches` | ❌ | ❌* | ✅ | Build caches only — no exec of any kind (RAT staging risk; see axios case study) |
 
 \* Exception: `~/Library/Caches/copilot/pkg/` has `file-map-executable` for Copilot's native modules (`pty.node`, `keytar.node`). This carve-out is placed after the deny rule (SBPL last-match-wins).

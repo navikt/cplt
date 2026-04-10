@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 const SBPL_UNSAFE_CHARS: &[char] = &['"', ')', '(', ';', '\\', '\n', '\r', '\0'];
 
 /// Sensitive directories under $HOME that are always denied.
-const DENIED_DOTFILES: &[&str] = &[
+pub const DENIED_DOTFILES: &[&str] = &[
     ".ssh",
     ".gnupg",
     ".aws",
@@ -20,7 +20,7 @@ const DENIED_DOTFILES: &[&str] = &[
 ];
 
 /// Sensitive files under $HOME that are always denied.
-const DENIED_FILES: &[&str] = &[
+pub const DENIED_FILES: &[&str] = &[
     ".netrc",
     ".npmrc",
     ".pypirc",
@@ -122,6 +122,10 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     // Python
     "VIRTUAL_ENV",
     "PYTHONPATH",
+    "PYENV_ROOT",              // pyenv install location
+    "PYTHONDONTWRITEBYTECODE", // Prevent .pyc writes (common in CI/sandboxed envs)
+    // pnpm
+    "PNPM_HOME", // pnpm binary location
     // Editor
     "EDITOR",
     "VISUAL",
@@ -130,12 +134,15 @@ pub const ENV_ALLOWLIST: &[&str] = &[
 
 /// Environment variable prefixes safe to pass through.
 pub const ENV_PREFIX_ALLOWLIST: &[&str] = &[
-    "LC_",      // Locale
-    "LANG",     // Locale (LANG, LANGUAGE)
-    "COPILOT_", // Copilot-specific config
-    "MISE_",    // mise tool manager
-    "NVM_",     // nvm
-    "SDKMAN_",  // SDKMAN
+    "LC_",       // Locale
+    "LANG",      // Locale (LANG, LANGUAGE)
+    "COPILOT_",  // Copilot-specific config
+    "COREPACK_", // Node.js Corepack (package manager manager)
+    "MISE_",     // mise tool manager
+    "NVM_",      // nvm
+    "PYENV_",    // pyenv (Python version manager)
+    "SDKMAN_",   // SDKMAN (Java version manager)
+    "YARN_",     // Yarn Berry config (hardening injection overrides YARN_ENABLE_SCRIPTS)
 ];
 
 /// Environment variables always stripped, even with --inherit-env.
@@ -243,6 +250,12 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         write: false,
     },
     HomeToolDir {
+        path: ".pyenv",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
         path: ".cargo",
         process_exec: true,
         map_exec: true,
@@ -280,10 +293,23 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         write: true,
     },
     HomeToolDir {
+        path: ".konan",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    HomeToolDir {
         path: "go/pkg",
         process_exec: false,
         map_exec: true,
         write: false,
+    },
+    // Yarn Berry global cache: packages only, no executables
+    HomeToolDir {
+        path: ".yarn",
+        process_exec: false,
+        map_exec: false,
+        write: true,
     },
     // Build caches: downloads, intermediate artifacts — NO exec (RAT staging risk)
     HomeToolDir {
