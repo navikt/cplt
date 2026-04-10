@@ -93,12 +93,13 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 
 | Kill chain step | Attack technique | Sandbox defense | Verdict |
 |---|---|---|---|
-| **1. Infection** | `postinstall` hook runs code | Runs in sandbox — can execute but all restrictions apply | ⚠️ Code runs, but is caged |
+| **1. Infection** | `postinstall` hook runs code | **Blocked by default.** Hardening injects `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false` | ✅ **Stopped** |
 | **2. Recon** | Read hostname, IP, env vars | Can read process env vars (needed for Copilot), hostname | ⚠️ Partial leak possible |
 | **3. Credential harvest** | Read ~/.ssh, ~/.aws, .env | **Kernel-blocked.** macOS Seatbelt denies the read syscall. | ✅ **Stopped** |
 | **4a. HTTP exfil** | POST to discord/webhook/C2 | **Partially mitigated.** Only port 443 allowed (HTTPS); localhost blocked; SSH agent blocked. Credentials are unreadable, limiting blast radius. Proxy blocklist helps if enabled. | ⚠️ **Partially mitigated** |
 | **4b. DNS tunneling** | Encode data in DNS queries | Not inspected — DNS bypasses the proxy | ❌ **Not stopped** |
 | **4c. Reverse shell** | Connect back via ngrok | Non-standard ports blocked; `ngrok.io` blocked when proxy enabled; localhost blocked | ⚠️ **Partially mitigated** |
+| **5. Binary staging** | Drop RAT into cache dir and execute | **Kernel-blocked.** `~/Library/Caches` has no `process-exec` or `file-map-executable`; `/tmp` exec also denied | ✅ **Stopped** |
 | **Worm propagation** | Republish infected packages | Can't read npm tokens (in ~/.npmrc, kernel-blocked) | ✅ **Stopped** |
 
 ### Honest gaps
@@ -114,13 +115,27 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 - A compromised agent CANNOT exfiltrate SSH keys, cloud credentials, or npm tokens (kernel-blocked from reading them)
 - The proxy (when enabled with `--with-proxy`) provides logging and domain blocking for tools that respect `http_proxy`, but Copilot's own Node.js traffic bypasses it
 
+*Possible mitigation:* A domain-allowlist proxy that intercepts all TLS connections (not just `http_proxy`-aware tools) could restrict traffic to known Copilot endpoints. This requires transparent proxy + iptables-style routing, which conflicts with macOS code signing. Alternatively, a Network Extension (NExt) could filter at the system level — but requires an Apple-signed profile. See issue #4 for MCP proxy exploration.
+
 **`~/.config/gh/hosts.yml` is readable.** Copilot spawns `gh auth token` inside the sandbox. This file contains a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable (not the entire `.config/gh` directory). With outbound port 443 allowed, a compromised agent could theoretically exfiltrate this token. However, the token grants access to GitHub — which Copilot is already connected to. Users who want to mitigate this can use `--deny-path ~/.config/gh` (Copilot will fall back to Keychain auth).
+
+*Possible mitigation:* A repo-scoped MCP proxy or fine-grained PAT that limits token scope to the current repository only. See issue #4 for investigation.
 
 **DNS tunneling** is the one channel we cannot inspect. However:
 - Bandwidth is ~15 KB/s at best (encoding overhead in subdomain labels)
 - Requires attacker-controlled authoritative DNS server
 - The most valuable targets (credentials, tokens, keys) are kernel-blocked from being read
 - Detectable with DNS monitoring (high-entropy subdomain queries to unusual domains)
+
+*Possible mitigation:* Route DNS through a local resolver that logs and rate-limits queries, or block DNS entirely and use a pre-configured resolver for known domains. Practical impact is low given that credentials are already inaccessible.
+
+**Reconnaissance leaks basic host info.** Hostname, IP address, OS version, and the sanitized subset of env vars are readable by any code running inside the sandbox. This is unavoidable — Copilot itself needs this information to function.
+
+*Possible mitigation:* A future hardening category could mask hostname and inject synthetic env values, but this risks breaking tools that depend on accurate system info. Low priority given that recon without credential access has minimal value.
+
+**Project source code is readable and writable.** The agent needs read/write access to the project directory — that's its job. A compromised agent could exfiltrate source code via HTTPS on port 443.
+
+*Possible mitigation:* A read-only project mode (`--read-only-project`) for review-only workflows where the agent should not modify files. Outbound bandwidth tracking could detect bulk exfiltration (large POSTs relative to Copilot's normal API pattern), but would require deep packet inspection.
 
 Since credentials are inaccessible inside the sandbox (both at filesystem and environment level), network-based exfiltration can only leak project source code and `~/.config/gh` tokens — a much smaller blast radius than full credential theft.
 
@@ -142,6 +157,28 @@ By default, `cplt` clears the child process environment and re-adds only safe va
 **Deliberately blocked:** `AWS_*`, `AZURE_*`, `NPM_TOKEN`, `DATABASE_URL`, `VAULT_TOKEN`, `SSH_AUTH_SOCK`, Docker vars, CI tokens.
 
 **Escape hatch:** `--inherit-env` disables sanitization and inherits all env vars (still strips `ENV_ALWAYS_DENY`). This is dangerous and should only be used for debugging.
+
+### Layer 0.25: Security Environment Hardening
+
+Beyond sanitization, `cplt` injects hardening environment variables that disable dangerous tool behaviors inside the sandbox. This is a declarative, category-based system designed for extensibility.
+
+**How it works:**
+1. `HARDENING_ENV_VARS` is a compile-time list of `(name, value, category)` tuples
+2. Each variable belongs to a `HardeningCategory` (e.g., `LifecycleScripts`, `GitHardening`)
+3. Variables are injected unless their category has been opted out via CLI flag
+4. If a user explicitly passes a variable via `--pass-env`, their value is preserved
+
+**Currently injected variables:**
+
+| Variable | Value | Category | Purpose |
+|---|---|---|---|
+| `npm_config_ignore_scripts` | `true` | LifecycleScripts | Block npm/pnpm postinstall hooks |
+| `YARN_ENABLE_SCRIPTS` | `false` | LifecycleScripts | Block Yarn Berry lifecycle scripts |
+| `GIT_TERMINAL_PROMPT` | `0` | GitHardening | Prevent git credential prompts |
+
+**Why this matters:** Supply chain attacks (e.g., axios March 2026) use `postinstall` hooks to execute malicious payloads. Blocking lifecycle scripts eliminates this attack class — `npm install` still downloads packages, but no arbitrary code runs. Explicit commands like `npm run build` still work normally.
+
+**Escape hatch:** `--allow-lifecycle-scripts` disables the `LifecycleScripts` category. Use when `npm install` requires postinstall hooks (e.g., native module compilation).
 
 ### Layer 0.5: Native Module Write Protection
 
@@ -197,6 +234,18 @@ Files always denied:
 - `~/.pypirc` — PyPI credentials
 - `~/.gem/credentials` — RubyGems credentials
 - `~/.vault-token` — HashiCorp Vault
+
+#### Tool directory permissions
+
+Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permission model (`HomeToolDir`) with granular `process_exec`, `map_exec`, and `write` flags:
+
+| Directory | process-exec | file-map-executable | file-write | Rationale |
+|---|---|---|---|---|
+| `.local`, `.mise`, `.nvm`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
+| `.gradle`, `.m2`, `go/pkg` | ❌ | ✅ | varies | JNI/cgo native libs loaded via dlopen, no direct executables |
+| `Library/Caches` | ❌ | ❌ | ✅ | Build caches only — no exec of any kind (RAT staging risk; see axios case study) |
+
+**Security principle:** Every writable+executable directory is a potential binary-drop staging path. By denying both `process-exec` and `file-map-executable` on `~/Library/Caches`, this vector is eliminated at the kernel level.
 
 ### Layer 2: CONNECT Proxy (Optional Logging and Domain Blocking)
 
