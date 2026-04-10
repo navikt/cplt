@@ -531,6 +531,19 @@ pub fn generate_profile(
             writeln!(sb, "(allow file-write* (subpath \"{home}/{p}\"))").unwrap();
         }
     }
+    // Deny exec from writable dirs that should not have it.
+    // Must come AFTER allows (last-match-wins in Seatbelt).
+    // The blanket (allow process-exec) means we need explicit denies,
+    // not just absence of a per-dir allow.
+    for dir in &active_dirs {
+        let p = dir.path;
+        if dir.write && !dir.process_exec {
+            writeln!(sb, "(deny process-exec (subpath \"{home}/{p}\"))").unwrap();
+        }
+        if dir.write && !dir.map_exec {
+            writeln!(sb, "(deny file-map-executable (subpath \"{home}/{p}\"))").unwrap();
+        }
+    }
     writeln!(sb).unwrap();
 
     // System config files (specific, not broad)

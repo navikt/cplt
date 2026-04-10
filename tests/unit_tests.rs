@@ -995,11 +995,20 @@ fn profile_library_caches_no_exec() {
     );
     assert!(
         !p.contains("(allow process-exec (subpath \"/Users/test/Library/Caches\"))"),
-        "Library/Caches must NOT have process-exec (RAT staging risk)"
+        "Library/Caches must NOT have process-exec allow"
     );
     assert!(
         !p.contains("(allow file-map-executable (subpath \"/Users/test/Library/Caches\"))"),
-        "Library/Caches must NOT have file-map-executable (RAT staging risk)"
+        "Library/Caches must NOT have file-map-executable allow"
+    );
+    // Explicit denies must be present (blanket process-exec allow means absence of allow is not enough)
+    assert!(
+        p.contains("(deny process-exec (subpath \"/Users/test/Library/Caches\"))"),
+        "Library/Caches must have explicit process-exec DENY"
+    );
+    assert!(
+        p.contains("(deny file-map-executable (subpath \"/Users/test/Library/Caches\"))"),
+        "Library/Caches must have explicit file-map-executable DENY"
     );
 }
 
@@ -1030,11 +1039,19 @@ fn profile_gradle_has_map_exec_only() {
     let p = default_profile();
     assert!(
         !p.contains("(allow process-exec (subpath \"/Users/test/.gradle\"))"),
-        ".gradle should NOT have process-exec"
+        ".gradle should NOT have process-exec allow"
+    );
+    assert!(
+        p.contains("(deny process-exec (subpath \"/Users/test/.gradle\"))"),
+        ".gradle should have explicit process-exec DENY (writable dir)"
     );
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.gradle\"))"),
         ".gradle should have file-map-executable for JNI native libs"
+    );
+    assert!(
+        !p.contains("(deny file-map-executable (subpath \"/Users/test/.gradle\"))"),
+        ".gradle should NOT deny file-map-executable (JNI needs it)"
     );
     assert!(
         p.contains("(allow file-write* (subpath \"/Users/test/.gradle\"))"),
