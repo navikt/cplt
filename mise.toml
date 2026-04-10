@@ -1,6 +1,69 @@
+[tools]
+rust = "1.94"
+
+[tasks.version]
+description = "Generate version string (YYYY.MM.DD-HH.MM-gitsha)"
+run = "echo $(date +%Y.%m.%d)-$(date +%H.%M)-$(git rev-parse --short HEAD)"
+
+[tasks.fmt]
+description = "Format code with rustfmt"
+run = "cargo fmt"
+
+[tasks."fmt:check"]
+description = "Check code formatting"
+run = "cargo fmt -- --check"
+
+[tasks.clippy]
+description = "Run Clippy linter"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.build]
+description = "Build debug binary"
+run = "cargo build"
+
+[tasks."build:release"]
+description = "Build optimized release binary"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test"
+
+[tasks."test:unit"]
+description = "Run unit tests only"
+run = "cargo test --test unit_tests"
+
+[tasks."test:integration"]
+description = "Run integration tests (macOS only)"
+run = "cargo test --test integration"
+
+[tasks."test:e2e"]
+description = "Run E2E tests (requires macOS + Copilot CLI)"
+run = "cargo test --test e2e"
+
+[tasks."test:e2e-live"]
+description = "Run live E2E tests that hit Copilot API (requires auth)"
+run = "cargo test --test e2e -- --ignored"
+
+[tasks.check]
+description = "Run all checks (fmt, clippy, test)"
+depends = ["fmt:check", "clippy", "test"]
+
+[tasks.all]
+description = "Run all checks and build release"
+depends = ["check", "build:release"]
+
 [tasks.install]
 description = "Build and install cplt to /usr/local/bin"
 run = "cargo build --release && sudo cp target/release/cplt /usr/local/bin/cplt"
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "cargo clean"
+
+[tasks.run]
+description = "Build and run copilot --version inside sandbox"
+run = "cargo run -- -- --version"
 
 [tasks.setup-hooks]
 description = "Install git pre-commit hook"
