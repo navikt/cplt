@@ -181,21 +181,7 @@ pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
 
 const TOOLS_TO_CHECK: &[&str] = &["gh", "git", "node", "mise", "cargo"];
 
-/// Tool directories under $HOME that get read access (must match sandbox.rs).
-const HOME_TOOL_DIRS: &[&str] = &[
-    ".local",
-    ".mise",
-    ".nvm",
-    ".cargo",
-    ".rustup",
-    ".gradle",
-    ".m2",
-    ".sdkman",
-    "go/bin",
-    "go/pkg",
-    "Library/Caches",
-    "Library/pnpm",
-];
+use crate::sandbox::HOME_TOOL_DIRS;
 
 pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
     let tools: Vec<ToolInfo> = TOOLS_TO_CHECK
@@ -215,8 +201,8 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
 
     let existing_home_tool_dirs: Vec<String> = HOME_TOOL_DIRS
         .iter()
-        .filter(|dir| home_dir.join(dir).exists())
-        .map(|s| s.to_string())
+        .filter(|d| home_dir.join(d.path).exists())
+        .map(|d| d.path.to_string())
         .collect();
 
     ToolDiscovery {
@@ -399,9 +385,10 @@ impl Discovery {
                 self.tools.existing_home_tool_dirs.join(", ~/")
             );
         }
-        let missing_dirs: Vec<&&str> = HOME_TOOL_DIRS
+        let missing_dirs: Vec<&str> = HOME_TOOL_DIRS
             .iter()
-            .filter(|d| !self.tools.existing_home_tool_dirs.iter().any(|e| e == *d))
+            .map(|d| d.path)
+            .filter(|p| !self.tools.existing_home_tool_dirs.iter().any(|e| e == p))
             .collect();
         if !missing_dirs.is_empty() {
             let joined: Vec<String> = missing_dirs.iter().map(|d| format!("~/{d}")).collect();

@@ -131,6 +131,13 @@ struct Cli {
     #[arg(long)]
     inherit_env: bool,
 
+    /// Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run.
+    /// These are blocked by default to prevent supply chain attacks
+    /// (e.g., malicious postinstall hooks that deploy RATs).
+    /// Enable this if your project needs native module compilation.
+    #[arg(long)]
+    allow_lifecycle_scripts: bool,
+
     /// Skip the startup check that verifies the sandbox is working.
     /// The check runs a quick test command inside the sandbox to confirm
     /// that file and network restrictions are active.
@@ -336,6 +343,7 @@ fn main() -> ExitCode {
         cli.no_validate,
         cli.pass_env.clone(),
         cli.inherit_env,
+        cli.allow_lifecycle_scripts,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -502,6 +510,9 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Compute hardening categories before proxy setup (which partially moves `resolved`)
+    let disabled_categories = resolved.disabled_hardening_categories();
+
     // Start proxy if requested
     let mut proxy_handle = None;
 
@@ -556,6 +567,11 @@ fn main() -> ExitCode {
     info("Protected: ~/.ssh, ~/.gnupg, ~/.aws, ~/.azure, ~/.kube, ~/.docker, ~/.netrc");
     if !resolved.allow_env_files {
         info("Protected: .env*, .pem, .key files in project (--allow-env-files to override)");
+    }
+    if !resolved.allow_lifecycle_scripts {
+        info(
+            "Hardened:  npm/yarn/pnpm lifecycle scripts blocked (--allow-lifecycle-scripts to override)",
+        );
     }
     if resolved.with_proxy {
         info(&format!(
@@ -630,6 +646,7 @@ fn main() -> ExitCode {
         &cli.copilot_args,
         &resolved.pass_env,
         resolved.inherit_env,
+        &disabled_categories,
     );
 
     // Cleanup

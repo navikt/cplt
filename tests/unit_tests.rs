@@ -5,7 +5,7 @@
 
 use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_private_hostname, is_private_ip};
-use cplt::sandbox::{generate_profile, validate_sbpl_path};
+use cplt::sandbox::{HardeningCategory, build_sandbox_env, generate_profile, validate_sbpl_path};
 
 // ============================================================
 // Unsafe root detection
@@ -958,5 +958,228 @@ fn profile_denies_git_persistence_vectors() {
     assert!(
         hooks_pos > allow_pos,
         "Git hooks deny must come after project allow"
+    );
+}
+
+// ============================================================
+// HomeToolDir permissions in profile
+// ============================================================
+
+/// Helper to generate a default profile for permission tests.
+fn default_profile() -> String {
+    generate_profile(
+        std::path::Path::new("/projects/app"),
+        std::path::Path::new("/Users/test"),
+        &[],
+        &[],
+        &[],
+        None,
+        &[],
+        &[],
+        None,
+        false,
+        false,
+    )
+}
+
+#[test]
+fn profile_library_caches_no_exec() {
+    let p = default_profile();
+    assert!(
+        p.contains("(allow file-read* (subpath \"/Users/test/Library/Caches\"))"),
+        "Library/Caches should have file-read*"
+    );
+    assert!(
+        p.contains("(allow file-write* (subpath \"/Users/test/Library/Caches\"))"),
+        "Library/Caches should have file-write*"
+    );
+    assert!(
+        !p.contains("(allow process-exec (subpath \"/Users/test/Library/Caches\"))"),
+        "Library/Caches must NOT have process-exec (RAT staging risk)"
+    );
+    assert!(
+        !p.contains("(allow file-map-executable (subpath \"/Users/test/Library/Caches\"))"),
+        "Library/Caches must NOT have file-map-executable (RAT staging risk)"
+    );
+}
+
+#[test]
+fn profile_cargo_has_exec() {
+    let p = default_profile();
+    assert!(
+        p.contains("(allow process-exec (subpath \"/Users/test/.cargo\"))"),
+        ".cargo should have process-exec for cargo, rustc, etc."
+    );
+    assert!(
+        p.contains("(allow file-map-executable (subpath \"/Users/test/.cargo\"))"),
+        ".cargo should have file-map-executable for native libs"
+    );
+}
+
+#[test]
+fn profile_nvm_has_exec() {
+    let p = default_profile();
+    assert!(
+        p.contains("(allow process-exec (subpath \"/Users/test/.nvm\"))"),
+        ".nvm should have process-exec for node, npm shims"
+    );
+}
+
+#[test]
+fn profile_gradle_has_map_exec_only() {
+    let p = default_profile();
+    assert!(
+        !p.contains("(allow process-exec (subpath \"/Users/test/.gradle\"))"),
+        ".gradle should NOT have process-exec"
+    );
+    assert!(
+        p.contains("(allow file-map-executable (subpath \"/Users/test/.gradle\"))"),
+        ".gradle should have file-map-executable for JNI native libs"
+    );
+    assert!(
+        p.contains("(allow file-write* (subpath \"/Users/test/.gradle\"))"),
+        ".gradle should have file-write* for build caches"
+    );
+}
+
+#[test]
+fn profile_m2_has_map_exec_only() {
+    let p = default_profile();
+    assert!(
+        !p.contains("(allow process-exec (subpath \"/Users/test/.m2\"))"),
+        ".m2 should NOT have process-exec"
+    );
+    assert!(
+        p.contains("(allow file-map-executable (subpath \"/Users/test/.m2\"))"),
+        ".m2 should have file-map-executable for JNI native libs"
+    );
+}
+
+// ============================================================
+// build_sandbox_env — hardening env injection
+// ============================================================
+
+fn make_env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn env_sanitized_injects_hardening_vars() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let env = build_sandbox_env(&parent, &[], false, &[]);
+
+    let npm = env
+        .vars
+        .iter()
+        .find(|(k, _)| k == "npm_config_ignore_scripts");
+    assert!(npm.is_some(), "should inject npm_config_ignore_scripts");
+    assert_eq!(npm.unwrap().1, "true");
+
+    let yarn = env.vars.iter().find(|(k, _)| k == "YARN_ENABLE_SCRIPTS");
+    assert!(yarn.is_some(), "should inject YARN_ENABLE_SCRIPTS");
+    assert_eq!(yarn.unwrap().1, "false");
+
+    let git = env.vars.iter().find(|(k, _)| k == "GIT_TERMINAL_PROMPT");
+    assert!(git.is_some(), "should inject GIT_TERMINAL_PROMPT");
+    assert_eq!(git.unwrap().1, "0");
+}
+
+#[test]
+fn env_sanitized_lifecycle_opt_out_skips_npm_yarn() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let disabled = vec![HardeningCategory::LifecycleScripts];
+    let env = build_sandbox_env(&parent, &[], false, &disabled);
+
+    assert!(
+        !env.vars
+            .iter()
+            .any(|(k, _)| k == "npm_config_ignore_scripts"),
+        "should not inject npm_config_ignore_scripts when lifecycle scripts allowed"
+    );
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "YARN_ENABLE_SCRIPTS"),
+        "should not inject YARN_ENABLE_SCRIPTS when lifecycle scripts allowed"
+    );
+    // Git hardening should still be active
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "GIT_TERMINAL_PROMPT"),
+        "git hardening should remain active even when lifecycle scripts allowed"
+    );
+}
+
+#[test]
+fn env_inherit_injects_hardening_vars() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let env = build_sandbox_env(&parent, &[], true, &[]);
+
+    assert!(!env.clear_first, "inherit mode should not clear env");
+    let npm = env
+        .vars
+        .iter()
+        .find(|(k, _)| k == "npm_config_ignore_scripts");
+    assert!(
+        npm.is_some(),
+        "inherit mode should still inject hardening vars"
+    );
+    assert_eq!(npm.unwrap().1, "true");
+}
+
+#[test]
+fn env_pass_env_preserves_user_override() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        ("npm_config_ignore_scripts", "false"),
+    ]);
+    let extra = vec!["npm_config_ignore_scripts".to_string()];
+    let env = build_sandbox_env(&parent, &extra, false, &[]);
+
+    let npm: Vec<_> = env
+        .vars
+        .iter()
+        .filter(|(k, _)| k == "npm_config_ignore_scripts")
+        .collect();
+    assert_eq!(
+        npm.len(),
+        1,
+        "should have exactly one npm_config_ignore_scripts"
+    );
+    assert_eq!(
+        npm[0].1, "false",
+        "user's explicit --pass-env value should be preserved, not overridden by hardening"
+    );
+}
+
+#[test]
+fn env_inherit_pass_env_preserves_user_override() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("npm_config_ignore_scripts", "false"),
+    ]);
+    let extra = vec!["npm_config_ignore_scripts".to_string()];
+    let env = build_sandbox_env(&parent, &extra, true, &[]);
+
+    // In inherit mode with --pass-env, the user's value is inherited
+    // and hardening should NOT override it
+    assert!(
+        !env.vars
+            .iter()
+            .any(|(k, v)| k == "npm_config_ignore_scripts" && v == "true"),
+        "hardening should not override user's explicit --pass-env value in inherit mode"
+    );
+}
+
+#[test]
+fn env_sanitized_clears_first() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("SECRET_TOKEN", "abc123")]);
+    let env = build_sandbox_env(&parent, &[], false, &[]);
+
+    assert!(env.clear_first, "sanitized mode should clear env first");
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "SECRET_TOKEN"),
+        "SECRET_TOKEN should not pass through in sanitized mode"
     );
 }

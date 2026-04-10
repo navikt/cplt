@@ -146,22 +146,150 @@ const ENV_ALWAYS_DENY: &[&str] = &[
     "SSH_AGENT_PID", // SSH agent PID
 ];
 
-/// Tool directories under $HOME that get read access.
+// ── Security environment hardening ─────────────────────────────
+
+/// Categories of security-hardening environment variables.
+/// Opt-outs are per-category, not per-variable — users accept a *risk*,
+/// not toggle a specific tool's knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardeningCategory {
+    /// Block npm/yarn/pnpm `postinstall` hooks — the #1 supply chain entry point.
+    LifecycleScripts,
+    /// Prevent git from prompting or leaking credentials interactively.
+    GitHardening,
+}
+
+/// A security-hardening environment variable injected into the sandbox.
+pub struct HardeningEnvVar {
+    pub name: &'static str,
+    pub value: &'static str,
+    pub category: HardeningCategory,
+    pub description: &'static str,
+}
+
+/// Declarative list of security-hardening env vars.
+/// Adding a new entry is a one-line addition — no plumbing needed.
+pub const HARDENING_ENV_VARS: &[HardeningEnvVar] = &[
+    // Lifecycle scripts — blocks the postinstall attack vector
+    HardeningEnvVar {
+        name: "npm_config_ignore_scripts",
+        value: "true",
+        category: HardeningCategory::LifecycleScripts,
+        description: "Block npm/pnpm postinstall hooks",
+    },
+    HardeningEnvVar {
+        name: "YARN_ENABLE_SCRIPTS",
+        value: "false",
+        category: HardeningCategory::LifecycleScripts,
+        description: "Block Yarn Berry lifecycle scripts",
+    },
+    // Git hardening — prevent interactive prompts in a non-interactive sandbox
+    HardeningEnvVar {
+        name: "GIT_TERMINAL_PROMPT",
+        value: "0",
+        category: HardeningCategory::GitHardening,
+        description: "Prevent git from prompting for credentials",
+    },
+];
+
+/// Tool directory under $HOME with granular sandbox permissions.
+///
+/// Each directory gets `file-read*` unconditionally. The flags control
+/// additional permissions:
+/// - `process_exec`: allow direct binary execution (`process-exec`)
+/// - `map_exec`: allow shared library loading (`file-map-executable`) for native addons
+/// - `write`: allow file writes (`file-write*`) for build caches and dependency stores
+///
+/// Security principle: every writable+executable directory is a potential
+/// binary-drop staging path (see SECURITY.md axios case study). Grant exec
+/// only where tools genuinely install executables.
+pub struct HomeToolDir {
+    pub path: &'static str,
+    pub process_exec: bool,
+    pub map_exec: bool,
+    pub write: bool,
+}
+
+/// Tool directories under $HOME with per-directory permissions.
 /// NOTE: Only tool/binary dirs, never source code dirs.
 /// ~/go/src is intentionally excluded — it contains other repos.
-const HOME_TOOL_DIRS: &[&str] = &[
-    ".local",
-    ".mise",
-    ".nvm",
-    ".cargo",
-    ".rustup",
-    ".gradle",
-    ".m2",
-    ".sdkman",
-    "go/bin",
-    "go/pkg",
-    "Library/Caches",
-    "Library/pnpm",
+pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
+    // Executables: bin/ dirs with shims, compilers, runtimes
+    HomeToolDir {
+        path: ".local",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".mise",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".nvm",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".cargo",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".rustup",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".sdkman",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: "go/bin",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    // Dependency stores: JARs, compiled packages — may contain JNI/cgo native libs
+    HomeToolDir {
+        path: ".gradle",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    HomeToolDir {
+        path: ".m2",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    HomeToolDir {
+        path: "go/pkg",
+        process_exec: false,
+        map_exec: true,
+        write: false,
+    },
+    // Build caches: downloads, intermediate artifacts — NO exec (RAT staging risk)
+    HomeToolDir {
+        path: "Library/Caches",
+        process_exec: false,
+        map_exec: false,
+        write: true,
+    },
+    // pnpm global store: contains packages + executable shims
+    HomeToolDir {
+        path: "Library/pnpm",
+        process_exec: true,
+        map_exec: true,
+        write: true,
+    },
 ];
 
 /// Validate that a path is safe for interpolation into SBPL profile strings.
@@ -383,20 +511,24 @@ pub fn generate_profile(
         writeln!(sb, "(allow file-map-executable (subpath \"{dir}\"))").unwrap();
     }
     // Home tool dirs: use discovered existing dirs if available, else include all
-    let home_dirs: Vec<&str> = match existing_home_tool_dirs {
-        Some(dirs) => dirs.iter().map(|s| s.as_str()).collect(),
-        None => HOME_TOOL_DIRS.to_vec(),
+    let active_dirs: Vec<&HomeToolDir> = match existing_home_tool_dirs {
+        Some(dirs) => HOME_TOOL_DIRS
+            .iter()
+            .filter(|d| dirs.iter().any(|s| s == d.path))
+            .collect(),
+        None => HOME_TOOL_DIRS.iter().collect(),
     };
-    for dir in &home_dirs {
-        writeln!(sb, "(allow file-read* (subpath \"{home}/{dir}\"))").unwrap();
-        // Tool dirs contain executables (cargo, node, pnpm, mise shims, etc.)
-        writeln!(sb, "(allow process-exec (subpath \"{home}/{dir}\"))").unwrap();
-        writeln!(sb, "(allow file-map-executable (subpath \"{home}/{dir}\"))").unwrap();
-    }
-    // Build caches and dependency stores need write access
-    for write_dir in &["Library/Caches", ".gradle", ".m2", "Library/pnpm"] {
-        if home_dirs.contains(write_dir) {
-            writeln!(sb, "(allow file-write* (subpath \"{home}/{write_dir}\"))").unwrap();
+    for dir in &active_dirs {
+        let p = dir.path;
+        writeln!(sb, "(allow file-read* (subpath \"{home}/{p}\"))").unwrap();
+        if dir.process_exec {
+            writeln!(sb, "(allow process-exec (subpath \"{home}/{p}\"))").unwrap();
+        }
+        if dir.map_exec {
+            writeln!(sb, "(allow file-map-executable (subpath \"{home}/{p}\"))").unwrap();
+        }
+        if dir.write {
+            writeln!(sb, "(allow file-write* (subpath \"{home}/{p}\"))").unwrap();
         }
     }
     writeln!(sb).unwrap();
@@ -548,6 +680,89 @@ pub fn validate(profile_path: &Path, _project_dir: &Path, _home_dir: &Path) -> R
     }
 }
 
+/// Build the environment variable map for the sandboxed process.
+///
+/// Pure function (takes parent env as input) for testability.
+/// Returns (vars_to_set, vars_to_remove, should_clear).
+///
+/// - `should_clear`: if true, caller must `env_clear()` first, then set all vars from `vars_to_set`.
+/// - `vars_to_remove`: only relevant when `should_clear` is false (inherit mode).
+pub fn build_sandbox_env(
+    parent_env: &[(String, String)],
+    extra_pass_env: &[String],
+    inherit_env: bool,
+    disabled_categories: &[HardeningCategory],
+) -> SandboxEnv {
+    let mut env = SandboxEnv {
+        vars: Vec::new(),
+        remove: Vec::new(),
+        clear_first: !inherit_env,
+    };
+
+    if inherit_env {
+        // Legacy mode: inherit everything, strip known-bad vars
+        for var in ENV_ALWAYS_DENY {
+            env.remove.push(var.to_string());
+        }
+    } else {
+        // Secure mode: only allowlisted vars
+        for &var in ENV_ALLOWLIST {
+            if let Some((_, val)) = parent_env.iter().find(|(k, _)| k == var) {
+                env.vars.push((var.to_string(), val.clone()));
+            }
+        }
+        for (key, val) in parent_env {
+            if ENV_PREFIX_ALLOWLIST
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+            {
+                // Avoid duplicates from the explicit allowlist
+                if !env.vars.iter().any(|(k, _)| k == key) {
+                    env.vars.push((key.clone(), val.clone()));
+                }
+            }
+        }
+        for var in extra_pass_env {
+            if let Some((_, val)) = parent_env.iter().find(|(k, _)| k == var)
+                && !env.vars.iter().any(|(k, _)| k == var)
+            {
+                env.vars.push((var.clone(), val.clone()));
+            }
+        }
+    }
+
+    // Apply security hardening: inject vars unless the category is disabled
+    // or the user has explicitly set the var (via --pass-env or parent env in inherit mode).
+    for hvar in HARDENING_ENV_VARS {
+        if disabled_categories.contains(&hvar.category) {
+            continue;
+        }
+        let user_has_set = if inherit_env {
+            // In inherit mode, check if user explicitly passed it via --pass-env
+            extra_pass_env.iter().any(|v| v == hvar.name)
+        } else {
+            // In sanitized mode, check if it ended up in our vars (via pass-env)
+            env.vars.iter().any(|(k, _)| k == hvar.name)
+        };
+        if !user_has_set {
+            env.vars
+                .push((hvar.name.to_string(), hvar.value.to_string()));
+        }
+    }
+
+    env
+}
+
+/// Environment configuration for the sandboxed process.
+pub struct SandboxEnv {
+    /// Variables to set (name, value).
+    pub vars: Vec<(String, String)>,
+    /// Variables to remove (only used when `clear_first` is false).
+    pub remove: Vec<String>,
+    /// Whether to clear all env vars before applying `vars`.
+    pub clear_first: bool,
+}
+
 /// Execute copilot inside the sandbox, forwarding signals to the child process group.
 ///
 /// Environment handling:
@@ -555,6 +770,7 @@ pub fn validate(profile_path: &Path, _project_dir: &Path, _home_dir: &Path) -> R
 ///   npm tokens, database URLs, etc. are stripped. Use `extra_pass_env` for extras.
 /// - Legacy (inherit_env=true): all env vars inherited, only SSH_AUTH_SOCK and
 ///   color vars are stripped. Use only when the default breaks something.
+/// - Security hardening env vars are injected unless their category is disabled.
 pub fn exec(
     profile_path: &Path,
     project_dir: &Path,
@@ -562,6 +778,7 @@ pub fn exec(
     copilot_args: &[String],
     extra_pass_env: &[String],
     inherit_env: bool,
+    disabled_categories: &[HardeningCategory],
 ) -> u8 {
     let mut cmd = std::process::Command::new("sandbox-exec");
     cmd.arg("-f").arg(profile_path).arg("copilot");
@@ -577,32 +794,26 @@ pub fn exec(
     // Set working directory to project
     cmd.current_dir(project_dir);
 
-    // Environment sanitization
-    if inherit_env {
-        // Legacy mode: pass everything, strip known-bad vars
-        for var in ENV_ALWAYS_DENY {
-            cmd.env_remove(var);
+    // Build and apply environment
+    let parent_env: Vec<(String, String)> = std::env::vars().collect();
+    let sandbox_env = build_sandbox_env(
+        &parent_env,
+        extra_pass_env,
+        inherit_env,
+        disabled_categories,
+    );
+
+    if sandbox_env.clear_first {
+        cmd.env_clear();
+        for (key, val) in &sandbox_env.vars {
+            cmd.env(key, val);
         }
     } else {
-        // Secure mode: clear env, pass only allowlisted vars
-        cmd.env_clear();
-        for var in ENV_ALLOWLIST {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
+        for var in &sandbox_env.remove {
+            cmd.env_remove(var);
         }
-        for (key, val) in std::env::vars() {
-            if ENV_PREFIX_ALLOWLIST
-                .iter()
-                .any(|prefix| key.starts_with(prefix))
-            {
-                cmd.env(&key, val);
-            }
-        }
-        for var in extra_pass_env {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
+        for (key, val) in &sandbox_env.vars {
+            cmd.env(key, val);
         }
     }
 

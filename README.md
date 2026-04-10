@@ -46,10 +46,11 @@ cplt -- -p "fix the tests"
 | Read `.env*`, `.pem`, `.key` in project                                          | 🔒 Kernel-blocked                         | Prevents secret exfiltration; `--allow-env-files` to override                           |
 | Write `.git/hooks`, `.git/config`, `.gitmodules`                                 | 🔒 Kernel-blocked                         | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking             |
 | Execute from `/tmp`, `/var/folders`                                              | 🔒 Kernel-blocked                         | Prevents write-then-exec; interpreter-based exec not blocked (see SECURITY.md)          |
+| Execute from `~/Library/Caches`                                                  | 🔒 Kernel-blocked                         | Prevents binary-drop staging; write still allowed for build caches                      |
 | Modify `.vscode/tasks.json`, `launch.json`                                       | ⚠️ Allowed — known risk                   | IDE trust boundary; see SECURITY.md for mitigations                                     |
 | Read/write `~/.copilot` (auth, settings)                                         | ✅ Allowed                                | Includes `file-map-executable` for `keytar.node`, `pty.node`, `computer.node`           |
 | Write `~/.copilot/pkg` (native modules)                                          | 🔒 Kernel-blocked                         | Prevents persistence via native module replacement                                      |
-| Environment variables                                                            | 🔒 Sanitized                              | Only safe allowlist passes through; `--pass-env VAR` to add extras                      |
+| Environment variables                                                            | 🔒 Sanitized + hardened                   | Only safe allowlist passes through; lifecycle scripts blocked; `--pass-env VAR` to add  |
 | Read `~/.config/gh/hosts.yml` + `config.yml`                                     | ✅ Allowed (read-only)                    | Only these two files — rest of `.config/gh` is blocked                                  |
 | Read `~/.config/mise`                                                            | ✅ Allowed (read-only)                    | Tool versions and PATH — no secrets                                                     |
 | Read `~/.gitconfig`, `~/.config/git/config`                                      | ✅ Allowed (read-only)                    |                                                                                         |
@@ -140,12 +141,13 @@ The project directory is the primary writable workspace, plus a narrow allowlist
 
 ### Environment variables
 
-By default, `cplt` sanitizes the child environment — only safe variables pass through (see `ENV_ALLOWLIST` in `sandbox.rs`). Cloud credentials, database URLs, and package tokens are stripped.
+By default, `cplt` sanitizes the child environment — only safe variables pass through (see `ENV_ALLOWLIST` in `sandbox.rs`). Cloud credentials, database URLs, and package tokens are stripped. Additionally, security hardening variables are injected to block npm/yarn/pnpm lifecycle scripts (postinstall hooks) — the #1 supply chain attack vector.
 
 | Flag               | What it does                                                                                                                                            |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--pass-env <VAR>` | Explicitly pass an environment variable through to Copilot. Can be repeated.                                                                            |
 | `--inherit-env`    | ⚠️ **Dangerous.** Inherit the full parent environment (only strips `NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`). Use only for debugging. |
+| `--allow-lifecycle-scripts` | Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run. Blocked by default. Use when `npm install` needs postinstall hooks.         |
 
 ### Proxy (optional)
 
@@ -390,6 +392,30 @@ Or set it permanently in config:
 ```toml
 [sandbox]
 allow_env_files = true
+```
+
+### Lifecycle scripts (postinstall hooks)
+
+npm/yarn/pnpm lifecycle scripts are **blocked by default** via `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false`. This prevents supply chain attacks through postinstall hooks, but may break packages that require post-install steps:
+
+| Operation                        | Impact      | Why                                                            |
+| -------------------------------- | ----------- | -------------------------------------------------------------- |
+| `npm install` (download only)    | ✅ Works     | Packages are downloaded and extracted normally                 |
+| `npm install` (with native deps) | ⚠️ May fail  | Packages like `node-gyp`, `sharp`, `bcrypt` need postinstall  |
+| `npm run build` / `npm test`     | ✅ Works     | Explicit scripts are not blocked, only lifecycle hooks         |
+| `yarn install` (Yarn Berry)      | ⚠️ May fail  | If packages have install scripts                               |
+
+**Fix:** Use `--allow-lifecycle-scripts` when the project needs postinstall hooks:
+
+```bash
+cplt --allow-lifecycle-scripts -- -p "install dependencies and build the project"
+```
+
+Or set it permanently in config:
+
+```toml
+[sandbox]
+allow_lifecycle_scripts = true
 ```
 
 ### Localhost blocking

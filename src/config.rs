@@ -6,6 +6,7 @@
 //!
 //! Override config location with `CPLT_CONFIG` env var.
 
+use crate::sandbox::HardeningCategory;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -71,6 +72,9 @@ pub struct SandboxConfig {
     /// Inherit ALL env vars instead of using the safe allowlist (default: false).
     /// DANGEROUS: exposes cloud credentials, npm tokens, database URLs, etc.
     pub inherit_env: Option<bool>,
+    /// Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run (default: false).
+    /// These are blocked by default to prevent supply chain attacks.
+    pub allow_lifecycle_scripts: Option<bool>,
 }
 
 /// Resolved configuration after merging config file + CLI flags.
@@ -90,6 +94,7 @@ pub struct Resolved {
     pub no_validate: bool,
     pub pass_env: Vec<String>,
     pub inherit_env: bool,
+    pub allow_lifecycle_scripts: bool,
 }
 
 impl Config {
@@ -142,6 +147,7 @@ impl Config {
         cli_no_validate: bool,
         cli_pass_env: Vec<String>,
         cli_inherit_env: bool,
+        cli_allow_lifecycle_scripts: bool,
     ) -> Result<Resolved, String> {
         // Proxy: --no-proxy always wins, then --with-proxy, then config, then false (default off).
         // The proxy is a passive logging tool — Copilot CLI doesn't use it (Node.js ignores
@@ -249,6 +255,13 @@ impl Config {
             self.sandbox.inherit_env.unwrap_or(false)
         };
 
+        // Allow-lifecycle-scripts: CLI flag wins, then config, then false (blocked by default)
+        let allow_lifecycle_scripts = if cli_allow_lifecycle_scripts {
+            true
+        } else {
+            self.sandbox.allow_lifecycle_scripts.unwrap_or(false)
+        };
+
         // Validate all paths for SBPL injection characters
         for p in allow_read
             .iter()
@@ -272,11 +285,21 @@ impl Config {
             no_validate,
             pass_env,
             inherit_env,
+            allow_lifecycle_scripts,
         })
     }
 }
 
 impl Resolved {
+    /// Returns the hardening categories that are disabled by user configuration.
+    pub fn disabled_hardening_categories(&self) -> Vec<HardeningCategory> {
+        let mut disabled = Vec::new();
+        if self.allow_lifecycle_scripts {
+            disabled.push(HardeningCategory::LifecycleScripts);
+        }
+        disabled
+    }
+
     /// Print comprehensive sandbox configuration summary to stderr.
     ///
     /// Shows ALL effective settings including defaults so the user can make
@@ -329,6 +352,15 @@ impl Resolved {
             );
         } else {
             eprintln!("{blue}[cplt]{nc}    .env/.pem/.key blocked     {dim}secrets protected{nc}");
+        }
+        if self.allow_lifecycle_scripts {
+            eprintln!(
+                "{blue}[cplt]{nc}    Lifecycle:     {yellow}allowed{nc}     {dim}(--allow-lifecycle-scripts){nc}"
+            );
+        } else {
+            eprintln!(
+                "{blue}[cplt]{nc}    Lifecycle:     blocked     {dim}npm/yarn postinstall hooks{nc}"
+            );
         }
         eprintln!(
             "{blue}[cplt]{nc}    SSH/GPG/cloud: blocked     {dim}~/.ssh, ~/.gnupg, ~/.aws, ...{nc}"
@@ -496,6 +528,11 @@ pub fn default_config_contents() -> String {
 # secrets that a rogue agent could exfiltrate via HTTPS.
 # allow_env_files = false
 #
+# Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run.
+# Blocked by default — supply chain attacks (e.g. axios March 2026)
+# use postinstall hooks to execute malicious payloads.
+# allow_lifecycle_scripts = false
+#
 # Allow outbound TCP to localhost on ALL ports.
 # Needed for build tools like Turbopack (Next.js), Vite, and esbuild
 # that spawn workers communicating via TCP on random localhost ports.
@@ -659,6 +696,7 @@ validate = false
                 false,
                 vec![],
                 false,
+                false,
             )
             .unwrap();
         assert!(resolved.with_proxy);
@@ -682,6 +720,7 @@ validate = false
                 false,
                 false,
                 vec![],
+                false,
                 false,
             )
             .unwrap();
@@ -707,6 +746,7 @@ validate = false
                 false,
                 vec![],
                 false,
+                false,
             )
             .unwrap();
         assert!(resolved.with_proxy);
@@ -730,6 +770,7 @@ validate = false
                 false,
                 false,
                 vec![],
+                false,
                 false,
             )
             .unwrap();
@@ -755,6 +796,7 @@ validate = false
                 false,
                 vec![],
                 false,
+                false,
             )
             .unwrap();
         assert_eq!(resolved.proxy_port, 9090);
@@ -778,6 +820,7 @@ validate = false
                 false,
                 false,
                 vec![],
+                false,
                 false,
             )
             .unwrap();
@@ -803,6 +846,7 @@ validate = false
                 true,
                 vec![],
                 false,
+                false,
             )
             .unwrap();
         assert!(resolved.no_validate);
@@ -826,6 +870,7 @@ validate = false
                 false,
                 false,
                 vec![],
+                false,
                 false,
             )
             .unwrap();
@@ -852,6 +897,7 @@ validate = false
                 false,
                 false,
                 vec![],
+                false,
                 false,
             )
             .unwrap();
@@ -883,6 +929,7 @@ validate = false
             false,
             vec![],
             false,
+            false,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("cannot be resolved"));
@@ -913,6 +960,7 @@ validate = false
                 false,
                 false,
                 vec![],
+                false,
                 false,
             )
             .unwrap();
@@ -955,6 +1003,7 @@ validate = false
                 false,
                 vec![],
                 false,
+                false,
             )
             .unwrap();
         assert!(resolved.allow_env_files);
@@ -979,6 +1028,7 @@ validate = false
                 false,
                 vec![],
                 false,
+                false,
             )
             .unwrap();
         assert!(resolved.allow_env_files);
@@ -1002,6 +1052,7 @@ validate = false
                 false,
                 false,
                 vec![],
+                false,
                 false,
             )
             .unwrap();
