@@ -45,8 +45,8 @@ cplt -- -p "fix the tests"
 | Read/write project directory                                                     | ✅ Allowed                                |                                                                                         |
 | Read `.env*`, `.pem`, `.key` in project                                          | 🔒 Kernel-blocked                         | Prevents secret exfiltration; `--allow-env-files` to override                           |
 | Write `.git/hooks`, `.git/config`, `.gitmodules`                                 | 🔒 Kernel-blocked                         | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking             |
-| Execute from `/tmp`, `/var/folders`                                              | 🔒 Kernel-blocked                         | Prevents write-then-exec; interpreter-based exec not blocked (see SECURITY.md)          |
-| Execute from `~/Library/Caches`                                                  | 🔒 Kernel-blocked                         | Prevents binary-drop staging; write still allowed for build caches                      |
+| Execute from `/tmp`, `/var/folders`                                              | 🔒 Kernel-blocked                         | Prevents write-then-exec; `--scratch-dir` redirects TMPDIR to safe location             |
+| Execute from `~/Library/Caches`                                                  | 🔒 Kernel-blocked                         | Prevents binary-drop staging; Copilot native modules exempted via carve-out             |
 | Modify `.vscode/tasks.json`, `launch.json`                                       | ⚠️ Allowed — known risk                   | IDE trust boundary; see SECURITY.md for mitigations                                     |
 | Read/write `~/.copilot` (auth, settings)                                         | ✅ Allowed                                | Includes `file-map-executable` for `keytar.node`, `pty.node`, `computer.node`           |
 | Write `~/.copilot/pkg` (native modules)                                          | 🔒 Kernel-blocked                         | Prevents persistence via native module replacement                                      |
@@ -148,6 +148,8 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | `--pass-env <VAR>` | Explicitly pass an environment variable through to Copilot. Can be repeated.                                                                            |
 | `--inherit-env`    | ⚠️ **Dangerous.** Inherit the full parent environment (only strips `NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`). Use only for debugging. |
 | `--allow-lifecycle-scripts` | Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run. Blocked by default. Use when `npm install` needs postinstall hooks.         |
+| `--scratch-dir`             | Enable per-session scratch directory with TMPDIR redirect. Required for `go test`, `mise` inline tasks, and other compile-then-exec tools.   |
+| `--allow-tmp-exec`          | ⚠️ **Dangerous.** Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer `--scratch-dir`.                        |
 
 ### Proxy (optional)
 
@@ -416,6 +418,33 @@ Or set it permanently in config:
 ```toml
 [sandbox]
 allow_lifecycle_scripts = true
+```
+
+### Temp dir execution (go test, mise, node-gyp)
+
+Tools that compile-then-execute from `$TMPDIR` are **blocked by default** because the sandbox denies `process-exec` and `file-map-executable` from `/private/tmp` and `/private/var/folders`. This affects:
+
+| Tool                      | Impact      | Why                                                                   |
+| ------------------------- | ----------- | --------------------------------------------------------------------- |
+| `go test`                 | ❌ Blocked   | Compiles test binaries to `$TMPDIR`, then executes them               |
+| `mise run` (inline tasks) | ❌ Blocked   | Writes script to temp file, then executes it                          |
+| `node-gyp` (native addons)| ❌ Blocked  | Compiles C/C++ to temp, then loads via dlopen                         |
+| `cargo test`              | ✅ Works     | Rust builds in `target/`, not `$TMPDIR`                               |
+| `npm test` / `vitest`     | ✅ Works     | JavaScript runs via interpreter, not compiled to temp                 |
+
+**Fix:** Use `--scratch-dir` to create a controlled per-session scratch directory with exec permissions:
+
+```bash
+cplt --scratch-dir -- -p "run the Go tests"
+```
+
+This creates `~/Library/Caches/cplt/tmp/{session-id}/` with `rwx` permissions, redirects `TMPDIR`, `TMP`, `TEMP`, and `GOTMPDIR` there, and cleans up on exit. Stale directories older than 24 hours are garbage-collected on startup.
+
+Or set it permanently in config:
+
+```toml
+[sandbox]
+scratch_dir = true
 ```
 
 ### Localhost blocking

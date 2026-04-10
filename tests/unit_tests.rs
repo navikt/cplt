@@ -5,7 +5,9 @@
 
 use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_private_hostname, is_private_ip};
-use cplt::sandbox::{HardeningCategory, build_sandbox_env, generate_profile, validate_sbpl_path};
+use cplt::sandbox::{
+    HardeningCategory, ProfileOptions, build_sandbox_env, generate_profile, validate_sbpl_path,
+};
 
 // ============================================================
 // Unsafe root detection
@@ -281,37 +283,41 @@ fn sbpl_path_allows_normal_path() {
 
 #[test]
 fn profile_contains_deny_default() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(p.contains("(deny default)"));
 }
 
 #[test]
 fn profile_allows_tty_ioctl() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         p.contains("(allow file-ioctl)"),
         "Profile must allow file-ioctl for terminal raw mode"
@@ -320,19 +326,21 @@ fn profile_allows_tty_ioctl() {
 
 #[test]
 fn profile_grants_project_access() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(p.contains("(allow file-read* (subpath \"/projects/app\"))"));
     assert!(p.contains("(allow file-write* (subpath \"/projects/app\"))"));
     assert!(
@@ -343,37 +351,41 @@ fn profile_grants_project_access() {
 
 #[test]
 fn profile_grants_copilot_config_access() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(p.contains("(allow file-read* (subpath \"/Users/test/.copilot\"))"));
 }
 
 #[test]
 fn profile_denies_sensitive_dirs() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     for dir in &[
         ".ssh",
         ".gnupg",
@@ -404,19 +416,21 @@ fn profile_denies_sensitive_dirs() {
 
 #[test]
 fn profile_denies_sensitive_files() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     for file in &[
         ".netrc",
         ".npmrc",
@@ -435,19 +449,21 @@ fn profile_denies_sensitive_files() {
 
 #[test]
 fn profile_restricts_outbound_tcp() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         p.contains("(deny network-outbound (remote tcp))"),
         "Profile must deny general TCP before port allows"
@@ -476,19 +492,21 @@ fn profile_restricts_outbound_tcp() {
 
 #[test]
 fn profile_extra_ports_adds_allows() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[8080, 3000],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[8080, 3000],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
         "Profile must allow extra port 8080"
@@ -505,19 +523,21 @@ fn profile_extra_ports_adds_allows() {
 
 #[test]
 fn profile_proxy_port_allows_localhost() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        Some(18080),
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: Some(18080),
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:18080\"))"),
         "Profile must allow localhost proxy port"
@@ -530,19 +550,21 @@ fn profile_proxy_port_allows_localhost() {
 
 #[test]
 fn profile_allow_localhost_opens_specific_ports() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[3000, 8080],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[3000, 8080],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:3000\"))"),
         "Profile must allow localhost:3000"
@@ -570,19 +592,21 @@ fn profile_allow_localhost_opens_specific_ports() {
 
 #[test]
 fn profile_deny_rules_come_after_allow_rules() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     let allow_pos = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
         .unwrap();
@@ -597,19 +621,21 @@ fn profile_deny_rules_come_after_allow_rules() {
 
 #[test]
 fn profile_allows_gh_config_read_only() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.config/gh/hosts.yml\"))"),
         "should allow read to .config/gh/hosts.yml"
@@ -626,19 +652,21 @@ fn profile_allows_gh_config_read_only() {
 
 #[test]
 fn profile_allows_file_map_executable_for_copilot() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.copilot\"))"),
         "should allow file-map-executable for native Node.js addons (keytar.node, pty.node)"
@@ -651,19 +679,21 @@ fn profile_allows_file_map_executable_for_copilot() {
 
 #[test]
 fn profile_denies_env_files_by_default() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         p.contains(r#"(deny file-read* (regex #"/\.env$"))"#),
         "should deny .env files: {p}"
@@ -684,19 +714,21 @@ fn profile_denies_env_files_by_default() {
 
 #[test]
 fn profile_allows_env_files_when_flag_set() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        true,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: true,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         !p.contains("deny file-read* (regex"),
         "should NOT deny any files when allow_env_files is true: {p}"
@@ -705,19 +737,21 @@ fn profile_allows_env_files_when_flag_set() {
 
 #[test]
 fn profile_env_deny_comes_after_project_allow() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     let project_allow = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
         .unwrap();
@@ -734,19 +768,21 @@ fn profile_env_deny_comes_after_project_allow() {
 
 #[test]
 fn profile_allows_all_localhost_when_flag_set() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        true, // allow_localhost_any = true
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: true,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     assert!(
         !p.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
         "Profile must NOT deny localhost when allow_localhost_any is set"
@@ -772,19 +808,21 @@ fn profile_allows_all_localhost_when_flag_set() {
 
 #[test]
 fn profile_denies_write_to_copilot_pkg() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     // Must allow write to ~/.copilot (session state, config)
     assert!(
         p.contains("(allow file-write* (subpath \"/Users/test/.copilot\"))"),
@@ -876,19 +914,21 @@ fn env_allowlist_excludes_dangerous_vars() {
 
 #[test]
 fn profile_denies_exec_from_tmp() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     // Must allow read+write to /tmp (needed for temp files)
     assert!(
         p.contains("(allow file-write* (subpath \"/private/tmp\"))"),
@@ -920,19 +960,21 @@ fn profile_denies_exec_from_tmp() {
 
 #[test]
 fn profile_denies_git_persistence_vectors() {
-    let p = generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    );
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    });
     // Must deny writes to .git/hooks (post-checkout etc. run outside sandbox)
     assert!(
         p.contains("(deny file-write* (subpath \"/projects/app/.git/hooks\"))"),
@@ -967,19 +1009,21 @@ fn profile_denies_git_persistence_vectors() {
 
 /// Helper to generate a default profile for permission tests.
 fn default_profile() -> String {
-    generate_profile(
-        std::path::Path::new("/projects/app"),
-        std::path::Path::new("/Users/test"),
-        &[],
-        &[],
-        &[],
-        None,
-        &[],
-        &[],
-        None,
-        false,
-        false,
-    )
+    generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+    })
 }
 
 #[test]
@@ -1086,7 +1130,7 @@ fn make_env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 #[test]
 fn env_sanitized_injects_hardening_vars() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
-    let env = build_sandbox_env(&parent, &[], false, &[]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
 
     let npm = env
         .vars
@@ -1108,7 +1152,7 @@ fn env_sanitized_injects_hardening_vars() {
 fn env_sanitized_lifecycle_opt_out_skips_npm_yarn() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
     let disabled = vec![HardeningCategory::LifecycleScripts];
-    let env = build_sandbox_env(&parent, &[], false, &disabled);
+    let env = build_sandbox_env(&parent, &[], false, &disabled, None);
 
     assert!(
         !env.vars
@@ -1130,7 +1174,7 @@ fn env_sanitized_lifecycle_opt_out_skips_npm_yarn() {
 #[test]
 fn env_inherit_injects_hardening_vars() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
-    let env = build_sandbox_env(&parent, &[], true, &[]);
+    let env = build_sandbox_env(&parent, &[], true, &[], None);
 
     assert!(!env.clear_first, "inherit mode should not clear env");
     let npm = env
@@ -1152,7 +1196,7 @@ fn env_pass_env_preserves_user_override() {
         ("npm_config_ignore_scripts", "false"),
     ]);
     let extra = vec!["npm_config_ignore_scripts".to_string()];
-    let env = build_sandbox_env(&parent, &extra, false, &[]);
+    let env = build_sandbox_env(&parent, &extra, false, &[], None);
 
     let npm: Vec<_> = env
         .vars
@@ -1177,7 +1221,7 @@ fn env_inherit_pass_env_preserves_user_override() {
         ("npm_config_ignore_scripts", "false"),
     ]);
     let extra = vec!["npm_config_ignore_scripts".to_string()];
-    let env = build_sandbox_env(&parent, &extra, true, &[]);
+    let env = build_sandbox_env(&parent, &extra, true, &[], None);
 
     // In inherit mode with --pass-env, the user's value is inherited
     // and hardening should NOT override it
@@ -1192,11 +1236,255 @@ fn env_inherit_pass_env_preserves_user_override() {
 #[test]
 fn env_sanitized_clears_first() {
     let parent = make_env(&[("HOME", "/Users/test"), ("SECRET_TOKEN", "abc123")]);
-    let env = build_sandbox_env(&parent, &[], false, &[]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
 
     assert!(env.clear_first, "sanitized mode should clear env first");
     assert!(
         !env.vars.iter().any(|(k, _)| k == "SECRET_TOKEN"),
         "SECRET_TOKEN should not pass through in sanitized mode"
     );
+}
+
+// ============================================================
+// Scratch dir SBPL rules
+// ============================================================
+
+#[test]
+fn profile_scratch_dir_adds_all_permissions() {
+    let scratch = std::path::Path::new("/Users/test/Library/Caches/cplt/tmp/abc123");
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: Some(scratch),
+        allow_tmp_exec: false,
+    });
+
+    let scratch_str = scratch.to_string_lossy();
+    assert!(
+        p.contains(&format!("(allow file-read* (subpath \"{scratch_str}\"))")),
+        "scratch dir should have file-read*"
+    );
+    assert!(
+        p.contains(&format!("(allow file-write* (subpath \"{scratch_str}\"))")),
+        "scratch dir should have file-write*"
+    );
+    assert!(
+        p.contains(&format!("(allow process-exec (subpath \"{scratch_str}\"))")),
+        "scratch dir should have process-exec"
+    );
+    assert!(
+        p.contains(&format!(
+            "(allow file-map-executable (subpath \"{scratch_str}\"))"
+        )),
+        "scratch dir should have file-map-executable"
+    );
+}
+
+#[test]
+fn profile_no_scratch_dir_omits_rules() {
+    let p = default_profile();
+    assert!(
+        !p.contains("scratch"),
+        "default profile should not mention scratch dir"
+    );
+}
+
+// ============================================================
+// allow-tmp-exec SBPL rules
+// ============================================================
+
+#[test]
+fn profile_allow_tmp_exec_removes_denies() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: true,
+    });
+
+    assert!(
+        !p.contains("(deny process-exec (subpath \"/private/tmp\"))"),
+        "allow-tmp-exec should remove /private/tmp exec deny"
+    );
+    assert!(
+        !p.contains("(deny file-map-executable (subpath \"/private/tmp\"))"),
+        "allow-tmp-exec should remove /private/tmp map-exec deny"
+    );
+    assert!(
+        !p.contains("(deny process-exec (subpath \"/private/var/folders\"))"),
+        "allow-tmp-exec should remove /private/var/folders exec deny"
+    );
+    assert!(
+        !p.contains("(deny file-map-executable (subpath \"/private/var/folders\"))"),
+        "allow-tmp-exec should remove /private/var/folders map-exec deny"
+    );
+    // Read/write should still be allowed
+    assert!(
+        p.contains("(allow file-read* (subpath \"/private/tmp\"))"),
+        "tmp read should still be allowed"
+    );
+    assert!(
+        p.contains("(allow file-write* (subpath \"/private/tmp\"))"),
+        "tmp write should still be allowed"
+    );
+}
+
+#[test]
+fn profile_default_has_tmp_exec_denies() {
+    let p = default_profile();
+    assert!(
+        p.contains("(deny process-exec (subpath \"/private/tmp\"))"),
+        "default profile should deny exec from /private/tmp"
+    );
+    assert!(
+        p.contains("(deny process-exec (subpath \"/private/var/folders\"))"),
+        "default profile should deny exec from /private/var/folders"
+    );
+}
+
+// ============================================================
+// Copilot Caches native module carve-out
+// ============================================================
+
+#[test]
+fn profile_allows_copilot_caches_map_exec() {
+    let p = default_profile();
+    assert!(
+        p.contains(
+            "(allow file-map-executable (subpath \"/Users/test/Library/Caches/copilot/pkg\"))"
+        ),
+        "Profile must allow file-map-executable for Copilot Caches native modules"
+    );
+    // The general Library/Caches deny must still be present
+    assert!(
+        p.contains("(deny file-map-executable (subpath \"/Users/test/Library/Caches\"))"),
+        "General Library/Caches map-exec deny must still be present"
+    );
+}
+
+#[test]
+fn profile_copilot_caches_carveout_after_deny() {
+    let p = default_profile();
+    let deny_pos = p
+        .find("(deny file-map-executable (subpath \"/Users/test/Library/Caches\"))")
+        .expect("Library/Caches deny must exist");
+    let allow_pos = p
+        .find("(allow file-map-executable (subpath \"/Users/test/Library/Caches/copilot/pkg\"))")
+        .expect("Copilot Caches carve-out must exist");
+    assert!(
+        allow_pos > deny_pos,
+        "Copilot Caches carve-out must come AFTER the general deny (last-match-wins)"
+    );
+}
+
+// ============================================================
+// build_sandbox_env — scratch dir env injection
+// ============================================================
+
+#[test]
+fn env_scratch_dir_sets_tmpdir_vars() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        ("TMPDIR", "/private/var/folders/old"),
+    ]);
+    let scratch = std::path::Path::new("/Users/test/Library/Caches/cplt/tmp/session123");
+    let env = build_sandbox_env(&parent, &[], false, &[], Some(scratch));
+
+    let tmpdir = env.vars.iter().find(|(k, _)| k == "TMPDIR");
+    assert!(tmpdir.is_some(), "TMPDIR should be set");
+    assert_eq!(
+        tmpdir.unwrap().1,
+        scratch.to_string_lossy(),
+        "TMPDIR should point to scratch dir"
+    );
+
+    let gotmpdir = env.vars.iter().find(|(k, _)| k == "GOTMPDIR");
+    assert!(gotmpdir.is_some(), "GOTMPDIR should be set");
+    assert_eq!(gotmpdir.unwrap().1, scratch.to_string_lossy());
+
+    let tmp = env.vars.iter().find(|(k, _)| k == "TMP");
+    assert!(tmp.is_some(), "TMP should be set");
+
+    let temp = env.vars.iter().find(|(k, _)| k == "TEMP");
+    assert!(temp.is_some(), "TEMP should be set");
+}
+
+#[test]
+fn env_scratch_dir_no_duplicate_tmpdir() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("TMPDIR", "/old/tmp")]);
+    let scratch = std::path::Path::new("/new/scratch");
+    let env = build_sandbox_env(&parent, &[], false, &[], Some(scratch));
+
+    let tmpdir_count = env.vars.iter().filter(|(k, _)| k == "TMPDIR").count();
+    assert_eq!(tmpdir_count, 1, "TMPDIR should appear exactly once");
+}
+
+#[test]
+fn env_scratch_dir_respects_pass_env_override() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("TMPDIR", "/custom/tmp")]);
+    let extra = vec!["TMPDIR".to_string()];
+    let scratch = std::path::Path::new("/scratch/dir");
+    let env = build_sandbox_env(&parent, &extra, false, &[], Some(scratch));
+
+    let tmpdir = env.vars.iter().find(|(k, _)| k == "TMPDIR");
+    assert!(tmpdir.is_some());
+    assert_eq!(
+        tmpdir.unwrap().1,
+        "/custom/tmp",
+        "user's explicit --pass-env TMPDIR should override scratch dir"
+    );
+}
+
+#[test]
+fn env_no_scratch_dir_passes_system_tmpdir() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("TMPDIR", "/private/var/folders/xx"),
+    ]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
+
+    let tmpdir = env.vars.iter().find(|(k, _)| k == "TMPDIR");
+    assert!(tmpdir.is_some());
+    assert_eq!(
+        tmpdir.unwrap().1,
+        "/private/var/folders/xx",
+        "without scratch dir, system TMPDIR should pass through"
+    );
+}
+
+// ============================================================
+// Config parsing — new options
+// ============================================================
+
+#[test]
+fn config_parses_scratch_dir() {
+    use cplt::config::Config;
+    let config: Config = toml::from_str("[sandbox]\nscratch_dir = true\n").unwrap();
+    assert_eq!(config.sandbox.scratch_dir, Some(true));
+}
+
+#[test]
+fn config_parses_allow_tmp_exec() {
+    use cplt::config::Config;
+    let config: Config = toml::from_str("[sandbox]\nallow_tmp_exec = true\n").unwrap();
+    assert_eq!(config.sandbox.allow_tmp_exec, Some(true));
 }

@@ -1,5 +1,5 @@
 use clap::Parser;
-use cplt::{config, discover, proxy, sandbox};
+use cplt::{config, discover, proxy, sandbox, scratch};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -137,6 +137,21 @@ struct Cli {
     /// Enable this if your project needs native module compilation.
     #[arg(long)]
     allow_lifecycle_scripts: bool,
+
+    /// Allow process execution from system temp directories.
+    /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
+    /// Prefer --scratch-dir which creates a controlled executable temp dir.
+    /// Only use this as a last resort when --scratch-dir is insufficient.
+    #[arg(long)]
+    allow_tmp_exec: bool,
+
+    /// Enable a per-session scratch directory for TMPDIR redirect.
+    /// Creates ~/.cache/cplt/tmp/{session}/ with write+exec permissions
+    /// and redirects TMPDIR/GOTMPDIR there. This allows tools like
+    /// `go test`, `mise` inline tasks, and `node-gyp` to work.
+    /// Cleaned up automatically on exit.
+    #[arg(long)]
+    scratch_dir: bool,
 
     /// Skip the startup check that verifies the sandbox is working.
     /// The check runs a quick test command inside the sandbox to confirm
@@ -328,23 +343,25 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let resolved = match cfg.merge(
-        cli.with_proxy,
-        cli.no_proxy,
-        cli.proxy_port,
-        cli.blocked_domains.clone(),
-        cli_allow_read,
-        cli_allow_write,
-        cli_deny_paths,
-        cli.allow_ports.clone(),
-        cli.allow_localhost.clone(),
-        cli.allow_localhost_any,
-        cli.allow_env_files,
-        cli.no_validate,
-        cli.pass_env.clone(),
-        cli.inherit_env,
-        cli.allow_lifecycle_scripts,
-    ) {
+    let resolved = match cfg.merge(config::CliFlags {
+        with_proxy: cli.with_proxy,
+        no_proxy: cli.no_proxy,
+        proxy_port: cli.proxy_port,
+        blocked_domains: cli.blocked_domains.clone(),
+        allow_read: cli_allow_read,
+        allow_write: cli_allow_write,
+        deny_paths: cli_deny_paths,
+        allow_ports: cli.allow_ports.clone(),
+        allow_localhost: cli.allow_localhost.clone(),
+        allow_localhost_any: cli.allow_localhost_any,
+        allow_env_files: cli.allow_env_files,
+        no_validate: cli.no_validate,
+        pass_env: cli.pass_env.clone(),
+        inherit_env: cli.inherit_env,
+        allow_lifecycle_scripts: cli.allow_lifecycle_scripts,
+        allow_tmp_exec: cli.allow_tmp_exec,
+        scratch_dir: cli.scratch_dir,
+    }) {
         Ok(r) => r,
         Err(e) => {
             error(&e);
@@ -432,25 +449,47 @@ fn main() -> ExitCode {
     let tool_discovery = discover::discover_tools(&home_dir);
     let existing_dirs = tool_discovery.existing_home_tool_dirs;
 
+    // Create per-session scratch directory if enabled
+    let scratch_guard = if resolved.scratch_dir {
+        // GC stale scratch dirs from previous sessions (best-effort)
+        scratch::ScratchDir::gc_stale(&home_dir);
+
+        match scratch::ScratchDir::create(&home_dir) {
+            Ok(s) => {
+                ok(&format!("Scratch dir: {}", s.path().display()));
+                Some(s)
+            }
+            Err(e) => {
+                error(&format!("Cannot create scratch dir: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let scratch_path = scratch_guard.as_ref().map(|s| s.path());
+
     // Generate sandbox profile
     let proxy_port_for_profile = if resolved.with_proxy {
         Some(resolved.proxy_port)
     } else {
         None
     };
-    let profile = sandbox::generate_profile(
-        &project_dir,
-        &home_dir,
-        &resolved.allow_read,
-        &resolved.allow_write,
-        &resolved.deny_paths,
-        Some(&existing_dirs),
-        &resolved.allow_ports,
-        &resolved.allow_localhost,
-        proxy_port_for_profile,
-        resolved.allow_env_files,
-        resolved.allow_localhost_any,
-    );
+    let profile = sandbox::generate_profile(&sandbox::ProfileOptions {
+        project_dir: &project_dir,
+        home_dir: &home_dir,
+        extra_read: &resolved.allow_read,
+        extra_write: &resolved.allow_write,
+        extra_deny: &resolved.deny_paths,
+        existing_home_tool_dirs: Some(&existing_dirs),
+        extra_ports: &resolved.allow_ports,
+        localhost_ports: &resolved.allow_localhost,
+        proxy_port: proxy_port_for_profile,
+        allow_env_files: resolved.allow_env_files,
+        allow_localhost_any: resolved.allow_localhost_any,
+        scratch_dir: scratch_path,
+        allow_tmp_exec: resolved.allow_tmp_exec,
+    });
 
     // --print-profile: dump the SBPL and exit
     if cli.print_profile {
@@ -642,11 +681,11 @@ fn main() -> ExitCode {
     let exit_code = sandbox::exec(
         &profile_path,
         &project_dir,
-        &home_dir,
         &cli.copilot_args,
         &resolved.pass_env,
         resolved.inherit_env,
         &disabled_categories,
+        scratch_path,
     );
 
     // Cleanup

@@ -75,6 +75,12 @@ pub struct SandboxConfig {
     /// Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run (default: false).
     /// These are blocked by default to prevent supply chain attacks.
     pub allow_lifecycle_scripts: Option<bool>,
+    /// Allow process execution from system temp directories (default: false).
+    /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
+    pub allow_tmp_exec: Option<bool>,
+    /// Enable per-session scratch directory for TMPDIR redirect (default: false).
+    /// Creates an executable temp dir so tools like `go test` and `mise` can work.
+    pub scratch_dir: Option<bool>,
 }
 
 /// Resolved configuration after merging config file + CLI flags.
@@ -95,6 +101,33 @@ pub struct Resolved {
     pub pass_env: Vec<String>,
     pub inherit_env: bool,
     pub allow_lifecycle_scripts: bool,
+    pub allow_tmp_exec: bool,
+    pub scratch_dir: bool,
+}
+
+/// CLI flag values to merge with the config file.
+///
+/// Booleans default to `false` (secure default). The merge logic treats
+/// `true` as an explicit CLI override.
+#[derive(Debug, Default)]
+pub struct CliFlags {
+    pub with_proxy: bool,
+    pub no_proxy: bool,
+    pub proxy_port: Option<u16>,
+    pub blocked_domains: Option<PathBuf>,
+    pub allow_read: Vec<PathBuf>,
+    pub allow_write: Vec<PathBuf>,
+    pub deny_paths: Vec<PathBuf>,
+    pub allow_ports: Vec<u16>,
+    pub allow_localhost: Vec<u16>,
+    pub allow_localhost_any: bool,
+    pub allow_env_files: bool,
+    pub no_validate: bool,
+    pub pass_env: Vec<String>,
+    pub inherit_env: bool,
+    pub allow_lifecycle_scripts: bool,
+    pub allow_tmp_exec: bool,
+    pub scratch_dir: bool,
 }
 
 impl Config {
@@ -130,41 +163,22 @@ impl Config {
     ///
     /// Returns an error if a deny path from config cannot be resolved
     /// (security-critical: silently dropping deny rules is dangerous).
-    #[allow(clippy::too_many_arguments)]
-    pub fn merge(
-        &self,
-        cli_with_proxy: bool,
-        cli_no_proxy: bool,
-        cli_proxy_port: Option<u16>,
-        cli_blocked_domains: Option<PathBuf>,
-        cli_allow_read: Vec<PathBuf>,
-        cli_allow_write: Vec<PathBuf>,
-        cli_deny_paths: Vec<PathBuf>,
-        cli_allow_ports: Vec<u16>,
-        cli_allow_localhost: Vec<u16>,
-        cli_allow_localhost_any: bool,
-        cli_allow_env_files: bool,
-        cli_no_validate: bool,
-        cli_pass_env: Vec<String>,
-        cli_inherit_env: bool,
-        cli_allow_lifecycle_scripts: bool,
-    ) -> Result<Resolved, String> {
+    pub fn merge(&self, cli: CliFlags) -> Result<Resolved, String> {
         // Proxy: --no-proxy always wins, then --with-proxy, then config, then false (default off).
-        // The proxy is a passive logging tool — Copilot CLI doesn't use it (Node.js ignores
-        // http_proxy env vars). It's useful for logging traffic from tools like `gh` or `curl`.
-        let with_proxy = if cli_no_proxy {
+        let with_proxy = if cli.no_proxy {
             false
-        } else if cli_with_proxy {
+        } else if cli.with_proxy {
             true
         } else {
             self.proxy.enabled.unwrap_or(false)
         };
 
         // Port: CLI (if provided) > config > 18080
-        let proxy_port = cli_proxy_port.or(self.proxy.port).unwrap_or(18080);
+        let proxy_port = cli.proxy_port.or(self.proxy.port).unwrap_or(18080);
 
         // Blocked domains: CLI > config > exe_dir fallback (handled later in main)
-        let blocked_domains = cli_blocked_domains
+        let blocked_domains = cli
+            .blocked_domains
             .or_else(|| self.proxy.blocked_domains.as_ref().map(|s| expand_tilde(s)));
 
         // Allow-read: merge config + CLI
@@ -178,7 +192,7 @@ impl Config {
                 }
             }
         }
-        allow_read.extend(cli_allow_read);
+        allow_read.extend(cli.allow_read);
 
         // Allow-write: merge config + CLI
         let mut allow_write: Vec<PathBuf> = Vec::new();
@@ -190,7 +204,7 @@ impl Config {
                 }
             }
         }
-        allow_write.extend(cli_allow_write);
+        allow_write.extend(cli.allow_write);
 
         // Deny-paths: merge config + CLI
         // SECURITY: config deny paths MUST resolve — a silently dropped deny is dangerous
@@ -207,17 +221,17 @@ impl Config {
                 }
             }
         }
-        deny_paths.extend(cli_deny_paths);
+        deny_paths.extend(cli.deny_paths);
 
         // Validate: --no-validate wins, then config, then true (validate by default)
-        let no_validate = if cli_no_validate {
+        let no_validate = if cli.no_validate {
             true
         } else {
             !self.sandbox.validate.unwrap_or(true)
         };
 
         // Allow-env-files: CLI flag wins, then config, then false (deny by default)
-        let allow_env_files = if cli_allow_env_files {
+        let allow_env_files = if cli.allow_env_files {
             true
         } else {
             self.sandbox.allow_env_files.unwrap_or(false)
@@ -225,18 +239,18 @@ impl Config {
 
         // Allow-ports: merge config + CLI
         let mut allow_ports = self.allow.ports.clone();
-        allow_ports.extend(cli_allow_ports);
+        allow_ports.extend(cli.allow_ports);
         allow_ports.sort_unstable();
         allow_ports.dedup();
 
         // Allow-localhost: merge config + CLI
         let mut allow_localhost = self.allow.localhost.clone();
-        allow_localhost.extend(cli_allow_localhost);
+        allow_localhost.extend(cli.allow_localhost);
         allow_localhost.sort_unstable();
         allow_localhost.dedup();
 
         // Allow-localhost-any: CLI flag wins, then config, then false
-        let allow_localhost_any = if cli_allow_localhost_any {
+        let allow_localhost_any = if cli.allow_localhost_any {
             true
         } else {
             self.sandbox.allow_localhost_any.unwrap_or(false)
@@ -244,22 +258,36 @@ impl Config {
 
         // Pass-env: merge config + CLI
         let mut pass_env = self.sandbox.pass_env.clone();
-        pass_env.extend(cli_pass_env);
+        pass_env.extend(cli.pass_env);
         pass_env.sort_unstable();
         pass_env.dedup();
 
         // Inherit-env: CLI flag wins, then config, then false (secure by default)
-        let inherit_env = if cli_inherit_env {
+        let inherit_env = if cli.inherit_env {
             true
         } else {
             self.sandbox.inherit_env.unwrap_or(false)
         };
 
         // Allow-lifecycle-scripts: CLI flag wins, then config, then false (blocked by default)
-        let allow_lifecycle_scripts = if cli_allow_lifecycle_scripts {
+        let allow_lifecycle_scripts = if cli.allow_lifecycle_scripts {
             true
         } else {
             self.sandbox.allow_lifecycle_scripts.unwrap_or(false)
+        };
+
+        // Allow-tmp-exec: CLI flag wins, then config, then false (blocked by default)
+        let allow_tmp_exec = if cli.allow_tmp_exec {
+            true
+        } else {
+            self.sandbox.allow_tmp_exec.unwrap_or(false)
+        };
+
+        // Scratch-dir: CLI flag wins, then config, then false (off by default)
+        let scratch_dir = if cli.scratch_dir {
+            true
+        } else {
+            self.sandbox.scratch_dir.unwrap_or(false)
         };
 
         // Validate all paths for SBPL injection characters
@@ -286,6 +314,8 @@ impl Config {
             pass_env,
             inherit_env,
             allow_lifecycle_scripts,
+            allow_tmp_exec,
+            scratch_dir,
         })
     }
 }
@@ -360,6 +390,17 @@ impl Resolved {
         } else {
             eprintln!(
                 "{blue}[cplt]{nc}    Lifecycle:     blocked     {dim}npm/yarn postinstall hooks{nc}"
+            );
+        }
+        if self.scratch_dir {
+            eprintln!(
+                "{blue}[cplt]{nc}    Scratch dir:   {green}enabled{nc}     {dim}TMPDIR redirected (--scratch-dir){nc}"
+            );
+        }
+        if self.allow_tmp_exec {
+            let red = "\x1b[0;31m";
+            eprintln!(
+                "{blue}[cplt]{nc}    Tmp exec:      {red}ALLOWED{nc}     {dim}⚠ /tmp + /var/folders exec enabled{nc}"
             );
         }
         eprintln!(
@@ -546,6 +587,17 @@ pub fn default_config_contents() -> String {
 # DANGEROUS: Inherit ALL environment variables (disables sanitization).
 # Cloud credentials, npm tokens, database URLs, etc. will be visible.
 # inherit_env = false
+#
+# Enable per-session scratch directory for TMPDIR redirect.
+# Creates ~/Library/Caches/cplt/tmp/{session}/ with write+exec permissions
+# so tools like `go test`, `mise` inline tasks, and `node-gyp` can work.
+# Cleaned up automatically on exit.
+# scratch_dir = false
+#
+# DANGEROUS: Allow process execution from system temp directories.
+# Re-enables exec from /private/tmp and /private/var/folders.
+# Prefer scratch_dir which creates a controlled executable temp dir.
+# allow_tmp_exec = false
 "#
     .to_string()
 }
@@ -681,23 +733,10 @@ validate = false
     fn cli_proxy_flag_overrides_config() {
         let config: Config = toml::from_str("[proxy]\nenabled = false\n").unwrap();
         let resolved = config
-            .merge(
-                true,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
+            .merge(CliFlags {
+                with_proxy: true,
+                ..Default::default()
+            })
             .unwrap();
         assert!(resolved.with_proxy);
     }
@@ -706,23 +745,10 @@ validate = false
     fn no_proxy_flag_overrides_config_enabled() {
         let config: Config = toml::from_str("[proxy]\nenabled = true\n").unwrap();
         let resolved = config
-            .merge(
-                false,
-                true,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
+            .merge(CliFlags {
+                no_proxy: true,
+                ..Default::default()
+            })
             .unwrap();
         assert!(!resolved.with_proxy);
     }
@@ -730,25 +756,7 @@ validate = false
     #[test]
     fn config_proxy_used_when_no_cli_flag() {
         let config: Config = toml::from_str("[proxy]\nenabled = true\n").unwrap();
-        let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
-            .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(resolved.with_proxy);
     }
 
@@ -756,23 +764,10 @@ validate = false
     fn cli_port_overrides_config() {
         let config: Config = toml::from_str("[proxy]\nport = 9090\n").unwrap();
         let resolved = config
-            .merge(
-                false,
-                false,
-                Some(12345),
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
+            .merge(CliFlags {
+                proxy_port: Some(12345),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(resolved.proxy_port, 12345);
     }
@@ -780,50 +775,14 @@ validate = false
     #[test]
     fn config_port_used_when_cli_none() {
         let config: Config = toml::from_str("[proxy]\nport = 9090\n").unwrap();
-        let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
-            .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
         assert_eq!(resolved.proxy_port, 9090);
     }
 
     #[test]
     fn default_port_when_neither_set() {
         let config = Config::default();
-        let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
-            .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
         assert_eq!(resolved.proxy_port, 18080);
     }
 
@@ -831,23 +790,10 @@ validate = false
     fn cli_no_validate_overrides_config() {
         let config: Config = toml::from_str("[sandbox]\nvalidate = true\n").unwrap();
         let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                true,
-                vec![],
-                false,
-                false,
-            )
+            .merge(CliFlags {
+                no_validate: true,
+                ..Default::default()
+            })
             .unwrap();
         assert!(resolved.no_validate);
     }
@@ -855,25 +801,7 @@ validate = false
     #[test]
     fn config_validate_false_sets_no_validate() {
         let config: Config = toml::from_str("[sandbox]\nvalidate = false\n").unwrap();
-        let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
-            .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(resolved.no_validate);
     }
 
@@ -883,23 +811,10 @@ validate = false
         let config: Config = toml::from_str("[deny]\npaths = [\"/tmp\"]\n").unwrap();
         let cli_deny = vec![PathBuf::from("/var")];
         let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                cli_deny,
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
+            .merge(CliFlags {
+                deny_paths: cli_deny,
+                ..Default::default()
+            })
             .unwrap();
         assert!(
             resolved
@@ -914,23 +829,7 @@ validate = false
     fn deny_path_config_error_on_nonexistent() {
         let config: Config =
             toml::from_str("[deny]\npaths = [\"/nonexistent/path/xyz\"]\n").unwrap();
-        let result = config.merge(
-            false,
-            false,
-            None,
-            None,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-            vec![],
-            false,
-            false,
-        );
+        let result = config.merge(CliFlags::default());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("cannot be resolved"));
     }
@@ -945,25 +844,7 @@ validate = false
     #[test]
     fn proxy_disabled_by_default_when_no_config_or_flags() {
         let config = Config::default();
-        let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
-            .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(
             !resolved.with_proxy,
             "Proxy should be disabled by default — it's a passive logging tool, not required for Copilot"
@@ -988,23 +869,10 @@ validate = false
     fn cli_allow_env_files_overrides_default() {
         let config = Config::default();
         let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                true,
-                false,
-                vec![],
-                false,
-                false,
-            )
+            .merge(CliFlags {
+                allow_env_files: true,
+                ..Default::default()
+            })
             .unwrap();
         assert!(resolved.allow_env_files);
     }
@@ -1012,50 +880,14 @@ validate = false
     #[test]
     fn config_allow_env_files_used_when_cli_false() {
         let config: Config = toml::from_str("[sandbox]\nallow_env_files = true\n").unwrap();
-        let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
-            .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(resolved.allow_env_files);
     }
 
     #[test]
     fn env_files_denied_by_default() {
         let config = Config::default();
-        let resolved = config
-            .merge(
-                false,
-                false,
-                None,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                false,
-                false,
-                false,
-                vec![],
-                false,
-                false,
-            )
-            .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(!resolved.allow_env_files);
     }
 }

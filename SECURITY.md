@@ -14,7 +14,7 @@ cplt assumes Copilot CLI is an **untrusted agent** executing arbitrary code sugg
 | **DNS rebinding SSRF** | Domain resolves to `127.0.0.1` after check | Post-DNS-resolution IP validation |
 | **Sandbox profile injection** | Path with `\n(allow file-read* (subpath "/"))` | SBPL path character validation |
 | **Temp file symlink attack** | Symlink at predictable `/tmp/cplt.sb` | Unique filename + `O_CREAT\|O_EXCL` |
-| **Write-then-exec in /tmp** | Drop binary in `/tmp`, execute it | `deny process-exec` + `deny file-map-executable` on `/tmp` and `/var/folders` |
+| **Write-then-exec in /tmp** | Drop binary in `/tmp`, execute it | `deny process-exec` + `deny file-map-executable` on `/tmp` and `/var/folders`; `--scratch-dir` provides a safe alternative |
 | **Cloud metadata access** | Fetch `169.254.169.254` or CGNAT range | Comprehensive private IP blocklist |
 | **Cross-project access** | Read files outside project directory | Seatbelt subpath restrictions |
 | **Process-group escape** | Kill parent, children continue unsandboxed | `setpgid` + signal forwarding |
@@ -243,9 +243,25 @@ Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permissio
 |---|---|---|---|---|
 | `.local`, `.mise`, `.nvm`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
 | `.gradle`, `.m2`, `go/pkg` | ❌ | ✅ | varies | JNI/cgo native libs loaded via dlopen, no direct executables |
-| `Library/Caches` | ❌ | ❌ | ✅ | Build caches only — no exec of any kind (RAT staging risk; see axios case study) |
+| `Library/Caches` | ❌ | ❌* | ✅ | Build caches only — no exec of any kind (RAT staging risk; see axios case study) |
+
+\* Exception: `~/Library/Caches/copilot/pkg/` has `file-map-executable` for Copilot's native modules (`pty.node`, `keytar.node`). This carve-out is placed after the deny rule (SBPL last-match-wins).
 
 **Security principle:** Every writable+executable directory is a potential binary-drop staging path. By denying both `process-exec` and `file-map-executable` on `~/Library/Caches`, this vector is eliminated at the kernel level.
+
+#### Scratch directory
+
+When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Library/Caches/cplt/tmp/{session-id}/` with full `read/write/exec/map-exec` permissions. This is a controlled exception to the TMPDIR exec deny:
+
+- **Why it exists:** `go test`, `mise` inline tasks, and `node-gyp` compile to `$TMPDIR` then execute. The sandbox blocks this, breaking these tools.
+- **Security model:** The scratch dir has both write+exec — this is the accepted trade-off. Mitigations:
+  - **Scoped path:** Only the specific session subpath has exec, not all of `~/Library/Caches/cplt/`
+  - **0700 permissions:** Owner-only access, verified at creation
+  - **Symlink rejection:** Base path is validated as a real directory, not a symlink
+  - **Owner check:** `stat()` verifies the directory owner matches the current uid
+  - **SBPL injection guard:** Path validated against metacharacters before interpolation
+  - **Ephemeral:** Cleaned up on exit via RAII Drop; stale dirs GC'd after 24h on startup
+- **Opt-in:** Disabled by default. Enable with `--scratch-dir` or `sandbox.scratch_dir = true` in config.
 
 ### Layer 2: CONNECT Proxy (Optional Logging and Domain Blocking)
 

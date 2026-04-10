@@ -2,6 +2,7 @@ pub mod config;
 pub mod discover;
 pub mod proxy;
 pub mod sandbox;
+pub mod scratch;
 
 /// Safety check: reject overly broad project roots.
 pub fn is_unsafe_root(path: &std::path::Path, home: &std::path::Path) -> bool {
