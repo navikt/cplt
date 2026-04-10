@@ -1,1 +1,6 @@
 /target/
+
+# Temp dirs created by e2e tests (cleaned on drop, but may survive panics/kills)
+.cplt-e2e-*
+.cplt-smoke-*
+.cplt-fake-copilot-*
