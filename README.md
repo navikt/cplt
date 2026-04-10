@@ -452,6 +452,22 @@ SSH agent access is blocked (unix socket denied), which means:
 - `ssh` commands spawned by the agent will fail
 - `gh` CLI uses HTTPS by default and is unaffected
 
+### Git restrictions
+
+Certain git operations are blocked to prevent persistence attacks that survive the sandbox session:
+
+| Operation                          | Impact      | Why                                                               |
+| ---------------------------------- | ----------- | ----------------------------------------------------------------- |
+| `git add/commit/status/diff/log`   | ✅ Works     | Local operations, no writes to protected paths                    |
+| `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
+| `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth token` provides credentials            |
+| `git fetch/pull/push` (SSH)        | ❌ Blocked   | SSH agent socket denied — use HTTPS                               |
+| `git config` (local)               | ❌ Blocked   | `.git/config` is write-protected (prevents `url.*.insteadOf` hijacking) |
+| `git config --global`              | ❌ Blocked   | `~/.gitconfig` is read-only                                      |
+| `git remote set-url`               | ❌ Blocked   | Writes to `.git/config`                                           |
+| `git submodule add`                | ❌ Blocked   | `.gitmodules` is write-protected (supply chain vector)            |
+| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected (hooks run unsandboxed)          |
+
 ### Port restriction
 
 Only port 443 is allowed by default. Services on other ports need `--allow-port`:
