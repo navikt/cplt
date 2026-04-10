@@ -345,6 +345,466 @@ mod macos_tests {
     }
 
     // ============================================================
+    // Real-profile integration tests
+    //
+    // These use generate_profile() to produce the REAL shipped profile,
+    // then verify kernel enforcement via sandbox-exec. This tests the
+    // full pipeline: profile generation → SBPL → kernel enforcement.
+    // ============================================================
+
+    use cplt::sandbox::{ProfileOptions, generate_profile};
+
+    /// Write a real cplt-generated profile to a temp file.
+    fn write_real_profile(opts: &ProfileOptions) -> PathBuf {
+        let profile = generate_profile(opts);
+        let path = unique_profile_path();
+        fs::write(&path, &profile).unwrap();
+        path
+    }
+
+    /// Default ProfileOptions pointing at the given project/home dirs.
+    fn default_opts<'a>(
+        project: &'a std::path::Path,
+        home: &'a std::path::Path,
+    ) -> ProfileOptions<'a> {
+        ProfileOptions {
+            project_dir: project,
+            home_dir: home,
+            extra_read: &[],
+            extra_write: &[],
+            extra_deny: &[],
+            existing_home_tool_dirs: None,
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            allow_tmp_exec: false,
+        }
+    }
+
+    // ── Git persistence prevention ────────────────────────────────
+
+    #[test]
+    fn real_profile_blocks_git_hooks_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".cplt-git-test-{}", std::process::id()));
+        fs::create_dir_all(tmp.join(".git/hooks")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let hook_path = tmp.join(".git/hooks/post-checkout");
+        let cmd = format!(
+            "echo '#!/bin/sh' > '{}' 2>&1; echo EXIT:$?",
+            hook_path.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "writing to .git/hooks should be blocked, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_blocks_git_config_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".cplt-gitcfg-{}", std::process::id()));
+        fs::create_dir_all(tmp.join(".git")).unwrap();
+        fs::write(tmp.join(".git/config"), "[core]\n").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let config_path = tmp.join(".git/config");
+        let cmd = format!(
+            "echo 'injected' >> '{}' 2>&1; echo EXIT:$?",
+            config_path.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "writing to .git/config should be blocked, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_blocks_gitmodules_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".cplt-gitmod-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join(".gitmodules"), "").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let gitmod_path = tmp.join(".gitmodules");
+        let cmd = format!(
+            "echo 'injected' >> '{}' 2>&1; echo EXIT:$?",
+            gitmod_path.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "writing to .gitmodules should be blocked, got: {output}"
+        );
+    }
+
+    // ── Temp exec denial (write-then-exec attack) ─────────────────
+
+    #[test]
+    fn real_profile_blocks_tmp_exec() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        // Write a real executable to /tmp, then try to exec it directly.
+        // This tests the process-exec deny, not interpreter-based exec.
+        let bin_path = format!("/tmp/cplt-exec-test-{}", std::process::id());
+        let cmd = format!(
+            "cp /usr/bin/true '{bin_path}' && chmod +x '{bin_path}' && '{bin_path}' 2>&1; echo EXIT:$?"
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        // Cleanup (may fail if write was denied too, that's fine)
+        let cleanup_profile = write_test_profile(&project.to_string_lossy(), false);
+        run_sandboxed(&cleanup_profile, &format!("rm -f '{bin_path}'"));
+        fs::remove_file(&cleanup_profile).ok();
+        fs::remove_file(&profile).ok();
+
+        assert!(
+            output.contains("Operation not permitted")
+                || output.contains("Killed")
+                || output.contains("EXIT:1"),
+            "executing binary from /tmp should be blocked, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_allow_tmp_exec_permits_execution() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let mut opts = default_opts(&project, &home);
+        opts.allow_tmp_exec = true;
+        let profile = write_real_profile(&opts);
+
+        let bin_path = format!("/tmp/cplt-exec-allow-{}", std::process::id());
+        let cmd = format!(
+            "cp /usr/bin/true '{bin_path}' && chmod +x '{bin_path}' && '{bin_path}' && echo EXEC_OK"
+        );
+        let (output, success) = run_sandboxed(&profile, &cmd);
+
+        // Cleanup
+        let cleanup_profile = write_test_profile(&project.to_string_lossy(), false);
+        run_sandboxed(&cleanup_profile, &format!("rm -f '{bin_path}'"));
+        fs::remove_file(&cleanup_profile).ok();
+        fs::remove_file(&profile).ok();
+
+        assert!(
+            success && output.contains("EXEC_OK"),
+            "with allow_tmp_exec, executing from /tmp should work, got: {output}"
+        );
+    }
+
+    // ── Scratch dir ───────────────────────────────────────────────
+
+    #[test]
+    fn real_profile_scratch_dir_allows_exec() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let scratch = std::env::temp_dir().join(format!("cplt-scratch-{}", std::process::id()));
+        fs::create_dir_all(&scratch).unwrap();
+        let scratch = fs::canonicalize(&scratch).unwrap();
+
+        let mut opts = default_opts(&project, &home);
+        opts.scratch_dir = Some(&scratch);
+        let profile = write_real_profile(&opts);
+
+        let bin_path = scratch.join("test-exec");
+        let cmd = format!(
+            "cp /usr/bin/true '{}' && chmod +x '{}' && '{}' && echo SCRATCH_EXEC_OK",
+            bin_path.display(),
+            bin_path.display(),
+            bin_path.display()
+        );
+        let (output, success) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&scratch).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            success && output.contains("SCRATCH_EXEC_OK"),
+            "scratch dir should allow exec, got: {output}"
+        );
+    }
+
+    // ── Copilot pkg write denial ──────────────────────────────────
+
+    #[test]
+    fn real_profile_blocks_copilot_pkg_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let copilot_pkg = home.join(".copilot/pkg");
+        if !copilot_pkg.exists() {
+            eprintln!("Skipping: ~/.copilot/pkg does not exist");
+            return;
+        }
+
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        let test_file = copilot_pkg.join(format!("cplt-write-test-{}.tmp", std::process::id()));
+        let cmd = format!(
+            "echo 'malicious' > '{}' 2>&1; echo EXIT:$?",
+            test_file.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_file(&test_file).ok(); // cleanup if it somehow succeeded
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "writing to ~/.copilot/pkg should be blocked, got: {output}"
+        );
+    }
+
+    // ── .env file read denial ─────────────────────────────────────
+
+    #[test]
+    fn real_profile_blocks_env_file_read() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".cplt-envtest-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join(".env"), "SECRET=hunter2\n").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let env_path = tmp.join(".env");
+        let cmd = format!("cat '{}' 2>&1; echo EXIT:$?", env_path.display());
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            ".env read should be blocked by default, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_allows_env_file_when_opted_in() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".cplt-envallow-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join(".env"), "SECRET=hunter2\n").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let mut opts = default_opts(&tmp, &home);
+        opts.allow_env_files = true;
+        let profile = write_real_profile(&opts);
+
+        let env_path = tmp.join(".env");
+        let cmd = format!("cat '{}'", env_path.display());
+        let (output, success) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            success && output.contains("SECRET=hunter2"),
+            "with allow_env_files, .env should be readable, got: {output}"
+        );
+    }
+
+    // ── Denied files (not just dirs) ──────────────────────────────
+
+    #[test]
+    fn real_profile_blocks_netrc_read() {
+        require_sandbox!();
+        let home = home_dir();
+        let netrc = home.join(".netrc");
+        if !netrc.exists() {
+            eprintln!("Skipping: ~/.netrc does not exist");
+            return;
+        }
+
+        let project = fs::canonicalize(".").unwrap();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        let cmd = format!("cat '{}' 2>&1; echo EXIT:$?", netrc.display());
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "~/.netrc should be blocked, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_blocks_npmrc_read() {
+        require_sandbox!();
+        let home = home_dir();
+        let npmrc = home.join(".npmrc");
+        if !npmrc.exists() {
+            eprintln!("Skipping: ~/.npmrc does not exist");
+            return;
+        }
+
+        let project = fs::canonicalize(".").unwrap();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        let cmd = format!("cat '{}' 2>&1; echo EXIT:$?", npmrc.display());
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "~/.npmrc should be blocked, got: {output}"
+        );
+    }
+
+    // ── Deny path wins over allow ─────────────────────────────────
+
+    #[test]
+    fn real_profile_deny_overrides_extra_read() {
+        require_sandbox!();
+        let tmp = std::env::temp_dir().join(format!("cplt-deny-override-{}", std::process::id()));
+        let denied = tmp.join("secret");
+        fs::create_dir_all(&denied).unwrap();
+        fs::write(denied.join("data.txt"), "top-secret\n").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let denied = fs::canonicalize(&denied).unwrap();
+        let home = home_dir();
+        let project = fs::canonicalize(".").unwrap();
+
+        let extra_read = vec![tmp.clone()];
+        let extra_deny = vec![denied.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_read = &extra_read;
+        opts.extra_deny = &extra_deny;
+        let profile = write_real_profile(&opts);
+
+        // The parent dir should be readable
+        let cmd = format!("ls '{}' 2>&1", tmp.display());
+        let (output, success) = run_sandboxed(&profile, &cmd);
+        assert!(success, "parent dir should be readable, got: {output}");
+
+        // The denied subdir should be blocked
+        let cmd = format!("cat '{}/data.txt' 2>&1; echo EXIT:$?", denied.display());
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "deny-path should override allow-read, got: {output}"
+        );
+    }
+
+    // ── Localhost blocking ────────────────────────────────────────
+
+    #[test]
+    fn real_profile_blocks_localhost_by_default() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        // Try to connect to a likely-unused localhost port
+        let cmd = "exec 3<>/dev/tcp/127.0.0.1/19999 2>&1; echo EXIT:$?";
+        let (output, _) = run_sandboxed(&profile, cmd);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted")
+                || output.contains("Connection refused")
+                || output.contains("EXIT:1"),
+            "localhost should be blocked by default, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_allows_localhost_when_opted_in() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let mut opts = default_opts(&project, &home);
+        opts.allow_localhost_any = true;
+        let profile = write_real_profile(&opts);
+
+        // Start a tiny listener, connect to it
+        let cmd = "\
+            /bin/bash -c '\
+            # Start background listener\n\
+            exec 3<>/dev/tcp/127.0.0.1/19876 2>/dev/null && echo CONNECT_OK || echo CONNECT_FAIL\n\
+            ' 2>&1";
+        let (output, _) = run_sandboxed(&profile, cmd);
+
+        fs::remove_file(&profile).ok();
+        // With allow_localhost_any, the connection attempt should not get
+        // "Operation not permitted" — it may get "Connection refused" (no listener)
+        // but that's a network error, not a sandbox denial.
+        assert!(
+            !output.contains("Operation not permitted"),
+            "with allow_localhost_any, localhost should not be denied by sandbox, got: {output}"
+        );
+    }
+
+    // ── Process spawning of common tools ──────────────────────────
+
+    #[test]
+    fn real_profile_allows_git_execution() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        let (output, success) = run_sandboxed(&profile, "git --version");
+        fs::remove_file(&profile).ok();
+        assert!(
+            success,
+            "git should be executable inside sandbox, got: {output}"
+        );
+        assert!(
+            output.contains("git version"),
+            "should see git version string, got: {output}"
+        );
+    }
+
+    // ============================================================
     // Binary CLI tests
     // ============================================================
 

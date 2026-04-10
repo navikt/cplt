@@ -6,16 +6,13 @@
 //!
 //! Override config location with `CPLT_CONFIG` env var.
 
-use crate::sandbox::HardeningCategory;
+use crate::sandbox::{HardeningCategory, validate_sbpl_path};
 use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Default config directory relative to $HOME.
 const CONFIG_DIR: &str = ".config/cplt";
 const CONFIG_FILE: &str = "config.toml";
-
-// Characters that would break SBPL profile string interpolation.
-const SBPL_UNSAFE_CHARS: &[char] = &['"', ')', '(', ';', '\\', '\n', '\r', '\0'];
 
 /// Top-level config file structure.
 #[derive(Debug, Default, Deserialize)]
@@ -632,20 +629,6 @@ fn resolve_config_path(path: &str, config_dir: Option<&PathBuf>) -> Result<PathB
     };
 
     std::fs::canonicalize(&full).map_err(|e| format!("path does not exist or is inaccessible: {e}"))
-}
-
-/// Validate that a path doesn't contain characters that could break SBPL string interpolation.
-fn validate_sbpl_path(path: &std::path::Path) -> Result<(), String> {
-    let s = path.to_string_lossy();
-    for c in SBPL_UNSAFE_CHARS {
-        if s.contains(*c) {
-            return Err(format!(
-                "Path contains unsafe character '{c}' for sandbox profile: {s}\n\
-                 This could be used for SBPL injection. Remove or rename the path."
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

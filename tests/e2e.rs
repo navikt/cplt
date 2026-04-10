@@ -13,6 +13,9 @@
 mod e2e_tests {
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
 
     fn binary_path() -> PathBuf {
         PathBuf::from(env!("CARGO_BIN_EXE_cplt"))
@@ -503,6 +506,373 @@ mod e2e_tests {
         assert!(
             stderr.contains("Sandbox paths") && stderr.contains("Protected"),
             "--doctor should show Sandbox paths with protected dirs.\nstderr: {stderr}"
+        );
+    }
+
+    // ============================================================
+    // CLI flag profile tests — new scenarios
+    // ============================================================
+
+    #[test]
+    fn e2e_print_profile_allow_tmp_exec_removes_denies() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["--allow-tmp-exec", "--print-profile"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(
+            !stdout.contains("(deny process-exec (subpath \"/private/tmp\"))"),
+            "--allow-tmp-exec should remove tmp exec denies.\nstdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("(deny process-exec (subpath \"/private/var/folders\"))"),
+            "--allow-tmp-exec should remove var/folders exec denies.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_print_profile_allow_localhost_any() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["--allow-localhost-any", "--print-profile"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(
+            stdout.contains("(allow network-outbound (remote ip \"localhost:*\"))"),
+            "--allow-localhost-any should allow all localhost.\nstdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
+            "--allow-localhost-any should remove localhost deny.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_print_profile_allow_localhost_port() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["--allow-localhost", "3000", "--print-profile"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(
+            stdout.contains("(allow network-outbound (remote ip \"localhost:3000\"))"),
+            "--allow-localhost 3000 should add port carve-out.\nstdout: {stdout}"
+        );
+        // Localhost should still be denied generally
+        assert!(
+            stdout.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
+            "general localhost deny should remain.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_print_profile_allow_port() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["--allow-port", "8080", "--print-profile"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(
+            stdout.contains("(allow network-outbound (remote ip \"*:8080\"))"),
+            "--allow-port 8080 should appear.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_print_profile_allow_write() {
+        require_copilot!();
+        let allow_dir =
+            std::env::temp_dir().join(format!("cplt-e2e-allow-write-{}", std::process::id()));
+        std::fs::create_dir_all(&allow_dir).unwrap();
+        let allow_dir_canonical = std::fs::canonicalize(&allow_dir).unwrap();
+
+        let output = Command::new(binary_path())
+            .args([
+                "--allow-write",
+                &allow_dir.to_string_lossy(),
+                "--print-profile",
+            ])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        std::fs::remove_dir(&allow_dir).ok();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let allow_str = allow_dir_canonical.to_string_lossy();
+
+        assert!(output.status.success());
+        assert!(
+            stdout.contains(&format!("(allow file-read* (subpath \"{allow_str}\"))")),
+            "--allow-write should grant read.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("(allow file-write* (subpath \"{allow_str}\"))")),
+            "--allow-write should grant write.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_print_profile_allow_env_files() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["--allow-env-files", "--print-profile"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        // With --allow-env-files, the .env deny rules should NOT appear
+        assert!(
+            !stdout.contains(r"\.env\$"),
+            "--allow-env-files should remove .env deny rules.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_print_profile_scratch_dir_appears() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["--scratch-dir", "--print-profile"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(
+            stdout.contains("scratch directory"),
+            "scratch dir section should appear in profile.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("(allow process-exec (subpath"),
+            "scratch dir should allow process-exec.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_print_profile_copilot_pkg_write_denied() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["--print-profile"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(
+            stdout.contains("(deny file-write* (subpath") && stdout.contains(".copilot/pkg"),
+            "profile should deny writes to .copilot/pkg.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_print_profile_git_persistence_blocked() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["--print-profile"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(
+            stdout.contains(".git/hooks"),
+            "profile should deny .git/hooks writes.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains(".git/config"),
+            "profile should deny .git/config writes.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains(".gitmodules"),
+            "profile should deny .gitmodules writes.\nstdout: {stdout}"
+        );
+    }
+
+    // ============================================================
+    // Environment isolation tests
+    //
+    // These use a fake "copilot" script that dumps its environment,
+    // placed earlier in PATH to intercept cplt's exec call.
+    // ============================================================
+
+    /// Create a fake copilot script that prints its environment and exits.
+    /// Placed inside the project dir so the sandbox allows execution
+    /// (process-exec is denied in /tmp).
+    fn create_fake_copilot() -> PathBuf {
+        let id = FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = project_dir().join(format!(".cplt-fake-copilot-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("copilot");
+        std::fs::write(&script, "#!/bin/sh\nenv | sort\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    /// Run cplt with fake copilot and capture the environment output.
+    fn run_with_fake_copilot(extra_args: &[&str], extra_env: &[(&str, &str)]) -> (String, String) {
+        let fake_dir = create_fake_copilot();
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.display());
+
+        let mut cmd = Command::new(binary_path());
+        cmd.args(["--yes", "--no-validate"])
+            .args(extra_args)
+            .args(["--", "--version"]) // fake copilot ignores args, prints env
+            .current_dir(project_dir())
+            .env("PATH", &new_path);
+
+        for (key, val) in extra_env {
+            cmd.env(key, val);
+        }
+
+        let output = cmd.output().expect("binary should run");
+        std::fs::remove_dir_all(&fake_dir).ok();
+
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
+    #[test]
+    fn e2e_env_strips_cloud_credentials() {
+        require_sandbox!();
+        let (stdout, stderr) = run_with_fake_copilot(
+            &[],
+            &[
+                ("AWS_SECRET_ACCESS_KEY", "FAKESECRET"),
+                ("AWS_ACCESS_KEY_ID", "FAKEKEY"),
+                ("NPM_TOKEN", "npm_faketoken"),
+                ("DATABASE_URL", "postgres://localhost/db"),
+            ],
+        );
+
+        assert!(
+            !stdout.contains("FAKESECRET"),
+            "AWS_SECRET_ACCESS_KEY should be stripped.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("npm_faketoken"),
+            "NPM_TOKEN should be stripped.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("postgres://"),
+            "DATABASE_URL should be stripped.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_env_passes_safe_vars() {
+        require_sandbox!();
+        let (stdout, _) = run_with_fake_copilot(&[], &[]);
+
+        assert!(
+            stdout.contains("HOME="),
+            "HOME should pass through.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("PATH="),
+            "PATH should pass through.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_env_injects_hardening_vars() {
+        require_sandbox!();
+        let (stdout, _) = run_with_fake_copilot(&[], &[]);
+
+        assert!(
+            stdout.contains("npm_config_ignore_scripts=true"),
+            "npm_config_ignore_scripts should be injected.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("YARN_ENABLE_SCRIPTS=false"),
+            "YARN_ENABLE_SCRIPTS should be injected.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("GIT_TERMINAL_PROMPT=0"),
+            "GIT_TERMINAL_PROMPT should be injected.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_env_lifecycle_opt_out_removes_hardening() {
+        require_sandbox!();
+        let (stdout, _) = run_with_fake_copilot(&["--allow-lifecycle-scripts"], &[]);
+
+        assert!(
+            !stdout.contains("npm_config_ignore_scripts=true"),
+            "--allow-lifecycle-scripts should remove npm hardening.\nstdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("YARN_ENABLE_SCRIPTS=false"),
+            "--allow-lifecycle-scripts should remove yarn hardening.\nstdout: {stdout}"
+        );
+        // Git hardening should remain — it's a separate category
+        assert!(
+            stdout.contains("GIT_TERMINAL_PROMPT=0"),
+            "git hardening should remain.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_env_pass_env_adds_specific_var() {
+        require_sandbox!();
+        let (stdout, _) = run_with_fake_copilot(
+            &["--pass-env", "MY_CUSTOM_VAR"],
+            &[("MY_CUSTOM_VAR", "custom_value")],
+        );
+
+        assert!(
+            stdout.contains("MY_CUSTOM_VAR=custom_value"),
+            "--pass-env should pass the specified var.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_env_inherit_still_strips_ssh() {
+        require_sandbox!();
+        let (stdout, _) = run_with_fake_copilot(
+            &["--inherit-env"],
+            &[("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock")],
+        );
+
+        assert!(
+            !stdout.contains("SSH_AUTH_SOCK"),
+            "--inherit-env should still strip SSH_AUTH_SOCK.\nstdout: {stdout}"
         );
     }
 

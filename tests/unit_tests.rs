@@ -1511,6 +1511,56 @@ fn profile_copilot_caches_carveout_after_deny() {
     );
 }
 
+#[test]
+fn profile_allows_copilot_caches_process_exec() {
+    let p = default_profile();
+    assert!(
+        p.contains("(allow process-exec (subpath \"/Users/test/Library/Caches/copilot/pkg\"))"),
+        "Profile must allow process-exec for Copilot Caches helper binaries (spawn-helper, rg)"
+    );
+    // General Library/Caches deny must still be present
+    assert!(
+        p.contains("(deny process-exec (subpath \"/Users/test/Library/Caches\"))"),
+        "General Library/Caches process-exec deny must still be present"
+    );
+}
+
+#[test]
+fn profile_copilot_caches_exec_carveout_after_deny() {
+    let p = default_profile();
+    let deny_pos = p
+        .find("(deny process-exec (subpath \"/Users/test/Library/Caches\"))")
+        .expect("Library/Caches process-exec deny must exist");
+    let allow_pos = p
+        .find("(allow process-exec (subpath \"/Users/test/Library/Caches/copilot/pkg\"))")
+        .expect("Copilot Caches process-exec carve-out must exist");
+    assert!(
+        allow_pos > deny_pos,
+        "Copilot Caches process-exec carve-out must come AFTER the general deny (last-match-wins)"
+    );
+}
+
+#[test]
+fn profile_denies_write_to_copilot_caches_pkg() {
+    let p = default_profile();
+    // Must deny writes to prevent write-then-exec (binary-drop staging attack)
+    assert!(
+        p.contains("(deny file-write* (subpath \"/Users/test/Library/Caches/copilot/pkg\"))"),
+        "Profile must deny file-write* to ~/Library/Caches/copilot/pkg (prevents binary-drop staging)"
+    );
+    // The deny must come after the broad Library/Caches write allow
+    let allow_pos = p
+        .find("(allow file-write* (subpath \"/Users/test/Library/Caches\"))")
+        .expect("Library/Caches write allow must exist");
+    let deny_pos = p
+        .find("(deny file-write* (subpath \"/Users/test/Library/Caches/copilot/pkg\"))")
+        .expect("Copilot Caches pkg write deny must exist");
+    assert!(
+        deny_pos > allow_pos,
+        "Copilot Caches pkg write deny must come AFTER Library/Caches write allow (last-match-wins)"
+    );
+}
+
 // ============================================================
 // build_sandbox_env — scratch dir env injection
 // ============================================================

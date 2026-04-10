@@ -25,7 +25,11 @@ Always run `mise run check` at the end of a coding session.
 
 ## Project layout
 
-- `src/sandbox.rs` — sandbox profile generation, env hardening, exec
+- `src/sandbox.rs` — module root with re-exports (submodules use `#[path]`)
+- `src/sandbox_policy.rs` — constants, types, deny lists, env allowlists, validation
+- `src/sandbox_profile.rs` — SBPL profile generation (`generate_profile`, `ProfileOptions`)
+- `src/sandbox_env.rs` — environment variable construction (`build_sandbox_env`)
+- `src/sandbox_exec.rs` — sandbox execution, validation, signal forwarding
 - `src/config.rs` — config file parsing, CLI/config merging, `Resolved` struct
 - `src/discover.rs` — runtime environment probing (`--doctor`)
 - `src/main.rs` — CLI entry point, orchestration
