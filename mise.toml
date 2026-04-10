@@ -55,7 +55,7 @@ depends = ["check", "build:release"]
 
 [tasks.install]
 description = "Build and install cplt to /usr/local/bin"
-run = "cargo build --release && sudo cp target/release/cplt /usr/local/bin/cplt && sudo /usr/bin/xattr -cr /usr/local/bin/cplt"
+run = "cargo build --release && sudo cp target/release/cplt /usr/local/bin/cplt && sudo /usr/bin/xattr -cr /usr/local/bin/cplt && sudo codesign --force --sign - /usr/local/bin/cplt"
 
 [tasks.clean]
 description = "Clean build artifacts"
