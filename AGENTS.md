@@ -30,21 +30,24 @@ Always run `mise run check` at the end of a coding session.
 - `src/sandbox_profile.rs` — SBPL profile generation (`generate_profile`, `ProfileOptions`)
 - `src/sandbox_env.rs` — environment variable construction (`build_sandbox_env`)
 - `src/sandbox_exec.rs` — sandbox execution, validation, signal forwarding
+- `src/scratch.rs` — per-session scratch directory with TMPDIR redirect
 - `src/config.rs` — config file parsing, CLI/config merging, `Resolved` struct
 - `src/discover.rs` — runtime environment probing (`--doctor`)
 - `src/main.rs` — CLI entry point, orchestration
+- `src/lib.rs` — library crate root (re-exports modules for test access)
 - `src/proxy.rs` + `src/proxy/` — CONNECT proxy, domain blocking
-- `tests/unit_tests.rs` — cross-platform unit tests
-- `tests/integration.rs` — macOS sandbox-exec tests
-- `tests/e2e.rs` — end-to-end with compiled binary
+- `tests/unit_tests.rs` — cross-platform unit tests (92 tests)
+- `tests/integration.rs` — macOS sandbox-exec kernel-level tests (29 tests)
+- `tests/e2e.rs` — end-to-end with compiled binary + smoke tests
+- `tests/e2e_projects.rs` — e2e tests with realistic project scaffolding (18 tests)
 - `SECURITY.md` — threat model, defense layers, honest gaps
 
 ## Testing
 
 Tests are split by platform requirement:
 - **unit_tests** run on any OS (Linux CI, macOS)
-- **integration** + **e2e** require macOS with `sandbox-exec`
-- 2 e2e tests are `#[ignore]` (need Copilot auth + network)
+- **integration** + **e2e** + **e2e_projects** require macOS with `sandbox-exec`
+- 6 smoke tests in `e2e.rs` are `#[ignore]` (need Copilot auth + network)
 
 When adding sandbox rules, add a unit test verifying the SBPL string.
 When adding config options, add a merge test in `config.rs`.

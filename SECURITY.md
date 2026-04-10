@@ -147,8 +147,8 @@ By default, `cplt` clears the child process environment and re-adds only safe va
 
 **How it works:**
 1. `cmd.env_clear()` removes all environment variables
-2. Variables matching `ENV_ALLOWLIST` (38 safe vars) are re-added from the parent process
-3. Variables matching `ENV_PREFIX_ALLOWLIST` (6 prefixes like `LC_*`, `COPILOT_*`, `MISE_*`) are re-added
+2. Variables matching `ENV_ALLOWLIST` (49 safe vars) are re-added from the parent process
+3. Variables matching `ENV_PREFIX_ALLOWLIST` (8 prefixes: `LC_*`, `COPILOT_*`, `COREPACK_*`, `MISE_*`, `NVM_*`, `PYENV_*`, `SDKMAN_*`, `YARN_*`) are re-added
 4. `--pass-env VAR` adds explicit vars (repeatable)
 5. `ENV_ALWAYS_DENY` vars (`NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`) are always stripped
 
@@ -201,7 +201,7 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 (deny process-exec /private/tmp)        ← But no executing from tmp!
 (deny file-* ~/.ssh, ~/.aws, ...)       ← Sensitive dirs blocked
 (deny network-outbound (remote tcp))    ← Block all outbound TCP by default
-(allow network-outbound *:443, *:80)    ← Then allow HTTPS/HTTP ports only
+(allow network-outbound *:443)           ← Then allow HTTPS port only (use --allow-port for extras)
 (deny network-outbound localhost:*)     ← Block localhost SSRF
 (allow network-outbound localhost:PORT) ← Carve-out for proxy (if --with-proxy)
 ```
@@ -246,7 +246,7 @@ Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permissio
 | `.yarn` | ❌ | ❌ | ✅ | Yarn Berry global cache — JavaScript packages only, no native binaries |
 | `Library/Caches` | ❌ | ❌* | ✅ | Build caches only — no exec of any kind (RAT staging risk; see axios case study) |
 
-\* Exception: `~/Library/Caches/copilot/pkg/` has `file-map-executable` for Copilot's native modules (`pty.node`, `keytar.node`). This carve-out is placed after the deny rule (SBPL last-match-wins).
+\* Exception: `~/Library/Caches/copilot/pkg/` has `file-map-executable` and `process-exec` for Copilot's native modules and helper binaries (`pty.node`, `spawn-helper`, `rg`). A `file-write*` deny prevents write-then-exec attacks. These carve-outs are placed after the broader deny rules (SBPL last-match-wins).
 
 **Security principle:** Every writable+executable directory is a potential binary-drop staging path. By denying both `process-exec` and `file-map-executable` on `~/Library/Caches`, this vector is eliminated at the kernel level.
 
@@ -407,33 +407,53 @@ These test core logic without invoking `sandbox-exec`, using the real library fu
 | Category | Tests | What's verified |
 |---|---|---|
 | Unsafe root detection | 11 | Rejects `/`, `/Users`, `/tmp`, `/var`, `/Applications`, `/System`, `$HOME`; allows project subdirs |
-| Domain blocking | 7 | Exact match, subdomain match, no partial match, comments, case-insensitive, empty blocklist |
-| Private IP detection | 9 | Loopback, RFC 1918, link-local, unspecified, CGNAT, benchmarking, reserved, ULA, link-local v6 |
-| Hostname detection | 3 | localhost, .localhost, .local patterns; allows normal hostnames |
 | SBPL injection | 5 | Rejects `\n`, `\0`, `"`, `(`; allows normal paths |
-| Profile generation | 8 | Uses real `generate_profile()`; verifies deny-default, project access, sensitive dir blocks, network rules, deny-after-allow ordering, exec-from-tmp denied, sensitive files denied |
-| Config parsing | 20 | TOML parsing, CLI/config merge precedence, tilde expansion, SBPL validation, path canonicalization |
+| Domain blocking | 7 | Exact match, subdomain match, no partial match, comments, case-insensitive, empty blocklist |
+| Private IP detection | 11 | Loopback, RFC 1918, link-local, unspecified, CGNAT, benchmarking, reserved, ULA, link-local v6 |
+| Hostname detection | 3 | localhost, .localhost, .local patterns; allows normal hostnames |
+| Profile generation | 35 | Uses real `generate_profile()`; verifies deny-default, project access, sensitive dir/file blocks, network rules, deny-after-allow ordering, exec-from-tmp denied, env file deny/allow, copilot caches carve-outs, tool dir permissions, scratch dir rules |
+| Home tool dirs | 1 | All runtime entries present in `HOME_TOOL_DIRS` |
+| Env allowlist | 3 | Essential vars included, dangerous vars excluded, runtime vars present |
+| Env behavior | 12 | Sanitization, hardening injection, pass-env overrides, LANG prefix leak prevention, YARN hardening bypass prevention, scratch dir TMPDIR redirect |
+| Config parsing | 24 | TOML parsing, CLI/config merge precedence, tilde expansion, SBPL validation, scratch dir, allow-tmp-exec |
 
-### Integration Tests (macOS only)
+### Integration Tests (macOS only, 29 tests)
 
 These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-level enforcement**:
 
-| Test | Verifies |
+| Category | Tests | What's verified |
+|---|---|---|
+| File access | 5 | Project read/write, copilot config, temp write, process execution |
+| Sensitive dir blocks | 4 | `~/.ssh`, `~/.aws`, `~/.docker`, `~/.kube` blocked |
+| Network | 1 | Outbound connections blocked |
+| Binary CLI | 4 | Version, help, root/home dir rejection |
+| Tool dir permissions | 15 | Each HOME_TOOL_DIR has correct exec/map-exec/write at kernel level |
+
+### E2E Project Tests (macOS only, 18 tests)
+
+End-to-end tests using realistic project scaffolding (Node, Go, Python, Rust) with fake copilot scripts:
+
+| Category | Tests | What's verified |
+|---|---|---|
+| Per-language file ops | 4 | Read/write files in Node, Go, Python, Rust project structures |
+| Git workflows | 2 | git init/commit/status/diff/log, multi-step edit cycles |
+| Security matrix | 2 | Secret files blocked (.env, .pem, .key), home secrets (~/.ssh, ~/.aws) |
+| Mode combinations | 6 | allow-env-files, scratch-dir exec, deny-path, config file, deny-path + scratch-dir, allow-lifecycle-scripts |
+| Git persistence | 1 | Cannot write .git/hooks or .git/config |
+| Lifecycle scripts | 3 | npm/yarn/pnpm lifecycle script hardening |
+
+### Smoke Tests (macOS only, 6 tests, `#[ignore]`)
+
+Real Copilot CLI integration tests requiring authentication and network access:
+
+| Test | What's verified |
 |---|---|
-| `sandbox_allows_project_file_read` | Can read files in project directory |
-| `sandbox_allows_project_file_write` | Can write files in project directory |
-| `sandbox_allows_copilot_config` | Can access `~/.copilot` |
-| `sandbox_allows_temp_write` | Can write to `/tmp` |
-| `sandbox_allows_process_execution` | Can run child processes |
-| `sandbox_blocks_ssh_read` | **Cannot** read `~/.ssh` |
-| `sandbox_blocks_aws_read` | **Cannot** read `~/.aws` |
-| `sandbox_blocks_docker_read` | **Cannot** read `~/.docker` |
-| `sandbox_blocks_kube_read` | **Cannot** read `~/.kube` |
-| `sandbox_blocks_outbound_network` | **Cannot** make outbound connections |
-| `binary_shows_version` | Binary runs and shows version |
-| `binary_shows_help` | Binary shows help text |
-| `binary_rejects_root_project_dir` | Refuses `/` as project dir |
-| `binary_rejects_home_project_dir` | Refuses `$HOME` as project dir |
+| `smoke_copilot_version` | Copilot outputs version string inside sandbox |
+| `smoke_copilot_list_models` | API call returns model list (JSON) |
+| `smoke_copilot_simple_prompt` | Chat completion returns response containing UUID canary |
+| `smoke_copilot_file_context` | Copilot reads project file and references its content |
+| `smoke_copilot_write_file` | Copilot creates a new file on disk (side-effect assertion) |
+| `smoke_env_vars_denied` | `SUPER_SECRET_TOKEN` not visible inside sandbox |
 
 ### CI Pipeline
 

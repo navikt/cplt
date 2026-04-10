@@ -141,7 +141,7 @@ The project directory is the primary writable workspace, plus a narrow allowlist
 
 ### Environment variables
 
-By default, `cplt` sanitizes the child environment — only safe variables pass through (see `ENV_ALLOWLIST` in `sandbox.rs`). Cloud credentials, database URLs, and package tokens are stripped. Additionally, security hardening variables are injected to block npm/yarn/pnpm lifecycle scripts (postinstall hooks) — the #1 supply chain attack vector.
+By default, `cplt` sanitizes the child environment — only safe variables pass through (see `ENV_ALLOWLIST` in `sandbox_policy.rs`). Cloud credentials, database URLs, and package tokens are stripped. Additionally, security hardening variables are injected to block npm/yarn/pnpm lifecycle scripts (postinstall hooks) — the #1 supply chain attack vector.
 
 | Flag               | What it does                                                                                                                                            |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -263,10 +263,19 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 
 [sandbox]
 # validate = true
+# allow_env_files = false
+# allow_lifecycle_scripts = false
+# allow_localhost_any = false
+# scratch_dir = false
+# allow_tmp_exec = false       # Dangerous — prefer scratch_dir
+# inherit_env = false          # Dangerous — exposes all env vars
+# pass_env = ["MY_CUSTOM_VAR"]
 
 [allow]
 # read = ["~/some/path"]
 # write = ["~/another/path"]
+# ports = [8080]
+# localhost = [3000, 8080]
 
 [deny]
 # paths = ["~/extra/secret"]
