@@ -34,7 +34,7 @@ jobs:
           - target: aarch64-apple-darwin
             archive: tar.gz
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
@@ -63,7 +63,7 @@ jobs:
         with:
           subject-path: cplt-${{ matrix.target }}.${{ matrix.archive }}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.0
         with:
           name: cplt-${{ matrix.target }}
           path: cplt-${{ matrix.target }}.${{ matrix.archive }}
@@ -75,12 +75,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8.0.1
         with:
           path: artifacts
           merge-multiple: true
