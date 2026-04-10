@@ -75,14 +75,15 @@ pub fn build_sandbox_env(
         if disabled_categories.contains(&hvar.category) {
             continue;
         }
-        let user_has_set = if inherit_env {
-            // In inherit mode, check if user explicitly passed it via --pass-env
-            extra_pass_env.iter().any(|v| v == hvar.name)
-        } else {
-            // In sanitized mode, check if it ended up in our vars (via pass-env)
-            env.vars.iter().any(|(k, _)| k == hvar.name)
-        };
+        // Only skip hardening if the user *explicitly* requested it via --pass-env.
+        // In sanitized mode, prefix-matched vars (e.g. YARN_ENABLE_SCRIPTS from
+        // parent env via the YARN_ prefix) must NOT prevent hardening injection —
+        // otherwise a parent env setting silently bypasses security controls.
+        let user_has_set = extra_pass_env.iter().any(|v| v == hvar.name);
         if !user_has_set {
+            // Remove any prefix-matched value before injecting the hardened one.
+            // e.g. YARN_ENABLE_SCRIPTS=true from parent env must be replaced with false.
+            env.vars.retain(|(k, _)| k != hvar.name);
             env.vars
                 .push((hvar.name.to_string(), hvar.value.to_string()));
         }

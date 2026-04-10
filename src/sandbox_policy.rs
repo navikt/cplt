@@ -125,6 +125,9 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "PYTHONDONTWRITEBYTECODE", // Prevent .pyc writes (common in CI/sandboxed envs)
     // pnpm
     "PNPM_HOME", // pnpm binary location
+    // Locale
+    "LANG",
+    "LANGUAGE",
     // Editor
     "EDITOR",
     "VISUAL",
@@ -134,7 +137,6 @@ pub const ENV_ALLOWLIST: &[&str] = &[
 /// Environment variable prefixes safe to pass through.
 pub const ENV_PREFIX_ALLOWLIST: &[&str] = &[
     "LC_",       // Locale
-    "LANG",      // Locale (LANG, LANGUAGE)
     "COPILOT_",  // Copilot-specific config
     "COREPACK_", // Node.js Corepack (package manager manager)
     "MISE_",     // mise tool manager

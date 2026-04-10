@@ -1361,6 +1361,82 @@ fn env_sanitized_clears_first() {
     );
 }
 
+#[test]
+fn env_lang_prefix_does_not_leak_langchain_keys() {
+    // Regression: the LANG prefix in ENV_PREFIX_ALLOWLIST matched LANGCHAIN_API_KEY,
+    // LANGFUSE_SECRET_KEY, LANGSMITH_API_KEY — leaking AI/ML API keys.
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        ("LANG", "en_US.UTF-8"),
+        ("LANGUAGE", "en"),
+        ("LANGCHAIN_API_KEY", "sk-secret-langchain"),
+        ("LANGFUSE_SECRET_KEY", "sk-secret-langfuse"),
+        ("LANGSMITH_API_KEY", "sk-secret-langsmith"),
+    ]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
+
+    // LANG and LANGUAGE should pass through (explicit allowlist)
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "LANG"),
+        "LANG should be in the sanitized env"
+    );
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "LANGUAGE"),
+        "LANGUAGE should be in the sanitized env"
+    );
+
+    // LANGCHAIN/LANGFUSE/LANGSMITH keys must NOT leak
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "LANGCHAIN_API_KEY"),
+        "LANGCHAIN_API_KEY must not leak through LANG prefix"
+    );
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "LANGFUSE_SECRET_KEY"),
+        "LANGFUSE_SECRET_KEY must not leak through LANG prefix"
+    );
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "LANGSMITH_API_KEY"),
+        "LANGSMITH_API_KEY must not leak through LANG prefix"
+    );
+}
+
+#[test]
+fn env_yarn_prefix_does_not_bypass_hardening() {
+    // Regression: YARN_ENABLE_SCRIPTS=true from parent env passed through via
+    // the YARN_ prefix, then prevented hardening injection because the var was
+    // already present in env.vars.
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        ("YARN_ENABLE_SCRIPTS", "true"),
+        ("YARN_CACHE_FOLDER", "/some/cache"),
+    ]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
+
+    // YARN_ENABLE_SCRIPTS must be overridden to "false" by hardening
+    let yarn: Vec<_> = env
+        .vars
+        .iter()
+        .filter(|(k, _)| k == "YARN_ENABLE_SCRIPTS")
+        .collect();
+    assert_eq!(
+        yarn.len(),
+        1,
+        "should have exactly one YARN_ENABLE_SCRIPTS (no duplicates)"
+    );
+    assert_eq!(
+        yarn[0].1, "false",
+        "hardening must override parent's YARN_ENABLE_SCRIPTS=true to false"
+    );
+
+    // Other YARN_ vars should still pass through
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "YARN_CACHE_FOLDER"),
+        "non-hardening YARN_ vars should pass through"
+    );
+}
+
 // ============================================================
 // Scratch dir SBPL rules
 // ============================================================
