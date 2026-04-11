@@ -33,6 +33,9 @@ EXAMPLES:
 
   cplt --deny-path ~/.config/gh -- -p \"refactor auth\"
     Block access to a path that is normally allowed
+
+  eval \"$(cplt --shell-setup)\"
+    Add to your shell rc so 'copilot' runs the sandboxed version
 "
 )]
 struct Cli {
@@ -176,6 +179,12 @@ struct Cli {
     #[arg(long)]
     init_config: bool,
 
+    /// Print shell setup code for your shell rc file.
+    /// Usage: eval "$(cplt --shell-setup)"
+    /// Creates a 'copilot' alias that transparently runs cplt.
+    #[arg(long)]
+    shell_setup: bool,
+
     /// Run environment diagnostics and report what the sandbox will do.
     /// Checks auth mechanisms, Copilot CLI install, tool availability,
     /// and sandbox-critical paths. Exits 0 if all critical checks pass.
@@ -281,6 +290,12 @@ fn main() -> ExitCode {
     // Handle --init-config
     if cli.init_config {
         return init_config();
+    }
+
+    // Handle --shell-setup: print alias definition and exit
+    if cli.shell_setup {
+        println!("alias copilot=cplt");
+        return ExitCode::SUCCESS;
     }
 
     // macOS only

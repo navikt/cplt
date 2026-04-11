@@ -1348,4 +1348,16 @@ mod e2e_tests {
             "error should mention Copilot CLI not found.\nstderr: {stderr}"
         );
     }
+
+    #[test]
+    fn e2e_shell_setup_prints_alias() {
+        let output = Command::new(binary_path())
+            .arg("--shell-setup")
+            .output()
+            .expect("binary should run");
+
+        assert!(output.status.success(), "cplt --shell-setup should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "alias copilot=cplt");
+    }
 }
