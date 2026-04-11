@@ -622,20 +622,15 @@ fn main() -> ExitCode {
             resolved.proxy_port
         ));
 
-        match proxy::start(resolved.proxy_port, blocked_file) {
+        match proxy::start(resolved.proxy_port, blocked_file, &resolved.allow_ports) {
             Ok(handle) => {
                 ok(&format!(
                     "Proxy running on localhost:{} (thread)",
                     resolved.proxy_port
                 ));
                 proxy_handle = Some(handle);
-                // NOTE: We intentionally do NOT set http_proxy/https_proxy env vars.
-                // Node.js (used by Copilot CLI) doesn't natively respect these,
-                // and libraries that do (global-agent) can interfere with Copilot's
-                // own HTTP client, causing auth failures with api.githubcopilot.com.
-                // The proxy runs as a passive listener — tools like `gh` (Go) that
-                // natively respect http_proxy can be configured separately if needed.
-                // The sandbox's filesystem protection is the primary security control.
+                // Proxy env vars (NODE_USE_ENV_PROXY, HTTP_PROXY, HTTPS_PROXY) are
+                // injected by sandbox_exec::exec() when proxy_port is Some.
             }
             Err(e) => {
                 error(&format!("Failed to start proxy: {e}"));
@@ -728,6 +723,11 @@ fn main() -> ExitCode {
         resolved.inherit_env,
         &disabled_categories,
         scratch_path,
+        if resolved.with_proxy {
+            Some(resolved.proxy_port)
+        } else {
+            None
+        },
     );
 
     // Cleanup

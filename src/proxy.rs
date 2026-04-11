@@ -27,7 +27,19 @@ impl ProxyHandle {
 }
 
 /// Start the proxy on a background thread. Returns a handle for shutdown.
-pub fn start(port: u16, blocked_file: PathBuf) -> Result<ProxyHandle, String> {
+///
+/// `allowed_ports` controls which remote ports CONNECT tunnels can reach.
+/// Port 443 is always allowed. Additional ports come from `--allow-port`.
+pub fn start(
+    port: u16,
+    blocked_file: PathBuf,
+    allowed_ports: &[u16],
+) -> Result<ProxyHandle, String> {
+    let mut ports: Vec<u16> = vec![443];
+    ports.extend_from_slice(allowed_ports);
+    ports.sort_unstable();
+    ports.dedup();
+    let allowed_ports = Arc::new(ports);
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr).map_err(|e| format!("Cannot bind to {addr}: {e}"))?;
 
@@ -52,7 +64,7 @@ pub fn start(port: u16, blocked_file: PathBuf) -> Result<ProxyHandle, String> {
     std::thread::Builder::new()
         .name("proxy-accept".into())
         .spawn(move || {
-            accept_loop(listener, flag, blocked_file, active_count);
+            accept_loop(listener, flag, blocked_file, active_count, allowed_ports);
         })
         .map_err(|e| format!("spawn proxy thread: {e}"))?;
 
@@ -66,6 +78,7 @@ fn accept_loop(
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     blocked_file: PathBuf,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
+    allowed_ports: Arc<Vec<u16>>,
 ) {
     // Non-blocking accept with periodic shutdown check
     listener.set_nonblocking(true).ok();
@@ -95,11 +108,12 @@ fn accept_loop(
         active_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let blocked = blocked_file.clone();
         let counter = active_count.clone();
+        let ports = allowed_ports.clone();
 
         if let Err(e) = std::thread::Builder::new()
             .name("proxy-conn".into())
             .spawn(move || {
-                handle_connection(stream, &blocked);
+                handle_connection(stream, &blocked, &ports);
                 counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             })
         {
@@ -109,7 +123,7 @@ fn accept_loop(
     }
 }
 
-fn handle_connection(mut client: TcpStream, blocked_file: &PathBuf) {
+fn handle_connection(mut client: TcpStream, blocked_file: &PathBuf, allowed_ports: &[u16]) {
     client.set_read_timeout(Some(READ_TIMEOUT)).ok();
     client.set_write_timeout(Some(READ_TIMEOUT)).ok();
 
@@ -134,7 +148,7 @@ fn handle_connection(mut client: TcpStream, blocked_file: &PathBuf) {
     let target = parts[1];
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect(client, target, blocked_file);
+        handle_connect(client, target, blocked_file, allowed_ports);
     } else {
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
@@ -143,12 +157,26 @@ fn handle_connection(mut client: TcpStream, blocked_file: &PathBuf) {
     }
 }
 
-fn handle_connect(mut client: TcpStream, target: &str, blocked_file: &PathBuf) {
+fn handle_connect(
+    mut client: TcpStream,
+    target: &str,
+    blocked_file: &PathBuf,
+    allowed_ports: &[u16],
+) {
     // Parse host:port
     let (host, port) = match target.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(443)),
         None => (target.to_string(), 443),
     };
+
+    // Enforce port policy — only allow ports matching the sandbox network rules.
+    // Without this, the proxy would let sandboxed processes tunnel to arbitrary
+    // remote ports, bypassing the sandbox's port restrictions.
+    if !allowed_ports.contains(&port) {
+        log_connection("CONNECT", target, "BLOCKED-PORT");
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPort not allowed\r\n");
+        return;
+    }
 
     // Check blocklist (hostname-level)
     if is_blocked(&host, blocked_file) {

@@ -41,6 +41,7 @@ pub fn exec(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     scratch_dir: Option<&Path>,
+    proxy_port: Option<u16>,
 ) -> u8 {
     let mut cmd = std::process::Command::new("sandbox-exec");
     cmd.arg("-f").arg(profile_path).arg(copilot_bin);
@@ -83,6 +84,23 @@ pub fn exec(
     // Recursion guard: if copilot somehow re-invokes cplt (e.g. via symlink),
     // cplt will see this and bail before launching another sandbox.
     cmd.env("__CPLT_WRAPPED", "1");
+
+    // When proxy is enabled, tell Node.js (bundled in Copilot CLI) to route
+    // traffic through our CONNECT proxy. NODE_USE_ENV_PROXY is required for
+    // Node.js ≥24.5.0 to honor HTTP_PROXY/HTTPS_PROXY natively.
+    // Both cases are set for compatibility with non-Node tools (curl, gh, etc).
+    if let Some(port) = proxy_port {
+        let proxy_url = format!("http://127.0.0.1:{port}");
+        cmd.env("NODE_USE_ENV_PROXY", "1");
+        cmd.env("HTTP_PROXY", &proxy_url);
+        cmd.env("HTTPS_PROXY", &proxy_url);
+        cmd.env("http_proxy", &proxy_url);
+        cmd.env("https_proxy", &proxy_url);
+        // Exclude loopback from proxying — MCP servers, dev servers, etc.
+        // on localhost should connect directly, not through our CONNECT proxy.
+        cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+        cmd.env("no_proxy", "localhost,127.0.0.1,::1");
+    }
 
     // Child inherits our process group — terminal signals (Ctrl+C)
     // reach both parent and child naturally. No setpgid/tcsetpgrp needed.
