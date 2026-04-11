@@ -91,6 +91,30 @@ pub(super) const TOOL_READ_DIRS: &[&str] = &[
     "/Library/Developer/CommandLineTools",
 ];
 
+/// Suffixes of env var names that indicate secrets/credentials.
+/// Vars matching a prefix allowlist entry BUT also matching one of these
+/// suffixes are stripped — deny wins. Prevents `YARN_NPM_AUTH_TOKEN`,
+/// `COPILOT_SECRET_KEY`, etc. from leaking through broad prefix rules.
+const ENV_PREFIX_DENY_SUFFIXES: &[&str] = &[
+    "_TOKEN",
+    "_AUTH",
+    "_SECRET",
+    "_SECRET_KEY",
+    "_KEY",
+    "_PASSWORD",
+    "_CREDENTIALS",
+];
+
+/// Check if a var name looks like a secret based on its suffix.
+/// Vars in the explicit `ENV_ALLOWLIST` (e.g. `GH_TOKEN`) bypass this check
+/// because they are intentionally allowed.
+pub(super) fn is_secret_suffix(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ENV_PREFIX_DENY_SUFFIXES
+        .iter()
+        .any(|suffix| upper.ends_with(suffix))
+}
+
 /// Environment variables safe to pass through to the sandboxed process.
 /// Deliberately excludes cloud credentials (AWS_*, AZURE_*), CI tokens,
 /// npm/pip tokens, database URLs, and other secrets.

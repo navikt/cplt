@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::policy::{
     ENV_ALLOWLIST, ENV_ALWAYS_DENY, ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HardeningCategory,
-    SCRATCH_DIR_ENV_VARS,
+    SCRATCH_DIR_ENV_VARS, is_secret_suffix,
 };
 
 /// Environment configuration for the sandboxed process.
@@ -53,6 +53,7 @@ pub fn build_sandbox_env(
             if ENV_PREFIX_ALLOWLIST
                 .iter()
                 .any(|prefix| key.starts_with(prefix))
+                && !is_secret_suffix(key)
             {
                 // Avoid duplicates from the explicit allowlist
                 if !env.vars.iter().any(|(k, _)| k == key) {

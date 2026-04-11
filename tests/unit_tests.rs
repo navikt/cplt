@@ -1475,6 +1475,109 @@ fn env_yarn_prefix_does_not_bypass_hardening() {
     );
 }
 
+#[test]
+fn env_prefix_denies_secret_suffixes() {
+    // YARN_NPM_AUTH_TOKEN, COPILOT_SECRET_KEY, etc. must NOT leak
+    // through the prefix allowlist even though YARN_ and COPILOT_ are allowed.
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        // YARN_ prefix — config vars should pass, auth tokens should not
+        ("YARN_CACHE_FOLDER", "/some/cache"),
+        ("YARN_NPM_AUTH_TOKEN", "npm_secret_token_123"),
+        ("YARN_NPM_AUTH_TYPE", "authToken"),
+        // COPILOT_ prefix — config vars should pass, secrets should not
+        ("COPILOT_DEBUG", "1"),
+        ("COPILOT_SECRET_KEY", "sk-secret-copilot"),
+        ("COPILOT_API_KEY", "key-secret"),
+        // NVM_ prefix — dir should pass, hypothetical token should not
+        ("NVM_DIR", "/Users/test/.nvm"),
+        ("NVM_AUTH_TOKEN", "nvm-secret"),
+        // MISE_ prefix
+        ("MISE_ENV", "production"),
+        ("MISE_TOKEN", "mise-secret"),
+        // SDKMAN_ prefix
+        ("SDKMAN_DIR", "/Users/test/.sdkman"),
+        ("SDKMAN_CREDENTIALS", "sdk-secret"),
+    ]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
+
+    // Safe config vars must pass through
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "YARN_CACHE_FOLDER"),
+        "YARN_CACHE_FOLDER should pass through"
+    );
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "COPILOT_DEBUG"),
+        "COPILOT_DEBUG should pass through"
+    );
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "NVM_DIR"),
+        "NVM_DIR should pass through"
+    );
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "MISE_ENV"),
+        "MISE_ENV should pass through"
+    );
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "SDKMAN_DIR"),
+        "SDKMAN_DIR should pass through"
+    );
+
+    // Secret-bearing vars must be blocked
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "YARN_NPM_AUTH_TOKEN"),
+        "YARN_NPM_AUTH_TOKEN must not leak through YARN_ prefix"
+    );
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "COPILOT_SECRET_KEY"),
+        "COPILOT_SECRET_KEY must not leak through COPILOT_ prefix"
+    );
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "COPILOT_API_KEY"),
+        "COPILOT_API_KEY must not leak through COPILOT_ prefix"
+    );
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "NVM_AUTH_TOKEN"),
+        "NVM_AUTH_TOKEN must not leak through NVM_ prefix"
+    );
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "MISE_TOKEN"),
+        "MISE_TOKEN must not leak through MISE_ prefix"
+    );
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "SDKMAN_CREDENTIALS"),
+        "SDKMAN_CREDENTIALS must not leak through SDKMAN_ prefix"
+    );
+}
+
+#[test]
+fn env_explicit_allowlist_bypasses_suffix_deny() {
+    // GH_TOKEN and GITHUB_TOKEN are in the explicit ENV_ALLOWLIST and must pass
+    // through even though they end in _TOKEN.
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        ("GH_TOKEN", "ghp_abc123"),
+        ("GITHUB_TOKEN", "ghp_def456"),
+        ("COPILOT_GITHUB_TOKEN", "ghp_ghi789"),
+    ]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
+
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "GH_TOKEN"),
+        "GH_TOKEN is explicitly allowlisted and must pass through"
+    );
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "GITHUB_TOKEN"),
+        "GITHUB_TOKEN is explicitly allowlisted and must pass through"
+    );
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "COPILOT_GITHUB_TOKEN"),
+        "COPILOT_GITHUB_TOKEN is explicitly allowlisted and must pass through"
+    );
+}
+
 // ============================================================
 // Scratch dir SBPL rules
 // ============================================================
