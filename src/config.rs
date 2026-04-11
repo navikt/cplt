@@ -33,6 +33,10 @@ pub struct ProxyConfig {
     pub port: Option<u16>,
     /// Path to blocked domains file.
     pub blocked_domains: Option<String>,
+    /// Path to allowed domains file. When set, only listed domains are permitted.
+    pub allowed_domains: Option<String>,
+    /// Path to write proxy audit log (one line per CONNECT).
+    pub log_file: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -87,6 +91,8 @@ pub struct Resolved {
     pub with_proxy: bool,
     pub proxy_port: u16,
     pub blocked_domains: Option<PathBuf>,
+    pub allowed_domains: Option<PathBuf>,
+    pub proxy_log_file: Option<PathBuf>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
     pub deny_paths: Vec<PathBuf>,
@@ -112,6 +118,8 @@ pub struct CliFlags {
     pub no_proxy: bool,
     pub proxy_port: Option<u16>,
     pub blocked_domains: Option<PathBuf>,
+    pub allowed_domains: Option<PathBuf>,
+    pub proxy_log_file: Option<PathBuf>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
     pub deny_paths: Vec<PathBuf>,
@@ -177,6 +185,16 @@ impl Config {
         let blocked_domains = cli
             .blocked_domains
             .or_else(|| self.proxy.blocked_domains.as_ref().map(|s| expand_tilde(s)));
+
+        // Allowed domains: CLI > config
+        let allowed_domains = cli
+            .allowed_domains
+            .or_else(|| self.proxy.allowed_domains.as_ref().map(|s| expand_tilde(s)));
+
+        // Proxy log file: CLI > config
+        let proxy_log_file = cli
+            .proxy_log_file
+            .or_else(|| self.proxy.log_file.as_ref().map(|s| expand_tilde(s)));
 
         // Allow-read: merge config + CLI
         let config_dir = config_path().and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -300,6 +318,8 @@ impl Config {
             with_proxy,
             proxy_port,
             blocked_domains,
+            allowed_domains,
+            proxy_log_file,
             allow_read,
             allow_write,
             deny_paths,
@@ -449,6 +469,17 @@ impl Resolved {
                 "{blue}[cplt]{nc}    Proxy:         {green}on{nc}          {dim}localhost:{}{nc}",
                 self.proxy_port
             );
+            if self.allowed_domains.is_some() {
+                eprintln!(
+                    "{blue}[cplt]{nc}    Allowlist:     {green}on{nc}          {dim}only listed domains{nc}"
+                );
+            }
+            if let Some(ref lf) = self.proxy_log_file {
+                eprintln!(
+                    "{blue}[cplt]{nc}    Audit log:     {green}on{nc}          {dim}{}{nc}",
+                    lf.display()
+                );
+            }
         } else {
             eprintln!("{blue}[cplt]{nc}    Proxy:         off         {dim}direct connections{nc}");
         }
@@ -524,6 +555,8 @@ pub fn default_config_contents() -> String {
 # enabled = false
 # port = 18080
 # blocked_domains = "~/.config/cplt/blocked-domains.txt"
+# allowed_domains = "~/.config/cplt/allowed-domains.txt"
+# log_file = "~/.config/cplt/proxy.log"
 
 # ─── Allowed paths ──────────────────────────────────────────
 # Additional paths the sandboxed process may access.

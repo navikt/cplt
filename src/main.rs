@@ -69,6 +69,17 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     blocked_domains: Option<PathBuf>,
 
+    /// File with domains to allow (one per line). When set, the proxy
+    /// only permits connections to listed domains — everything else is
+    /// blocked. Blocklist still applies on top. Parsed at startup.
+    #[arg(long, value_name = "FILE")]
+    allowed_domains: Option<PathBuf>,
+
+    /// Write proxy connection log to a file (one line per CONNECT).
+    /// Useful for post-session audit. File is created if it doesn't exist.
+    #[arg(long, value_name = "FILE")]
+    proxy_log: Option<PathBuf>,
+
     /// Let Copilot read files outside the project directory.
     /// Use this when Copilot needs to reference shared libraries,
     /// monorepo siblings, or documentation stored elsewhere.
@@ -373,6 +384,8 @@ fn main() -> ExitCode {
         no_proxy: cli.no_proxy,
         proxy_port: cli.proxy_port,
         blocked_domains: cli.blocked_domains.clone(),
+        allowed_domains: cli.allowed_domains.clone(),
+        proxy_log_file: cli.proxy_log.clone(),
         allow_read: cli_allow_read,
         allow_write: cli_allow_write,
         deny_paths: cli_deny_paths,
@@ -616,12 +629,37 @@ fn main() -> ExitCode {
             PathBuf::from("/dev/null/no-blocklist")
         });
 
+        // Parse domain allowlist at startup (fail-closed: startup error if unreadable)
+        let allowed_domains = match &resolved.allowed_domains {
+            Some(path) => match proxy::parse_domain_file(path) {
+                Ok(domains) => {
+                    info(&format!(
+                        "Domain allowlist: {} domains from {}",
+                        domains.len(),
+                        path.display()
+                    ));
+                    domains
+                }
+                Err(e) => {
+                    error(&format!("Failed to load allowed domains: {e}"));
+                    return ExitCode::FAILURE;
+                }
+            },
+            None => Vec::new(),
+        };
+
         info(&format!(
             "Starting proxy on localhost:{} ...",
             resolved.proxy_port
         ));
 
-        match proxy::start(resolved.proxy_port, blocked_file, &resolved.allow_ports) {
+        match proxy::start(proxy::ProxyOptions {
+            port: resolved.proxy_port,
+            blocked_file,
+            allowed_ports: resolved.allow_ports.clone(),
+            allowed_domains,
+            log_file: resolved.proxy_log_file.clone(),
+        }) {
             Ok(handle) => {
                 ok(&format!(
                     "Proxy running on localhost:{} (thread)",

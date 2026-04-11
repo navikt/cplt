@@ -1016,4 +1016,86 @@ if [ -z "${HTTPS_PROXY:-}" ]; then echo "RESULT:no_https_proxy:OK"; else echo "R
         assert_result_ok(&stdout, "no_http_proxy");
         assert_result_ok(&stdout, "no_https_proxy");
     }
+
+    #[test]
+    fn project_proxy_allowlist_blocks_unlisted() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let port = 19700 + (std::process::id() % 300) as u16;
+
+        // Create an allowlist with only one domain
+        let allowlist_path = project.path().join("allowed-domains.txt");
+        std::fs::write(&allowlist_path, "only-this.example.com\n").unwrap();
+
+        // Try to CONNECT to a domain NOT in the allowlist
+        let script = format!(
+            r#"
+RESP=$(printf 'CONNECT blocked.example.com:443 HTTP/1.1\r\nHost: blocked.example.com:443\r\n\r\n' | nc -w 2 127.0.0.1 {port} 2>/dev/null | head -1)
+if echo "$RESP" | grep -q "403"; then echo "RESULT:blocked_unlisted:OK"; else echo "RESULT:blocked_unlisted:FAIL:$RESP"; fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(
+            &project,
+            &fake_dir,
+            &[
+                "--with-proxy",
+                "--proxy-port",
+                &port.to_string(),
+                "--allowed-domains",
+                &allowlist_path.to_string_lossy(),
+            ],
+        );
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "blocked_unlisted");
+    }
+
+    #[test]
+    fn project_proxy_audit_log_written() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let port = 19800 + (std::process::id() % 200) as u16;
+        let log_path = project.path().join("proxy-audit.log");
+
+        // Send a CONNECT through the proxy to generate a log entry
+        let script = format!(
+            r#"
+printf 'CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n' | nc -w 2 127.0.0.1 {port} 2>/dev/null >/dev/null
+echo "RESULT:sent:OK"
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(
+            &project,
+            &fake_dir,
+            &[
+                "--with-proxy",
+                "--proxy-port",
+                &port.to_string(),
+                "--proxy-log",
+                &log_path.to_string_lossy(),
+            ],
+        );
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "sent");
+
+        let log_contents = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|e| panic!("Audit log should exist at {}: {e}", log_path.display()));
+        assert!(
+            log_contents.contains("example.com:80"),
+            "Audit log should contain the target.\nlog:\n{log_contents}"
+        );
+        assert!(
+            log_contents.contains("BLOCKED-PORT"),
+            "Port 80 should be blocked.\nlog:\n{log_contents}"
+        );
+    }
 }

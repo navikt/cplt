@@ -4,7 +4,7 @@
 //! so they run on any platform (Linux CI, macOS, etc.).
 
 use cplt::is_unsafe_root;
-use cplt::proxy::{is_blocked_in_content, is_private_hostname, is_private_ip};
+use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
     HardeningCategory, ProfileOptions, build_sandbox_env, generate_profile, validate_sbpl_path,
 };
@@ -136,6 +136,71 @@ fn case_insensitive_blocking() {
 fn empty_blocklist_blocks_nothing() {
     assert!(!is_blocked_in_content("evil.com", ""));
     assert!(!is_blocked_in_content("anything.org", "# only comments\n"));
+}
+
+#[test]
+fn trailing_dot_normalized_in_blocklist() {
+    let blocklist = "evil.com\n";
+    assert!(is_blocked_in_content("evil.com.", blocklist));
+    assert!(is_blocked_in_content("sub.evil.com.", blocklist));
+}
+
+#[test]
+fn trailing_dot_in_blocklist_pattern() {
+    let blocklist = "evil.com.\n";
+    assert!(is_blocked_in_content("evil.com", blocklist));
+    assert!(is_blocked_in_content("evil.com.", blocklist));
+}
+
+// ============================================================
+// Domain allowlist matching
+// ============================================================
+
+#[test]
+fn allowlist_exact_match() {
+    let domains = vec![
+        "api.github.com".to_string(),
+        "copilot.github.com".to_string(),
+    ];
+    assert!(is_domain_match("api.github.com", &domains));
+    assert!(is_domain_match("copilot.github.com", &domains));
+    assert!(!is_domain_match("evil.com", &domains));
+}
+
+#[test]
+fn allowlist_subdomain_match() {
+    let domains = vec!["github.com".to_string()];
+    assert!(is_domain_match("api.github.com", &domains));
+    assert!(is_domain_match("api.business.github.com", &domains));
+    assert!(!is_domain_match("notgithub.com", &domains));
+}
+
+#[test]
+fn allowlist_case_insensitive() {
+    let domains = vec!["api.github.com".to_string()];
+    assert!(is_domain_match("API.GITHUB.COM", &domains));
+    assert!(is_domain_match("Api.GitHub.Com", &domains));
+}
+
+#[test]
+fn allowlist_trailing_dot_normalized() {
+    let domains = vec!["api.github.com".to_string()];
+    assert!(is_domain_match("api.github.com.", &domains));
+}
+
+#[test]
+fn allowlist_empty_allows_nothing() {
+    let domains: Vec<String> = vec![];
+    // Empty allowlist check is done in handle_connect (short-circuit),
+    // but is_domain_match itself returns false for empty list.
+    assert!(!is_domain_match("anything.com", &domains));
+}
+
+#[test]
+fn allowlist_no_partial_match() {
+    let domains = vec!["github.com".to_string()];
+    assert!(!is_domain_match("mygithub.com", &domains));
+    assert!(!is_domain_match("github.com.evil.org", &domains));
 }
 
 // ============================================================

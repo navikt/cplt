@@ -26,32 +26,52 @@ impl ProxyHandle {
     }
 }
 
+/// Bundled proxy startup options.
+pub struct ProxyOptions {
+    pub port: u16,
+    pub blocked_file: PathBuf,
+    pub allowed_ports: Vec<u16>,
+    /// Parsed allowlist domains (already validated). When non-empty,
+    /// only matching domains are permitted through the proxy.
+    pub allowed_domains: Vec<String>,
+    /// Path to append audit log lines. None = no file logging.
+    pub log_file: Option<PathBuf>,
+}
+
 /// Start the proxy on a background thread. Returns a handle for shutdown.
 ///
 /// `allowed_ports` controls which remote ports CONNECT tunnels can reach.
 /// Port 443 is always allowed. Additional ports come from `--allow-port`.
-pub fn start(
-    port: u16,
-    blocked_file: PathBuf,
-    allowed_ports: &[u16],
-) -> Result<ProxyHandle, String> {
+pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
     let mut ports: Vec<u16> = vec![443];
-    ports.extend_from_slice(allowed_ports);
+    ports.extend_from_slice(&opts.allowed_ports);
     ports.sort_unstable();
     ports.dedup();
     let allowed_ports = Arc::new(ports);
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("127.0.0.1:{}", opts.port);
     let listener = TcpListener::bind(&addr).map_err(|e| format!("Cannot bind to {addr}: {e}"))?;
 
     // Validate blocklist is readable at startup (fail-fast, not fail-open)
-    if blocked_file.exists() {
-        std::fs::read_to_string(&blocked_file).map_err(|e| {
+    if opts.blocked_file.exists() {
+        std::fs::read_to_string(&opts.blocked_file).map_err(|e| {
             format!(
                 "Cannot read blocked domains file {}: {e}",
-                blocked_file.display()
+                opts.blocked_file.display()
             )
         })?;
     }
+
+    // Validate log file is writable at startup
+    if let Some(ref log_path) = opts.log_file {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .map_err(|e| format!("Cannot open proxy log file {}: {e}", log_path.display()))?;
+    }
+
+    let allowed_domains = Arc::new(opts.allowed_domains);
+    let log_file = opts.log_file.map(Arc::new);
 
     listener
         .set_nonblocking(false)
@@ -64,7 +84,15 @@ pub fn start(
     std::thread::Builder::new()
         .name("proxy-accept".into())
         .spawn(move || {
-            accept_loop(listener, flag, blocked_file, active_count, allowed_ports);
+            accept_loop(
+                listener,
+                flag,
+                opts.blocked_file,
+                active_count,
+                allowed_ports,
+                allowed_domains,
+                log_file,
+            );
         })
         .map_err(|e| format!("spawn proxy thread: {e}"))?;
 
@@ -79,6 +107,8 @@ fn accept_loop(
     blocked_file: PathBuf,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     allowed_ports: Arc<Vec<u16>>,
+    allowed_domains: Arc<Vec<String>>,
+    log_file: Option<Arc<PathBuf>>,
 ) {
     // Non-blocking accept with periodic shutdown check
     listener.set_nonblocking(true).ok();
@@ -105,7 +135,7 @@ fn accept_loop(
         // Connection limit
         let count = active_count.load(std::sync::atomic::Ordering::SeqCst);
         if count >= MAX_CONNECTIONS {
-            log_connection("REJECT", "connection limit", "LIMIT");
+            log_connection("REJECT", "connection limit", "LIMIT", log_file.as_deref());
             drop(stream);
             continue;
         }
@@ -114,21 +144,34 @@ fn accept_loop(
         let blocked = blocked_file.clone();
         let counter = active_count.clone();
         let ports = allowed_ports.clone();
+        let domains = allowed_domains.clone();
+        let lf = log_file.clone();
 
         if let Err(e) = std::thread::Builder::new()
             .name("proxy-conn".into())
             .spawn(move || {
-                handle_connection(stream, &blocked, &ports);
+                handle_connection(stream, &blocked, &ports, &domains, lf.as_deref());
                 counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             })
         {
             active_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            log_connection("INTERNAL", "thread-spawn", &format!("FAIL:{e}"));
+            log_connection(
+                "INTERNAL",
+                "thread-spawn",
+                &format!("FAIL:{e}"),
+                log_file.as_deref(),
+            );
         }
     }
 }
 
-fn handle_connection(mut client: TcpStream, blocked_file: &PathBuf, allowed_ports: &[u16]) {
+fn handle_connection(
+    mut client: TcpStream,
+    blocked_file: &PathBuf,
+    allowed_ports: &[u16],
+    allowed_domains: &[String],
+    log_file: Option<&PathBuf>,
+) {
     client.set_read_timeout(Some(READ_TIMEOUT)).ok();
     client.set_write_timeout(Some(READ_TIMEOUT)).ok();
 
@@ -153,11 +196,18 @@ fn handle_connection(mut client: TcpStream, blocked_file: &PathBuf, allowed_port
     let target = parts[1];
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect(client, target, blocked_file, allowed_ports);
+        handle_connect(
+            client,
+            target,
+            blocked_file,
+            allowed_ports,
+            allowed_domains,
+            log_file,
+        );
     } else {
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
-        log_connection(method, target, "UNSUPPORTED");
+        log_connection(method, target, "UNSUPPORTED", log_file);
         let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
     }
 }
@@ -167,6 +217,8 @@ fn handle_connect(
     target: &str,
     blocked_file: &PathBuf,
     allowed_ports: &[u16],
+    allowed_domains: &[String],
+    log_file: Option<&PathBuf>,
 ) {
     // Parse host:port
     let (host, port) = match target.rsplit_once(':') {
@@ -174,25 +226,37 @@ fn handle_connect(
         None => (target.to_string(), 443),
     };
 
+    // Normalize hostname: lowercase, strip trailing dot (valid DNS but
+    // would bypass exact-match rules otherwise).
+    let host = normalize_hostname(&host);
+
     // Enforce port policy — only allow ports matching the sandbox network rules.
     // Without this, the proxy would let sandboxed processes tunnel to arbitrary
     // remote ports, bypassing the sandbox's port restrictions.
     if !allowed_ports.contains(&port) {
-        log_connection("CONNECT", target, "BLOCKED-PORT");
+        log_connection("CONNECT", target, "BLOCKED-PORT", log_file);
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPort not allowed\r\n");
+        return;
+    }
+
+    // Enforce domain allowlist — when configured, only listed domains pass.
+    // Fail-closed: if the allowlist is non-empty and the domain isn't in it, deny.
+    if !allowed_domains.is_empty() && !is_domain_match(&host, allowed_domains) {
+        log_connection("CONNECT", target, "BLOCKED-ALLOWLIST", log_file);
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist\r\n");
         return;
     }
 
     // Check blocklist (hostname-level)
     if is_blocked(&host, blocked_file) {
-        log_connection("CONNECT", target, "BLOCKED");
+        log_connection("CONNECT", target, "BLOCKED", log_file);
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n");
         return;
     }
 
     // Reject hostname patterns that are known private (fast path before DNS)
     if is_private_hostname(&host) {
-        log_connection("CONNECT", target, "BLOCKED-PRIVATE");
+        log_connection("CONNECT", target, "BLOCKED-PRIVATE", log_file);
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked\r\n");
         return;
     }
@@ -203,13 +267,13 @@ fn handle_connect(
         Ok(mut addrs) => match addrs.next() {
             Some(a) => a,
             None => {
-                log_connection("CONNECT", target, "DNS-FAIL");
+                log_connection("CONNECT", target, "DNS-FAIL", log_file);
                 let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
                 return;
             }
         },
         Err(_) => {
-            log_connection("CONNECT", target, "DNS-FAIL");
+            log_connection("CONNECT", target, "DNS-FAIL", log_file);
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
@@ -217,12 +281,10 @@ fn handle_connect(
 
     // Check the RESOLVED IP address (prevents DNS rebinding attacks)
     if is_private_ip(&socket_addr.ip()) {
-        log_connection("CONNECT", target, "BLOCKED-PRIVATE-RESOLVED");
+        log_connection("CONNECT", target, "BLOCKED-PRIVATE-RESOLVED", log_file);
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to private IP\r\n");
         return;
     }
-
-    log_connection("CONNECT", target, "OK");
 
     // Connect to resolved address (not re-resolving)
     let remote = match TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT) {
@@ -231,11 +293,14 @@ fn handle_connect(
             s
         }
         Err(e) => {
-            log_connection("CONNECT", target, &format!("FAIL:{e}"));
+            log_connection("CONNECT", target, &format!("CONNECT-FAIL:{e}"), log_file);
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
     };
+
+    // Log after TCP connect succeeds — this is the audit-relevant event.
+    log_connection("CONNECT", target, "CONNECTED", log_file);
 
     // Send 200 to client
     if client
@@ -320,17 +385,48 @@ pub fn is_blocked(hostname: &str, blocked_file: &PathBuf) -> bool {
 }
 
 pub fn is_blocked_in_content(hostname: &str, contents: &str) -> bool {
-    let host = hostname.to_lowercase();
+    let host = normalize_hostname(hostname);
     for line in contents.lines() {
         let pattern = line.trim().to_lowercase();
         if pattern.is_empty() || pattern.starts_with('#') {
             continue;
         }
+        let pattern = pattern.trim_end_matches('.');
         if host == pattern || host.ends_with(&format!(".{pattern}")) {
             return true;
         }
     }
     false
+}
+
+/// Normalize a hostname for consistent matching: lowercase, strip trailing dot.
+fn normalize_hostname(host: &str) -> String {
+    host.to_lowercase().trim_end_matches('.').to_string()
+}
+
+/// Check if a hostname matches any entry in a domain list.
+/// Matching is exact or subdomain: `example.com` matches `example.com`
+/// and `sub.example.com`. Case-insensitive, trailing dots stripped.
+pub fn is_domain_match(hostname: &str, domains: &[String]) -> bool {
+    let host = normalize_hostname(hostname);
+    for pattern in domains {
+        if host == *pattern || host.ends_with(&format!(".{pattern}")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse a domain list file into normalized entries.
+/// Returns an error if the file cannot be read (fail-closed for allowlists).
+pub fn parse_domain_file(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read domain file {}: {e}", path.display()))?;
+    Ok(contents
+        .lines()
+        .map(|l| l.trim().to_lowercase().trim_end_matches('.').to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect())
 }
 
 /// Check if a resolved IP address is private/reserved (post-DNS resolution).
@@ -414,14 +510,25 @@ fn is_v4_mapped_private(ip: &std::net::Ipv6Addr) -> bool {
     }
 }
 
-fn log_connection(method: &str, target: &str, status: &str) {
+fn log_connection(method: &str, target: &str, status: &str, log_file: Option<&PathBuf>) {
     let color = match status {
-        "BLOCKED" | "BLOCKED-PRIVATE" | "LIMIT" => RED,
-        "OK" => GREEN,
+        "BLOCKED" | "BLOCKED-PRIVATE" | "BLOCKED-PORT" | "BLOCKED-ALLOWLIST" | "LIMIT" => RED,
+        "CONNECTED" => GREEN,
         _ => YELLOW,
     };
     let timestamp = chrono_now();
     eprintln!("{color}[proxy]{NC} {timestamp} {method} {target} → {status}");
+
+    // Append to audit log file (reopen per-write for rotation compatibility)
+    if let Some(path) = log_file
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let iso = iso_now();
+        let _ = writeln!(f, "{iso} {method} {target} {status}");
+    }
 }
 
 fn chrono_now() -> String {
@@ -434,6 +541,37 @@ fn chrono_now() -> String {
     let mins = (secs % 3600) / 60;
     let s = secs % 60;
     format!("{hours:02}:{mins:02}:{s:02}")
+}
+
+fn iso_now() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    // Approximate date calculation (sufficient for log timestamps)
+    let (y, m, d) = days_to_ymd(days);
+    let h = rem / 3600;
+    let mi = (rem % 3600) / 60;
+    let s = rem % 60;
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Civil calendar from day count (algorithm from Howard Hinnant)
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y } as u64;
+    (y, m, d)
 }
 
 use std::net::ToSocketAddrs;

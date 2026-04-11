@@ -21,6 +21,7 @@ macOS Seatbelt sandbox wrapper for GitHub Copilot CLI. Runs Copilot inside Apple
 - [Configuration file](#configuration-file)
 - [Architecture](#architecture)
 - [Security](#security)
+- [Domain filtering](#domain-filtering)
 - [Known impacts](#known-impacts)
 - [Limitations](#limitations)
 - [Contributing](#contributing)
@@ -220,6 +221,8 @@ The proxy is **disabled by default**. When enabled, all outbound traffic — inc
 
 - **Connection logging** — see every domain Copilot connects to in real time
 - **Domain blocking** — block known exfiltration infrastructure (paste sites, webhook services, etc.)
+- **Domain allowlisting** — restrict connections to only known-safe domains
+- **Audit log** — persistent file log of all connections for post-session review
 - **Port enforcement** — the proxy enforces the same port restrictions as the sandbox (443 + `--allow-port`)
 
 **One-time use:**
@@ -239,17 +242,25 @@ Then edit `~/.config/cplt/config.toml`:
 ```toml
 [proxy]
 enabled = true
-# blocked_domains = "~/.config/cplt/blocked-domains.txt"  # optional
+# blocked_domains = "~/.config/cplt/blocked-domains.txt"  # block known-bad domains
+# allowed_domains = "~/.config/cplt/allowed-domains.txt"  # restrict to known-safe domains
+# log_file = "~/.config/cplt/proxy.log"                   # persistent audit log
 ```
 
 After this, every `cplt` invocation starts the proxy automatically. Use `--no-proxy` to skip it for a single run.
 
-| Flag                       | What it does                                                                                     |
-| -------------------------- | ------------------------------------------------------------------------------------------------ |
-| `--with-proxy`             | Start a localhost CONNECT proxy that logs connections.                                           |
-| `--no-proxy`               | Disable the proxy, even if your config file enables it.                                          |
-| `--proxy-port <PORT>`      | Which port the proxy listens on (default: 18080).                                                |
-| `--blocked-domains <FILE>` | A text file with domains to block, one per line (e.g. `pastebin.com`). Re-read on every request. |
+| Flag                        | What it does                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------ |
+| `--with-proxy`              | Start a localhost CONNECT proxy that logs connections.                                           |
+| `--no-proxy`                | Disable the proxy, even if your config file enables it.                                          |
+| `--proxy-port <PORT>`       | Which port the proxy listens on (default: 18080).                                                |
+| `--blocked-domains <FILE>`  | Domains to block, one per line. Re-read on every request (edit live).                            |
+| `--allowed-domains <FILE>`  | Domains to allow — only listed domains can connect. Parsed at startup (fail-closed).             |
+| `--proxy-log <FILE>`        | Append a line per connection to this file for post-session audit.                                |
+
+> **Domain matching:** both blocklist and allowlist use the same rules — `example.com` matches the exact domain and all subdomains (`sub.example.com`, `deep.sub.example.com`). Matching is case-insensitive. Trailing dots are stripped.
+>
+> **Localhost traffic** (MCP servers, dev servers) bypasses the proxy via `NO_PROXY` and will not appear in the audit log.
 
 ### Debugging
 
@@ -325,6 +336,8 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 # enabled = true             # Recommended — logs all connections
 # port = 18080
 # blocked_domains = "~/.config/cplt/blocked-domains.txt"
+# allowed_domains = "~/.config/cplt/allowed-domains.txt"
+# log_file = "~/.config/cplt/proxy.log"
 
 [sandbox]
 # validate = true
@@ -426,26 +439,50 @@ SBPL (Seatbelt Profile Language) does not support wildcard port filtering by IP 
 
 See [SECURITY.md](SECURITY.md) for the full threat model and honest gaps.
 
-## Domain blocking
+## Domain filtering
 
-When the proxy is enabled, it can block domains commonly used for data exfiltration. A default blocklist is included based on real attack infrastructure observed in 2025–2026 supply chain incidents:
+When the proxy is enabled, it supports both **blocking** (deny known-bad domains) and **allowlisting** (permit only known-good domains).
+
+### Blocklist
+
+Block domains commonly used for data exfiltration. A default blocklist is included based on real attack infrastructure observed in 2025–2026 supply chain incidents:
 
 ```bash
-# One-time with domain blocking
 cplt --with-proxy --blocked-domains blocked-domains.txt -- -p "fix tests"
 ```
 
-Or set it permanently in `~/.config/cplt/config.toml`:
+The blocklist covers webhook capture services, paste sites, file sharing, tunneling services, and IP recon endpoints. See [`blocked-domains.txt`](blocked-domains.txt) for the full list with sources.
+
+### Allowlist
+
+Restrict connections to only specific domains. When set, the proxy blocks everything not in the list:
+
+```bash
+cplt --with-proxy --allowed-domains allowed-domains.txt -- -p "fix tests"
+```
+
+Example `allowed-domains.txt` for Copilot-only access:
+
+```
+api.github.com
+api.githubcopilot.com
+api.business.githubcopilot.com
+proxy.business.githubcopilot.com
+telemetry.business.githubcopilot.com
+```
+
+Both blocklist and allowlist can be used together — allowlist is checked first, then blocklist.
+
+Set either permanently in `~/.config/cplt/config.toml`:
 
 ```toml
 [proxy]
 enabled = true
 blocked_domains = "~/.config/cplt/blocked-domains.txt"
+# allowed_domains = "~/.config/cplt/allowed-domains.txt"
 ```
 
-The blocklist covers webhook capture services, paste sites, file sharing, tunneling services, and IP recon endpoints. See [`blocked-domains.txt`](blocked-domains.txt) for the full list with sources.
-
-> **Note:** When the proxy is enabled, all traffic routes through it — including Copilot CLI (via `NODE_USE_ENV_PROXY=1`). Domain blocking applies to all connections.
+> **Note:** The allowlist is parsed at startup and fails closed — if the file is missing or unreadable, cplt exits with an error. The blocklist is re-read on every request so you can edit it live.
 
 ## Copilot CLI network endpoints
 

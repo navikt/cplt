@@ -104,7 +104,7 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 
 ### Honest gaps
 
-**Network is port-restricted, not domain-filtered.** SBPL (Seatbelt Profile Language) does not support domain-based filtering. Copilot CLI connects to CDN-backed endpoints (`api.business.githubcopilot.com`) with changing IPs that cannot be enumerated. We allow outbound TCP on port 443 only (use `--allow-port` for extras, e.g. `--allow-port 80` for HTTP). SSH agent access and localhost outbound are blocked at the kernel level. This means:
+**Network is port-restricted, with optional domain filtering.** SBPL (Seatbelt Profile Language) does not support domain-based filtering at the kernel level. Copilot CLI connects to CDN-backed endpoints (`api.business.githubcopilot.com`) with changing IPs that cannot be enumerated. We allow outbound TCP on port 443 only (use `--allow-port` for extras, e.g. `--allow-port 80` for HTTP). SSH agent access and localhost outbound are blocked at the kernel level. This means:
 
 - A compromised agent CAN make HTTPS requests to attacker-controlled servers on port 443
 - A compromised agent CANNOT exfiltrate cloud credentials from env vars (env is sanitized; only safe allowlist passes through)
@@ -115,7 +115,7 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 - A compromised agent CANNOT exfiltrate SSH keys, cloud credentials, or npm tokens (kernel-blocked from reading them)
 - The proxy (when enabled with `--with-proxy`) logs and filters all outbound connections, including Copilot CLI traffic (via `NODE_USE_ENV_PROXY=1`). The proxy also enforces port restrictions matching the sandbox policy.
 
-*Possible mitigation:* A domain-allowlist proxy (using `--with-proxy --blocked-domains`) can restrict traffic to known Copilot endpoints. All traffic, including Copilot's own Node.js connections, routes through the proxy when enabled.
+*Mitigation:* Use `--with-proxy --allowed-domains allowed-domains.txt` to restrict traffic to known Copilot endpoints only. Use `--blocked-domains blocked-domains.txt` to block known exfiltration infrastructure. Use `--proxy-log proxy.log` for post-session audit. All traffic, including Copilot's own Node.js connections, routes through the proxy when enabled.
 
 **`~/.config/gh/hosts.yml` is readable.** Copilot spawns `gh auth token` inside the sandbox. This file contains a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable (not the entire `.config/gh` directory). With outbound port 443 allowed, a compromised agent could theoretically exfiltrate this token. However, the token grants access to GitHub — which Copilot is already connected to. Users who want to mitigate this can use `--deny-path ~/.config/gh` (Copilot will fall back to Keychain auth).
 
