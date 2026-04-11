@@ -917,4 +917,103 @@ if /bin/rm -rf test-spawn-dir 2>/dev/null; then echo "RESULT:exec_rm:OK"; else e
         assert_result_ok(&stdout, "exec_mkdir");
         assert_result_ok(&stdout, "exec_rm");
     }
+
+    #[test]
+    fn project_proxy_env_vars_injected() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let port = 19500 + (std::process::id() % 400) as u16;
+
+        let script = r#"
+# Proxy env vars should be set when --with-proxy is used
+if [ -n "${NODE_USE_ENV_PROXY:-}" ]; then echo "RESULT:node_use_env_proxy:OK"; else echo "RESULT:node_use_env_proxy:FAIL"; fi
+if echo "${HTTP_PROXY:-}" | grep -q '127.0.0.1'; then echo "RESULT:http_proxy_upper:OK"; else echo "RESULT:http_proxy_upper:FAIL"; fi
+if echo "${HTTPS_PROXY:-}" | grep -q '127.0.0.1'; then echo "RESULT:https_proxy_upper:OK"; else echo "RESULT:https_proxy_upper:FAIL"; fi
+if echo "${http_proxy:-}" | grep -q '127.0.0.1'; then echo "RESULT:http_proxy_lower:OK"; else echo "RESULT:http_proxy_lower:FAIL"; fi
+if echo "${https_proxy:-}" | grep -q '127.0.0.1'; then echo "RESULT:https_proxy_lower:OK"; else echo "RESULT:https_proxy_lower:FAIL"; fi
+if [ -n "${NO_PROXY:-}" ]; then echo "RESULT:no_proxy_upper:OK"; else echo "RESULT:no_proxy_upper:FAIL"; fi
+if [ -n "${no_proxy:-}" ]; then echo "RESULT:no_proxy_lower:OK"; else echo "RESULT:no_proxy_lower:FAIL"; fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(
+            &project,
+            &fake_dir,
+            &["--with-proxy", "--proxy-port", &port.to_string()],
+        );
+
+        assert!(
+            success,
+            "cplt should succeed with proxy.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "node_use_env_proxy");
+        assert_result_ok(&stdout, "http_proxy_upper");
+        assert_result_ok(&stdout, "https_proxy_upper");
+        assert_result_ok(&stdout, "http_proxy_lower");
+        assert_result_ok(&stdout, "https_proxy_lower");
+        assert_result_ok(&stdout, "no_proxy_upper");
+        assert_result_ok(&stdout, "no_proxy_lower");
+    }
+
+    #[test]
+    fn project_proxy_port_filtering() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let port = 19600 + (std::process::id() % 400) as u16;
+
+        // Script that tries to connect to various ports through the proxy.
+        // For port 443 we use a non-existent host — the proxy allows the port
+        // but fails DNS, returning 502. This proves port filtering passed.
+        let script = format!(
+            r#"
+# Port 443: allowed → proxy tries DNS, fails → 502 (proves port check passed)
+RESP443=$(printf 'CONNECT nonexistent.invalid:443 HTTP/1.1\r\nHost: nonexistent.invalid:443\r\n\r\n' | nc -w 3 127.0.0.1 {port} 2>/dev/null | head -1)
+if echo "$RESP443" | grep -q "502"; then echo "RESULT:port_443:OK"; else echo "RESULT:port_443:FAIL:$RESP443"; fi
+
+# Port 80: blocked → 403 (port filter rejects before DNS)
+RESP80=$(printf 'CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n' | nc -w 2 127.0.0.1 {port} 2>/dev/null | head -1)
+if echo "$RESP80" | grep -q "403"; then echo "RESULT:port_80:OK"; else echo "RESULT:port_80:FAIL:$RESP80"; fi
+
+# Port 8080: blocked → 403
+RESP8080=$(printf 'CONNECT example.com:8080 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n' | nc -w 2 127.0.0.1 {port} 2>/dev/null | head -1)
+if echo "$RESP8080" | grep -q "403"; then echo "RESULT:port_8080:OK"; else echo "RESULT:port_8080:FAIL:$RESP8080"; fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(
+            &project,
+            &fake_dir,
+            &["--with-proxy", "--proxy-port", &port.to_string()],
+        );
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "port_443");
+        assert_result_ok(&stdout, "port_80");
+        assert_result_ok(&stdout, "port_8080");
+    }
+
+    #[test]
+    fn project_no_proxy_env_without_flag() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+
+        // Without --with-proxy, proxy env vars should NOT be present
+        let script = r#"
+if [ -z "${NODE_USE_ENV_PROXY:-}" ]; then echo "RESULT:no_node_proxy:OK"; else echo "RESULT:no_node_proxy:FAIL"; fi
+if [ -z "${HTTP_PROXY:-}" ]; then echo "RESULT:no_http_proxy:OK"; else echo "RESULT:no_http_proxy:FAIL"; fi
+if [ -z "${HTTPS_PROXY:-}" ]; then echo "RESULT:no_https_proxy:OK"; else echo "RESULT:no_https_proxy:FAIL"; fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "no_node_proxy");
+        assert_result_ok(&stdout, "no_http_proxy");
+        assert_result_ok(&stdout, "no_https_proxy");
+    }
 }

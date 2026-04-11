@@ -97,6 +97,11 @@ fn accept_loop(
             Err(_) => continue,
         };
 
+        // Ensure accepted socket is blocking (listener is non-blocking for
+        // shutdown checks, but connection handlers need blocking I/O).
+        stream.set_nonblocking(false).ok();
+        stream.set_nodelay(true).ok();
+
         // Connection limit
         let count = active_count.load(std::sync::atomic::Ordering::SeqCst);
         if count >= MAX_CONNECTIONS {
@@ -221,7 +226,10 @@ fn handle_connect(
 
     // Connect to resolved address (not re-resolving)
     let remote = match TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT) {
-        Ok(s) => s,
+        Ok(s) => {
+            s.set_nodelay(true).ok();
+            s
+        }
         Err(e) => {
             log_connection("CONNECT", target, &format!("FAIL:{e}"));
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
@@ -257,6 +265,9 @@ fn relay(client: TcpStream, remote: TcpStream) {
     client_read.set_read_timeout(Some(READ_TIMEOUT)).ok();
     remote_read.set_read_timeout(Some(READ_TIMEOUT)).ok();
 
+    // Use Write shutdown (TCP half-close) so the other direction can
+    // finish delivering in-flight data. shutdown(Both) would kill the
+    // read half of the shared socket, breaking the other relay thread.
     let t1 = std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
@@ -269,7 +280,7 @@ fn relay(client: TcpStream, remote: TcpStream) {
                 }
             }
         }
-        remote_write.shutdown(std::net::Shutdown::Both).ok();
+        remote_write.shutdown(std::net::Shutdown::Write).ok();
     });
 
     let t2 = std::thread::spawn(move || {
@@ -284,7 +295,7 @@ fn relay(client: TcpStream, remote: TcpStream) {
                 }
             }
         }
-        client_write.shutdown(std::net::Shutdown::Both).ok();
+        client_write.shutdown(std::net::Shutdown::Write).ok();
     });
 
     t1.join().ok();
