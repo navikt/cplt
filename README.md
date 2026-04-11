@@ -214,11 +214,35 @@ To see which tools cplt detected, run `cplt --doctor`.
 
 ### Proxy (optional)
 
-The proxy is **disabled by default**. When enabled, all outbound traffic — including Copilot CLI, `gh`, and `curl` — is routed through a localhost CONNECT proxy via `HTTP_PROXY`/`HTTPS_PROXY` env vars and `NODE_USE_ENV_PROXY=1`. The proxy is useful for:
+The proxy is **disabled by default**. When enabled, all outbound traffic — including Copilot CLI, `gh`, and `curl` — is routed through a localhost CONNECT proxy via `HTTP_PROXY`/`HTTPS_PROXY` env vars and `NODE_USE_ENV_PROXY=1`.
 
-- **Connection logging** — see what domains Copilot and other tools connect to
+**What the proxy gives you:**
+
+- **Connection logging** — see every domain Copilot connects to in real time
 - **Domain blocking** — block known exfiltration infrastructure (paste sites, webhook services, etc.)
 - **Port enforcement** — the proxy enforces the same port restrictions as the sandbox (443 + `--allow-port`)
+
+**One-time use:**
+
+```bash
+cplt --with-proxy -- -p "fix the tests"
+```
+
+**Enable permanently** (recommended):
+
+```bash
+cplt --init-config
+```
+
+Then edit `~/.config/cplt/config.toml`:
+
+```toml
+[proxy]
+enabled = true
+# blocked_domains = "~/.config/cplt/blocked-domains.txt"  # optional
+```
+
+After this, every `cplt` invocation starts the proxy automatically. Use `--no-proxy` to skip it for a single run.
 
 | Flag                       | What it does                                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------------------------ |
@@ -298,7 +322,7 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 
 ```toml
 [proxy]
-# enabled = false           # Set to true for connection logging
+# enabled = true             # Recommended — logs all connections
 # port = 18080
 # blocked_domains = "~/.config/cplt/blocked-domains.txt"
 
@@ -404,18 +428,19 @@ See [SECURITY.md](SECURITY.md) for the full threat model and honest gaps.
 
 ## Domain blocking
 
-When the proxy is enabled (`--with-proxy`), it can block domains commonly used for data exfiltration. A default blocklist is included based on real attack infrastructure observed in 2025–2026 supply chain incidents:
+When the proxy is enabled, it can block domains commonly used for data exfiltration. A default blocklist is included based on real attack infrastructure observed in 2025–2026 supply chain incidents:
 
 ```bash
-# Enable proxy with domain blocking
+# One-time with domain blocking
 cplt --with-proxy --blocked-domains blocked-domains.txt -- -p "fix tests"
+```
 
-# Or set it permanently in config
-cplt --init-config
-# Then edit ~/.config/cplt/config.toml:
-#   [proxy]
-#   enabled = true
-#   blocked_domains = "~/.config/cplt/blocked-domains.txt"
+Or set it permanently in `~/.config/cplt/config.toml`:
+
+```toml
+[proxy]
+enabled = true
+blocked_domains = "~/.config/cplt/blocked-domains.txt"
 ```
 
 The blocklist covers webhook capture services, paste sites, file sharing, tunneling services, and IP recon endpoints. See [`blocked-domains.txt`](blocked-domains.txt) for the full list with sources.

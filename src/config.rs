@@ -519,8 +519,7 @@ pub fn default_config_contents() -> String {
 # When enabled, HTTP_PROXY/HTTPS_PROXY and NODE_USE_ENV_PROXY=1 are injected
 # so all traffic (Copilot, gh, curl) routes through the proxy.
 # The proxy enforces the same port policy as the sandbox (443 + allow-port).
-# Disabled by default. Enable with --with-proxy for connection visibility
-# and domain blocking.
+# Disabled by default. Enable with --with-proxy or set enabled = true below.
 [proxy]
 # enabled = false
 # port = 18080
