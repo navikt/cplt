@@ -41,9 +41,17 @@ run = "cargo test --test integration"
 description = "Run E2E tests (requires macOS + Copilot CLI)"
 run = "cargo test --test e2e"
 
+[tasks."test:e2e-projects"]
+description = "Run E2E project scaffold tests (requires macOS)"
+run = "cargo test --test e2e_projects"
+
 [tasks."test:e2e-live"]
 description = "Run live E2E tests that hit Copilot API (requires auth)"
 run = "cargo test --test e2e -- --ignored"
+
+[tasks."test:all"]
+description = "Run all test suites (unit, integration, e2e, e2e-projects)"
+depends = ["test:unit", "test:integration", "test:e2e", "test:e2e-projects"]
 
 [tasks.check]
 description = "Run all checks (fmt, clippy, test)"
