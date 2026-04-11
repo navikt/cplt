@@ -19,11 +19,17 @@ run = "cargo clippy --all-targets -- -D warnings"
 
 [tasks.build]
 description = "Build debug binary"
-run = "cargo build"
+run = """
+export CPLT_LONG_VERSION="$(cargo metadata --format-version=1 --no-deps -q 2>/dev/null | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4) ($(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)$(git diff --quiet HEAD 2>/dev/null || echo '-dirty') $(git log -1 --format=%cd --date=short 2>/dev/null || echo unknown))"
+cargo build
+"""
 
 [tasks."build:release"]
 description = "Build optimized release binary"
-run = "cargo build --release"
+run = """
+export CPLT_LONG_VERSION="$(cargo metadata --format-version=1 --no-deps -q 2>/dev/null | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4) ($(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)$(git diff --quiet HEAD 2>/dev/null || echo '-dirty') $(git log -1 --format=%cd --date=short 2>/dev/null || echo unknown))"
+cargo build --release
+"""
 
 [tasks.test]
 description = "Run all tests (same as cargo test; macOS only)"
@@ -63,7 +69,10 @@ depends = ["check", "build:release"]
 
 [tasks.install]
 description = "Build and install cplt to /usr/local/bin"
-run = "cargo build --release && sudo cp target/release/cplt /usr/local/bin/cplt && sudo /usr/bin/xattr -cr /usr/local/bin/cplt && sudo codesign --force --sign - /usr/local/bin/cplt"
+run = """
+export CPLT_LONG_VERSION="$(cargo metadata --format-version=1 --no-deps -q 2>/dev/null | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4) ($(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)$(git diff --quiet HEAD 2>/dev/null || echo '-dirty') $(git log -1 --format=%cd --date=short 2>/dev/null || echo unknown))"
+cargo build --release && sudo cp target/release/cplt /usr/local/bin/cplt && sudo /usr/bin/xattr -cr /usr/local/bin/cplt && sudo codesign --force --sign - /usr/local/bin/cplt
+"""
 
 [tasks.clean]
 description = "Clean build artifacts"

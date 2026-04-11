@@ -3,6 +3,13 @@ use cplt::{config, discover, proxy, sandbox, scratch};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// Build info: if CPLT_LONG_VERSION is set at compile time (via mise tasks),
+/// use that; otherwise fall back to the Cargo package version.
+const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Run GitHub Copilot CLI inside a macOS sandbox.
 ///
 /// Copilot can read and write your project files, but cannot access your
@@ -19,6 +26,7 @@ use std::process::ExitCode;
 #[command(
     name = "cplt",
     version,
+    long_version = LONG_VERSION,
     about,
     after_help = "\
 EXAMPLES:
