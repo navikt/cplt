@@ -1098,4 +1098,159 @@ echo "RESULT:sent:OK"
             "Port 80 should be blocked.\nlog:\n{log_contents}"
         );
     }
+
+    // ============================================================
+    // Go toolchain sandbox tests
+    // ============================================================
+
+    fn go_available() -> bool {
+        Command::new("go")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Go build to a project-local path works without --scratch-dir.
+    /// The compiled binary lives in the project dir (exec allowed).
+    #[test]
+    fn project_go_build_and_run_in_sandbox() {
+        require_sandbox!();
+        if !go_available() {
+            eprintln!("SKIPPED: go not available");
+            return;
+        }
+
+        let project = TempProject::scaffold_go();
+        let script = r#"
+export GOTOOLCHAIN=local
+
+# go build writes the binary to the project dir (exec allowed there)
+if go build -o ./testapp . 2>&1; then
+    echo "RESULT:go_build:OK"
+else
+    echo "RESULT:go_build:FAIL"
+fi
+
+# Execute the locally-built binary
+if ./testapp 2>/dev/null; then
+    echo "RESULT:go_exec:OK"
+else
+    echo "RESULT:go_exec:FAIL"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "go_build");
+        assert_result_ok(&stdout, "go_exec");
+    }
+
+    /// Go test works with --scratch-dir: GOTMPDIR is redirected to a
+    /// controlled dir with exec permissions, so the compiled test binary
+    /// can be executed.
+    #[test]
+    fn project_go_test_with_scratch_dir() {
+        require_sandbox!();
+        if !go_available() {
+            eprintln!("SKIPPED: go not available");
+            return;
+        }
+
+        let project = TempProject::scaffold_go();
+        project.write_file(
+            "main_test.go",
+            "package main\n\nimport \"testing\"\n\nfunc TestHello(t *testing.T) {\n\tt.Log(\"hello from sandbox\")\n}\n",
+        );
+
+        let script = r#"
+export GOTOOLCHAIN=local
+
+# Verify GOTMPDIR is redirected away from system temp dirs
+GOTMP="${GOTMPDIR:-unset}"
+case "$GOTMP" in
+    unset|/tmp|/private/tmp|/var/folders/*|/private/var/folders/*)
+        echo "RESULT:gotmpdir_redirected:FAIL:GOTMPDIR=$GOTMP"
+        ;;
+    *)
+        echo "RESULT:gotmpdir_redirected:OK"
+        ;;
+esac
+
+# go test compiles a test binary to GOTMPDIR then executes it.
+# With --scratch-dir, GOTMPDIR points to a dir with exec permissions.
+if go test -count=1 . 2>&1; then
+    echo "RESULT:go_test:OK"
+else
+    echo "RESULT:go_test:FAIL"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--scratch-dir"]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "gotmpdir_redirected");
+        assert_result_ok(&stdout, "go_test");
+    }
+
+    /// Without --scratch-dir, go test is blocked because the compiled test
+    /// binary lands in a temp dir where process-exec is denied.
+    #[test]
+    fn project_go_test_blocked_without_scratch() {
+        require_sandbox!();
+        if !go_available() {
+            eprintln!("SKIPPED: go not available");
+            return;
+        }
+
+        let project = TempProject::scaffold_go();
+        project.write_file(
+            "main_test.go",
+            "package main\n\nimport \"testing\"\n\nfunc TestHello(t *testing.T) {\n\tt.Log(\"hello from sandbox\")\n}\n",
+        );
+
+        // Capture stderr so we can assert the deny signature.
+        // Explicitly unset GOTMPDIR and set TMPDIR to a denied path
+        // so the test isn't flaky on machines with custom TMPDIR.
+        // Use `if` wrapper to prevent set -e from killing the script
+        // when go test returns non-zero.
+        let script = r#"
+export GOTOOLCHAIN=local
+unset GOTMPDIR 2>/dev/null || true
+export TMPDIR=/private/tmp
+
+if GO_OUTPUT=$(go test -count=1 . 2>&1); then
+    echo "RESULT:go_test_no_scratch:OK"
+else
+    echo "RESULT:go_test_no_scratch:FAIL"
+fi
+
+# Verify the failure is actually a permission deny, not some other error
+case "$GO_OUTPUT" in
+    *"not permitted"*|*"permission denied"*|*"signal: killed"*)
+        echo "RESULT:deny_signature:OK"
+        ;;
+    *)
+        echo "RESULT:deny_signature:FAIL:output=$GO_OUTPUT"
+        ;;
+esac
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // go test should be blocked: sandbox denies exec from temp dirs
+        assert_result_fail(&stdout, "go_test_no_scratch");
+        assert_result_ok(&stdout, "deny_signature");
+    }
 }
