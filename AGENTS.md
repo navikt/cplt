@@ -61,8 +61,28 @@ Test suites and where they can run:
 - **e2e-live** (6 smoke tests) need real Copilot auth and network — not for regular CI
 - All suites except **e2e-live** run fine inside the cplt sandbox
 
-When adding sandbox rules, add a unit test verifying the SBPL string.
-When adding config options, add a merge test in `config.rs`.
+### Test strategy
+
+The four tiers validate different properties — all are needed:
+
+1. **Unit tests** verify SBPL profile string generation: the profile text contains the
+   correct allow/deny rules, env vars are filtered properly, config merging works.
+   Fast and cross-platform, but do not prove the kernel actually enforces anything.
+2. **Integration tests** verify kernel enforcement: run a real command inside
+   `sandbox-exec` and assert it is denied or allowed. This is the ground truth for
+   security properties — if a unit test says "deny" but integration passes, the rule
+   is broken.
+3. **E2E tests** verify the full binary pipeline: CLI arg parsing → profile generation →
+   sandbox-exec invocation → exit code. Catches wiring bugs between modules.
+4. **E2E project tests** verify realistic developer workflows (git, node, python, rust
+   file ops, config files) work correctly inside the sandbox. Catches real-world
+   breakage that synthetic tests miss.
+
+**Which tier to use:**
+- Adding/changing a sandbox rule → unit test for the SBPL string + integration test for kernel enforcement
+- Adding a config option → unit test for merge logic in `config.rs`
+- Adding env var filtering → unit test in `unit_tests.rs`
+- Fixing a real-world breakage → e2e_projects test reproducing the scenario
 
 ## Security constraints
 
