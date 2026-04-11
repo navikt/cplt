@@ -515,11 +515,12 @@ pub fn default_config_contents() -> String {
 # Override: CPLT_CONFIG=/path/to/config.toml
 
 # ─── Proxy ───────────────────────────────────────────────────
-# Optional CONNECT proxy that logs outbound HTTPS connections.
-# Disabled by default — Copilot CLI connects directly to its APIs
-# and does not use http_proxy/https_proxy env vars.
-# Enable with --with-proxy for connection visibility and domain blocking.
-# The proxy is a passive logging tool, not a security boundary.
+# Optional CONNECT proxy that logs and filters outbound HTTPS connections.
+# When enabled, HTTP_PROXY/HTTPS_PROXY and NODE_USE_ENV_PROXY=1 are injected
+# so all traffic (Copilot, gh, curl) routes through the proxy.
+# The proxy enforces the same port policy as the sandbox (443 + allow-port).
+# Disabled by default. Enable with --with-proxy for connection visibility
+# and domain blocking.
 [proxy]
 # enabled = false
 # port = 18080

@@ -45,12 +45,11 @@ struct Cli {
     #[arg(long, short = 'd', value_name = "DIR")]
     project_dir: Option<PathBuf>,
 
-    /// Enable a local CONNECT proxy that logs outbound connections.
-    /// Useful for visibility into what domains Copilot (and tools like gh)
-    /// connect to. Can also block known-bad domains with --blocked-domains.
-    /// Note: Copilot CLI itself does NOT route through the proxy — it
-    /// connects directly to its APIs. The proxy captures traffic from
-    /// tools that respect http_proxy (like gh, curl).
+    /// Enable a local CONNECT proxy that logs and filters outbound connections.
+    /// All traffic (Copilot, gh, curl) is routed through the proxy via
+    /// HTTP_PROXY/HTTPS_PROXY env vars. Can block known-bad domains with
+    /// --blocked-domains. The proxy enforces the same port restrictions as
+    /// the sandbox (443 + --allow-port values).
     #[arg(long)]
     with_proxy: bool,
 

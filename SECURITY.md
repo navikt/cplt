@@ -113,9 +113,9 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 - A compromised agent CANNOT use loaded SSH keys (unix socket is blocked)
 - A compromised agent CANNOT connect on non-standard ports (e.g., 8080, 3000) unless `--allow-port` is used
 - A compromised agent CANNOT exfiltrate SSH keys, cloud credentials, or npm tokens (kernel-blocked from reading them)
-- The proxy (when enabled with `--with-proxy`) provides logging and domain blocking for tools that respect `http_proxy`, but Copilot's own Node.js traffic bypasses it
+- The proxy (when enabled with `--with-proxy`) logs and filters all outbound connections, including Copilot CLI traffic (via `NODE_USE_ENV_PROXY=1`). The proxy also enforces port restrictions matching the sandbox policy.
 
-*Possible mitigation:* A domain-allowlist proxy that intercepts all TLS connections (not just `http_proxy`-aware tools) could restrict traffic to known Copilot endpoints. This requires transparent proxy + iptables-style routing, which conflicts with macOS code signing. Alternatively, a Network Extension (NExt) could filter at the system level — but requires an Apple-signed profile. See issue #4 for MCP proxy exploration.
+*Possible mitigation:* A domain-allowlist proxy (using `--with-proxy --blocked-domains`) can restrict traffic to known Copilot endpoints. All traffic, including Copilot's own Node.js connections, routes through the proxy when enabled.
 
 **`~/.config/gh/hosts.yml` is readable.** Copilot spawns `gh auth token` inside the sandbox. This file contains a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable (not the entire `.config/gh` directory). With outbound port 443 allowed, a compromised agent could theoretically exfiltrate this token. However, the token grants access to GitHub — which Copilot is already connected to. Users who want to mitigate this can use `--deny-path ~/.config/gh` (Copilot will fall back to Keychain auth).
 
@@ -268,16 +268,17 @@ When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Libr
   - **Ephemeral:** Cleaned up on exit via RAII Drop; stale dirs GC'd after 24h on startup
 - **Opt-in:** Disabled by default. Enable with `--scratch-dir` or `sandbox.scratch_dir = true` in config.
 
-### Layer 2: CONNECT Proxy (Optional Logging and Domain Blocking)
+### Layer 2: CONNECT Proxy (Optional Logging and Domain Filtering)
 
-When `--with-proxy` is enabled, a localhost CONNECT proxy provides **passive logging and domain blocking** for tools that respect `http_proxy` env vars (like `gh`, `curl`). It does NOT intercept Copilot CLI traffic — Node.js does not natively use `http_proxy`/`https_proxy`, and setting these vars breaks Copilot's auth flow.
+When `--with-proxy` is enabled, a localhost CONNECT proxy intercepts all outbound traffic. `HTTP_PROXY`/`HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1` are injected into the sandbox environment, routing traffic from Copilot CLI (Node.js), `gh` (Go), `curl`, and any other tool through the proxy.
 
 The proxy provides:
 
 1. **Connection logging** — every CONNECT target is logged with timestamp and status
 2. **Domain blocklist** — configurable file-based blocklist with subdomain matching
-3. **DNS rebinding protection** — resolves DNS first, validates the *resolved IP*, then connects using the pinned address
-4. **Comprehensive private IP blocking** — covers all reserved ranges
+3. **Port enforcement** — only port 443 (and `--allow-port` values) are permitted, matching the sandbox policy
+4. **DNS rebinding protection** — resolves DNS first, validates the *resolved IP*, then connects using the pinned address
+5. **Comprehensive private IP blocking** — covers all reserved ranges
 
 #### DNS Rebinding Defense
 
@@ -359,48 +360,40 @@ cplt refuses to sandbox overly broad directories that would grant the agent acce
 
 ### Network Limitations
 
-#### Why we cannot filter Copilot's network traffic
+#### Proxy support for Copilot traffic
 
-The original design routed all sandbox traffic through a localhost CONNECT proxy, giving us full visibility and control over outbound connections. This was the ideal architecture: block outbound at the kernel level (`(deny network*)`), allow only localhost on the proxy port (`(allow network-outbound (local ip "localhost:18080"))`), and let the proxy log, filter, and enforce a domain allowlist.
+Copilot CLI bundles Node.js v24.11.1, which supports `NODE_USE_ENV_PROXY=1` (added in Node.js v24.5.0). When this env var is set, Node.js natively honors `HTTP_PROXY`/`HTTPS_PROXY` — routing all outbound connections through the specified proxy.
 
-**It did not work.** Here is what we discovered through systematic debugging:
+When `--with-proxy` is enabled, cplt injects `NODE_USE_ENV_PROXY=1`, `HTTP_PROXY`, and `HTTPS_PROXY` into the sandbox environment. All traffic — Copilot CLI, `gh`, `curl`, and any other tool — routes through the localhost CONNECT proxy.
 
-**Phase 1: Proxy env vars break Copilot's auth flow.** The sandbox injected `http_proxy=http://localhost:18080` and `https_proxy=http://localhost:18080` into the child process environment. Copilot CLI is a Node.js application, and **Node.js does not natively respect `http_proxy`/`https_proxy` env vars**. The standard `https` module (and most HTTP client libraries in Node) connect directly — they do not read proxy settings from the environment the way Go's `net/http` or curl do.
+**Historical context:** Earlier versions of Copilot CLI used a Node.js runtime that did not support proxy env vars, and injecting them broke the auth flow. This is no longer the case as of Copilot CLI 1.0.24+ with bundled Node.js v24.11.1.
 
-Setting these env vars did not route Copilot traffic through the proxy. Instead, it interfered with Copilot's HTTP client internals. The auth flow — which contacts `api.github.com` to validate tokens, then `api.business.githubcopilot.com` for the Copilot API — failed with "No authentication information found" even though the token was valid.
+**Design decision:** The proxy remains opt-in (`--with-proxy`) rather than default-on because:
+- It adds latency to every connection (localhost roundtrip + proxy processing)
+- The sandbox's filesystem isolation is the primary security control
+- Port restrictions are enforced at both the kernel level (SBPL) and the proxy level
 
-**Phase 2: Removing proxy env vars fixes auth.** When we stopped injecting proxy env vars and allowed outbound TCP directly (`(allow network-outbound (remote tcp))`), Copilot authenticated successfully and worked correctly. This confirmed the env vars were the cause — not the sandbox itself.
-
-**Phase 3: Go tools DO respect proxy env vars.** We observed that `gh` (the GitHub CLI, a Go binary that Copilot spawns for `gh auth token`) did route through the proxy. Go's `net/http.ProxyFromEnvironment()` reads `https_proxy` by default. This means the proxy saw CONNECT requests to `api.github.com` from `gh`, but never saw Copilot's own traffic to `api.business.githubcopilot.com`, `api.githubcopilot.com`, or `proxy.business.githubcopilot.com`.
-
-**Root cause summary:**
-
-| Component | Language | Respects `http_proxy`? | Through proxy? |
-|---|---|---|---|
-| Copilot CLI | Node.js | ❌ No (breaks auth when set) | ❌ Never |
-| `gh` CLI | Go | ✅ Yes (`net/http`) | ✅ Yes |
-| `curl` | C | ✅ Yes | ✅ Yes |
-
-**Why not force Node.js to use the proxy?** Node.js requires explicit proxy support in the HTTP client code (e.g., the `global-agent` npm package or `--proxy-server` flag for Electron). Copilot CLI is a pre-built binary — we cannot modify its source code to add proxy support. Even if we could, CONNECT proxies for HTTPS only see the target hostname:port (SNI), not the request body, so the security value is limited to domain filtering.
-
-**Design decision:** The proxy is kept as an opt-in tool (`--with-proxy`) for logging connections from tools that DO respect proxy env vars (`gh`, `curl`, other Go/Python tools). It is disabled by default because it provides no value for Copilot's primary traffic and was misleading when presented as a security control.
+| Component | Language | Routes through proxy? |
+|---|---|---|
+| Copilot CLI | Node.js | ✅ Yes (via `NODE_USE_ENV_PROXY=1`) |
+| `gh` CLI | Go | ✅ Yes (via `net/http.ProxyFromEnvironment()`) |
+| `curl` | C | ✅ Yes |
 
 #### SBPL network filtering limitations
 
-Even without the proxy, we explored filtering at the Seatbelt level. SBPL has fundamental limitations:
+SBPL has fundamental limitations for network filtering:
 
 - **No domain-based rules** — SBPL operates at the syscall level, not the application level. It cannot match on hostnames.
 - **No wildcard port filtering** — there is no syntax for "allow any host on port 443 only"
-- **IP-based rules require known IPs** — Copilot's API endpoints (`api.business.githubcopilot.com`) use CDN-backed IPs that change regularly and cannot be enumerated
+- **IP-based rules require known IPs** — Copilot's API endpoints use CDN-backed IPs that change regularly
 
-The only viable options are `(allow network-outbound (remote tcp))` (allow all) or `(deny network*)` (deny all). We chose to allow all outbound TCP because Copilot cannot function without network access.
+The only viable options are `(allow network-outbound (remote tcp))` (allow all) or `(deny network*)` (deny all). We allow outbound TCP because Copilot cannot function without network access, and use port restrictions as a secondary control.
 
 #### Current state
 
-- **All outbound TCP is allowed** in the sandbox profile
+- **Outbound TCP is allowed** in the sandbox profile, restricted to port 443 (+ `--allow-port`)
 - **Filesystem isolation is the primary security control** — credentials are kernel-blocked regardless of network policy
-- **The proxy remains useful** for logging traffic from Go-based tools (`gh`) and for domain blocking as a defense-in-depth measure
-- **Future improvement:** If Copilot CLI ever adds native proxy support (e.g., via `global-agent` or `NODE_EXTRA_CA_CERTS` + MITM proxy), the full proxy architecture could be re-enabled
+- **The proxy** (when enabled) provides connection logging, domain blocking, port enforcement, and DNS rebinding protection for all traffic including Copilot
 
 ## Test Strategy
 

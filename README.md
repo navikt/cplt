@@ -214,10 +214,11 @@ To see which tools cplt detected, run `cplt --doctor`.
 
 ### Proxy (optional)
 
-The proxy is **disabled by default**. Copilot CLI connects directly to its APIs (Node.js does not natively respect `http_proxy`/`https_proxy` env vars). The proxy is useful for:
+The proxy is **disabled by default**. When enabled, all outbound traffic — including Copilot CLI, `gh`, and `curl` — is routed through a localhost CONNECT proxy via `HTTP_PROXY`/`HTTPS_PROXY` env vars and `NODE_USE_ENV_PROXY=1`. The proxy is useful for:
 
-- **Connection logging** — see what domains tools like `gh` and `curl` connect to
+- **Connection logging** — see what domains Copilot and other tools connect to
 - **Domain blocking** — block known exfiltration infrastructure (paste sites, webhook services, etc.)
+- **Port enforcement** — the proxy enforces the same port restrictions as the sandbox (443 + `--allow-port`)
 
 | Flag                       | What it does                                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------------------------ |
@@ -225,8 +226,6 @@ The proxy is **disabled by default**. Copilot CLI connects directly to its APIs 
 | `--no-proxy`               | Disable the proxy, even if your config file enables it.                                          |
 | `--proxy-port <PORT>`      | Which port the proxy listens on (default: 18080).                                                |
 | `--blocked-domains <FILE>` | A text file with domains to block, one per line (e.g. `pastebin.com`). Re-read on every request. |
-
-> **Why doesn't the proxy intercept Copilot traffic?** Copilot CLI is a Node.js application. Node.js does not natively use `http_proxy`/`https_proxy` env vars. Setting these vars actually *breaks* Copilot's auth flow with `api.business.githubcopilot.com`. Go-based tools like `gh` do respect proxy env vars and will be logged.
 
 ### Debugging
 
@@ -398,7 +397,7 @@ SBPL (Seatbelt Profile Language) does not support wildcard port filtering by IP 
 - **Localhost outbound is blocked** — prevents access to local services (databases, dev servers, etc.)
 - **SSH agent is blocked** — unix socket access is denied, preventing use of loaded SSH keys
 - **Filesystem isolation is the primary control** — credentials are kernel-blocked regardless of network
-- **The proxy cannot intercept Copilot traffic** — Node.js ignores `http_proxy` env vars, and setting them breaks auth
+- **Use `--with-proxy`** to log and filter all outbound connections (including Copilot traffic)
 - **Use `--allow-port`** to add extra ports when needed (e.g., `--allow-port 8080` for a dev server)
 
 See [SECURITY.md](SECURITY.md) for the full threat model and honest gaps.
@@ -421,7 +420,7 @@ cplt --init-config
 
 The blocklist covers webhook capture services, paste sites, file sharing, tunneling services, and IP recon endpoints. See [`blocked-domains.txt`](blocked-domains.txt) for the full list with sources.
 
-> **Note:** The proxy only captures traffic from tools that respect `http_proxy` (like `gh`, `curl`). Copilot CLI's own API traffic bypasses the proxy. Domain blocking is a defense-in-depth measure, not a primary control.
+> **Note:** When the proxy is enabled, all traffic routes through it — including Copilot CLI (via `NODE_USE_ENV_PROXY=1`). Domain blocking applies to all connections.
 
 ## Copilot CLI network endpoints
 
@@ -581,7 +580,6 @@ Only port 443 is allowed by default. Services on other ports need `--allow-port`
 - **No TLS inspection** — the proxy sees domain names (via CONNECT) but not request bodies
 - **No network filtering** — SBPL doesn't support domain-based or port-based filtering for outbound TCP
 - **Keychain access required** — Copilot stores auth tokens in macOS Keychain
-- **Proxy doesn't intercept Copilot** — Node.js ignores `http_proxy`; the proxy is for tools like `gh`
 - **`sandbox-exec` is deprecated** — Apple has not removed it but may in future macOS versions
 
 For known attack vectors, out-of-scope threats, and prior art, see [SECURITY.md](SECURITY.md).
