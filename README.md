@@ -32,6 +32,9 @@ macOS Seatbelt sandbox wrapper for GitHub Copilot CLI. Runs Copilot inside Apple
 # Install
 brew install navikt/tap/cplt
 
+# Make 'copilot' run the sandboxed version (add to ~/.zshrc)
+eval "$(cplt --shell-setup)"
+
 # Check your environment
 cplt --doctor
 
