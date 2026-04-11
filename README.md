@@ -558,8 +558,11 @@ Tools that compile-then-execute from `$TMPDIR` are **blocked by default** becaus
 | Tool                      | Impact      | Why                                                                   |
 | ------------------------- | ----------- | --------------------------------------------------------------------- |
 | `go test`                 | ❌ Blocked   | Compiles test binaries to `$TMPDIR`, then executes them               |
+| `go run`                  | ❌ Blocked   | Compiles to `$TMPDIR` then executes — same as `go test`               |
+| `go generate`             | ❌ Blocked   | If the generator is a Go binary compiled to `$TMPDIR`                 |
 | `mise run` (inline tasks) | ❌ Blocked   | Writes script to temp file, then executes it                          |
 | `node-gyp` (native addons)| ❌ Blocked  | Compiles C/C++ to temp, then loads via dlopen                         |
+| `go build`                | ✅ Works     | Output binary goes to project dir or `$GOBIN`, not `$TMPDIR`         |
 | `cargo test`              | ✅ Works     | Rust builds in `target/`, not `$TMPDIR`                               |
 | `npm test` / `vitest`     | ✅ Works     | JavaScript runs via interpreter, not compiled to temp                 |
 
