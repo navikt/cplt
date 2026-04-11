@@ -1360,4 +1360,52 @@ mod e2e_tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout.trim(), "alias copilot=cplt");
     }
+
+    #[test]
+    fn e2e_shell_install_appends_to_rc_file() {
+        let fake_home = std::env::temp_dir().join(format!("cplt-test-{}", std::process::id()));
+        std::fs::create_dir_all(&fake_home).expect("create fake home");
+        let zshrc = fake_home.join(".zshrc");
+
+        // First install — should create the file with the eval line
+        let output = Command::new(binary_path())
+            .arg("--shell-install")
+            .env("HOME", &fake_home)
+            .env("SHELL", "/bin/zsh")
+            .output()
+            .expect("binary should run");
+
+        assert!(
+            output.status.success(),
+            "first --shell-install should succeed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let contents = std::fs::read_to_string(&zshrc).expect("zshrc should exist");
+        assert!(
+            contents.contains("cplt --shell-setup"),
+            "zshrc should contain setup line.\ncontents: {contents}"
+        );
+
+        // Second install — should be idempotent
+        let output2 = Command::new(binary_path())
+            .arg("--shell-install")
+            .env("HOME", &fake_home)
+            .env("SHELL", "/bin/zsh")
+            .output()
+            .expect("binary should run");
+
+        assert!(
+            output2.status.success(),
+            "second --shell-install should succeed"
+        );
+        let contents2 = std::fs::read_to_string(&zshrc).expect("zshrc should exist");
+        assert_eq!(
+            contents.matches("cplt").count(),
+            contents2.matches("cplt").count(),
+            "should not add duplicate entries"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
 }

@@ -32,8 +32,8 @@ macOS Seatbelt sandbox wrapper for GitHub Copilot CLI. Runs Copilot inside Apple
 # Install
 brew install navikt/tap/cplt
 
-# Make 'copilot' run the sandboxed version (add to ~/.zshrc)
-eval "$(cplt --shell-setup)"
+# Make 'copilot' run the sandboxed version (persistent)
+cplt --shell-install
 
 # Check your environment
 cplt --doctor
@@ -121,13 +121,37 @@ mise run install
 
 ### Shell setup (recommended)
 
-By default, you run the sandboxed version with `cplt`. If you'd like `copilot` to run the sandboxed version too, add this to your shell rc file (`~/.zshrc`, `~/.bashrc`, etc.):
+By default, you run the sandboxed version with `cplt`. To make `copilot` run the sandboxed version too, use the one-command installer:
 
 ```bash
-eval "$(cplt --shell-setup)"
+cplt --shell-install
 ```
 
-This creates a shell alias `copilot=cplt`. When you type `copilot`, your shell runs `cplt` instead, which finds the real Copilot CLI in PATH and wraps it in the sandbox.
+This detects your shell, appends the alias to your rc file, and prints what it did. Safe to run multiple times — it won't add duplicates.
+
+| Shell | File modified | What's added |
+|-------|--------------|--------------|
+| **zsh** (macOS default) | `~/.zshrc` | `eval "$(cplt --shell-setup)"` |
+| **bash** | `~/.bashrc` | `eval "$(cplt --shell-setup)"` |
+| **fish** | `~/.config/fish/conf.d/cplt.fish` | `alias copilot cplt` |
+
+After installing, restart your shell or `source` the file to activate.
+
+<details>
+<summary>Manual setup (alternative)</summary>
+
+If you prefer not to use `--shell-install`, add the appropriate line to your shell rc file manually:
+
+```bash
+# zsh / bash
+eval "$(cplt --shell-setup)"
+
+# fish
+alias copilot cplt
+```
+
+This is the same pattern used by tools like mise, direnv, and starship.
+</details>
 
 **Why an alias instead of a symlink?** Both cplt and Copilot CLI install into the same Homebrew bin directory (`/opt/homebrew/bin/`). A symlink would conflict — only one file named `copilot` can exist there. A shell alias avoids this entirely: the real `copilot` binary stays in PATH (so cplt can find and wrap it), and the alias transparently redirects your command.
 

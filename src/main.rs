@@ -185,6 +185,12 @@ struct Cli {
     #[arg(long)]
     shell_setup: bool,
 
+    /// Install the shell alias permanently into your shell rc file.
+    /// Detects your shell (zsh/bash/fish) and appends the setup line.
+    /// Safe to run multiple times — won't add duplicates.
+    #[arg(long)]
+    shell_install: bool,
+
     /// Run environment diagnostics and report what the sandbox will do.
     /// Checks auth mechanisms, Copilot CLI install, tool availability,
     /// and sandbox-critical paths. Exits 0 if all critical checks pass.
@@ -296,6 +302,11 @@ fn main() -> ExitCode {
     if cli.shell_setup {
         println!("alias copilot=cplt");
         return ExitCode::SUCCESS;
+    }
+
+    // Handle --shell-install: append setup line to shell rc file
+    if cli.shell_install {
+        return shell_install();
     }
 
     // macOS only
@@ -799,6 +810,101 @@ fn init_config() -> ExitCode {
         }
         Err(e) => {
             error(&format!("Cannot write config file: {e}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Install the cplt shell alias into the user's shell rc file.
+///
+/// Detects the current shell from $SHELL, picks the right rc file,
+/// and appends an eval line. Idempotent — won't add duplicates.
+fn shell_install() -> ExitCode {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let home = match std::env::var("HOME") {
+        Ok(h) => PathBuf::from(h),
+        Err(_) => {
+            error("$HOME not set");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (rc_file, setup_line) = if shell.ends_with("/fish") {
+        (
+            home.join(".config/fish/conf.d/cplt.fish"),
+            "alias copilot cplt\n",
+        )
+    } else if shell.ends_with("/bash") {
+        (home.join(".bashrc"), "eval \"$(cplt --shell-setup)\"\n")
+    } else {
+        // Default to zsh (macOS default)
+        (home.join(".zshrc"), "eval \"$(cplt --shell-setup)\"\n")
+    };
+
+    // Check if already installed
+    if rc_file.exists() {
+        match std::fs::read_to_string(&rc_file) {
+            Ok(contents) if contents.contains("cplt") => {
+                ok(&format!("Already installed in {}", rc_file.display()));
+                return ExitCode::SUCCESS;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error(&format!("Cannot read {}: {e}", rc_file.display()));
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // For fish, ensure the conf.d directory exists
+    if shell.ends_with("/fish")
+        && let Some(parent) = rc_file.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        error(&format!("Cannot create {}: {e}", parent.display()));
+        return ExitCode::FAILURE;
+    }
+
+    // Append the setup line
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&rc_file)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            error(&format!("Cannot open {}: {e}", rc_file.display()));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    use std::io::Write;
+    // Add a newline before our line if the file doesn't end with one
+    let needs_newline = rc_file.exists()
+        && std::fs::read_to_string(&rc_file)
+            .map(|c| !c.is_empty() && !c.ends_with('\n'))
+            .unwrap_or(false);
+
+    let content = if needs_newline {
+        format!("\n{setup_line}")
+    } else {
+        setup_line.to_string()
+    };
+
+    match file.write_all(content.as_bytes()) {
+        Ok(()) => {
+            ok(&format!(
+                "Installed 'copilot' alias in {}",
+                rc_file.display()
+            ));
+            info(&format!(
+                "Restart your shell or run: source {}",
+                rc_file.display()
+            ));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error(&format!("Cannot write to {}: {e}", rc_file.display()));
             ExitCode::FAILURE
         }
     }
