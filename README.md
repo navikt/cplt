@@ -15,6 +15,7 @@ macOS Seatbelt sandbox wrapper for GitHub Copilot CLI. Runs Copilot inside Apple
 
 - [Quick start](#quick-start)
 - [Install](#install)
+  - [Shell setup](#shell-setup-recommended)
 - [What it does](#what-it-does)
 - [Usage](#usage)
 - [Configuration file](#configuration-file)
@@ -114,6 +115,20 @@ Or with [mise](https://mise.jdx.dev):
 ```bash
 mise run install
 ```
+
+### Shell setup (recommended)
+
+By default, you run the sandboxed version with `cplt`. If you'd like `copilot` to run the sandboxed version too, add this to your shell rc file (`~/.zshrc`, `~/.bashrc`, etc.):
+
+```bash
+eval "$(cplt --shell-setup)"
+```
+
+This creates a shell alias `copilot=cplt`. When you type `copilot`, your shell runs `cplt` instead, which finds the real Copilot CLI in PATH and wraps it in the sandbox.
+
+**Why an alias instead of a symlink?** Both cplt and Copilot CLI install into the same Homebrew bin directory (`/opt/homebrew/bin/`). A symlink would conflict — only one file named `copilot` can exist there. A shell alias avoids this entirely: the real `copilot` binary stays in PATH (so cplt can find and wrap it), and the alias transparently redirects your command.
+
+> **Note:** cplt has recursion prevention built in. If it detects it's already running inside a sandbox (via the `__CPLT_WRAPPED` environment variable), it will refuse to launch again. Read-only subcommands like `--print-profile` and `--doctor` still work inside an existing sandbox.
 
 ## What it does
 
