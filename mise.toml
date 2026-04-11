@@ -26,31 +26,31 @@ description = "Build optimized release binary"
 run = "cargo build --release"
 
 [tasks.test]
-description = "Run all tests"
+description = "Run all tests (same as cargo test; macOS only)"
 run = "cargo test"
 
 [tasks."test:unit"]
-description = "Run unit tests only"
+description = "Run unit tests — cross-platform, safe inside sandbox and CI"
 run = "cargo test --test unit_tests"
 
 [tasks."test:integration"]
-description = "Run integration tests (macOS only)"
+description = "Run integration tests — requires macOS sandbox-exec, safe inside sandbox"
 run = "cargo test --test integration"
 
 [tasks."test:e2e"]
-description = "Run E2E tests (requires macOS + Copilot CLI)"
+description = "Run E2E tests — requires macOS + copilot binary in PATH"
 run = "cargo test --test e2e"
 
 [tasks."test:e2e-projects"]
-description = "Run E2E project scaffold tests (requires macOS)"
+description = "Run E2E project scaffold tests — requires macOS sandbox-exec"
 run = "cargo test --test e2e_projects"
 
 [tasks."test:e2e-live"]
-description = "Run live E2E tests that hit Copilot API (requires auth)"
+description = "Run live smoke tests — requires macOS + Copilot auth + network"
 run = "cargo test --test e2e -- --ignored"
 
 [tasks."test:all"]
-description = "Run all test suites (unit, integration, e2e, e2e-projects)"
+description = "Run all test suites except live smoke tests (macOS only)"
 depends = ["test:unit", "test:integration", "test:e2e", "test:e2e-projects"]
 
 [tasks.check]

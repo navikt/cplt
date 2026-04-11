@@ -6,8 +6,9 @@ Rust project — macOS Seatbelt sandbox wrapper for GitHub Copilot CLI.
 
 ```bash
 mise run check          # fmt + clippy + test (run before every commit)
-mise run test           # all tests
+mise run test           # all tests (macOS only)
 mise run test:unit      # unit tests only (cross-platform)
+mise run test:all       # all suites except live smoke tests (macOS only)
 mise run clippy         # linter
 mise run fmt            # auto-format
 ```
@@ -44,10 +45,21 @@ Always run `mise run check` at the end of a coding session.
 
 ## Testing
 
-Tests are split by platform requirement:
-- **unit_tests** run on any OS (Linux CI, macOS)
-- **integration** + **e2e** + **e2e_projects** require macOS with `sandbox-exec`
-- 6 smoke tests in `e2e.rs` are `#[ignore]` (need Copilot auth + network)
+Test suites and where they can run:
+
+| Task                    | Suite          | In sandbox | Linux CI | macOS CI | Requirements                  |
+|-------------------------|----------------|:----------:|:--------:|:--------:|-------------------------------|
+| `mise run test:unit`    | unit_tests     | ✅         | ✅       | ✅       | None                          |
+| `mise run test:integration` | integration | ✅         | ❌       | ✅       | macOS `sandbox-exec`          |
+| `mise run test:e2e`     | e2e            | ✅         | ❌       | ✅       | macOS + `copilot` in PATH     |
+| `mise run test:e2e-projects` | e2e_projects | ✅      | ❌       | ✅       | macOS `sandbox-exec`          |
+| `mise run test:e2e-live`| e2e (ignored)  | ❌         | ❌       | ⚠️       | macOS + Copilot auth + network|
+| `mise run test:all`     | all above      | ✅         | ❌       | ✅       | macOS + `copilot` in PATH     |
+
+- **unit_tests** are the only cross-platform suite — use `test:unit` on Linux CI
+- **integration**, **e2e**, **e2e_projects** all require macOS with `sandbox-exec`
+- **e2e-live** (6 smoke tests) need real Copilot auth and network — not for regular CI
+- All suites except **e2e-live** run fine inside the cplt sandbox
 
 When adding sandbox rules, add a unit test verifying the SBPL string.
 When adding config options, add a merge test in `config.rs`.
