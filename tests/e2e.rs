@@ -1260,4 +1260,92 @@ mod e2e_tests {
              Expected token: {token}\nstdout: {stdout}\nstderr: {stderr}"
         );
     }
+
+    // ============================================================
+    // Alias / symlink resolution tests
+    // ============================================================
+
+    #[test]
+    fn e2e_recursion_guard_blocks_nested_launch() {
+        require_sandbox!();
+        // Simulate being inside a cplt sandbox by setting __CPLT_WRAPPED
+        let fake_dir = create_fake_copilot();
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.display());
+
+        let output = Command::new(binary_path())
+            .args(["--yes", "--no-validate", "--", "--version"])
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .env("__CPLT_WRAPPED", "1")
+            .output()
+            .expect("binary should run");
+
+        std::fs::remove_dir_all(&fake_dir).ok();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "cplt should fail when __CPLT_WRAPPED is set.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("recursion"),
+            "error should mention recursion.\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_recursion_guard_allows_print_profile() {
+        // __CPLT_WRAPPED should NOT block --print-profile (read-only subcommand)
+        let output = Command::new(binary_path())
+            .args([
+                "--print-profile",
+                "--project-dir",
+                &project_dir().display().to_string(),
+            ])
+            .env("__CPLT_WRAPPED", "1")
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "--print-profile should work even with __CPLT_WRAPPED.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("deny default"),
+            "profile should contain deny default.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_symlink_self_detection_fails_gracefully() {
+        // Create a directory with only a copilot symlink pointing to cplt itself
+        let id = FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = project_dir().join(format!(".cplt-symlink-test-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(binary_path(), dir.join("copilot")).unwrap();
+
+        // PATH contains ONLY the symlink dir — no real copilot anywhere
+        let output = Command::new(binary_path())
+            .args(["--yes", "--no-validate", "--", "--version"])
+            .current_dir(project_dir())
+            .env("PATH", dir.display().to_string())
+            .output()
+            .expect("binary should run");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "cplt should fail when only a self-symlink is in PATH.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("Copilot CLI not found"),
+            "error should mention Copilot CLI not found.\nstderr: {stderr}"
+        );
+    }
 }

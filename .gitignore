@@ -4,3 +4,4 @@
 .cplt-e2e-*
 .cplt-smoke-*
 .cplt-fake-copilot-*
+nvim.log

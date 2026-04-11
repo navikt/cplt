@@ -421,21 +421,19 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Check copilot is installed
-    if std::process::Command::new("which")
-        .arg("copilot")
-        .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
-    {
-        error("GitHub Copilot CLI not found in PATH");
-        return ExitCode::FAILURE;
-    }
+    // Resolve the real Copilot CLI binary, skipping any cplt symlinks.
+    let copilot_bin = match resolve_copilot_binary() {
+        Ok(path) => path,
+        Err(msg) => {
+            error(&msg);
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
     // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
     // so extraction must happen here, outside.
-    ensure_copilot_extracted(&home_dir);
+    ensure_copilot_extracted(&copilot_bin, &home_dir);
 
     info(&format!("Project:  {}", project_dir.display()));
     info(&format!("Home:     {}", home_dir.display()));
@@ -500,6 +498,18 @@ fn main() -> ExitCode {
     if cli.print_profile {
         println!("{profile}");
         return ExitCode::SUCCESS;
+    }
+
+    // Recursion guard: detect if we're already inside a cplt sandbox.
+    // Placed after --print-profile/--doctor/--init-config so those subcommands
+    // still work inside the sandbox. Only the actual sandbox launch is blocked.
+    if std::env::var("__CPLT_WRAPPED").is_ok() {
+        error(
+            "cplt is already running (recursion detected). \
+             If 'copilot' is aliased to cplt, ensure the real Copilot CLI \
+             is also in PATH.",
+        );
+        return ExitCode::FAILURE;
     }
 
     // Write profile to temp file with unique name (prevents symlink attacks)
@@ -684,6 +694,7 @@ fn main() -> ExitCode {
 
     // Run copilot inside sandbox
     let exit_code = sandbox::exec(
+        &copilot_bin,
         &profile_path,
         &project_dir,
         &cli.copilot_args,
@@ -781,8 +792,8 @@ fn init_config() -> ExitCode {
 /// Parse the Copilot CLI version from `copilot --version` output.
 ///
 /// Returns e.g. `"1.0.24"` from `"GitHub Copilot CLI 1.0.24.\n..."`.
-fn get_copilot_version() -> Option<String> {
-    let output = std::process::Command::new("copilot")
+fn get_copilot_version(copilot_bin: &Path) -> Option<String> {
+    let output = std::process::Command::new(copilot_bin)
         .arg("--version")
         .output()
         .ok()?;
@@ -802,8 +813,8 @@ fn get_copilot_version() -> Option<String> {
 ///
 /// This function checks for the `.extraction-complete` marker and, if missing,
 /// runs `copilot` briefly to trigger the SEA loader extraction.
-fn ensure_copilot_extracted(home: &Path) {
-    let version = match get_copilot_version() {
+fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) {
+    let version = match get_copilot_version(copilot_bin) {
         Some(v) => v,
         None => return,
     };
@@ -831,7 +842,7 @@ fn ensure_copilot_extracted(home: &Path) {
     // Run copilot briefly to trigger SEA extraction. The extraction happens
     // during Node.js startup, before any CLI logic. We use `-p ""` to start
     // the runtime, then poll for the marker and kill the process once done.
-    let child = std::process::Command::new("copilot")
+    let child = std::process::Command::new(copilot_bin)
         .args(["--no-auto-update", "-p", ""])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -870,4 +881,40 @@ fn ensure_copilot_extracted(home: &Path) {
              try running 'copilot -p exit' manually"
         ));
     }
+}
+
+/// Resolve the real Copilot CLI binary, skipping any symlinks that point back to cplt.
+///
+/// Walks PATH entries looking for a `copilot` executable. Each candidate is
+/// canonicalized and compared to cplt's own binary path. The first non-self
+/// match is returned. This allows `copilot` → `cplt` symlinks to work without
+/// infinite recursion.
+fn resolve_copilot_binary() -> Result<PathBuf, String> {
+    let self_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(&p).ok());
+
+    let path_var = std::env::var("PATH").unwrap_or_default();
+
+    for dir in path_var.split(':') {
+        let candidate = PathBuf::from(dir).join("copilot");
+
+        // Must exist and be executable
+        if !candidate.is_file() {
+            continue;
+        }
+
+        // Resolve symlinks and compare to self
+        let resolved = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if self_exe.as_ref() == Some(&resolved) {
+            continue; // skip — this is cplt aliased as copilot
+        }
+
+        return Ok(resolved);
+    }
+
+    Err("GitHub Copilot CLI not found in PATH. \
+         If you installed cplt as a 'copilot' alias, the real Copilot CLI \
+         must also be in PATH (e.g. brew install --cask copilot-cli)."
+        .to_string())
 }

@@ -31,7 +31,9 @@ pub fn validate(profile_path: &Path, _project_dir: &Path, _home_dir: &Path) -> R
 /// - Legacy (inherit_env=true): all env vars inherited, only SSH_AUTH_SOCK and
 ///   color vars are stripped. Use only when the default breaks something.
 /// - Security hardening env vars are injected unless their category is disabled.
+#[allow(clippy::too_many_arguments)]
 pub fn exec(
+    copilot_bin: &Path,
     profile_path: &Path,
     project_dir: &Path,
     copilot_args: &[String],
@@ -41,7 +43,7 @@ pub fn exec(
     scratch_dir: Option<&Path>,
 ) -> u8 {
     let mut cmd = std::process::Command::new("sandbox-exec");
-    cmd.arg("-f").arg(profile_path).arg("copilot");
+    cmd.arg("-f").arg(profile_path).arg(copilot_bin);
 
     // Prevent Copilot from trying to auto-update inside the sandbox
     // (writes to ~/.copilot/pkg are denied, so it would fail anyway).
@@ -77,6 +79,10 @@ pub fn exec(
             cmd.env(key, val);
         }
     }
+
+    // Recursion guard: if copilot somehow re-invokes cplt (e.g. via symlink),
+    // cplt will see this and bail before launching another sandbox.
+    cmd.env("__CPLT_WRAPPED", "1");
 
     // Child inherits our process group — terminal signals (Ctrl+C)
     // reach both parent and child naturally. No setpgid/tcsetpgrp needed.
