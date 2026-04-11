@@ -25,8 +25,7 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 #[derive(Parser)]
 #[command(
     name = "cplt",
-    version,
-    long_version = LONG_VERSION,
+    version = LONG_VERSION,
     about,
     after_help = "\
 EXAMPLES:
