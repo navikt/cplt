@@ -69,6 +69,11 @@ Do not modify `blocked-domains.txt` without reviewing the domain's purpose.
 - `HomeToolDir` — per-directory exec/map/write permissions
 - Config precedence: CLI flag > config file > default (secure default)
 
+## Git conventions
+
+- Do **not** add `Co-authored-by` trailers to commits
+- GPG signing may be unavailable in sandbox; use `git -c commit.gpgSign=false commit` when needed
+
 ## Docs
 
 - [README.md](README.md) — usage, flags, troubleshooting
