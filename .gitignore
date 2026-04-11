@@ -5,3 +5,9 @@
 .cplt-smoke-*
 .cplt-fake-copilot-*
 nvim.log
+dist/
+internal/
+new-dir/
+output.txt
+src/utils.rs
+tests/test_new.py

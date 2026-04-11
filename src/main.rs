@@ -436,20 +436,6 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Resolve the real Copilot CLI binary, skipping any cplt symlinks.
-    let copilot_bin = match resolve_copilot_binary() {
-        Ok(path) => path,
-        Err(msg) => {
-            error(&msg);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
-    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
-    // so extraction must happen here, outside.
-    ensure_copilot_extracted(&copilot_bin, &home_dir);
-
     info(&format!("Project:  {}", project_dir.display()));
     info(&format!("Home:     {}", home_dir.display()));
 
@@ -509,7 +495,7 @@ fn main() -> ExitCode {
         allow_tmp_exec: resolved.allow_tmp_exec,
     });
 
-    // --print-profile: dump the SBPL and exit
+    // --print-profile: dump the SBPL and exit (no copilot binary needed)
     if cli.print_profile {
         println!("{profile}");
         return ExitCode::SUCCESS;
@@ -526,6 +512,20 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+
+    // Resolve the real Copilot CLI binary, skipping any cplt symlinks.
+    let copilot_bin = match resolve_copilot_binary() {
+        Ok(path) => path,
+        Err(msg) => {
+            error(&msg);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
+    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
+    // so extraction must happen here, outside.
+    ensure_copilot_extracted(&copilot_bin, &home_dir);
 
     // Write profile to temp file with unique name (prevents symlink attacks)
     let profile_path = std::env::temp_dir().join(format!(
