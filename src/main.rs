@@ -1,6 +1,6 @@
 use clap::Parser;
 use cplt::{config, discover, proxy, sandbox, scratch};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Run GitHub Copilot CLI inside a macOS sandbox.
@@ -432,6 +432,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
+    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
+    // so extraction must happen here, outside.
+    ensure_copilot_extracted(&home_dir);
+
     info(&format!("Project:  {}", project_dir.display()));
     info(&format!("Home:     {}", home_dir.display()));
 
@@ -770,5 +775,99 @@ fn init_config() -> ExitCode {
             error(&format!("Cannot write config file: {e}"));
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Parse the Copilot CLI version from `copilot --version` output.
+///
+/// Returns e.g. `"1.0.24"` from `"GitHub Copilot CLI 1.0.24.\n..."`.
+fn get_copilot_version() -> Option<String> {
+    let output = std::process::Command::new("copilot")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_whitespace()
+        .find(|s| s.starts_with(|c: char| c.is_ascii_digit()))
+        .map(|s| s.trim_end_matches('.').to_string())
+}
+
+/// Ensure Copilot's bundled package is extracted before entering the sandbox.
+///
+/// Copilot CLI (SEA binary) extracts its runtime into
+/// `~/Library/Caches/copilot/pkg/<platform>/<version>/` on first launch after
+/// an update. Writes to that directory are denied inside the sandbox to prevent
+/// write-then-exec attacks, so the extraction must happen outside.
+///
+/// This function checks for the `.extraction-complete` marker and, if missing,
+/// runs `copilot` briefly to trigger the SEA loader extraction.
+fn ensure_copilot_extracted(home: &Path) {
+    let version = match get_copilot_version() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        _ => return,
+    };
+
+    let pkg_dir = home
+        .join("Library/Caches/copilot/pkg")
+        .join(format!("darwin-{arch}"))
+        .join(&version);
+    let marker = pkg_dir.join(".extraction-complete");
+
+    if marker.exists() {
+        return;
+    }
+
+    info(&format!(
+        "Extracting Copilot {version} runtime (first run after update)..."
+    ));
+
+    // Run copilot briefly to trigger SEA extraction. The extraction happens
+    // during Node.js startup, before any CLI logic. We use `-p ""` to start
+    // the runtime, then poll for the marker and kill the process once done.
+    let child = std::process::Command::new("copilot")
+        .args(["--no-auto-update", "-p", ""])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Poll for extraction completion (typically < 2s).
+    for _ in 0..30 {
+        if marker.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            ok(&format!("Copilot {version} runtime extracted"));
+            return;
+        }
+        // Check if the process exited (extraction might have failed)
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Cleanup: kill if still running
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if marker.exists() {
+        ok(&format!("Copilot {version} runtime extracted"));
+    } else {
+        warn(&format!(
+            "Copilot {version} runtime extraction may have failed — \
+             try running 'copilot -p exit' manually"
+        ));
     }
 }
