@@ -2051,12 +2051,18 @@ mod e2e_tests {
             .output()
             .expect("should run");
 
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Rate limiting is expected in CI (shared runner IPs) — skip assertions
+        if stderr.contains("rate limit") {
+            eprintln!("Skipping: GitHub API rate limit hit");
+            return;
+        }
+
         assert!(
             output.status.success(),
-            "update --check should succeed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "update --check should succeed: {stderr}"
         );
-        let stderr = String::from_utf8_lossy(&output.stderr);
         // Should mention either "up to date", "available", "dev build", or "same date"
         assert!(
             stderr.contains("up to date")
