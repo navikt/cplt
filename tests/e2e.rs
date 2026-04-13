@@ -1668,4 +1668,298 @@ mod e2e_tests {
 
         let _ = std::fs::remove_dir_all(&fake_home);
     }
+
+    // ── config set / get e2e tests ────────────────────────────
+
+    fn make_config_home(label: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-{label}-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn e2e_config_set_creates_file_and_sets_value() {
+        let fake_home = make_config_home("set-create");
+        let config_path = fake_home.join(".config/cplt/config.toml");
+        assert!(!config_path.exists());
+
+        let output = Command::new(binary_path())
+            .args(["config", "set", "sandbox.quiet", "true"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "set should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(config_path.exists(), "config file should be created");
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("quiet = true"),
+            "file should contain the key: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_get_returns_default() {
+        let fake_home = make_config_home("get-default");
+
+        let output = Command::new(binary_path())
+            .args(["config", "get", "sandbox.quiet"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "false", "default should be false");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("default"),
+            "should indicate default value: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_then_get_roundtrip() {
+        let fake_home = make_config_home("set-get");
+
+        // Set a value
+        let set_out = Command::new(binary_path())
+            .args(["config", "set", "proxy.port", "9090"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        assert!(
+            set_out.status.success(),
+            "set: {}",
+            String::from_utf8_lossy(&set_out.stderr)
+        );
+
+        // Get it back
+        let get_out = Command::new(binary_path())
+            .args(["config", "get", "proxy.port"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        assert!(get_out.status.success());
+        let stdout = String::from_utf8_lossy(&get_out.stdout);
+        assert_eq!(stdout.trim(), "9090");
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_unset_reverts_to_default() {
+        let fake_home = make_config_home("set-unset");
+
+        // Set a value
+        Command::new(binary_path())
+            .args(["config", "set", "sandbox.quiet", "true"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+
+        // Unset it
+        let unset_out = Command::new(binary_path())
+            .args(["config", "set", "sandbox.quiet", "--unset"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        assert!(
+            unset_out.status.success(),
+            "unset: {}",
+            String::from_utf8_lossy(&unset_out.stderr)
+        );
+
+        // Get should return default
+        let get_out = Command::new(binary_path())
+            .args(["config", "get", "sandbox.quiet"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&get_out.stdout);
+        assert_eq!(stdout.trim(), "false", "should revert to default");
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_dangerous_requires_force() {
+        let fake_home = make_config_home("set-dangerous");
+
+        // Without --force should fail
+        let output = Command::new(binary_path())
+            .args(["config", "set", "sandbox.inherit_env", "true"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        assert!(!output.status.success(), "should fail without --force");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--force"),
+            "should mention --force: {stderr}"
+        );
+
+        // With --force should succeed
+        let output2 = Command::new(binary_path())
+            .args(["config", "set", "sandbox.inherit_env", "true", "--force"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        assert!(
+            output2.status.success(),
+            "should succeed with --force: {}",
+            String::from_utf8_lossy(&output2.stderr)
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_dangerous_false_no_force_needed() {
+        let fake_home = make_config_home("set-dangerous-false");
+
+        let output = Command::new(binary_path())
+            .args(["config", "set", "sandbox.inherit_env", "false"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        assert!(
+            output.status.success(),
+            "false should not require --force: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_invalid_key_fails() {
+        let fake_home = make_config_home("set-badkey");
+
+        let output = Command::new(binary_path())
+            .args(["config", "set", "sandbox.queit", "true"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("quiet"), "should suggest 'quiet': {stderr}");
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_get_invalid_key_fails() {
+        let fake_home = make_config_home("get-badkey");
+
+        let output = Command::new(binary_path())
+            .args(["config", "get", "nope"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        assert!(!output.status.success());
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_preserves_comments() {
+        let fake_home = make_config_home("set-comments");
+
+        // Create a config with comments via init
+        Command::new(binary_path())
+            .args(["config", "init"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+
+        let config_path = fake_home.join(".config/cplt/config.toml");
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        assert!(before.contains('#'), "init template should have comments");
+
+        // Set a value
+        Command::new(binary_path())
+            .args(["config", "set", "sandbox.quiet", "true"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            after.contains('#'),
+            "comments should be preserved after set"
+        );
+        assert!(
+            after.contains("quiet = true"),
+            "new value should be present: {after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_set_append_array() {
+        let fake_home = make_config_home("set-append");
+
+        // Set initial array
+        Command::new(binary_path())
+            .args(["config", "set", "allow.ports", "8080"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+
+        // Append another value
+        let output = Command::new(binary_path())
+            .args(["config", "set", "allow.ports", "--append", "9090"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        assert!(
+            output.status.success(),
+            "append: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Get should show both
+        let get_out = Command::new(binary_path())
+            .args(["config", "get", "allow.ports"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&get_out.stdout);
+        assert!(stdout.contains("8080"), "should have 8080: {stdout}");
+        assert!(stdout.contains("9090"), "should have 9090: {stdout}");
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
 }

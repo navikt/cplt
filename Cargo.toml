@@ -10,6 +10,7 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
+toml_edit = "0.22"
 
 [profile.release]
 strip = true

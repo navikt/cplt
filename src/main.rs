@@ -283,6 +283,40 @@ enum ConfigAction {
     /// Creates ~/.config/cplt/config.toml with all options commented out
     /// and explained. Will not overwrite an existing file.
     Init,
+
+    /// Get a config value (from file, or default if not set).
+    ///
+    /// Prints the value to stdout for scripting.
+    /// Example: cplt config get sandbox.quiet
+    Get {
+        /// Config key in section.key format (e.g., sandbox.quiet, proxy.port)
+        key: String,
+    },
+
+    /// Set a config value. Creates the config file if it doesn't exist.
+    ///
+    /// Example: cplt config set sandbox.quiet true
+    Set {
+        /// Config key in section.key format (e.g., sandbox.quiet, proxy.port)
+        key: String,
+
+        /// Value to set (omit when using --unset)
+        value: Option<String>,
+
+        /// Append value to an array key instead of replacing.
+        /// Only valid for array keys (allow.read, allow.ports, etc.)
+        #[arg(long)]
+        append: bool,
+
+        /// Remove the key from config file (reverts to built-in default)
+        #[arg(long)]
+        unset: bool,
+
+        /// Required when setting dangerous keys to true
+        /// (sandbox.inherit_env, sandbox.allow_tmp_exec)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 const GREEN: &str = "\x1b[0;32m";
@@ -910,6 +944,14 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
         ConfigAction::Show => run_config_show(),
         ConfigAction::Path => run_config_path(),
         ConfigAction::Init => init_config(),
+        ConfigAction::Get { key } => run_config_get(&key),
+        ConfigAction::Set {
+            key,
+            value,
+            append,
+            unset,
+            force,
+        } => run_config_set(&key, value.as_deref(), append, unset, force),
     }
 }
 
@@ -984,6 +1026,117 @@ fn run_config_path() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_config_get(key: &str) -> ExitCode {
+    let key_info = match config::lookup_key(key) {
+        Ok(k) => k,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let loaded = match config::Config::load_file() {
+        Ok(l) => l,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (value, from_file) = config::get_config_value(key_info, loaded.as_ref());
+    println!("{value}");
+    if !from_file {
+        eprintln!("{BLUE}[cplt]{NC} (default — not set in config file)");
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_config_set(
+    key: &str,
+    value: Option<&str>,
+    append: bool,
+    unset: bool,
+    force: bool,
+) -> ExitCode {
+    let op = match config::ConfigSetOp::new(key) {
+        Ok(op) => op,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Validate flag combinations
+    if unset && value.is_some() {
+        error("--unset does not take a value");
+        return ExitCode::FAILURE;
+    }
+    if unset && append {
+        error("--unset and --append are mutually exclusive");
+        return ExitCode::FAILURE;
+    }
+    if !unset && value.is_none() {
+        error(&format!(
+            "missing value for {key}\n  Usage: cplt config set {key} <VALUE>"
+        ));
+        return ExitCode::FAILURE;
+    }
+
+    // Dangerous key safeguard
+    if op.key_info.dangerous
+        && !unset
+        && let Some(val) = value
+        && val == "true"
+        && !force
+    {
+        error(&format!(
+            "{key} is a dangerous setting — it weakens sandbox security.\n  \
+             Add --force to confirm: cplt config set {key} true --force"
+        ));
+        return ExitCode::FAILURE;
+    }
+
+    // Load or create document
+    let mut doc = match op.load_document() {
+        Ok(d) => d,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Apply modification
+    let result = if unset {
+        config::unset_value_in_doc(&mut doc, op.key_info);
+        Ok(())
+    } else if append {
+        config::append_value_in_doc(&mut doc, op.key_info, value.unwrap())
+    } else {
+        config::set_value_in_doc(&mut doc, op.key_info, value.unwrap())
+    };
+
+    if let Err(e) = result {
+        error(&e);
+        return ExitCode::FAILURE;
+    }
+
+    // Write back
+    if let Err(e) = op.write_document(&doc) {
+        error(&e);
+        return ExitCode::FAILURE;
+    }
+
+    if unset {
+        ok(&format!("{key} removed (will use default)"));
+    } else if append {
+        ok(&format!("{key}: appended {}", value.unwrap()));
+    } else {
+        ok(&format!("{key} = {}", value.unwrap()));
+    }
+
+    ExitCode::SUCCESS
 }
 
 /// Install the cplt shell alias into the user's shell rc file.

@@ -925,6 +925,413 @@ fn value_type_name(v: &toml::Value) -> &'static str {
     }
 }
 
+// ── Config key registry (for get/set) ────────────────────────────────
+
+/// The type of a config value, used for parsing and display.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConfigValueType {
+    Bool,
+    U16,
+    Str,
+    U16Array,
+    StrArray,
+}
+
+/// Metadata about a single config key.
+#[derive(Debug, Clone)]
+pub struct ConfigKeyInfo {
+    pub section: &'static str,
+    pub key: &'static str,
+    pub value_type: ConfigValueType,
+    pub dangerous: bool,
+    /// Default value as displayed to the user.
+    pub default_display: &'static str,
+}
+
+/// All known config keys with their metadata.
+const CONFIG_KEYS: &[ConfigKeyInfo] = &[
+    // [proxy]
+    ConfigKeyInfo {
+        section: "proxy",
+        key: "enabled",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
+        key: "port",
+        value_type: ConfigValueType::U16,
+        dangerous: false,
+        default_display: "18080",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
+        key: "blocked_domains",
+        value_type: ConfigValueType::Str,
+        dangerous: false,
+        default_display: "",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
+        key: "allowed_domains",
+        value_type: ConfigValueType::Str,
+        dangerous: false,
+        default_display: "",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
+        key: "log_file",
+        value_type: ConfigValueType::Str,
+        dangerous: false,
+        default_display: "",
+    },
+    // [allow]
+    ConfigKeyInfo {
+        section: "allow",
+        key: "read",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[]",
+    },
+    ConfigKeyInfo {
+        section: "allow",
+        key: "write",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[]",
+    },
+    ConfigKeyInfo {
+        section: "allow",
+        key: "ports",
+        value_type: ConfigValueType::U16Array,
+        dangerous: false,
+        default_display: "[]",
+    },
+    ConfigKeyInfo {
+        section: "allow",
+        key: "localhost",
+        value_type: ConfigValueType::U16Array,
+        dangerous: false,
+        default_display: "[]",
+    },
+    // [deny]
+    ConfigKeyInfo {
+        section: "deny",
+        key: "paths",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[]",
+    },
+    // [sandbox]
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "validate",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "allow_env_files",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "allow_localhost_any",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "pass_env",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[]",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "inherit_env",
+        value_type: ConfigValueType::Bool,
+        dangerous: true,
+        default_display: "false",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "allow_lifecycle_scripts",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "allow_tmp_exec",
+        value_type: ConfigValueType::Bool,
+        dangerous: true,
+        default_display: "false",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "scratch_dir",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "quiet",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+    },
+];
+
+/// Look up a config key by "section.key" dotted notation.
+pub fn lookup_key(dotted: &str) -> Result<&'static ConfigKeyInfo, String> {
+    let (section, key) = dotted.split_once('.').ok_or_else(|| {
+        format!("invalid key format '{dotted}': expected section.key (e.g., sandbox.quiet)")
+    })?;
+
+    CONFIG_KEYS
+        .iter()
+        .find(|k| k.section == section && k.key == key)
+        .ok_or_else(|| {
+            // Try to give a helpful suggestion
+            let all_dotted: Vec<String> = CONFIG_KEYS
+                .iter()
+                .map(|k| format!("{}.{}", k.section, k.key))
+                .collect();
+            let all_refs: Vec<&str> = all_dotted.iter().map(|s| s.as_str()).collect();
+            let suggestion = suggest_key(dotted, &all_refs);
+            let hint = suggestion
+                .map(|s| format!("\n  Did you mean '{s}'?"))
+                .unwrap_or_default();
+            format!(
+                "unknown config key '{dotted}'{hint}\n  Valid keys: {}",
+                all_dotted.join(", ")
+            )
+        })
+}
+
+/// Get the effective value of a config key.
+/// Returns `(value_string, is_from_file)`.
+#[allow(clippy::collapsible_if)]
+pub fn get_config_value(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) -> (String, bool) {
+    if let Some(loaded) = loaded {
+        if let Ok(root) = loaded.raw.parse::<toml::Table>() {
+            if let Some(section) = root.get(key_info.section) {
+                if let Some(val) = section.get(key_info.key) {
+                    return (format_toml_value(val), true);
+                }
+            }
+        }
+    }
+
+    (key_info.default_display.to_string(), false)
+}
+
+fn format_toml_value(val: &toml::Value) -> String {
+    match val {
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_toml_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Parse a CLI value string into the correct TOML type for the given key.
+fn parse_value_for_key(key_info: &ConfigKeyInfo, value: &str) -> Result<toml_edit::Value, String> {
+    match key_info.value_type {
+        ConfigValueType::Bool => match value {
+            "true" => Ok(toml_edit::value(true).into_value().unwrap()),
+            "false" => Ok(toml_edit::value(false).into_value().unwrap()),
+            _ => Err(format!(
+                "invalid boolean value '{value}' for {}.{}: expected 'true' or 'false'",
+                key_info.section, key_info.key
+            )),
+        },
+        ConfigValueType::U16 => {
+            let n: u16 = value.parse().map_err(|_| {
+                format!(
+                    "invalid port value '{value}' for {}.{}: expected 1-65535",
+                    key_info.section, key_info.key
+                )
+            })?;
+            if n == 0 {
+                return Err(format!(
+                    "port 0 is not valid for {}.{}",
+                    key_info.section, key_info.key
+                ));
+            }
+            Ok(toml_edit::value(n as i64).into_value().unwrap())
+        }
+        ConfigValueType::Str => Ok(toml_edit::value(value).into_value().unwrap()),
+        ConfigValueType::U16Array => {
+            // Comma-separated: "8080,9090" or single "8080"
+            let mut arr = toml_edit::Array::new();
+            for item in value.split(',') {
+                let item = item.trim();
+                let n: u16 = item
+                    .parse()
+                    .map_err(|_| format!("invalid port value '{item}': expected 1-65535"))?;
+                if n == 0 {
+                    return Err("port 0 is not valid".to_string());
+                }
+                arr.push(n as i64);
+            }
+            Ok(toml_edit::Value::Array(arr))
+        }
+        ConfigValueType::StrArray => {
+            // Comma-separated: "path1,path2" or single "path1"
+            let mut arr = toml_edit::Array::new();
+            for item in value.split(',') {
+                arr.push(item.trim());
+            }
+            Ok(toml_edit::Value::Array(arr))
+        }
+    }
+}
+
+/// Parse a single element value for appending to an array.
+fn parse_element_for_key(
+    key_info: &ConfigKeyInfo,
+    value: &str,
+) -> Result<toml_edit::Value, String> {
+    match key_info.value_type {
+        ConfigValueType::U16Array => {
+            let n: u16 = value
+                .parse()
+                .map_err(|_| format!("invalid port value '{value}': expected 1-65535"))?;
+            if n == 0 {
+                return Err("port 0 is not valid".to_string());
+            }
+            Ok(toml_edit::value(n as i64).into_value().unwrap())
+        }
+        ConfigValueType::StrArray => Ok(toml_edit::value(value).into_value().unwrap()),
+        _ => Err(format!(
+            "{}.{} is not an array key — use 'set' without --append",
+            key_info.section, key_info.key
+        )),
+    }
+}
+
+/// Set a value in a TOML document, creating the section if needed.
+pub fn set_value_in_doc(
+    doc: &mut toml_edit::DocumentMut,
+    key_info: &ConfigKeyInfo,
+    value: &str,
+) -> Result<(), String> {
+    let typed_value = parse_value_for_key(key_info, value)?;
+
+    // Ensure section exists
+    if !doc.contains_table(key_info.section) {
+        doc[key_info.section] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    doc[key_info.section][key_info.key] = toml_edit::Item::Value(typed_value);
+    Ok(())
+}
+
+/// Append a value to an array in a TOML document.
+pub fn append_value_in_doc(
+    doc: &mut toml_edit::DocumentMut,
+    key_info: &ConfigKeyInfo,
+    value: &str,
+) -> Result<(), String> {
+    let element = parse_element_for_key(key_info, value)?;
+
+    // Ensure section exists
+    if !doc.contains_table(key_info.section) {
+        doc[key_info.section] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    let section = doc[key_info.section].as_table_mut().unwrap();
+    match section.get_mut(key_info.key) {
+        Some(item) => {
+            if let Some(arr) = item.as_array_mut() {
+                arr.push_formatted(element);
+                Ok(())
+            } else {
+                Err(format!(
+                    "{}.{} exists but is not an array",
+                    key_info.section, key_info.key
+                ))
+            }
+        }
+        None => {
+            let mut arr = toml_edit::Array::new();
+            arr.push_formatted(element);
+            section.insert(
+                key_info.key,
+                toml_edit::Item::Value(toml_edit::Value::Array(arr)),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Remove a key from a TOML document (--unset).
+pub fn unset_value_in_doc(doc: &mut toml_edit::DocumentMut, key_info: &ConfigKeyInfo) {
+    if let Some(section) = doc.get_mut(key_info.section).and_then(|s| s.as_table_mut()) {
+        section.remove(key_info.key);
+    }
+}
+
+/// The full set/get/unset operation on a config file.
+/// Handles file creation, validation, and write-back.
+pub struct ConfigSetOp {
+    pub key_info: &'static ConfigKeyInfo,
+    pub path: PathBuf,
+}
+
+impl ConfigSetOp {
+    pub fn new(dotted_key: &str) -> Result<Self, String> {
+        let key_info = lookup_key(dotted_key)?;
+        let path = config_path().ok_or("cannot determine config path ($HOME not set)")?;
+        Ok(Self { key_info, path })
+    }
+
+    /// Load the existing TOML document, or create an empty one.
+    pub fn load_document(&self) -> Result<toml_edit::DocumentMut, String> {
+        if self.path.exists() {
+            let raw = std::fs::read_to_string(&self.path)
+                .map_err(|e| format!("cannot read {}: {e}", self.path.display()))?;
+            raw.parse::<toml_edit::DocumentMut>()
+                .map_err(|e| format!("invalid TOML in {}: {e}", self.path.display()))
+        } else {
+            Ok(toml_edit::DocumentMut::new())
+        }
+    }
+
+    /// Write the document back, creating parent dirs if needed.
+    /// Only verifies the result is valid TOML (not full key validation —
+    /// an existing typo elsewhere shouldn't block a valid set operation).
+    pub fn write_document(&self, doc: &toml_edit::DocumentMut) -> Result<(), String> {
+        let output = doc.to_string();
+
+        // Sanity check: the result must still be valid TOML
+        if output.parse::<toml::Table>().is_err() {
+            return Err("modification produced invalid TOML (this is a bug)".to_string());
+        }
+
+        // Create parent dirs
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create config directory: {e}"))?;
+        }
+
+        std::fs::write(&self.path, output)
+            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
+    }
+}
+
 // ── Config display (effective config) ────────────────────────────────
 
 /// Display the effective configuration from a config file merged with defaults.
@@ -1591,5 +1998,208 @@ quiet = false
     fn config_parse_invalid() {
         let result = Config::parse("[broken");
         assert!(result.is_err());
+    }
+
+    // ── set/get infrastructure tests ──────────────────────────
+
+    #[test]
+    fn lookup_key_valid_keys() {
+        assert!(lookup_key("sandbox.quiet").is_ok());
+        assert!(lookup_key("proxy.port").is_ok());
+        assert!(lookup_key("allow.ports").is_ok());
+        assert!(lookup_key("deny.paths").is_ok());
+    }
+
+    #[test]
+    fn lookup_key_invalid_format() {
+        assert!(lookup_key("nope").is_err());
+        assert!(lookup_key("a.b.c").is_err());
+        assert!(lookup_key("").is_err());
+    }
+
+    #[test]
+    fn lookup_key_unknown_suggests() {
+        let err = lookup_key("sandbox.queit").unwrap_err();
+        assert!(err.contains("quiet"), "should suggest 'quiet': {err}");
+    }
+
+    #[test]
+    fn lookup_key_unknown_section() {
+        let err = lookup_key("bogus.key").unwrap_err();
+        assert!(err.contains("unknown config key"), "{err}");
+    }
+
+    #[test]
+    fn get_config_value_returns_default_when_no_file() {
+        let info = lookup_key("sandbox.quiet").unwrap();
+        let (val, from_file) = get_config_value(info, None);
+        assert_eq!(val, "false");
+        assert!(!from_file);
+    }
+
+    #[test]
+    fn get_config_value_returns_file_value() {
+        let info = lookup_key("sandbox.quiet").unwrap();
+        let loaded = LoadedConfig {
+            config: Config::parse("[sandbox]\nquiet = true\n").unwrap(),
+            raw: "[sandbox]\nquiet = true\n".to_string(),
+            path: std::path::PathBuf::from("/tmp/fake"),
+        };
+        let (val, from_file) = get_config_value(info, Some(&loaded));
+        assert_eq!(val, "true");
+        assert!(from_file);
+    }
+
+    #[test]
+    fn get_config_value_returns_array_from_file() {
+        let info = lookup_key("allow.ports").unwrap();
+        let raw = "[allow]\nports = [8080, 9090]\n";
+        let loaded = LoadedConfig {
+            config: Config::parse(raw).unwrap(),
+            raw: raw.to_string(),
+            path: std::path::PathBuf::from("/tmp/fake"),
+        };
+        let (val, from_file) = get_config_value(info, Some(&loaded));
+        assert!(from_file);
+        assert!(val.contains("8080"));
+        assert!(val.contains("9090"));
+    }
+
+    #[test]
+    fn set_value_in_doc_creates_section_and_key() {
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("sandbox.quiet").unwrap();
+        set_value_in_doc(&mut doc, info, "true").unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("[sandbox]"));
+        assert!(result.contains("quiet = true"));
+    }
+
+    #[test]
+    fn set_value_in_doc_overwrites_existing() {
+        let mut doc = "[sandbox]\nquiet = false\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("sandbox.quiet").unwrap();
+        set_value_in_doc(&mut doc, info, "true").unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("quiet = true"));
+        assert!(!result.contains("quiet = false"));
+    }
+
+    #[test]
+    fn set_value_in_doc_preserves_comments() {
+        let input = "# Important security comment\n[sandbox]\n# This is quiet\nquiet = false\n";
+        let mut doc = input.parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("sandbox.quiet").unwrap();
+        set_value_in_doc(&mut doc, info, "true").unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("Important security comment"));
+        assert!(result.contains("quiet = true"));
+    }
+
+    #[test]
+    fn set_value_in_doc_port_number() {
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("proxy.port").unwrap();
+        set_value_in_doc(&mut doc, info, "9090").unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("port = 9090"));
+    }
+
+    #[test]
+    fn set_value_in_doc_string_value() {
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("proxy.log_file").unwrap();
+        set_value_in_doc(&mut doc, info, "/tmp/proxy.log").unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("log_file = \"/tmp/proxy.log\""));
+    }
+
+    #[test]
+    fn set_value_in_doc_array_replacement() {
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("allow.ports").unwrap();
+        set_value_in_doc(&mut doc, info, "8080,9090").unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("8080"));
+        assert!(result.contains("9090"));
+    }
+
+    #[test]
+    fn set_value_rejects_invalid_bool() {
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("sandbox.quiet").unwrap();
+        assert!(set_value_in_doc(&mut doc, info, "yes").is_err());
+    }
+
+    #[test]
+    fn set_value_rejects_invalid_port() {
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("proxy.port").unwrap();
+        assert!(set_value_in_doc(&mut doc, info, "99999").is_err());
+        assert!(set_value_in_doc(&mut doc, info, "abc").is_err());
+    }
+
+    #[test]
+    fn append_value_in_doc_new_array() {
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("allow.ports").unwrap();
+        append_value_in_doc(&mut doc, info, "3000").unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("3000"));
+    }
+
+    #[test]
+    fn append_value_in_doc_existing_array() {
+        let mut doc = "[allow]\nports = [8080]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("allow.ports").unwrap();
+        append_value_in_doc(&mut doc, info, "9090").unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("8080"));
+        assert!(result.contains("9090"));
+    }
+
+    #[test]
+    fn append_rejects_non_array_key() {
+        let info = lookup_key("sandbox.quiet").unwrap();
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(append_value_in_doc(&mut doc, info, "true").is_err());
+    }
+
+    #[test]
+    fn unset_value_removes_key() {
+        let mut doc = "[sandbox]\nquiet = true\nvalidate = true\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("sandbox.quiet").unwrap();
+        unset_value_in_doc(&mut doc, info);
+        let result = doc.to_string();
+        assert!(!result.contains("quiet"));
+        assert!(result.contains("validate = true"));
+    }
+
+    #[test]
+    fn unset_value_noop_if_missing() {
+        let mut doc = "[sandbox]\nvalidate = true\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("sandbox.quiet").unwrap();
+        unset_value_in_doc(&mut doc, info);
+        let result = doc.to_string();
+        assert!(result.contains("validate = true"));
+    }
+
+    #[test]
+    fn dangerous_keys_are_marked() {
+        let inherit = lookup_key("sandbox.inherit_env").unwrap();
+        assert!(inherit.dangerous);
+        let tmp_exec = lookup_key("sandbox.allow_tmp_exec").unwrap();
+        assert!(tmp_exec.dangerous);
+
+        let quiet = lookup_key("sandbox.quiet").unwrap();
+        assert!(!quiet.dangerous);
     }
 }
