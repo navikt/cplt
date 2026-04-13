@@ -500,8 +500,9 @@ fn main() -> ExitCode {
             std::process::exit(1);
         });
 
-    let cfg = match config::Config::load() {
-        Ok(c) => c,
+    let (cfg, config_path) = match config::Config::load_file() {
+        Ok(Some(loaded)) => (loaded.config, Some(loaded.path)),
+        Ok(None) => (config::Config::default(), None),
         Err(e) => {
             error(&e);
             return ExitCode::FAILURE;
@@ -592,6 +593,9 @@ fn main() -> ExitCode {
     if !resolved.quiet {
         info(&format!("Project:  {}", project_dir.display()));
         info(&format!("Home:     {}", home_dir.display()));
+        if let Some(ref cp) = config_path {
+            info(&format!("Config:   {}", cp.display()));
+        }
     }
 
     // Validate all paths that will be interpolated into SBPL profile

@@ -150,23 +150,6 @@ pub struct LoadedConfig {
 }
 
 impl Config {
-    /// Load config from `~/.config/cplt/config.toml` (or CPLT_CONFIG).
-    /// Returns `Config::default()` if the file doesn't exist.
-    /// Returns an error if the file exists but is malformed or unreadable.
-    /// Prints the config path to stderr on success.
-    pub fn load() -> Result<Self, String> {
-        match Self::load_file()? {
-            Some(loaded) => {
-                eprintln!(
-                    "\x1b[0;34m[cplt]\x1b[0m Config:   {}",
-                    loaded.path.display()
-                );
-                Ok(loaded.config)
-            }
-            None => Ok(Config::default()),
-        }
-    }
-
     /// Load config file without printing anything.
     /// Returns `None` if no config file exists (HOME unset or file absent).
     /// Returns `Err` if the file exists but can't be read or parsed.
