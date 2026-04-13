@@ -577,7 +577,7 @@ impl Resolved {
         }
         eprintln!("{blue}[cplt]{nc}  {dim}Full profile:{nc}   cplt --print-profile");
         eprintln!(
-            "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet or sandbox.quiet = true to hide this{nc}"
+            "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet or: cplt config set sandbox.quiet true{nc}"
         );
         eprintln!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
     }
