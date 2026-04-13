@@ -179,8 +179,19 @@ impl Config {
             return Ok(None);
         }
 
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Cannot read config file {}: {e}", path.display()))?;
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "\x1b[0;34m[cplt]\x1b[0m Cannot read config file {}: {e}",
+                    path.display()
+                );
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(format!("Cannot read config file {}: {e}", path.display()));
+            }
+        };
 
         let config: Config =
             toml::from_str(&raw).map_err(|e| format!("Invalid TOML in {}: {e}", path.display()))?;
