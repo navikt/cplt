@@ -957,6 +957,8 @@ pub struct ConfigKeyInfo {
     pub dangerous: bool,
     /// Default value as displayed to the user.
     pub default_display: &'static str,
+    /// Human-readable description of what this key does.
+    pub description: &'static str,
 }
 
 /// All known config keys with their metadata.
@@ -968,6 +970,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
+        description: "Enable the CONNECT proxy for outbound HTTPS traffic logging and domain filtering.",
     },
     ConfigKeyInfo {
         section: "proxy",
@@ -975,6 +978,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::U16,
         dangerous: false,
         default_display: "18080",
+        description: "Local port for the CONNECT proxy listener.",
     },
     ConfigKeyInfo {
         section: "proxy",
@@ -982,6 +986,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Str,
         dangerous: false,
         default_display: "",
+        description: "Path to a file listing domains to block through the proxy (one per line).",
     },
     ConfigKeyInfo {
         section: "proxy",
@@ -989,6 +994,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Str,
         dangerous: false,
         default_display: "",
+        description: "Path to a file listing the only domains allowed through the proxy (allowlist mode).",
     },
     ConfigKeyInfo {
         section: "proxy",
@@ -996,6 +1002,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Str,
         dangerous: false,
         default_display: "",
+        description: "Path to write proxy connection logs (CONNECT requests and outcomes).",
     },
     // [allow]
     ConfigKeyInfo {
@@ -1004,6 +1011,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::StrArray,
         dangerous: false,
         default_display: "[]",
+        description: "Extra directories to allow read access (e.g., shared libraries outside the project).",
     },
     ConfigKeyInfo {
         section: "allow",
@@ -1011,6 +1019,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::StrArray,
         dangerous: false,
         default_display: "[]",
+        description: "Extra directories to allow write access (use sparingly — project dir is already writable).",
     },
     ConfigKeyInfo {
         section: "allow",
@@ -1018,6 +1027,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::U16Array,
         dangerous: false,
         default_display: "[]",
+        description: "Additional outbound ports to allow (443 is always allowed).",
     },
     ConfigKeyInfo {
         section: "allow",
@@ -1025,6 +1035,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::U16Array,
         dangerous: false,
         default_display: "[]",
+        description: "Specific localhost ports to allow outbound connections to (e.g., local dev servers).",
     },
     // [deny]
     ConfigKeyInfo {
@@ -1033,6 +1044,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::StrArray,
         dangerous: false,
         default_display: "[]",
+        description: "Extra paths to deny access to (overrides project-dir allows for sensitive subdirs).",
     },
     // [sandbox]
     ConfigKeyInfo {
@@ -1041,6 +1053,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "true",
+        description: "Validate the sandbox profile with sandbox-exec before launching Copilot.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1048,6 +1061,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
+        description: "Allow Copilot to read .env, .pem, .key files in the project directory.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1055,6 +1069,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
+        description: "Allow outbound connections to any localhost port (for local dev servers).",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1062,6 +1077,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::StrArray,
         dangerous: false,
         default_display: "[]",
+        description: "Extra environment variables to pass through to the sandbox (exact names).",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1069,6 +1085,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: true,
         default_display: "false",
+        description: "⚠️  DANGEROUS: Pass ALL environment variables instead of the safe allowlist. May leak secrets.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1076,6 +1093,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
+        description: "Allow npm/yarn/pnpm lifecycle scripts (postinstall, prepare, etc.) to run.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1083,6 +1101,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: true,
         default_display: "false",
+        description: "⚠️  DANGEROUS: Allow executing binaries from /tmp and /var/folders. Weakens code-exec isolation.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1090,6 +1109,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
+        description: "Create a per-session scratch directory and redirect TMPDIR into it.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1097,6 +1117,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
+        description: "Hide the startup configuration summary (sandbox rules, network, env info).",
     },
 ];
 
@@ -1125,6 +1146,68 @@ pub fn lookup_key(dotted: &str) -> Result<&'static ConfigKeyInfo, String> {
                 all_dotted.join(", ")
             )
         })
+}
+
+fn type_label(vt: ConfigValueType) -> &'static str {
+    match vt {
+        ConfigValueType::Bool => "bool",
+        ConfigValueType::U16 => "integer (1-65535)",
+        ConfigValueType::Str => "string",
+        ConfigValueType::U16Array => "integer array",
+        ConfigValueType::StrArray => "string array",
+    }
+}
+
+/// Print explanation of a single config key.
+pub fn explain_key(key_info: &ConfigKeyInfo) {
+    let blue = "\x1b[0;34m";
+    let bold = "\x1b[1m";
+    let dim = "\x1b[2m";
+    let yellow = "\x1b[0;33m";
+    let nc = "\x1b[0m";
+
+    eprintln!("{bold}{}.{}{nc}", key_info.section, key_info.key);
+    eprintln!("  {}", key_info.description);
+    eprintln!("  {dim}Type:{nc}    {}", type_label(key_info.value_type));
+    eprintln!("{dim}  Default:{nc} {}", key_info.default_display);
+    if key_info.dangerous {
+        eprintln!("  {yellow}Requires --force to enable{nc}");
+    }
+    eprintln!(
+        "  {blue}Set:{nc}     cplt config set {}.{} <value>",
+        key_info.section, key_info.key
+    );
+}
+
+/// Print explanation of all config keys, grouped by section.
+pub fn explain_all() {
+    let blue = "\x1b[0;34m";
+    let bold = "\x1b[1m";
+    let dim = "\x1b[2m";
+    let yellow = "\x1b[0;33m";
+    let nc = "\x1b[0m";
+
+    let mut current_section = "";
+    for key in CONFIG_KEYS {
+        if key.section != current_section {
+            if !current_section.is_empty() {
+                eprintln!();
+            }
+            eprintln!("{blue}[{bold}{}{nc}{blue}]{nc}", key.section);
+            current_section = key.section;
+        }
+        let danger = if key.dangerous {
+            format!(" {yellow}⚠{nc}")
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "  {bold}{:<25}{nc} {dim}{:<15}{nc} {}{danger}",
+            format!("{}.{}", key.section, key.key),
+            format!("({})", type_label(key.value_type)),
+            key.description.trim_start_matches("⚠️  DANGEROUS: "),
+        );
+    }
 }
 
 /// Get the effective value of a config key.

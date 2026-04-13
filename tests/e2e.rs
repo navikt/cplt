@@ -1976,4 +1976,53 @@ mod e2e_tests {
 
         let _ = std::fs::remove_dir_all(&fake_home);
     }
+
+    #[test]
+    fn e2e_config_explain_all_lists_keys() {
+        let output = Command::new(binary_path())
+            .args(["config", "explain"])
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("sandbox.quiet"),
+            "should list sandbox.quiet"
+        );
+        assert!(
+            stderr.contains("proxy.enabled"),
+            "should list proxy.enabled"
+        );
+        assert!(stderr.contains("sandbox"), "should have section headers");
+    }
+
+    #[test]
+    fn e2e_config_explain_single_key() {
+        let output = Command::new(binary_path())
+            .args(["config", "explain", "sandbox.quiet"])
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("sandbox.quiet"), "should show key name");
+        assert!(stderr.contains("bool"), "should show type");
+        assert!(
+            stderr.contains("cplt config set"),
+            "should show set command"
+        );
+    }
+
+    #[test]
+    fn e2e_config_explain_invalid_key() {
+        let output = Command::new(binary_path())
+            .args(["config", "explain", "sandbox.queit"])
+            .output()
+            .expect("should run");
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("quiet"), "should suggest quiet: {stderr}");
+    }
 }

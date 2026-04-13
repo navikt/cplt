@@ -47,6 +47,9 @@ EXAMPLES:
   cplt config show
     Show effective configuration (file + defaults)
 
+  cplt config explain sandbox.quiet
+    Learn what a config key does and how to set it
+
   eval \"$(cplt --shell-setup)\"
     Add to your shell rc so 'copilot' runs the sandboxed version
 "
@@ -316,6 +319,16 @@ enum ConfigAction {
         /// (sandbox.inherit_env, sandbox.allow_tmp_exec)
         #[arg(long)]
         force: bool,
+    },
+
+    /// Explain what config keys do.
+    ///
+    /// Without arguments, lists all keys with descriptions.
+    /// With a key, shows detailed info for that key.
+    /// Example: cplt config explain sandbox.quiet
+    Explain {
+        /// Config key to explain (omit to list all)
+        key: Option<String>,
     },
 }
 
@@ -952,6 +965,7 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
             unset,
             force,
         } => run_config_set(&key, value.as_deref(), append, unset, force),
+        ConfigAction::Explain { key } => run_config_explain(key.as_deref()),
     }
 }
 
@@ -1137,6 +1151,25 @@ fn run_config_set(
     }
 
     ExitCode::SUCCESS
+}
+
+fn run_config_explain(key: Option<&str>) -> ExitCode {
+    match key {
+        Some(k) => match config::lookup_key(k) {
+            Ok(info) => {
+                config::explain_key(info);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error(&e);
+                ExitCode::FAILURE
+            }
+        },
+        None => {
+            config::explain_all();
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 /// Install the cplt shell alias into the user's shell rc file.
