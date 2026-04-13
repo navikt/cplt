@@ -1408,4 +1408,264 @@ mod e2e_tests {
         // Cleanup
         let _ = std::fs::remove_dir_all(&fake_home);
     }
+
+    // ── Config subcommand e2e tests ─────────────────────────
+
+    #[test]
+    fn e2e_config_path_prints_path() {
+        let output = Command::new(binary_path())
+            .args(["config", "path"])
+            .output()
+            .expect("should run");
+        assert!(output.status.success(), "config path should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("config.toml"),
+            "should print config path: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_config_validate_no_config_succeeds() {
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-config-validate-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["config", "validate"])
+            .env("HOME", &fake_home)
+            .env(
+                "CPLT_CONFIG",
+                fake_home.join("nonexistent.toml").to_str().unwrap(),
+            )
+            .output()
+            .expect("should run");
+
+        // Should succeed (no config is not an error)
+        assert!(
+            output.status.success(),
+            "validate with no config should succeed"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No config file found"),
+            "should report no config: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_validate_valid_config_succeeds() {
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-config-valid-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let config_file = fake_home.join("config.toml");
+        std::fs::write(&config_file, "[sandbox]\nquiet = true\n").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["config", "validate"])
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "valid config should pass validation"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Config OK"), "should say OK: {stderr}");
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_validate_typo_fails() {
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-config-typo-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let config_file = fake_home.join("config.toml");
+        std::fs::write(&config_file, "[sandbox]\ninherit_evn = true\n").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["config", "validate"])
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+
+        assert!(
+            !output.status.success(),
+            "config with typo should fail validation"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("inherit_evn") && stderr.contains("did you mean"),
+            "should report typo with suggestion: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_show_displays_config() {
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-config-show-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let config_file = fake_home.join("config.toml");
+        std::fs::write(
+            &config_file,
+            "[proxy]\nenabled = true\nport = 9999\n[sandbox]\nquiet = true\n",
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["config", "show"])
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success(), "config show should succeed");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("9999"),
+            "should show configured port: {stderr}"
+        );
+        assert!(
+            stderr.contains("[proxy]"),
+            "should show proxy section: {stderr}"
+        );
+        assert!(
+            stderr.contains("[sandbox]"),
+            "should show sandbox section: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_show_no_config_shows_defaults() {
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-config-show-none-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["config", "show"])
+            .env(
+                "CPLT_CONFIG",
+                fake_home.join("nonexistent.toml").to_str().unwrap(),
+            )
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "show with no config should succeed (shows defaults)"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("(default)"),
+            "should show defaults: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_init_creates_file() {
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-config-init-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let config_file = fake_home.join(".config/cplt/config.toml");
+
+        let output = Command::new(binary_path())
+            .args(["config", "init"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success(), "config init should succeed");
+        assert!(config_file.exists(), "config file should be created");
+        let contents = std::fs::read_to_string(&config_file).unwrap();
+        assert!(
+            contents.contains("[sandbox]"),
+            "should have sandbox section"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_config_init_refuses_overwrite() {
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-config-init-ow-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        let config_dir = fake_home.join(".config/cplt");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), "# existing\n").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["config", "init"])
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+
+        assert!(
+            !output.status.success(),
+            "config init should fail when file exists"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn e2e_init_config_flag_still_works() {
+        // Verify the legacy --init-config flag still works
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-init-config-legacy-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let output = Command::new(binary_path())
+            .arg("--init-config")
+            .env("HOME", fake_home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG")
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success(), "--init-config should still work");
+        assert!(
+            fake_home.join(".config/cplt/config.toml").exists(),
+            "config file should be created"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
 }

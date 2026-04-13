@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use cplt::{config, discover, proxy, sandbox, scratch};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,8 +20,8 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 /// The filesystem isolation is the primary security control.
 ///
 /// Defaults can be saved to ~/.config/cplt/config.toml
-/// so you don't need to pass flags every time. Run --init-config to
-/// create a starter config.
+/// so you don't need to pass flags every time. Run `cplt config init` to
+/// create a starter config, or `cplt config validate` to check for typos.
 #[derive(Parser)]
 #[command(
     name = "cplt",
@@ -40,6 +40,12 @@ EXAMPLES:
 
   cplt --deny-path ~/.config/gh -- -p \"refactor auth\"
     Block access to a path that is normally allowed
+
+  cplt config validate
+    Check config file for typos and unknown keys
+
+  cplt config show
+    Show effective configuration (file + defaults)
 
   eval \"$(cplt --shell-setup)\"
     Add to your shell rc so 'copilot' runs the sandboxed version
@@ -232,10 +238,51 @@ struct Cli {
     #[arg(long)]
     no_quiet: bool,
 
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Everything after -- is passed directly to the copilot command.
     /// Example: cplt -- -p "fix the tests"
     #[arg(last = true)]
     copilot_args: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Manage cplt configuration.
+    ///
+    /// Validate, inspect, or initialize your config file.
+    /// Config is stored at ~/.config/cplt/config.toml (override with CPLT_CONFIG).
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Validate config file for syntax errors and unknown keys.
+    ///
+    /// Catches typos like `inherit_evn = true` that are silently
+    /// ignored at runtime. Also warns about dangerous settings.
+    Validate,
+
+    /// Show effective configuration (file values + defaults).
+    ///
+    /// Displays what cplt would use at runtime based on the config file,
+    /// without CLI flag overrides (those are ephemeral per-invocation).
+    Show,
+
+    /// Print config file path.
+    ///
+    /// Useful for scripting: $EDITOR $(cplt config path)
+    Path,
+
+    /// Create a starter config file with documented defaults.
+    ///
+    /// Creates ~/.config/cplt/config.toml with all options commented out
+    /// and explained. Will not overwrite an existing file.
+    Init,
 }
 
 const GREEN: &str = "\x1b[0;32m";
@@ -344,6 +391,13 @@ fn main() -> ExitCode {
     // Handle --shell-install: append setup line to shell rc file
     if cli.shell_install {
         return shell_install();
+    }
+
+    // Handle subcommands (these don't need macOS or sandbox)
+    if let Some(command) = cli.command {
+        return match command {
+            Command::Config { action } => run_config_command(action),
+        };
     }
 
     // macOS only
@@ -845,6 +899,88 @@ fn init_config() -> ExitCode {
         }
         Err(e) => {
             error(&format!("Cannot write config file: {e}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_config_command(action: ConfigAction) -> ExitCode {
+    match action {
+        ConfigAction::Validate => run_config_validate(),
+        ConfigAction::Show => run_config_show(),
+        ConfigAction::Path => run_config_path(),
+        ConfigAction::Init => init_config(),
+    }
+}
+
+fn run_config_validate() -> ExitCode {
+    let loaded = match config::Config::load_file() {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            let path_hint = config::config_path()
+                .map(|p| format!(" (looked for {})", p.display()))
+                .unwrap_or_default();
+            info(&format!("No config file found{path_hint}"));
+            info("Run `cplt config init` to create one.");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    info(&format!("Validating {}", loaded.path.display()));
+
+    let diagnostics = config::validate_config(&loaded.raw);
+
+    if diagnostics.is_empty() {
+        ok("Config OK ✓");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut has_errors = false;
+    for d in &diagnostics {
+        match d.level {
+            config::DiagnosticLevel::Error => {
+                has_errors = true;
+                error(&d.message);
+            }
+            config::DiagnosticLevel::Warning => {
+                warn(&d.message);
+            }
+        }
+    }
+
+    if has_errors {
+        ExitCode::FAILURE
+    } else {
+        ok("Config OK ✓ (with warnings)");
+        ExitCode::SUCCESS
+    }
+}
+
+fn run_config_show() -> ExitCode {
+    let loaded = match config::Config::load_file() {
+        Ok(l) => l,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    config::display_config(loaded.as_ref());
+    ExitCode::SUCCESS
+}
+
+fn run_config_path() -> ExitCode {
+    match config::config_path() {
+        Some(p) => {
+            println!("{}", p.display());
+            ExitCode::SUCCESS
+        }
+        None => {
+            error("Cannot determine config path ($HOME not set)");
             ExitCode::FAILURE
         }
     }

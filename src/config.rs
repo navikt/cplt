@@ -15,7 +15,7 @@ const CONFIG_DIR: &str = ".config/cplt";
 const CONFIG_FILE: &str = "config.toml";
 
 /// Top-level config file structure.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub proxy: ProxyConfig,
@@ -24,7 +24,7 @@ pub struct Config {
     pub sandbox: SandboxConfig,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     /// Enable the CONNECT proxy (default: false).
@@ -39,7 +39,7 @@ pub struct ProxyConfig {
     pub log_file: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct AllowConfig {
     /// Additional paths to allow reading.
@@ -52,14 +52,14 @@ pub struct AllowConfig {
     pub localhost: Vec<u16>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct DenyConfig {
     /// Additional paths to explicitly deny.
     pub paths: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct SandboxConfig {
     /// Run sandbox-exec validation test on startup (default: true).
@@ -141,28 +141,56 @@ pub struct CliFlags {
     pub no_quiet: bool,
 }
 
+/// Result of loading a config file from disk.
+pub struct LoadedConfig {
+    pub config: Config,
+    pub path: PathBuf,
+    /// Raw TOML text (retained for validation).
+    pub raw: String,
+}
+
 impl Config {
     /// Load config from `~/.config/cplt/config.toml` (or CPLT_CONFIG).
     /// Returns `Config::default()` if the file doesn't exist.
     /// Returns an error if the file exists but is malformed or unreadable.
+    /// Prints the config path to stderr on success.
     pub fn load() -> Result<Self, String> {
+        match Self::load_file()? {
+            Some(loaded) => {
+                eprintln!(
+                    "\x1b[0;34m[cplt]\x1b[0m Config:   {}",
+                    loaded.path.display()
+                );
+                Ok(loaded.config)
+            }
+            None => Ok(Config::default()),
+        }
+    }
+
+    /// Load config file without printing anything.
+    /// Returns `None` if no config file exists (HOME unset or file absent).
+    /// Returns `Err` if the file exists but can't be read or parsed.
+    pub fn load_file() -> Result<Option<LoadedConfig>, String> {
         let Some(path) = config_path() else {
-            return Ok(Config::default());
+            return Ok(None);
         };
 
         if !path.exists() {
-            return Ok(Config::default());
+            return Ok(None);
         }
 
-        let contents = std::fs::read_to_string(&path)
+        let raw = std::fs::read_to_string(&path)
             .map_err(|e| format!("Cannot read config file {}: {e}", path.display()))?;
 
-        let config: Config = toml::from_str(&contents)
-            .map_err(|e| format!("Invalid TOML in {}: {e}", path.display()))?;
+        let config: Config =
+            toml::from_str(&raw).map_err(|e| format!("Invalid TOML in {}: {e}", path.display()))?;
 
-        eprintln!("\x1b[0;34m[cplt]\x1b[0m Config:   {}", path.display());
+        Ok(Some(LoadedConfig { config, path, raw }))
+    }
 
-        Ok(config)
+    /// Parse config from a TOML string (no I/O, no side effects).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        toml::from_str(s).map_err(|e| format!("Invalid TOML: {e}"))
     }
 
     /// Merge config file values with CLI flags.
@@ -689,6 +717,380 @@ fn resolve_config_path(path: &str, config_dir: Option<&PathBuf>) -> Result<PathB
     std::fs::canonicalize(&full).map_err(|e| format!("path does not exist or is inaccessible: {e}"))
 }
 
+// ── Config validation (unknown key detection) ────────────────────────
+
+/// Valid keys for each TOML section. Used by `validate_config` to detect typos.
+const VALID_PROXY_KEYS: &[&str] = &[
+    "enabled",
+    "port",
+    "blocked_domains",
+    "allowed_domains",
+    "log_file",
+];
+const VALID_ALLOW_KEYS: &[&str] = &["read", "write", "ports", "localhost"];
+const VALID_DENY_KEYS: &[&str] = &["paths"];
+const VALID_SANDBOX_KEYS: &[&str] = &[
+    "validate",
+    "allow_env_files",
+    "allow_localhost_any",
+    "pass_env",
+    "inherit_env",
+    "allow_lifecycle_scripts",
+    "allow_tmp_exec",
+    "scratch_dir",
+    "quiet",
+];
+const VALID_SECTIONS: &[&str] = &["proxy", "allow", "deny", "sandbox"];
+
+/// A single validation diagnostic.
+#[derive(Debug)]
+pub struct ConfigDiagnostic {
+    pub level: DiagnosticLevel,
+    pub message: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DiagnosticLevel {
+    Error,
+    Warning,
+}
+
+impl std::fmt::Display for ConfigDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let prefix = match self.level {
+            DiagnosticLevel::Error => "error",
+            DiagnosticLevel::Warning => "warning",
+        };
+        write!(f, "{prefix}: {}", self.message)
+    }
+}
+
+/// Validate a TOML config string for unknown keys and dangerous settings.
+///
+/// This is stricter than runtime loading — runtime silently ignores unknown keys
+/// for forward compatibility, but `config validate` reports them so typos like
+/// `inherit_evn = true` don't silently fail.
+pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
+    let mut diagnostics = Vec::new();
+
+    // First check: is it valid TOML at all?
+    let table: toml::Table = match toml_text.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("invalid TOML syntax: {e}"),
+            });
+            return diagnostics;
+        }
+    };
+
+    // Check top-level keys (should all be known section names)
+    for key in table.keys() {
+        if !VALID_SECTIONS.contains(&key.as_str()) {
+            let suggestion = suggest_key(key, VALID_SECTIONS);
+            let hint = suggestion
+                .map(|s| format!(" (did you mean '{s}'?)"))
+                .unwrap_or_default();
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("unknown section [{key}]{hint}"),
+            });
+        }
+    }
+
+    // Check keys within each known section
+    check_section_keys(&table, "proxy", VALID_PROXY_KEYS, &mut diagnostics);
+    check_section_keys(&table, "allow", VALID_ALLOW_KEYS, &mut diagnostics);
+    check_section_keys(&table, "deny", VALID_DENY_KEYS, &mut diagnostics);
+    check_section_keys(&table, "sandbox", VALID_SANDBOX_KEYS, &mut diagnostics);
+
+    // Also verify it deserializes correctly (catches type errors)
+    if diagnostics
+        .iter()
+        .all(|d| d.level != DiagnosticLevel::Error)
+        && let Err(e) = toml::from_str::<Config>(toml_text)
+    {
+        diagnostics.push(ConfigDiagnostic {
+            level: DiagnosticLevel::Error,
+            message: format!("type error: {e}"),
+        });
+    }
+
+    // Warn about dangerous settings
+    if let Some(sandbox) = table.get("sandbox").and_then(|v| v.as_table()) {
+        if sandbox.get("inherit_env").and_then(|v| v.as_bool()) == Some(true) {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.inherit_env = true: all env vars will be exposed (DANGEROUS)"
+                    .to_string(),
+            });
+        }
+        if sandbox.get("allow_tmp_exec").and_then(|v| v.as_bool()) == Some(true) {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.allow_tmp_exec = true: exec from temp dirs enabled (DANGEROUS)"
+                    .to_string(),
+            });
+        }
+    }
+
+    diagnostics
+}
+
+fn check_section_keys(
+    table: &toml::Table,
+    section: &str,
+    valid_keys: &[&str],
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let Some(section_value) = table.get(section) else {
+        return;
+    };
+    let Some(section_table) = section_value.as_table() else {
+        diagnostics.push(ConfigDiagnostic {
+            level: DiagnosticLevel::Error,
+            message: format!(
+                "[{section}] must be a table, not a {}",
+                value_type_name(section_value)
+            ),
+        });
+        return;
+    };
+
+    for key in section_table.keys() {
+        if !valid_keys.contains(&key.as_str()) {
+            let suggestion = suggest_key(key, valid_keys);
+            let hint = suggestion
+                .map(|s| format!(" (did you mean '{s}'?)"))
+                .unwrap_or_default();
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("unknown key '{key}' in [{section}]{hint}"),
+            });
+        }
+    }
+}
+
+/// Suggest the closest valid key using simple edit distance.
+fn suggest_key<'a>(input: &str, valid: &[&'a str]) -> Option<&'a str> {
+    let input_lower = input.to_lowercase();
+    valid
+        .iter()
+        .filter_map(|&candidate| {
+            let dist = edit_distance(&input_lower, candidate);
+            // Only suggest if reasonably close (at most 3 edits and less than half the key length)
+            if dist <= 3 && dist < candidate.len() / 2 + 1 {
+                Some((candidate, dist))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|(_, d)| *d)
+        .map(|(s, _)| s)
+}
+
+/// Simple Levenshtein edit distance.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut matrix = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, val) in matrix[0].iter_mut().enumerate() {
+        *val = j;
+    }
+    for (i, a_char) in a.iter().enumerate() {
+        for (j, b_char) in b.iter().enumerate() {
+            let cost = if a_char == b_char { 0 } else { 1 };
+            matrix[i + 1][j + 1] = (matrix[i][j + 1] + 1)
+                .min(matrix[i + 1][j] + 1)
+                .min(matrix[i][j] + cost);
+        }
+    }
+    matrix[a.len()][b.len()]
+}
+
+fn value_type_name(v: &toml::Value) -> &'static str {
+    match v {
+        toml::Value::String(_) => "string",
+        toml::Value::Integer(_) => "integer",
+        toml::Value::Float(_) => "float",
+        toml::Value::Boolean(_) => "boolean",
+        toml::Value::Datetime(_) => "datetime",
+        toml::Value::Array(_) => "array",
+        toml::Value::Table(_) => "table",
+    }
+}
+
+// ── Config display (effective config) ────────────────────────────────
+
+/// Display the effective configuration from a config file merged with defaults.
+/// Shows what cplt would use at runtime (without CLI flag overrides).
+pub fn display_config(loaded: Option<&LoadedConfig>) {
+    let blue = "\x1b[0;34m";
+    let dim = "\x1b[2m";
+    let green = "\x1b[0;32m";
+    let yellow = "\x1b[0;33m";
+    let nc = "\x1b[0m";
+
+    let config = loaded.map(|l| &l.config);
+    let c = config.cloned().unwrap_or_default();
+
+    // Source label helper
+    let src =
+        |has_file_value: bool| -> &'static str { if has_file_value { "" } else { " (default)" } };
+
+    eprintln!("{blue}[cplt]{nc} ── Effective Configuration ──────────────────────");
+    eprintln!();
+
+    // Config file path
+    if let Some(l) = loaded {
+        eprintln!("{blue}[cplt]{nc}  {dim}File:{nc}  {}", l.path.display());
+    } else if let Some(p) = config_path() {
+        eprintln!(
+            "{blue}[cplt]{nc}  {dim}File:{nc}  {dim}(not found: {}){nc}",
+            p.display()
+        );
+    } else {
+        eprintln!("{blue}[cplt]{nc}  {dim}File:{nc}  {dim}(no config path — $HOME not set){nc}");
+    }
+    eprintln!();
+
+    // [proxy]
+    eprintln!("{blue}[cplt]{nc}  {dim}[proxy]{nc}");
+    let proxy_enabled = c.proxy.enabled.unwrap_or(false);
+    eprintln!(
+        "{blue}[cplt]{nc}    enabled          = {}{}{nc}{}",
+        if proxy_enabled { yellow } else { green },
+        proxy_enabled,
+        src(c.proxy.enabled.is_some())
+    );
+    eprintln!(
+        "{blue}[cplt]{nc}    port             = {}{}",
+        c.proxy.port.unwrap_or(18080),
+        src(c.proxy.port.is_some())
+    );
+    if let Some(ref bd) = c.proxy.blocked_domains {
+        eprintln!("{blue}[cplt]{nc}    blocked_domains  = \"{bd}\"");
+    }
+    if let Some(ref ad) = c.proxy.allowed_domains {
+        eprintln!("{blue}[cplt]{nc}    allowed_domains  = \"{ad}\"");
+    }
+    if let Some(ref lf) = c.proxy.log_file {
+        eprintln!("{blue}[cplt]{nc}    log_file         = \"{lf}\"");
+    }
+    eprintln!();
+
+    // [allow]
+    eprintln!("{blue}[cplt]{nc}  {dim}[allow]{nc}");
+    if c.allow.read.is_empty() {
+        eprintln!("{blue}[cplt]{nc}    read             = {dim}[]{nc}");
+    } else {
+        eprintln!("{blue}[cplt]{nc}    read             = {:?}", c.allow.read);
+    }
+    if c.allow.write.is_empty() {
+        eprintln!("{blue}[cplt]{nc}    write            = {dim}[]{nc}");
+    } else {
+        eprintln!(
+            "{blue}[cplt]{nc}    write            = {yellow}{:?}{nc}",
+            c.allow.write
+        );
+    }
+    if c.allow.ports.is_empty() {
+        eprintln!("{blue}[cplt]{nc}    ports            = {dim}[]{nc}");
+    } else {
+        eprintln!("{blue}[cplt]{nc}    ports            = {:?}", c.allow.ports);
+    }
+    if c.allow.localhost.is_empty() {
+        eprintln!("{blue}[cplt]{nc}    localhost         = {dim}[]{nc}");
+    } else {
+        eprintln!(
+            "{blue}[cplt]{nc}    localhost         = {:?}",
+            c.allow.localhost
+        );
+    }
+    eprintln!();
+
+    // [deny]
+    eprintln!("{blue}[cplt]{nc}  {dim}[deny]{nc}");
+    if c.deny.paths.is_empty() {
+        eprintln!("{blue}[cplt]{nc}    paths            = {dim}[]{nc}");
+    } else {
+        eprintln!("{blue}[cplt]{nc}    paths            = {:?}", c.deny.paths);
+    }
+    eprintln!();
+
+    // [sandbox]
+    eprintln!("{blue}[cplt]{nc}  {dim}[sandbox]{nc}");
+    let validate = c.sandbox.validate.unwrap_or(true);
+    eprintln!(
+        "{blue}[cplt]{nc}    validate              = {}{}",
+        validate,
+        src(c.sandbox.validate.is_some())
+    );
+    let allow_env_files = c.sandbox.allow_env_files.unwrap_or(false);
+    eprintln!(
+        "{blue}[cplt]{nc}    allow_env_files       = {}{}",
+        allow_env_files,
+        src(c.sandbox.allow_env_files.is_some())
+    );
+    let allow_localhost_any = c.sandbox.allow_localhost_any.unwrap_or(false);
+    eprintln!(
+        "{blue}[cplt]{nc}    allow_localhost_any    = {}{}",
+        allow_localhost_any,
+        src(c.sandbox.allow_localhost_any.is_some())
+    );
+    if !c.sandbox.pass_env.is_empty() {
+        eprintln!(
+            "{blue}[cplt]{nc}    pass_env              = {:?}",
+            c.sandbox.pass_env
+        );
+    }
+    let inherit_env = c.sandbox.inherit_env.unwrap_or(false);
+    if inherit_env {
+        let red = "\x1b[0;31m";
+        eprintln!("{blue}[cplt]{nc}    inherit_env           = {red}true{nc} ⚠ DANGEROUS");
+    } else {
+        eprintln!(
+            "{blue}[cplt]{nc}    inherit_env           = false{}",
+            src(c.sandbox.inherit_env.is_some())
+        );
+    }
+    let allow_lifecycle = c.sandbox.allow_lifecycle_scripts.unwrap_or(false);
+    eprintln!(
+        "{blue}[cplt]{nc}    allow_lifecycle_scripts = {}{}",
+        allow_lifecycle,
+        src(c.sandbox.allow_lifecycle_scripts.is_some())
+    );
+    let allow_tmp = c.sandbox.allow_tmp_exec.unwrap_or(false);
+    if allow_tmp {
+        let red = "\x1b[0;31m";
+        eprintln!("{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS");
+    } else {
+        eprintln!(
+            "{blue}[cplt]{nc}    allow_tmp_exec        = false{}",
+            src(c.sandbox.allow_tmp_exec.is_some())
+        );
+    }
+    let scratch = c.sandbox.scratch_dir.unwrap_or(false);
+    eprintln!(
+        "{blue}[cplt]{nc}    scratch_dir           = {}{}",
+        scratch,
+        src(c.sandbox.scratch_dir.is_some())
+    );
+    let quiet = c.sandbox.quiet.unwrap_or(false);
+    eprintln!(
+        "{blue}[cplt]{nc}    quiet                 = {}{}",
+        quiet,
+        src(c.sandbox.quiet.is_some())
+    );
+
+    eprintln!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,5 +1383,213 @@ validate = false
             })
             .unwrap();
         assert!(!resolved.quiet, "--no-quiet should always win over --quiet");
+    }
+
+    // ── Validation tests ────────────────────────────────────────
+
+    #[test]
+    fn validate_valid_config_no_diagnostics() {
+        let toml = r#"
+[proxy]
+enabled = true
+port = 9090
+
+[allow]
+read = ["/opt/homebrew"]
+ports = [8080]
+
+[deny]
+paths = ["~/.config/gcloud"]
+
+[sandbox]
+validate = true
+quiet = false
+"#;
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics.is_empty(),
+            "valid config should have no diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_empty_config_no_diagnostics() {
+        let diagnostics = validate_config("");
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn validate_detects_unknown_top_level_section() {
+        let toml = "[proxxy]\nenabled = true\n";
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.level == DiagnosticLevel::Error && d.message.contains("unknown section [proxxy]")
+            }),
+            "should detect unknown section: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_suggests_similar_section() {
+        let toml = "[sandox]\nquiet = true\n";
+        let diagnostics = validate_config(toml);
+        let msg = diagnostics
+            .iter()
+            .find(|d| d.message.contains("sandox"))
+            .unwrap();
+        assert!(
+            msg.message.contains("did you mean 'sandbox'?"),
+            "should suggest: {}",
+            msg.message
+        );
+    }
+
+    #[test]
+    fn validate_detects_unknown_key_in_section() {
+        let toml = "[sandbox]\ninherit_evn = true\n";
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.level == DiagnosticLevel::Error && d.message.contains("unknown key 'inherit_evn'")
+            }),
+            "should detect typo: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_suggests_similar_key() {
+        let toml = "[sandbox]\ninherit_evn = true\n";
+        let diagnostics = validate_config(toml);
+        let msg = diagnostics
+            .iter()
+            .find(|d| d.message.contains("inherit_evn"))
+            .unwrap();
+        assert!(
+            msg.message.contains("did you mean 'inherit_env'?"),
+            "should suggest: {}",
+            msg.message
+        );
+    }
+
+    #[test]
+    fn validate_detects_invalid_toml_syntax() {
+        let toml = "[sandbox\nquiet = true\n";
+        let diagnostics = validate_config(toml);
+        assert!(diagnostics.iter().any(|d| {
+            d.level == DiagnosticLevel::Error && d.message.contains("invalid TOML syntax")
+        }));
+    }
+
+    #[test]
+    fn validate_warns_about_dangerous_inherit_env() {
+        let toml = "[sandbox]\ninherit_env = true\n";
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.level == DiagnosticLevel::Warning && d.message.contains("DANGEROUS")
+            }),
+            "should warn about dangerous: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_warns_about_dangerous_tmp_exec() {
+        let toml = "[sandbox]\nallow_tmp_exec = true\n";
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.level == DiagnosticLevel::Warning && d.message.contains("DANGEROUS")
+            })
+        );
+    }
+
+    #[test]
+    fn validate_no_warning_for_safe_settings() {
+        let toml = "[sandbox]\nquiet = true\nscratch_dir = true\n";
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics.is_empty(),
+            "safe settings should have no diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_detects_type_error() {
+        let toml = "[proxy]\nport = \"not a number\"\n";
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| { d.level == DiagnosticLevel::Error && d.message.contains("type error") }),
+            "should catch type errors: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_detects_section_used_as_scalar() {
+        let toml = "proxy = true\n";
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.level == DiagnosticLevel::Error && d.message.contains("must be a table")
+            }),
+            "should detect section as scalar: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_default_config_template() {
+        let contents = default_config_contents();
+        let diagnostics = validate_config(&contents);
+        assert!(
+            diagnostics.is_empty(),
+            "default template should validate clean: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_multiple_unknown_keys_reported() {
+        let toml = "[sandbox]\nquiet_mode = true\nfast = true\n";
+        let diagnostics = validate_config(toml);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.level == DiagnosticLevel::Error)
+            .collect();
+        assert_eq!(
+            errors.len(),
+            2,
+            "should report both unknown keys: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn edit_distance_identical() {
+        assert_eq!(edit_distance("hello", "hello"), 0);
+    }
+
+    #[test]
+    fn edit_distance_one_char_diff() {
+        assert_eq!(edit_distance("inherit_env", "inherit_evn"), 2);
+    }
+
+    #[test]
+    fn edit_distance_empty_strings() {
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+    }
+
+    // ── from_str tests ────────────────────────────────────────
+
+    #[test]
+    fn config_parse_valid() {
+        let config = Config::parse("[sandbox]\nquiet = true\n").unwrap();
+        assert_eq!(config.sandbox.quiet, Some(true));
+    }
+
+    #[test]
+    fn config_parse_invalid() {
+        let result = Config::parse("[broken");
+        assert!(result.is_err());
     }
 }

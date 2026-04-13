@@ -1936,3 +1936,77 @@ fn config_parses_allow_tmp_exec() {
     let config: Config = toml::from_str("[sandbox]\nallow_tmp_exec = true\n").unwrap();
     assert_eq!(config.sandbox.allow_tmp_exec, Some(true));
 }
+
+// ============================================================
+// Config validation (unknown key detection)
+// ============================================================
+
+#[test]
+fn validate_catches_typo_in_sandbox_key() {
+    use cplt::config::{DiagnosticLevel, validate_config};
+    let diagnostics = validate_config("[sandbox]\ninherit_evn = true\n");
+    assert!(diagnostics.iter().any(|d| {
+        d.level == DiagnosticLevel::Error
+            && d.message.contains("inherit_evn")
+            && d.message.contains("did you mean")
+    }));
+}
+
+#[test]
+fn validate_catches_unknown_proxy_key() {
+    use cplt::config::{DiagnosticLevel, validate_config};
+    let diagnostics = validate_config("[proxy]\nenabled = true\ntimeout = 30\n");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| { d.level == DiagnosticLevel::Error && d.message.contains("timeout") })
+    );
+}
+
+#[test]
+fn validate_accepts_all_valid_keys() {
+    use cplt::config::validate_config;
+    let toml = r#"
+[proxy]
+enabled = false
+port = 18080
+blocked_domains = "file.txt"
+allowed_domains = "file.txt"
+log_file = "log.txt"
+
+[allow]
+read = []
+write = []
+ports = []
+localhost = []
+
+[deny]
+paths = []
+
+[sandbox]
+validate = true
+allow_env_files = false
+allow_localhost_any = false
+pass_env = []
+inherit_env = false
+allow_lifecycle_scripts = false
+allow_tmp_exec = false
+scratch_dir = false
+quiet = false
+"#;
+    let diagnostics = validate_config(toml);
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.level == cplt::config::DiagnosticLevel::Error)
+        .collect();
+    assert!(errors.is_empty(), "all valid keys should pass: {errors:?}");
+}
+
+#[test]
+fn config_from_str_round_trips() {
+    use cplt::config::Config;
+    let toml = "[proxy]\nenabled = true\nport = 1234\n";
+    let config = Config::parse(toml).unwrap();
+    assert_eq!(config.proxy.enabled, Some(true));
+    assert_eq!(config.proxy.port, Some(1234));
+}
