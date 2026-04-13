@@ -56,7 +56,7 @@ jobs:
         run: |
           COMMIT_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:7}"
-          VERSION="$(date -u +%Y.%m.%d)-${SHORT_SHA}"
+          VERSION="$(date -u +%Y.%m.%d.%H.%M.%S)-${SHORT_SHA}"
           CPLT_LONG_VERSION="$VERSION" cargo build --release --target ${{ matrix.target }}
 
       - name: Package
@@ -102,7 +102,7 @@ jobs:
         run: |
           COMMIT_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:7}"
-          DATE=$(date -u +%Y.%m.%d)
+          DATE=$(date -u +%Y.%m.%d.%H.%M.%S)
           echo "tag=cplt/${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "title=cplt ${DATE} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
           echo "sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
