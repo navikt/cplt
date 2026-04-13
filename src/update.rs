@@ -62,7 +62,7 @@ pub fn fetch_latest_release(current_version: &str) -> Result<Release, String> {
         if let Some(tag) = rel.get("tag_name").and_then(|v| v.as_str()) {
             // Accept both "cplt/VERSION" and bare "VERSION" tag formats
             let version = tag.strip_prefix("cplt/").unwrap_or(tag);
-            // Validate it looks like a version (YYYY.MM.DD.HH.MM.SS-SHA or YYYY.MM.DD-SHA)
+            // Validate it looks like a version (YYYY.MM.DD-HHMMSS-SHA or legacy formats)
             if looks_like_version(version) {
                 return Ok(Release {
                     tag: tag.to_string(),
@@ -220,33 +220,56 @@ pub fn asset_name(arch: &str) -> String {
 }
 
 /// Check if a string looks like a cplt version.
-/// Accepts both old format (YYYY.MM.DD-SHA) and new format (YYYY.MM.DD.HH.MM.SS-SHA).
+/// Accepts formats:
+///   - YYYY.MM.DD-SHA (legacy)
+///   - YYYY.MM.DD.HH.MM.SS-SHA (intermediate)
+///   - YYYY.MM.DD-HHMMSS-SHA (current)
 pub fn looks_like_version(s: &str) -> bool {
-    let parts: Vec<&str> = s.splitn(2, '-').collect();
-    if parts.len() != 2 {
+    // SHA is always the last dash-separated segment
+    let Some((prefix, sha)) = s.rsplit_once('-') else {
+        return false;
+    };
+    if sha.is_empty() {
         return false;
     }
-    let date_parts: Vec<&str> = parts[0].split('.').collect();
-    // Accept 3 parts (old: YYYY.MM.DD) or 6 parts (new: YYYY.MM.DD.HH.MM.SS)
+
+    // Try current format: YYYY.MM.DD-HHMMSS
+    if let Some((date_str, time_str)) = prefix.rsplit_once('-') {
+        let date_parts: Vec<&str> = date_str.split('.').collect();
+        if date_parts.len() == 3
+            && date_parts[0].len() == 4
+            && date_parts[1..].iter().all(|p| p.len() == 2)
+            && date_parts
+                .iter()
+                .all(|p| p.chars().all(|c| c.is_ascii_digit()))
+            && time_str.len() == 6
+            && time_str.chars().all(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+
+    // Try legacy formats: YYYY.MM.DD or YYYY.MM.DD.HH.MM.SS (no time dash)
+    let date_parts: Vec<&str> = prefix.split('.').collect();
     if date_parts.len() != 3 && date_parts.len() != 6 {
         return false;
     }
-    // Year should be 4 digits, all others 2 digits
     date_parts[0].len() == 4
         && date_parts[1..].iter().all(|p| p.len() == 2)
         && date_parts
             .iter()
             .all(|p| p.chars().all(|c| c.is_ascii_digit()))
-        && !parts[1].is_empty()
 }
 
-/// Extract the date+time portion of a version string for comparison.
-/// Returns everything before the first `-`. Lexicographic comparison
-/// works for both "YYYY.MM.DD" and "YYYY.MM.DD.HH.MM.SS" formats,
-/// and correctly orders new-format versions after old-format ones
-/// (e.g., "2026.04.13.17.00.00" > "2026.04.13").
+/// Extract the sortable date+time portion of a version string.
+/// Returns everything before the last `-` (the git SHA).
+/// Lexicographic comparison works correctly across all formats:
+///   "2026.04.13" < "2026.04.13-173045" < "2026.04.13.17.30.45"
 pub fn version_date(version: &str) -> &str {
-    version.split('-').next().unwrap_or("")
+    version
+        .rsplit_once('-')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(version)
 }
 
 /// Parse SHA256SUMS content and find the hash for a given asset.
@@ -501,12 +524,14 @@ mod tests {
 
     #[test]
     fn version_looks_valid() {
-        // Old format (YYYY.MM.DD-SHA)
+        // Legacy format (YYYY.MM.DD-SHA)
         assert!(looks_like_version("2026.04.13-a1b2c3d"));
         assert!(looks_like_version("2024.12.01-abc1234"));
-        // New format (YYYY.MM.DD.HH.MM.SS-SHA)
+        // Intermediate format (YYYY.MM.DD.HH.MM.SS-SHA)
         assert!(looks_like_version("2026.04.13.17.30.45-a1b2c3d"));
-        assert!(looks_like_version("2024.12.01.00.00.00-abc1234"));
+        // Current format (YYYY.MM.DD-HHMMSS-SHA)
+        assert!(looks_like_version("2026.04.13-173045-a1b2c3d"));
+        assert!(looks_like_version("2024.12.01-000000-abc1234"));
     }
 
     #[test]
@@ -516,13 +541,20 @@ mod tests {
         assert!(!looks_like_version("not-a-version"));
         assert!(!looks_like_version(""));
         assert!(!looks_like_version("2026.4.13-abc")); // month not 2 digits
-        assert!(!looks_like_version("2026.04.13.17.30-abc")); // 5 parts (invalid)
-        assert!(!looks_like_version("2026.04.13.7.30.45-abc")); // hour not 2 digits
+        assert!(!looks_like_version("2026.04.13.17.30-abc")); // 5 dot-parts (invalid)
+        assert!(!looks_like_version("2026.04.13-1730-abc")); // time not 6 digits
     }
 
     #[test]
     fn version_date_extraction() {
+        // Legacy: everything before the single dash
         assert_eq!(version_date("2026.04.13-a1b2c3d"), "2026.04.13");
+        // Current: everything before the last dash (date-time portion)
+        assert_eq!(
+            version_date("2026.04.13-173045-a1b2c3d"),
+            "2026.04.13-173045"
+        );
+        // Intermediate
         assert_eq!(
             version_date("2026.04.13.17.30.45-a1b2c3d"),
             "2026.04.13.17.30.45"
@@ -532,42 +564,41 @@ mod tests {
 
     #[test]
     fn version_comparison_newer() {
-        // New format: later timestamp is newer
         let latest = Release {
-            tag: "cplt/2026.04.15.10.00.00-abc1234".to_string(),
-            version: "2026.04.15.10.00.00-abc1234".to_string(),
+            tag: "cplt/2026.04.15-100000-abc1234".to_string(),
+            version: "2026.04.15-100000-abc1234".to_string(),
         };
-        let status = check_version("2026.04.13.08.00.00-def5678", &latest);
+        let status = check_version("2026.04.13-080000-def5678", &latest);
         assert!(matches!(status, VersionStatus::UpdateAvailable { .. }));
     }
 
     #[test]
     fn version_comparison_up_to_date() {
         let latest = Release {
-            tag: "cplt/2026.04.13.17.30.45-abc1234".to_string(),
-            version: "2026.04.13.17.30.45-abc1234".to_string(),
+            tag: "cplt/2026.04.13-173045-abc1234".to_string(),
+            version: "2026.04.13-173045-abc1234".to_string(),
         };
-        let status = check_version("2026.04.13.17.30.45-abc1234", &latest);
+        let status = check_version("2026.04.13-173045-abc1234", &latest);
         assert_eq!(status, VersionStatus::UpToDate);
     }
 
     #[test]
     fn version_comparison_local_newer() {
         let latest = Release {
-            tag: "cplt/2026.04.10.12.00.00-abc1234".to_string(),
-            version: "2026.04.10.12.00.00-abc1234".to_string(),
+            tag: "cplt/2026.04.10-120000-abc1234".to_string(),
+            version: "2026.04.10-120000-abc1234".to_string(),
         };
-        let status = check_version("2026.04.13.08.00.00-def5678", &latest);
+        let status = check_version("2026.04.13-080000-def5678", &latest);
         assert_eq!(status, VersionStatus::UpToDate);
     }
 
     #[test]
     fn version_comparison_same_date_different_sha() {
         let latest = Release {
-            tag: "cplt/2026.04.13.17.30.45-abc1234".to_string(),
-            version: "2026.04.13.17.30.45-abc1234".to_string(),
+            tag: "cplt/2026.04.13-173045-abc1234".to_string(),
+            version: "2026.04.13-173045-abc1234".to_string(),
         };
-        let status = check_version("2026.04.13.17.30.45-def5678", &latest);
+        let status = check_version("2026.04.13-173045-def5678", &latest);
         assert!(matches!(
             status,
             VersionStatus::SameDateDifferentBuild { .. }
@@ -577,8 +608,8 @@ mod tests {
     #[test]
     fn version_comparison_dev_build() {
         let latest = Release {
-            tag: "cplt/2026.04.13.17.30.45-abc1234".to_string(),
-            version: "2026.04.13.17.30.45-abc1234".to_string(),
+            tag: "cplt/2026.04.13-173045-abc1234".to_string(),
+            version: "2026.04.13-173045-abc1234".to_string(),
         };
         let status = check_version("0.0.0", &latest);
         assert!(matches!(status, VersionStatus::DevBuild { .. }));
@@ -586,13 +617,23 @@ mod tests {
 
     #[test]
     fn version_comparison_cross_format() {
-        // New format should be considered newer than old format for same date
-        // because "2026.04.15.10.00.00" > "2026.04.13" lexicographically
+        // Current format release vs legacy local version
         let latest = Release {
-            tag: "cplt/2026.04.15.10.00.00-abc1234".to_string(),
-            version: "2026.04.15.10.00.00-abc1234".to_string(),
+            tag: "cplt/2026.04.15-100000-abc1234".to_string(),
+            version: "2026.04.15-100000-abc1234".to_string(),
         };
         let status = check_version("2026.04.13-def5678", &latest);
+        assert!(matches!(status, VersionStatus::UpdateAvailable { .. }));
+    }
+
+    #[test]
+    fn version_same_day_different_time() {
+        // Same day but different time → later time is newer
+        let latest = Release {
+            tag: "cplt/2026.04.13-180000-abc1234".to_string(),
+            version: "2026.04.13-180000-abc1234".to_string(),
+        };
+        let status = check_version("2026.04.13-120000-def5678", &latest);
         assert!(matches!(status, VersionStatus::UpdateAvailable { .. }));
     }
 
