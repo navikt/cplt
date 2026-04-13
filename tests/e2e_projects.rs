@@ -17,9 +17,15 @@ mod project_tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
     static PROJECT_COUNTER: AtomicU32 = AtomicU32::new(0);
+    /// Each proxy test gets a unique port to avoid collisions in parallel runs.
+    static PROXY_PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
+
+    fn next_proxy_port() -> u16 {
+        19400 + PROXY_PORT_COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
 
     // ── Guards ─────────────────────────────────────────────────────
 
@@ -841,7 +847,7 @@ fi
     fn project_with_proxy_mode() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = 19400 + (std::process::id() % 600) as u16;
+        let port = next_proxy_port();
 
         // Fake copilot that just reads a file (basic smoke test with proxy)
         let script = script_file_ops(&["package.json"], "output.txt");
@@ -982,7 +988,7 @@ if /bin/rm -rf test-spawn-dir 2>/dev/null; then echo "RESULT:exec_rm:OK"; else e
     fn project_proxy_env_vars_injected() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = 19500 + (std::process::id() % 400) as u16;
+        let port = next_proxy_port();
 
         let script = r#"
 # Proxy env vars should be set when --with-proxy is used
@@ -1018,7 +1024,7 @@ if [ -n "${no_proxy:-}" ]; then echo "RESULT:no_proxy_lower:OK"; else echo "RESU
     fn project_proxy_port_filtering() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = 19600 + (std::process::id() % 400) as u16;
+        let port = next_proxy_port();
 
         // Script that tries to connect to various ports through the proxy.
         // For port 443 we use a non-existent host — the proxy allows the port
@@ -1081,7 +1087,7 @@ if [ -z "${HTTPS_PROXY:-}" ]; then echo "RESULT:no_https_proxy:OK"; else echo "R
     fn project_proxy_allowlist_blocks_unlisted() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = 19700 + (std::process::id() % 300) as u16;
+        let port = next_proxy_port();
 
         // Create an allowlist with only one domain
         let allowlist_path = project.path().join("allowed-domains.txt");
@@ -1118,7 +1124,7 @@ if echo "$RESP" | grep -q "403"; then echo "RESULT:blocked_unlisted:OK"; else ec
     fn project_proxy_audit_log_written() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
-        let port = 19800 + (std::process::id() % 200) as u16;
+        let port = next_proxy_port();
         let log_path = project.path().join("proxy-audit.log");
 
         // Send a CONNECT through the proxy to generate a log entry
