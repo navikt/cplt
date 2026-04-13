@@ -178,6 +178,66 @@ mod project_tests {
             p.write_file(".env", "RUST_LOG=debug\nSECRET=hidden\n");
             p
         }
+
+        fn scaffold_kotlin_ktor() -> Self {
+            let p = Self::new("kotlin-ktor");
+            p.write_file(
+                "build.gradle.kts",
+                r#"plugins {
+    kotlin("jvm") version "2.1.20"
+    id("io.ktor.plugin") version "3.1.2"
+}
+
+group = "com.example"
+version = "0.0.1"
+
+application {
+    mainClass = "com.example.ApplicationKt"
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("io.ktor:ktor-server-core")
+    implementation("io.ktor:ktor-server-netty")
+    testImplementation("io.ktor:ktor-server-test-host")
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit")
+}
+"#,
+            );
+            p.write_file(
+                "settings.gradle.kts",
+                "rootProject.name = \"test-ktor-app\"\n",
+            );
+            p.write_file(
+                "src/main/kotlin/com/example/Application.kt",
+                r#"package com.example
+
+import io.ktor.server.application.*
+import io.ktor.server.engine.*
+import io.ktor.server.netty.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+
+fun main() {
+    embeddedServer(Netty, port = 8080) {
+        routing {
+            get("/") {
+                call.respondText("Hello, world!")
+            }
+        }
+    }.start(wait = true)
+}
+"#,
+            );
+            p.write_file("README.md", "# Test Kotlin Ktor App\n");
+            p.write_file(".gitignore", ".env*\nbuild/\n.gradle/\n");
+            p.git_init();
+            p.write_file(".env", "DB_URL=jdbc:postgresql://localhost/prod\n");
+            p
+        }
     }
 
     impl Drop for TempProject {
@@ -1103,6 +1163,14 @@ echo "RESULT:sent:OK"
     // Go toolchain sandbox tests
     // ============================================================
 
+    fn gradle_available() -> bool {
+        Command::new("gradle")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn go_available() -> bool {
         Command::new("go")
             .arg("version")
@@ -1252,5 +1320,86 @@ esac
         // go test should be blocked: sandbox denies exec from temp dirs
         assert_result_fail(&stdout, "go_test_no_scratch");
         assert_result_ok(&stdout, "deny_signature");
+    }
+
+    // ============================================================
+    // Gradle/Kotlin/Ktor tests
+    // ============================================================
+
+    /// Gradle build is blocked in the sandbox due to socket permission
+    /// restrictions. Gradle's daemon (and even --no-daemon mode) requires
+    /// Unix domain sockets that `(deny default)` blocks.
+    #[test]
+    fn project_gradle_build_blocked_by_socket_deny() {
+        require_sandbox!();
+        if !gradle_available() {
+            eprintln!("SKIPPED: gradle not available");
+            return;
+        }
+
+        let project = TempProject::scaffold_kotlin_ktor();
+
+        let script = r#"
+# Run gradle with --no-daemon to avoid background daemon complexity.
+# Even --no-daemon still needs sockets for internal JVM communication.
+if GRADLE_OUTPUT=$(gradle build --no-daemon 2>&1); then
+    echo "RESULT:gradle_build:OK"
+else
+    echo "RESULT:gradle_build:FAIL"
+fi
+
+# Verify the failure is a socket/permission deny, not some other error
+case "$GRADLE_OUTPUT" in
+    *"socket"*|*"not permitted"*|*"permission denied"*|*"Operation not permitted"*|*"sandbox"*)
+        echo "RESULT:deny_signature:OK"
+        ;;
+    *)
+        echo "RESULT:deny_signature:FAIL:output=$GRADLE_OUTPUT"
+        ;;
+esac
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // Gradle build should be blocked: sandbox denies socket operations
+        assert_result_fail(&stdout, "gradle_build");
+        assert_result_ok(&stdout, "deny_signature");
+    }
+
+    /// Kotlin/Ktor project file operations work normally in the sandbox.
+    /// Reading and writing project files is unaffected by the socket deny.
+    #[test]
+    fn project_kotlin_ktor_file_ops() {
+        require_sandbox!();
+        let project = TempProject::scaffold_kotlin_ktor();
+        let script = script_file_ops(
+            &[
+                "build.gradle.kts",
+                "settings.gradle.kts",
+                "src/main/kotlin/com/example/Application.kt",
+                "README.md",
+            ],
+            "src/test/kotlin/com/example/ApplicationTest.kt",
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "read_build.gradle.kts");
+        assert_result_ok(&stdout, "read_settings.gradle.kts");
+        assert_result_ok(&stdout, "read_src/main/kotlin/com/example/Application.kt");
+        assert_result_ok(&stdout, "read_README.md");
+        assert_result_ok(
+            &stdout,
+            "write_src/test/kotlin/com/example/ApplicationTest.kt",
+        );
+        assert_result_ok(&stdout, "create_dir");
     }
 }
