@@ -5,10 +5,11 @@ Rust project — macOS Seatbelt sandbox wrapper for GitHub Copilot CLI.
 ## Build & test
 
 ```bash
-mise run check          # fmt + clippy + test (run before every commit)
-mise run test           # all tests (macOS only)
-mise run test:unit      # unit tests only (cross-platform)
+mise run check          # fmt + clippy + unit/lib tests (works inside sandbox)
 mise run test:all       # all suites except live smoke tests (macOS only)
+mise run test           # all tests via cargo test (macOS only)
+mise run test:unit      # unit tests only (cross-platform)
+mise run test:lib       # library crate module tests
 mise run clippy         # linter
 mise run fmt            # auto-format
 ```
@@ -50,13 +51,16 @@ Test suites and where they can run:
 | Task                    | Suite          | In sandbox | Linux CI | macOS CI | Requirements                  |
 |-------------------------|----------------|:----------:|:--------:|:--------:|-------------------------------|
 | `mise run test:unit`    | unit_tests     | ✅         | ✅       | ✅       | None                          |
+| `mise run test:lib`     | lib (modules)  | ✅         | ✅       | ✅       | None                          |
 | `mise run test:integration` | integration | ✅         | ❌       | ✅       | macOS `sandbox-exec`          |
 | `mise run test:e2e`     | e2e            | ✅         | ❌       | ✅       | macOS + `copilot` in PATH     |
 | `mise run test:e2e-projects` | e2e_projects | ✅      | ❌       | ✅       | macOS `sandbox-exec`          |
 | `mise run test:e2e-live`| e2e (ignored)  | ❌         | ❌       | ⚠️       | macOS + Copilot auth + network|
+| `mise run check`        | fmt+clippy+unit+lib | ✅    | ✅       | ✅       | None (safe everywhere)        |
 | `mise run test:all`     | all above      | ✅         | ❌       | ✅       | macOS + `copilot` in PATH     |
 
-- **unit_tests** are the only cross-platform suite — use `test:unit` on Linux CI
+- **check** runs fmt, clippy, unit_tests, and lib tests — safe inside sandbox, CI, anywhere
+- **unit_tests** + **lib** are cross-platform — use `check` on Linux CI or inside sandbox
 - **integration**, **e2e**, **e2e_projects** all require macOS with `sandbox-exec`
 - **e2e-live** (6 smoke tests) need real Copilot auth and network — not for regular CI
 - All suites except **e2e-live** run fine inside the cplt sandbox

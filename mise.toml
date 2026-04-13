@@ -35,6 +35,10 @@ cargo build --release
 description = "Run all tests (same as cargo test; macOS only)"
 run = "cargo test"
 
+[tasks."test:lib"]
+description = "Run library crate tests (config, discover, scratch modules)"
+run = "cargo test --lib"
+
 [tasks."test:unit"]
 description = "Run unit tests — cross-platform, safe inside sandbox and CI"
 run = "cargo test --test unit_tests"
@@ -57,11 +61,11 @@ run = "cargo test --test e2e -- --ignored"
 
 [tasks."test:all"]
 description = "Run all test suites except live smoke tests (macOS only)"
-depends = ["test:unit", "test:integration", "test:e2e", "test:e2e-projects"]
+depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects"]
 
 [tasks.check]
-description = "Run all checks (fmt, clippy, test)"
-depends = ["fmt:check", "clippy", "test"]
+description = "Run all checks (fmt, clippy, test) — works inside sandbox"
+depends = ["fmt:check", "clippy", "test:unit", "test:lib"]
 
 [tasks.all]
 description = "Run all checks and build release"
