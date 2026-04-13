@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use cplt::{config, discover, proxy, sandbox, scratch};
+use cplt::{config, discover, proxy, sandbox, scratch, update};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -49,6 +49,9 @@ EXAMPLES:
 
   cplt config explain sandbox.quiet
     Learn what a config key does and how to set it
+
+  cplt update
+    Update cplt to the latest release from GitHub
 
   eval \"$(cplt --shell-setup)\"
     Add to your shell rc so 'copilot' runs the sandboxed version
@@ -260,6 +263,22 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+
+    /// Update cplt to the latest release.
+    ///
+    /// Downloads the latest release from GitHub, verifies the SHA256
+    /// checksum, and replaces the current binary atomically.
+    ///
+    /// If installed via Homebrew, directs you to use `brew upgrade` instead.
+    Update {
+        /// Only check if an update is available (don't download or install).
+        #[arg(long)]
+        check: bool,
+
+        /// Force update even if already on the latest version.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -444,6 +463,7 @@ fn main() -> ExitCode {
     if let Some(command) = cli.command {
         return match command {
             Command::Config { action } => run_config_command(action),
+            Command::Update { check, force } => run_update(check, force),
         };
     }
 
@@ -1172,6 +1192,93 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
         None => {
             config::explain_all();
             ExitCode::SUCCESS
+        }
+    }
+}
+
+fn run_update(check_only: bool, force: bool) -> ExitCode {
+    // Check for Homebrew-managed install
+    if update::is_homebrew_managed() {
+        info("cplt is managed by Homebrew.");
+        eprintln!("  Run: {GREEN}brew upgrade navikt/tap/cplt{NC}");
+        return ExitCode::SUCCESS;
+    }
+
+    // Fetch latest release
+    info("Checking for updates...");
+    let latest = match update::fetch_latest_release(LONG_VERSION) {
+        Ok(r) => r,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let status = update::check_version(LONG_VERSION, &latest);
+
+    match status {
+        update::VersionStatus::UpToDate => {
+            info(&format!("✓ cplt is up to date ({LONG_VERSION})"));
+            ExitCode::SUCCESS
+        }
+        update::VersionStatus::UpdateAvailable {
+            current,
+            latest: latest_ver,
+            tag,
+        } => {
+            info(&format!(
+                "Update available: {current} → {GREEN}{latest_ver}{NC}"
+            ));
+            if check_only {
+                return ExitCode::SUCCESS;
+            }
+            do_update(&tag)
+        }
+        update::VersionStatus::SameDateDifferentBuild {
+            current,
+            latest: latest_ver,
+            tag,
+        } => {
+            info(&format!(
+                "Same date, different build: {current} vs {latest_ver}"
+            ));
+            if check_only {
+                return ExitCode::SUCCESS;
+            }
+            if !force {
+                warn("Same-date build. Use --force to reinstall.");
+                return ExitCode::SUCCESS;
+            }
+            do_update(&tag)
+        }
+        update::VersionStatus::DevBuild {
+            latest: latest_ver,
+            tag,
+        } => {
+            warn(&format!(
+                "Running dev build (0.0.0). Latest release: {latest_ver}"
+            ));
+            if check_only {
+                return ExitCode::SUCCESS;
+            }
+            if !force {
+                warn("Use --force to replace dev build with release.");
+                return ExitCode::SUCCESS;
+            }
+            do_update(&tag)
+        }
+    }
+}
+
+fn do_update(tag: &str) -> ExitCode {
+    match update::perform_update(tag, LONG_VERSION) {
+        Ok(path) => {
+            info(&format!("✓ Updated successfully → {path}"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error(&e);
+            ExitCode::FAILURE
         }
     }
 }

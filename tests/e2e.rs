@@ -2025,4 +2025,45 @@ mod e2e_tests {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("quiet"), "should suggest quiet: {stderr}");
     }
+
+    // --- Update tests ---
+
+    #[test]
+    fn e2e_update_help() {
+        let output = Command::new(binary_path())
+            .args(["update", "--help"])
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("--check"), "should have --check flag");
+        assert!(stdout.contains("--force"), "should have --force flag");
+        assert!(stdout.contains("SHA256"), "should mention SHA256: {stdout}");
+    }
+
+    /// This test hits the real GitHub API — keep it in the normal suite
+    /// since --check is read-only and fast.
+    #[test]
+    fn e2e_update_check_runs() {
+        let output = Command::new(binary_path())
+            .args(["update", "--check"])
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "update --check should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Should mention either "up to date", "available", "dev build", or "same date"
+        assert!(
+            stderr.contains("up to date")
+                || stderr.contains("Update available")
+                || stderr.contains("dev build")
+                || stderr.contains("Same date"),
+            "should report version status: {stderr}"
+        );
+    }
 }
