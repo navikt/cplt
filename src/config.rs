@@ -82,6 +82,9 @@ pub struct SandboxConfig {
     /// Enable per-session scratch directory for TMPDIR redirect (default: false).
     /// Creates an executable temp dir so tools like `go test` and `mise` can work.
     pub scratch_dir: Option<bool>,
+    /// Suppress the startup configuration summary and non-essential info messages.
+    /// Errors and warnings are always shown. (default: false)
+    pub quiet: Option<bool>,
 }
 
 /// Resolved configuration after merging config file + CLI flags.
@@ -106,6 +109,7 @@ pub struct Resolved {
     pub allow_lifecycle_scripts: bool,
     pub allow_tmp_exec: bool,
     pub scratch_dir: bool,
+    pub quiet: bool,
 }
 
 /// CLI flag values to merge with the config file.
@@ -133,6 +137,8 @@ pub struct CliFlags {
     pub allow_lifecycle_scripts: bool,
     pub allow_tmp_exec: bool,
     pub scratch_dir: bool,
+    pub quiet: bool,
+    pub no_quiet: bool,
 }
 
 impl Config {
@@ -305,6 +311,15 @@ impl Config {
             self.sandbox.scratch_dir.unwrap_or(false)
         };
 
+        // Quiet: --no-quiet always wins, then --quiet, then config, then false
+        let quiet = if cli.no_quiet {
+            false
+        } else if cli.quiet {
+            true
+        } else {
+            self.sandbox.quiet.unwrap_or(false)
+        };
+
         // Validate all paths for SBPL injection characters
         for p in allow_read
             .iter()
@@ -333,6 +348,7 @@ impl Config {
             allow_lifecycle_scripts,
             allow_tmp_exec,
             scratch_dir,
+            quiet,
         })
     }
 }
@@ -521,6 +537,9 @@ impl Resolved {
             );
         }
         eprintln!("{blue}[cplt]{nc}  {dim}Full profile:{nc}   cplt --print-profile");
+        eprintln!(
+            "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet or sandbox.quiet = true to hide this{nc}"
+        );
         eprintln!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
     }
 }
@@ -628,6 +647,12 @@ pub fn default_config_contents() -> String {
 # Re-enables exec from /private/tmp and /private/var/folders.
 # Prefer scratch_dir which creates a controlled executable temp dir.
 # allow_tmp_exec = false
+#
+# Suppress the startup configuration summary and non-essential messages.
+# Errors and warnings are always shown. Useful once you've reviewed the
+# sandbox settings and don't need to see them every time.
+# Override with --no-quiet for a single run.
+# quiet = false
 "#
     .to_string()
 }
@@ -905,5 +930,56 @@ validate = false
         let config = Config::default();
         let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(!resolved.allow_env_files);
+    }
+
+    #[test]
+    fn quiet_disabled_by_default() {
+        let config = Config::default();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(!resolved.quiet);
+    }
+
+    #[test]
+    fn cli_quiet_flag_enables_quiet() {
+        let config = Config::default();
+        let resolved = config
+            .merge(CliFlags {
+                quiet: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.quiet);
+    }
+
+    #[test]
+    fn config_quiet_used_when_cli_false() {
+        let config: Config = toml::from_str("[sandbox]\nquiet = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.quiet);
+    }
+
+    #[test]
+    fn no_quiet_flag_overrides_config_quiet() {
+        let config: Config = toml::from_str("[sandbox]\nquiet = true\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                no_quiet: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!resolved.quiet);
+    }
+
+    #[test]
+    fn no_quiet_wins_over_quiet_flag() {
+        let config = Config::default();
+        let resolved = config
+            .merge(CliFlags {
+                quiet: true,
+                no_quiet: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!resolved.quiet, "--no-quiet should always win over --quiet");
     }
 }

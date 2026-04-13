@@ -220,6 +220,18 @@ struct Cli {
     #[arg(long, short = 'y')]
     yes: bool,
 
+    /// Suppress the startup configuration summary and non-essential messages.
+    /// Errors and warnings are always shown. Use when you've reviewed the
+    /// sandbox settings and don't need to see them every time.
+    /// Can also be set in config: sandbox.quiet = true
+    #[arg(long, short = 'q')]
+    quiet: bool,
+
+    /// Show the startup configuration summary even if sandbox.quiet = true
+    /// in the config file. Overrides the config setting for this run.
+    #[arg(long)]
+    no_quiet: bool,
+
     /// Everything after -- is passed directly to the copilot command.
     /// Example: cplt -- -p "fix the tests"
     #[arg(last = true)]
@@ -268,9 +280,11 @@ use cplt::is_unsafe_root;
 ///
 /// Returns Ok(()) if the user confirms, Err with message if they decline or
 /// if no TTY is available without --yes.
-fn prompt_confirm(auto_yes: bool) -> Result<(), String> {
+fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     if auto_yes {
-        eprintln!("{BLUE}[cplt]{NC} Auto-confirmed (--yes)");
+        if !quiet {
+            eprintln!("{BLUE}[cplt]{NC} Auto-confirmed (--yes)");
+        }
         return Ok(());
     }
 
@@ -290,7 +304,13 @@ fn prompt_confirm(auto_yes: bool) -> Result<(), String> {
         }
     };
 
-    eprint!("{BLUE}[cplt]{NC} Proceed? [y/N] ");
+    if quiet {
+        eprint!(
+            "{BLUE}[cplt]{NC} Proceed with sandboxed Copilot? (run without --quiet to review config) [y/N] "
+        );
+    } else {
+        eprint!("{BLUE}[cplt]{NC} Proceed? [y/N] ");
+    }
 
     use std::io::BufRead;
     let mut reader = std::io::BufReader::new(tty);
@@ -406,6 +426,8 @@ fn main() -> ExitCode {
         allow_lifecycle_scripts: cli.allow_lifecycle_scripts,
         allow_tmp_exec: cli.allow_tmp_exec,
         scratch_dir: cli.scratch_dir,
+        quiet: cli.quiet,
+        no_quiet: cli.no_quiet,
     }) {
         Ok(r) => r,
         Err(e) => {
@@ -466,8 +488,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    info(&format!("Project:  {}", project_dir.display()));
-    info(&format!("Home:     {}", home_dir.display()));
+    if !resolved.quiet {
+        info(&format!("Project:  {}", project_dir.display()));
+        info(&format!("Home:     {}", home_dir.display()));
+    }
 
     // Validate all paths that will be interpolated into SBPL profile
     if let Err(e) = sandbox::validate_sbpl_path(&project_dir) {
@@ -490,7 +514,9 @@ fn main() -> ExitCode {
 
         match scratch::ScratchDir::create(&home_dir) {
             Ok(s) => {
-                ok(&format!("Scratch dir: {}", s.path().display()));
+                if !resolved.quiet {
+                    ok(&format!("Scratch dir: {}", s.path().display()));
+                }
                 Some(s)
             }
             Err(e) => {
@@ -593,7 +619,11 @@ fn main() -> ExitCode {
     // Validate profile with a quick test
     if !resolved.no_validate {
         match sandbox::validate(&profile_path, &project_dir, &home_dir) {
-            Ok(()) => ok("Sandbox profile validated ✓"),
+            Ok(()) => {
+                if !resolved.quiet {
+                    ok("Sandbox profile validated ✓");
+                }
+            }
             Err(e) => {
                 error(&format!("Sandbox validation failed: {e}"));
                 return ExitCode::FAILURE;
@@ -602,8 +632,10 @@ fn main() -> ExitCode {
     }
 
     // Print comprehensive summary and confirm before launching Copilot
-    resolved.print_summary(&project_dir, &home_dir);
-    if let Err(e) = prompt_confirm(cli.yes) {
+    if !resolved.quiet {
+        resolved.print_summary(&project_dir, &home_dir);
+    }
+    if let Err(e) = prompt_confirm(cli.yes, resolved.quiet) {
         error(&e);
         let _ = std::fs::remove_file(&profile_path);
         return ExitCode::FAILURE;
@@ -640,11 +672,13 @@ fn main() -> ExitCode {
         let allowed_domains = match &resolved.allowed_domains {
             Some(path) => match proxy::parse_domain_file(path) {
                 Ok(domains) => {
-                    info(&format!(
-                        "Domain allowlist: {} domains from {}",
-                        domains.len(),
-                        path.display()
-                    ));
+                    if !resolved.quiet {
+                        info(&format!(
+                            "Domain allowlist: {} domains from {}",
+                            domains.len(),
+                            path.display()
+                        ));
+                    }
                     domains
                 }
                 Err(e) => {
@@ -655,10 +689,12 @@ fn main() -> ExitCode {
             None => Vec::new(),
         };
 
-        info(&format!(
-            "Starting proxy on localhost:{} ...",
-            resolved.proxy_port
-        ));
+        if !resolved.quiet {
+            info(&format!(
+                "Starting proxy on localhost:{} ...",
+                resolved.proxy_port
+            ));
+        }
 
         match proxy::start(proxy::ProxyOptions {
             port: resolved.proxy_port,
@@ -668,10 +704,12 @@ fn main() -> ExitCode {
             log_file: resolved.proxy_log_file.clone(),
         }) {
             Ok(handle) => {
-                ok(&format!(
-                    "Proxy running on localhost:{} (thread)",
-                    resolved.proxy_port
-                ));
+                if !resolved.quiet {
+                    ok(&format!(
+                        "Proxy running on localhost:{} (thread)",
+                        resolved.proxy_port
+                    ));
+                }
                 proxy_handle = Some(handle);
                 // Proxy env vars (NODE_USE_ENV_PROXY, HTTP_PROXY, HTTPS_PROXY) are
                 // injected by sandbox_exec::exec() when proxy_port is Some.
@@ -683,53 +721,6 @@ fn main() -> ExitCode {
         }
     }
 
-    info("Protected: ~/.ssh, ~/.gnupg, ~/.aws, ~/.azure, ~/.kube, ~/.docker, ~/.netrc");
-    if !resolved.allow_env_files {
-        info("Protected: .env*, .pem, .key files in project (--allow-env-files to override)");
-    }
-    if !resolved.allow_lifecycle_scripts {
-        info(
-            "Hardened:  npm/yarn/pnpm lifecycle scripts blocked (--allow-lifecycle-scripts to override)",
-        );
-    }
-    if resolved.with_proxy {
-        info(&format!(
-            "Network:   Port 443{}, proxy logging on localhost:{}",
-            if resolved.allow_ports.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "+{}",
-                    resolved
-                        .allow_ports
-                        .iter()
-                        .map(|p| p.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-            },
-            resolved.proxy_port
-        ));
-    } else {
-        info(&format!(
-            "Network:   Port 443{} (use --with-proxy for connection logging)",
-            if resolved.allow_ports.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "+{}",
-                    resolved
-                        .allow_ports
-                        .iter()
-                        .map(|p| p.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-            }
-        ));
-    }
-
-    eprintln!();
     ok("Starting Copilot in sandbox...");
 
     // --show-denials: stream macOS sandbox denial logs in the background
