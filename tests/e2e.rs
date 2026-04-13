@@ -68,6 +68,20 @@ mod e2e_tests {
         };
     }
 
+    /// Configure a Command to ignore the user's config file.
+    /// Prevents user settings (e.g., allow_localhost_any) from affecting test assertions.
+    fn no_user_config(cmd: &mut Command) -> &mut Command {
+        cmd.env("CPLT_CONFIG", "/dev/null/nonexistent")
+    }
+
+    /// Create a cplt Command pre-configured to ignore the user's config.
+    /// Use for tests that assert on profile/output content that config could affect.
+    fn cplt_cmd() -> Command {
+        let mut cmd = Command::new(binary_path());
+        no_user_config(&mut cmd);
+        cmd
+    }
+
     // ============================================================
     // Full pipeline tests (sandbox-exec → copilot child process)
     // ============================================================
@@ -188,7 +202,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_contains_deny_default() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -206,7 +220,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_blocks_sensitive_dirs() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -226,7 +240,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_allows_project_dir() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -257,7 +271,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_restricts_network() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -290,7 +304,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_allows_gh_config_readonly() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -328,7 +342,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&deny_dir).unwrap();
         let deny_dir_canonical = std::fs::canonicalize(&deny_dir).unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--deny-path",
                 &deny_dir.to_string_lossy(),
@@ -363,7 +377,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&allow_dir).unwrap();
         let allow_dir_canonical = std::fs::canonicalize(&allow_dir).unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--allow-read",
                 &allow_dir.to_string_lossy(),
@@ -399,7 +413,7 @@ mod e2e_tests {
             std::env::temp_dir().join(format!("cplt-e2e-project-{}", std::process::id()));
         std::fs::create_dir_all(&custom_dir).unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--project-dir",
                 &custom_dir.to_string_lossy(),
@@ -516,7 +530,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_allow_tmp_exec_removes_denies() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--allow-tmp-exec", "--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -538,7 +552,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_allow_localhost_any() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--allow-localhost-any", "--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -560,7 +574,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_allow_localhost_port() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--allow-localhost", "3000", "--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -583,7 +597,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_allow_port() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--allow-port", "8080", "--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -606,7 +620,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&allow_dir).unwrap();
         let allow_dir_canonical = std::fs::canonicalize(&allow_dir).unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--allow-write",
                 &allow_dir.to_string_lossy(),
@@ -635,7 +649,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_allow_env_files() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--allow-env-files", "--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -654,7 +668,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_scratch_dir_appears() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--scratch-dir", "--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -676,7 +690,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_copilot_pkg_write_denied() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -694,7 +708,7 @@ mod e2e_tests {
     #[test]
     fn e2e_print_profile_git_persistence_blocked() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
             .output()
@@ -1297,7 +1311,7 @@ mod e2e_tests {
     #[test]
     fn e2e_recursion_guard_allows_print_profile() {
         // __CPLT_WRAPPED should NOT block --print-profile (read-only subcommand)
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--print-profile",
                 "--project-dir",
