@@ -8,6 +8,8 @@ updates:
       day: monday
     reviewers:
       - navikt/copilot
+    assignees:
+      - navikt/copilot
     groups:
       rust-dependencies:
         patterns:
@@ -19,6 +21,8 @@ updates:
       interval: weekly
       day: monday
     reviewers:
+      - navikt/copilot
+    assignees:
       - navikt/copilot
     groups:
       github-actions:
