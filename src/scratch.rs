@@ -2,22 +2,31 @@
 //!
 //! Many tools (Go test, mise inline tasks, node-gyp) compile binaries to
 //! `$TMPDIR` then execute them. The sandbox blocks exec from system temp dirs
-//! (`/private/tmp`, `/private/var/folders`) to prevent write-then-exec attacks.
+//! to prevent write-then-exec attacks:
+//! - macOS: `/private/tmp`, `/private/var/folders`
+//! - Linux: `/tmp`, `/var/tmp`
 //!
 //! The scratch directory provides a controlled alternative: a per-session
 //! directory with write+exec permissions, cleaned up automatically on exit.
 //!
-//! Location: `~/Library/Caches/cplt/tmp/{session-id}/`
-//! - macOS convention for ephemeral data
-//! - Separate from `~/.cplt` (config/state) vs cache (throwaway)
-//! - Each session gets a UUID subdirectory for isolation
+//! Location varies by platform:
+//! - macOS: `~/Library/Caches/cplt/tmp/{session-id}/`
+//! - Linux: `~/.cache/cplt/tmp/{session-id}/`
+//!
+//! Each session gets a UUID subdirectory for isolation.
 
 use crate::sandbox::validate_sbpl_path;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Base directory for scratch dirs, relative to $HOME.
+#[cfg(target_os = "macos")]
 const SCRATCH_BASE: &str = "Library/Caches/cplt/tmp";
+
+/// Base directory for scratch dirs, relative to $HOME.
+/// Follows XDG Base Directory spec (`$XDG_CACHE_HOME` defaults to `~/.cache`).
+#[cfg(not(target_os = "macos"))]
+const SCRATCH_BASE: &str = ".cache/cplt/tmp";
 
 /// Maximum age for stale scratch dirs before garbage collection.
 const STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
@@ -25,7 +34,7 @@ const STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 /// A per-session scratch directory with write+exec permissions.
 ///
 /// Implements `Drop` to ensure cleanup on all exit paths (RAII guard).
-/// The directory is created under `~/Library/Caches/cplt/tmp/{uuid}/`.
+/// The directory is created under `$HOME/{SCRATCH_BASE}/{uuid}/`.
 #[derive(Debug)]
 pub struct ScratchDir {
     path: PathBuf,

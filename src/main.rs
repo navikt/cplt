@@ -482,9 +482,17 @@ fn main() -> ExitCode {
         };
     }
 
-    // macOS only
-    if std::env::consts::OS != "macos" {
-        error("cplt requires macOS (uses sandbox-exec)");
+    // Platform check: cplt currently supports macOS (Seatbelt) and Linux (planned: Landlock).
+    // Other platforms (Windows, FreeBSD, etc.) are not supported.
+    if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+        error("cplt requires macOS or Linux");
+        return ExitCode::FAILURE;
+    }
+
+    // Linux sandbox is not yet implemented — gate at runtime until Landlock backend lands.
+    #[cfg(target_os = "linux")]
+    {
+        error("Linux sandbox support is not yet implemented (see issue #16)");
         return ExitCode::FAILURE;
     }
 
@@ -635,16 +643,6 @@ fn main() -> ExitCode {
         }
     }
 
-    // Validate all paths that will be interpolated into SBPL profile
-    if let Err(e) = sandbox::validate_sbpl_path(&project_dir) {
-        error(&format!("Project dir: {e}"));
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) = sandbox::validate_sbpl_path(&home_dir) {
-        error(&format!("Home dir: {e}"));
-        return ExitCode::FAILURE;
-    }
-
     // Run auto-discovery to tighten the sandbox profile
     let tool_discovery = discover::discover_tools(&home_dir);
     let existing_dirs = tool_discovery.existing_home_tool_dirs;
@@ -687,21 +685,9 @@ fn main() -> ExitCode {
             })
         })
         .filter(|d| !crate::is_unsafe_root(d, &home_dir));
-    if let Some(ref dir) = copilot_install_dir
-        && let Err(e) = sandbox::validate_sbpl_path(dir)
-    {
-        error(&format!("Copilot install dir: {e}"));
-        return ExitCode::FAILURE;
-    }
 
     // Discover global git hooks path from core.hooksPath
     let git_hooks_path = discover::git_hooks_path(&home_dir);
-    if let Some(ref p) = git_hooks_path
-        && let Err(e) = sandbox::validate_sbpl_path(p)
-    {
-        error(&format!("Git hooks path: {e}"));
-        return ExitCode::FAILURE;
-    }
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
     // The shim invokes VS Code's Electron runtime, which needs dyld access to
@@ -710,20 +696,16 @@ fn main() -> ExitCode {
         .as_ref()
         .ok()
         .and_then(|p| discover::discover_electron_app(p));
-    if let Some(ref dir) = electron_app_dir
-        && let Err(e) = sandbox::validate_sbpl_path(dir)
-    {
-        error(&format!("Electron app path: {e}"));
-        return ExitCode::FAILURE;
-    }
 
-    // Generate sandbox profile
+    // Prepare the sandbox — validates paths, generates platform-specific profile.
+    // Path validation (SBPL injection checks on macOS) is handled internally
+    // by prepare(), so callers don't need to know about backend-specific risks.
     let proxy_port_for_profile = if resolved.with_proxy {
         Some(resolved.proxy_port)
     } else {
         None
     };
-    let profile = sandbox::generate_profile(&sandbox::ProfileOptions {
+    let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
         project_dir: &project_dir,
         home_dir: &home_dir,
         extra_read: &resolved.allow_read,
@@ -741,11 +723,17 @@ fn main() -> ExitCode {
         git_hooks_path: git_hooks_path.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         electron_app_dir: electron_app_dir.as_deref(),
-    });
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    // --print-profile: dump the SBPL and exit (no copilot binary needed)
+    // --print-profile: dump the sandbox policy and exit (no copilot binary needed)
     if cli.print_profile {
-        println!("{profile}");
+        println!("{}", sandbox::describe(&prepared));
         return ExitCode::SUCCESS;
     }
 
@@ -775,42 +763,9 @@ fn main() -> ExitCode {
     // so extraction must happen here, outside.
     ensure_copilot_extracted(&copilot_bin, &home_dir);
 
-    // Write profile to temp file with unique name (prevents symlink attacks)
-    let profile_path = std::env::temp_dir().join(format!(
-        "cplt-{}-{}.sb",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    // O_CREAT|O_EXCL: atomic create, fails if exists (prevents symlink following)
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&profile_path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                error(&format!("Cannot create sandbox profile: {e}"));
-                return ExitCode::FAILURE;
-            }
-        };
-        if let Err(e) = file.write_all(profile.as_bytes()) {
-            error(&format!("Cannot write sandbox profile: {e}"));
-            let _ = std::fs::remove_file(&profile_path);
-            return ExitCode::FAILURE;
-        }
-    }
-
-    // Validate profile with a quick test
+    // Preflight: verify the sandbox mechanism works on this system
     if !resolved.no_validate {
-        match sandbox::validate(&profile_path, &project_dir, &home_dir) {
+        match sandbox::preflight(&prepared) {
             Ok(()) => {
                 if !resolved.quiet {
                     ok("Sandbox profile validated ✓");
@@ -829,7 +784,6 @@ fn main() -> ExitCode {
     }
     if let Err(e) = prompt_confirm(cli.yes, resolved.quiet) {
         error(&e);
-        let _ = std::fs::remove_file(&profile_path);
         return ExitCode::FAILURE;
     }
 
@@ -941,24 +895,16 @@ fn main() -> ExitCode {
     eprintln!();
 
     // Run copilot inside sandbox
-    let exit_code = sandbox::exec(
+    let exit_code = sandbox::exec_sandboxed(
+        &prepared,
         &copilot_bin,
-        &profile_path,
-        &project_dir,
         &cli.copilot_args,
         &resolved.pass_env,
         resolved.inherit_env,
         &disabled_categories,
-        scratch_path,
-        if resolved.with_proxy {
-            Some(resolved.proxy_port)
-        } else {
-            None
-        },
     );
 
     // Cleanup
-    let _ = std::fs::remove_file(&profile_path);
     if let Some(handle) = proxy_handle {
         handle.shutdown();
     }
