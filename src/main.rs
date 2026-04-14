@@ -185,13 +185,18 @@ struct Cli {
     #[arg(long)]
     allow_tmp_exec: bool,
 
-    /// Enable a per-session scratch directory for TMPDIR redirect.
+    /// Enable a per-session scratch directory for TMPDIR redirect (default).
     /// Creates ~/.cache/cplt/tmp/{session}/ with write+exec permissions
     /// and redirects TMPDIR/GOTMPDIR there. This allows tools like
     /// `go test`, `mise` inline tasks, and `node-gyp` to work.
     /// Cleaned up automatically on exit.
     #[arg(long)]
     scratch_dir: bool,
+
+    /// Disable the per-session scratch directory. TMPDIR will not be
+    /// redirected, so tools needing exec in temp may fail.
+    #[arg(long)]
+    no_scratch_dir: bool,
 
     /// Skip the startup check that verifies the sandbox is working.
     /// The check runs a quick test command inside the sandbox to confirm
@@ -557,6 +562,7 @@ fn main() -> ExitCode {
         allow_gpg_signing: cli.allow_gpg_signing,
         allow_tmp_exec: cli.allow_tmp_exec,
         scratch_dir: cli.scratch_dir,
+        no_scratch_dir: cli.no_scratch_dir,
         quiet: cli.quiet,
         no_quiet: cli.no_quiet,
     }) {

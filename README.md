@@ -50,7 +50,7 @@ cplt -- -p "fix the tests"
 | Read/write project directory                                                     | ✅ Allowed                                |                                                                                         |
 | Read `.env*`, `.pem`, `.key` in project                                          | 🔒 Kernel-blocked                         | Prevents secret exfiltration; `--allow-env-files` to override                           |
 | Write `.git/hooks`, `.git/config`, `.gitmodules`                                 | 🔒 Kernel-blocked                         | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking             |
-| Execute from `/tmp`, `/var/folders`                                              | 🔒 Kernel-blocked                         | Prevents write-then-exec; `--scratch-dir` redirects TMPDIR to safe location             |
+| Execute from `/tmp`, `/var/folders`                                              | 🔒 Kernel-blocked                         | Prevents write-then-exec; scratch dir redirects TMPDIR to safe location (on by default) |
 | Execute from `~/Library/Caches`                                                  | 🔒 Kernel-blocked                         | Prevents binary-drop staging; Copilot native modules exempted via carve-out             |
 | Modify `.vscode/tasks.json`, `launch.json`                                       | ⚠️ Allowed — known risk                   | IDE trust boundary; see SECURITY.md for mitigations                                     |
 | Read/write `~/.copilot` (auth, settings)                                         | ✅ Allowed                                | Includes `file-map-executable` for `keytar.node`, `pty.node`, `computer.node`           |
@@ -194,8 +194,9 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | `--inherit-env`    | ⚠️ **Dangerous.** Inherit the full parent environment (only strips `NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`). Use only for debugging. |
 | `--allow-lifecycle-scripts` | Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run. Blocked by default. Use when `npm install` needs postinstall hooks.         |
 | `--allow-gpg-signing`       | Allow GPG commit/tag signing inside the sandbox. Grants read-only access to public keyring and GPG agent socket (private keys stay denied). See [GPG signing](#gpg-commit-signing). |
-| `--scratch-dir`             | Enable per-session scratch directory with TMPDIR redirect. Required for `go test`, `mise` inline tasks, and other compile-then-exec tools.   |
-| `--allow-tmp-exec`          | ⚠️ **Dangerous.** Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer `--scratch-dir`.                        |
+| `--no-scratch-dir`          | Disable the per-session scratch directory (on by default). TMPDIR will not be redirected.                                                    |
+| `--scratch-dir`             | Explicitly enable per-session scratch directory (already the default). Useful to override `scratch_dir = false` in config.                   |
+| `--allow-tmp-exec`          | ⚠️ **Dangerous.** Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer scratch dir.                             |
 
 ### Supported runtimes
 
@@ -348,7 +349,7 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 # allow_lifecycle_scripts = false
 # allow_gpg_signing = false    # Allow GPG commit signing (see SECURITY.md)
 # allow_localhost_any = false
-# scratch_dir = false
+# scratch_dir = true           # On by default; set false to disable
 # allow_tmp_exec = false       # Dangerous — prefer scratch_dir
 # inherit_env = false          # Dangerous — exposes all env vars
 # pass_env = ["MY_CUSTOM_VAR"]
@@ -570,19 +571,12 @@ Tools that compile-then-execute from `$TMPDIR` are **blocked by default** becaus
 | `cargo test`              | ✅ Works     | Rust builds in `target/`, not `$TMPDIR`                               |
 | `npm test` / `vitest`     | ✅ Works     | JavaScript runs via interpreter, not compiled to temp                 |
 
-**Fix:** Use `--scratch-dir` to create a controlled per-session scratch directory with exec permissions:
+**Fix:** The scratch dir is now **on by default** — cplt creates `~/Library/Caches/cplt/tmp/{session-id}/` with `rwx` permissions, redirects `TMPDIR`, `TMP`, `TEMP`, and `GOTMPDIR` there, and cleans up on exit. Stale directories older than 24 hours are garbage-collected on startup.
+
+If you're still seeing this error, check that you haven't set `scratch_dir = false` in your config:
 
 ```bash
-cplt --scratch-dir -- -p "run the Go tests"
-```
-
-This creates `~/Library/Caches/cplt/tmp/{session-id}/` with `rwx` permissions, redirects `TMPDIR`, `TMP`, `TEMP`, and `GOTMPDIR` there, and cleans up on exit. Stale directories older than 24 hours are garbage-collected on startup.
-
-Or set it permanently in config:
-
-```toml
-[sandbox]
-scratch_dir = true
+cplt config explain sandbox.scratch_dir
 ```
 
 ### Localhost blocking

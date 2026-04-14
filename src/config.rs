@@ -84,7 +84,7 @@ pub struct SandboxConfig {
     /// Allow process execution from system temp directories (default: false).
     /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
     pub allow_tmp_exec: Option<bool>,
-    /// Enable per-session scratch directory for TMPDIR redirect (default: false).
+    /// Enable per-session scratch directory for TMPDIR redirect (default: true).
     /// Creates an executable temp dir so tools like `go test` and `mise` can work.
     pub scratch_dir: Option<bool>,
     /// Suppress the startup configuration summary and non-essential info messages.
@@ -144,6 +144,7 @@ pub struct CliFlags {
     pub allow_gpg_signing: bool,
     pub allow_tmp_exec: bool,
     pub scratch_dir: bool,
+    pub no_scratch_dir: bool,
     pub quiet: bool,
     pub no_quiet: bool,
 }
@@ -340,11 +341,13 @@ impl Config {
             self.sandbox.allow_tmp_exec.unwrap_or(false)
         };
 
-        // Scratch-dir: CLI flag wins, then config, then false (off by default)
-        let scratch_dir = if cli.scratch_dir {
+        // Scratch-dir: --no-scratch-dir always wins, then --scratch-dir, then config, then true (on by default)
+        let scratch_dir = if cli.no_scratch_dir {
+            false
+        } else if cli.scratch_dir {
             true
         } else {
-            self.sandbox.scratch_dir.unwrap_or(false)
+            self.sandbox.scratch_dir.unwrap_or(true)
         };
 
         // Quiet: --no-quiet always wins, then --quiet, then config, then false
@@ -465,9 +468,9 @@ impl Resolved {
                 "{blue}[cplt]{nc}    Lifecycle:     blocked     {dim}npm/yarn postinstall hooks{nc}"
             );
         }
-        if self.scratch_dir {
+        if !self.scratch_dir {
             eprintln!(
-                "{blue}[cplt]{nc}    Scratch dir:   {green}enabled{nc}     {dim}TMPDIR redirected (--scratch-dir){nc}"
+                "{blue}[cplt]{nc}    Scratch dir:   disabled    {dim}TMPDIR not redirected (--no-scratch-dir){nc}"
             );
         }
         if self.allow_tmp_exec {
@@ -694,11 +697,11 @@ pub fn default_config_contents() -> String {
 # Cloud credentials, npm tokens, database URLs, etc. will be visible.
 # inherit_env = false
 #
-# Enable per-session scratch directory for TMPDIR redirect.
+# Enable per-session scratch directory for TMPDIR redirect (default: true).
 # Creates ~/Library/Caches/cplt/tmp/{session}/ with write+exec permissions
 # so tools like `go test`, `mise` inline tasks, and `node-gyp` can work.
 # Cleaned up automatically on exit.
-# scratch_dir = false
+# scratch_dir = true
 #
 # DANGEROUS: Allow process execution from system temp directories.
 # Re-enables exec from /private/tmp and /private/var/folders.
@@ -1142,7 +1145,7 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         key: "scratch_dir",
         value_type: ConfigValueType::Bool,
         dangerous: false,
-        default_display: "false",
+        default_display: "true",
         description: "Create a per-session scratch directory and redirect TMPDIR into it.",
     },
     ConfigKeyInfo {
@@ -1620,7 +1623,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
             src(c.sandbox.allow_tmp_exec.is_some())
         );
     }
-    let scratch = c.sandbox.scratch_dir.unwrap_or(false);
+    let scratch = c.sandbox.scratch_dir.unwrap_or(true);
     eprintln!(
         "{blue}[cplt]{nc}    scratch_dir           = {}{}",
         scratch,
