@@ -630,6 +630,43 @@ SSH agent access is blocked (unix socket denied), which means:
 - `ssh` commands spawned by the agent will fail
 - `gh` CLI uses HTTPS by default and is unaffected
 
+### macOS protected folders (Desktop, Documents)
+
+macOS TCC (Transparency, Consent, and Control) protects certain folders at the kernel level. Without Full Disk Access, Copilot CLI cannot access `~/Desktop` or `~/Documents` **with or without cplt** — this is a macOS restriction, not a sandbox limitation. The cplt sandbox remains fully active regardless of FDA status.
+
+| Path | Without FDA | With FDA | Notes |
+| ---- | :---: | :---: | --- |
+| `~/Desktop` | ❌ | ✅ | TCC-protected |
+| `~/Documents` | ❌ | ✅ | TCC-protected |
+| `~/Downloads` | ✅ | ✅ | Less restrictive TCC policy |
+| Dragged screenshots | ❌ | ✅ | `TemporaryItems/NSIRD_*` are per-process isolated |
+
+**Fix: Grant Full Disk Access to your terminal** (recommended):
+
+1. Open **System Settings → Privacy & Security → Full Disk Access**
+2. Enable your terminal app (Terminal.app, iTerm2, Ghostty, etc.)
+3. **Restart the terminal** — TCC grants only take effect for new processes
+
+This lifts TCC restrictions for all child processes while the cplt sandbox continues to enforce its own deny-by-default rules (write protection, network filtering, dotfile access, etc.).
+
+**Alternatives** (if you prefer not to grant FDA):
+
+1. **Copy files into your project**:
+   ```bash
+   cp ~/Desktop/screenshot.png .
+   ```
+
+2. **Use a non-protected folder** for screenshots:
+   ```bash
+   defaults write com.apple.screencapture location ~/Screenshots
+   mkdir -p ~/Screenshots
+   ```
+   Then add to config:
+   ```toml
+   [sandbox]
+   allow_read = ["~/Screenshots"]
+   ```
+
 ### Git restrictions
 
 Certain git operations are blocked to prevent persistence attacks that survive the sandbox session:
