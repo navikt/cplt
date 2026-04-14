@@ -11,6 +11,9 @@ concurrency:
   group: release
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -30,23 +33,29 @@ jobs:
       matrix:
         include:
           - target: x86_64-apple-darwin
-            archive: tar.gz
           - target: aarch64-apple-darwin
-            archive: tar.gz
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.94"
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # ratchet:Swatinem/rust-cache@v2
+      - name: Cache cargo registry and build
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # ratchet:actions/cache@v5.0.4
         with:
-          key: ${{ matrix.target }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-
 
-      - name: Build
+      - name: Build release binary
         run: |
           COMMIT_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:7}"
@@ -61,12 +70,12 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # ratchet:actions/attest-build-provenance@v4
         with:
-          subject-path: cplt-${{ matrix.target }}.${{ matrix.archive }}
+          subject-path: cplt-${{ matrix.target }}.tar.gz
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
         with:
           name: cplt-${{ matrix.target }}
-          path: cplt-${{ matrix.target }}.${{ matrix.archive }}
+          path: cplt-${{ matrix.target }}.tar.gz
 
   release:
     name: Publish release
@@ -89,6 +98,7 @@ jobs:
         run: |
           cd artifacts
           sha256sum cplt-* > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Determine version
         id: version
@@ -101,19 +111,43 @@ jobs:
           echo "sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
-        id: changelog
-        uses: orhun/git-cliff-action@c93ef52f3d0ddcdcc9bd5447d98d458a11cd4f72 # ratchet:orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --unreleased --tag ${{ steps.version.outputs.tag }}
+        id: notes
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | head -1 || echo "")
+          {
+            echo "body<<RELEASE_EOF"
+            echo "## cplt"
+            echo ""
+            echo "macOS Seatbelt sandbox wrapper for GitHub Copilot CLI."
+            echo ""
+            echo "### Installation"
+            echo ""
+            echo '```bash'
+            echo "# Apple Silicon (M1/M2/M3/M4)"
+            echo "curl -fsSL https://github.com/navikt/cplt/releases/download/${{ steps.version.outputs.tag }}/cplt-aarch64-apple-darwin.tar.gz | tar xz"
+            echo ""
+            echo "# Intel Mac"
+            echo "curl -fsSL https://github.com/navikt/cplt/releases/download/${{ steps.version.outputs.tag }}/cplt-x86_64-apple-darwin.tar.gz | tar xz"
+            echo '```'
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              echo "### Changes since ${PREV_TAG##*/}"
+              echo ""
+              git log --oneline "${PREV_TAG}..HEAD" | head -20
+            else
+              echo "### Initial release"
+            fi
+            echo ""
+            echo "RELEASE_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # ratchet:softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # ratchet:softprops/action-gh-release@v3.0.0
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           target_commitish: ${{ steps.version.outputs.sha }}
           name: ${{ steps.version.outputs.title }}
-          body: ${{ steps.changelog.outputs.content }}
+          body: ${{ steps.notes.outputs.body }}
           make_latest: true
           files: |
             artifacts/cplt-*
