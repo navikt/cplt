@@ -1954,6 +1954,41 @@ fn profile_allows_copilot_install_dir() {
 }
 
 #[test]
+fn profile_allows_vscode_copilot_path() {
+    // VS Code bundles Copilot CLI at ~/Library/Application Support/Code/.../copilotCli/
+    // When copilot_pkg_dir() returns None, main.rs falls back to the binary's parent dir
+    let vscode_dir = "/Users/test/Library/Application Support/Code/User/globalStorage/github.copilot-chat/copilotCli";
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: Some(std::path::Path::new(vscode_dir)),
+        git_hooks_path: None,
+        allow_gpg_signing: false,
+    });
+    assert!(
+        p.contains(&format!("(allow file-read* (subpath \"{vscode_dir}\"))")),
+        "Profile must allow reading VS Code Copilot CLI directory (path with spaces)"
+    );
+    assert!(
+        p.contains(&format!(
+            "(allow file-map-executable (subpath \"{vscode_dir}\"))"
+        )),
+        "Profile must allow file-map-executable for VS Code Copilot CLI"
+    );
+}
+
+#[test]
 fn profile_no_copilot_install_dir_omits_section() {
     let p = default_profile();
     assert!(

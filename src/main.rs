@@ -676,7 +676,15 @@ fn main() -> ExitCode {
     let copilot_install_dir = copilot_bin_result
         .as_ref()
         .ok()
-        .and_then(|p| discover::copilot_pkg_dir(p, &home_dir));
+        .and_then(|p| {
+            // Try package.json discovery first (npm/Homebrew installs)
+            discover::copilot_pkg_dir(p, &home_dir).or_else(|| {
+                // Fallback: use the binary's parent directory (VS Code extension installs
+                // at ~/Library/Application Support/Code/.../copilotCli/copilot)
+                p.parent().map(|d| d.to_path_buf())
+            })
+        })
+        .filter(|d| !crate::is_unsafe_root(d, &home_dir));
     if let Some(ref dir) = copilot_install_dir
         && let Err(e) = sandbox::validate_sbpl_path(dir)
     {
