@@ -339,11 +339,13 @@ enum ConfigAction {
         value: Option<String>,
 
         /// Append value to an array key instead of replacing.
-        /// Only valid for array keys (allow.read, allow.ports, etc.)
+        /// Note: `set` already appends for array keys, so --append is optional.
         #[arg(long)]
         append: bool,
 
-        /// Remove the key from config file (reverts to built-in default)
+        /// Remove from config. For scalar keys: removes the key entirely.
+        /// For array keys with a value: removes that element from the array.
+        /// For array keys without a value: removes the entire key.
         #[arg(long)]
         unset: bool,
 
@@ -1172,8 +1174,8 @@ fn run_config_set(
     };
 
     // Validate flag combinations
-    if unset && value.is_some() {
-        error("--unset does not take a value");
+    if unset && value.is_some() && !op.key_info.value_type.is_array() {
+        error("--unset does not take a value (except for array keys)");
         return ExitCode::FAILURE;
     }
     if unset && append {
@@ -1212,9 +1214,19 @@ fn run_config_set(
 
     // Apply modification
     let result = if unset {
-        config::unset_value_in_doc(&mut doc, op.key_info);
-        Ok(())
-    } else if append {
+        if let Some(val) = value
+            && op.key_info.value_type.is_array()
+        {
+            // Array key + value: remove just that element
+            config::remove_array_element_in_doc(&mut doc, op.key_info, val)
+        } else {
+            // Scalar key, or array key without value: remove entire key
+            config::unset_value_in_doc(&mut doc, op.key_info);
+            Ok(())
+        }
+    } else if append || op.key_info.value_type.is_array() {
+        // Array keys always append — `set` adds to the array, not replaces it.
+        // Use `--unset` first to clear, then `set` to start fresh.
         config::append_value_in_doc(&mut doc, op.key_info, value.unwrap())
     } else {
         config::set_value_in_doc(&mut doc, op.key_info, value.unwrap())
@@ -1232,8 +1244,14 @@ fn run_config_set(
     }
 
     if unset {
-        ok(&format!("{key} removed (will use default)"));
-    } else if append {
+        if let Some(val) = value
+            && op.key_info.value_type.is_array()
+        {
+            ok(&format!("{key}: removed {val}"));
+        } else {
+            ok(&format!("{key} removed (will use default)"));
+        }
+    } else if append || op.key_info.value_type.is_array() {
         ok(&format!("{key}: appended {}", value.unwrap()));
     } else {
         ok(&format!("{key} = {}", value.unwrap()));

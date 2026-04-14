@@ -977,6 +977,12 @@ pub enum ConfigValueType {
     StrArray,
 }
 
+impl ConfigValueType {
+    pub fn is_array(self) -> bool {
+        matches!(self, Self::U16Array | Self::StrArray)
+    }
+}
+
 /// Metadata about a single config key.
 #[derive(Debug, Clone)]
 pub struct ConfigKeyInfo {
@@ -1345,7 +1351,16 @@ fn parse_element_for_key(
             }
             Ok(toml_edit::value(n as i64).into_value().unwrap())
         }
-        ConfigValueType::StrArray => Ok(toml_edit::value(value).into_value().unwrap()),
+        ConfigValueType::StrArray => {
+            if value.contains(',') {
+                return Err(format!(
+                    "value contains a comma — add one value at a time:\n  \
+                     cplt config set {}.{} <VALUE>",
+                    key_info.section, key_info.key
+                ));
+            }
+            Ok(toml_edit::value(value).into_value().unwrap())
+        }
         _ => Err(format!(
             "{}.{} is not an array key — use 'set' without --append",
             key_info.section, key_info.key
@@ -1371,6 +1386,7 @@ pub fn set_value_in_doc(
 }
 
 /// Append a value to an array in a TOML document.
+/// Idempotent — skips if the value is already present.
 pub fn append_value_in_doc(
     doc: &mut toml_edit::DocumentMut,
     key_info: &ConfigKeyInfo,
@@ -1387,7 +1403,10 @@ pub fn append_value_in_doc(
     match section.get_mut(key_info.key) {
         Some(item) => {
             if let Some(arr) = item.as_array_mut() {
-                arr.push_formatted(element);
+                // Skip if already present (idempotent)
+                if !array_contains(arr, &element) {
+                    arr.push_formatted(element);
+                }
                 Ok(())
             } else {
                 Err(format!(
@@ -1405,6 +1424,62 @@ pub fn append_value_in_doc(
             );
             Ok(())
         }
+    }
+}
+
+/// Remove a single element from an array in a TOML document.
+/// If the array becomes empty, removes the key entirely.
+pub fn remove_array_element_in_doc(
+    doc: &mut toml_edit::DocumentMut,
+    key_info: &ConfigKeyInfo,
+    value: &str,
+) -> Result<(), String> {
+    let element = parse_element_for_key(key_info, value)?;
+
+    let Some(section) = doc.get_mut(key_info.section).and_then(|s| s.as_table_mut()) else {
+        return Ok(()); // Section doesn't exist — nothing to remove
+    };
+
+    let Some(item) = section.get_mut(key_info.key) else {
+        return Ok(()); // Key doesn't exist — nothing to remove
+    };
+
+    let Some(arr) = item.as_array_mut() else {
+        return Err(format!(
+            "{}.{} exists but is not an array",
+            key_info.section, key_info.key
+        ));
+    };
+
+    // Find and remove all matching elements (handles manual duplicates)
+    while let Some(idx) = array_index_of(arr, &element) {
+        arr.remove(idx);
+    }
+
+    // Clean up empty arrays
+    if arr.is_empty() {
+        section.remove(key_info.key);
+    }
+
+    Ok(())
+}
+
+/// Check if a TOML array contains a value (by semantic equality).
+fn array_contains(arr: &toml_edit::Array, value: &toml_edit::Value) -> bool {
+    array_index_of(arr, value).is_some()
+}
+
+/// Find the index of a value in a TOML array (by semantic equality).
+fn array_index_of(arr: &toml_edit::Array, value: &toml_edit::Value) -> Option<usize> {
+    arr.iter().position(|v| values_equal(v, value))
+}
+
+/// Compare two TOML values semantically (ignoring formatting).
+fn values_equal(a: &toml_edit::Value, b: &toml_edit::Value) -> bool {
+    match (a, b) {
+        (toml_edit::Value::String(a), toml_edit::Value::String(b)) => a.value() == b.value(),
+        (toml_edit::Value::Integer(a), toml_edit::Value::Integer(b)) => a.value() == b.value(),
+        _ => false,
     }
 }
 
@@ -2304,6 +2379,28 @@ quiet = false
     }
 
     #[test]
+    fn append_value_is_idempotent() {
+        let mut doc = "[allow]\nread = [\"/tmp/a\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        append_value_in_doc(&mut doc, info, "/tmp/a").unwrap();
+        let arr = doc["allow"]["read"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "duplicate should not be added");
+    }
+
+    #[test]
+    fn append_value_idempotent_ports() {
+        let mut doc = "[allow]\nports = [8080]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("allow.ports").unwrap();
+        append_value_in_doc(&mut doc, info, "8080").unwrap();
+        let arr = doc["allow"]["ports"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "duplicate port should not be added");
+    }
+
+    #[test]
     fn append_rejects_non_array_key() {
         let info = lookup_key("sandbox.quiet").unwrap();
         let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
@@ -2331,6 +2428,98 @@ quiet = false
         unset_value_in_doc(&mut doc, info);
         let result = doc.to_string();
         assert!(result.contains("validate = true"));
+    }
+
+    #[test]
+    fn remove_array_element_removes_single_value() {
+        let mut doc = "[allow]\nread = [\"/tmp/a\", \"/tmp/b\", \"/tmp/c\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        remove_array_element_in_doc(&mut doc, info, "/tmp/b").unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("/tmp/a"));
+        assert!(!result.contains("/tmp/b"));
+        assert!(result.contains("/tmp/c"));
+    }
+
+    #[test]
+    fn remove_array_element_cleans_up_empty_array() {
+        let mut doc = "[allow]\nread = [\"/tmp/a\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        remove_array_element_in_doc(&mut doc, info, "/tmp/a").unwrap();
+        let result = doc.to_string();
+        assert!(
+            !result.contains("read"),
+            "empty array key should be removed"
+        );
+    }
+
+    #[test]
+    fn remove_array_element_noop_if_not_present() {
+        let mut doc = "[allow]\nread = [\"/tmp/a\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        remove_array_element_in_doc(&mut doc, info, "/tmp/missing").unwrap();
+        let arr = doc["allow"]["read"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "array should be unchanged");
+    }
+
+    #[test]
+    fn remove_array_element_noop_if_key_missing() {
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        remove_array_element_in_doc(&mut doc, info, "/tmp/a").unwrap();
+    }
+
+    #[test]
+    fn remove_array_element_port() {
+        let mut doc = "[allow]\nports = [8080, 9090, 3000]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("allow.ports").unwrap();
+        remove_array_element_in_doc(&mut doc, info, "9090").unwrap();
+        let arr = doc["allow"]["ports"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.get(0).unwrap().as_integer(), Some(8080));
+        assert_eq!(arr.get(1).unwrap().as_integer(), Some(3000));
+    }
+
+    #[test]
+    fn remove_array_element_errors_on_non_array() {
+        let mut doc = "[sandbox]\nquiet = true\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("sandbox.quiet").unwrap();
+        let result = remove_array_element_in_doc(&mut doc, info, "true");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not an array"));
+    }
+
+    #[test]
+    fn remove_array_element_removes_all_duplicates() {
+        let mut doc = "[allow]\nread = [\"/tmp/a\", \"/tmp/a\", \"/tmp/b\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        remove_array_element_in_doc(&mut doc, info, "/tmp/a").unwrap();
+        let arr = doc["allow"]["read"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "both duplicates should be removed");
+        assert_eq!(arr.get(0).unwrap().as_str(), Some("/tmp/b"));
+    }
+
+    #[test]
+    fn append_rejects_comma_separated_values() {
+        let mut doc = "[allow]\nread = []\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        let result = append_value_in_doc(&mut doc, info, "/tmp/a,/tmp/b");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("comma"));
     }
 
     #[test]
