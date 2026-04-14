@@ -399,6 +399,43 @@ CPLT_CONFIG=/path/to/custom.toml cplt -- --version
 
 **Path expansion:** Paths in `[allow]` and `[deny]` support `~/` expansion and are resolved relative to the config file directory. `proxy.blocked_domains` supports `~/` expansion only.
 
+### Managing config from the CLI
+
+Instead of editing TOML by hand, use `cplt config`:
+
+```bash
+cplt config show                          # show effective config (file + defaults)
+cplt config get sandbox.quiet             # get a single value
+cplt config explain                       # list all keys with descriptions
+cplt config explain sandbox.pass_env      # explain a specific key
+cplt config validate                      # check for syntax errors and unknown keys
+```
+
+**Setting values:**
+
+```bash
+# Scalar keys — set replaces the value
+cplt config set sandbox.quiet true
+cplt config set proxy.port 18080
+
+# Array keys — set appends (idempotent, no duplicates)
+cplt config set allow.read ~/Desktop
+cplt config set allow.read ~/Documents    # adds a second entry
+cplt config set allow.read ~/Desktop      # no-op, already present
+cplt config set allow.ports 8080
+```
+
+**Removing values:**
+
+```bash
+# Remove a single element from an array
+cplt config set allow.read ~/Desktop --unset
+
+# Remove an entire key (reverts to default)
+cplt config set allow.read --unset
+cplt config set sandbox.quiet --unset
+```
+
 ## Architecture
 
 ```
