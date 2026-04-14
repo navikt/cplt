@@ -40,6 +40,11 @@ pub struct ProfileOptions<'a> {
     /// Allow GPG commit/tag signing. When true, grants read-only access to
     /// the public keyring and GPG agent socket. Private keys stay denied.
     pub allow_gpg_signing: bool,
+    /// Electron app bundle Contents directory (e.g., VS Code .app/Contents).
+    /// Needed when Copilot CLI is installed as a VS Code extension and uses
+    /// VS Code's Electron runtime. Allows read + file-map-executable so dyld
+    /// can load the Electron Framework.
+    pub electron_app_dir: Option<&'a Path>,
 }
 
 /// Generate a complete SBPL sandbox profile from the given options.
@@ -60,6 +65,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_system_access(&mut sb, &home);
     emit_tool_dirs(&mut sb, &home, opts.existing_home_tool_dirs);
     emit_copilot_install(&mut sb, opts.copilot_install_dir);
+    emit_electron_app(&mut sb, opts.electron_app_dir);
     emit_system_files(&mut sb);
     emit_temp_rules(&mut sb, opts.allow_tmp_exec, opts.scratch_dir);
     emit_user_allows(&mut sb, opts.extra_read, opts.extra_write);
@@ -385,6 +391,24 @@ fn emit_copilot_install(sb: &mut String, install_dir: Option<&Path>) {
     if let Some(dir) = install_dir {
         let p = dir.to_string_lossy();
         writeln!(sb, ";; Copilot CLI installation directory").unwrap();
+        writeln!(sb, "(allow file-read* (subpath \"{p}\"))").unwrap();
+        writeln!(sb, "(allow file-map-executable (subpath \"{p}\"))").unwrap();
+        writeln!(sb).unwrap();
+    }
+}
+
+/// Allow reading and loading shared libraries from an Electron app bundle.
+/// Needed when Copilot CLI uses VS Code's (or similar editor's) Electron as its
+/// Node.js runtime — dyld must load `Electron Framework.framework` from within
+/// the `.app/Contents` directory.
+fn emit_electron_app(sb: &mut String, electron_app: Option<&Path>) {
+    if let Some(dir) = electron_app {
+        let p = dir.to_string_lossy();
+        writeln!(
+            sb,
+            ";; Electron app bundle (VS Code runtime for Copilot CLI)"
+        )
+        .unwrap();
         writeln!(sb, "(allow file-read* (subpath \"{p}\"))").unwrap();
         writeln!(sb, "(allow file-map-executable (subpath \"{p}\"))").unwrap();
         writeln!(sb).unwrap();

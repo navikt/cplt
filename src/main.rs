@@ -701,6 +701,20 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Discover Electron app bundle when Copilot CLI is installed via VS Code.
+    // The shim invokes VS Code's Electron runtime, which needs dyld access to
+    // load Electron Framework from within the .app bundle.
+    let electron_app_dir = copilot_bin_result
+        .as_ref()
+        .ok()
+        .and_then(|p| discover::discover_electron_app(p));
+    if let Some(ref dir) = electron_app_dir
+        && let Err(e) = sandbox::validate_sbpl_path(dir)
+    {
+        error(&format!("Electron app path: {e}"));
+        return ExitCode::FAILURE;
+    }
+
     // Generate sandbox profile
     let proxy_port_for_profile = if resolved.with_proxy {
         Some(resolved.proxy_port)
@@ -724,6 +738,7 @@ fn main() -> ExitCode {
         copilot_install_dir: copilot_install_dir.as_deref(),
         git_hooks_path: git_hooks_path.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
+        electron_app_dir: electron_app_dir.as_deref(),
     });
 
     // --print-profile: dump the SBPL and exit (no copilot binary needed)
@@ -1525,15 +1540,19 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) {
 /// Resolve the real Copilot CLI binary, skipping any symlinks that point back to cplt.
 ///
 /// Walks PATH entries looking for a `copilot` executable. Each candidate is
-/// canonicalized and compared to cplt's own binary path. The first non-self
-/// match is returned. This allows `copilot` → `cplt` symlinks to work without
-/// infinite recursion.
+/// canonicalized and compared to cplt's own binary path. Prefers standalone
+/// binaries (Homebrew, npm global) over VS Code editor shims, since standalone
+/// binaries don't require Electron Framework access in the sandbox.
+///
+/// Falls back to a VS Code shim if no standalone binary is found.
 fn resolve_copilot_binary() -> Result<PathBuf, String> {
     let self_exe = std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::canonicalize(&p).ok());
 
     let path_var = std::env::var("PATH").unwrap_or_default();
+
+    let mut editor_shim: Option<PathBuf> = None;
 
     for dir in path_var.split(':') {
         let candidate = PathBuf::from(dir).join("copilot");
@@ -1549,11 +1568,34 @@ fn resolve_copilot_binary() -> Result<PathBuf, String> {
             continue; // skip — this is cplt aliased as copilot
         }
 
+        // Prefer standalone binaries over editor shims (VS Code, Cursor, etc.)
+        // Editor shims invoke an Electron runtime that needs extra sandbox rules.
+        if is_editor_shim(&resolved) {
+            if editor_shim.is_none() {
+                editor_shim = Some(resolved);
+            }
+            continue;
+        }
+
         return Ok(resolved);
+    }
+
+    // Fall back to editor shim if no standalone binary found
+    if let Some(shim) = editor_shim {
+        return Ok(shim);
     }
 
     Err("GitHub Copilot CLI not found in PATH. \
          If you installed cplt as a 'copilot' alias, the real Copilot CLI \
          must also be in PATH (e.g. brew install --cask copilot-cli)."
         .to_string())
+}
+
+/// Check if a copilot binary is a VS Code/Cursor/editor shim script.
+/// These are shell scripts that invoke the editor's Electron runtime.
+fn is_editor_shim(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    content.starts_with("#!") && content.contains("copilotCLIShim.js")
 }

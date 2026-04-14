@@ -534,6 +534,110 @@ pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Discover the Electron `.app` bundle used by a VS Code-installed Copilot CLI.
+///
+/// When Copilot is installed via the VS Code extension, the `copilot` binary is a
+/// shell script shim that invokes VS Code's Electron runtime:
+/// ```text
+/// ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/.../Code Helper (Plugin)" \
+///   "/path/to/copilotCLIShim.js" "$@"
+/// ```
+///
+/// The Electron Framework (loaded by `dyld` at startup) lives inside the `.app`
+/// bundle. Without read + `file-map-executable` access the sandbox blocks `dyld`
+/// from loading it, causing an immediate `SIGABRT`.
+///
+/// Returns `<bundle>.app/Contents` (not the whole bundle) to limit scope.
+/// Also works for VS Code Insiders, Cursor, Windsurf, and other Electron editors.
+pub fn discover_electron_app(copilot_bin: &Path) -> Option<PathBuf> {
+    // Only process shell scripts (text files), not compiled binaries
+    let content = std::fs::read_to_string(copilot_bin).ok()?;
+    if !content.starts_with("#!") {
+        return None;
+    }
+
+    // Must be a Copilot CLI shim — not some unrelated script
+    if !content.contains("copilotCLIShim.js") {
+        return None;
+    }
+
+    // Extract the .app bundle from quoted paths in the shim.
+    // The shim uses double-quoted paths: "/.../Something.app/.../Binary"
+    for path in extract_quoted_paths(&content) {
+        if let Some(app_contents) = find_app_contents(&path) {
+            // Verify it's a real macOS app bundle
+            if !app_contents.join("Info.plist").is_file() {
+                continue;
+            }
+            // Canonicalize to resolve symlinks, then verify the resolved path
+            // still has the .app/Contents structure. Without this check, a
+            // symlinked Contents/ could resolve to an arbitrary directory and
+            // punch a read+exec hole through the sandbox.
+            let canonical = std::fs::canonicalize(&app_contents).unwrap_or(app_contents);
+            if canonical.file_name().is_some_and(|n| n == "Contents")
+                && canonical
+                    .parent()
+                    .and_then(|p| p.extension())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+            {
+                return Some(canonical);
+            }
+        }
+    }
+    None
+}
+
+/// Extract double-quoted absolute paths from shell script content.
+fn extract_quoted_paths(content: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            // Find the closing quote
+            if let Some(end) = content[i + 1..].find('"') {
+                let inner = &content[i + 1..i + 1 + end];
+                if inner.starts_with('/') {
+                    paths.push(PathBuf::from(inner));
+                }
+                i += 2 + end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    paths
+}
+
+/// Walk up from a path to find the outermost `<something>.app/Contents`.
+/// Returns the `Contents` directory of the top-level `.app` bundle.
+///
+/// Electron editors nest helper apps inside the main bundle:
+/// `Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/...`
+/// We need the outermost bundle (`Visual Studio Code.app/Contents`) because that's
+/// where `Electron Framework.framework` lives.
+fn find_app_contents(path: &Path) -> Option<PathBuf> {
+    let mut result: Option<PathBuf> = None;
+    let mut current = path;
+    loop {
+        if let Some(name) = current.file_name()
+            && name == "Contents"
+            && let Some(parent) = current.parent()
+            && parent
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+        {
+            // Keep going — we want the outermost match
+            result = Some(current.to_path_buf());
+        }
+        match current.parent() {
+            Some(p) if p != current => current = p,
+            _ => break,
+        }
+    }
+    result
+}
+
 /// Resolve a command name to its real path (following symlinks).
 fn which_resolved(name: &str) -> Option<PathBuf> {
     let output = std::process::Command::new("which")
@@ -654,5 +758,95 @@ mod tests {
         let paths = discover_paths(&home, &project);
         // Just verify it doesn't panic and returns plausible results
         let _ = paths.copilot_dir_exists;
+    }
+
+    // ── Electron app discovery ──────────────────────────────────
+
+    #[test]
+    fn extract_quoted_paths_finds_absolute_paths() {
+        let content = r#"#!/bin/sh
+ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)" "/Users/test/copilotCLIShim.js" "$@"
+"#;
+        let paths = extract_quoted_paths(content);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            paths[0],
+            PathBuf::from(
+                "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)"
+            )
+        );
+        assert_eq!(paths[1], PathBuf::from("/Users/test/copilotCLIShim.js"));
+    }
+
+    #[test]
+    fn extract_quoted_paths_skips_relative_and_variables() {
+        let content = r#"#!/bin/sh
+"relative/path" "$@" "/absolute/path"
+"#;
+        let paths = extract_quoted_paths(content);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn find_app_contents_outermost_bundle() {
+        // Nested .app bundles — should return the outermost .app/Contents
+        let path = PathBuf::from(
+            "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)",
+        );
+        let result = find_app_contents(&path);
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/Applications/Visual Studio Code.app/Contents")
+        );
+    }
+
+    #[test]
+    fn find_app_contents_single_bundle() {
+        let path = PathBuf::from("/Applications/Cursor.app/Contents/MacOS/Cursor");
+        let result = find_app_contents(&path);
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/Applications/Cursor.app/Contents")
+        );
+    }
+
+    #[test]
+    fn find_app_contents_no_bundle() {
+        let path = PathBuf::from("/usr/local/bin/node");
+        let result = find_app_contents(&path);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_app_contents_home_applications() {
+        let path = PathBuf::from(
+            "/Users/test/Applications/Visual Studio Code - Insiders.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper",
+        );
+        let result = find_app_contents(&path);
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/Users/test/Applications/Visual Studio Code - Insiders.app/Contents")
+        );
+    }
+
+    #[test]
+    fn discover_electron_app_non_shim_returns_none() {
+        // A compiled binary (non-text) should return None
+        let tmp = std::env::temp_dir().join("cplt-test-binary");
+        std::fs::write(&tmp, [0x7f, 0x45, 0x4c, 0x46]).unwrap(); // ELF magic
+        let result = discover_electron_app(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn discover_electron_app_non_copilot_shim_returns_none() {
+        // A shell script without copilotCLIShim.js marker
+        let tmp = std::env::temp_dir().join("cplt-test-non-copilot");
+        std::fs::write(&tmp, "#!/bin/sh\necho hello\n").unwrap();
+        let result = discover_electron_app(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert!(result.is_none());
     }
 }

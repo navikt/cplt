@@ -366,6 +366,7 @@ fn profile_contains_deny_default() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(p.contains("(deny default)"));
 }
@@ -389,6 +390,7 @@ fn profile_allows_tty_ioctl() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(allow file-ioctl)"),
@@ -415,6 +417,7 @@ fn profile_grants_project_access() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(p.contains("(allow file-read* (subpath \"/projects/app\"))"));
     assert!(p.contains("(allow file-write* (subpath \"/projects/app\"))"));
@@ -443,6 +446,7 @@ fn profile_grants_copilot_config_access() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(p.contains("(allow file-read* (subpath \"/Users/test/.copilot\"))"));
 }
@@ -466,6 +470,7 @@ fn profile_denies_sensitive_dirs() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     for dir in &[
         ".ssh",
@@ -514,6 +519,7 @@ fn profile_denies_sensitive_files() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     for file in &[
         ".netrc",
@@ -550,6 +556,7 @@ fn profile_restricts_outbound_tcp() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(deny network-outbound (remote tcp))"),
@@ -596,6 +603,7 @@ fn profile_extra_ports_adds_allows() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
@@ -630,6 +638,7 @@ fn profile_proxy_port_allows_localhost() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:18080\"))"),
@@ -660,6 +669,7 @@ fn profile_allow_localhost_opens_specific_ports() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:3000\"))"),
@@ -705,6 +715,7 @@ fn profile_deny_rules_come_after_allow_rules() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     let allow_pos = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -737,6 +748,7 @@ fn profile_allows_gh_config_read_only() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.config/gh/hosts.yml\"))"),
@@ -771,6 +783,7 @@ fn profile_allows_file_map_executable_for_copilot() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.copilot\"))"),
@@ -801,6 +814,7 @@ fn profile_denies_env_files_by_default() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains(r#"(deny file-read* (regex #"/\.env$"))"#),
@@ -839,6 +853,7 @@ fn profile_allows_env_files_when_flag_set() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         !p.contains(r#"deny file-read* (regex #"/projects/app/"#),
@@ -865,6 +880,7 @@ fn profile_env_deny_comes_after_project_allow() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     let project_allow = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -899,6 +915,7 @@ fn profile_allows_all_localhost_when_flag_set() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         !p.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
@@ -942,6 +959,7 @@ fn profile_denies_write_to_copilot_pkg() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     // Must allow write to ~/.copilot (session state, config)
     assert!(
@@ -1108,6 +1126,7 @@ fn profile_denies_exec_from_tmp() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     // Must allow read+write to /tmp (needed for temp files)
     assert!(
@@ -1157,6 +1176,7 @@ fn profile_denies_git_persistence_vectors() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     // Must deny writes to .git/hooks (post-checkout etc. run outside sandbox)
     assert!(
@@ -1209,6 +1229,7 @@ fn default_profile() -> String {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     })
 }
 
@@ -1731,6 +1752,7 @@ fn profile_scratch_dir_adds_all_permissions() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
 
     let scratch_str = scratch.to_string_lossy();
@@ -1786,6 +1808,7 @@ fn profile_allow_tmp_exec_removes_denies() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
 
     assert!(
@@ -1938,6 +1961,7 @@ fn profile_allows_copilot_install_dir() {
         )),
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains(
@@ -1975,6 +1999,7 @@ fn profile_allows_vscode_copilot_path() {
         copilot_install_dir: Some(std::path::Path::new(vscode_dir)),
         git_hooks_path: None,
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{vscode_dir}\"))")),
@@ -1994,6 +2019,53 @@ fn profile_no_copilot_install_dir_omits_section() {
     assert!(
         !p.contains("Copilot CLI installation directory"),
         "Default profile should not have copilot install dir section"
+    );
+}
+
+#[test]
+fn profile_allows_electron_app_bundle() {
+    let electron_dir = "/Applications/Visual Studio Code.app/Contents";
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: false,
+        electron_app_dir: Some(std::path::Path::new(electron_dir)),
+    });
+    assert!(
+        p.contains(&format!("(allow file-read* (subpath \"{electron_dir}\"))")),
+        "Profile must allow reading Electron app bundle"
+    );
+    assert!(
+        p.contains(&format!(
+            "(allow file-map-executable (subpath \"{electron_dir}\"))"
+        )),
+        "Profile must allow file-map-executable for Electron framework"
+    );
+    assert!(
+        p.contains("Electron app bundle"),
+        "Profile should have Electron section comment"
+    );
+}
+
+#[test]
+fn profile_no_electron_app_omits_section() {
+    let p = default_profile();
+    assert!(
+        !p.contains("Electron app bundle"),
+        "Default profile should not have Electron section"
     );
 }
 
@@ -2116,6 +2188,7 @@ fn profile_allows_git_hooks_path() {
         copilot_install_dir: None,
         git_hooks_path: Some(std::path::Path::new("/Users/test/.config/git/hooks")),
         allow_gpg_signing: false,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(allow file-read* (subpath \"/Users/test/.config/git/hooks\"))"),
@@ -2244,6 +2317,7 @@ fn profile_gpg_signing_allows_public_keyring() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: true,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.gnupg/pubring.kbx\"))"),
@@ -2278,6 +2352,7 @@ fn profile_gpg_signing_allows_agent_socket() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: true,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(allow network-outbound (literal \"/Users/test/.gnupg/S.gpg-agent\"))"),
@@ -2309,6 +2384,7 @@ fn profile_gpg_signing_denies_private_keys() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: true,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(deny file-read* (subpath \"/Users/test/.gnupg/private-keys-v1.d\"))"),
@@ -2339,6 +2415,7 @@ fn profile_gpg_signing_rules_come_after_deny() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: true,
+        electron_app_dir: None,
     });
     let deny_pos = p
         .find("(deny file-read* (subpath \"/Users/test/.gnupg\"))")
@@ -2379,6 +2456,7 @@ fn profile_gpg_signing_uses_literal_not_subpath() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: true,
+        electron_app_dir: None,
     });
     // Must use literal (exact file), never subpath (recursive) for GPG allows
     assert!(
@@ -2407,6 +2485,7 @@ fn profile_gpg_signing_deny_path_wins() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: true,
+        electron_app_dir: None,
     });
     // When user explicitly denies ~/.gnupg, GPG allows should NOT appear
     assert!(
@@ -2438,6 +2517,7 @@ fn profile_gpg_signing_denies_legacy_secring() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: true,
+        electron_app_dir: None,
     });
     assert!(
         p.contains("(deny file-read* (literal \"/Users/test/.gnupg/secring.gpg\"))"),
@@ -2464,6 +2544,7 @@ fn profile_gpg_signing_allows_socket_file_read() {
         copilot_install_dir: None,
         git_hooks_path: None,
         allow_gpg_signing: true,
+        electron_app_dir: None,
     });
     // Socket needs file-read* for inode lookup before connect(2)
     assert!(
