@@ -669,6 +669,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Discover global git hooks path from core.hooksPath
+    let git_hooks_path = discover::git_hooks_path(&home_dir);
+    if let Some(ref p) = git_hooks_path
+        && let Err(e) = sandbox::validate_sbpl_path(p)
+    {
+        error(&format!("Git hooks path: {e}"));
+        return ExitCode::FAILURE;
+    }
+
     // Generate sandbox profile
     let proxy_port_for_profile = if resolved.with_proxy {
         Some(resolved.proxy_port)
@@ -690,6 +699,7 @@ fn main() -> ExitCode {
         scratch_dir: scratch_path,
         allow_tmp_exec: resolved.allow_tmp_exec,
         copilot_install_dir: copilot_install_dir.as_deref(),
+        git_hooks_path: git_hooks_path.as_deref(),
     });
 
     // --print-profile: dump the SBPL and exit (no copilot binary needed)

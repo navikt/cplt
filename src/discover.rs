@@ -486,6 +486,54 @@ fn is_copilot_package(pkg_json: &Path) -> bool {
     v.get("name").and_then(|n| n.as_str()) == Some("@github/copilot")
 }
 
+/// Discover the global git hooks directory from `core.hooksPath`.
+///
+/// Runs `git config --global core.hooksPath`, expands `~`, canonicalizes,
+/// and validates the result. Returns `None` when:
+/// - `core.hooksPath` is not set or the directory doesn't exist
+/// - the path resolves to an unsafe root
+/// - the path is not under `$HOME` (prevents arbitrary filesystem reads)
+/// - the path is too shallow under `$HOME` (must be ≥3 components deep,
+///   e.g. `~/.config/git/hooks` OK, `~/hooks` rejected as too broad)
+pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--global", "core.hooksPath"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    // Expand ~ to home dir
+    let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+        home_dir.join(rest)
+    } else {
+        PathBuf::from(&raw)
+    };
+    // Canonicalize to resolve symlinks
+    let resolved = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+    // Safety: reject unsafe roots
+    if crate::is_unsafe_root(&resolved, home_dir) {
+        return None;
+    }
+    // Must be under $HOME — prevents punching read holes in arbitrary fs paths
+    let suffix = resolved.strip_prefix(home_dir).ok()?;
+    // Must be ≥3 components deep under $HOME to prevent overly broad reads.
+    // e.g. ~/.config/git/hooks (3 components) is OK,
+    //      ~/hooks (1 component) is too broad.
+    if suffix.components().count() < 3 {
+        return None;
+    }
+    if resolved.is_dir() {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
 /// Resolve a command name to its real path (following symlinks).
 fn which_resolved(name: &str) -> Option<PathBuf> {
     let output = std::process::Command::new("which")

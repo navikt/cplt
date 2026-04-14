@@ -59,6 +59,8 @@ cplt -- -p "fix the tests"
 | Read `~/.config/gh/hosts.yml` + `config.yml`                                     | ✅ Allowed (read-only)                    | Only these two files — rest of `.config/gh` is blocked                                  |
 | Read `~/.config/mise`                                                            | ✅ Allowed (read-only)                    | Tool versions and PATH — no secrets                                                     |
 | Read `~/.gitconfig`, `~/.config/git/config`                                      | ✅ Allowed (read-only)                    |                                                                                         |
+| Read global git hooks (`core.hooksPath`)                                         | ✅ Allowed (read-only, write-denied)      | Auto-detected; must be under `$HOME` with depth ≥3; writes explicitly blocked           |
+| Commit/tag signing (`commit.gpgsign`, `tag.gpgsign`)                             | 🔒 Disabled                               | Private keys (`~/.ssh`, `~/.gnupg`) are blocked; signing disabled via env var override  |
 | Read `~/Library/Application Support/Microsoft`                                   | ✅ Allowed (read-only)                    | Device ID for telemetry                                                                 |
 | Access macOS Keychain                                                            | ✅ Allowed (read+write)                   | Security framework locks db during access; Copilot uses `keytar.node` for token storage |
 | Outbound network (port 443)                                                      | ✅ Allowed                                | All other ports blocked — use `--allow-port` to add extras                              |
@@ -184,7 +186,7 @@ The project directory is the primary writable workspace, plus a narrow allowlist
 
 ### Environment variables
 
-By default, `cplt` sanitizes the child environment — only safe variables pass through (see `ENV_ALLOWLIST` in `sandbox_policy.rs`). Cloud credentials, database URLs, and package tokens are stripped. Additionally, security hardening variables are injected to block npm/yarn/pnpm lifecycle scripts (postinstall hooks) — the #1 supply chain attack vector.
+By default, `cplt` sanitizes the child environment — only safe variables pass through (see `ENV_ALLOWLIST` in `sandbox_policy.rs`). Cloud credentials, database URLs, and package tokens are stripped. Additionally, security hardening variables are injected to block npm/yarn/pnpm lifecycle scripts (postinstall hooks) — the #1 supply chain attack vector — and disable git commit/tag signing (since `~/.ssh` and `~/.gnupg` are inaccessible inside the sandbox).
 
 | Flag               | What it does                                                                                                                                            |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -630,6 +632,11 @@ Certain git operations are blocked to prevent persistence attacks that survive t
 | `git remote set-url`               | ❌ Blocked   | Writes to `.git/config`                                           |
 | `git submodule add`                | ❌ Blocked   | `.gitmodules` is write-protected (supply chain vector)            |
 | Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected (hooks run unsandboxed)          |
+| Signed commits/tags                | ❌ Disabled  | `commit.gpgsign` and `tag.gpgsign` overridden to `false` via env  |
+
+**Global git hooks**: If `core.hooksPath` is set in `~/.gitconfig`, cplt auto-detects the hooks directory and allows reading it so git operations succeed. Write access is explicitly denied to prevent persistence attacks. The hooks path must be under `$HOME` with at least 3 path components (e.g. `~/.config/git/hooks`) to prevent overly broad read access.
+
+**Commit signing**: `~/.ssh` and `~/.gnupg` are blocked, so GPG/SSH signing would fail. Instead of opening private key directories, cplt injects `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_N`/`GIT_CONFIG_VALUE_N` env vars to disable `commit.gpgsign` and `tag.gpgsign` inside the sandbox. Commits made by Copilot are unsigned — this is expected since users typically re-sign on merge/squash.
 
 ### Port restriction
 

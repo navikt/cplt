@@ -364,6 +364,7 @@ fn profile_contains_deny_default() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(p.contains("(deny default)"));
 }
@@ -385,6 +386,7 @@ fn profile_allows_tty_ioctl() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         p.contains("(allow file-ioctl)"),
@@ -409,6 +411,7 @@ fn profile_grants_project_access() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(p.contains("(allow file-read* (subpath \"/projects/app\"))"));
     assert!(p.contains("(allow file-write* (subpath \"/projects/app\"))"));
@@ -435,6 +438,7 @@ fn profile_grants_copilot_config_access() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(p.contains("(allow file-read* (subpath \"/Users/test/.copilot\"))"));
 }
@@ -456,6 +460,7 @@ fn profile_denies_sensitive_dirs() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     for dir in &[
         ".ssh",
@@ -502,6 +507,7 @@ fn profile_denies_sensitive_files() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     for file in &[
         ".netrc",
@@ -536,6 +542,7 @@ fn profile_restricts_outbound_tcp() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         p.contains("(deny network-outbound (remote tcp))"),
@@ -580,6 +587,7 @@ fn profile_extra_ports_adds_allows() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
@@ -612,6 +620,7 @@ fn profile_proxy_port_allows_localhost() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:18080\"))"),
@@ -640,6 +649,7 @@ fn profile_allow_localhost_opens_specific_ports() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:3000\"))"),
@@ -683,6 +693,7 @@ fn profile_deny_rules_come_after_allow_rules() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     let allow_pos = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -713,6 +724,7 @@ fn profile_allows_gh_config_read_only() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.config/gh/hosts.yml\"))"),
@@ -745,6 +757,7 @@ fn profile_allows_file_map_executable_for_copilot() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.copilot\"))"),
@@ -773,6 +786,7 @@ fn profile_denies_env_files_by_default() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         p.contains(r#"(deny file-read* (regex #"/\.env$"))"#),
@@ -809,6 +823,7 @@ fn profile_allows_env_files_when_flag_set() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         !p.contains(r#"deny file-read* (regex #"/projects/app/"#),
@@ -833,6 +848,7 @@ fn profile_env_deny_comes_after_project_allow() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     let project_allow = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -865,6 +881,7 @@ fn profile_allows_all_localhost_when_flag_set() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     assert!(
         !p.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
@@ -906,6 +923,7 @@ fn profile_denies_write_to_copilot_pkg() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     // Must allow write to ~/.copilot (session state, config)
     assert!(
@@ -1070,6 +1088,7 @@ fn profile_denies_exec_from_tmp() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     // Must allow read+write to /tmp (needed for temp files)
     assert!(
@@ -1117,6 +1136,7 @@ fn profile_denies_git_persistence_vectors() {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
     // Must deny writes to .git/hooks (post-checkout etc. run outside sandbox)
     assert!(
@@ -1167,6 +1187,7 @@ fn default_profile() -> String {
         scratch_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     })
 }
 
@@ -1687,6 +1708,7 @@ fn profile_scratch_dir_adds_all_permissions() {
         scratch_dir: Some(scratch),
         allow_tmp_exec: false,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
 
     let scratch_str = scratch.to_string_lossy();
@@ -1740,6 +1762,7 @@ fn profile_allow_tmp_exec_removes_denies() {
         scratch_dir: None,
         allow_tmp_exec: true,
         copilot_install_dir: None,
+        git_hooks_path: None,
     });
 
     assert!(
@@ -1890,6 +1913,7 @@ fn profile_allows_copilot_install_dir() {
         copilot_install_dir: Some(std::path::Path::new(
             "/Users/test/n/lib/node_modules/@github/copilot",
         )),
+        git_hooks_path: None,
     });
     assert!(
         p.contains(
@@ -2008,6 +2032,73 @@ fn pkg_dir_finds_package_multiple_levels_up() {
     assert_eq!(result, Some(pkg.clone()));
 
     std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+// ============================================================
+// git_hooks_path — global git hooks profile emission
+// ============================================================
+
+#[test]
+fn profile_allows_git_hooks_path() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: Some(std::path::Path::new("/Users/test/.config/git/hooks")),
+    });
+    assert!(
+        p.contains("(allow file-read* (subpath \"/Users/test/.config/git/hooks\"))"),
+        "Profile must allow reading global git hooks"
+    );
+    assert!(
+        p.contains("(deny file-write* (subpath \"/Users/test/.config/git/hooks\"))"),
+        "Profile must deny writing to git hooks (persistence attack prevention)"
+    );
+    assert!(
+        p.contains("Global git hooks"),
+        "Profile must have git hooks section comment"
+    );
+}
+
+#[test]
+fn profile_no_git_hooks_path_omits_section() {
+    let p = default_profile();
+    assert!(
+        !p.contains("Global git hooks"),
+        "Default profile should not have git hooks section"
+    );
+}
+
+// ============================================================
+// git signing hardening — GIT_CONFIG env vars disable signing
+// ============================================================
+
+#[test]
+fn env_git_signing_disabled_by_default() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
+    let get = |name: &str| {
+        env.vars
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(get("GIT_CONFIG_COUNT"), Some("2"));
+    assert_eq!(get("GIT_CONFIG_KEY_0"), Some("commit.gpgsign"));
+    assert_eq!(get("GIT_CONFIG_VALUE_0"), Some("false"));
+    assert_eq!(get("GIT_CONFIG_KEY_1"), Some("tag.gpgsign"));
+    assert_eq!(get("GIT_CONFIG_VALUE_1"), Some("false"));
 }
 
 // ============================================================

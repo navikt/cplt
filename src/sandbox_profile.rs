@@ -34,6 +34,9 @@ pub struct ProfileOptions<'a> {
     /// Needed when Copilot is installed in a non-standard location (e.g. ~/n/
     /// via the `n` Node version manager) that isn't covered by TOOL_READ_DIRS.
     pub copilot_install_dir: Option<&'a Path>,
+    /// Global git hooks directory from `core.hooksPath`.
+    /// Git needs to read and execute hooks from this directory for commits.
+    pub git_hooks_path: Option<&'a Path>,
 }
 
 /// Generate a complete SBPL sandbox profile from the given options.
@@ -50,6 +53,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_process_rules(&mut sb);
     emit_project_access(&mut sb, &project, opts.allow_env_files);
     emit_home_access(&mut sb, &home);
+    emit_git_hooks(&mut sb, opts.git_hooks_path);
     emit_system_access(&mut sb, &home);
     emit_tool_dirs(&mut sb, &home, opts.existing_home_tool_dirs);
     emit_copilot_install(&mut sb, opts.copilot_install_dir);
@@ -250,6 +254,24 @@ fn emit_system_access(sb: &mut String, home: &str) {
     writeln!(sb, ";; Tool version files (mise/asdf, read-only)").unwrap();
     writeln!(sb, "(allow file-read* (literal \"{home}/.tool-versions\"))").unwrap();
     writeln!(sb).unwrap();
+}
+
+/// Allow reading global git hooks from `core.hooksPath`.
+///
+/// Git hooks are user-configured scripts that run on commit/push/etc.
+/// We explicitly deny writes to prevent a persistence attack: a rogue agent
+/// could plant hooks (pre-commit, post-checkout) that execute unsandboxed
+/// the next time the user runs git outside cplt.
+fn emit_git_hooks(sb: &mut String, git_hooks_path: Option<&Path>) {
+    if let Some(hooks) = git_hooks_path {
+        let p = hooks.to_string_lossy();
+        writeln!(sb, ";; Global git hooks (core.hooksPath)").unwrap();
+        writeln!(sb, "(allow file-read* (subpath \"{p}\"))").unwrap();
+        // Deny writes — hooks must not be modifiable from the sandbox.
+        // Must come after any broader allow (last-match-wins).
+        writeln!(sb, "(deny file-write* (subpath \"{p}\"))").unwrap();
+        writeln!(sb).unwrap();
+    }
 }
 
 fn emit_tool_dirs(sb: &mut String, home: &str, existing_home_tool_dirs: Option<&[String]>) {

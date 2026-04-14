@@ -256,6 +256,39 @@ pub const HARDENING_ENV_VARS: &[HardeningEnvVar] = &[
         category: HardeningCategory::GitHardening,
         description: "Prevent git from prompting for credentials",
     },
+    // Git signing — ~/.ssh and ~/.gnupg are denied by the sandbox, so commit/tag
+    // signing would fail with EPERM. Disable it via config override rather than
+    // opening private key directories. Unsigned Copilot commits are fine.
+    HardeningEnvVar {
+        name: "GIT_CONFIG_COUNT",
+        value: "2",
+        category: HardeningCategory::GitHardening,
+        description: "Number of git config overrides (commit + tag signing)",
+    },
+    HardeningEnvVar {
+        name: "GIT_CONFIG_KEY_0",
+        value: "commit.gpgsign",
+        category: HardeningCategory::GitHardening,
+        description: "Override commit signing config key",
+    },
+    HardeningEnvVar {
+        name: "GIT_CONFIG_VALUE_0",
+        value: "false",
+        category: HardeningCategory::GitHardening,
+        description: "Disable commit signing (private keys inaccessible)",
+    },
+    HardeningEnvVar {
+        name: "GIT_CONFIG_KEY_1",
+        value: "tag.gpgsign",
+        category: HardeningCategory::GitHardening,
+        description: "Override tag signing config key",
+    },
+    HardeningEnvVar {
+        name: "GIT_CONFIG_VALUE_1",
+        value: "false",
+        category: HardeningCategory::GitHardening,
+        description: "Disable tag signing (private keys inaccessible)",
+    },
 ];
 
 /// Tool directory under $HOME with granular sandbox permissions.

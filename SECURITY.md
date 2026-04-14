@@ -20,8 +20,8 @@ cplt assumes Copilot CLI is an **untrusted agent** executing arbitrary code sugg
 | **Process-group escape** | Kill parent, children continue unsandboxed | `setpgid` + signal forwarding |
 | **Env var credential theft** | Read `AWS_SECRET_ACCESS_KEY` from env | `env_clear()` + safe allowlist |
 | **Persistence via native modules** | Replace `keytar.node` with malware | Deny writes to `~/.copilot/pkg` |
-| **Git hook injection** | Write post-checkout hook that runs outside sandbox | Deny writes to `.git/hooks/` |
-| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Deny writes to `.git/config` |
+| **Git hook injection** | Write post-checkout hook that runs outside sandbox | Deny writes to `.git/hooks/` and global `core.hooksPath` dir |
+| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Deny writes to `.git/config`; global hooks path validated (under `$HOME`, depth ≥3) |
 | **Submodule supply chain** | Modify `.gitmodules` to point to malicious repo | Deny writes to `.gitmodules` |
 
 ### Out of scope
@@ -179,14 +179,34 @@ Beyond sanitization, `cplt` injects hardening environment variables that disable
 | `npm_config_ignore_scripts` | `true` | LifecycleScripts | Block npm/pnpm postinstall hooks |
 | `YARN_ENABLE_SCRIPTS` | `false` | LifecycleScripts | Block Yarn Berry lifecycle scripts |
 | `GIT_TERMINAL_PROMPT` | `0` | GitHardening | Prevent git credential prompts |
+| `GIT_CONFIG_COUNT` | `2` | GitHardening | Number of git config overrides |
+| `GIT_CONFIG_KEY_0` | `commit.gpgsign` | GitHardening | Override commit signing config |
+| `GIT_CONFIG_VALUE_0` | `false` | GitHardening | Disable commit signing (private keys inaccessible) |
+| `GIT_CONFIG_KEY_1` | `tag.gpgsign` | GitHardening | Override tag signing config |
+| `GIT_CONFIG_VALUE_1` | `false` | GitHardening | Disable tag signing (private keys inaccessible) |
 
-**Why this matters:** Supply chain attacks (e.g., axios March 2026) use `postinstall` hooks to execute malicious payloads. Blocking lifecycle scripts eliminates this attack class — `npm install` still downloads packages, but no arbitrary code runs. Explicit commands like `npm run build` still work normally.
+**Why this matters:** Supply chain attacks (e.g., axios March 2026) use `postinstall` hooks to execute malicious payloads. Blocking lifecycle scripts eliminates this attack class — `npm install` still downloads packages, but no arbitrary code runs. Explicit commands like `npm run build` still work normally. Git signing is disabled because `~/.ssh` and `~/.gnupg` are denied by the sandbox — attempting to sign would fail with EPERM. Disabling via env var gives a clean error-free experience.
 
 **Escape hatch:** `--allow-lifecycle-scripts` disables the `LifecycleScripts` category. Use when `npm install` requires postinstall hooks (e.g., native module compilation).
 
 ### Layer 0.5: Native Module Write Protection
 
 The sandbox denies writes to `~/.copilot/pkg/` (where Copilot's native modules like `keytar.node` live). This prevents a persistence attack where a rogue agent replaces a native module with malware that executes *unsandboxed* next time Copilot runs outside `cplt`.
+
+### Layer 0.6: Copilot Install Directory Auto-Detection
+
+When Copilot CLI is installed via a non-standard Node version manager (e.g. `n` at `~/n/`, Volta at `~/.volta/`, custom npm prefix), its package directory falls outside the static `TOOL_READ_DIRS`. At startup, cplt resolves the copilot binary path, walks up at most 4 ancestors looking for a `package.json` with `"name": "@github/copilot"`, and adds the directory to the sandbox read allowlist. Safety checks:
+- **Package identity**: parsed via `serde_json` — only the real Copilot package is accepted
+- **Unsafe root rejection**: `/`, `$HOME`, `/tmp`, etc. are rejected
+- **SBPL injection validation**: path characters validated before profile interpolation
+
+### Layer 0.7: Global Git Hooks Protection
+
+Git's `core.hooksPath` points to a directory of user-configured hooks that run on commit, push, etc. If not allowed, the sandbox causes git to fail with EPERM (instead of ENOENT for missing hooks). cplt auto-detects the hooks path and allows reading it. Safety checks:
+- **Write denied**: `(deny file-write*)` explicitly blocks writes to the hooks directory, preventing persistence attacks even if the path overlaps a writable sandbox directory
+- **Under `$HOME`**: paths outside the home directory are rejected (prevents arbitrary filesystem reads)
+- **Depth ≥ 3**: the path must have at least 3 components under `$HOME` (e.g. `~/.config/git/hooks` is OK, `~/hooks` is too broad)
+- **Unsafe root rejection**: `/`, `$HOME`, `/tmp`, etc. are rejected
 
 ### Layer 1: Seatbelt Kernel Sandbox (sandbox-exec)
 
@@ -201,6 +221,10 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 (allow file-read/write project_dir)     ← Project access
 (allow file-read ~/.copilot)            ← Auth token access + native modules
 (allow file-read ~/.config/gh/hosts.yml)← GitHub CLI auth (2 files only)
+(allow file-read ~/.config/git/config)  ← Git config (read-only)
+(allow file-read core.hooksPath dir)    ← Global git hooks (auto-detected, if set)
+(deny  file-write core.hooksPath dir)   ← Prevent persistence via hook modification
+(allow file-read copilot_install_dir)   ← Copilot CLI package dir (auto-detected)
 (allow file-read/write /private/tmp)    ← Temp file access
 (deny process-exec /private/tmp)        ← But no executing from tmp!
 (deny file-* ~/.ssh, ~/.aws, ...)       ← Sensitive dirs blocked
