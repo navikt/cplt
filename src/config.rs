@@ -76,6 +76,11 @@ pub struct SandboxConfig {
     /// Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run (default: false).
     /// These are blocked by default to prevent supply chain attacks.
     pub allow_lifecycle_scripts: Option<bool>,
+    /// Allow GPG commit/tag signing inside the sandbox (default: false).
+    /// DANGEROUS: exposes GPG agent socket, allowing signature requests.
+    /// Private keys remain protected — only the agent socket and public
+    /// keyring are accessible. See SECURITY.md for risk analysis.
+    pub allow_gpg_signing: Option<bool>,
     /// Allow process execution from system temp directories (default: false).
     /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
     pub allow_tmp_exec: Option<bool>,
@@ -107,6 +112,7 @@ pub struct Resolved {
     pub pass_env: Vec<String>,
     pub inherit_env: bool,
     pub allow_lifecycle_scripts: bool,
+    pub allow_gpg_signing: bool,
     pub allow_tmp_exec: bool,
     pub scratch_dir: bool,
     pub quiet: bool,
@@ -135,6 +141,7 @@ pub struct CliFlags {
     pub pass_env: Vec<String>,
     pub inherit_env: bool,
     pub allow_lifecycle_scripts: bool,
+    pub allow_gpg_signing: bool,
     pub allow_tmp_exec: bool,
     pub scratch_dir: bool,
     pub quiet: bool,
@@ -319,6 +326,13 @@ impl Config {
             self.sandbox.allow_lifecycle_scripts.unwrap_or(false)
         };
 
+        // Allow-gpg-signing: CLI flag wins, then config, then false (blocked by default)
+        let allow_gpg_signing = if cli.allow_gpg_signing {
+            true
+        } else {
+            self.sandbox.allow_gpg_signing.unwrap_or(false)
+        };
+
         // Allow-tmp-exec: CLI flag wins, then config, then false (blocked by default)
         let allow_tmp_exec = if cli.allow_tmp_exec {
             true
@@ -368,6 +382,7 @@ impl Config {
             pass_env,
             inherit_env,
             allow_lifecycle_scripts,
+            allow_gpg_signing,
             allow_tmp_exec,
             scratch_dir,
             quiet,
@@ -381,6 +396,9 @@ impl Resolved {
         let mut disabled = Vec::new();
         if self.allow_lifecycle_scripts {
             disabled.push(HardeningCategory::LifecycleScripts);
+        }
+        if self.allow_gpg_signing {
+            disabled.push(HardeningCategory::GitSigning);
         }
         disabled
     }
@@ -458,9 +476,19 @@ impl Resolved {
                 "{blue}[cplt]{nc}    Tmp exec:      {red}ALLOWED{nc}     {dim}⚠ /tmp + /var/folders exec enabled{nc}"
             );
         }
-        eprintln!(
-            "{blue}[cplt]{nc}    SSH/GPG/cloud: blocked     {dim}~/.ssh, ~/.gnupg, ~/.aws, ...{nc}"
-        );
+        if self.allow_gpg_signing {
+            let red = "\x1b[0;31m";
+            eprintln!(
+                "{blue}[cplt]{nc}    GPG signing:   {red}ALLOWED{nc}     {dim}⚠ agent socket exposed (--allow-gpg-signing){nc}"
+            );
+            eprintln!(
+                "{blue}[cplt]{nc}    SSH/cloud:     blocked     {dim}~/.ssh, ~/.aws, ...{nc}"
+            );
+        } else {
+            eprintln!(
+                "{blue}[cplt]{nc}    SSH/GPG/cloud: blocked     {dim}~/.ssh, ~/.gnupg, ~/.aws, ...{nc}"
+            );
+        }
         eprintln!("{blue}[cplt]{nc}    Copilot dir:   {green}allowed{nc}     {dim}~/.copilot{nc}");
         eprintln!(
             "{blue}[cplt]{nc}    Keychain:      {green}allowed{nc}     {dim}~/Library/Keychains{nc}"
@@ -645,6 +673,13 @@ pub fn default_config_contents() -> String {
 # use postinstall hooks to execute malicious payloads.
 # allow_lifecycle_scripts = false
 #
+# DANGEROUS: Allow GPG commit/tag signing inside the sandbox.
+# Exposes the GPG agent socket so gpg can request signatures.
+# Private keys remain protected — only the public keyring and agent
+# socket are accessible. A compromised process cannot extract the key,
+# but it CAN request arbitrary signatures while the session is active.
+# allow_gpg_signing = false
+#
 # Allow outbound TCP to localhost on ALL ports.
 # Needed for build tools like Turbopack (Next.js), Vite, and esbuild
 # that spawn workers communicating via TCP on random localhost ports.
@@ -730,6 +765,7 @@ const VALID_SANDBOX_KEYS: &[&str] = &[
     "pass_env",
     "inherit_env",
     "allow_lifecycle_scripts",
+    "allow_gpg_signing",
     "allow_tmp_exec",
     "scratch_dir",
     "quiet",
@@ -824,6 +860,13 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
                 message: "sandbox.allow_tmp_exec = true: exec from temp dirs enabled (DANGEROUS)"
+                    .to_string(),
+            });
+        }
+        if sandbox.get("allow_gpg_signing").and_then(|v| v.as_bool()) == Some(true) {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.allow_gpg_signing = true: GPG agent socket exposed — signing requests possible (DANGEROUS)"
                     .to_string(),
             });
         }
@@ -1077,6 +1120,14 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         dangerous: false,
         default_display: "false",
         description: "Allow npm/yarn/pnpm lifecycle scripts (postinstall, prepare, etc.) to run.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "allow_gpg_signing",
+        value_type: ConfigValueType::Bool,
+        dangerous: true,
+        default_display: "false",
+        description: "⚠️  DANGEROUS: Allow GPG commit/tag signing. Exposes the GPG agent socket for signature requests. Private keys stay protected.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -1549,6 +1600,16 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         allow_lifecycle,
         src(c.sandbox.allow_lifecycle_scripts.is_some())
     );
+    let allow_gpg = c.sandbox.allow_gpg_signing.unwrap_or(false);
+    if allow_gpg {
+        let red = "\x1b[0;31m";
+        eprintln!("{blue}[cplt]{nc}    allow_gpg_signing     = {red}true{nc} ⚠ DANGEROUS");
+    } else {
+        eprintln!(
+            "{blue}[cplt]{nc}    allow_gpg_signing     = false{}",
+            src(c.sandbox.allow_gpg_signing.is_some())
+        );
+    }
     let allow_tmp = c.sandbox.allow_tmp_exec.unwrap_or(false);
     if allow_tmp {
         let red = "\x1b[0;31m";

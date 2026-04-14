@@ -170,6 +170,14 @@ struct Cli {
     #[arg(long)]
     allow_lifecycle_scripts: bool,
 
+    /// Allow GPG commit/tag signing inside the sandbox (DANGEROUS).
+    /// Exposes the GPG agent socket — enables signing AND decryption requests.
+    /// Private keys remain protected — only the public keyring and agent
+    /// socket are accessible. A compromised process cannot extract the key,
+    /// but CAN request arbitrary signatures and decryptions while active.
+    #[arg(long)]
+    allow_gpg_signing: bool,
+
     /// Allow process execution from system temp directories.
     /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
     /// Prefer --scratch-dir which creates a controlled executable temp dir.
@@ -546,6 +554,7 @@ fn main() -> ExitCode {
         pass_env: cli.pass_env.clone(),
         inherit_env: cli.inherit_env,
         allow_lifecycle_scripts: cli.allow_lifecycle_scripts,
+        allow_gpg_signing: cli.allow_gpg_signing,
         allow_tmp_exec: cli.allow_tmp_exec,
         scratch_dir: cli.scratch_dir,
         quiet: cli.quiet,
@@ -700,6 +709,7 @@ fn main() -> ExitCode {
         allow_tmp_exec: resolved.allow_tmp_exec,
         copilot_install_dir: copilot_install_dir.as_deref(),
         git_hooks_path: git_hooks_path.as_deref(),
+        allow_gpg_signing: resolved.allow_gpg_signing,
     });
 
     // --print-profile: dump the SBPL and exit (no copilot binary needed)

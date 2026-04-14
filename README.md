@@ -193,6 +193,7 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | `--pass-env <VAR>` | Explicitly pass an environment variable through to Copilot. Can be repeated.                                                                            |
 | `--inherit-env`    | ⚠️ **Dangerous.** Inherit the full parent environment (only strips `NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`). Use only for debugging. |
 | `--allow-lifecycle-scripts` | Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run. Blocked by default. Use when `npm install` needs postinstall hooks.         |
+| `--allow-gpg-signing`       | Allow GPG commit/tag signing inside the sandbox. Grants read-only access to public keyring and GPG agent socket (private keys stay denied). See [GPG signing](#gpg-commit-signing). |
 | `--scratch-dir`             | Enable per-session scratch directory with TMPDIR redirect. Required for `go test`, `mise` inline tasks, and other compile-then-exec tools.   |
 | `--allow-tmp-exec`          | ⚠️ **Dangerous.** Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer `--scratch-dir`.                        |
 
@@ -345,6 +346,7 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 # validate = true
 # allow_env_files = false
 # allow_lifecycle_scripts = false
+# allow_gpg_signing = false    # Allow GPG commit signing (see SECURITY.md)
 # allow_localhost_any = false
 # scratch_dir = false
 # allow_tmp_exec = false       # Dangerous — prefer scratch_dir
@@ -632,11 +634,84 @@ Certain git operations are blocked to prevent persistence attacks that survive t
 | `git remote set-url`               | ❌ Blocked   | Writes to `.git/config`                                           |
 | `git submodule add`                | ❌ Blocked   | `.gitmodules` is write-protected (supply chain vector)            |
 | Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected (hooks run unsandboxed)          |
-| Signed commits/tags                | ❌ Disabled  | `commit.gpgsign` and `tag.gpgsign` overridden to `false` via env  |
+| Signed commits/tags                | ❌ Disabled  | `commit.gpgsign` and `tag.gpgsign` overridden to `false` via env; use `--allow-gpg-signing` to enable |
 
 **Global git hooks**: If `core.hooksPath` is set in `~/.gitconfig`, cplt auto-detects the hooks directory and allows reading it so git operations succeed. Write access is explicitly denied to prevent persistence attacks. The hooks path must be under `$HOME` with at least 3 path components (e.g. `~/.config/git/hooks`) to prevent overly broad read access.
 
-**Commit signing**: `~/.ssh` and `~/.gnupg` are blocked, so GPG/SSH signing would fail. Instead of opening private key directories, cplt injects `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_N`/`GIT_CONFIG_VALUE_N` env vars to disable `commit.gpgsign` and `tag.gpgsign` inside the sandbox. Commits made by Copilot are unsigned — this is expected since users typically re-sign on merge/squash.
+**Commit signing**: `~/.ssh` and `~/.gnupg` are blocked, so GPG/SSH signing would fail. Instead of opening private key directories, cplt injects `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_N`/`GIT_CONFIG_VALUE_N` env vars to disable `commit.gpgsign` and `tag.gpgsign` inside the sandbox. Commits made by Copilot are unsigned — this is expected since users typically re-sign on merge/squash. Use `--allow-gpg-signing` to override this (see [GPG signing](#gpg-commit-signing)).
+
+### GPG commit signing
+
+GPG commit/tag signing is **disabled by default** because `~/.gnupg` is blocked. Copilot commits are unsigned — you re-sign on merge/squash.
+
+If you want Copilot commits to be signed (e.g. branch protection requires signatures), use `--allow-gpg-signing`:
+
+```bash
+cplt --allow-gpg-signing -- -p "commit your changes"
+```
+
+Or set it permanently in config:
+
+```toml
+[sandbox]
+allow_gpg_signing = true
+```
+
+**Setup checklist:**
+
+Before using this flag, verify GPG signing works outside the sandbox:
+
+```bash
+# 1. Check your signing key is configured
+git config --get user.signingkey          # should show your key ID
+
+# 2. Check gpg-agent is running
+gpg-connect-agent 'GETINFO version' /bye  # should print version + OK
+
+# 3. Cache your passphrase (so signing doesn't hang)
+echo "test" | gpg --clearsign > /dev/null  # triggers passphrase prompt
+
+# 4. Verify git signing works
+git commit --allow-empty -S -m "test signed commit"
+git log --show-signature -1               # should show "Good signature"
+git reset HEAD~1                          # undo the test commit
+```
+
+If all of that works, `cplt --allow-gpg-signing` will work too. The `gpg-agent` runs **outside** the sandbox, so pinentry prompts appear normally — the sandbox only needs to reach the agent socket.
+
+> **Note:** Signature *verification* (`git log --show-signature`) won't work inside the sandbox because GPG opens `trustdb.gpg` for writing during verification. This is harmless — signing works correctly, and signatures can be verified outside the sandbox or in CI.
+
+**Troubleshooting:**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `error: gpg failed to sign the data` | Agent not running or passphrase not cached | Run `gpg-connect-agent 'GETINFO version' /bye` and `echo test \| gpg --clearsign` outside cplt |
+| `signing failed: No secret key` | Wrong `user.signingkey` in git config | Run `gpg --list-secret-keys` and set `git config --global user.signingkey <KEY_ID>` |
+| `signing failed: Operation not permitted` | Flag not set, or `--deny-path` overriding | Check `cplt --doctor` output for GPG signing status |
+| Commits unsigned despite flag | `gpg.format=ssh` in git config | This flag is GPG-only; SSH signing is not supported |
+| `GNUPGHOME` set to non-default path | SBPL rules only cover `~/.gnupg` | Unset `GNUPGHOME` or symlink to `~/.gnupg` |
+| `git log --show-signature` shows `Fatal: can't open trustdb.gpg` | GPG opens `trustdb.gpg` for writing during *verification*, which the sandbox denies | This is expected — **signing works**, only verification is affected. Verify signatures outside the sandbox or in CI |
+
+**What this does:**
+
+| Resource | Access | Why |
+|---|---|---|
+| `~/.gnupg/pubring.kbx`, `pubring.gpg` | Read-only | Public key lookup |
+| `~/.gnupg/trustdb.gpg` | Read-only | Trust validation |
+| `~/.gnupg/gpg.conf`, `common.conf` | Read-only | GPG config |
+| `~/.gnupg/S.gpg-agent` | Read + socket connect | IPC to agent daemon |
+| `~/.gnupg/S.keyboxd` | Read + socket connect | IPC to keyboxd (GnuPG 2.4+ public key daemon) |
+| `~/.gnupg/private-keys-v1.d/` | **DENIED** | Private keys stay locked |
+| `~/.gnupg/secring.gpg` | **DENIED** | Legacy private keyring stays locked |
+| `~/.gnupg/*` (writes) | **DENIED** | No modifications |
+
+**Security notes:**
+
+- **Private keys are NOT exposed.** GPG agent holds keys in memory — the Assuan IPC protocol has no command to export private key material. The `private-keys-v1.d/` directory remains denied even with this flag.
+- **Risk: signature impersonation and decryption.** A compromised process with agent socket access can request signatures on arbitrary data (adding a "Verified" badge) and, if an encryption subkey exists, decrypt arbitrary ciphertext. This is the same level of impersonation Copilot already has for unsigned commits — signing just adds the badge.
+- **GPG-only.** This flag does not enable SSH signing (`gpg.format=ssh`). SSH keys and `SSH_AUTH_SOCK` remain blocked.
+- **`--deny-path` wins.** If you specify `--deny-path ~/.gnupg` alongside `--allow-gpg-signing`, the deny takes precedence — all GPG allows are suppressed.
+- **`GNUPGHOME`** is not supported yet — only the default `~/.gnupg` location is allowed.
 
 ### Port restriction
 

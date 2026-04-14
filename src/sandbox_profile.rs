@@ -2,8 +2,8 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use super::policy::{
-    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, HOME_TOOL_DIRS, HomeToolDir,
-    SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
+    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, GPG_SIGNING_ALLOW_FILES, HOME_TOOL_DIRS,
+    HomeToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
 };
 
 /// Options for generating an SBPL sandbox profile.
@@ -37,6 +37,9 @@ pub struct ProfileOptions<'a> {
     /// Global git hooks directory from `core.hooksPath`.
     /// Git needs to read and execute hooks from this directory for commits.
     pub git_hooks_path: Option<&'a Path>,
+    /// Allow GPG commit/tag signing. When true, grants read-only access to
+    /// the public keyring and GPG agent socket. Private keys stay denied.
+    pub allow_gpg_signing: bool,
 }
 
 /// Generate a complete SBPL sandbox profile from the given options.
@@ -61,6 +64,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_temp_rules(&mut sb, opts.allow_tmp_exec, opts.scratch_dir);
     emit_user_allows(&mut sb, opts.extra_read, opts.extra_write);
     emit_deny_rules(&mut sb, &home, opts.extra_deny);
+    emit_gpg_signing_rules(&mut sb, &home, opts.allow_gpg_signing, opts.extra_deny);
     emit_network_rules(
         &mut sb,
         opts.extra_ports,
@@ -474,6 +478,78 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
         writeln!(sb, "(deny file-read* (subpath \"{p}\"))").unwrap();
         writeln!(sb, "(deny file-write* (subpath \"{p}\"))").unwrap();
     }
+    writeln!(sb).unwrap();
+}
+
+/// Allow GPG commit signing when `--allow-gpg-signing` is set.
+///
+/// Emitted AFTER `emit_deny_rules` (which denies all of `~/.gnupg`).
+/// SBPL uses last-match-wins, so these targeted allows override the
+/// blanket deny. Private keys (`private-keys-v1.d/` and legacy
+/// `secring.gpg`) are explicitly re-denied after the allows to
+/// ensure they remain locked.
+///
+/// If any `extra_deny` path overlaps with `~/.gnupg`, GPG rules are
+/// skipped entirely — explicit user denies always win.
+fn emit_gpg_signing_rules(
+    sb: &mut String,
+    home: &str,
+    allow_gpg_signing: bool,
+    extra_deny: &[PathBuf],
+) {
+    if !allow_gpg_signing {
+        return;
+    }
+    // Explicit --deny-path wins: if the user denied anything under ~/.gnupg,
+    // skip all GPG allows so the deny is not overridden.
+    let gnupg_dir = format!("{home}/.gnupg");
+    for deny in extra_deny {
+        let d = deny.to_string_lossy();
+        if d == gnupg_dir || d.starts_with(&format!("{gnupg_dir}/")) {
+            writeln!(
+                sb,
+                ";; GPG signing skipped: --deny-path overlaps with ~/.gnupg"
+            )
+            .unwrap();
+            return;
+        }
+    }
+    writeln!(sb, ";; GPG signing (--allow-gpg-signing)").unwrap();
+    // Allow read-only access to public keyring and config
+    for file in GPG_SIGNING_ALLOW_FILES {
+        writeln!(sb, "(allow file-read* (literal \"{home}/.gnupg/{file}\"))").unwrap();
+    }
+    // Allow connecting to the GPG agent socket for signing requests.
+    // The agent holds private keys in memory — the socket is the only
+    // interface, and the Assuan protocol cannot export keys.
+    // file-read* is needed for the inode lookup before connect(2).
+    // S.keyboxd is needed for GnuPG 2.4+ with keyboxd-managed public keys.
+    for socket in &["S.gpg-agent", "S.keyboxd"] {
+        writeln!(
+            sb,
+            "(allow file-read* (literal \"{home}/.gnupg/{socket}\"))"
+        )
+        .unwrap();
+        writeln!(
+            sb,
+            "(allow network-outbound (literal \"{home}/.gnupg/{socket}\"))"
+        )
+        .unwrap();
+    }
+    // Private keys must remain denied even with GPG signing enabled.
+    // Covers both modern (private-keys-v1.d/) and legacy (secring.gpg).
+    writeln!(
+        sb,
+        "(deny file-read* (subpath \"{home}/.gnupg/private-keys-v1.d\"))"
+    )
+    .unwrap();
+    writeln!(
+        sb,
+        "(deny file-read* (literal \"{home}/.gnupg/secring.gpg\"))"
+    )
+    .unwrap();
+    // No write access to any part of .gnupg
+    writeln!(sb, "(deny file-write* (subpath \"{home}/.gnupg\"))").unwrap();
     writeln!(sb).unwrap();
 }
 

@@ -365,6 +365,7 @@ fn profile_contains_deny_default() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(p.contains("(deny default)"));
 }
@@ -387,6 +388,7 @@ fn profile_allows_tty_ioctl() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains("(allow file-ioctl)"),
@@ -412,6 +414,7 @@ fn profile_grants_project_access() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(p.contains("(allow file-read* (subpath \"/projects/app\"))"));
     assert!(p.contains("(allow file-write* (subpath \"/projects/app\"))"));
@@ -439,6 +442,7 @@ fn profile_grants_copilot_config_access() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(p.contains("(allow file-read* (subpath \"/Users/test/.copilot\"))"));
 }
@@ -461,6 +465,7 @@ fn profile_denies_sensitive_dirs() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     for dir in &[
         ".ssh",
@@ -508,6 +513,7 @@ fn profile_denies_sensitive_files() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     for file in &[
         ".netrc",
@@ -543,6 +549,7 @@ fn profile_restricts_outbound_tcp() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains("(deny network-outbound (remote tcp))"),
@@ -588,6 +595,7 @@ fn profile_extra_ports_adds_allows() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
@@ -621,6 +629,7 @@ fn profile_proxy_port_allows_localhost() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:18080\"))"),
@@ -650,6 +659,7 @@ fn profile_allow_localhost_opens_specific_ports() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:3000\"))"),
@@ -694,6 +704,7 @@ fn profile_deny_rules_come_after_allow_rules() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     let allow_pos = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -725,6 +736,7 @@ fn profile_allows_gh_config_read_only() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.config/gh/hosts.yml\"))"),
@@ -758,6 +770,7 @@ fn profile_allows_file_map_executable_for_copilot() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.copilot\"))"),
@@ -787,6 +800,7 @@ fn profile_denies_env_files_by_default() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains(r#"(deny file-read* (regex #"/\.env$"))"#),
@@ -824,6 +838,7 @@ fn profile_allows_env_files_when_flag_set() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         !p.contains(r#"deny file-read* (regex #"/projects/app/"#),
@@ -849,6 +864,7 @@ fn profile_env_deny_comes_after_project_allow() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     let project_allow = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -882,6 +898,7 @@ fn profile_allows_all_localhost_when_flag_set() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         !p.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
@@ -924,6 +941,7 @@ fn profile_denies_write_to_copilot_pkg() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     // Must allow write to ~/.copilot (session state, config)
     assert!(
@@ -1089,6 +1107,7 @@ fn profile_denies_exec_from_tmp() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     // Must allow read+write to /tmp (needed for temp files)
     assert!(
@@ -1137,6 +1156,7 @@ fn profile_denies_git_persistence_vectors() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     // Must deny writes to .git/hooks (post-checkout etc. run outside sandbox)
     assert!(
@@ -1188,6 +1208,7 @@ fn default_profile() -> String {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     })
 }
 
@@ -1709,6 +1730,7 @@ fn profile_scratch_dir_adds_all_permissions() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
 
     let scratch_str = scratch.to_string_lossy();
@@ -1763,6 +1785,7 @@ fn profile_allow_tmp_exec_removes_denies() {
         allow_tmp_exec: true,
         copilot_install_dir: None,
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
 
     assert!(
@@ -1914,6 +1937,7 @@ fn profile_allows_copilot_install_dir() {
             "/Users/test/n/lib/node_modules/@github/copilot",
         )),
         git_hooks_path: None,
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains(
@@ -2056,6 +2080,7 @@ fn profile_allows_git_hooks_path() {
         allow_tmp_exec: false,
         copilot_install_dir: None,
         git_hooks_path: Some(std::path::Path::new("/Users/test/.config/git/hooks")),
+        allow_gpg_signing: false,
     });
     assert!(
         p.contains("(allow file-read* (subpath \"/Users/test/.config/git/hooks\"))"),
@@ -2099,6 +2124,317 @@ fn env_git_signing_disabled_by_default() {
     assert_eq!(get("GIT_CONFIG_VALUE_0"), Some("false"));
     assert_eq!(get("GIT_CONFIG_KEY_1"), Some("tag.gpgsign"));
     assert_eq!(get("GIT_CONFIG_VALUE_1"), Some("false"));
+}
+
+#[test]
+fn env_git_signing_enabled_skips_signing_vars() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let env = build_sandbox_env(&parent, &[], false, &[HardeningCategory::GitSigning], None);
+    let get = |name: &str| {
+        env.vars
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    // Signing vars should be absent when GitSigning category is disabled
+    assert_eq!(
+        get("GIT_CONFIG_COUNT"),
+        None,
+        "GIT_CONFIG_COUNT should not be set when GPG signing is allowed"
+    );
+    assert_eq!(get("GIT_CONFIG_KEY_0"), None);
+    assert_eq!(get("GIT_CONFIG_VALUE_0"), None);
+    // GIT_TERMINAL_PROMPT should still be set (it's GitHardening, not GitSigning)
+    assert_eq!(
+        get("GIT_TERMINAL_PROMPT"),
+        Some("0"),
+        "GIT_TERMINAL_PROMPT must remain set even when GPG signing is allowed"
+    );
+}
+
+#[test]
+fn env_gpg_tty_passed_through() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        ("GPG_TTY", "/dev/ttys001"),
+    ]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
+    let get = |name: &str| {
+        env.vars
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(
+        get("GPG_TTY"),
+        Some("/dev/ttys001"),
+        "GPG_TTY should be in the allowlist"
+    );
+}
+
+// ============================================================
+// GPG signing — profile SBPL rules
+// ============================================================
+
+#[test]
+fn profile_gpg_signing_disabled_by_default() {
+    let p = default_profile();
+    assert!(
+        !p.contains("GPG signing"),
+        "GPG signing section should not appear when disabled"
+    );
+    assert!(
+        !p.contains("S.gpg-agent"),
+        "GPG agent socket should not be allowed when disabled"
+    );
+}
+
+#[test]
+fn profile_gpg_signing_allows_public_keyring() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: true,
+    });
+    assert!(
+        p.contains("(allow file-read* (literal \"/Users/test/.gnupg/pubring.kbx\"))"),
+        "Must allow reading public keyring"
+    );
+    assert!(
+        p.contains("(allow file-read* (literal \"/Users/test/.gnupg/trustdb.gpg\"))"),
+        "Must allow reading trust database"
+    );
+    assert!(
+        p.contains("(allow file-read* (literal \"/Users/test/.gnupg/gpg.conf\"))"),
+        "Must allow reading GPG config"
+    );
+}
+
+#[test]
+fn profile_gpg_signing_allows_agent_socket() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: true,
+    });
+    assert!(
+        p.contains("(allow network-outbound (literal \"/Users/test/.gnupg/S.gpg-agent\"))"),
+        "Must allow connecting to GPG agent socket"
+    );
+    // GnuPG 2.4+ keyboxd socket for public key lookups
+    assert!(
+        p.contains("(allow network-outbound (literal \"/Users/test/.gnupg/S.keyboxd\"))"),
+        "Must allow connecting to keyboxd socket for GnuPG 2.4+"
+    );
+}
+
+#[test]
+fn profile_gpg_signing_denies_private_keys() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: true,
+    });
+    assert!(
+        p.contains("(deny file-read* (subpath \"/Users/test/.gnupg/private-keys-v1.d\"))"),
+        "Private keys must remain denied even with GPG signing enabled"
+    );
+    assert!(
+        p.contains("(deny file-write* (subpath \"/Users/test/.gnupg\"))"),
+        "Write access to .gnupg must be denied"
+    );
+}
+
+#[test]
+fn profile_gpg_signing_rules_come_after_deny() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: true,
+    });
+    let deny_pos = p
+        .find("(deny file-read* (subpath \"/Users/test/.gnupg\"))")
+        .expect("must have .gnupg deny rule");
+    let allow_pos = p
+        .find("(allow file-read* (literal \"/Users/test/.gnupg/pubring.kbx\"))")
+        .expect("must have GPG signing allow rule");
+    assert!(
+        allow_pos > deny_pos,
+        "GPG signing allows must come after .gnupg deny rules for correct SBPL last-match-wins"
+    );
+    // Private key deny must come after the GPG allows
+    let privkey_deny = p
+        .find("(deny file-read* (subpath \"/Users/test/.gnupg/private-keys-v1.d\"))")
+        .expect("must have private key deny");
+    assert!(
+        privkey_deny > allow_pos,
+        "Private key deny must come after GPG signing allows"
+    );
+}
+
+#[test]
+fn profile_gpg_signing_uses_literal_not_subpath() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: true,
+    });
+    // Must use literal (exact file), never subpath (recursive) for GPG allows
+    assert!(
+        !p.contains("(allow file-read* (subpath \"/Users/test/.gnupg\"))"),
+        "Must use literal, never subpath, for GPG file allows"
+    );
+}
+
+#[test]
+fn profile_gpg_signing_deny_path_wins() {
+    let deny = vec![std::path::PathBuf::from("/Users/test/.gnupg")];
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &deny,
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: true,
+    });
+    // When user explicitly denies ~/.gnupg, GPG allows should NOT appear
+    assert!(
+        !p.contains("(allow file-read* (literal \"/Users/test/.gnupg/pubring.kbx\"))"),
+        "explicit --deny-path ~/.gnupg should override --allow-gpg-signing"
+    );
+    assert!(
+        p.contains("--deny-path overlaps"),
+        "profile should note that deny-path overrode GPG signing"
+    );
+}
+
+#[test]
+fn profile_gpg_signing_denies_legacy_secring() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: true,
+    });
+    assert!(
+        p.contains("(deny file-read* (literal \"/Users/test/.gnupg/secring.gpg\"))"),
+        "legacy secring.gpg must be explicitly denied"
+    );
+}
+
+#[test]
+fn profile_gpg_signing_allows_socket_file_read() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: true,
+    });
+    // Socket needs file-read* for inode lookup before connect(2)
+    assert!(
+        p.contains("(allow file-read* (literal \"/Users/test/.gnupg/S.gpg-agent\"))"),
+        "GPG agent socket should have file-read* for inode lookup"
+    );
 }
 
 // ============================================================
@@ -2248,6 +2584,7 @@ allow_localhost_any = false
 pass_env = []
 inherit_env = false
 allow_lifecycle_scripts = false
+allow_gpg_signing = false
 allow_tmp_exec = false
 scratch_dir = false
 quiet = false

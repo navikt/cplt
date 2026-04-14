@@ -383,6 +383,7 @@ mod macos_tests {
             allow_tmp_exec: false,
             copilot_install_dir: None,
             git_hooks_path: None,
+            allow_gpg_signing: false,
         }
     }
 
@@ -693,6 +694,110 @@ mod macos_tests {
         assert!(
             output.contains("Operation not permitted") || output.contains("EXIT:1"),
             "~/.npmrc should be blocked, got: {output}"
+        );
+    }
+
+    // ── GPG signing ─────────────────────────────────────────────
+
+    #[test]
+    fn real_profile_blocks_gnupg_by_default() {
+        require_sandbox!();
+        let home = home_dir();
+        let gnupg = home.join(".gnupg");
+        if !gnupg.exists() {
+            eprintln!("Skipping: ~/.gnupg does not exist");
+            return;
+        }
+
+        let project = fs::canonicalize(".").unwrap();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        let cmd = format!("ls '{}' 2>&1; echo EXIT:$?", gnupg.display());
+        let (output, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "~/.gnupg should be blocked by default, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_gpg_signing_allows_pubring_read() {
+        require_sandbox!();
+        let home = home_dir();
+        let pubring = home.join(".gnupg/pubring.kbx");
+        if !pubring.exists() {
+            eprintln!("Skipping: ~/.gnupg/pubring.kbx does not exist");
+            return;
+        }
+
+        let project = fs::canonicalize(".").unwrap();
+        let mut opts = default_opts(&project, &home);
+        opts.allow_gpg_signing = true;
+        let profile = write_real_profile(&opts);
+
+        // Should be able to read pubring.kbx (it's a binary file, just check exit code)
+        let cmd = format!(
+            "cat '{}' > /dev/null 2>&1 && echo READ_OK || echo READ_FAIL",
+            pubring.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("READ_OK"),
+            "with allow_gpg_signing, pubring.kbx should be readable, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_gpg_signing_blocks_private_keys() {
+        require_sandbox!();
+        let home = home_dir();
+        let privdir = home.join(".gnupg/private-keys-v1.d");
+        if !privdir.exists() {
+            eprintln!("Skipping: ~/.gnupg/private-keys-v1.d does not exist");
+            return;
+        }
+
+        let project = fs::canonicalize(".").unwrap();
+        let mut opts = default_opts(&project, &home);
+        opts.allow_gpg_signing = true;
+        let profile = write_real_profile(&opts);
+
+        let cmd = format!("ls '{}' 2>&1; echo EXIT:$?", privdir.display());
+        let (output, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "private-keys-v1.d should STILL be blocked even with allow_gpg_signing, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_gpg_signing_blocks_gnupg_write() {
+        require_sandbox!();
+        let home = home_dir();
+        let gnupg = home.join(".gnupg");
+        if !gnupg.exists() {
+            eprintln!("Skipping: ~/.gnupg does not exist");
+            return;
+        }
+
+        let project = fs::canonicalize(".").unwrap();
+        let mut opts = default_opts(&project, &home);
+        opts.allow_gpg_signing = true;
+        let profile = write_real_profile(&opts);
+
+        let test_file = gnupg.join(format!("cplt-write-test-{}.tmp", std::process::id()));
+        let cmd = format!("echo 'test' > '{}' 2>&1; echo EXIT:$?", test_file.display());
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_file(&test_file).ok(); // cleanup if it somehow succeeded
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "writing to ~/.gnupg should be blocked even with allow_gpg_signing, got: {output}"
         );
     }
 

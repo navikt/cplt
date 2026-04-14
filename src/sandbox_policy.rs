@@ -181,6 +181,8 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "EDITOR",
     "VISUAL",
     "PAGER",
+    // GPG — terminal device path for pinentry (not sensitive, e.g. "/dev/ttys001")
+    "GPG_TTY",
 ];
 
 /// Environment variable prefixes safe to pass through.
@@ -223,6 +225,10 @@ pub enum HardeningCategory {
     LifecycleScripts,
     /// Prevent git from prompting or leaking credentials interactively.
     GitHardening,
+    /// Disable commit/tag signing inside the sandbox. Separated from GitHardening
+    /// so `--allow-gpg-signing` can re-enable signing without removing
+    /// `GIT_TERMINAL_PROMPT=0`.
+    GitSigning,
 }
 
 /// A security-hardening environment variable injected into the sandbox.
@@ -258,37 +264,48 @@ pub const HARDENING_ENV_VARS: &[HardeningEnvVar] = &[
     },
     // Git signing — ~/.ssh and ~/.gnupg are denied by the sandbox, so commit/tag
     // signing would fail with EPERM. Disable it via config override rather than
-    // opening private key directories. Unsigned Copilot commits are fine.
+    // opening private key directories. Re-enabled by --allow-gpg-signing.
     HardeningEnvVar {
         name: "GIT_CONFIG_COUNT",
         value: "2",
-        category: HardeningCategory::GitHardening,
+        category: HardeningCategory::GitSigning,
         description: "Number of git config overrides (commit + tag signing)",
     },
     HardeningEnvVar {
         name: "GIT_CONFIG_KEY_0",
         value: "commit.gpgsign",
-        category: HardeningCategory::GitHardening,
+        category: HardeningCategory::GitSigning,
         description: "Override commit signing config key",
     },
     HardeningEnvVar {
         name: "GIT_CONFIG_VALUE_0",
         value: "false",
-        category: HardeningCategory::GitHardening,
+        category: HardeningCategory::GitSigning,
         description: "Disable commit signing (private keys inaccessible)",
     },
     HardeningEnvVar {
         name: "GIT_CONFIG_KEY_1",
         value: "tag.gpgsign",
-        category: HardeningCategory::GitHardening,
+        category: HardeningCategory::GitSigning,
         description: "Override tag signing config key",
     },
     HardeningEnvVar {
         name: "GIT_CONFIG_VALUE_1",
         value: "false",
-        category: HardeningCategory::GitHardening,
+        category: HardeningCategory::GitSigning,
         description: "Disable tag signing (private keys inaccessible)",
     },
+];
+
+/// Files within `~/.gnupg/` that are safe to expose read-only for GPG signing.
+/// These contain public key material and configuration — no secrets.
+/// Private keys (`private-keys-v1.d/`) are never exposed.
+pub const GPG_SIGNING_ALLOW_FILES: &[&str] = &[
+    "pubring.kbx", // Public key database (GnuPG 2.x)
+    "pubring.gpg", // Public key database (GnuPG 1.x legacy)
+    "trustdb.gpg", // Trust metadata (who signed what)
+    "gpg.conf",    // User GPG configuration
+    "common.conf", // Shared config (GnuPG 2.3+)
 ];
 
 /// Tool directory under $HOME with granular sandbox permissions.

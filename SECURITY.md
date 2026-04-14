@@ -113,6 +113,7 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 - A compromised agent CANNOT use loaded SSH keys (unix socket is blocked)
 - A compromised agent CANNOT connect on non-standard ports (e.g., 8080, 3000) unless `--allow-port` is used
 - A compromised agent CANNOT exfiltrate SSH keys, cloud credentials, or npm tokens (kernel-blocked from reading them)
+- A compromised agent CAN request GPG signatures (if `--allow-gpg-signing` is enabled) but CANNOT exfiltrate private keys
 - The proxy (when enabled with `--with-proxy`) logs and filters all outbound connections, including Copilot CLI traffic (via `NODE_USE_ENV_PROXY=1`). The proxy also enforces port restrictions matching the sandbox policy.
 
 *Mitigation:* Use `--with-proxy --allowed-domains allowed-domains.txt` to restrict traffic to known Copilot endpoints only. Use `--blocked-domains blocked-domains.txt` to block known exfiltration infrastructure. Use `--proxy-log proxy.log` for post-session audit. All traffic, including Copilot's own Node.js connections, routes through the proxy when enabled.
@@ -179,15 +180,17 @@ Beyond sanitization, `cplt` injects hardening environment variables that disable
 | `npm_config_ignore_scripts` | `true` | LifecycleScripts | Block npm/pnpm postinstall hooks |
 | `YARN_ENABLE_SCRIPTS` | `false` | LifecycleScripts | Block Yarn Berry lifecycle scripts |
 | `GIT_TERMINAL_PROMPT` | `0` | GitHardening | Prevent git credential prompts |
-| `GIT_CONFIG_COUNT` | `2` | GitHardening | Number of git config overrides |
-| `GIT_CONFIG_KEY_0` | `commit.gpgsign` | GitHardening | Override commit signing config |
-| `GIT_CONFIG_VALUE_0` | `false` | GitHardening | Disable commit signing (private keys inaccessible) |
-| `GIT_CONFIG_KEY_1` | `tag.gpgsign` | GitHardening | Override tag signing config |
-| `GIT_CONFIG_VALUE_1` | `false` | GitHardening | Disable tag signing (private keys inaccessible) |
+| `GIT_CONFIG_COUNT` | `2` | GitSigning | Number of git config overrides |
+| `GIT_CONFIG_KEY_0` | `commit.gpgsign` | GitSigning | Override commit signing config |
+| `GIT_CONFIG_VALUE_0` | `false` | GitSigning | Disable commit signing (private keys inaccessible) |
+| `GIT_CONFIG_KEY_1` | `tag.gpgsign` | GitSigning | Override tag signing config |
+| `GIT_CONFIG_VALUE_1` | `false` | GitSigning | Disable tag signing (private keys inaccessible) |
 
 **Why this matters:** Supply chain attacks (e.g., axios March 2026) use `postinstall` hooks to execute malicious payloads. Blocking lifecycle scripts eliminates this attack class — `npm install` still downloads packages, but no arbitrary code runs. Explicit commands like `npm run build` still work normally. Git signing is disabled because `~/.ssh` and `~/.gnupg` are denied by the sandbox — attempting to sign would fail with EPERM. Disabling via env var gives a clean error-free experience.
 
-**Escape hatch:** `--allow-lifecycle-scripts` disables the `LifecycleScripts` category. Use when `npm install` requires postinstall hooks (e.g., native module compilation).
+**Escape hatches:**
+- `--allow-lifecycle-scripts` disables the `LifecycleScripts` category. Use when `npm install` requires postinstall hooks (e.g., native module compilation).
+- `--allow-gpg-signing` disables the `GitSigning` category and adds targeted SBPL rules for GPG access. See GPG signing risk analysis below.
 
 ### Layer 0.5: Native Module Write Protection
 
@@ -382,6 +385,39 @@ cplt refuses to sandbox overly broad directories that would grant the agent acce
 - **Allow paths** (`--allow-read`, `--allow-write`): canonicalized; unresolvable paths are warned and skipped
 - **Deny paths** (`--deny-path`): canonicalized; unresolvable paths cause a **hard error** (silently dropping a deny rule is a security risk)
 
+### GPG Signing Risk Analysis (`--allow-gpg-signing`)
+
+When `--allow-gpg-signing` is enabled, cplt grants targeted access to the GPG subsystem:
+
+**What is exposed:**
+- Read-only access to `~/.gnupg/pubring.kbx`, `pubring.gpg`, `trustdb.gpg`, `gpg.conf`, `common.conf` (public data only)
+- Unix socket connect to `~/.gnupg/S.gpg-agent` (IPC to the GPG agent daemon running outside the sandbox)
+
+**What stays denied:**
+- `~/.gnupg/private-keys-v1.d/` — private key files remain kernel-blocked
+- `~/.gnupg/secring.gpg` — legacy private keyring explicitly denied
+- All writes to `~/.gnupg/` — no modifications possible
+- `~/.ssh/` and `SSH_AUTH_SOCK` — SSH signing is not enabled by this flag
+
+**Key exfiltration is impossible.** The GPG agent uses the Assuan IPC protocol, which exposes `PKSIGN` (sign), `PKDECRYPT` (decrypt), `READKEY` (public key), and `KEYINFO` (metadata) — but has **no command to export private key material**. The agent is a privilege-separation boundary by design. Even if the on-disk key files weren't denied, they are encrypted with the user's passphrase.
+
+**The actual risk is signature impersonation AND decryption.** A compromised process with agent socket access can:
+1. Request signatures via `PKSIGN` — signing arbitrary data, including malicious commits
+2. Request decryptions via `PKDECRYPT` — if the user has an encryption subkey, the compromised process can decrypt arbitrary ciphertext
+
+This is **not key theft** — the attacker cannot take the key with them. Operations can only be performed while the sandbox is running and the agent connection is active.
+
+**Risk context:** Copilot already has `git commit` ability and can make commits as the user. GPG signing only adds the "Verified" badge. The incremental risk is specifically: a compromised agent can make commits that appear cryptographically verified by the user, and can decrypt data if an encryption subkey exists. Mitigating factors:
+- Agent passphrase cache has a TTL (default: 10 min idle, 2 hr max)
+- The network proxy (when enabled) can audit/block pushes to unexpected remotes
+- Branch protection rules may still require PR review regardless of signature status
+
+**Deny-path override:** If `--deny-path ~/.gnupg` is specified alongside `--allow-gpg-signing`, the deny wins — all GPG allows are suppressed. This is consistent with the project-wide principle that explicit denies always take precedence.
+
+**Known limitations:**
+- `GNUPGHOME` is not in `ENV_ALLOWLIST` but could be injected via `--pass-env` or `--inherit-env`, redirecting GPG to a different directory outside the SBPL policy. The SBPL rules only cover `~/.gnupg/`.
+- If `~/.gnupg` is a symlink, SBPL path resolution may cause rules to not match as expected. Signing will fail closed (no access) rather than open.
+
 ### Network Limitations
 
 #### Proxy support for Copilot traffic
@@ -438,7 +474,7 @@ These test core logic without invoking `sandbox-exec`, using the real library fu
 | Env behavior | 12 | Sanitization, hardening injection, pass-env overrides, LANG prefix leak prevention, YARN hardening bypass prevention, scratch dir TMPDIR redirect |
 | Config parsing | 24 | TOML parsing, CLI/config merge precedence, tilde expansion, SBPL validation, scratch dir, allow-tmp-exec |
 
-### Integration Tests (macOS only, 29 tests)
+### Integration Tests (macOS only, 33 tests)
 
 These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-level enforcement**:
 
@@ -449,8 +485,9 @@ These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-leve
 | Network | 1 | Outbound connections blocked |
 | Binary CLI | 4 | Version, help, root/home dir rejection |
 | Tool dir permissions | 15 | Each HOME_TOOL_DIR has correct exec/map-exec/write at kernel level |
+| GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |
 
-### E2E Project Tests (macOS only, 18 tests)
+### E2E Project Tests (macOS only, 28 tests)
 
 End-to-end tests using realistic project scaffolding (Node, Go, Python, Rust) with fake copilot scripts:
 
