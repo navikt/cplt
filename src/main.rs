@@ -654,6 +654,21 @@ fn main() -> ExitCode {
     };
     let scratch_path = scratch_guard.as_ref().map(|s| s.path());
 
+    // Resolve the Copilot CLI binary early so its installation directory
+    // can be included in the sandbox profile. Failure is deferred —
+    // --print-profile doesn't need the binary.
+    let copilot_bin_result = resolve_copilot_binary();
+    let copilot_install_dir = copilot_bin_result
+        .as_ref()
+        .ok()
+        .and_then(|p| discover::copilot_pkg_dir(p, &home_dir));
+    if let Some(ref dir) = copilot_install_dir
+        && let Err(e) = sandbox::validate_sbpl_path(dir)
+    {
+        error(&format!("Copilot install dir: {e}"));
+        return ExitCode::FAILURE;
+    }
+
     // Generate sandbox profile
     let proxy_port_for_profile = if resolved.with_proxy {
         Some(resolved.proxy_port)
@@ -674,6 +689,7 @@ fn main() -> ExitCode {
         allow_localhost_any: resolved.allow_localhost_any,
         scratch_dir: scratch_path,
         allow_tmp_exec: resolved.allow_tmp_exec,
+        copilot_install_dir: copilot_install_dir.as_deref(),
     });
 
     // --print-profile: dump the SBPL and exit (no copilot binary needed)
@@ -694,8 +710,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Resolve the real Copilot CLI binary, skipping any cplt symlinks.
-    let copilot_bin = match resolve_copilot_binary() {
+    // Unwrap the copilot binary resolution (deferred from above).
+    let copilot_bin = match copilot_bin_result {
         Ok(path) => path,
         Err(msg) => {
             error(&msg);

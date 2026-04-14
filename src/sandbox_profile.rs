@@ -30,6 +30,10 @@ pub struct ProfileOptions<'a> {
     pub scratch_dir: Option<&'a Path>,
     /// Remove temp dir exec denies (break-glass for system TMPDIR exec).
     pub allow_tmp_exec: bool,
+    /// Copilot CLI package directory (resolved from the binary location).
+    /// Needed when Copilot is installed in a non-standard location (e.g. ~/n/
+    /// via the `n` Node version manager) that isn't covered by TOOL_READ_DIRS.
+    pub copilot_install_dir: Option<&'a Path>,
 }
 
 /// Generate a complete SBPL sandbox profile from the given options.
@@ -48,6 +52,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_home_access(&mut sb, &home);
     emit_system_access(&mut sb, &home);
     emit_tool_dirs(&mut sb, &home, opts.existing_home_tool_dirs);
+    emit_copilot_install(&mut sb, opts.copilot_install_dir);
     emit_system_files(&mut sb);
     emit_temp_rules(&mut sb, opts.allow_tmp_exec, opts.scratch_dir);
     emit_user_allows(&mut sb, opts.extra_read, opts.extra_write);
@@ -345,6 +350,19 @@ fn emit_tool_dirs(sb: &mut String, home: &str, existing_home_tool_dirs: Option<&
     )
     .unwrap();
     writeln!(sb).unwrap();
+}
+
+/// Allow reading and dlopen from the Copilot CLI package directory.
+/// Needed when Copilot is installed via a non-standard Node version manager
+/// (e.g. `n` at ~/n/) whose path isn't covered by TOOL_READ_DIRS.
+fn emit_copilot_install(sb: &mut String, install_dir: Option<&Path>) {
+    if let Some(dir) = install_dir {
+        let p = dir.to_string_lossy();
+        writeln!(sb, ";; Copilot CLI installation directory").unwrap();
+        writeln!(sb, "(allow file-read* (subpath \"{p}\"))").unwrap();
+        writeln!(sb, "(allow file-map-executable (subpath \"{p}\"))").unwrap();
+        writeln!(sb).unwrap();
+    }
 }
 
 fn emit_system_files(sb: &mut String) {

@@ -381,6 +381,7 @@ mod macos_tests {
             allow_localhost_any: false,
             scratch_dir: None,
             allow_tmp_exec: false,
+            copilot_install_dir: None,
         }
     }
 

@@ -3,6 +3,7 @@
 //! These tests verify core logic without invoking sandbox-exec,
 //! so they run on any platform (Linux CI, macOS, etc.).
 
+use cplt::discover::copilot_pkg_dir;
 use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
@@ -362,6 +363,7 @@ fn profile_contains_deny_default() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(p.contains("(deny default)"));
 }
@@ -382,6 +384,7 @@ fn profile_allows_tty_ioctl() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         p.contains("(allow file-ioctl)"),
@@ -405,6 +408,7 @@ fn profile_grants_project_access() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(p.contains("(allow file-read* (subpath \"/projects/app\"))"));
     assert!(p.contains("(allow file-write* (subpath \"/projects/app\"))"));
@@ -430,6 +434,7 @@ fn profile_grants_copilot_config_access() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(p.contains("(allow file-read* (subpath \"/Users/test/.copilot\"))"));
 }
@@ -450,6 +455,7 @@ fn profile_denies_sensitive_dirs() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     for dir in &[
         ".ssh",
@@ -495,6 +501,7 @@ fn profile_denies_sensitive_files() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     for file in &[
         ".netrc",
@@ -528,6 +535,7 @@ fn profile_restricts_outbound_tcp() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         p.contains("(deny network-outbound (remote tcp))"),
@@ -571,6 +579,7 @@ fn profile_extra_ports_adds_allows() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
@@ -602,6 +611,7 @@ fn profile_proxy_port_allows_localhost() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:18080\"))"),
@@ -629,6 +639,7 @@ fn profile_allow_localhost_opens_specific_ports() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:3000\"))"),
@@ -671,6 +682,7 @@ fn profile_deny_rules_come_after_allow_rules() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     let allow_pos = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -700,6 +712,7 @@ fn profile_allows_gh_config_read_only() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.config/gh/hosts.yml\"))"),
@@ -731,6 +744,7 @@ fn profile_allows_file_map_executable_for_copilot() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.copilot\"))"),
@@ -758,6 +772,7 @@ fn profile_denies_env_files_by_default() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         p.contains(r#"(deny file-read* (regex #"/\.env$"))"#),
@@ -793,6 +808,7 @@ fn profile_allows_env_files_when_flag_set() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         !p.contains(r#"deny file-read* (regex #"/projects/app/"#),
@@ -816,6 +832,7 @@ fn profile_env_deny_comes_after_project_allow() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     let project_allow = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -847,6 +864,7 @@ fn profile_allows_all_localhost_when_flag_set() {
         allow_localhost_any: true,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     assert!(
         !p.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
@@ -887,6 +905,7 @@ fn profile_denies_write_to_copilot_pkg() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     // Must allow write to ~/.copilot (session state, config)
     assert!(
@@ -1050,6 +1069,7 @@ fn profile_denies_exec_from_tmp() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     // Must allow read+write to /tmp (needed for temp files)
     assert!(
@@ -1096,6 +1116,7 @@ fn profile_denies_git_persistence_vectors() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
     // Must deny writes to .git/hooks (post-checkout etc. run outside sandbox)
     assert!(
@@ -1145,6 +1166,7 @@ fn default_profile() -> String {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     })
 }
 
@@ -1664,6 +1686,7 @@ fn profile_scratch_dir_adds_all_permissions() {
         allow_localhost_any: false,
         scratch_dir: Some(scratch),
         allow_tmp_exec: false,
+        copilot_install_dir: None,
     });
 
     let scratch_str = scratch.to_string_lossy();
@@ -1716,6 +1739,7 @@ fn profile_allow_tmp_exec_removes_denies() {
         allow_localhost_any: false,
         scratch_dir: None,
         allow_tmp_exec: true,
+        copilot_install_dir: None,
     });
 
     assert!(
@@ -1841,6 +1865,149 @@ fn profile_denies_write_to_copilot_caches_pkg() {
         deny_pos > allow_pos,
         "Copilot Caches pkg write deny must come AFTER Library/Caches write allow (last-match-wins)"
     );
+}
+
+// ============================================================
+// copilot_install_dir — non-standard Copilot install locations
+// ============================================================
+
+#[test]
+fn profile_allows_copilot_install_dir() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: Some(std::path::Path::new(
+            "/Users/test/n/lib/node_modules/@github/copilot",
+        )),
+    });
+    assert!(
+        p.contains(
+            "(allow file-read* (subpath \"/Users/test/n/lib/node_modules/@github/copilot\"))"
+        ),
+        "Profile must allow reading the Copilot installation directory"
+    );
+    assert!(
+        p.contains(
+            "(allow file-map-executable (subpath \"/Users/test/n/lib/node_modules/@github/copilot\"))"
+        ),
+        "Profile must allow file-map-executable for native addons in Copilot install dir"
+    );
+}
+
+#[test]
+fn profile_no_copilot_install_dir_omits_section() {
+    let p = default_profile();
+    assert!(
+        !p.contains("Copilot CLI installation directory"),
+        "Default profile should not have copilot install dir section"
+    );
+}
+
+// ============================================================
+// copilot_pkg_dir — package root detection for non-standard installs
+// ============================================================
+
+#[test]
+fn pkg_dir_finds_copilot_package() {
+    let tmp = std::env::temp_dir().join(format!("cplt-test-pkg-{}", std::process::id()));
+    let pkg = tmp.join("lib/node_modules/@github/copilot");
+    let bin = pkg.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name": "@github/copilot", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+    let binary = bin.join("copilot");
+    std::fs::write(&binary, "#!/usr/bin/env node").unwrap();
+
+    let home = std::path::Path::new("/Users/test");
+    let result = copilot_pkg_dir(&binary, home);
+    assert_eq!(result, Some(pkg.clone()));
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn pkg_dir_returns_none_for_standalone_binary() {
+    let tmp = std::env::temp_dir().join(format!("cplt-test-standalone-{}", std::process::id()));
+    let bin = tmp.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let binary = bin.join("copilot");
+    std::fs::write(&binary, "#!/bin/sh\nexec node").unwrap();
+
+    let home = std::path::Path::new("/Users/test");
+    let result = copilot_pkg_dir(&binary, home);
+    assert_eq!(result, None);
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn pkg_dir_rejects_wrong_package_name() {
+    let tmp = std::env::temp_dir().join(format!("cplt-test-wrong-{}", std::process::id()));
+    let pkg = tmp.join("my-app");
+    let bin = pkg.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name": "not-copilot", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+    let binary = bin.join("copilot");
+    std::fs::write(&binary, "#!/usr/bin/env node").unwrap();
+
+    let home = std::path::Path::new("/Users/test");
+    let result = copilot_pkg_dir(&binary, home);
+    assert_eq!(result, None);
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn pkg_dir_rejects_home_dir_as_root() {
+    let tmp = std::env::temp_dir().join(format!("cplt-test-home-{}", std::process::id()));
+    std::fs::create_dir_all(tmp.join("bin")).unwrap();
+    // Put package.json at the "home" dir level — should be rejected as unsafe root
+    std::fs::write(tmp.join("package.json"), r#"{"name": "@github/copilot"}"#).unwrap();
+    let binary = tmp.join("bin/copilot");
+    std::fs::write(&binary, "#!/usr/bin/env node").unwrap();
+
+    // Treat tmp itself as the home directory
+    let result = copilot_pkg_dir(&binary, &tmp);
+    assert_eq!(result, None, "should reject when package root equals HOME");
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn pkg_dir_finds_package_multiple_levels_up() {
+    // Simulates pnpm-style deep nesting: .pnpm/@github+copilot@1.0.0/node_modules/@github/copilot/bin/copilot
+    let tmp = std::env::temp_dir().join(format!("cplt-test-deep-{}", std::process::id()));
+    let pkg = tmp.join("store/node_modules/@github/copilot");
+    let bin = pkg.join("dist/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(pkg.join("package.json"), r#"{"name": "@github/copilot"}"#).unwrap();
+    let binary = bin.join("copilot");
+    std::fs::write(&binary, "#!/usr/bin/env node").unwrap();
+
+    let home = std::path::Path::new("/Users/test");
+    let result = copilot_pkg_dir(&binary, home);
+    // dist/bin/copilot → dist/ → @github/copilot/ (has package.json) — 2 levels up
+    assert_eq!(result, Some(pkg.clone()));
+
+    std::fs::remove_dir_all(&tmp).unwrap();
 }
 
 // ============================================================

@@ -444,6 +444,48 @@ impl Discovery {
 
 // ── Helpers ─────────────────────────────────────────────────────
 
+/// Find the Copilot CLI package root from the resolved binary path.
+///
+/// Walks up at most 4 ancestor directories looking for a `package.json`
+/// whose `"name"` field is `"@github/copilot"`. This handles any npm-like
+/// package manager (npm, pnpm, yarn, bun) and any install prefix (`n`,
+/// `nvm`, `volta`, `fnm`, `mise`, custom `--prefix`, etc.).
+///
+/// Returns `None` when:
+/// - the binary is standalone (no `package.json` ancestor) — e.g. Homebrew cask
+/// - the nearest `package.json` belongs to a different package
+/// - the path would resolve to an unsafe root (`/`, `$HOME`, `/tmp`)
+pub fn copilot_pkg_dir(copilot_bin: &Path, home_dir: &Path) -> Option<PathBuf> {
+    let mut dir = copilot_bin.parent()?;
+    for _ in 0..4 {
+        let pkg_json = dir.join("package.json");
+        if pkg_json.is_file() && is_copilot_package(&pkg_json) {
+            // Reject overly broad directories
+            if crate::is_unsafe_root(dir, home_dir) {
+                return None;
+            }
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// Check if a `package.json` file belongs to `@github/copilot`.
+fn is_copilot_package(pkg_json: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(pkg_json) else {
+        return false;
+    };
+    // Fast-path: skip JSON parsing if the package name isn't mentioned at all
+    if !contents.contains("@github/copilot") {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    v.get("name").and_then(|n| n.as_str()) == Some("@github/copilot")
+}
+
 /// Resolve a command name to its real path (following symlinks).
 fn which_resolved(name: &str) -> Option<PathBuf> {
     let output = std::process::Command::new("which")
