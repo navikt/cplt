@@ -1213,12 +1213,14 @@ fn run_config_set(
     };
 
     // Apply modification
+    let mut element_removed = false;
     let result = if unset {
         if let Some(val) = value
             && op.key_info.value_type.is_array()
         {
             // Array key + value: remove just that element
             config::remove_array_element_in_doc(&mut doc, op.key_info, val)
+                .map(|removed| element_removed = removed)
         } else {
             // Scalar key, or array key without value: remove entire key
             config::unset_value_in_doc(&mut doc, op.key_info);
@@ -1237,6 +1239,16 @@ fn run_config_set(
         return ExitCode::FAILURE;
     }
 
+    // Skip writing when nothing changed (unset element that wasn't present)
+    if let Some(val) = value
+        && !element_removed
+        && unset
+        && op.key_info.value_type.is_array()
+    {
+        warn(&format!("{key}: {val} is not set"));
+        return ExitCode::SUCCESS;
+    }
+
     // Write back
     if let Err(e) = op.write_document(&doc) {
         error(&e);
@@ -1247,12 +1259,18 @@ fn run_config_set(
         if let Some(val) = value
             && op.key_info.value_type.is_array()
         {
-            ok(&format!("{key}: removed {val}"));
+            if let Some(remaining) = config::get_value_from_doc(&doc, op.key_info) {
+                ok(&format!("{key}: removed {val} → {remaining}"));
+            } else {
+                ok(&format!("{key}: removed {val} (now empty)"));
+            }
         } else {
             ok(&format!("{key} removed (will use default)"));
         }
     } else if append || op.key_info.value_type.is_array() {
-        ok(&format!("{key}: appended {}", value.unwrap()));
+        let current = config::get_value_from_doc(&doc, op.key_info)
+            .unwrap_or_else(|| value.unwrap().to_string());
+        ok(&format!("{key} = {current}"));
     } else {
         ok(&format!("{key} = {}", value.unwrap()));
     }

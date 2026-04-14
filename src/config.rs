@@ -1359,7 +1359,12 @@ fn parse_element_for_key(
                     key_info.section, key_info.key
                 ));
             }
-            Ok(toml_edit::value(value).into_value().unwrap())
+            // Expand ~ so stored values are always absolute paths.
+            // For non-path keys (e.g. pass_env), expand_tilde is a no-op.
+            let expanded = expand_tilde(value);
+            Ok(toml_edit::value(expanded.to_string_lossy().as_ref())
+                .into_value()
+                .unwrap())
         }
         _ => Err(format!(
             "{}.{} is not an array key — use 'set' without --append",
@@ -1429,19 +1434,20 @@ pub fn append_value_in_doc(
 
 /// Remove a single element from an array in a TOML document.
 /// If the array becomes empty, removes the key entirely.
+/// Returns `true` if any elements were actually removed.
 pub fn remove_array_element_in_doc(
     doc: &mut toml_edit::DocumentMut,
     key_info: &ConfigKeyInfo,
     value: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let element = parse_element_for_key(key_info, value)?;
 
     let Some(section) = doc.get_mut(key_info.section).and_then(|s| s.as_table_mut()) else {
-        return Ok(()); // Section doesn't exist — nothing to remove
+        return Ok(false); // Section doesn't exist — nothing to remove
     };
 
     let Some(item) = section.get_mut(key_info.key) else {
-        return Ok(()); // Key doesn't exist — nothing to remove
+        return Ok(false); // Key doesn't exist — nothing to remove
     };
 
     let Some(arr) = item.as_array_mut() else {
@@ -1452,8 +1458,10 @@ pub fn remove_array_element_in_doc(
     };
 
     // Find and remove all matching elements (handles manual duplicates)
+    let mut removed = false;
     while let Some(idx) = array_index_of(arr, &element) {
         arr.remove(idx);
+        removed = true;
     }
 
     // Clean up empty arrays
@@ -1461,7 +1469,7 @@ pub fn remove_array_element_in_doc(
         section.remove(key_info.key);
     }
 
-    Ok(())
+    Ok(removed)
 }
 
 /// Check if a TOML array contains a value (by semantic equality).
@@ -1487,6 +1495,37 @@ fn values_equal(a: &toml_edit::Value, b: &toml_edit::Value) -> bool {
 pub fn unset_value_in_doc(doc: &mut toml_edit::DocumentMut, key_info: &ConfigKeyInfo) {
     if let Some(section) = doc.get_mut(key_info.section).and_then(|s| s.as_table_mut()) {
         section.remove(key_info.key);
+    }
+}
+
+/// Read the current display value for a key from a toml_edit document.
+/// Returns `None` if the key is not set.
+pub fn get_value_from_doc(
+    doc: &toml_edit::DocumentMut,
+    key_info: &ConfigKeyInfo,
+) -> Option<String> {
+    let section = doc.get(key_info.section)?.as_table()?;
+    let item = section.get(key_info.key)?;
+    Some(format_edit_value(item))
+}
+
+fn format_edit_value(item: &toml_edit::Item) -> String {
+    match item {
+        toml_edit::Item::Value(toml_edit::Value::Array(arr)) => {
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| match v {
+                    toml_edit::Value::String(s) => s.value().to_string(),
+                    toml_edit::Value::Integer(i) => i.value().to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+        toml_edit::Item::Value(toml_edit::Value::String(s)) => s.value().to_string(),
+        toml_edit::Item::Value(toml_edit::Value::Integer(i)) => i.value().to_string(),
+        toml_edit::Item::Value(toml_edit::Value::Boolean(b)) => b.value().to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -2436,7 +2475,8 @@ quiet = false
             .parse::<toml_edit::DocumentMut>()
             .unwrap();
         let info = lookup_key("allow.read").unwrap();
-        remove_array_element_in_doc(&mut doc, info, "/tmp/b").unwrap();
+        let removed = remove_array_element_in_doc(&mut doc, info, "/tmp/b").unwrap();
+        assert!(removed, "should report element was removed");
         let result = doc.to_string();
         assert!(result.contains("/tmp/a"));
         assert!(!result.contains("/tmp/b"));
@@ -2463,7 +2503,8 @@ quiet = false
             .parse::<toml_edit::DocumentMut>()
             .unwrap();
         let info = lookup_key("allow.read").unwrap();
-        remove_array_element_in_doc(&mut doc, info, "/tmp/missing").unwrap();
+        let removed = remove_array_element_in_doc(&mut doc, info, "/tmp/missing").unwrap();
+        assert!(!removed, "should report nothing was removed");
         let arr = doc["allow"]["read"].as_array().unwrap();
         assert_eq!(arr.len(), 1, "array should be unchanged");
     }
@@ -2472,7 +2513,8 @@ quiet = false
     fn remove_array_element_noop_if_key_missing() {
         let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
         let info = lookup_key("allow.read").unwrap();
-        remove_array_element_in_doc(&mut doc, info, "/tmp/a").unwrap();
+        let removed = remove_array_element_in_doc(&mut doc, info, "/tmp/a").unwrap();
+        assert!(!removed, "should report nothing was removed");
     }
 
     #[test]
