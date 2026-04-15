@@ -872,7 +872,7 @@ fn main() -> ExitCode {
 
     // --show-denials: stream macOS sandbox denial logs in the background.
     // Landlock does not produce kernel audit logs, so this is macOS-only.
-    let mut denial_proc = None;
+    let mut denial_proc: Option<std::process::Child> = None;
     if cli.show_denials {
         #[cfg(target_os = "macos")]
         {
