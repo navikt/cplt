@@ -157,15 +157,10 @@ pub fn perform_update(tag: &str, current_version: &str) -> Result<String, String
         .map_err(|e| format!("Cannot determine current binary path: {e}"))?;
     let target_path = std::fs::canonicalize(&current_exe).unwrap_or(current_exe);
 
-    // 5. Stage: set permissions and sign BEFORE replacing
+    // 5. Stage: set permissions and platform-specific postprocessing
     eprintln!("  Preparing binary...");
     set_executable(&new_binary)?;
-    // xattr and codesign are macOS-specific (Gatekeeper requirements)
-    #[cfg(target_os = "macos")]
-    {
-        let _ = run_xattr(&new_binary);
-        let _ = run_codesign(&new_binary);
-    }
+    postprocess_binary(&new_binary);
 
     // 6. Atomic rename
     let staged = target_path.with_extension("new");
@@ -182,11 +177,7 @@ pub fn perform_update(tag: &str, current_version: &str) -> Result<String, String
 
     // Copy permissions/signing to staged location too
     set_executable(&staged)?;
-    #[cfg(target_os = "macos")]
-    {
-        let _ = run_xattr(&staged);
-        let _ = run_codesign(&staged);
-    }
+    postprocess_binary(&staged);
 
     std::fs::rename(&staged, &target_path).map_err(|e| {
         let _ = std::fs::remove_file(&staged);
@@ -402,19 +393,11 @@ fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), String> {
     }
 }
 
-/// Compute SHA256 hash of a file using /usr/bin/shasum.
+/// Compute SHA256 hash of a file using the platform's hash utility.
+///
+/// macOS uses `/usr/bin/shasum -a 256`, Linux uses `sha256sum`.
 fn compute_sha256(path: &Path) -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    let output = Command::new("/usr/bin/shasum")
-        .args(["-a", "256", &path.to_string_lossy()])
-        .output()
-        .map_err(|e| format!("Cannot run shasum: {e}"))?;
-
-    #[cfg(not(target_os = "macos"))]
-    let output = Command::new("sha256sum")
-        .arg(path.to_string_lossy().to_string())
-        .output()
-        .map_err(|e| format!("Cannot run sha256sum: {e}"))?;
+    let output = sha256_command(path)?;
 
     if !output.status.success() {
         return Err("SHA256 computation failed".to_string());
@@ -426,6 +409,22 @@ fn compute_sha256(path: &Path) -> Result<String, String> {
         .next()
         .map(|h| h.to_lowercase())
         .ok_or_else(|| "Cannot parse shasum output".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
+    Command::new("/usr/bin/shasum")
+        .args(["-a", "256", &path.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("Cannot run shasum: {e}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
+    Command::new("sha256sum")
+        .arg(path.to_string_lossy().to_string())
+        .output()
+        .map_err(|e| format!("Cannot run sha256sum: {e}"))
 }
 
 /// Validate archive contents before extraction.
@@ -512,6 +511,22 @@ fn set_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("Cannot set permissions: {e}"))
+}
+
+/// Apply platform-specific binary postprocessing after download.
+///
+/// On macOS, removes quarantine attributes and ad-hoc code signs the binary
+/// (required by Gatekeeper). On Linux, this is a no-op.
+fn postprocess_binary(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run_xattr(path);
+        let _ = run_codesign(path);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+    }
 }
 
 /// Remove macOS quarantine extended attributes.

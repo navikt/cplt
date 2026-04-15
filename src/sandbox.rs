@@ -140,74 +140,13 @@ impl PreparedSandbox {
 /// - A path contains characters that could cause profile injection (macOS)
 /// - The platform does not support sandboxing
 pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
-    #[cfg(target_os = "macos")]
-    {
-        // Validate all paths for SBPL injection safety.
-        validate_config_paths(config)?;
-
-        let profile_text = profile::generate_profile(&profile::ProfileOptions {
-            project_dir: config.project_dir,
-            home_dir: config.home_dir,
-            extra_read: config.extra_read,
-            extra_write: config.extra_write,
-            extra_deny: config.extra_deny,
-            existing_home_tool_dirs: config.existing_home_tool_dirs,
-            extra_ports: config.extra_ports,
-            localhost_ports: config.localhost_ports,
-            proxy_port: config.proxy_port,
-            allow_env_files: config.allow_env_files,
-            allow_localhost_any: config.allow_localhost_any,
-            scratch_dir: config.scratch_dir,
-            allow_tmp_exec: config.allow_tmp_exec,
-            copilot_install_dir: config.copilot_install_dir,
-            git_hooks_path: config.git_hooks_path,
-            allow_gpg_signing: config.allow_gpg_signing,
-            electron_app_dir: config.electron_app_dir,
-        });
-
-        Ok(PreparedSandbox {
-            project_dir: config.project_dir.to_path_buf(),
-            home_dir: config.home_dir.to_path_buf(),
-            profile_text,
-            scratch_dir: config.scratch_dir.map(Path::to_path_buf),
-            proxy_port: config.proxy_port,
-        })
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // Warn about config options that Linux cannot enforce at kernel level.
-        if !config.extra_deny.is_empty() {
-            eprintln!(
-                "\x1b[0;33m[cplt]\x1b[0m --deny-path has no effect on Linux: \
-                 Landlock cannot deny subpaths within allowed directories. \
-                 Proxy and env hardening provide defense-in-depth."
-            );
-        }
-
-        let policy = landlock_mod::generate_policy(config);
-        let profile_text = landlock_mod::describe_policy(&policy);
-
-        // Pre-compute everything in the parent process.
-        // ABI check, BPF construction, and all allocation happens here.
-        // The pre_exec hook only makes raw syscalls.
-        let precomputed = landlock_mod::precompute(policy)?;
-
-        Ok(PreparedSandbox {
-            project_dir: config.project_dir.to_path_buf(),
-            home_dir: config.home_dir.to_path_buf(),
-            profile_text,
-            scratch_dir: config.scratch_dir.map(Path::to_path_buf),
-            proxy_port: config.proxy_port,
-            precomputed,
-        })
-    }
+    prepare_impl(config)
 }
 
 /// Human-readable representation of the sandbox policy.
 ///
 /// On macOS, returns the SBPL profile text (useful for `--print-profile`).
-/// On Linux (future), returns a formatted Landlock rule summary.
+/// On Linux, returns a formatted Landlock rule summary.
 pub fn describe(sandbox: &PreparedSandbox) -> &str {
     &sandbox.profile_text
 }
@@ -217,22 +156,9 @@ pub fn describe(sandbox: &PreparedSandbox) -> &str {
 /// On macOS, writes the profile to a temp file and runs `/usr/bin/true`
 /// inside `sandbox-exec` to confirm enforcement is active.
 ///
-/// On Linux, checks Landlock ABI availability and kernel version.
+/// On Linux, this is a no-op (ABI checks happen during prepare).
 pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let profile_path = write_temp_profile(&sandbox.profile_text)?;
-        let result = exec::validate(&profile_path, &sandbox.project_dir, &sandbox.home_dir);
-        let _ = std::fs::remove_file(&profile_path);
-        result
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // ABI check and warnings already done in prepare()/precompute().
-        let _ = sandbox;
-        Ok(())
-    }
+    exec::preflight(sandbox)
 }
 
 /// Execute a command inside the sandbox, forwarding signals to the child.
@@ -243,7 +169,6 @@ pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
 ///
 /// Environment handling is controlled by `extra_pass_env`, `inherit_env`,
 /// and `disabled_categories` — see [`build_sandbox_env()`] for details.
-#[allow(clippy::too_many_arguments)]
 pub fn exec_sandboxed(
     sandbox: &PreparedSandbox,
     copilot_bin: &Path,
@@ -252,46 +177,78 @@ pub fn exec_sandboxed(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
 ) -> u8 {
-    #[cfg(target_os = "macos")]
-    {
-        let profile_path = match write_temp_profile(&sandbox.profile_text) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("\x1b[0;31m[cplt]\x1b[0m {e}");
-                return 1;
-            }
-        };
+    exec::exec(
+        sandbox,
+        copilot_bin,
+        copilot_args,
+        extra_pass_env,
+        inherit_env,
+        disabled_categories,
+    )
+}
 
-        let exit_code = exec::exec(
-            copilot_bin,
-            &profile_path,
-            &sandbox.project_dir,
-            copilot_args,
-            extra_pass_env,
-            inherit_env,
-            disabled_categories,
-            sandbox.scratch_dir.as_deref(),
-            sandbox.proxy_port,
+// ── Platform-specific prepare implementations ─────────────────
+
+#[cfg(target_os = "macos")]
+fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
+    validate_config_paths(config)?;
+
+    let profile_text = profile::generate_profile(&profile::ProfileOptions {
+        project_dir: config.project_dir,
+        home_dir: config.home_dir,
+        extra_read: config.extra_read,
+        extra_write: config.extra_write,
+        extra_deny: config.extra_deny,
+        existing_home_tool_dirs: config.existing_home_tool_dirs,
+        extra_ports: config.extra_ports,
+        localhost_ports: config.localhost_ports,
+        proxy_port: config.proxy_port,
+        allow_env_files: config.allow_env_files,
+        allow_localhost_any: config.allow_localhost_any,
+        scratch_dir: config.scratch_dir,
+        allow_tmp_exec: config.allow_tmp_exec,
+        copilot_install_dir: config.copilot_install_dir,
+        git_hooks_path: config.git_hooks_path,
+        allow_gpg_signing: config.allow_gpg_signing,
+        electron_app_dir: config.electron_app_dir,
+    });
+
+    Ok(PreparedSandbox {
+        project_dir: config.project_dir.to_path_buf(),
+        home_dir: config.home_dir.to_path_buf(),
+        profile_text,
+        scratch_dir: config.scratch_dir.map(Path::to_path_buf),
+        proxy_port: config.proxy_port,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
+    // Warn about config options that Linux cannot enforce at kernel level.
+    if !config.extra_deny.is_empty() {
+        eprintln!(
+            "\x1b[0;33m[cplt]\x1b[0m --deny-path has no effect on Linux: \
+             Landlock cannot deny subpaths within allowed directories. \
+             Proxy and env hardening provide defense-in-depth."
         );
-
-        let _ = std::fs::remove_file(&profile_path);
-        exit_code
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        exec::exec_linux(
-            copilot_bin,
-            &sandbox.project_dir,
-            copilot_args,
-            extra_pass_env,
-            inherit_env,
-            disabled_categories,
-            sandbox.scratch_dir.as_deref(),
-            sandbox.proxy_port,
-            &sandbox.precomputed,
-        )
-    }
+    let policy = landlock_mod::generate_policy(config);
+    let profile_text = landlock_mod::describe_policy(&policy);
+
+    // Pre-compute everything in the parent process.
+    // ABI check, BPF construction, and all allocation happens here.
+    // The pre_exec hook only makes raw syscalls.
+    let precomputed = landlock_mod::precompute(policy)?;
+
+    Ok(PreparedSandbox {
+        project_dir: config.project_dir.to_path_buf(),
+        home_dir: config.home_dir.to_path_buf(),
+        profile_text,
+        scratch_dir: config.scratch_dir.map(Path::to_path_buf),
+        proxy_port: config.proxy_port,
+        precomputed,
+    })
 }
 
 // ── Internal helpers (macOS only) ──────────────────────────────
@@ -331,37 +288,4 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// Write SBPL profile text to a temp file with secure creation (macOS only).
-///
-/// Uses O_CREAT|O_EXCL (create_new) to prevent symlink-following attacks,
-/// and mode 0600 to restrict read access.
-#[cfg(target_os = "macos")]
-fn write_temp_profile(profile_text: &str) -> Result<PathBuf, String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let path = std::env::temp_dir().join(format!(
-        "cplt-{}-{}.sb",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| format!("Cannot create sandbox profile: {e}"))?;
-
-    file.write_all(profile_text.as_bytes()).map_err(|e| {
-        let _ = std::fs::remove_file(&path);
-        format!("Cannot write sandbox profile: {e}")
-    })?;
-
-    Ok(path)
 }

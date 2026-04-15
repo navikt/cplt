@@ -106,10 +106,7 @@ pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
     let gh_config_exists = home_dir.join(".config/gh/hosts.yml").exists();
 
     // macOS Keychain CLI — not applicable on Linux.
-    #[cfg(target_os = "macos")]
-    let security_cli_exists = Path::new("/usr/bin/security").exists();
-    #[cfg(not(target_os = "macos"))]
-    let security_cli_exists = false;
+    let security_cli_exists = probe_security_cli();
 
     let keytar_nodes = find_native_modules(home_dir, "keytar.node");
 
@@ -241,10 +238,7 @@ pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
     let copilot_dir_exists = home_dir.join(".copilot").exists();
 
     // macOS-only: Keychain and Security framework database.
-    #[cfg(target_os = "macos")]
-    let keychains_dir_exists = home_dir.join("Library/Keychains").exists();
-    #[cfg(not(target_os = "macos"))]
-    let keychains_dir_exists = false;
+    let keychains_dir_exists = probe_keychains_dir(home_dir);
 
     let is_git_repo = std::process::Command::new("git")
         .args(["rev-parse", "--git-dir"])
@@ -254,10 +248,7 @@ pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
         .status()
         .is_ok_and(|s| s.success());
 
-    #[cfg(target_os = "macos")]
-    let security_db_exists = Path::new("/private/var/db/mds").exists();
-    #[cfg(not(target_os = "macos"))]
-    let security_db_exists = false;
+    let security_db_exists = probe_security_db();
 
     PathDiscovery {
         existing_denied_dirs,
@@ -315,12 +306,7 @@ impl Discovery {
         } else {
             eprintln!("  {YELLOW}⚠{NC} gh CLI: no config found (~/.config/gh/hosts.yml)");
         }
-        #[cfg(target_os = "macos")]
-        if self.auth.security_cli_exists {
-            eprintln!("  {GREEN}✓{NC} Keychain CLI: /usr/bin/security exists");
-        } else {
-            eprintln!("  {YELLOW}⚠{NC} Keychain CLI: /usr/bin/security not found");
-        }
+        print_keychain_status(self.auth.security_cli_exists);
         if !self.auth.keytar_nodes.is_empty() {
             eprintln!("  {GREEN}✓{NC} keytar.node: found in ~/.copilot/pkg/");
         } else {
@@ -408,17 +394,10 @@ impl Discovery {
             eprintln!("  {RED}✗{NC} ~/.copilot not found — Copilot CLI may not be installed");
             critical_ok = false;
         }
-        #[cfg(target_os = "macos")]
-        {
-            if self.paths.keychains_dir_exists {
-                eprintln!("  {GREEN}✓{NC} ~/Library/Keychains exists");
-            } else {
-                eprintln!("  {YELLOW}⚠{NC} ~/Library/Keychains not found");
-            }
-            if self.paths.security_db_exists {
-                eprintln!("  {GREEN}✓{NC} /private/var/db/mds exists (Security framework)");
-            }
-        }
+        print_macos_path_status(
+            self.paths.keychains_dir_exists,
+            self.paths.security_db_exists,
+        );
 
         let n_denied =
             self.paths.existing_denied_dirs.len() + self.paths.existing_denied_files.len();
@@ -449,45 +428,8 @@ impl Discovery {
 
         // Sandbox mechanism section
         eprintln!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Sandbox mechanism{NC}");
-        #[cfg(target_os = "macos")]
-        {
-            let sandbox_exec_exists = Path::new("/usr/bin/sandbox-exec").exists();
-            if sandbox_exec_exists {
-                eprintln!("  {GREEN}✓{NC} Seatbelt: /usr/bin/sandbox-exec available");
-            } else {
-                eprintln!("  {RED}✗{NC} Seatbelt: /usr/bin/sandbox-exec not found");
-                critical_ok = false;
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            match std::fs::read_to_string("/sys/kernel/security/landlock/abi_version") {
-                Ok(s) => {
-                    let abi = s.trim();
-                    eprintln!("  {GREEN}✓{NC} Landlock: ABI v{abi}");
-                    if let Ok(v) = abi.parse::<u32>()
-                        && v < 4
-                    {
-                        eprintln!(
-                            "  {YELLOW}⚠{NC} Landlock ABI < v4: TCP port filtering unavailable (kernel < 6.7)"
-                        );
-                        eprintln!("      Network security provided by proxy only.");
-                    }
-                }
-                Err(_) => {
-                    eprintln!("  {RED}✗{NC} Landlock: not available");
-                    eprintln!("      Requires Linux 5.13+ with Landlock enabled.");
-                    eprintln!("      Check: cat /sys/kernel/security/lsm");
-                    critical_ok = false;
-                }
-            }
-            if let Ok(uname) = std::process::Command::new("uname").arg("-r").output()
-                && uname.status.success()
-            {
-                let kernel = String::from_utf8_lossy(&uname.stdout);
-                eprintln!("  {GREEN}✓{NC} Kernel: {}", kernel.trim());
-            }
-            eprintln!("  {GREEN}✓{NC} seccomp: available (built-in on modern kernels)");
+        if !print_sandbox_mechanism_status() {
+            critical_ok = false;
         }
         eprintln!();
 
@@ -499,6 +441,126 @@ impl Discovery {
         }
 
         critical_ok
+    }
+}
+
+// ── Platform-specific probes ────────────────────────────────────
+//
+// Named functions keep cfg blocks out of the discovery logic above.
+
+/// Check if macOS Keychain CLI exists. Always false on other platforms.
+fn probe_security_cli() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        Path::new("/usr/bin/security").exists()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Check if macOS Keychain directory exists. Always false on other platforms.
+fn probe_keychains_dir(home_dir: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir.join("Library/Keychains").exists()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home_dir;
+        false
+    }
+}
+
+/// Check if macOS Security framework database exists. Always false on other platforms.
+fn probe_security_db() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        Path::new("/private/var/db/mds").exists()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Print Keychain CLI status in doctor output (macOS only, no-op on Linux).
+fn print_keychain_status(security_cli_exists: bool) {
+    #[cfg(target_os = "macos")]
+    if security_cli_exists {
+        eprintln!("  {GREEN}✓{NC} Keychain CLI: /usr/bin/security exists");
+    } else {
+        eprintln!("  {YELLOW}⚠{NC} Keychain CLI: /usr/bin/security not found");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = security_cli_exists;
+    }
+}
+
+/// Print macOS-specific path status (keychains, security db). No-op on Linux.
+fn print_macos_path_status(keychains_dir_exists: bool, security_db_exists: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if keychains_dir_exists {
+            eprintln!("  {GREEN}✓{NC} ~/Library/Keychains exists");
+        } else {
+            eprintln!("  {YELLOW}⚠{NC} ~/Library/Keychains not found");
+        }
+        if security_db_exists {
+            eprintln!("  {GREEN}✓{NC} /private/var/db/mds exists (Security framework)");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (keychains_dir_exists, security_db_exists);
+    }
+}
+
+/// Print sandbox mechanism status and return true if mechanism is available.
+fn print_sandbox_mechanism_status() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let sandbox_exec_exists = Path::new("/usr/bin/sandbox-exec").exists();
+        if sandbox_exec_exists {
+            eprintln!("  {GREEN}✓{NC} Seatbelt: /usr/bin/sandbox-exec available");
+        } else {
+            eprintln!("  {RED}✗{NC} Seatbelt: /usr/bin/sandbox-exec not found");
+        }
+        sandbox_exec_exists
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let ok = match std::fs::read_to_string("/sys/kernel/security/landlock/abi_version") {
+            Ok(s) => {
+                let abi = s.trim();
+                eprintln!("  {GREEN}✓{NC} Landlock: ABI v{abi}");
+                if let Ok(v) = abi.parse::<u32>()
+                    && v < 4
+                {
+                    eprintln!(
+                        "  {YELLOW}⚠{NC} Landlock ABI < v4: TCP port filtering unavailable (kernel < 6.7)"
+                    );
+                    eprintln!("      Network security provided by proxy only.");
+                }
+                true
+            }
+            Err(_) => {
+                eprintln!("  {RED}✗{NC} Landlock: not available");
+                eprintln!("      Requires Linux 5.13+ with Landlock enabled.");
+                eprintln!("      Check: cat /sys/kernel/security/lsm");
+                false
+            }
+        };
+        if let Ok(uname) = std::process::Command::new("uname").arg("-r").output()
+            && uname.status.success()
+        {
+            let kernel = String::from_utf8_lossy(&uname.stdout);
+            eprintln!("  {GREEN}✓{NC} Kernel: {}", kernel.trim());
+        }
+        eprintln!("  {GREEN}✓{NC} seccomp: available (built-in on modern kernels)");
+        ok
     }
 }
 
