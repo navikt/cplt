@@ -337,8 +337,8 @@ mod tests {
 
     #[test]
     fn scratch_dir_rejects_ancestor_symlink() {
-        // If ~/Library/Caches/cplt is a symlink to /tmp/evil, the scratch dir
-        // would escape into /tmp. The canonicalize + prefix check must catch this.
+        // If the scratch base ancestor is a symlink, the scratch dir
+        // would escape. The canonicalize + prefix check must catch this.
         let tmp = std::env::temp_dir().join("cplt-test-ancestor-symlink");
         let _ = std::fs::remove_dir_all(&tmp);
         let evil_target = tmp.join("evil-target");

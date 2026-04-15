@@ -1088,6 +1088,7 @@ fn main() -> ExitCode {
 
     // --show-denials: stream macOS sandbox denial logs in the background.
     // Landlock does not produce kernel audit logs, so this is macOS-only.
+    #[allow(unused_mut)] // mut needed on macOS where denial_proc is assigned
     let mut denial_proc: Option<std::process::Child> = None;
     if cli.show_denials {
         #[cfg(target_os = "macos")]
@@ -1713,6 +1714,7 @@ fn shell_install() -> ExitCode {
         }
     }
 }
+
 
 /// Ensure Copilot's bundled package is extracted before entering the sandbox.
 ///
