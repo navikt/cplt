@@ -140,7 +140,7 @@ mod linux_tests {
             fs::create_dir_all(&ssh_dir).ok();
             fs::write(ssh_dir.join("test_key"), "secret").ok();
         }
-        let (code, stdout, stderr) =
+        let (_code, stdout, stderr) =
             run_sandboxed(project.path(), "cat ~/.ssh/test_key 2>&1 || true");
         // With 2>&1, the denial message goes to stdout. code is 0 due to || true.
         assert!(
