@@ -735,17 +735,19 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     let abi = ABI::V5;
     let abi_version = sandbox.abi_version;
 
-    let mut ruleset = Ruleset::default()
+    let ruleset = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // Always handle ConnectTcp on ABI v4+ — even with empty rules this means
     // "deny all TCP connect" (deny-by-default for network).
-    if abi_version >= 4 {
+    let ruleset = if abi_version >= 4 {
         ruleset
             .handle_access(AccessNet::ConnectTcp)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    }
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+    } else {
+        ruleset
+    };
 
     let mut created = ruleset
         .create()
@@ -780,7 +782,7 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
 
         // Skip paths that don't exist — the tool may not be installed.
         if let Ok(fd) = PathFd::new(&rule.path) {
-            created
+            created = created
                 .add_rule(PathBeneath::new(fd, access))
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         }
@@ -789,7 +791,7 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     // Add network rules (ABI v4+).
     if abi_version >= 4 {
         for rule in &sandbox.policy.net_rules {
-            created
+            created = created
                 .add_rule(NetPort::new(rule.port, AccessNet::ConnectTcp))
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         }
