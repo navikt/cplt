@@ -779,8 +779,8 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     use std::os::fd::BorrowedFd;
 
     use landlock::{
-        ABI, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus,
+        ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus,
     };
 
     // Map the detected kernel ABI to the landlock crate's ABI enum.
