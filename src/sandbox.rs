@@ -232,6 +232,13 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
              Proxy and env hardening provide defense-in-depth."
         );
     }
+    if !config.allow_env_files {
+        eprintln!(
+            "\x1b[0;33m[cplt]\x1b[0m allow_env_files=false is not fully enforceable on Linux: \
+             Landlock grants the project directory full read access, so .env files \
+             within it remain readable. Differs from macOS Seatbelt behavior."
+        );
+    }
 
     let policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);

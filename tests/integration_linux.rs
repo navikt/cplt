@@ -140,11 +140,14 @@ mod linux_tests {
             fs::create_dir_all(&ssh_dir).ok();
             fs::write(ssh_dir.join("test_key"), "secret").ok();
         }
-        let (code, _, stderr) = run_sandboxed(project.path(), "cat ~/.ssh/test_key 2>&1 || true");
-        // Either the file doesn't exist or access is denied — both are acceptable
+        let (code, stdout, stderr) =
+            run_sandboxed(project.path(), "cat ~/.ssh/test_key 2>&1 || true");
+        // With 2>&1, the denial message goes to stdout. code is 0 due to || true.
         assert!(
-            code != 0 || stderr.contains("Permission denied") || stderr.contains("denied"),
-            "Should not be able to read ~/.ssh"
+            stdout.contains("Permission denied")
+                || stdout.contains("denied")
+                || stdout.contains("No such file"),
+            "Should not be able to read ~/.ssh — stdout: {stdout}, stderr: {stderr}"
         );
     }
 
@@ -471,17 +474,23 @@ else:
     }
 
     #[test]
-    fn project_dotenv_blocked_by_default() {
+    fn project_dotenv_readable_in_allowed_tree() {
         require_landlock!();
         let project = create_test_project();
-        // Create .env files and verify they can't be read
+        // Landlock cannot deny subpaths within an allowed directory.
+        // On Linux, .env files inside the project tree remain readable.
+        // Protection comes from the proxy (blocks exfiltration) and
+        // env hardening (blocks hook injection), not filesystem rules.
         fs::write(project.path().join(".env"), "SECRET=value").unwrap();
-        fs::write(project.path().join(".env.local"), "LOCAL_SECRET=value").unwrap();
 
-        let (code, stdout, _) = run_sandboxed(project.path(), "cat .env 2>&1");
+        let (code, stdout, _) = run_sandboxed(project.path(), "cat .env");
+        assert_eq!(
+            code, 0,
+            ".env inside the allowed project tree is readable on Linux (Landlock limitation)"
+        );
         assert!(
-            code != 0 || stdout.contains("Permission denied"),
-            ".env should be blocked by default"
+            stdout.contains("SECRET=value"),
+            "Expected to read .env contents from the allowed project tree"
         );
     }
 
