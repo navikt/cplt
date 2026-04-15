@@ -105,7 +105,11 @@ pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
 
     let gh_config_exists = home_dir.join(".config/gh/hosts.yml").exists();
 
+    // macOS Keychain CLI — not applicable on Linux.
+    #[cfg(target_os = "macos")]
     let security_cli_exists = Path::new("/usr/bin/security").exists();
+    #[cfg(not(target_os = "macos"))]
+    let security_cli_exists = false;
 
     let keytar_nodes = find_native_modules(home_dir, "keytar.node");
 
@@ -185,7 +189,7 @@ const TOOLS_TO_CHECK: &[&str] = &[
     "gh", "git", "node", "mise", "cargo", "python3", "java", "go", "gradle", "yarn", "pnpm",
 ];
 
-use crate::sandbox::HOME_TOOL_DIRS;
+use crate::sandbox::home_tool_dirs;
 
 pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
     let tools: Vec<ToolInfo> = TOOLS_TO_CHECK
@@ -203,7 +207,7 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
         .map(PathBuf::from)
         .find(|p| p.exists());
 
-    let existing_home_tool_dirs: Vec<String> = HOME_TOOL_DIRS
+    let existing_home_tool_dirs: Vec<String> = home_tool_dirs()
         .iter()
         // Writable cache dirs are always included: tools create them on first use,
         // and the profile must permit the write that creates the directory.
@@ -235,7 +239,12 @@ pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
         .collect();
 
     let copilot_dir_exists = home_dir.join(".copilot").exists();
+
+    // macOS-only: Keychain and Security framework database.
+    #[cfg(target_os = "macos")]
     let keychains_dir_exists = home_dir.join("Library/Keychains").exists();
+    #[cfg(not(target_os = "macos"))]
+    let keychains_dir_exists = false;
 
     let is_git_repo = std::process::Command::new("git")
         .args(["rev-parse", "--git-dir"])
@@ -245,7 +254,10 @@ pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
         .status()
         .is_ok_and(|s| s.success());
 
+    #[cfg(target_os = "macos")]
     let security_db_exists = Path::new("/private/var/db/mds").exists();
+    #[cfg(not(target_os = "macos"))]
+    let security_db_exists = false;
 
     PathDiscovery {
         existing_denied_dirs,
@@ -303,6 +315,7 @@ impl Discovery {
         } else {
             eprintln!("  {YELLOW}⚠{NC} gh CLI: no config found (~/.config/gh/hosts.yml)");
         }
+        #[cfg(target_os = "macos")]
         if self.auth.security_cli_exists {
             eprintln!("  {GREEN}✓{NC} Keychain CLI: /usr/bin/security exists");
         } else {
@@ -368,7 +381,7 @@ impl Discovery {
                 self.tools.existing_home_tool_dirs.join(", ~/")
             );
         }
-        let missing_dirs: Vec<&str> = HOME_TOOL_DIRS
+        let missing_dirs: Vec<&str> = home_tool_dirs()
             .iter()
             .map(|d| d.path)
             .filter(|p| !self.tools.existing_home_tool_dirs.iter().any(|e| e == p))
@@ -395,13 +408,16 @@ impl Discovery {
             eprintln!("  {RED}✗{NC} ~/.copilot not found — Copilot CLI may not be installed");
             critical_ok = false;
         }
-        if self.paths.keychains_dir_exists {
-            eprintln!("  {GREEN}✓{NC} ~/Library/Keychains exists");
-        } else {
-            eprintln!("  {YELLOW}⚠{NC} ~/Library/Keychains not found");
-        }
-        if self.paths.security_db_exists {
-            eprintln!("  {GREEN}✓{NC} /private/var/db/mds exists (Security framework)");
+        #[cfg(target_os = "macos")]
+        {
+            if self.paths.keychains_dir_exists {
+                eprintln!("  {GREEN}✓{NC} ~/Library/Keychains exists");
+            } else {
+                eprintln!("  {YELLOW}⚠{NC} ~/Library/Keychains not found");
+            }
+            if self.paths.security_db_exists {
+                eprintln!("  {GREEN}✓{NC} /private/var/db/mds exists (Security framework)");
+            }
         }
 
         let n_denied =
@@ -428,6 +444,50 @@ impl Discovery {
                 "  {GREEN}✓{NC} Protected ({n_denied} found): {}",
                 all.join(", ")
             );
+        }
+        eprintln!();
+
+        // Sandbox mechanism section
+        eprintln!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Sandbox mechanism{NC}");
+        #[cfg(target_os = "macos")]
+        {
+            let sandbox_exec_exists = Path::new("/usr/bin/sandbox-exec").exists();
+            if sandbox_exec_exists {
+                eprintln!("  {GREEN}✓{NC} Seatbelt: /usr/bin/sandbox-exec available");
+            } else {
+                eprintln!("  {RED}✗{NC} Seatbelt: /usr/bin/sandbox-exec not found");
+                critical_ok = false;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            match std::fs::read_to_string("/sys/kernel/security/landlock/abi_version") {
+                Ok(s) => {
+                    let abi = s.trim();
+                    eprintln!("  {GREEN}✓{NC} Landlock: ABI v{abi}");
+                    if let Ok(v) = abi.parse::<u32>() {
+                        if v < 4 {
+                            eprintln!(
+                                "  {YELLOW}⚠{NC} Landlock ABI < v4: TCP port filtering unavailable (kernel < 6.7)"
+                            );
+                            eprintln!("      Network security provided by proxy only.");
+                        }
+                    }
+                }
+                Err(_) => {
+                    eprintln!("  {RED}✗{NC} Landlock: not available");
+                    eprintln!("      Requires Linux 5.13+ with Landlock enabled.");
+                    eprintln!("      Check: cat /sys/kernel/security/lsm");
+                    critical_ok = false;
+                }
+            }
+            if let Ok(uname) = std::process::Command::new("uname").arg("-r").output() {
+                if uname.status.success() {
+                    let kernel = String::from_utf8_lossy(&uname.stdout);
+                    eprintln!("  {GREEN}✓{NC} Kernel: {}", kernel.trim());
+                }
+            }
+            eprintln!("  {GREEN}✓{NC} seccomp: available (built-in on modern kernels)");
         }
         eprintln!();
 

@@ -863,8 +863,9 @@ fn main() -> ExitCode {
     let git_hooks_path = discover::git_hooks_path(&home_dir);
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
-    // The shim invokes VS Code's Electron runtime, which needs dyld access to
-    // load Electron Framework from within the .app bundle.
+    // macOS-only: the shim invokes VS Code's Electron runtime, which needs
+    // dyld access to load Electron Framework from within the .app bundle.
+    #[cfg(target_os = "macos")]
     let electron_app_dir = if active_agent == agent::Agent::Copilot {
         agent_bin_result
             .as_ref()
@@ -873,6 +874,8 @@ fn main() -> ExitCode {
     } else {
         None
     };
+    #[cfg(not(target_os = "macos"))]
+    let electron_app_dir: Option<std::path::PathBuf> = None;
 
     // Compute agent-specific sandbox directories
     let agent_dirs = active_agent.config_dirs(&home_dir);
@@ -1039,7 +1042,7 @@ fn main() -> ExitCode {
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
     // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
-    // so extraction must happen here, outside. macOS-only: SEA extraction is an
+    // so extraction must happen here, outside. macOS-only: SEA extraction is a
     // macOS Copilot packaging detail. Skipped for other agents.
     #[cfg(target_os = "macos")]
     if active_agent.needs_sea_extraction() {
@@ -1051,7 +1054,10 @@ fn main() -> ExitCode {
         match sandbox::preflight(&prepared) {
             Ok(()) => {
                 if !resolved.quiet {
+                    #[cfg(target_os = "macos")]
                     ok("Sandbox profile validated ✓");
+                    #[cfg(target_os = "linux")]
+                    ok("Landlock sandbox ready ✓");
                 }
             }
             Err(e) => {
@@ -1080,25 +1086,36 @@ fn main() -> ExitCode {
         active_agent.display_name()
     ));
 
-    // --show-denials: stream macOS sandbox denial logs in the background
+    // --show-denials: stream macOS sandbox denial logs in the background.
+    // Landlock does not produce kernel audit logs, so this is macOS-only.
     let mut denial_proc = None;
     if cli.show_denials {
-        info("Streaming sandbox denial logs (--show-denials)...");
-        match std::process::Command::new("log")
-            .args([
-                "stream",
-                "--predicate",
-                "eventMessage CONTAINS \"Sandbox\" AND eventMessage CONTAINS \"deny\"",
-                "--info",
-                "--style",
-                "compact",
-            ])
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
+        #[cfg(target_os = "macos")]
         {
-            Ok(child) => denial_proc = Some(child),
-            Err(e) => warn(&format!("Could not start denial log stream: {e}")),
+            info("Streaming sandbox denial logs (--show-denials)...");
+            match std::process::Command::new("log")
+                .args([
+                    "stream",
+                    "--predicate",
+                    "eventMessage CONTAINS \"Sandbox\" AND eventMessage CONTAINS \"deny\"",
+                    "--info",
+                    "--style",
+                    "compact",
+                ])
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+            {
+                Ok(child) => denial_proc = Some(child),
+                Err(e) => warn(&format!("Could not start denial log stream: {e}")),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            warn(
+                "--show-denials is not available on Linux: Landlock does not produce kernel audit logs.",
+            );
+            info("Use `strace -f -e trace=file,network` for filesystem/network debugging.");
         }
     }
 

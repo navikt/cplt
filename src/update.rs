@@ -160,9 +160,12 @@ pub fn perform_update(tag: &str, current_version: &str) -> Result<String, String
     // 5. Stage: set permissions and sign BEFORE replacing
     eprintln!("  Preparing binary...");
     set_executable(&new_binary)?;
-    // xattr and codesign are best-effort (may not be needed in all contexts)
-    let _ = run_xattr(&new_binary);
-    let _ = run_codesign(&new_binary);
+    // xattr and codesign are macOS-specific (Gatekeeper requirements)
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run_xattr(&new_binary);
+        let _ = run_codesign(&new_binary);
+    }
 
     // 6. Atomic rename
     let staged = target_path.with_extension("new");
@@ -179,8 +182,11 @@ pub fn perform_update(tag: &str, current_version: &str) -> Result<String, String
 
     // Copy permissions/signing to staged location too
     set_executable(&staged)?;
-    let _ = run_xattr(&staged);
-    let _ = run_codesign(&staged);
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run_xattr(&staged);
+        let _ = run_codesign(&staged);
+    }
 
     std::fs::rename(&staged, &target_path).map_err(|e| {
         let _ = std::fs::remove_file(&staged);
@@ -214,9 +220,20 @@ pub fn is_homebrew_managed() -> bool {
     }
 }
 
-/// Construct the asset filename for the current architecture.
+/// Construct the asset filename for the current platform and architecture.
 pub fn asset_name(arch: &str) -> String {
-    format!("cplt-{arch}-apple-darwin.tar.gz")
+    #[cfg(target_os = "macos")]
+    {
+        format!("cplt-{arch}-apple-darwin.tar.gz")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        format!("cplt-{arch}-unknown-linux-gnu.tar.gz")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        format!("cplt-{arch}-apple-darwin.tar.gz")
+    }
 }
 
 /// Check if a string looks like a cplt version.
@@ -387,10 +404,17 @@ fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), String> {
 
 /// Compute SHA256 hash of a file using /usr/bin/shasum.
 fn compute_sha256(path: &Path) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
     let output = Command::new("/usr/bin/shasum")
         .args(["-a", "256", &path.to_string_lossy()])
         .output()
-        .map_err(|e| format!("Cannot run /usr/bin/shasum: {e}"))?;
+        .map_err(|e| format!("Cannot run shasum: {e}"))?;
+
+    #[cfg(not(target_os = "macos"))]
+    let output = Command::new("sha256sum")
+        .arg(&path.to_string_lossy().to_string())
+        .output()
+        .map_err(|e| format!("Cannot run sha256sum: {e}"))?;
 
     if !output.status.success() {
         return Err("SHA256 computation failed".to_string());
@@ -491,6 +515,8 @@ fn set_executable(path: &Path) -> Result<(), String> {
 }
 
 /// Remove macOS quarantine extended attributes.
+/// Remove quarantine attribute (macOS only — required for Gatekeeper).
+#[cfg(target_os = "macos")]
 fn run_xattr(path: &Path) -> Result<(), String> {
     let output = Command::new("/usr/bin/xattr")
         .args(["-cr", &path.to_string_lossy()])
@@ -504,7 +530,8 @@ fn run_xattr(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Ad-hoc code sign the binary (required for macOS Gatekeeper).
+/// Ad-hoc code sign the binary (macOS only — required for Gatekeeper).
+#[cfg(target_os = "macos")]
 fn run_codesign(path: &Path) -> Result<(), String> {
     let output = Command::new("/usr/bin/codesign")
         .args(["--force", "--sign", "-", &path.to_string_lossy()])
@@ -657,13 +684,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn asset_name_aarch64() {
         assert_eq!(asset_name("aarch64"), "cplt-aarch64-apple-darwin.tar.gz");
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn asset_name_x86_64() {
         assert_eq!(asset_name("x86_64"), "cplt-x86_64-apple-darwin.tar.gz");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn asset_name_aarch64_linux() {
+        assert_eq!(
+            asset_name("aarch64"),
+            "cplt-aarch64-unknown-linux-gnu.tar.gz"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn asset_name_x86_64_linux() {
+        assert_eq!(asset_name("x86_64"), "cplt-x86_64-unknown-linux-gnu.tar.gz");
     }
 
     #[test]
