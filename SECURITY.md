@@ -8,36 +8,38 @@ cplt assumes Copilot CLI is an **untrusted agent** executing arbitrary code sugg
 
 | Threat | Example | Defense layer |
 |---|---|---|
-| **Credential theft** | Read `~/.ssh/id_ed25519`, `~/.aws/credentials` | Seatbelt file deny rules |
+| **Credential theft** | Read `~/.ssh/id_ed25519`, `~/.aws/credentials` | Seatbelt deny rules (macOS) / Landlock deny (Linux) |
 | **Data exfiltration** | POST secrets to `https://evil.com/collect` | Filesystem isolation (credentials unreadable) |
-| **Secret file access** | Read `~/.netrc`, `~/.npmrc`, `~/.vault-token` | Seatbelt file deny rules |
+| **Secret file access** | Read `~/.netrc`, `~/.npmrc`, `~/.vault-token` | Seatbelt deny rules (macOS) / Landlock deny (Linux) |
 | **DNS rebinding SSRF** | Domain resolves to `127.0.0.1` after check | Post-DNS-resolution IP validation |
-| **Sandbox profile injection** | Path with `\n(allow file-read* (subpath "/"))` | SBPL path character validation |
+| **Sandbox profile injection** | Path with `\n(allow file-read* (subpath "/"))` | SBPL path character validation (macOS) |
 | **Temp file symlink attack** | Symlink at predictable `/tmp/cplt.sb` | Unique filename + `O_CREAT\|O_EXCL` |
-| **Write-then-exec in /tmp** | Drop binary in `/tmp`, execute it | `deny process-exec` + `deny file-map-executable` on `/tmp` and `/var/folders`; `--scratch-dir` provides a safe alternative |
+| **Write-then-exec in /tmp** | Drop binary in `/tmp`, execute it | Seatbelt deny (macOS) / Landlock deny (Linux); `--scratch-dir` provides safe alternative |
 | **Cloud metadata access** | Fetch `169.254.169.254` or CGNAT range | Comprehensive private IP blocklist |
-| **Cross-project access** | Read files outside project directory | Seatbelt subpath restrictions |
+| **Cross-project access** | Read files outside project directory | Seatbelt subpath (macOS) / Landlock ruleset (Linux) |
 | **Process-group escape** | Kill parent, children continue unsandboxed | `setpgid` + signal forwarding |
 | **Env var credential theft** | Read `AWS_SECRET_ACCESS_KEY` from env | `env_clear()` + safe allowlist |
 | **Persistence via native modules** | Replace `keytar.node` with malware | Deny writes to `~/.copilot/pkg` |
 | **Git hook injection** | Write post-checkout hook that runs outside sandbox | Deny writes to `.git/hooks/` and global `core.hooksPath` dir |
-| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Deny writes to `.git/config`; global hooks path validated (under `$HOME`, depth ≥3) |
+| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Deny writes to `.git/config`; global hooks path validated |
 | **Submodule supply chain** | Modify `.gitmodules` to point to malicious repo | Deny writes to `.gitmodules` |
+| **Syscall abuse** | `ptrace`, `mount`, `kexec_load` | seccomp-BPF filter (Linux) |
 
 ### Out of scope
 
 - **TLS interception** — the proxy sees CONNECT targets (hostname:port) but not request bodies or responses
-- **macOS kernel exploits** — we rely on Apple's Seatbelt enforcement being correct
-- **Keychain isolation** — Copilot requires Keychain access for auth; this is an accepted trade-off. `mach-lookup` is blanket because Node.js needs it for DNS, Security framework, and system services. Scoping to individual service names is impractical (undocumented, version-dependent).
-- **sandbox-exec deprecation** — Apple marks it deprecated but has not removed it; Chromium and VS Code still use it
+- **Kernel exploits** — we rely on Apple's Seatbelt (macOS) and Landlock/seccomp (Linux) enforcement being correct
+- **Keychain isolation** (macOS) — Copilot requires Keychain access for auth; this is an accepted trade-off. `mach-lookup` is blanket because Node.js needs it for DNS, Security framework, and system services.
+- **sandbox-exec deprecation** (macOS) — Apple marks it deprecated but has not removed it; Chromium and VS Code still use it
+- **Landlock subpath limitations** (Linux) — Landlock cannot deny access to subpaths within allowed directories. If a parent directory is allowed, all children are allowed. This means certain fine-grained macOS rules (e.g., deny `.config/gh/extensions` while allowing `.config/gh/hosts.yml`) cannot be replicated on Linux.
 - **Code quality** — the sandbox cannot judge whether code written by Copilot contains backdoors; that's a code review problem
 - **`~/.config/gh/hosts.yml` token** — contains the user's GitHub OAuth token. Copilot needs *a* GitHub token to function (via env var or this file). The token is readable inside the sandbox. If this is a concern, set `GH_TOKEN` env var (passes through allowlist) and add `--deny-path ~/.config/gh` to block the file.
-- **Interpreter-based temp execution** — the sandbox blocks *direct* exec from `/tmp` (Mach-O binaries, dlopen), but cannot block `bash /tmp/evil.sh` or `node /tmp/evil.js` because the exec target is the interpreter (`/bin/bash`, `/usr/bin/node`), not the script file. Sandboxing interpreters would break Copilot.
+- **Interpreter-based temp execution** — the sandbox blocks *direct* exec from `/tmp` (Mach-O/ELF binaries, dlopen), but cannot block `bash /tmp/evil.sh` or `node /tmp/evil.js` because the exec target is the interpreter (`/bin/bash`, `/usr/bin/node`), not the script file. Sandboxing interpreters would break Copilot.
 - **`.vscode/` project configs** — the agent can write `.vscode/tasks.json`, `launch.json`, and `settings.json` which VS Code may auto-execute outside the sandbox. This is an IDE trust boundary issue, not a sandbox scope issue. Mitigation: review `.vscode/` changes in `git diff` before committing; set `"task.autoRunTasks": "off"` in VS Code.
-- **Write+exec in home cache dirs** — `~/.gradle`, `~/.m2`, `~/Library/pnpm` have both write and exec permissions. Build tools need write for dependency downloads and exec for build plugins. A rogue agent could write a malicious JAR to `~/.m2` or a Gradle plugin to `~/.gradle`, but the executed code would still be sandboxed. `~/Library/Caches` is broadly allowed for dev tool caches (go-build, Homebrew, pip, etc.), but browser and app caches (Chrome, Firefox, Discord, etc.) are denied via regex prefix rules — no allowlist maintenance needed for new dev tools.
+- **Write+exec in home cache dirs** — `~/.gradle`, `~/.m2`, `~/Library/pnpm` (macOS) / `~/.local/share/pnpm` (Linux) have both write and exec permissions. Build tools need write for dependency downloads and exec for build plugins. A rogue agent could write a malicious JAR, but the executed code would still be sandboxed.
 - **Project build scripts** — the agent can modify `Makefile`, `package.json` scripts, `build.gradle`, `.github/workflows/`, etc. These are legitimate Copilot targets and cannot be blocked. The risk is mitigated by code review (git diff) before running builds or committing.
-- **POSIX shared memory** — `ipc-posix-shm-*` is allowed because Node.js needs it for DNS and system queries. An agent could theoretically use SHM as an IPC channel to processes outside the sandbox, but this requires a cooperating process already running on the machine.
-- **DNS tunneling** — DNS queries go through macOS mDNSResponder Unix socket. Seatbelt offers no per-query filtering; it's all-or-nothing. Blocking DNS breaks everything. Bandwidth is ~15 KB/s max, requires attacker-controlled authoritative DNS, and is detectable with network monitoring.
+- **POSIX shared memory** (macOS) — `ipc-posix-shm-*` is allowed because Node.js needs it for DNS and system queries. An agent could theoretically use SHM as an IPC channel to processes outside the sandbox, but this requires a cooperating process already running on the machine.
+- **DNS tunneling** — DNS queries are unrestricted on both platforms. Bandwidth is ~15 KB/s max, requires attacker-controlled authoritative DNS, and is detectable with network monitoring.
 
 ## Real-World Attack Landscape (2025–2026)
 
@@ -298,6 +300,88 @@ When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Libr
 ### Layer 2: CONNECT Proxy (Optional Logging and Domain Filtering)
 
 When `--with-proxy` is enabled, a localhost CONNECT proxy intercepts all outbound traffic. `HTTP_PROXY`/`HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1` are injected into the sandbox environment, routing traffic from Copilot CLI (Node.js), `gh` (Go), `curl`, and any other tool through the proxy.
+
+### Layer 1L: Landlock + seccomp Kernel Sandbox (Linux)
+
+On Linux, kernel-level enforcement uses two complementary mechanisms:
+
+#### Landlock LSM (filesystem + network)
+
+[Landlock](https://docs.kernel.org/userspace-api/landlock.html) is a stacking LSM that provides unprivileged, process-level access control. Rules are additive within a ruleset — access not explicitly granted is denied.
+
+**ABI version support:**
+
+| ABI | Kernel | Capabilities |
+|-----|--------|-------------|
+| v1  | 5.13+  | Filesystem access control |
+| v2  | 5.19+  | + file refer (cross-directory rename) |
+| v3  | 6.2+   | + file truncate |
+| v4  | 6.7+   | + TCP port filtering (bind + connect) |
+| v5  | 6.10+  | + ioctl on character devices |
+
+cplt requires ABI v1 minimum. On ABI < v4, network security relies on the CONNECT proxy only (Landlock cannot filter TCP ports). On ABI v4+, Landlock denies all TCP connections except to explicitly allowed ports.
+
+**Key differences from Seatbelt:**
+
+| Property | Seatbelt (macOS) | Landlock (Linux) |
+|----------|-----------------|------------------|
+| Granularity | Path regex, file-level deny | Path-based, directory-level allow |
+| Default | deny-by-default | deny-by-default |
+| Subpath deny | ✅ Can deny subpaths within allowed dirs | ❌ Cannot deny within allowed paths |
+| Network | Port-based (all ABIs) | Port-based (ABI v4+ only) |
+| Audit logs | Full Seatbelt violation log | None (no audit mode) |
+| Privilege | Requires `sandbox-exec` (deprecated) | Unprivileged (any user) |
+
+**Pre-exec safety:** Because the proxy thread makes the process multi-threaded, Landlock rules and seccomp filters are pre-computed in the parent process (`PrecomputedSandbox`) and applied in the child's `pre_exec` callback using only async-signal-safe raw syscalls.
+
+#### seccomp-BPF (syscall filtering)
+
+A BPF filter blocks dangerous syscalls that could be used to escape the sandbox or escalate privileges:
+
+| Blocked syscall | Reason |
+|----------------|--------|
+| `ptrace` | Prevents debugging/injecting into other processes |
+| `mount`, `umount2` | Prevents filesystem namespace manipulation |
+| `pivot_root`, `chroot` | Prevents root filesystem escape |
+| `unshare` | Prevents creating new namespaces |
+| `setns` | Prevents entering other namespaces |
+| `reboot` | Prevents system disruption |
+| `kexec_load`, `kexec_file_load` | Prevents kernel replacement |
+| `init_module`, `finit_module`, `delete_module` | Prevents kernel module manipulation |
+| `perf_event_open` | Prevents performance monitoring-based side channels |
+| `process_vm_readv`, `process_vm_writev` | Prevents cross-process memory access |
+| `userfaultfd` | Prevents use-after-free exploitation primitive |
+| `bpf` | Prevents loading arbitrary BPF programs |
+| `add_key`, `keyctl`, `request_key` | Prevents kernel keyring manipulation |
+| `io_uring_setup`, `io_uring_enter`, `io_uring_register` | io_uring has a large attack surface |
+| `move_mount`, `open_tree`, `mount_setattr`, `fsopen`, `fsconfig`, `fsmount`, `fspick` | Prevents mount API v2 manipulation |
+| `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | Prevents self-modification of sandbox |
+
+The filter uses `SECCOMP_RET_ERRNO` (returns EPERM) rather than `SECCOMP_RET_KILL` to avoid crashing on legitimate probes.
+
+#### Protected paths (Linux)
+
+The same credential directories are denied as on macOS:
+
+- `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.nais`
+- `~/.password-store`, `~/.config/gcloud`, `~/.config/op`, `~/.terraform.d`
+- `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.gem/credentials`, `~/.vault-token`
+
+Linux-specific tool directories use XDG-style paths:
+
+| Directory | Permissions | Rationale |
+|-----------|------------|-----------|
+| `~/.cache` | read+write | XDG cache dir (pip, go-build, etc.) |
+| `~/.local/share/pnpm` | read+write+exec | pnpm global store |
+| `~/.local/bin` | read+exec | User-installed binaries |
+| `~/.local/share/mise` | read+write+exec | mise tool installations |
+
+#### Linux-specific limitations
+
+1. **No `--show-denials`**: Landlock has no audit logging. Use `strace` for debugging.
+2. **No subpath deny**: Cannot deny `~/.config/gh/extensions` while allowing `~/.config/gh/hosts.yml` — the entire directory must be allowed or denied.
+3. **No auth integration**: Linux v1 supports env token + `gh auth` only (no D-Bus/Secret Service).
+4. **Copilot extraction**: The macOS SEA extraction path is unknown on Linux — `ensure_copilot_extracted()` is skipped.
 
 The proxy provides:
 

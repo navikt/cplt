@@ -60,8 +60,20 @@ description = "Run live smoke tests — requires macOS + Copilot auth + network"
 run = "cargo test --test e2e -- --ignored"
 
 [tasks."test:all"]
-description = "Run all test suites except live smoke tests (macOS only)"
+description = "Run all test suites except live smoke tests (platform-aware)"
 depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-projects"]
+
+[tasks."test:integration-linux"]
+description = "Run Linux Landlock integration tests — requires Linux with Landlock"
+run = "cargo test --test integration_linux"
+
+[tasks."test:e2e-linux"]
+description = "Run Linux E2E tests — requires Linux with compiled binary"
+run = "cargo test --test e2e_linux"
+
+[tasks."test:e2e-projects-linux"]
+description = "Run Linux project workflow tests — requires Linux with Landlock"
+run = "cargo test --test e2e_projects_linux"
 
 [tasks.check]
 description = "Run all checks (fmt, clippy, test) — works inside sandbox"
@@ -75,7 +87,12 @@ depends = ["check", "build:release"]
 description = "Build and install cplt to /usr/local/bin"
 run = """
 export CPLT_LONG_VERSION="$(date -u +%Y.%m.%d-%H%M%S)-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)$(git diff --quiet HEAD 2>/dev/null || echo '-dirty')"
-cargo build --release && sudo cp target/release/cplt /usr/local/bin/cplt && sudo /usr/bin/xattr -cr /usr/local/bin/cplt && sudo codesign --force --sign - /usr/local/bin/cplt
+cargo build --release
+sudo cp target/release/cplt /usr/local/bin/cplt
+if [[ "$(uname)" == "Darwin" ]]; then
+  sudo /usr/bin/xattr -cr /usr/local/bin/cplt
+  sudo codesign --force --sign - /usr/local/bin/cplt
+fi
 """
 
 [tasks.clean]
