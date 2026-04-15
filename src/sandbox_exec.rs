@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "macos")]
 use super::env::build_sandbox_env;
-#[cfg(target_os = "macos")]
 use super::policy::HardeningCategory;
 use crate::agent::Agent;
 
