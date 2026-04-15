@@ -66,11 +66,21 @@ pub struct LandlockPolicy {
 /// Everything here is computed in the parent (where allocation and I/O
 /// are safe). The `pre_exec` hook only receives this immutable data and
 /// makes raw syscalls — no allocation, no file I/O.
+///
+/// File descriptors in `pre_opened_fds` are opened with `O_PATH | O_CLOEXEC`
+/// in `precompute()`. They survive `fork()` and are used by
+/// `apply_precomputed()` via `BorrowedFd` — no `open()` or allocation
+/// in the async-signal-unsafe post-fork context.
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub struct PrecomputedSandbox {
     pub abi_version: u32,
-    pub policy: LandlockPolicy,
+    /// Pre-opened `O_PATH` file descriptors for Landlock filesystem rules.
+    /// Opened in `precompute()` (parent), used in `apply_precomputed()` (child).
+    /// Raw fds (i32) so the struct remains Clone-able. Closed on exec via
+    /// `O_CLOEXEC`; the parent leaks them (harmless — ~30 fds, program exits).
+    pub pre_opened_fds: Vec<(i32, FsAccess)>,
+    pub net_rules: Vec<NetRule>,
     pub seccomp_filter: Vec<BpfInstruction>,
 }
 
@@ -466,15 +476,23 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     });
 
     // ── Network rules (requires ABI v4+, kernel 6.7+) ──
-    let mut net_rules = Vec::new();
-    if let Some(port) = config.proxy_port {
+    // Always allow HTTPS (443) — Copilot needs it to reach GitHub APIs.
+    // This mirrors the macOS SBPL profile which allows outbound 443.
+    let mut net_rules = vec![NetRule { port: 443 }];
+    if let Some(port) = config.proxy_port
+        && !net_rules.iter().any(|r| r.port == port)
+    {
         net_rules.push(NetRule { port });
     }
     for &port in config.extra_ports {
-        net_rules.push(NetRule { port });
+        if !net_rules.iter().any(|r| r.port == port) {
+            net_rules.push(NetRule { port });
+        }
     }
     for &port in config.localhost_ports {
-        net_rules.push(NetRule { port });
+        if !net_rules.iter().any(|r| r.port == port) {
+            net_rules.push(NetRule { port });
+        }
     }
 
     // Denied dotfiles and denied files are handled by simply NOT adding
@@ -613,10 +631,17 @@ pub fn check_availability() -> Result<u32, String> {
 /// issues when forking a multi-threaded process (the proxy thread may
 /// be running).
 ///
+/// File descriptors are opened here with `O_PATH | O_CLOEXEC`. The
+/// `CString` allocation for path conversion happens safely in the parent.
+/// The child's `pre_exec` hook receives only raw fd numbers.
+///
 /// Called once in `prepare()`. The returned `PrecomputedSandbox` is
 /// cloned into the `pre_exec` closure.
 #[cfg(target_os = "linux")]
 pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
     let abi_version = check_availability()?;
     let seccomp_filter = build_seccomp_filter();
 
@@ -627,9 +652,25 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
         );
     }
 
+    // Pre-open all filesystem paths in the parent process.
+    // This avoids CString allocation and open() calls in pre_exec.
+    let mut pre_opened_fds = Vec::new();
+    for rule in &policy.fs_rules {
+        let c_path = CString::new(rule.path.as_os_str().as_bytes())
+            .map_err(|_| format!("Path contains null byte: {}", rule.path.display()))?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            pre_opened_fds.push((fd, rule.access));
+        }
+        // Skip paths that don't exist (fd < 0) — the tool may not be installed.
+    }
+
+    let net_rules = policy.net_rules.clone();
+
     Ok(PrecomputedSandbox {
         abi_version,
-        policy,
+        pre_opened_fds,
+        net_rules,
         seccomp_filter,
     })
 }
@@ -669,10 +710,10 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
         BpfInstruction { code, jt, jf, k }
     }
 
-    // Blocked syscall numbers (x86_64).
-    // Privilege escalation and system modification syscalls
-    // that a sandboxed code assistant should never need.
-    let blocked: &[u32] = &[
+    // Blocked syscall numbers — privilege escalation and system modification
+    // syscalls that a sandboxed code assistant should never need.
+    // Cross-architecture: only common syscalls here.
+    let mut blocked: Vec<u32> = vec![
         libc::SYS_ptrace as u32,
         libc::SYS_mount as u32,
         libc::SYS_umount2 as u32,
@@ -687,14 +728,19 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
         libc::SYS_reboot as u32,
         libc::SYS_swapon as u32,
         libc::SYS_swapoff as u32,
-        libc::SYS_iopl as u32,
-        libc::SYS_ioperm as u32,
-        libc::SYS_modify_ldt as u32,
         libc::SYS_personality as u32,
         libc::SYS_keyctl as u32,
         libc::SYS_request_key as u32,
         libc::SYS_add_key as u32,
     ];
+
+    // x86_64-only syscalls — these don't exist on aarch64.
+    #[cfg(target_arch = "x86_64")]
+    {
+        blocked.push(libc::SYS_iopl as u32);
+        blocked.push(libc::SYS_ioperm as u32);
+        blocked.push(libc::SYS_modify_ldt as u32);
+    }
 
     let mut filter = Vec::with_capacity(blocked.len() * 2 + 2);
 
@@ -702,7 +748,7 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
     filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, NR_OFFSET));
 
     // For each blocked syscall: compare and jump to EPERM if match
-    for &nr in blocked {
+    for &nr in &blocked {
         filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
         filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
     }
@@ -715,24 +761,36 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
 
 /// Apply the pre-computed sandbox to the current process.
 ///
-/// Called in the child's `pre_exec` hook — all data is pre-computed,
-/// so this function only makes raw syscalls (no allocation, no I/O).
+/// Called in the child's `pre_exec` hook. All file descriptors are
+/// pre-opened in the parent, and BPF instructions pre-built, so this
+/// function only makes syscalls (Landlock, prctl) — no allocation,
+/// no file I/O, no CString construction.
 ///
 /// # Safety context
 ///
 /// Safe for `pre_exec` because:
 /// - Landlock crate API internally uses only syscalls + stack structs
-/// - PathFd::new() is just open() (async-signal-safe)
+/// - File descriptors are pre-opened in parent (via `precompute()`)
+/// - `BorrowedFd::borrow_raw()` is zero-cost, no allocation
 /// - Seccomp filter is pre-built; only prctl() is called here
 /// - All error messages are static strings (no allocation)
 #[cfg(target_os = "linux")]
 pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
+    use std::os::fd::BorrowedFd;
+
     use landlock::{
-        ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus,
+        ABI, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus,
     };
 
-    let abi = ABI::V5;
+    // Map the detected kernel ABI to the landlock crate's ABI enum.
+    let abi = match sandbox.abi_version {
+        1 => ABI::V1,
+        2 => ABI::V2,
+        3 => ABI::V3,
+        4 => ABI::V4,
+        _ => ABI::V5,
+    };
     let abi_version = sandbox.abi_version;
 
     let ruleset = Ruleset::default()
@@ -751,15 +809,16 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
 
     let mut created = ruleset.create().map_err(std::io::Error::other)?;
 
-    // Add filesystem rules.
-    for rule in &sandbox.policy.fs_rules {
-        let mut access = if rule.access.read {
+    // Add filesystem rules using pre-opened file descriptors.
+    // No open() or CString allocation — just borrow the raw fd.
+    for &(raw_fd, access) in &sandbox.pre_opened_fds {
+        let mut access_flags = if access.read {
             AccessFs::ReadFile | AccessFs::ReadDir
         } else {
             landlock::BitFlags::EMPTY
         };
 
-        if rule.access.write {
+        if access.write {
             let mut write_flags = AccessFs::WriteFile
                 | AccessFs::RemoveDir
                 | AccessFs::RemoveFile
@@ -771,24 +830,24 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
             if abi_version >= 3 {
                 write_flags |= AccessFs::Truncate;
             }
-            access |= write_flags;
+            access_flags |= write_flags;
         }
 
-        if rule.access.execute {
-            access |= AccessFs::Execute;
+        if access.execute {
+            access_flags |= AccessFs::Execute;
         }
 
-        // Skip paths that don't exist — the tool may not be installed.
-        if let Ok(fd) = PathFd::new(&rule.path) {
-            created = created
-                .add_rule(PathBeneath::new(fd, access))
-                .map_err(std::io::Error::other)?;
-        }
+        // Safety: raw_fd was opened in precompute() and is still valid
+        // (O_CLOEXEC keeps it alive until exec, fork inherits it).
+        let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+        created = created
+            .add_rule(PathBeneath::new(fd, access_flags))
+            .map_err(std::io::Error::other)?;
     }
 
     // Add network rules (ABI v4+).
     if abi_version >= 4 {
-        for rule in &sandbox.policy.net_rules {
+        for rule in &sandbox.net_rules {
             created = created
                 .add_rule(NetPort::new(rule.port, AccessNet::ConnectTcp))
                 .map_err(std::io::Error::other)?;

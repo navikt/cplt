@@ -103,10 +103,28 @@ jobs:
           restore-keys: Linux-integration-cargo-
 
       - name: Verify Landlock availability
+        id: landlock
         run: |
           echo "Kernel: $(uname -r)"
-          echo "LSM: $(cat /sys/kernel/security/lsm)"
+
+          if [ ! -r /sys/kernel/security/lsm ]; then
+            echo "Landlock integration tests skipped: /sys/kernel/security/lsm not available"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          lsm="$(cat /sys/kernel/security/lsm)"
+          echo "LSM: $lsm"
+
+          if [ ! -r /sys/kernel/security/landlock/abi_version ]; then
+            echo "Landlock integration tests skipped: Landlock ABI not available"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           echo "Landlock ABI: $(cat /sys/kernel/security/landlock/abi_version)"
+          echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Run all Linux tests
+        if: steps.landlock.outputs.available == 'true'
         run: cargo test --verbose

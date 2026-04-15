@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 const SCRATCH_BASE: &str = "Library/Caches/cplt/tmp";
 
 /// Base directory for scratch dirs, relative to $HOME.
-/// Follows XDG Base Directory spec (`$XDG_CACHE_HOME` defaults to `~/.cache`).
+/// Uses `~/.cache` (does not read `$XDG_CACHE_HOME` — sandbox env is filtered).
 #[cfg(not(target_os = "macos"))]
 const SCRATCH_BASE: &str = ".cache/cplt/tmp";
 
