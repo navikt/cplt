@@ -20,6 +20,7 @@ fn rejects_filesystem_root() {
     assert!(is_unsafe_root(std::path::Path::new("/"), home));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn rejects_users_dir() {
     let home = std::path::Path::new("/Users/testuser");
@@ -32,6 +33,7 @@ fn rejects_tmp() {
     assert!(is_unsafe_root(std::path::Path::new("/tmp"), home));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn rejects_private_tmp() {
     let home = std::path::Path::new("/Users/testuser");
@@ -44,18 +46,21 @@ fn rejects_var() {
     assert!(is_unsafe_root(std::path::Path::new("/var"), home));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn rejects_private_var() {
     let home = std::path::Path::new("/Users/testuser");
     assert!(is_unsafe_root(std::path::Path::new("/private/var"), home));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn rejects_applications() {
     let home = std::path::Path::new("/Users/testuser");
     assert!(is_unsafe_root(std::path::Path::new("/Applications"), home));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn rejects_system() {
     let home = std::path::Path::new("/Users/testuser");
@@ -84,6 +89,19 @@ fn allows_deep_project_path() {
         std::path::Path::new("/Users/testuser/go/src/github.com/org/repo"),
         home
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rejects_linux_unsafe_roots() {
+    let home = std::path::Path::new("/home/testuser");
+    assert!(is_unsafe_root(std::path::Path::new("/home"), home));
+    assert!(is_unsafe_root(std::path::Path::new("/proc"), home));
+    assert!(is_unsafe_root(std::path::Path::new("/sys"), home));
+    assert!(is_unsafe_root(std::path::Path::new("/boot"), home));
+    assert!(is_unsafe_root(std::path::Path::new("/usr"), home));
+    assert!(is_unsafe_root(std::path::Path::new("/etc"), home));
+    assert!(is_unsafe_root(std::path::Path::new("/var/tmp"), home));
 }
 
 // ============================================================

@@ -482,9 +482,10 @@ fn main() -> ExitCode {
         };
     }
 
-    // macOS only
-    if std::env::consts::OS != "macos" {
-        error("cplt requires macOS (uses sandbox-exec)");
+    // Platform check: cplt supports macOS (Seatbelt) and Linux (Landlock).
+    // Other platforms (Windows, FreeBSD, etc.) are not supported.
+    if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+        error("cplt requires macOS or Linux");
         return ExitCode::FAILURE;
     }
 
@@ -635,16 +636,6 @@ fn main() -> ExitCode {
         }
     }
 
-    // Validate all paths that will be interpolated into SBPL profile
-    if let Err(e) = sandbox::validate_sbpl_path(&project_dir) {
-        error(&format!("Project dir: {e}"));
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) = sandbox::validate_sbpl_path(&home_dir) {
-        error(&format!("Home dir: {e}"));
-        return ExitCode::FAILURE;
-    }
-
     // Run auto-discovery to tighten the sandbox profile
     let tool_discovery = discover::discover_tools(&home_dir);
     let existing_dirs = tool_discovery.existing_home_tool_dirs;
@@ -687,43 +678,24 @@ fn main() -> ExitCode {
             })
         })
         .filter(|d| !crate::is_unsafe_root(d, &home_dir));
-    if let Some(ref dir) = copilot_install_dir
-        && let Err(e) = sandbox::validate_sbpl_path(dir)
-    {
-        error(&format!("Copilot install dir: {e}"));
-        return ExitCode::FAILURE;
-    }
 
     // Discover global git hooks path from core.hooksPath
     let git_hooks_path = discover::git_hooks_path(&home_dir);
-    if let Some(ref p) = git_hooks_path
-        && let Err(e) = sandbox::validate_sbpl_path(p)
-    {
-        error(&format!("Git hooks path: {e}"));
-        return ExitCode::FAILURE;
-    }
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
-    // The shim invokes VS Code's Electron runtime, which needs dyld access to
-    // load Electron Framework from within the .app bundle.
-    let electron_app_dir = copilot_bin_result
-        .as_ref()
-        .ok()
-        .and_then(|p| discover::discover_electron_app(p));
-    if let Some(ref dir) = electron_app_dir
-        && let Err(e) = sandbox::validate_sbpl_path(dir)
-    {
-        error(&format!("Electron app path: {e}"));
-        return ExitCode::FAILURE;
-    }
+    // macOS-only: the shim invokes VS Code's Electron runtime, which needs
+    // dyld access to load Electron Framework from within the .app bundle.
+    let electron_app_dir = discover_electron_app_dir(&copilot_bin_result);
 
-    // Generate sandbox profile
+    // Prepare the sandbox — validates paths, generates platform-specific profile.
+    // Path validation (SBPL injection checks on macOS) is handled internally
+    // by prepare(), so callers don't need to know about backend-specific risks.
     let proxy_port_for_profile = if resolved.with_proxy {
         Some(resolved.proxy_port)
     } else {
         None
     };
-    let profile = sandbox::generate_profile(&sandbox::ProfileOptions {
+    let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
         project_dir: &project_dir,
         home_dir: &home_dir,
         extra_read: &resolved.allow_read,
@@ -741,11 +713,17 @@ fn main() -> ExitCode {
         git_hooks_path: git_hooks_path.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         electron_app_dir: electron_app_dir.as_deref(),
-    });
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    // --print-profile: dump the SBPL and exit (no copilot binary needed)
+    // --print-profile: dump the sandbox policy and exit (no copilot binary needed)
     if cli.print_profile {
-        println!("{profile}");
+        println!("{}", sandbox::describe(&prepared));
         return ExitCode::SUCCESS;
     }
 
@@ -771,49 +749,18 @@ fn main() -> ExitCode {
     };
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
-    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
-    // so extraction must happen here, outside.
+    // macOS-only: writes to ~/Library/Caches/copilot/pkg/ are denied inside the
+    // sandbox (write-then-exec defense), so extraction must happen here, outside.
+    // TODO(linux): verify if Linux Copilot CLI needs extraction and where.
+    #[cfg(target_os = "macos")]
     ensure_copilot_extracted(&copilot_bin, &home_dir);
 
-    // Write profile to temp file with unique name (prevents symlink attacks)
-    let profile_path = std::env::temp_dir().join(format!(
-        "cplt-{}-{}.sb",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    // O_CREAT|O_EXCL: atomic create, fails if exists (prevents symlink following)
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&profile_path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                error(&format!("Cannot create sandbox profile: {e}"));
-                return ExitCode::FAILURE;
-            }
-        };
-        if let Err(e) = file.write_all(profile.as_bytes()) {
-            error(&format!("Cannot write sandbox profile: {e}"));
-            let _ = std::fs::remove_file(&profile_path);
-            return ExitCode::FAILURE;
-        }
-    }
-
-    // Validate profile with a quick test
+    // Preflight: verify the sandbox mechanism works on this system
     if !resolved.no_validate {
-        match sandbox::validate(&profile_path, &project_dir, &home_dir) {
+        match sandbox::preflight(&prepared) {
             Ok(()) => {
                 if !resolved.quiet {
-                    ok("Sandbox profile validated ✓");
+                    print_preflight_ok();
                 }
             }
             Err(e) => {
@@ -829,7 +776,6 @@ fn main() -> ExitCode {
     }
     if let Err(e) = prompt_confirm(cli.yes, resolved.quiet) {
         error(&e);
-        let _ = std::fs::remove_file(&profile_path);
         return ExitCode::FAILURE;
     }
 
@@ -915,50 +861,27 @@ fn main() -> ExitCode {
 
     ok("Starting Copilot in sandbox...");
 
-    // --show-denials: stream macOS sandbox denial logs in the background
-    let mut denial_proc = None;
+    // --show-denials: stream sandbox denial logs in the background.
+    #[allow(unused_mut)] // mut needed on macOS where denial_proc is assigned
+    let mut denial_proc: Option<std::process::Child> = None;
     if cli.show_denials {
-        info("Streaming sandbox denial logs (--show-denials)...");
-        match std::process::Command::new("log")
-            .args([
-                "stream",
-                "--predicate",
-                "eventMessage CONTAINS \"Sandbox\" AND eventMessage CONTAINS \"deny\"",
-                "--info",
-                "--style",
-                "compact",
-            ])
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-        {
-            Ok(child) => denial_proc = Some(child),
-            Err(e) => warn(&format!("Could not start denial log stream: {e}")),
-        }
+        denial_proc = start_denial_stream();
     }
 
     eprintln!("{YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}");
     eprintln!();
 
     // Run copilot inside sandbox
-    let exit_code = sandbox::exec(
+    let exit_code = sandbox::exec_sandboxed(
+        &prepared,
         &copilot_bin,
-        &profile_path,
-        &project_dir,
         &cli.copilot_args,
         &resolved.pass_env,
         resolved.inherit_env,
         &disabled_categories,
-        scratch_path,
-        if resolved.with_proxy {
-            Some(resolved.proxy_port)
-        } else {
-            None
-        },
     );
 
     // Cleanup
-    let _ = std::fs::remove_file(&profile_path);
     if let Some(handle) = proxy_handle {
         handle.shutdown();
     }
@@ -1479,9 +1402,81 @@ fn shell_install() -> ExitCode {
     }
 }
 
+// ── Platform-specific helpers ─────────────────────────────────
+//
+// Named functions with cfg-gated bodies keep the run() function
+// free of inline #[cfg] blocks.
+
+/// Discover the VS Code Electron app bundle containing Copilot's shim (macOS only).
+///
+/// On Linux, Copilot doesn't use Electron app bundles, so this always returns `None`.
+fn discover_electron_app_dir(
+    copilot_bin_result: &Result<PathBuf, String>,
+) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        copilot_bin_result
+            .as_ref()
+            .ok()
+            .and_then(|p| discover::discover_electron_app(p))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = copilot_bin_result;
+        None
+    }
+}
+
+/// Print the preflight success message appropriate for this platform.
+fn print_preflight_ok() {
+    #[cfg(target_os = "macos")]
+    ok("Sandbox profile validated ✓");
+    #[cfg(target_os = "linux")]
+    ok("Landlock sandbox ready ✓");
+}
+
+/// Start streaming sandbox denial logs (macOS only).
+///
+/// On macOS, spawns `log stream` filtering for Sandbox deny events.
+/// On Linux, prints a hint about `strace` since Landlock has no audit logs.
+fn start_denial_stream() -> Option<std::process::Child> {
+    #[cfg(target_os = "macos")]
+    {
+        info("Streaming sandbox denial logs (--show-denials)...");
+        match std::process::Command::new("log")
+            .args([
+                "stream",
+                "--predicate",
+                "eventMessage CONTAINS \"Sandbox\" AND eventMessage CONTAINS \"deny\"",
+                "--info",
+                "--style",
+                "compact",
+            ])
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => Some(child),
+            Err(e) => {
+                warn(&format!("Could not start denial log stream: {e}"));
+                None
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        warn(
+            "--show-denials is not available on Linux: Landlock does not produce kernel audit logs.",
+        );
+        info("Use `strace -f -e trace=file,network` for filesystem/network debugging.");
+        None
+    }
+}
+
 /// Parse the Copilot CLI version from `copilot --version` output.
 ///
 /// Returns e.g. `"1.0.24"` from `"GitHub Copilot CLI 1.0.24.\n..."`.
+#[cfg(target_os = "macos")]
 fn get_copilot_version(copilot_bin: &Path) -> Option<String> {
     let output = std::process::Command::new(copilot_bin)
         .arg("--version")
@@ -1503,6 +1498,7 @@ fn get_copilot_version(copilot_bin: &Path) -> Option<String> {
 ///
 /// This function checks for the `.extraction-complete` marker and, if missing,
 /// runs `copilot` briefly to trigger the SEA loader extraction.
+#[cfg(target_os = "macos")]
 fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) {
     let version = match get_copilot_version(copilot_bin) {
         Some(v) => v,

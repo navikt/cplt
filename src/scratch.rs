@@ -2,22 +2,31 @@
 //!
 //! Many tools (Go test, mise inline tasks, node-gyp) compile binaries to
 //! `$TMPDIR` then execute them. The sandbox blocks exec from system temp dirs
-//! (`/private/tmp`, `/private/var/folders`) to prevent write-then-exec attacks.
+//! to prevent write-then-exec attacks:
+//! - macOS: `/private/tmp`, `/private/var/folders`
+//! - Linux: `/tmp`, `/var/tmp`
 //!
 //! The scratch directory provides a controlled alternative: a per-session
 //! directory with write+exec permissions, cleaned up automatically on exit.
 //!
-//! Location: `~/Library/Caches/cplt/tmp/{session-id}/`
-//! - macOS convention for ephemeral data
-//! - Separate from `~/.cplt` (config/state) vs cache (throwaway)
-//! - Each session gets a UUID subdirectory for isolation
+//! Location varies by platform:
+//! - macOS: `~/Library/Caches/cplt/tmp/{session-id}/`
+//! - Linux: `~/.cache/cplt/tmp/{session-id}/`
+//!
+//! Each session gets a UUID subdirectory for isolation.
 
 use crate::sandbox::validate_sbpl_path;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Base directory for scratch dirs, relative to $HOME.
+#[cfg(target_os = "macos")]
 const SCRATCH_BASE: &str = "Library/Caches/cplt/tmp";
+
+/// Base directory for scratch dirs, relative to $HOME.
+/// Uses `~/.cache` (does not read `$XDG_CACHE_HOME` — sandbox env is filtered).
+#[cfg(not(target_os = "macos"))]
+const SCRATCH_BASE: &str = ".cache/cplt/tmp";
 
 /// Maximum age for stale scratch dirs before garbage collection.
 const STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
@@ -25,7 +34,7 @@ const STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 /// A per-session scratch directory with write+exec permissions.
 ///
 /// Implements `Drop` to ensure cleanup on all exit paths (RAII guard).
-/// The directory is created under `~/Library/Caches/cplt/tmp/{uuid}/`.
+/// The directory is created under `$HOME/{SCRATCH_BASE}/{uuid}/`.
 #[derive(Debug)]
 pub struct ScratchDir {
     path: PathBuf,
@@ -315,7 +324,7 @@ mod tests {
         let real_dir = tmp.join("real");
         std::fs::create_dir_all(&real_dir).unwrap();
 
-        let link_base = tmp.join("Library/Caches/cplt/tmp");
+        let link_base = tmp.join(SCRATCH_BASE);
         std::fs::create_dir_all(link_base.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&real_dir, &link_base).unwrap();
 
@@ -328,17 +337,21 @@ mod tests {
 
     #[test]
     fn scratch_dir_rejects_ancestor_symlink() {
-        // If ~/Library/Caches/cplt is a symlink to /tmp/evil, the scratch dir
-        // would escape into /tmp. The canonicalize + prefix check must catch this.
+        // If the scratch base ancestor is a symlink, the scratch dir
+        // would escape. The canonicalize + prefix check must catch this.
         let tmp = std::env::temp_dir().join("cplt-test-ancestor-symlink");
         let _ = std::fs::remove_dir_all(&tmp);
         let evil_target = tmp.join("evil-target");
         std::fs::create_dir_all(&evil_target).unwrap();
 
-        // Create the ancestor path with a symlink at the "cplt" level
-        let lib_caches = tmp.join("Library/Caches");
-        std::fs::create_dir_all(&lib_caches).unwrap();
-        std::os::unix::fs::symlink(&evil_target, lib_caches.join("cplt")).unwrap();
+        // Create the ancestor path with a symlink at the parent of SCRATCH_BASE
+        let scratch_path = std::path::Path::new(SCRATCH_BASE);
+        let parent = scratch_path.parent().unwrap(); // e.g. "Library/Caches/cplt" or ".cache/cplt"
+        let grandparent = parent.parent().unwrap(); // e.g. "Library/Caches" or ".cache"
+        let basename = parent.file_name().unwrap(); // e.g. "cplt"
+
+        std::fs::create_dir_all(tmp.join(grandparent)).unwrap();
+        std::os::unix::fs::symlink(&evil_target, tmp.join(grandparent).join(basename)).unwrap();
 
         let result = ScratchDir::create(&tmp);
         assert!(result.is_err(), "must reject ancestor symlinks");

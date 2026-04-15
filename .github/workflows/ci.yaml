@@ -79,3 +79,108 @@ jobs:
 
       - name: Run all tests
         run: cargo test --verbose
+
+  # Linux integration tests — Landlock kernel enforcement (requires Linux 5.13+)
+  linux-integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # ratchet:actions/cache@v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: Linux-integration-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: Linux-integration-cargo-
+
+      - name: Verify Landlock availability
+        id: landlock
+        run: |
+          echo "Kernel: $(uname -r)"
+
+          if [ ! -r /sys/kernel/security/lsm ]; then
+            echo "Landlock integration tests skipped: /sys/kernel/security/lsm not available"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          lsm="$(cat /sys/kernel/security/lsm)"
+          echo "LSM: $lsm"
+
+          if [ ! -r /sys/kernel/security/landlock/abi_version ]; then
+            echo "Landlock integration tests skipped: Landlock ABI not available"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Landlock ABI: $(cat /sys/kernel/security/landlock/abi_version)"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run all Linux tests
+        if: steps.landlock.outputs.available == 'true'
+        run: cargo test --verbose
+
+  # Build test binaries on PRs — downloadable from the workflow run page.
+  # Lets testers try changes without installing the Rust toolchain.
+  build-test-binaries:
+    if: github.event_name == 'pull_request'
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # ratchet:actions/cache@v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: pr-build-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: pr-build-${{ matrix.target }}-
+
+      - name: Build release binary
+        run: |
+          SHORT_SHA="${{ github.event.pull_request.head.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          VERSION="pr${{ github.event.pull_request.number }}-${SHORT_SHA}"
+          CPLT_LONG_VERSION="$VERSION" cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../cplt-${{ matrix.target }}.tar.gz cplt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
+        with:
+          name: cplt-${{ matrix.target }}
+          path: cplt-${{ matrix.target }}.tar.gz
+          retention-days: 7
