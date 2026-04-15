@@ -2,7 +2,7 @@
 name = "cplt"
 version = "0.0.0"
 edition = "2024"
-description = "macOS Seatbelt sandbox wrapper for GitHub Copilot CLI"
+description = "Sandbox wrapper for GitHub Copilot CLI (macOS Seatbelt, Linux Landlock)"
 license = "MIT"
 
 [dependencies]
@@ -12,6 +12,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
 toml_edit = "0.22"
+
+# Linux-only: Landlock LSM crate (only compiled and linked on Linux).
+# Run `cargo update` with network access to populate the lockfile.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
 
 [profile.release]
 strip = true

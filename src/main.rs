@@ -482,17 +482,10 @@ fn main() -> ExitCode {
         };
     }
 
-    // Platform check: cplt currently supports macOS (Seatbelt) and Linux (planned: Landlock).
+    // Platform check: cplt supports macOS (Seatbelt) and Linux (Landlock).
     // Other platforms (Windows, FreeBSD, etc.) are not supported.
     if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
         error("cplt requires macOS or Linux");
-        return ExitCode::FAILURE;
-    }
-
-    // Linux sandbox is not yet implemented — gate at runtime until Landlock backend lands.
-    #[cfg(target_os = "linux")]
-    {
-        error("Linux sandbox support is not yet implemented (see issue #16)");
         return ExitCode::FAILURE;
     }
 

@@ -177,3 +177,123 @@ fn install_signal_forwarding(child_pid: i32) {
         );
     }
 }
+
+/// Execute copilot inside a Landlock + seccomp sandbox (Linux only).
+///
+/// The sandbox is applied via a `pre_exec` hook that runs in the child
+/// process between fork() and exec(). This ensures only the child is
+/// restricted — the parent (cplt) keeps full access.
+///
+/// The pre_exec hook:
+/// 1. Applies the Landlock ruleset (filesystem + network restrictions)
+/// 2. Applies the seccomp filter (blocks dangerous syscalls)
+/// 3. Both are irreversible — the child cannot remove them
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub fn exec_linux(
+    copilot_bin: &Path,
+    project_dir: &Path,
+    copilot_args: &[String],
+    extra_pass_env: &[String],
+    inherit_env: bool,
+    disabled_categories: &[HardeningCategory],
+    scratch_dir: Option<&Path>,
+    proxy_port: Option<u16>,
+    precomputed: &super::landlock_mod::PrecomputedSandbox,
+) -> u8 {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut cmd = std::process::Command::new(copilot_bin);
+
+    // Prevent Copilot from trying to auto-update inside the sandbox.
+    cmd.arg("--no-auto-update");
+
+    for arg in copilot_args {
+        cmd.arg(arg);
+    }
+
+    cmd.current_dir(project_dir);
+
+    // Build and apply environment (same as macOS path)
+    let parent_env: Vec<(String, String)> = std::env::vars().collect();
+    let sandbox_env = build_sandbox_env(
+        &parent_env,
+        extra_pass_env,
+        inherit_env,
+        disabled_categories,
+        scratch_dir,
+    );
+
+    if sandbox_env.clear_first {
+        cmd.env_clear();
+        for (key, val) in &sandbox_env.vars {
+            cmd.env(key, val);
+        }
+    } else {
+        for var in &sandbox_env.remove {
+            cmd.env_remove(var);
+        }
+        for (key, val) in &sandbox_env.vars {
+            cmd.env(key, val);
+        }
+    }
+
+    // Recursion guard
+    cmd.env("__CPLT_WRAPPED", "1");
+
+    // Proxy setup (same as macOS)
+    if let Some(port) = proxy_port {
+        let proxy_url = format!("http://127.0.0.1:{port}");
+        cmd.env("NODE_USE_ENV_PROXY", "1");
+        cmd.env("HTTP_PROXY", &proxy_url);
+        cmd.env("HTTPS_PROXY", &proxy_url);
+        cmd.env("http_proxy", &proxy_url);
+        cmd.env("https_proxy", &proxy_url);
+        cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+        cmd.env("no_proxy", "localhost,127.0.0.1,::1");
+    }
+
+    // Terminal signal handling (same as macOS)
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
+
+    // Apply pre-computed sandbox in the child process, between fork and exec.
+    // All allocation and I/O was done in the parent — the closure only makes
+    // raw syscalls via the Landlock crate and prctl for seccomp.
+    let sandbox = precomputed.clone();
+    unsafe {
+        cmd.pre_exec(move || super::landlock_mod::apply_precomputed(&sandbox));
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("\x1b[0;31m[cplt]\x1b[0m Failed to start sandboxed process: {e}");
+            return 1;
+        }
+    };
+
+    let child_pid = child.id() as i32;
+    install_signal_forwarding(child_pid);
+
+    let status = match child.wait() {
+        Ok(status) => status.code().unwrap_or(1) as u8,
+        Err(e) => {
+            eprintln!("\x1b[0;31m[cplt]\x1b[0m Error waiting for child: {e}");
+            unsafe {
+                libc::kill(child_pid, libc::SIGTERM);
+            }
+            1
+        }
+    };
+
+    // Restore default signal handling
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+    }
+
+    status
+}
