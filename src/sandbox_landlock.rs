@@ -144,7 +144,7 @@ const LINUX_TOOL_DIRS: &[&str] = &[
 /// Shares most entries with macOS HOME_TOOL_DIRS (in sandbox_policy.rs)
 /// but replaces macOS-specific `Library/Caches` and `Library/pnpm` with
 /// their Linux equivalents.
-const LINUX_HOME_TOOL_DIRS: &[HomeToolDir] = &[
+pub(crate) const LINUX_HOME_TOOL_DIRS: &[HomeToolDir] = &[
     // ── Shared with macOS (same paths, same permissions) ──
     HomeToolDir {
         path: ".local",

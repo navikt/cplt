@@ -429,6 +429,25 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     },
 ];
 
+/// Return the platform-appropriate home tool directory list.
+///
+/// macOS uses `HOME_TOOL_DIRS` (includes `Library/Caches`, `Library/pnpm`).
+/// Linux uses `LINUX_HOME_TOOL_DIRS` (includes `.cache`, `.local/share/pnpm`).
+pub fn home_tool_dirs() -> &'static [HomeToolDir] {
+    #[cfg(target_os = "macos")]
+    {
+        HOME_TOOL_DIRS
+    }
+    #[cfg(target_os = "linux")]
+    {
+        super::landlock_mod::LINUX_HOME_TOOL_DIRS
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        HOME_TOOL_DIRS
+    }
+}
+
 /// Validate that a path is safe for interpolation into SBPL profile strings.
 /// Returns an error if the path contains characters that could break or inject SBPL rules.
 pub fn validate_sbpl_path(path: &Path) -> Result<(), String> {

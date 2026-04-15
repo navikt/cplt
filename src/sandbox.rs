@@ -42,7 +42,8 @@ mod profile;
 
 pub use policy::{
     DENIED_DOTFILES, DENIED_FILES, ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS,
-    HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar, HomeToolDir, validate_sbpl_path,
+    HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar, HomeToolDir, home_tool_dirs,
+    validate_sbpl_path,
 };
 
 // SBPL profile generation — kept public for unit tests.

@@ -683,12 +683,15 @@ fn main() -> ExitCode {
     let git_hooks_path = discover::git_hooks_path(&home_dir);
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
-    // The shim invokes VS Code's Electron runtime, which needs dyld access to
-    // load Electron Framework from within the .app bundle.
+    // macOS-only: the shim invokes VS Code's Electron runtime, which needs
+    // dyld access to load Electron Framework from within the .app bundle.
+    #[cfg(target_os = "macos")]
     let electron_app_dir = copilot_bin_result
         .as_ref()
         .ok()
         .and_then(|p| discover::discover_electron_app(p));
+    #[cfg(not(target_os = "macos"))]
+    let electron_app_dir: Option<std::path::PathBuf> = None;
 
     // Prepare the sandbox — validates paths, generates platform-specific profile.
     // Path validation (SBPL injection checks on macOS) is handled internally
@@ -752,8 +755,10 @@ fn main() -> ExitCode {
     };
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
-    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
-    // so extraction must happen here, outside.
+    // macOS-only: writes to ~/Library/Caches/copilot/pkg/ are denied inside the
+    // sandbox (write-then-exec defense), so extraction must happen here, outside.
+    // TODO(linux): verify if Linux Copilot CLI needs extraction and where.
+    #[cfg(target_os = "macos")]
     ensure_copilot_extracted(&copilot_bin, &home_dir);
 
     // Preflight: verify the sandbox mechanism works on this system
@@ -761,7 +766,10 @@ fn main() -> ExitCode {
         match sandbox::preflight(&prepared) {
             Ok(()) => {
                 if !resolved.quiet {
+                    #[cfg(target_os = "macos")]
                     ok("Sandbox profile validated ✓");
+                    #[cfg(target_os = "linux")]
+                    ok("Landlock sandbox ready ✓");
                 }
             }
             Err(e) => {
@@ -862,25 +870,36 @@ fn main() -> ExitCode {
 
     ok("Starting Copilot in sandbox...");
 
-    // --show-denials: stream macOS sandbox denial logs in the background
+    // --show-denials: stream macOS sandbox denial logs in the background.
+    // Landlock does not produce kernel audit logs, so this is macOS-only.
     let mut denial_proc = None;
     if cli.show_denials {
-        info("Streaming sandbox denial logs (--show-denials)...");
-        match std::process::Command::new("log")
-            .args([
-                "stream",
-                "--predicate",
-                "eventMessage CONTAINS \"Sandbox\" AND eventMessage CONTAINS \"deny\"",
-                "--info",
-                "--style",
-                "compact",
-            ])
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
+        #[cfg(target_os = "macos")]
         {
-            Ok(child) => denial_proc = Some(child),
-            Err(e) => warn(&format!("Could not start denial log stream: {e}")),
+            info("Streaming sandbox denial logs (--show-denials)...");
+            match std::process::Command::new("log")
+                .args([
+                    "stream",
+                    "--predicate",
+                    "eventMessage CONTAINS \"Sandbox\" AND eventMessage CONTAINS \"deny\"",
+                    "--info",
+                    "--style",
+                    "compact",
+                ])
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+            {
+                Ok(child) => denial_proc = Some(child),
+                Err(e) => warn(&format!("Could not start denial log stream: {e}")),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            warn(
+                "--show-denials is not available on Linux: Landlock does not produce kernel audit logs.",
+            );
+            info("Use `strace -f -e trace=file,network` for filesystem/network debugging.");
         }
     }
 
@@ -1442,6 +1461,7 @@ fn get_copilot_version(copilot_bin: &Path) -> Option<String> {
 ///
 /// This function checks for the `.extraction-complete` marker and, if missing,
 /// runs `copilot` briefly to trigger the SEA loader extraction.
+#[cfg(target_os = "macos")]
 fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) {
     let version = match get_copilot_version(copilot_bin) {
         Some(v) => v,
