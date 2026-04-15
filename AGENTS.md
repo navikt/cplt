@@ -32,14 +32,16 @@ Always run `mise run check` at the end of a coding session.
 - `src/sandbox_profile.rs` — SBPL profile generation (`generate_profile`, `ProfileOptions`)
 - `src/sandbox_env.rs` — environment variable construction (`build_sandbox_env`)
 - `src/sandbox_exec.rs` — sandbox execution, validation, signal forwarding
+- `src/sandbox_landlock.rs` — Landlock LSM + seccomp-BPF (cross-platform policy, Linux-only enforcement)
 - `src/scratch.rs` — per-session scratch directory with TMPDIR redirect
 - `src/config.rs` — config file parsing, CLI/config merging, `Resolved` struct
 - `src/discover.rs` — runtime environment probing (`--doctor`)
 - `src/main.rs` — CLI entry point, orchestration
 - `src/lib.rs` — library crate root (re-exports modules for test access)
 - `src/proxy.rs` + `src/proxy/` — CONNECT proxy, domain blocking
-- `tests/unit_tests.rs` — cross-platform unit tests (128 tests)
+- `tests/unit_tests.rs` — cross-platform unit tests (131 tests)
 - `tests/integration.rs` — macOS sandbox-exec kernel-level tests (33 tests)
+- `tests/integration_linux.rs` — Linux Landlock+seccomp kernel-level tests (24 tests)
 - `tests/e2e.rs` — end-to-end with compiled binary + smoke tests
 - `tests/e2e_projects.rs` — e2e tests with realistic project scaffolding (28 tests)
 - `SECURITY.md` — threat model, defense layers, honest gaps
@@ -53,6 +55,7 @@ Test suites and where they can run:
 | `mise run test:unit`    | unit_tests     | ✅         | ✅       | ✅       | None                          |
 | `mise run test:lib`     | lib (modules)  | ✅         | ✅       | ✅       | None                          |
 | `mise run test:integration` | integration | ✅         | ❌       | ✅       | macOS `sandbox-exec`          |
+| `mise run test:integration-linux` | integration_linux | ❌ | ✅  | ❌       | Linux with Landlock (5.13+)   |
 | `mise run test:e2e`     | e2e            | ✅         | ❌       | ✅       | macOS + `copilot` in PATH     |
 | `mise run test:e2e-projects` | e2e_projects | ✅      | ❌       | ✅       | macOS `sandbox-exec`          |
 | `mise run test:e2e-live`| e2e (ignored)  | ❌         | ❌       | ⚠️       | macOS + Copilot auth + network|
@@ -61,7 +64,9 @@ Test suites and where they can run:
 
 - **check** runs fmt, clippy, unit_tests, and lib tests — safe inside sandbox, CI, anywhere
 - **unit_tests** + **lib** are cross-platform — use `check` on Linux CI or inside sandbox
-- **integration**, **e2e**, **e2e_projects** all require macOS with `sandbox-exec`
+- **integration** requires macOS with `sandbox-exec`
+- **integration_linux** requires Linux with Landlock (kernel 5.13+)
+- **e2e**, **e2e_projects** require macOS with `sandbox-exec`
 - **e2e-live** (6 smoke tests) need real Copilot auth and network — not for regular CI
 - All suites except **e2e-live** run fine inside the cplt sandbox
 
@@ -69,24 +74,24 @@ Test suites and where they can run:
 
 The four tiers validate different properties — all are needed:
 
-1. **Unit tests** verify SBPL profile string generation: the profile text contains the
-   correct allow/deny rules, env vars are filtered properly, config merging works.
+1. **Unit tests** verify profile/policy generation: SBPL profile text and Landlock policy
+   contain the correct allow/deny rules, env vars are filtered properly, config merging works.
    Fast and cross-platform, but do not prove the kernel actually enforces anything.
-2. **Integration tests** verify kernel enforcement: run a real command inside
-   `sandbox-exec` and assert it is denied or allowed. This is the ground truth for
-   security properties — if a unit test says "deny" but integration passes, the rule
-   is broken.
+2. **Integration tests** verify kernel enforcement: run a real command inside the sandbox
+   (macOS: `sandbox-exec`, Linux: Landlock+seccomp) and assert it is denied or allowed.
+   This is the ground truth for security properties.
 3. **E2E tests** verify the full binary pipeline: CLI arg parsing → profile generation →
-   sandbox-exec invocation → exit code. Catches wiring bugs between modules.
+   sandbox invocation → exit code. Catches wiring bugs between modules.
 4. **E2E project tests** verify realistic developer workflows (git, node, python, rust
    file ops, config files) work correctly inside the sandbox. Catches real-world
    breakage that synthetic tests miss.
 
 **Which tier to use:**
-- Adding/changing a sandbox rule → unit test for the SBPL string + integration test for kernel enforcement
+- Adding/changing a sandbox rule → unit test for the policy string + integration test for kernel enforcement
 - Adding a config option → unit test for merge logic in `config.rs`
 - Adding env var filtering → unit test in `unit_tests.rs`
 - Fixing a real-world breakage → e2e_projects test reproducing the scenario
+- Adding a Landlock rule → unit test in `sandbox_landlock.rs` + test in `integration_linux.rs`
 
 ## Security constraints
 
