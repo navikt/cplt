@@ -408,7 +408,7 @@ fn compute_sha256(path: &Path) -> Result<String, String> {
         .split_whitespace()
         .next()
         .map(|h| h.to_lowercase())
-        .ok_or_else(|| "Cannot parse shasum output".to_string())
+        .ok_or_else(|| "Cannot parse hash output".to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -421,7 +421,13 @@ fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
 
 #[cfg(not(target_os = "macos"))]
 fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
-    Command::new("sha256sum")
+    // Try /usr/bin/sha256sum first, fall back to PATH lookup.
+    let bin = if std::path::Path::new("/usr/bin/sha256sum").exists() {
+        "/usr/bin/sha256sum"
+    } else {
+        "sha256sum"
+    };
+    Command::new(bin)
         .arg(path.to_string_lossy().to_string())
         .output()
         .map_err(|e| format!("Cannot run sha256sum: {e}"))

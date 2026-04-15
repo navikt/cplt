@@ -67,14 +67,6 @@ depends = ["test:unit", "test:lib", "test:integration", "test:e2e", "test:e2e-pr
 description = "Run Linux Landlock integration tests — requires Linux with Landlock"
 run = "cargo test --test integration_linux"
 
-[tasks."test:e2e-linux"]
-description = "Run Linux E2E tests — requires Linux with compiled binary"
-run = "cargo test --test e2e_linux"
-
-[tasks."test:e2e-projects-linux"]
-description = "Run Linux project workflow tests — requires Linux with Landlock"
-run = "cargo test --test e2e_projects_linux"
-
 [tasks.check]
 description = "Run all checks (fmt, clippy, test) — works inside sandbox"
 depends = ["fmt:check", "clippy", "test:unit", "test:lib"]

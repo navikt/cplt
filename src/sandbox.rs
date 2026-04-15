@@ -56,7 +56,7 @@ pub use env::{SandboxEnv, build_sandbox_env};
 
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{
-    BLOCKED_SYSCALL_NAMES, FsAccess, FsRule, LandlockPolicy, NetRule, describe_policy,
+    FsAccess, FsRule, LandlockPolicy, NetRule, blocked_syscall_names, describe_policy,
     generate_policy,
 };
 

@@ -903,8 +903,9 @@ fn apply_seccomp_filter(filter: &[BpfInstruction]) -> std::io::Result<()> {
 }
 
 /// Names of blocked syscalls for display/testing purposes.
-/// Matches the order in `apply_seccomp()`.
-pub const BLOCKED_SYSCALL_NAMES: &[&str] = &[
+/// Cross-architecture names only — x86_64-specific syscalls are appended
+/// via `blocked_syscall_names()` to match `build_seccomp_filter()`.
+const BLOCKED_SYSCALL_NAMES_COMMON: &[&str] = &[
     "ptrace",
     "mount",
     "umount2",
@@ -919,14 +920,22 @@ pub const BLOCKED_SYSCALL_NAMES: &[&str] = &[
     "reboot",
     "swapon",
     "swapoff",
-    "iopl",
-    "ioperm",
-    "modify_ldt",
     "personality",
     "keyctl",
     "request_key",
     "add_key",
 ];
+
+/// Return the full list of blocked syscall names for the current architecture.
+pub fn blocked_syscall_names() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut names = BLOCKED_SYSCALL_NAMES_COMMON.to_vec();
+    #[cfg(target_arch = "x86_64")]
+    {
+        names.extend_from_slice(&["iopl", "ioperm", "modify_ldt"]);
+    }
+    names
+}
 
 // ── Tests (cross-platform) ─────────────────────────────────────
 
@@ -1349,9 +1358,11 @@ mod tests {
 
     #[test]
     fn blocked_syscall_names_not_empty() {
+        let names = blocked_syscall_names();
         assert!(
-            BLOCKED_SYSCALL_NAMES.len() >= 20,
-            "should block at least 20 dangerous syscalls"
+            names.len() >= 18,
+            "should block at least 18 dangerous syscalls, got {}",
+            names.len()
         );
     }
 

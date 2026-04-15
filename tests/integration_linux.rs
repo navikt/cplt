@@ -135,19 +135,33 @@ mod linux_tests {
     fn landlock_blocks_ssh_read() {
         require_landlock!();
         let project = create_test_project();
-        let ssh_dir = home_dir().join(".ssh");
-        if !ssh_dir.exists() {
-            fs::create_dir_all(&ssh_dir).ok();
-            fs::write(ssh_dir.join("test_key"), "secret").ok();
-        }
-        let (_code, stdout, stderr) =
-            run_sandboxed(project.path(), "cat ~/.ssh/test_key 2>&1 || true");
-        // With 2>&1, the denial message goes to stdout. code is 0 due to || true.
+        // Create a temp dir to use as HOME with a .ssh directory,
+        // ensuring the test is hermetic and doesn't touch the real $HOME.
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        let ssh_dir = fake_home.path().join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::write(ssh_dir.join("test_key"), "secret").unwrap();
+
+        let output = Command::new(binary_path())
+            .args([
+                "--no-validate",
+                "--quiet",
+                "-C",
+                &project.path().to_string_lossy(),
+                "--",
+                "sh",
+                "-c",
+                "cat ~/.ssh/test_key 2>&1",
+            ])
+            .env("HOME", fake_home.path())
+            .output()
+            .expect("Failed to execute cplt");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let code = output.status.code().unwrap_or(-1);
         assert!(
-            stdout.contains("Permission denied")
-                || stdout.contains("denied")
-                || stdout.contains("No such file"),
-            "Should not be able to read ~/.ssh — stdout: {stdout}, stderr: {stderr}"
+            code != 0 || stdout.contains("Permission denied"),
+            "Should not be able to read ~/.ssh — code: {code}, stdout: {stdout}"
         );
     }
 
@@ -254,14 +268,33 @@ mod linux_tests {
     fn landlock_blocks_symlink_escape() {
         require_landlock!();
         let project = create_test_project();
-        // Create a symlink inside the project that points to a denied path
-        let (code, stdout, _) = run_sandboxed(
-            project.path(),
-            "ln -sf ~/.ssh/id_rsa symlink_test && cat symlink_test 2>&1",
-        );
+        // Use a fake HOME with a real .ssh/test_key file to ensure
+        // "No such file" isn't masking a missing target.
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        let ssh_dir = fake_home.path().join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::write(ssh_dir.join("test_key"), "secret_key_data").unwrap();
+
+        let output = Command::new(binary_path())
+            .args([
+                "--no-validate",
+                "--quiet",
+                "-C",
+                &project.path().to_string_lossy(),
+                "--",
+                "sh",
+                "-c",
+                "ln -sf ~/.ssh/test_key symlink_test && cat symlink_test 2>&1",
+            ])
+            .env("HOME", fake_home.path())
+            .output()
+            .expect("Failed to execute cplt");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let code = output.status.code().unwrap_or(-1);
         assert!(
-            code != 0 || stdout.contains("Permission denied") || stdout.contains("No such file"),
-            "Should not be able to read denied paths via symlink"
+            code != 0 || stdout.contains("Permission denied"),
+            "Should not be able to read denied paths via symlink — code: {code}, stdout: {stdout}"
         );
     }
 
@@ -269,14 +302,32 @@ mod linux_tests {
     fn landlock_restriction_inherited_by_child() {
         require_landlock!();
         let project = create_test_project();
-        // Spawn a nested shell — restrictions should still apply
-        let (code, stdout, _) = run_sandboxed(
-            project.path(),
-            "bash -c 'bash -c \"cat ~/.ssh/id_rsa 2>&1\"'",
-        );
+        // Use a fake HOME with a real .ssh/test_key to confirm enforcement.
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        let ssh_dir = fake_home.path().join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::write(ssh_dir.join("test_key"), "secret_key_data").unwrap();
+
+        let output = Command::new(binary_path())
+            .args([
+                "--no-validate",
+                "--quiet",
+                "-C",
+                &project.path().to_string_lossy(),
+                "--",
+                "sh",
+                "-c",
+                "bash -c 'bash -c \"cat ~/.ssh/test_key 2>&1\"'",
+            ])
+            .env("HOME", fake_home.path())
+            .output()
+            .expect("Failed to execute cplt");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let code = output.status.code().unwrap_or(-1);
         assert!(
-            code != 0 || stdout.contains("Permission denied") || stdout.contains("No such file"),
-            "Child processes should inherit sandbox restrictions"
+            code != 0 || stdout.contains("Permission denied"),
+            "Child processes should inherit sandbox restrictions — code: {code}, stdout: {stdout}"
         );
     }
 
@@ -316,6 +367,18 @@ EOF
     fn seccomp_blocks_ptrace() {
         require_landlock!();
         let project = create_test_project();
+
+        // Skip if python3 is not available — can't test ptrace without it.
+        let has_python = Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_python {
+            eprintln!("SKIPPED: python3 not available for ptrace test");
+            return;
+        }
+
         // Try to ptrace ourselves — should fail with EPERM
         let script = r#"
             python3 -c "
@@ -329,7 +392,7 @@ if ret == -1 and err == errno.EPERM:
 else:
     print(f'ALLOWED ret={ret} errno={err}')
     sys.exit(1)
-" 2>/dev/null || echo "BLOCKED"
+"
         "#;
         let (code, stdout, _) = run_sandboxed(project.path(), script);
         assert!(

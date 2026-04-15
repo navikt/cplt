@@ -17,7 +17,7 @@ cplt assumes Copilot CLI is an **untrusted agent** executing arbitrary code sugg
 | **Write-then-exec in /tmp** | Drop binary in `/tmp`, execute it | Seatbelt deny (macOS) / Landlock deny (Linux); `--scratch-dir` provides safe alternative |
 | **Cloud metadata access** | Fetch `169.254.169.254` or CGNAT range | Comprehensive private IP blocklist |
 | **Cross-project access** | Read files outside project directory | Seatbelt subpath (macOS) / Landlock ruleset (Linux) |
-| **Process-group escape** | Kill parent, children continue unsandboxed | `setpgid` + signal forwarding |
+| **Process-group escape** | Kill parent, children continue unsandboxed | Signal forwarding (SIGTERM, SIGHUP) |
 | **Env var credential theft** | Read `AWS_SECRET_ACCESS_KEY` from env | `env_clear()` + safe allowlist |
 | **Persistence via native modules** | Replace `keytar.node` with malware | Deny writes to `~/.copilot/pkg` |
 | **Git hook injection** | Write post-checkout hook that runs outside sandbox | Deny writes to `.git/hooks/` and global `core.hooksPath` dir |
@@ -346,16 +346,13 @@ A BPF filter blocks dangerous syscalls that could be used to escape the sandbox 
 | `unshare` | Prevents creating new namespaces |
 | `setns` | Prevents entering other namespaces |
 | `reboot` | Prevents system disruption |
-| `kexec_load`, `kexec_file_load` | Prevents kernel replacement |
+| `kexec_load` | Prevents kernel replacement |
 | `init_module`, `finit_module`, `delete_module` | Prevents kernel module manipulation |
-| `perf_event_open` | Prevents performance monitoring-based side channels |
-| `process_vm_readv`, `process_vm_writev` | Prevents cross-process memory access |
-| `userfaultfd` | Prevents use-after-free exploitation primitive |
-| `bpf` | Prevents loading arbitrary BPF programs |
+| `swapon`, `swapoff` | Prevents swap manipulation |
+| `personality` | Prevents ABI personality changes |
 | `add_key`, `keyctl`, `request_key` | Prevents kernel keyring manipulation |
-| `io_uring_setup`, `io_uring_enter`, `io_uring_register` | io_uring has a large attack surface |
-| `move_mount`, `open_tree`, `mount_setattr`, `fsopen`, `fsconfig`, `fsmount`, `fspick` | Prevents mount API v2 manipulation |
-| `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | Prevents self-modification of sandbox |
+| `iopl`, `ioperm` | Prevents I/O port access (x86_64 only) |
+| `modify_ldt` | Prevents LDT modification (x86_64 only) |
 
 The filter uses `SECCOMP_RET_ERRNO` (returns EPERM) rather than `SECCOMP_RET_KILL` to avoid crashing on legitimate probes.
 
