@@ -465,13 +465,13 @@ impl Discovery {
                 Ok(s) => {
                     let abi = s.trim();
                     eprintln!("  {GREEN}✓{NC} Landlock: ABI v{abi}");
-                    if let Ok(v) = abi.parse::<u32>() {
-                        if v < 4 {
-                            eprintln!(
-                                "  {YELLOW}⚠{NC} Landlock ABI < v4: TCP port filtering unavailable (kernel < 6.7)"
-                            );
-                            eprintln!("      Network security provided by proxy only.");
-                        }
+                    if let Ok(v) = abi.parse::<u32>()
+                        && v < 4
+                    {
+                        eprintln!(
+                            "  {YELLOW}⚠{NC} Landlock ABI < v4: TCP port filtering unavailable (kernel < 6.7)"
+                        );
+                        eprintln!("      Network security provided by proxy only.");
                     }
                 }
                 Err(_) => {
@@ -481,11 +481,11 @@ impl Discovery {
                     critical_ok = false;
                 }
             }
-            if let Ok(uname) = std::process::Command::new("uname").arg("-r").output() {
-                if uname.status.success() {
-                    let kernel = String::from_utf8_lossy(&uname.stdout);
-                    eprintln!("  {GREEN}✓{NC} Kernel: {}", kernel.trim());
-                }
+            if let Ok(uname) = std::process::Command::new("uname").arg("-r").output()
+                && uname.status.success()
+            {
+                let kernel = String::from_utf8_lossy(&uname.stdout);
+                eprintln!("  {GREEN}✓{NC} Kernel: {}", kernel.trim());
             }
             eprintln!("  {GREEN}✓{NC} seccomp: available (built-in on modern kernels)");
         }

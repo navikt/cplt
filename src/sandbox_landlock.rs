@@ -737,21 +737,19 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
 
     let ruleset = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(|e| std::io::Error::other(e))?;
 
     // Always handle ConnectTcp on ABI v4+ — even with empty rules this means
     // "deny all TCP connect" (deny-by-default for network).
     let ruleset = if abi_version >= 4 {
         ruleset
             .handle_access(AccessNet::ConnectTcp)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(|e| std::io::Error::other(e))?
     } else {
         ruleset
     };
 
-    let mut created = ruleset
-        .create()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut created = ruleset.create().map_err(|e| std::io::Error::other(e))?;
 
     // Add filesystem rules.
     for rule in &sandbox.policy.fs_rules {
@@ -784,7 +782,7 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
         if let Ok(fd) = PathFd::new(&rule.path) {
             created = created
                 .add_rule(PathBeneath::new(fd, access))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(|e| std::io::Error::other(e))?;
         }
     }
 
@@ -793,18 +791,17 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
         for rule in &sandbox.policy.net_rules {
             created = created
                 .add_rule(NetPort::new(rule.port, AccessNet::ConnectTcp))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(|e| std::io::Error::other(e))?;
         }
     }
 
     // Apply Landlock — this is irreversible.
     let status = created
         .restrict_self()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(|e| std::io::Error::other(e))?;
 
     if status.ruleset == RulesetStatus::NotEnforced {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "Landlock rules were not enforced by the kernel",
         ));
     }
