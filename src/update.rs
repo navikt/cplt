@@ -412,7 +412,7 @@ fn compute_sha256(path: &Path) -> Result<String, String> {
 
     #[cfg(not(target_os = "macos"))]
     let output = Command::new("sha256sum")
-        .arg(&path.to_string_lossy().to_string())
+        .arg(path.to_string_lossy().to_string())
         .output()
         .map_err(|e| format!("Cannot run sha256sum: {e}"))?;
 

@@ -1,9 +1,12 @@
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
 use super::env::build_sandbox_env;
+#[cfg(target_os = "macos")]
 use super::policy::HardeningCategory;
 
 /// Validate the profile by running a simple command inside the sandbox.
+#[cfg(target_os = "macos")]
 pub fn validate(profile_path: &Path, _project_dir: &Path, _home_dir: &Path) -> Result<(), String> {
     let output = std::process::Command::new("sandbox-exec")
         .arg("-f")
@@ -31,6 +34,7 @@ pub fn validate(profile_path: &Path, _project_dir: &Path, _home_dir: &Path) -> R
 /// - Legacy (inherit_env=true): all env vars inherited, only SSH_AUTH_SOCK and
 ///   color vars are stripped. Use only when the default breaks something.
 /// - Security hardening env vars are injected unless their category is disabled.
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub fn exec(
     copilot_bin: &Path,
