@@ -872,6 +872,7 @@ fn main() -> ExitCode {
 
     // --show-denials: stream macOS sandbox denial logs in the background.
     // Landlock does not produce kernel audit logs, so this is macOS-only.
+    #[allow(unused_mut)] // mut needed on macOS where denial_proc is assigned
     let mut denial_proc: Option<std::process::Child> = None;
     if cli.show_denials {
         #[cfg(target_os = "macos")]
@@ -1440,6 +1441,7 @@ fn shell_install() -> ExitCode {
 /// Parse the Copilot CLI version from `copilot --version` output.
 ///
 /// Returns e.g. `"1.0.24"` from `"GitHub Copilot CLI 1.0.24.\n..."`.
+#[cfg(target_os = "macos")]
 fn get_copilot_version(copilot_bin: &Path) -> Option<String> {
     let output = std::process::Command::new(copilot_bin)
         .arg("--version")
