@@ -4,12 +4,14 @@
 [![Release](https://github.com/navikt/cplt/actions/workflows/release.yaml/badge.svg)](https://github.com/navikt/cplt/actions/workflows/release.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-macOS Seatbelt sandbox wrapper for AI coding agents. Runs GitHub Copilot CLI, OpenCode, or a plain shell inside Apple's kernel-level sandbox (`sandbox-exec`) so the agent can work on your project but cannot access your secrets.
+Sandbox wrapper for AI coding agents. Runs GitHub Copilot CLI, OpenCode, or a plain shell inside a kernel-level sandbox so the agent can work on your project but cannot access your secrets.
+
+- **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
+- **Linux**: Landlock LSM + seccomp-BPF (kernel 5.13+)
 
 ![cplt banner](./assets/cplt.png)
-
-> **macOS only** — uses Apple's Seatbelt framework (the same mechanism App Store apps run under).
 
 ## Table of contents
 
@@ -100,15 +102,23 @@ brew install navikt/tap/cplt
 
 ### Pre-compiled binary
 
-Download the latest release for your Mac:
+Download the latest release for your platform:
 
 ```bash
-# Apple Silicon (M1/M2/M3/M4)
+# macOS — Apple Silicon (M1/M2/M3/M4)
 curl -fsSL https://github.com/navikt/cplt/releases/latest/download/cplt-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv cplt /usr/local/bin/
 
-# Intel Mac
+# macOS — Intel
 curl -fsSL https://github.com/navikt/cplt/releases/latest/download/cplt-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv cplt /usr/local/bin/
+
+# Linux — x86_64
+curl -fsSL https://github.com/navikt/cplt/releases/latest/download/cplt-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv cplt /usr/local/bin/
+
+# Linux — ARM64
+curl -fsSL https://github.com/navikt/cplt/releases/latest/download/cplt-aarch64-unknown-linux-gnu.tar.gz | tar xz
 sudo mv cplt /usr/local/bin/
 ```
 
@@ -560,27 +570,37 @@ cplt config set sandbox.quiet --unset
 
 ```
 ┌──────────────────────────────────┐
-│  cplt (Rust binary)   │
-│  ┌───────────┐  ┌─────────────┐ │
-│  │ Profile    │  │ CONNECT     │ │
-│  │ Generator  │  │ Proxy       │ │
-│  │ (SBPL)     │  │ (optional)  │ │
-│  └─────┬─────┘  └─────────────┘ │
-│        │                         │
+│  cplt (Rust binary)              │
+│  ┌───────────┐  ┌─────────────┐  │
+│  │ Policy    │  │ CONNECT     │  │
+│  │ Generator │  │ Proxy       │  │
+│  └─────┬─────┘  │ (optional)  │  │
+│        │        └─────────────┘  │
 │        ▼                         │
-│  sandbox-exec (Apple kernel)     │
+│  ┌─────────────┬────────────┐    │
+│  │   macOS     │   Linux    │    │
+│  │  Seatbelt   │  Landlock  │    │
+│  │  sandbox-   │  + seccomp │    │
+│  │  exec       │  pre_exec  │    │
+│  └─────────────┴────────────┘    │
 │        │                         │
 │        ▼                         │
 │  copilot (sandboxed)             │
 │  ├── All child processes         │
 │  ├── Cannot read ~/.ssh          │
 │  ├── Network port-restricted     │
-│  ├── SSH agent blocked            │
+│  ├── SSH agent blocked           │
 │  └── Filesystem = primary ctrl   │
 └──────────────────────────────────┘
 ```
 
-**Security model**: deny-by-default filesystem with kernel enforcement. Network is restricted to port 443 (HTTPS) by default (use `--allow-port` for extras). SSH agent access and localhost outbound are blocked at the kernel level. The profile generator auto-discovers your environment (`--doctor`) and only includes tool directories that actually exist on disk — fewer rules means a tighter sandbox. See [SECURITY.md](SECURITY.md) for the full threat model, defense layers, and honest gaps.
+**Security model**: deny-by-default filesystem with kernel enforcement. Network is restricted to port 443 (HTTPS) by default (use `--allow-port` for extras). SSH agent access and localhost outbound are blocked at the kernel level. The profile generator auto-discovers your environment (`--doctor`) and only includes tool directories that actually exist on disk — fewer rules means a tighter sandbox.
+
+Platform-specific details:
+- **macOS**: Seatbelt/SBPL profile generated and passed to `sandbox-exec`
+- **Linux**: Landlock LSM rules + seccomp-BPF filter applied via `pre_exec` (kernel 5.13+, TCP port filtering on 6.7+)
+
+See [SECURITY.md](SECURITY.md) for the full threat model, defense layers, and honest gaps.
 
 ## Security
 
@@ -1074,11 +1094,23 @@ Only port 443 is allowed by default. Services on other ports need `--allow-port`
 
 ## Limitations
 
-- **macOS only** — uses `sandbox-exec` (deprecated but functional, used by Chromium and VS Code)
-- **No TLS inspection** — the proxy sees domain names (via CONNECT) but not request bodies
-- **No network filtering** — SBPL doesn't support domain-based or port-based filtering for outbound TCP
-- **Keychain access required** — Copilot stores auth tokens in macOS Keychain
+### macOS
+
 - **`sandbox-exec` is deprecated** — Apple has not removed it but may in future macOS versions
+- **SBPL has no domain-based filtering** — the optional CONNECT proxy provides domain blocking
+- **Keychain access required** — Copilot stores auth tokens in macOS Keychain
+
+### Linux
+
+- **Kernel 5.13+ required** — Landlock LSM must be enabled (`cat /sys/kernel/security/lsm`)
+- **TCP port filtering requires kernel 6.7+** — older kernels get filesystem-only enforcement; network security via proxy only
+- **Landlock cannot deny subpaths within allowed paths** — different granularity than Seatbelt
+- **No audit logs** — `--show-denials` is macOS-only; use `strace -f -e trace=file,network` for debugging
+- **Auth scoped to env + gh CLI** — no D-Bus/Secret Service integration for v1
+
+### Both platforms
+
+- **No TLS inspection** — the proxy sees domain names (via CONNECT) but not request bodies
 
 For known attack vectors, out-of-scope threats, and prior art, see [SECURITY.md](SECURITY.md).
 
@@ -1099,6 +1131,8 @@ Please open an issue before starting large changes. All PRs must pass CI (fmt, c
 - [SECURITY.md](SECURITY.md) — Full security model, threat analysis, test strategy, and prior art
 - [Apple sandbox-exec(1)](https://keith.github.io/xcode-man-pages/sandbox-exec.1.html)
 - [Chromium Seatbelt V2 Design](https://chromium.googlesource.com/chromium/src/sandbox/+show/refs/heads/main/mac/seatbelt_sandbox_design.md)
+- [Landlock LSM documentation](https://docs.kernel.org/userspace-api/landlock.html)
+- [seccomp-BPF documentation](https://www.kernel.org/doc/html/latest/userspace-api/seccomp_filter.html)
 - [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
 - [michaelneale/agent-seatbelt-sandbox](https://github.com/michaelneale/agent-seatbelt-sandbox)
 
