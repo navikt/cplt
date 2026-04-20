@@ -611,6 +611,8 @@ fn emit_network_rules(
 
     // Block localhost outbound — prevents SSRF to local dev servers, databases, etc.
     // Must come AFTER port allows so it overrides them for localhost.
+    // Note: SBPL's "localhost" token matches both IPv4 (127.0.0.1) and IPv6 (::1)
+    // connections at the kernel level — no separate IPv4 rule is needed.
     if !allow_localhost_any {
         writeln!(sb, "(deny network-outbound (remote ip \"localhost:*\"))").unwrap();
     } else {
