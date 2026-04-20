@@ -1066,6 +1066,10 @@ fn env_allowlist_includes_essential_vars() {
     assert!(ENV_ALLOWLIST.contains(&"GOPATH"));
     assert!(ENV_ALLOWLIST.contains(&"CARGO_HOME"));
 
+    // Java/Maven build options (consistent with NODE_OPTIONS)
+    assert!(ENV_ALLOWLIST.contains(&"MAVEN_OPTS"));
+    assert!(ENV_ALLOWLIST.contains(&"JAVA_TOOL_OPTIONS"));
+
     // Prefixes
     assert!(ENV_PREFIX_ALLOWLIST.contains(&"LC_"));
     assert!(ENV_PREFIX_ALLOWLIST.contains(&"COPILOT_"));
