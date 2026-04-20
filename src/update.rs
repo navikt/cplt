@@ -157,12 +157,10 @@ pub fn perform_update(tag: &str, current_version: &str) -> Result<String, String
         .map_err(|e| format!("Cannot determine current binary path: {e}"))?;
     let target_path = std::fs::canonicalize(&current_exe).unwrap_or(current_exe);
 
-    // 5. Stage: set permissions and sign BEFORE replacing
+    // 5. Stage: set permissions and platform-specific postprocessing
     eprintln!("  Preparing binary...");
     set_executable(&new_binary)?;
-    // xattr and codesign are best-effort (may not be needed in all contexts)
-    let _ = run_xattr(&new_binary);
-    let _ = run_codesign(&new_binary);
+    postprocess_binary(&new_binary);
 
     // 6. Atomic rename
     let staged = target_path.with_extension("new");
@@ -179,8 +177,7 @@ pub fn perform_update(tag: &str, current_version: &str) -> Result<String, String
 
     // Copy permissions/signing to staged location too
     set_executable(&staged)?;
-    let _ = run_xattr(&staged);
-    let _ = run_codesign(&staged);
+    postprocess_binary(&staged);
 
     std::fs::rename(&staged, &target_path).map_err(|e| {
         let _ = std::fs::remove_file(&staged);
@@ -214,9 +211,20 @@ pub fn is_homebrew_managed() -> bool {
     }
 }
 
-/// Construct the asset filename for the current architecture.
+/// Construct the asset filename for the current platform and architecture.
 pub fn asset_name(arch: &str) -> String {
-    format!("cplt-{arch}-apple-darwin.tar.gz")
+    #[cfg(target_os = "macos")]
+    {
+        format!("cplt-{arch}-apple-darwin.tar.gz")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        format!("cplt-{arch}-unknown-linux-gnu.tar.gz")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        format!("cplt-{arch}-apple-darwin.tar.gz")
+    }
 }
 
 /// Check if a string looks like a cplt version.
@@ -385,12 +393,11 @@ fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), String> {
     }
 }
 
-/// Compute SHA256 hash of a file using /usr/bin/shasum.
+/// Compute SHA256 hash of a file using the platform's hash utility.
+///
+/// macOS uses `/usr/bin/shasum -a 256`, Linux uses `sha256sum`.
 fn compute_sha256(path: &Path) -> Result<String, String> {
-    let output = Command::new("/usr/bin/shasum")
-        .args(["-a", "256", &path.to_string_lossy()])
-        .output()
-        .map_err(|e| format!("Cannot run /usr/bin/shasum: {e}"))?;
+    let output = sha256_command(path)?;
 
     if !output.status.success() {
         return Err("SHA256 computation failed".to_string());
@@ -401,7 +408,29 @@ fn compute_sha256(path: &Path) -> Result<String, String> {
         .split_whitespace()
         .next()
         .map(|h| h.to_lowercase())
-        .ok_or_else(|| "Cannot parse shasum output".to_string())
+        .ok_or_else(|| "Cannot parse hash output".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
+    Command::new("/usr/bin/shasum")
+        .args(["-a", "256", &path.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("Cannot run shasum: {e}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
+    // Try /usr/bin/sha256sum first, fall back to PATH lookup.
+    let bin = if std::path::Path::new("/usr/bin/sha256sum").exists() {
+        "/usr/bin/sha256sum"
+    } else {
+        "sha256sum"
+    };
+    Command::new(bin)
+        .arg(path.to_string_lossy().to_string())
+        .output()
+        .map_err(|e| format!("Cannot run sha256sum: {e}"))
 }
 
 /// Validate archive contents before extraction.
@@ -490,7 +519,25 @@ fn set_executable(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("Cannot set permissions: {e}"))
 }
 
+/// Apply platform-specific binary postprocessing after download.
+///
+/// On macOS, removes quarantine attributes and ad-hoc code signs the binary
+/// (required by Gatekeeper). On Linux, this is a no-op.
+fn postprocess_binary(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run_xattr(path);
+        let _ = run_codesign(path);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+    }
+}
+
 /// Remove macOS quarantine extended attributes.
+/// Remove quarantine attribute (macOS only — required for Gatekeeper).
+#[cfg(target_os = "macos")]
 fn run_xattr(path: &Path) -> Result<(), String> {
     let output = Command::new("/usr/bin/xattr")
         .args(["-cr", &path.to_string_lossy()])
@@ -504,7 +551,8 @@ fn run_xattr(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Ad-hoc code sign the binary (required for macOS Gatekeeper).
+/// Ad-hoc code sign the binary (macOS only — required for Gatekeeper).
+#[cfg(target_os = "macos")]
 fn run_codesign(path: &Path) -> Result<(), String> {
     let output = Command::new("/usr/bin/codesign")
         .args(["--force", "--sign", "-", &path.to_string_lossy()])
@@ -657,13 +705,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn asset_name_aarch64() {
         assert_eq!(asset_name("aarch64"), "cplt-aarch64-apple-darwin.tar.gz");
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn asset_name_x86_64() {
         assert_eq!(asset_name("x86_64"), "cplt-x86_64-apple-darwin.tar.gz");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn asset_name_aarch64_linux() {
+        assert_eq!(
+            asset_name("aarch64"),
+            "cplt-aarch64-unknown-linux-gnu.tar.gz"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn asset_name_x86_64_linux() {
+        assert_eq!(asset_name("x86_64"), "cplt-x86_64-unknown-linux-gnu.tar.gz");
     }
 
     #[test]

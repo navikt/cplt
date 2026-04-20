@@ -493,6 +493,7 @@ impl Resolved {
             );
         }
         eprintln!("{blue}[cplt]{nc}    Copilot dir:   {green}allowed{nc}     {dim}~/.copilot{nc}");
+        #[cfg(target_os = "macos")]
         eprintln!(
             "{blue}[cplt]{nc}    Keychain:      {green}allowed{nc}     {dim}~/Library/Keychains{nc}"
         );
@@ -698,13 +699,14 @@ pub fn default_config_contents() -> String {
 # inherit_env = false
 #
 # Enable per-session scratch directory for TMPDIR redirect (default: true).
-# Creates ~/Library/Caches/cplt/tmp/{session}/ with write+exec permissions
+# Creates ~/.cache/cplt/tmp/{session}/ (Linux) or
+# ~/Library/Caches/cplt/tmp/{session}/ (macOS) with write+exec permissions
 # so tools like `go test`, `mise` inline tasks, and `node-gyp` can work.
 # Cleaned up automatically on exit.
 # scratch_dir = true
 #
 # DANGEROUS: Allow process execution from system temp directories.
-# Re-enables exec from /private/tmp and /private/var/folders.
+# Re-enables exec from /tmp (Linux) or /private/tmp, /private/var/folders (macOS).
 # Prefer scratch_dir which creates a controlled executable temp dir.
 # allow_tmp_exec = false
 #

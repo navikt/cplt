@@ -164,6 +164,8 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "GRADLE_USER_HOME",
     "MAVEN_HOME",
     "M2_HOME",
+    "MAVEN_OPTS",        // JVM flags for Maven (e.g. -Xmx, -Djava.io.tmpdir)
+    "JAVA_TOOL_OPTIONS", // JVM-wide options picked up by all Java processes
     // Rust
     "CARGO_HOME",
     "RUSTUP_HOME",
@@ -208,10 +210,11 @@ pub(super) const ENV_ALWAYS_DENY: &[&str] = &[
 /// Environment variables redirected to the scratch directory.
 /// These control where tools write temporary files and compiled binaries.
 pub(super) const SCRATCH_DIR_ENV_VARS: &[&str] = &[
-    "TMPDIR",   // Standard Unix temp dir
-    "TMP",      // Used by some tools (Node.js, Python)
-    "TEMP",     // Used by some tools (cross-platform)
-    "GOTMPDIR", // Go test binary compilation target
+    "TMPDIR",       // Standard Unix temp dir
+    "TMP",          // Used by some tools (Node.js, Python)
+    "TEMP",         // Used by some tools (cross-platform)
+    "GOTMPDIR",     // Go test binary compilation target
+    "JANSI_TMPDIR", // Maven terminal library (jansi) native lib extraction
 ];
 
 // ── Security environment hardening ─────────────────────────────
@@ -428,6 +431,25 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         write: true,
     },
 ];
+
+/// Return the platform-appropriate home tool directory list.
+///
+/// macOS uses `HOME_TOOL_DIRS` (includes `Library/Caches`, `Library/pnpm`).
+/// Linux uses `LINUX_HOME_TOOL_DIRS` (includes `.cache`, `.local/share/pnpm`).
+pub fn home_tool_dirs() -> &'static [HomeToolDir] {
+    #[cfg(target_os = "macos")]
+    {
+        HOME_TOOL_DIRS
+    }
+    #[cfg(target_os = "linux")]
+    {
+        super::landlock_mod::LINUX_HOME_TOOL_DIRS
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        HOME_TOOL_DIRS
+    }
+}
 
 /// Validate that a path is safe for interpolation into SBPL profile strings.
 /// Returns an error if the path contains characters that could break or inject SBPL rules.

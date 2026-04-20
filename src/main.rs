@@ -482,9 +482,10 @@ fn main() -> ExitCode {
         };
     }
 
-    // macOS only
-    if std::env::consts::OS != "macos" {
-        error("cplt requires macOS (uses sandbox-exec)");
+    // Platform check: cplt supports macOS (Seatbelt) and Linux (Landlock).
+    // Other platforms (Windows, FreeBSD, etc.) are not supported.
+    if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+        error("cplt requires macOS or Linux");
         return ExitCode::FAILURE;
     }
 
@@ -635,16 +636,6 @@ fn main() -> ExitCode {
         }
     }
 
-    // Validate all paths that will be interpolated into SBPL profile
-    if let Err(e) = sandbox::validate_sbpl_path(&project_dir) {
-        error(&format!("Project dir: {e}"));
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) = sandbox::validate_sbpl_path(&home_dir) {
-        error(&format!("Home dir: {e}"));
-        return ExitCode::FAILURE;
-    }
-
     // Run auto-discovery to tighten the sandbox profile
     let tool_discovery = discover::discover_tools(&home_dir);
     let existing_dirs = tool_discovery.existing_home_tool_dirs;
@@ -687,43 +678,24 @@ fn main() -> ExitCode {
             })
         })
         .filter(|d| !crate::is_unsafe_root(d, &home_dir));
-    if let Some(ref dir) = copilot_install_dir
-        && let Err(e) = sandbox::validate_sbpl_path(dir)
-    {
-        error(&format!("Copilot install dir: {e}"));
-        return ExitCode::FAILURE;
-    }
 
     // Discover global git hooks path from core.hooksPath
     let git_hooks_path = discover::git_hooks_path(&home_dir);
-    if let Some(ref p) = git_hooks_path
-        && let Err(e) = sandbox::validate_sbpl_path(p)
-    {
-        error(&format!("Git hooks path: {e}"));
-        return ExitCode::FAILURE;
-    }
 
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
-    // The shim invokes VS Code's Electron runtime, which needs dyld access to
-    // load Electron Framework from within the .app bundle.
-    let electron_app_dir = copilot_bin_result
-        .as_ref()
-        .ok()
-        .and_then(|p| discover::discover_electron_app(p));
-    if let Some(ref dir) = electron_app_dir
-        && let Err(e) = sandbox::validate_sbpl_path(dir)
-    {
-        error(&format!("Electron app path: {e}"));
-        return ExitCode::FAILURE;
-    }
+    // macOS-only: the shim invokes VS Code's Electron runtime, which needs
+    // dyld access to load Electron Framework from within the .app bundle.
+    let electron_app_dir = discover_electron_app_dir(&copilot_bin_result);
 
-    // Generate sandbox profile
+    // Prepare the sandbox — validates paths, generates platform-specific profile.
+    // Path validation (SBPL injection checks on macOS) is handled internally
+    // by prepare(), so callers don't need to know about backend-specific risks.
     let proxy_port_for_profile = if resolved.with_proxy {
         Some(resolved.proxy_port)
     } else {
         None
     };
-    let profile = sandbox::generate_profile(&sandbox::ProfileOptions {
+    let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
         project_dir: &project_dir,
         home_dir: &home_dir,
         extra_read: &resolved.allow_read,
@@ -741,11 +713,17 @@ fn main() -> ExitCode {
         git_hooks_path: git_hooks_path.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         electron_app_dir: electron_app_dir.as_deref(),
-    });
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    // --print-profile: dump the SBPL and exit (no copilot binary needed)
+    // --print-profile: dump the sandbox policy and exit (no copilot binary needed)
     if cli.print_profile {
-        println!("{profile}");
+        println!("{}", sandbox::describe(&prepared));
         return ExitCode::SUCCESS;
     }
 
@@ -771,49 +749,18 @@ fn main() -> ExitCode {
     };
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
-    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
-    // so extraction must happen here, outside.
+    // macOS-only: writes to ~/Library/Caches/copilot/pkg/ are denied inside the
+    // sandbox (write-then-exec defense), so extraction must happen here, outside.
+    // TODO(linux): verify if Linux Copilot CLI needs extraction and where.
+    #[cfg(target_os = "macos")]
     ensure_copilot_extracted(&copilot_bin, &home_dir);
 
-    // Write profile to temp file with unique name (prevents symlink attacks)
-    let profile_path = std::env::temp_dir().join(format!(
-        "cplt-{}-{}.sb",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    // O_CREAT|O_EXCL: atomic create, fails if exists (prevents symlink following)
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&profile_path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                error(&format!("Cannot create sandbox profile: {e}"));
-                return ExitCode::FAILURE;
-            }
-        };
-        if let Err(e) = file.write_all(profile.as_bytes()) {
-            error(&format!("Cannot write sandbox profile: {e}"));
-            let _ = std::fs::remove_file(&profile_path);
-            return ExitCode::FAILURE;
-        }
-    }
-
-    // Validate profile with a quick test
+    // Preflight: verify the sandbox mechanism works on this system
     if !resolved.no_validate {
-        match sandbox::validate(&profile_path, &project_dir, &home_dir) {
+        match sandbox::preflight(&prepared) {
             Ok(()) => {
                 if !resolved.quiet {
-                    ok("Sandbox profile validated ✓");
+                    print_preflight_ok();
                 }
             }
             Err(e) => {
@@ -829,7 +776,6 @@ fn main() -> ExitCode {
     }
     if let Err(e) = prompt_confirm(cli.yes, resolved.quiet) {
         error(&e);
-        let _ = std::fs::remove_file(&profile_path);
         return ExitCode::FAILURE;
     }
 
@@ -915,50 +861,27 @@ fn main() -> ExitCode {
 
     ok("Starting Copilot in sandbox...");
 
-    // --show-denials: stream macOS sandbox denial logs in the background
-    let mut denial_proc = None;
+    // --show-denials: stream sandbox denial logs in the background.
+    #[allow(unused_mut)] // mut needed on macOS where denial_proc is assigned
+    let mut denial_proc: Option<std::process::Child> = None;
     if cli.show_denials {
-        info("Streaming sandbox denial logs (--show-denials)...");
-        match std::process::Command::new("log")
-            .args([
-                "stream",
-                "--predicate",
-                "eventMessage CONTAINS \"Sandbox\" AND eventMessage CONTAINS \"deny\"",
-                "--info",
-                "--style",
-                "compact",
-            ])
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-        {
-            Ok(child) => denial_proc = Some(child),
-            Err(e) => warn(&format!("Could not start denial log stream: {e}")),
-        }
+        denial_proc = start_denial_stream();
     }
 
     eprintln!("{YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}");
     eprintln!();
 
     // Run copilot inside sandbox
-    let exit_code = sandbox::exec(
+    let exit_code = sandbox::exec_sandboxed(
+        &prepared,
         &copilot_bin,
-        &profile_path,
-        &project_dir,
         &cli.copilot_args,
         &resolved.pass_env,
         resolved.inherit_env,
         &disabled_categories,
-        scratch_path,
-        if resolved.with_proxy {
-            Some(resolved.proxy_port)
-        } else {
-            None
-        },
     );
 
     // Cleanup
-    let _ = std::fs::remove_file(&profile_path);
     if let Some(handle) = proxy_handle {
         handle.shutdown();
     }
@@ -1479,19 +1402,75 @@ fn shell_install() -> ExitCode {
     }
 }
 
-/// Parse the Copilot CLI version from `copilot --version` output.
+// ── Platform-specific helpers ─────────────────────────────────
+//
+// Named functions with cfg-gated bodies keep the run() function
+// free of inline #[cfg] blocks.
+
+/// Discover the VS Code Electron app bundle containing Copilot's shim (macOS only).
 ///
-/// Returns e.g. `"1.0.24"` from `"GitHub Copilot CLI 1.0.24.\n..."`.
-fn get_copilot_version(copilot_bin: &Path) -> Option<String> {
-    let output = std::process::Command::new(copilot_bin)
-        .arg("--version")
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .split_whitespace()
-        .find(|s| s.starts_with(|c: char| c.is_ascii_digit()))
-        .map(|s| s.trim_end_matches('.').to_string())
+/// On Linux, Copilot doesn't use Electron app bundles, so this always returns `None`.
+fn discover_electron_app_dir(
+    copilot_bin_result: &Result<PathBuf, String>,
+) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        copilot_bin_result
+            .as_ref()
+            .ok()
+            .and_then(|p| discover::discover_electron_app(p))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = copilot_bin_result;
+        None
+    }
+}
+
+/// Print the preflight success message appropriate for this platform.
+fn print_preflight_ok() {
+    #[cfg(target_os = "macos")]
+    ok("Sandbox profile validated ✓");
+    #[cfg(target_os = "linux")]
+    ok("Landlock sandbox ready ✓");
+}
+
+/// Start streaming sandbox denial logs (macOS only).
+///
+/// On macOS, spawns `log stream` filtering for Sandbox deny events.
+/// On Linux, prints a hint about `strace` since Landlock has no audit logs.
+fn start_denial_stream() -> Option<std::process::Child> {
+    #[cfg(target_os = "macos")]
+    {
+        info("Streaming sandbox denial logs (--show-denials)...");
+        match std::process::Command::new("log")
+            .args([
+                "stream",
+                "--predicate",
+                "eventMessage CONTAINS \"Sandbox\" AND eventMessage CONTAINS \"deny\"",
+                "--info",
+                "--style",
+                "compact",
+            ])
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => Some(child),
+            Err(e) => {
+                warn(&format!("Could not start denial log stream: {e}"));
+                None
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        warn(
+            "--show-denials is not available on Linux: Landlock does not produce kernel audit logs.",
+        );
+        info("Use `strace -f -e trace=file,network` for filesystem/network debugging.");
+        None
+    }
 }
 
 /// Ensure Copilot's bundled package is extracted before entering the sandbox.
@@ -1501,37 +1480,53 @@ fn get_copilot_version(copilot_bin: &Path) -> Option<String> {
 /// an update. Writes to that directory are denied inside the sandbox to prevent
 /// write-then-exec attacks, so the extraction must happen outside.
 ///
-/// This function checks for the `.extraction-complete` marker and, if missing,
-/// runs `copilot` briefly to trigger the SEA loader extraction.
+/// Uses the binary's identity (path + inode + size + mtime) as a cache key
+/// rather than `--version` output, because pre-release builds can report a
+/// base version (e.g. `1.0.32`) while the SEA loader extracts to a different
+/// directory (e.g. `1.0.32-1-73748`). After extraction, we discover the actual
+/// directory created and verify its `.extraction-complete` marker.
+#[cfg(target_os = "macos")]
 fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) {
-    let version = match get_copilot_version(copilot_bin) {
-        Some(v) => v,
-        None => return,
-    };
-
     let arch = match std::env::consts::ARCH {
         "aarch64" => "arm64",
         "x86_64" => "x64",
         _ => return,
     };
 
-    let pkg_dir = home
-        .join("Library/Caches/copilot/pkg")
-        .join(format!("darwin-{arch}"))
-        .join(&version);
-    let marker = pkg_dir.join(".extraction-complete");
+    let binary_id = match binary_identity(copilot_bin) {
+        Some(id) => id,
+        None => return,
+    };
 
-    if marker.exists() {
-        return;
+    let pkg_base = home
+        .join("Library/Caches/copilot/pkg")
+        .join(format!("darwin-{arch}"));
+
+    // Fast path: check cplt-managed marker that records both the binary
+    // identity and the actual extraction directory from the last successful run.
+    let cache_dir = home.join("Library/Caches/cplt");
+    let cache_file = cache_dir.join("copilot-extracted");
+    if let Ok(cached) = std::fs::read_to_string(&cache_file) {
+        let mut lines = cached.lines();
+        if let (Some(cached_id), Some(cached_dir)) = (lines.next(), lines.next())
+            && cached_id == binary_id
+        {
+            // Binary unchanged — verify the extracted dir still exists on disk
+            let extracted_marker = pkg_base.join(cached_dir).join(".extraction-complete");
+            if extracted_marker.exists() {
+                return;
+            }
+        }
     }
 
-    info(&format!(
-        "Extracting Copilot {version} runtime (first run after update)..."
-    ));
+    info("Extracting Copilot runtime (first run after update)...");
+
+    // Snapshot existing extraction dirs so we can detect the new one.
+    let dirs_before = extraction_dirs(&pkg_base);
 
     // Run copilot briefly to trigger SEA extraction. The extraction happens
     // during Node.js startup, before any CLI logic. We use `-p ""` to start
-    // the runtime, then poll for the marker and kill the process once done.
+    // the runtime, then poll for a new `.extraction-complete` marker.
     let child = std::process::Command::new(copilot_bin)
         .args(["--no-auto-update", "-p", ""])
         .stdin(std::process::Stdio::null())
@@ -1544,33 +1539,126 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) {
         Err(_) => return,
     };
 
-    // Poll for extraction completion (typically < 2s).
+    // Poll for a new extraction directory with a `.extraction-complete` marker.
+    let mut extracted_dir_name: Option<String> = None;
     for _ in 0..30 {
-        if marker.exists() {
-            let _ = child.kill();
-            let _ = child.wait();
-            ok(&format!("Copilot {version} runtime extracted"));
-            return;
+        if let Some(name) = find_new_extracted_dir(&pkg_base, &dirs_before) {
+            extracted_dir_name = Some(name);
+            break;
         }
-        // Check if the process exited (extraction might have failed)
         if let Ok(Some(_)) = child.try_wait() {
+            // Process exited — check one more time
+            extracted_dir_name = find_new_extracted_dir(&pkg_base, &dirs_before);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    // Cleanup: kill if still running
     let _ = child.kill();
     let _ = child.wait();
 
-    if marker.exists() {
-        ok(&format!("Copilot {version} runtime extracted"));
-    } else {
-        warn(&format!(
-            "Copilot {version} runtime extraction may have failed — \
-             try running 'copilot -p exit' manually"
-        ));
+    // Final check after process exit
+    if extracted_dir_name.is_none() {
+        extracted_dir_name = find_new_extracted_dir(&pkg_base, &dirs_before);
     }
+
+    if let Some(ref dir_name) = extracted_dir_name {
+        // Persist success: binary identity + extracted dir name
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let _ = std::fs::write(&cache_file, format!("{binary_id}\n{dir_name}"));
+        ok("Copilot runtime extracted");
+    } else if !cache_file.exists() {
+        // Migration: first run of new cplt with an already-extracted Copilot.
+        // Only cache an existing dir when no marker file exists yet (i.e. this
+        // is genuinely the first time cplt tracks extraction). On subsequent
+        // runs with a changed binary, we must NOT fall back to an old dir —
+        // that would recreate the original version-mismatch bug.
+        if let Some(name) = find_any_complete_dir(&pkg_base) {
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let _ = std::fs::write(&cache_file, format!("{binary_id}\n{name}"));
+        }
+    } else {
+        warn(
+            "Copilot runtime extraction may have failed — \
+             try running 'copilot -p exit' manually",
+        );
+    }
+}
+
+/// Compute a stable identity for a binary based on filesystem metadata.
+/// Uses canonicalized path + inode + size + full mtime (seconds + nanoseconds).
+#[cfg(target_os = "macos")]
+fn binary_identity(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let canonical = path.canonicalize().ok()?;
+    let meta = canonical.metadata().ok()?;
+    Some(format!(
+        "{}:{}:{}:{}.{}",
+        canonical.display(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+    ))
+}
+
+/// List non-hidden directory names under `pkg_base` (extraction version dirs).
+#[cfg(target_os = "macos")]
+fn extraction_dirs(pkg_base: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_dir(pkg_base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with('.') && e.file_type().ok()?.is_dir() {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Find a newly created extraction dir (not in `before`) that has `.extraction-complete`.
+#[cfg(target_os = "macos")]
+fn find_new_extracted_dir(
+    pkg_base: &Path,
+    before: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let current = extraction_dirs(pkg_base);
+    for name in current.difference(before) {
+        if pkg_base.join(name).join(".extraction-complete").exists() {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+/// Find any extraction dir that has `.extraction-complete` (most recent first).
+#[cfg(target_os = "macos")]
+fn find_any_complete_dir(pkg_base: &Path) -> Option<String> {
+    let mut dirs: Vec<_> = std::fs::read_dir(pkg_base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                return None;
+            }
+            let marker = pkg_base.join(&name).join(".extraction-complete");
+            if marker.exists() {
+                let mtime = e.metadata().ok()?.modified().ok()?;
+                Some((name, mtime))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Most recently modified first
+    dirs.sort_by(|a, b| b.1.cmp(&a.1));
+    dirs.into_iter().next().map(|(name, _)| name)
 }
 
 /// Resolve the real Copilot CLI binary, skipping any symlinks that point back to cplt.
