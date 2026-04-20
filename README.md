@@ -1,7 +1,7 @@
 # cplt
 
-[![CI](https://github.com/navikt/cplt/actions/workflows/ci.yml/badge.svg)](https://github.com/navikt/cplt/actions/workflows/ci.yml)
-[![Release](https://github.com/navikt/cplt/actions/workflows/release.yml/badge.svg)](https://github.com/navikt/cplt/actions/workflows/release.yml)
+[![CI](https://github.com/navikt/cplt/actions/workflows/ci.yaml/badge.svg)](https://github.com/navikt/cplt/actions/workflows/ci.yaml)
+[![Release](https://github.com/navikt/cplt/actions/workflows/release.yaml/badge.svg)](https://github.com/navikt/cplt/actions/workflows/release.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
