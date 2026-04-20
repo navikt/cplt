@@ -489,16 +489,16 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Handle --doctor: run diagnostics and exit (works on all platforms)
+    if cli.doctor {
+        return run_doctor();
+    }
+
     // Linux sandbox is not yet implemented — gate at runtime until Landlock backend lands.
     #[cfg(target_os = "linux")]
     {
         error("Linux sandbox support is not yet implemented (see issue #16)");
         return ExitCode::FAILURE;
-    }
-
-    // Handle --doctor: run diagnostics and exit
-    if cli.doctor {
-        return run_doctor();
     }
 
     // Load config file and merge with CLI flags
@@ -760,7 +760,9 @@ fn main() -> ExitCode {
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
     // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
-    // so extraction must happen here, outside.
+    // so extraction must happen here, outside. macOS-only: SEA extraction is an
+    // macOS Copilot packaging detail.
+    #[cfg(target_os = "macos")]
     ensure_copilot_extracted(&copilot_bin, &home_dir);
 
     // Preflight: verify the sandbox mechanism works on this system
