@@ -1751,22 +1751,6 @@ fn start_denial_stream() -> Option<std::process::Child> {
     }
 }
 
-/// Parse the Copilot CLI version from `copilot --version` output.
-///
-/// Returns e.g. `"1.0.24"` from `"GitHub Copilot CLI 1.0.24.\n..."`.
-#[cfg(target_os = "macos")]
-fn get_copilot_version(copilot_bin: &Path) -> Option<String> {
-    let output = std::process::Command::new(copilot_bin)
-        .arg("--version")
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .split_whitespace()
-        .find(|s| s.starts_with(|c: char| c.is_ascii_digit()))
-        .map(|s| s.trim_end_matches('.').to_string())
-}
-
 /// Ensure Copilot's bundled package is extracted before entering the sandbox.
 ///
 /// Copilot CLI (SEA binary) extracts its runtime into

@@ -202,7 +202,6 @@ pub fn exec_sandboxed(
     )
 }
 
-
 // ── Platform-specific prepare implementations ─────────────────
 
 #[cfg(target_os = "macos")]

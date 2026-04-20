@@ -966,7 +966,10 @@ mod tests {
             copilot_install_dir: None,
             git_hooks_path: None,
             allow_gpg_signing: false,
+            allow_jvm_attach: false,
             electron_app_dir: None,
+            agent: crate::agent::Agent::Copilot,
+            agent_dirs: &[],
         }
     }
 
