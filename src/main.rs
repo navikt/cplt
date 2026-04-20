@@ -495,8 +495,9 @@ fn main() -> ExitCode {
     }
 
     // Linux sandbox is not yet implemented — gate at runtime until Landlock backend lands.
-    #[cfg(target_os = "linux")]
-    {
+    // Uses cfg!() instead of #[cfg()] so the compiler still type-checks the code below
+    // on Linux without triggering unreachable-code warnings.
+    if cfg!(not(target_os = "macos")) {
         error("Linux sandbox support is not yet implemented (see issue #16)");
         return ExitCode::FAILURE;
     }
