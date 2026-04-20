@@ -1408,4 +1408,587 @@ esac
         );
         assert_result_ok(&stdout, "create_dir");
     }
+
+    // ============================================================
+    // Maven / Kotlin developer workflow tests
+    // ============================================================
+
+    impl TempProject {
+        fn scaffold_maven() -> Self {
+            let p = Self::new("maven");
+            p.write_file(
+                "pom.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>test-app</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+    </properties>
+    <dependencies>
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
+"#,
+            );
+            p.write_file(
+                "src/main/java/com/example/App.java",
+                r#"package com.example;
+
+public class App {
+    public static void main(String[] args) {
+        System.out.println("Hello, Maven!");
+    }
+
+    public int add(int a, int b) {
+        return a + b;
+    }
+}
+"#,
+            );
+            p.write_file(
+                "src/test/java/com/example/AppTest.java",
+                r#"package com.example;
+
+import org.junit.Test;
+import static org.junit.Assert.assertEquals;
+
+public class AppTest {
+    @Test
+    public void testAdd() {
+        assertEquals(3, new App().add(1, 2));
+    }
+}
+"#,
+            );
+            p.write_file(
+                "src/main/resources/application.properties",
+                "app.name=test\napp.version=1.0\n",
+            );
+            p.write_file(".mvn/maven.config", "--no-transfer-progress\n-T1C\n");
+            p.write_file(
+                ".mvn/wrapper/maven-wrapper.properties",
+                "distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.6/apache-maven-3.9.6-bin.zip\n",
+            );
+            p.write_file("README.md", "# Test Maven App\n");
+            p.write_file(".gitignore", ".env*\ntarget/\n");
+            p.git_init();
+            p.write_file(
+                ".env",
+                "DB_URL=jdbc:postgresql://localhost/prod\nDB_PASS=secret\n",
+            );
+            p
+        }
+
+        fn scaffold_kotlin_maven() -> Self {
+            let p = Self::new("kotlin-maven");
+            p.write_file(
+                "pom.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>kotlin-app</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <properties>
+        <kotlin.version>2.1.20</kotlin.version>
+    </properties>
+    <dependencies>
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib</artifactId>
+            <version>${kotlin.version}</version>
+        </dependency>
+    </dependencies>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-maven-plugin</artifactId>
+                <version>${kotlin.version}</version>
+                <executions>
+                    <execution>
+                        <id>compile</id>
+                        <goals><goal>compile</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+"#,
+            );
+            p.write_file(
+                "src/main/kotlin/com/example/App.kt",
+                r#"package com.example
+
+fun main() {
+    println("Hello, Kotlin!")
+}
+
+data class Config(val name: String, val port: Int = 8080)
+"#,
+            );
+            p.write_file(
+                "src/test/kotlin/com/example/AppTest.kt",
+                r#"package com.example
+
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+class AppTest {
+    @Test
+    fun testConfig() {
+        val config = Config("test")
+        assertEquals(8080, config.port)
+    }
+}
+"#,
+            );
+            p.write_file("README.md", "# Test Kotlin Maven App\n");
+            p.write_file(".gitignore", ".env*\ntarget/\n");
+            p.git_init();
+            p.write_file(".env", "API_KEY=secret-key\n");
+            p
+        }
+
+        fn scaffold_maven_multi_module() -> Self {
+            let p = Self::new("maven-multi");
+            p.write_file(
+                "pom.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <modules>
+        <module>api</module>
+        <module>core</module>
+    </modules>
+</project>
+"#,
+            );
+            p.write_file(".mvn/maven.config", "--no-transfer-progress\n");
+            p.write_file(
+                "api/pom.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>parent</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+    <artifactId>api</artifactId>
+    <dependencies>
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
+</project>
+"#,
+            );
+            p.write_file(
+                "api/src/main/kotlin/com/example/api/Routes.kt",
+                r#"package com.example.api
+
+import com.example.core.UserService
+
+fun configureRoutes() {
+    val service = UserService()
+    println("Routes configured with ${service.greeting()}")
+}
+"#,
+            );
+            p.write_file(
+                "core/pom.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>parent</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+    <artifactId>core</artifactId>
+</project>
+"#,
+            );
+            p.write_file(
+                "core/src/main/kotlin/com/example/core/UserService.kt",
+                r#"package com.example.core
+
+class UserService {
+    fun greeting(): String = "Hello from core"
+}
+"#,
+            );
+            p.write_file("README.md", "# Multi-module Maven project\n");
+            p.write_file(".gitignore", ".env*\ntarget/\n");
+            p.git_init();
+            p.write_file(".env", "DB_PASSWORD=secret\n");
+            p
+        }
+    }
+
+    /// Maven project: read sources, config, .mvn hidden dir, write new files.
+    #[test]
+    fn project_maven_file_ops() {
+        require_sandbox!();
+        let project = TempProject::scaffold_maven();
+        let script = script_file_ops(
+            &[
+                "pom.xml",
+                "src/main/java/com/example/App.java",
+                "src/test/java/com/example/AppTest.java",
+                "src/main/resources/application.properties",
+                "README.md",
+            ],
+            "src/main/java/com/example/NewService.java",
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "read_pom.xml");
+        assert_result_ok(&stdout, "read_src/main/java/com/example/App.java");
+        assert_result_ok(&stdout, "read_src/test/java/com/example/AppTest.java");
+        assert_result_ok(&stdout, "read_src/main/resources/application.properties");
+        assert_result_ok(&stdout, "read_README.md");
+        assert_result_ok(&stdout, "write_src/main/java/com/example/NewService.java");
+        assert_result_ok(&stdout, "create_dir");
+    }
+
+    /// Maven hidden config dir (.mvn/) is readable — Maven wrapper properties,
+    /// maven.config flags, and extensions.xml all live here.
+    #[test]
+    fn project_maven_dotdir_accessible() {
+        require_sandbox!();
+        let project = TempProject::scaffold_maven();
+        let script = r#"
+# .mvn/maven.config should be readable (build flags like -T1C)
+if cat .mvn/maven.config >/dev/null 2>&1; then
+    echo "RESULT:mvn_config:OK"
+else
+    echo "RESULT:mvn_config:FAIL"
+fi
+
+# .mvn/wrapper/maven-wrapper.properties should be readable
+if cat .mvn/wrapper/maven-wrapper.properties >/dev/null 2>&1; then
+    echo "RESULT:mvn_wrapper_props:OK"
+else
+    echo "RESULT:mvn_wrapper_props:FAIL"
+fi
+
+# Should be able to write new files in .mvn/ (e.g., agent creates extensions.xml)
+if echo '<extensions/>' > .mvn/extensions.xml 2>/dev/null; then
+    echo "RESULT:mvn_write_extensions:OK"
+else
+    echo "RESULT:mvn_write_extensions:FAIL"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "mvn_config");
+        assert_result_ok(&stdout, "mvn_wrapper_props");
+        assert_result_ok(&stdout, "mvn_write_extensions");
+    }
+
+    /// Kotlin Maven project: read/write across Kotlin source directories.
+    #[test]
+    fn project_kotlin_maven_file_ops() {
+        require_sandbox!();
+        let project = TempProject::scaffold_kotlin_maven();
+        let script = script_file_ops(
+            &[
+                "pom.xml",
+                "src/main/kotlin/com/example/App.kt",
+                "src/test/kotlin/com/example/AppTest.kt",
+            ],
+            "src/main/kotlin/com/example/Repository.kt",
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "read_pom.xml");
+        assert_result_ok(&stdout, "read_src/main/kotlin/com/example/App.kt");
+        assert_result_ok(&stdout, "read_src/test/kotlin/com/example/AppTest.kt");
+        assert_result_ok(&stdout, "write_src/main/kotlin/com/example/Repository.kt");
+        assert_result_ok(&stdout, "create_dir");
+    }
+
+    /// Multi-module Maven project: agent can read/write across module boundaries.
+    #[test]
+    fn project_maven_multi_module_file_ops() {
+        require_sandbox!();
+        let project = TempProject::scaffold_maven_multi_module();
+        let script = r#"
+# Read parent pom and .mvn config
+if cat pom.xml >/dev/null 2>&1; then echo "RESULT:read_parent_pom:OK"; else echo "RESULT:read_parent_pom:FAIL"; fi
+if cat .mvn/maven.config >/dev/null 2>&1; then echo "RESULT:read_mvn_config:OK"; else echo "RESULT:read_mvn_config:FAIL"; fi
+
+# Read module poms
+if cat api/pom.xml >/dev/null 2>&1; then echo "RESULT:read_api_pom:OK"; else echo "RESULT:read_api_pom:FAIL"; fi
+if cat core/pom.xml >/dev/null 2>&1; then echo "RESULT:read_core_pom:OK"; else echo "RESULT:read_core_pom:FAIL"; fi
+
+# Read sources in different modules
+if cat api/src/main/kotlin/com/example/api/Routes.kt >/dev/null 2>&1; then echo "RESULT:read_api_src:OK"; else echo "RESULT:read_api_src:FAIL"; fi
+if cat core/src/main/kotlin/com/example/core/UserService.kt >/dev/null 2>&1; then echo "RESULT:read_core_src:OK"; else echo "RESULT:read_core_src:FAIL"; fi
+
+# Write new files across modules (agent modifying multiple modules)
+if mkdir -p api/src/test/kotlin/com/example/api 2>/dev/null && \
+   echo 'package com.example.api' > api/src/test/kotlin/com/example/api/RoutesTest.kt 2>/dev/null; then
+    echo "RESULT:write_api_test:OK"
+else
+    echo "RESULT:write_api_test:FAIL"
+fi
+
+if mkdir -p core/src/test/kotlin/com/example/core 2>/dev/null && \
+   echo 'package com.example.core' > core/src/test/kotlin/com/example/core/UserServiceTest.kt 2>/dev/null; then
+    echo "RESULT:write_core_test:OK"
+else
+    echo "RESULT:write_core_test:FAIL"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "read_parent_pom");
+        assert_result_ok(&stdout, "read_mvn_config");
+        assert_result_ok(&stdout, "read_api_pom");
+        assert_result_ok(&stdout, "read_core_pom");
+        assert_result_ok(&stdout, "read_api_src");
+        assert_result_ok(&stdout, "read_core_src");
+        assert_result_ok(&stdout, "write_api_test");
+        assert_result_ok(&stdout, "write_core_test");
+    }
+
+    /// Java/Maven env vars pass through the sandbox: MAVEN_OPTS,
+    /// JAVA_TOOL_OPTIONS, JAVA_HOME are on the allowlist. CLASSPATH is not.
+    #[test]
+    fn project_maven_env_vars_passthrough() {
+        require_sandbox!();
+        let project = TempProject::scaffold_maven();
+        let script = r#"
+# Allowed JVM/Maven env vars should pass through
+if [ -n "${JAVA_HOME:-}" ]; then echo "RESULT:env_java_home:OK"; else echo "RESULT:env_java_home:FAIL"; fi
+if [ -n "${MAVEN_OPTS:-}" ]; then echo "RESULT:env_maven_opts:OK"; else echo "RESULT:env_maven_opts:FAIL"; fi
+if [ -n "${JAVA_TOOL_OPTIONS:-}" ]; then echo "RESULT:env_java_tool_options:OK"; else echo "RESULT:env_java_tool_options:FAIL"; fi
+if [ -n "${MAVEN_HOME:-}" ]; then echo "RESULT:env_maven_home:OK"; else echo "RESULT:env_maven_home:FAIL"; fi
+if [ -n "${M2_HOME:-}" ]; then echo "RESULT:env_m2_home:OK"; else echo "RESULT:env_m2_home:FAIL"; fi
+if [ -n "${GRADLE_HOME:-}" ]; then echo "RESULT:env_gradle_home:OK"; else echo "RESULT:env_gradle_home:FAIL"; fi
+
+# CLASSPATH should be stripped (not on allowlist — potential injection vector)
+if [ -n "${CLASSPATH:-}" ]; then echo "RESULT:env_classpath:OK"; else echo "RESULT:env_classpath:FAIL"; fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.display());
+
+        let output = Command::new(binary_path())
+            .args(["--yes", "--no-validate"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--", "--version"])
+            .env("PATH", &new_path)
+            .env("JAVA_HOME", "/opt/java/21")
+            .env("MAVEN_OPTS", "-Xmx512m -Djava.io.tmpdir=/tmp")
+            .env("JAVA_TOOL_OPTIONS", "-Dfile.encoding=UTF-8")
+            .env("MAVEN_HOME", "/opt/maven")
+            .env("M2_HOME", "/opt/maven")
+            .env("GRADLE_HOME", "/opt/gradle")
+            .env("CLASSPATH", "/evil/path/injected.jar:/another/bad.jar")
+            .output()
+            .expect("cplt should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        assert!(
+            output.status.success(),
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+
+        // Allowed env vars pass through
+        assert_result_ok(&stdout, "env_java_home");
+        assert_result_ok(&stdout, "env_maven_opts");
+        assert_result_ok(&stdout, "env_java_tool_options");
+        assert_result_ok(&stdout, "env_maven_home");
+        assert_result_ok(&stdout, "env_m2_home");
+        assert_result_ok(&stdout, "env_gradle_home");
+
+        // CLASSPATH should be stripped
+        assert_result_fail(&stdout, "env_classpath");
+    }
+
+    /// With --scratch-dir, JANSI_TMPDIR is redirected to the scratch directory
+    /// so Maven's jansi terminal library extracts native libs there.
+    #[test]
+    fn project_maven_jansi_tmpdir_with_scratch() {
+        require_sandbox!();
+        let project = TempProject::scaffold_maven();
+        let script = r#"
+# JANSI_TMPDIR should be set and point to the scratch dir (same as TMPDIR)
+JANSI="${JANSI_TMPDIR:-unset}"
+TMPVAL="${TMPDIR:-unset}"
+
+# Should not be unset or pointing to system temp
+case "$JANSI" in
+    unset|/tmp|/private/tmp|/var/folders/*|/private/var/folders/*)
+        echo "RESULT:jansi_redirected:FAIL:JANSI_TMPDIR=$JANSI"
+        ;;
+    *)
+        echo "RESULT:jansi_redirected:OK"
+        ;;
+esac
+
+# JANSI_TMPDIR should match TMPDIR (both redirected to same scratch dir)
+if [ "$JANSI" = "$TMPVAL" ]; then
+    echo "RESULT:jansi_matches_tmpdir:OK"
+else
+    echo "RESULT:jansi_matches_tmpdir:FAIL:JANSI=$JANSI,TMPDIR=$TMPVAL"
+fi
+
+# Should be able to write to the JANSI_TMPDIR (native lib extraction)
+if echo "native-lib-data" > "$JANSI/libjansi.so" 2>/dev/null; then
+    echo "RESULT:jansi_writable:OK"
+else
+    echo "RESULT:jansi_writable:FAIL"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--scratch-dir"]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "jansi_redirected");
+        assert_result_ok(&stdout, "jansi_matches_tmpdir");
+        assert_result_ok(&stdout, "jansi_writable");
+    }
+
+    /// JVM cache dirs (~/.m2, ~/.gradle) allow writes and map-exec (for loading
+    /// JARs) but deny process-exec (prevent executing arbitrary binaries from
+    /// dependency caches — defense against supply-chain attacks).
+    #[test]
+    fn project_jvm_cache_dirs_permissions() {
+        require_sandbox!();
+        let project = TempProject::scaffold_maven();
+
+        // Create fake .m2 and .gradle dirs under the real HOME so the
+        // sandbox profile's home-tool-dir rules apply.
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let m2_dir = PathBuf::from(&home).join(".m2/repository/com/example");
+        let gradle_dir = PathBuf::from(&home).join(".gradle/caches/test-cplt-e2e");
+
+        // Create dirs (may already exist — that's fine)
+        fs::create_dir_all(&m2_dir).ok();
+        fs::create_dir_all(&gradle_dir).ok();
+
+        let script = format!(
+            r#"
+# ~/.m2 should be writable (dependency caching)
+if echo "fake-jar-data" > "{m2}/test-artifact.jar" 2>/dev/null; then
+    echo "RESULT:m2_write:OK"
+else
+    echo "RESULT:m2_write:FAIL"
+fi
+
+# ~/.gradle should be writable (Gradle cache)
+if echo "fake-cache-data" > "{gradle}/test-cache.bin" 2>/dev/null; then
+    echo "RESULT:gradle_write:OK"
+else
+    echo "RESULT:gradle_write:FAIL"
+fi
+
+# ~/.m2 should NOT allow process-exec (security: no running binaries from cache)
+if cp /usr/bin/true "{m2}/evil-binary" 2>/dev/null && chmod +x "{m2}/evil-binary" 2>/dev/null; then
+    if "{m2}/evil-binary" 2>/dev/null; then
+        echo "RESULT:m2_exec_denied:FAIL"
+    else
+        echo "RESULT:m2_exec_denied:OK"
+    fi
+else
+    # Can't even copy — still counts as denied
+    echo "RESULT:m2_exec_denied:OK"
+fi
+
+# ~/.gradle should NOT allow process-exec
+if cp /usr/bin/true "{gradle}/evil-binary" 2>/dev/null && chmod +x "{gradle}/evil-binary" 2>/dev/null; then
+    if "{gradle}/evil-binary" 2>/dev/null; then
+        echo "RESULT:gradle_exec_denied:FAIL"
+    else
+        echo "RESULT:gradle_exec_denied:OK"
+    fi
+else
+    echo "RESULT:gradle_exec_denied:OK"
+fi
+"#,
+            m2 = m2_dir.display(),
+            gradle = gradle_dir.display(),
+        );
+
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        // Clean up test artifacts
+        let _ = fs::remove_file(m2_dir.join("test-artifact.jar"));
+        let _ = fs::remove_file(m2_dir.join("evil-binary"));
+        let _ = fs::remove_file(gradle_dir.join("test-cache.bin"));
+        let _ = fs::remove_file(gradle_dir.join("evil-binary"));
+        let _ = fs::remove_dir(&gradle_dir);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "m2_write");
+        assert_result_ok(&stdout, "gradle_write");
+        assert_result_ok(&stdout, "m2_exec_denied");
+        assert_result_ok(&stdout, "gradle_exec_denied");
+    }
 }
