@@ -324,7 +324,7 @@ mod tests {
         let real_dir = tmp.join("real");
         std::fs::create_dir_all(&real_dir).unwrap();
 
-        let link_base = tmp.join("Library/Caches/cplt/tmp");
+        let link_base = tmp.join(SCRATCH_BASE);
         std::fs::create_dir_all(link_base.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&real_dir, &link_base).unwrap();
 
@@ -344,10 +344,15 @@ mod tests {
         let evil_target = tmp.join("evil-target");
         std::fs::create_dir_all(&evil_target).unwrap();
 
-        // Create the ancestor path with a symlink at the "cplt" level
-        let lib_caches = tmp.join("Library/Caches");
-        std::fs::create_dir_all(&lib_caches).unwrap();
-        std::os::unix::fs::symlink(&evil_target, lib_caches.join("cplt")).unwrap();
+        // Create the ancestor path with a symlink at the "cplt" level.
+        // Use SCRATCH_BASE to derive the correct platform-specific path
+        // (Library/Caches/cplt/tmp on macOS, .cache/cplt/tmp on Linux).
+        let scratch_base = Path::new(SCRATCH_BASE);
+        // Parent of "tmp" within the base is the "cplt" directory's parent
+        let cplt_parent = tmp.join(scratch_base.parent().and_then(|p| p.parent()).unwrap());
+        std::fs::create_dir_all(&cplt_parent).unwrap();
+        let cplt_dir = tmp.join(scratch_base.parent().unwrap());
+        std::os::unix::fs::symlink(&evil_target, &cplt_dir).unwrap();
 
         let result = ScratchDir::create(&tmp);
         assert!(result.is_err(), "must reject ancestor symlinks");
