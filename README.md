@@ -627,7 +627,7 @@ Tools that compile-then-execute from `$TMPDIR` are **blocked by default** becaus
 
 **Fix:** The scratch dir is now **on by default** — cplt creates `~/Library/Caches/cplt/tmp/{session-id}/` with `rwx` permissions, redirects `TMPDIR`, `TMP`, `TEMP`, and `GOTMPDIR` there, and cleans up on exit. Stale directories older than 24 hours are garbage-collected on startup.
 
-**JVM note:** On macOS, the JVM ignores `TMPDIR` — it reads `java.io.tmpdir` from `confstr(_CS_DARWIN_USER_TEMP_DIR)` which always returns `/var/folders/...`. cplt automatically injects `-Djava.io.tmpdir=<scratch> -Djansi.tmpdir=<scratch>` via `JAVA_TOOL_OPTIONS` so that Maven Surefire forks, the Kotlin compiler daemon, and Jansi native lib extraction all use the scratch dir. Override with `--pass-env JAVA_TOOL_OPTIONS` if you need custom JVM flags.
+**JVM note:** On macOS, the JVM ignores `TMPDIR` — it reads `java.io.tmpdir` from `confstr(_CS_DARWIN_USER_TEMP_DIR)` which always returns `/var/folders/...`. cplt automatically injects `-Djava.io.tmpdir=<scratch> -Djansi.tmpdir=<scratch> -Djava.rmi.server.hostname=localhost` via `JAVA_TOOL_OPTIONS` so that Maven Surefire forks, the Kotlin compiler daemon, and Jansi native lib extraction all use the scratch dir. The RMI hostname flag ensures the Kotlin daemon's Java RMI communication stays on `localhost` (without it, `InetAddress.getLocalHost()` may resolve to a non-loopback IP via mDNS, which the sandbox blocks). Override with `--pass-env JAVA_TOOL_OPTIONS` if you need custom JVM flags.
 
 If you're still seeing this error, check that you haven't set `scratch_dir = false` in your config:
 

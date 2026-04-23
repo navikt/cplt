@@ -285,7 +285,7 @@ Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permissio
 
 When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Library/Caches/cplt/tmp/{session-id}/` with full `read/write/exec/map-exec` permissions. This is a controlled exception to the TMPDIR exec deny:
 
-- **Why it exists:** `go test`, `mise` inline tasks, and `node-gyp` compile to `$TMPDIR` then execute. The sandbox blocks this, breaking these tools. On macOS, JVM processes also need this because `java.io.tmpdir` defaults to `/var/folders/...` (ignoring `TMPDIR` env var); cplt injects `-Djava.io.tmpdir` via `JAVA_TOOL_OPTIONS` to redirect JVM temp usage to the scratch dir.
+- **Why it exists:** `go test`, `mise` inline tasks, and `node-gyp` compile to `$TMPDIR` then execute. The sandbox blocks this, breaking these tools. On macOS, JVM processes also need this because `java.io.tmpdir` defaults to `/var/folders/...` (ignoring `TMPDIR` env var); cplt injects `-Djava.io.tmpdir`, `-Djansi.tmpdir`, and `-Djava.rmi.server.hostname=localhost` via `JAVA_TOOL_OPTIONS` to redirect JVM temp usage to the scratch dir and keep RMI communication on localhost.
 - **Security model:** The scratch dir has both write+exec — this is the accepted trade-off. Mitigations:
   - **Scoped path:** Only the specific session subpath has exec, not all of `~/Library/Caches/cplt/`
   - **0700 permissions:** Owner-only access, verified at creation
