@@ -1903,6 +1903,16 @@ case "$JTO" in
         ;;
 esac
 
+# Should contain -Djava.rmi.server.hostname=localhost (forces RMI to use localhost)
+case "$JTO" in
+    *-Djava.rmi.server.hostname=localhost*)
+        echo "RESULT:jto_has_rmi_hostname:OK"
+        ;;
+    *)
+        echo "RESULT:jto_has_rmi_hostname:FAIL:$JTO"
+        ;;
+esac
+
 # The -Djava.io.tmpdir should point to the scratch dir (same as TMPDIR)
 # Extract the value after -Djava.io.tmpdir=
 JTO_TMPDIR=$(echo "$JTO" | sed 's/.*-Djava.io.tmpdir=\([^ ]*\).*/\1/')
@@ -1922,6 +1932,7 @@ fi
         assert_result_ok(&stdout, "jto_set");
         assert_result_ok(&stdout, "jto_has_tmpdir");
         assert_result_ok(&stdout, "jto_has_jansi");
+        assert_result_ok(&stdout, "jto_has_rmi_hostname");
         assert_result_ok(&stdout, "jto_tmpdir_matches");
     }
 

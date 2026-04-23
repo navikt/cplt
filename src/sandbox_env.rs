@@ -105,15 +105,19 @@ pub fn build_sandbox_env(
             }
         }
 
-        // Inject JVM temp dir properties via JAVA_TOOL_OPTIONS.
+        // Inject JVM temp dir and RMI properties via JAVA_TOOL_OPTIONS.
         // On macOS, the JVM ignores TMPDIR — it uses confstr(_CS_DARWIN_USER_TEMP_DIR)
         // which always returns /var/folders/... where the sandbox blocks exec.
         // JAVA_TOOL_OPTIONS is the standard way to inject flags into ALL JVM processes,
         // including Maven Surefire forks and the Kotlin compiler daemon.
         // Also sets jansi.tmpdir (Java system property, not env var) for Jansi native lib extraction.
+        // Also sets java.rmi.server.hostname=localhost to force RMI (used by Kotlin daemon)
+        // to use localhost — without this, InetAddress.getLocalHost() may resolve to a
+        // non-loopback IP via mDNS, which the sandbox blocks on non-443 ports.
         if !extra_pass_env.iter().any(|v| v == "JAVA_TOOL_OPTIONS") {
-            let jvm_tmpdir_flags =
-                format!("-Djava.io.tmpdir={scratch_str} -Djansi.tmpdir={scratch_str}");
+            let jvm_tmpdir_flags = format!(
+                "-Djava.io.tmpdir={scratch_str} -Djansi.tmpdir={scratch_str} -Djava.rmi.server.hostname=localhost"
+            );
             // Append to existing JAVA_TOOL_OPTIONS if present, otherwise create new
             if let Some(pos) = env.vars.iter().position(|(k, _)| k == "JAVA_TOOL_OPTIONS") {
                 let existing = env.vars[pos].1.clone();

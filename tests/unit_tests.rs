@@ -2672,6 +2672,10 @@ fn env_scratch_dir_injects_java_tool_options() {
         val.contains("-Djansi.tmpdir=/scratch/session123"),
         "should contain jansi.tmpdir: {val}"
     );
+    assert!(
+        val.contains("-Djava.rmi.server.hostname=localhost"),
+        "should contain rmi hostname: {val}"
+    );
 }
 
 #[test]
