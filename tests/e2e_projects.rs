@@ -1925,6 +1925,134 @@ fi
         assert_result_ok(&stdout, "jto_tmpdir_matches");
     }
 
+    /// Simulate what JVM libraries (Jansi, JNI) actually do: extract a native binary
+    /// to the tmpdir path from JAVA_TOOL_OPTIONS, then execute/load it. This must work
+    /// inside the sandbox because the tmpdir points to the scratch dir (write+exec).
+    /// Also verifies the tmpdir is NOT under /var/folders (where exec is blocked).
+    #[test]
+    fn project_maven_jvm_tmpdir_native_lib_exec() {
+        require_sandbox!();
+        let project = TempProject::scaffold_maven();
+        let script = r#"
+# Extract -Djava.io.tmpdir=<path> from JAVA_TOOL_OPTIONS
+JTO="${JAVA_TOOL_OPTIONS:-}"
+JVM_TMPDIR=$(echo "$JTO" | sed 's/.*-Djava.io.tmpdir=\([^ ]*\).*/\1/')
+
+# Verify it's not empty and not under /var/folders (the macOS default that we're avoiding)
+if [ -z "$JVM_TMPDIR" ]; then
+    echo "RESULT:jvm_tmpdir_extracted:FAIL:empty"
+    exit 0
+fi
+echo "RESULT:jvm_tmpdir_extracted:OK:$JVM_TMPDIR"
+
+case "$JVM_TMPDIR" in
+    /var/folders/*|/private/var/folders/*)
+        echo "RESULT:jvm_tmpdir_not_var_folders:FAIL:$JVM_TMPDIR"
+        ;;
+    *)
+        echo "RESULT:jvm_tmpdir_not_var_folders:OK"
+        ;;
+esac
+
+# Simulate Jansi native lib extraction: write a binary to the JVM tmpdir
+# This is exactly what Jansi does: extract libjansi.jnilib to java.io.tmpdir
+if cp /usr/bin/true "$JVM_TMPDIR/libjansi.jnilib" 2>/dev/null && \
+   chmod +x "$JVM_TMPDIR/libjansi.jnilib" 2>/dev/null; then
+    echo "RESULT:native_lib_write:OK"
+else
+    echo "RESULT:native_lib_write:FAIL"
+    exit 0
+fi
+
+# Simulate dlopen/exec of the extracted native lib
+if "$JVM_TMPDIR/libjansi.jnilib" 2>/dev/null; then
+    echo "RESULT:native_lib_exec:OK"
+else
+    echo "RESULT:native_lib_exec:FAIL"
+fi
+
+# Verify that /var/folders exec IS blocked (proves why we need the redirect)
+VAR_FOLDERS=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "/private/var/folders/unknown")
+if cp /usr/bin/true "${VAR_FOLDERS}cplt-exec-test" 2>/dev/null && \
+   chmod +x "${VAR_FOLDERS}cplt-exec-test" 2>/dev/null; then
+    if "${VAR_FOLDERS}cplt-exec-test" 2>/dev/null; then
+        echo "RESULT:var_folders_exec_blocked:FAIL:exec succeeded"
+    else
+        echo "RESULT:var_folders_exec_blocked:OK"
+    fi
+    rm -f "${VAR_FOLDERS}cplt-exec-test" 2>/dev/null
+else
+    # Can't write — also proves it's restricted
+    echo "RESULT:var_folders_exec_blocked:OK:write-denied"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--scratch-dir"]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "jvm_tmpdir_extracted");
+        assert_result_ok(&stdout, "jvm_tmpdir_not_var_folders");
+        assert_result_ok(&stdout, "native_lib_write");
+        assert_result_ok(&stdout, "native_lib_exec");
+        assert_result_ok(&stdout, "var_folders_exec_blocked");
+    }
+
+    /// JAVA_TOOL_OPTIONS should append to user's existing value, not replace it.
+    /// Verifies append behavior by pre-setting JAVA_TOOL_OPTIONS in the parent env.
+    #[test]
+    fn project_maven_java_tool_options_appends() {
+        require_sandbox!();
+        let project = TempProject::scaffold_maven();
+        let script = r#"
+JTO="${JAVA_TOOL_OPTIONS:-unset}"
+
+# Should start with the user's original -Xmx256m value
+case "$JTO" in
+    -Xmx256m\ *)
+        echo "RESULT:preserves_user_flags:OK"
+        ;;
+    *)
+        echo "RESULT:preserves_user_flags:FAIL:$JTO"
+        ;;
+esac
+
+# Should also contain the injected tmpdir flags after the user's flags
+case "$JTO" in
+    *-Djava.io.tmpdir=*)
+        echo "RESULT:has_injected_flags:OK"
+        ;;
+    *)
+        echo "RESULT:has_injected_flags:FAIL:$JTO"
+        ;;
+esac
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.display());
+
+        let output = Command::new(binary_path())
+            .args(["--yes", "--no-validate"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--scratch-dir"])
+            .args(["--", "--version"])
+            .env("PATH", &new_path)
+            .env("JAVA_TOOL_OPTIONS", "-Xmx256m")
+            .output()
+            .expect("cplt should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            output.status.success(),
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "preserves_user_flags");
+        assert_result_ok(&stdout, "has_injected_flags");
+    }
+
     /// JVM cache dirs (~/.m2, ~/.gradle) allow writes and map-exec (for loading
     /// JARs) but deny process-exec (prevent executing arbitrary binaries from
     /// dependency caches — defense against supply-chain attacks).
