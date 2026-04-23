@@ -224,7 +224,7 @@ cplt auto-discovers installed tools and configures sandbox rules accordingly. On
 | **Node.js** | `.nvm`, `.local` | `NODE_*`, `NPM_*`, `NVM_*` | `node` |
 | **Rust** | `.cargo`, `.rustup` | `CARGO_HOME`, `RUSTUP_HOME` | `cargo` |
 | **Go** | `go/bin`, `go/pkg` | `GOPATH`, `GOROOT`, `GOCACHE`, etc. | `go` |
-| **Java/Kotlin (JVM)** | `.sdkman`, `.gradle`, `.m2` | `JAVA_HOME`, `GRADLE_*`, `MAVEN_*`, `SDKMAN_*` | `java`, `gradle` |
+| **Java/Kotlin (JVM)** | `.sdkman`, `.gradle`, `.m2` | `JAVA_HOME`, `JAVA_TOOL_OPTIONS`, `GRADLE_*`, `MAVEN_*`, `SDKMAN_*` | `java`, `gradle` |
 | **Kotlin Native** | `.konan` | — | — |
 | **Python** | `.pyenv` | `VIRTUAL_ENV`, `PYTHONPATH`, `PYENV_ROOT`, `PYENV_*` | `python3` |
 | **Yarn Berry** | `.yarn` | `YARN_*` (hardening overrides `YARN_ENABLE_SCRIPTS`) | `yarn` |
@@ -626,6 +626,8 @@ Tools that compile-then-execute from `$TMPDIR` are **blocked by default** becaus
 | `npm test` / `vitest`     | ✅ Works     | JavaScript runs via interpreter, not compiled to temp                 |
 
 **Fix:** The scratch dir is now **on by default** — cplt creates `~/Library/Caches/cplt/tmp/{session-id}/` with `rwx` permissions, redirects `TMPDIR`, `TMP`, `TEMP`, and `GOTMPDIR` there, and cleans up on exit. Stale directories older than 24 hours are garbage-collected on startup.
+
+**JVM note:** On macOS, the JVM ignores `TMPDIR` — it reads `java.io.tmpdir` from `confstr(_CS_DARWIN_USER_TEMP_DIR)` which always returns `/var/folders/...`. cplt automatically injects `-Djava.io.tmpdir=<scratch> -Djansi.tmpdir=<scratch>` via `JAVA_TOOL_OPTIONS` so that Maven Surefire forks, the Kotlin compiler daemon, and Jansi native lib extraction all use the scratch dir. Override with `--pass-env JAVA_TOOL_OPTIONS` if you need custom JVM flags.
 
 If you're still seeing this error, check that you haven't set `scratch_dir = false` in your config:
 

@@ -285,7 +285,7 @@ Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permissio
 
 When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Library/Caches/cplt/tmp/{session-id}/` with full `read/write/exec/map-exec` permissions. This is a controlled exception to the TMPDIR exec deny:
 
-- **Why it exists:** `go test`, `mise` inline tasks, and `node-gyp` compile to `$TMPDIR` then execute. The sandbox blocks this, breaking these tools.
+- **Why it exists:** `go test`, `mise` inline tasks, and `node-gyp` compile to `$TMPDIR` then execute. The sandbox blocks this, breaking these tools. On macOS, JVM processes also need this because `java.io.tmpdir` defaults to `/var/folders/...` (ignoring `TMPDIR` env var); cplt injects `-Djava.io.tmpdir` via `JAVA_TOOL_OPTIONS` to redirect JVM temp usage to the scratch dir.
 - **Security model:** The scratch dir has both write+exec — this is the accepted trade-off. Mitigations:
   - **Scoped path:** Only the specific session subpath has exec, not all of `~/Library/Caches/cplt/`
   - **0700 permissions:** Owner-only access, verified at creation
@@ -293,7 +293,7 @@ When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Libr
   - **Owner check:** `stat()` verifies the directory owner matches the current uid
   - **SBPL injection guard:** Path validated against metacharacters before interpolation
   - **Ephemeral:** Cleaned up on exit via RAII Drop; stale dirs GC'd after 24h on startup
-- **Opt-in:** Disabled by default. Enable with `--scratch-dir` or `sandbox.scratch_dir = true` in config.
+- **On by default:** Enabled by default. Disable with `--no-scratch-dir` or `sandbox.scratch_dir = false` in config.
 
 ### Layer 2: CONNECT Proxy (Optional Logging and Domain Filtering)
 
@@ -471,7 +471,7 @@ These test core logic without invoking `sandbox-exec`, using the real library fu
 | Profile generation | 35 | Uses real `generate_profile()`; verifies deny-default, project access, sensitive dir/file blocks, network rules, deny-after-allow ordering, exec-from-tmp denied, env file deny/allow, copilot caches carve-outs, tool dir permissions, scratch dir rules |
 | Home tool dirs | 1 | All runtime entries present in `HOME_TOOL_DIRS` |
 | Env allowlist | 3 | Essential vars included, dangerous vars excluded, runtime vars present |
-| Env behavior | 12 | Sanitization, hardening injection, pass-env overrides, LANG prefix leak prevention, YARN hardening bypass prevention, scratch dir TMPDIR redirect |
+| Env behavior | 17 | Sanitization, hardening injection, pass-env overrides, LANG prefix leak prevention, YARN hardening bypass prevention, scratch dir TMPDIR redirect, JAVA_TOOL_OPTIONS injection/append/override |
 | Config parsing | 24 | TOML parsing, CLI/config merge precedence, tilde expansion, SBPL validation, scratch dir, allow-tmp-exec |
 
 ### Integration Tests (macOS only, 33 tests)
@@ -487,16 +487,16 @@ These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-leve
 | Tool dir permissions | 15 | Each HOME_TOOL_DIR has correct exec/map-exec/write at kernel level |
 | GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |
 
-### E2E Project Tests (macOS only, 28 tests)
+### E2E Project Tests (macOS only, 35 tests)
 
-End-to-end tests using realistic project scaffolding (Node, Go, Python, Rust) with fake copilot scripts:
+End-to-end tests using realistic project scaffolding (Node, Go, Python, Rust, Java/Maven, Kotlin) with fake copilot scripts:
 
 | Category | Tests | What's verified |
 |---|---|---|
-| Per-language file ops | 4 | Read/write files in Node, Go, Python, Rust project structures |
+| Per-language file ops | 7 | Read/write files in Node, Go, Python, Rust, Maven, Kotlin/Maven, multi-module Maven project structures |
 | Git workflows | 2 | git init/commit/status/diff/log, multi-step edit cycles |
 | Security matrix | 2 | Secret files blocked (.env, .pem, .key), home secrets (~/.ssh, ~/.aws) |
-| Mode combinations | 6 | allow-env-files, scratch-dir exec, deny-path, config file, deny-path + scratch-dir, allow-lifecycle-scripts |
+| Mode combinations | 7 | allow-env-files, scratch-dir exec, deny-path, config file, deny-path + scratch-dir, allow-lifecycle-scripts, JAVA_TOOL_OPTIONS injection |
 | Git persistence | 1 | Cannot write .git/hooks or .git/config |
 | Lifecycle scripts | 3 | npm/yarn/pnpm lifecycle script hardening |
 
