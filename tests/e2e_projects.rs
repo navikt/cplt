@@ -1864,39 +1864,52 @@ if [ -n "${CLASSPATH:-}" ]; then echo "RESULT:env_classpath:OK"; else echo "RESU
         assert_result_fail(&stdout, "env_classpath");
     }
 
-    /// With --scratch-dir, JANSI_TMPDIR is redirected to the scratch directory
-    /// so Maven's jansi terminal library extracts native libs there.
+    /// With --scratch-dir, JAVA_TOOL_OPTIONS is injected with -Djava.io.tmpdir and
+    /// -Djansi.tmpdir pointing to the scratch directory. This is needed because macOS
+    /// JVM ignores TMPDIR (uses confstr(_CS_DARWIN_USER_TEMP_DIR) → /var/folders/...).
     #[test]
-    fn project_maven_jansi_tmpdir_with_scratch() {
+    fn project_maven_java_tool_options_with_scratch() {
         require_sandbox!();
         let project = TempProject::scaffold_maven();
         let script = r#"
-# JANSI_TMPDIR should be set and point to the scratch dir (same as TMPDIR)
-JANSI="${JANSI_TMPDIR:-unset}"
+# JAVA_TOOL_OPTIONS should contain -Djava.io.tmpdir and -Djansi.tmpdir
+JTO="${JAVA_TOOL_OPTIONS:-unset}"
 TMPVAL="${TMPDIR:-unset}"
 
-# Should not be unset or pointing to system temp
-case "$JANSI" in
-    unset|/tmp|/private/tmp|/var/folders/*|/private/var/folders/*)
-        echo "RESULT:jansi_redirected:FAIL:JANSI_TMPDIR=$JANSI"
+# Should not be unset
+if [ "$JTO" = "unset" ]; then
+    echo "RESULT:jto_set:FAIL:JAVA_TOOL_OPTIONS not set"
+else
+    echo "RESULT:jto_set:OK"
+fi
+
+# Should contain -Djava.io.tmpdir
+case "$JTO" in
+    *-Djava.io.tmpdir=*)
+        echo "RESULT:jto_has_tmpdir:OK"
         ;;
     *)
-        echo "RESULT:jansi_redirected:OK"
+        echo "RESULT:jto_has_tmpdir:FAIL:$JTO"
         ;;
 esac
 
-# JANSI_TMPDIR should match TMPDIR (both redirected to same scratch dir)
-if [ "$JANSI" = "$TMPVAL" ]; then
-    echo "RESULT:jansi_matches_tmpdir:OK"
-else
-    echo "RESULT:jansi_matches_tmpdir:FAIL:JANSI=$JANSI,TMPDIR=$TMPVAL"
-fi
+# Should contain -Djansi.tmpdir
+case "$JTO" in
+    *-Djansi.tmpdir=*)
+        echo "RESULT:jto_has_jansi:OK"
+        ;;
+    *)
+        echo "RESULT:jto_has_jansi:FAIL:$JTO"
+        ;;
+esac
 
-# Should be able to write to the JANSI_TMPDIR (native lib extraction)
-if echo "native-lib-data" > "$JANSI/libjansi.so" 2>/dev/null; then
-    echo "RESULT:jansi_writable:OK"
+# The -Djava.io.tmpdir should point to the scratch dir (same as TMPDIR)
+# Extract the value after -Djava.io.tmpdir=
+JTO_TMPDIR=$(echo "$JTO" | sed 's/.*-Djava.io.tmpdir=\([^ ]*\).*/\1/')
+if [ "$JTO_TMPDIR" = "$TMPVAL" ]; then
+    echo "RESULT:jto_tmpdir_matches:OK"
 else
-    echo "RESULT:jansi_writable:FAIL"
+    echo "RESULT:jto_tmpdir_matches:FAIL:JTO_TMPDIR=$JTO_TMPDIR,TMPDIR=$TMPVAL"
 fi
 "#;
         let fake_dir = create_fake_copilot(&project, script);
@@ -1906,9 +1919,10 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "jansi_redirected");
-        assert_result_ok(&stdout, "jansi_matches_tmpdir");
-        assert_result_ok(&stdout, "jansi_writable");
+        assert_result_ok(&stdout, "jto_set");
+        assert_result_ok(&stdout, "jto_has_tmpdir");
+        assert_result_ok(&stdout, "jto_has_jansi");
+        assert_result_ok(&stdout, "jto_tmpdir_matches");
     }
 
     /// JVM cache dirs (~/.m2, ~/.gradle) allow writes and map-exec (for loading

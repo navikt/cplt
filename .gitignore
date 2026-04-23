@@ -4,6 +4,12 @@
 .cplt-e2e-*
 .cplt-smoke-*
 .cplt-fake-copilot-*
+
+# Test artifact leftovers (e2e_projects scaffold dirs if tests crash at repo root)
+api/
+core/
+src/main/java/
+src/main/kotlin/
 nvim.log
 dist/
 internal/

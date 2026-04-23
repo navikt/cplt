@@ -210,11 +210,10 @@ pub(super) const ENV_ALWAYS_DENY: &[&str] = &[
 /// Environment variables redirected to the scratch directory.
 /// These control where tools write temporary files and compiled binaries.
 pub(super) const SCRATCH_DIR_ENV_VARS: &[&str] = &[
-    "TMPDIR",       // Standard Unix temp dir
-    "TMP",          // Used by some tools (Node.js, Python)
-    "TEMP",         // Used by some tools (cross-platform)
-    "GOTMPDIR",     // Go test binary compilation target
-    "JANSI_TMPDIR", // Maven terminal library (jansi) native lib extraction
+    "TMPDIR",   // Standard Unix temp dir
+    "TMP",      // Used by some tools (Node.js, Python)
+    "TEMP",     // Used by some tools (cross-platform)
+    "GOTMPDIR", // Go test binary compilation target
 ];
 
 // ── Security environment hardening ─────────────────────────────

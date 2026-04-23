@@ -2652,8 +2652,89 @@ fn env_no_scratch_dir_passes_system_tmpdir() {
 }
 
 // ============================================================
-// Config parsing — new options
+// build_sandbox_env — JAVA_TOOL_OPTIONS tmpdir injection
 // ============================================================
+
+#[test]
+fn env_scratch_dir_injects_java_tool_options() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let scratch = std::path::Path::new("/scratch/session123");
+    let env = build_sandbox_env(&parent, &[], false, &[], Some(scratch));
+
+    let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
+    assert!(jto.is_some(), "JAVA_TOOL_OPTIONS should be injected");
+    let val = &jto.unwrap().1;
+    assert!(
+        val.contains("-Djava.io.tmpdir=/scratch/session123"),
+        "should contain java.io.tmpdir: {val}"
+    );
+    assert!(
+        val.contains("-Djansi.tmpdir=/scratch/session123"),
+        "should contain jansi.tmpdir: {val}"
+    );
+}
+
+#[test]
+fn env_scratch_dir_appends_to_existing_java_tool_options() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("JAVA_TOOL_OPTIONS", "-Xmx512m")]);
+    let scratch = std::path::Path::new("/scratch/session123");
+    let env = build_sandbox_env(&parent, &[], false, &[], Some(scratch));
+
+    let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
+    assert!(jto.is_some());
+    let val = &jto.unwrap().1;
+    assert!(
+        val.starts_with("-Xmx512m "),
+        "should preserve existing flags: {val}"
+    );
+    assert!(
+        val.contains("-Djava.io.tmpdir=/scratch/session123"),
+        "should append java.io.tmpdir: {val}"
+    );
+}
+
+#[test]
+fn env_scratch_dir_java_tool_options_respects_pass_env() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("JAVA_TOOL_OPTIONS", "-Xmx1g")]);
+    let extra = vec!["JAVA_TOOL_OPTIONS".to_string()];
+    let scratch = std::path::Path::new("/scratch/session123");
+    let env = build_sandbox_env(&parent, &extra, false, &[], Some(scratch));
+
+    let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
+    assert!(jto.is_some());
+    assert_eq!(
+        jto.unwrap().1,
+        "-Xmx1g",
+        "--pass-env JAVA_TOOL_OPTIONS should prevent injection"
+    );
+}
+
+#[test]
+fn env_no_scratch_dir_no_java_tool_options_injected() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None);
+
+    let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
+    assert!(
+        jto.is_none(),
+        "without scratch dir, JAVA_TOOL_OPTIONS should not be injected"
+    );
+}
+
+#[test]
+fn env_scratch_dir_no_jansi_tmpdir_env_var() {
+    // JANSI_TMPDIR env var is NOT a thing — Jansi uses System.getProperty("jansi.tmpdir").
+    // Verify we don't set it as an env var anymore.
+    let parent = make_env(&[("HOME", "/Users/test")]);
+    let scratch = std::path::Path::new("/scratch/session123");
+    let env = build_sandbox_env(&parent, &[], false, &[], Some(scratch));
+
+    let jansi = env.vars.iter().find(|(k, _)| k == "JANSI_TMPDIR");
+    assert!(
+        jansi.is_none(),
+        "JANSI_TMPDIR env var should not be set (Jansi reads a Java system property, not an env var)"
+    );
+}
 
 #[test]
 fn config_parses_scratch_dir() {
