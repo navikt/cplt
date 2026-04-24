@@ -1173,6 +1173,15 @@ fn profile_denies_exec_from_tmp() {
         p.contains("(deny file-map-executable (subpath \"/private/var/folders\"))"),
         "Profile must deny file-map-executable from /var/folders"
     );
+    // Must allow unix socket bind+connect in /tmp for JVM Attach API
+    assert!(
+        p.contains("(allow network-bind (local unix-socket (subpath \"/private/tmp\")))"),
+        "Profile must allow unix socket bind in /tmp"
+    );
+    assert!(
+        p.contains("(allow network-outbound (remote unix-socket (subpath \"/private/tmp\")))"),
+        "Profile must allow unix socket connect in /tmp"
+    );
 }
 
 // ============================================================
