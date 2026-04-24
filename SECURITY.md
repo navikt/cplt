@@ -230,6 +230,8 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 (allow file-read copilot_install_dir)   ← Copilot CLI package dir (auto-detected)
 (allow file-read/write /private/tmp)    ← Temp file access
 (deny process-exec /private/tmp)        ← But no executing from tmp!
+(allow unix-socket .java_pid*)          ← JVM Attach API only (regex-restricted)
+(deny  unix-socket /tmp/*)              ← All other unix sockets blocked (SSH agent, etc.)
 (deny file-* ~/.ssh, ~/.aws, ...)       ← Sensitive dirs blocked
 (deny network-outbound (remote tcp))    ← Block all outbound TCP by default
 (allow network-outbound *:443)           ← Then allow HTTPS port only (use --allow-port for extras)
@@ -237,7 +239,7 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 (allow network-outbound localhost:PORT) ← Carve-out for proxy (if --with-proxy)
 ```
 
-> **Network note:** Outbound TCP is restricted to port 443 by default. SSH agent access (unix sockets) is blocked. Localhost outbound is blocked to prevent SSRF. Use `--allow-port` for additional ports. SBPL does not support domain-based rules — filesystem isolation is the primary security control.
+> **Network note:** Outbound TCP is restricted to port 443 by default. SSH agent access (unix sockets) is blocked. JVM Attach API sockets (`/tmp/.java_pid*`) are allowed via regex-restricted rule — all other unix sockets in `/tmp` remain blocked. Localhost outbound is blocked to prevent SSRF. Use `--allow-port` for additional ports. SBPL does not support domain-based rules — filesystem isolation is the primary security control.
 
 **Key design decision**: Deny rules are placed AFTER allow rules. In Seatbelt's evaluation model with `(deny default)`, more-specific rules override broader ones, and later rules take precedence for equal specificity. This means our deny rules for `~/.ssh` correctly override the broader temp/system allows.
 
@@ -474,7 +476,7 @@ These test core logic without invoking `sandbox-exec`, using the real library fu
 | Env behavior | 17 | Sanitization, hardening injection, pass-env overrides, LANG prefix leak prevention, YARN hardening bypass prevention, scratch dir TMPDIR redirect, JAVA_TOOL_OPTIONS injection/append/override |
 | Config parsing | 24 | TOML parsing, CLI/config merge precedence, tilde expansion, SBPL validation, scratch dir, allow-tmp-exec |
 
-### Integration Tests (macOS only, 34 tests)
+### Integration Tests (macOS only, 36 tests)
 
 These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-level enforcement**:
 
@@ -482,7 +484,7 @@ These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-leve
 |---|---|---|
 | File access | 5 | Project read/write, copilot config, temp write, process execution |
 | Sensitive dir blocks | 4 | `~/.ssh`, `~/.aws`, `~/.docker`, `~/.kube` blocked |
-| Network | 2 | Outbound connections blocked, unix domain sockets in /tmp allowed (JVM Attach API) |
+| Network | 4 | Outbound connections blocked, JVM Attach API socket allowed, SSH agent socket blocked, arbitrary `/tmp` sockets blocked |
 | Binary CLI | 4 | Version, help, root/home dir rejection |
 | Tool dir permissions | 15 | Each HOME_TOOL_DIR has correct exec/map-exec/write at kernel level |
 | GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |

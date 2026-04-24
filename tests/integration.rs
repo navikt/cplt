@@ -891,17 +891,17 @@ mod macos_tests {
     }
 
     #[test]
-    fn real_profile_allows_unix_socket_in_tmp() {
+    fn real_profile_allows_jvm_attach_socket_in_tmp() {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
         let opts = default_opts(&project, &home);
         let profile = write_real_profile(&opts);
 
-        // Simulate JVM Attach API: bind+connect a unix socket in /tmp
+        // Simulate JVM Attach API: bind+connect a .java_pid<PID> socket
         let cmd = r#"python3 -c "
 import socket, os, threading, time
-SOCK = '/tmp/.cplt_test_attach'
+SOCK = '/tmp/.java_pid99999'
 try: os.unlink(SOCK)
 except: pass
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -930,7 +930,88 @@ t.join(2)
         fs::remove_file(&profile).ok();
         assert!(
             output.contains("OK"),
-            "unix socket in /tmp should be allowed (JVM Attach API), got: {output}"
+            "JVM Attach socket (.java_pid*) should be allowed, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_blocks_ssh_agent_socket() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        // SSH_AUTH_SOCK on macOS is /private/tmp/com.apple.launchd.*/Listeners
+        // The sandbox must NOT allow connecting to it — even though .java_pid* is allowed.
+        let cmd = r#"python3 -c "
+import socket, os
+sock_path = os.environ.get('SSH_AUTH_SOCK', '')
+if not sock_path:
+    print('NO_SSH_AGENT')
+else:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(sock_path)
+        print('EXPOSED')
+    except PermissionError:
+        print('BLOCKED')
+    except OSError as e:
+        if e.errno == 1:
+            print('BLOCKED')
+        else:
+            print(f'ERROR:{e}')
+    finally:
+        s.close()
+""#;
+        let (output, _) = run_sandboxed(&profile, cmd);
+
+        fs::remove_file(&profile).ok();
+        // If no SSH agent running, skip the assertion
+        if !output.contains("NO_SSH_AGENT") {
+            assert!(
+                output.contains("BLOCKED"),
+                "SSH agent socket must be blocked by sandbox, got: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_profile_blocks_arbitrary_unix_socket_in_tmp() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        // Non-.java_pid sockets in /tmp must be blocked
+        let cmd = r#"python3 -c "
+import socket, os
+SOCK = '/tmp/.cplt_evil_test'
+try: os.unlink(SOCK)
+except: pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.bind(SOCK)
+    print('EXPOSED')
+    s.close()
+    os.unlink(SOCK)
+except PermissionError:
+    print('BLOCKED')
+except OSError as e:
+    if e.errno == 1:
+        print('BLOCKED')
+    else:
+        print(f'ERROR:{e}')
+finally:
+    s.close()
+""#;
+        let (output, _) = run_sandboxed(&profile, cmd);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("BLOCKED"),
+            "Arbitrary unix sockets in /tmp must be blocked, got: {output}"
         );
     }
 

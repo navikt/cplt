@@ -438,18 +438,20 @@ fn emit_temp_rules(sb: &mut String, allow_tmp_exec: bool, scratch_dir: Option<&P
     writeln!(sb, "(allow file-write* (subpath \"/private/tmp\"))").unwrap();
     writeln!(sb, "(allow file-read* (subpath \"/private/var/folders\"))").unwrap();
     writeln!(sb, "(allow file-write* (subpath \"/private/var/folders\"))").unwrap();
-    // Allow Unix domain socket operations in /tmp — needed for JVM Attach API
-    // (used by MockK, Mockito inline, ByteBuddy, JMX tools). The JVM creates a
-    // socket at /tmp/.java_pid<PID> for inter-process agent loading. Without this,
-    // "Could not self-attach to current VM" errors occur.
+    // Allow Unix domain socket operations ONLY for JVM Attach API sockets.
+    // The JVM creates a socket at /tmp/.java_pid<PID> for inter-process agent
+    // loading (used by MockK, Mockito inline, ByteBuddy, JMX tools).
+    // SECURITY: regex-restricted to .java_pid<PID> pattern only — a broad
+    // (subpath "/private/tmp") would expose SSH_AUTH_SOCK which lives at
+    // /private/tmp/com.apple.launchd.*/Listeners on macOS.
     writeln!(
         sb,
-        "(allow network-bind (local unix-socket (subpath \"/private/tmp\")))"
+        r#"(allow network-bind (local unix-socket (regex #"^/private/tmp/\.java_pid[0-9]+$")))"#
     )
     .unwrap();
     writeln!(
         sb,
-        "(allow network-outbound (remote unix-socket (subpath \"/private/tmp\")))"
+        r#"(allow network-outbound (remote unix-socket (regex #"^/private/tmp/\.java_pid[0-9]+$")))"#
     )
     .unwrap();
     if !allow_tmp_exec {

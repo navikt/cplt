@@ -1173,14 +1173,21 @@ fn profile_denies_exec_from_tmp() {
         p.contains("(deny file-map-executable (subpath \"/private/var/folders\"))"),
         "Profile must deny file-map-executable from /var/folders"
     );
-    // Must allow unix socket bind+connect in /tmp for JVM Attach API
+    // Must allow unix socket bind+connect ONLY for JVM Attach API (.java_pid*)
     assert!(
-        p.contains("(allow network-bind (local unix-socket (subpath \"/private/tmp\")))"),
-        "Profile must allow unix socket bind in /tmp"
+        p.contains(
+            r#"(allow network-bind (local unix-socket (regex #"^/private/tmp/\.java_pid[0-9]+$")))"#
+        ),
+        "Profile must allow unix socket bind for JVM Attach API pattern"
     );
     assert!(
-        p.contains("(allow network-outbound (remote unix-socket (subpath \"/private/tmp\")))"),
-        "Profile must allow unix socket connect in /tmp"
+        p.contains(r#"(allow network-outbound (remote unix-socket (regex #"^/private/tmp/\.java_pid[0-9]+$")))"#),
+        "Profile must allow unix socket connect for JVM Attach API pattern"
+    );
+    // Must NOT have broad subpath unix socket rules (would expose SSH agent)
+    assert!(
+        !p.contains("unix-socket (subpath \"/private/tmp\")"),
+        "Profile must NOT have broad subpath unix-socket rule — exposes SSH_AUTH_SOCK"
     );
 }
 
