@@ -474,7 +474,7 @@ These test core logic without invoking `sandbox-exec`, using the real library fu
 | Env behavior | 17 | Sanitization, hardening injection, pass-env overrides, LANG prefix leak prevention, YARN hardening bypass prevention, scratch dir TMPDIR redirect, JAVA_TOOL_OPTIONS injection/append/override |
 | Config parsing | 24 | TOML parsing, CLI/config merge precedence, tilde expansion, SBPL validation, scratch dir, allow-tmp-exec |
 
-### Integration Tests (macOS only, 33 tests)
+### Integration Tests (macOS only, 34 tests)
 
 These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-level enforcement**:
 
@@ -482,12 +482,12 @@ These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-leve
 |---|---|---|
 | File access | 5 | Project read/write, copilot config, temp write, process execution |
 | Sensitive dir blocks | 4 | `~/.ssh`, `~/.aws`, `~/.docker`, `~/.kube` blocked |
-| Network | 1 | Outbound connections blocked |
+| Network | 2 | Outbound connections blocked, unix domain sockets in /tmp allowed (JVM Attach API) |
 | Binary CLI | 4 | Version, help, root/home dir rejection |
 | Tool dir permissions | 15 | Each HOME_TOOL_DIR has correct exec/map-exec/write at kernel level |
 | GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |
 
-### E2E Project Tests (macOS only, 35 tests)
+### E2E Project Tests (macOS only, 37 tests)
 
 End-to-end tests using realistic project scaffolding (Node, Go, Python, Rust, Java/Maven, Kotlin) with fake copilot scripts:
 
