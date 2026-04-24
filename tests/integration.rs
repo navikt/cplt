@@ -384,6 +384,7 @@ mod macos_tests {
             copilot_install_dir: None,
             git_hooks_path: None,
             allow_gpg_signing: false,
+            allow_jvm_attach: false,
             electron_app_dir: None,
         }
     }
@@ -895,7 +896,8 @@ mod macos_tests {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
-        let opts = default_opts(&project, &home);
+        let mut opts = default_opts(&project, &home);
+        opts.allow_jvm_attach = true;
         let profile = write_real_profile(&opts);
 
         // Simulate JVM Attach API: bind+connect a .java_pid<PID> socket

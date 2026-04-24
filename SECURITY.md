@@ -230,7 +230,7 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 (allow file-read copilot_install_dir)   ← Copilot CLI package dir (auto-detected)
 (allow file-read/write /private/tmp)    ← Temp file access
 (deny process-exec /private/tmp)        ← But no executing from tmp!
-(allow unix-socket .java_pid*)          ← JVM Attach API only (regex-restricted)
+(allow unix-socket .java_pid*)          ← JVM Attach API only (--allow-jvm-attach, regex-restricted)
 (deny  unix-socket /tmp/*)              ← All other unix sockets blocked (SSH agent, etc.)
 (deny file-* ~/.ssh, ~/.aws, ...)       ← Sensitive dirs blocked
 (deny network-outbound (remote tcp))    ← Block all outbound TCP by default
@@ -239,7 +239,7 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 (allow network-outbound localhost:PORT) ← Carve-out for proxy (if --with-proxy)
 ```
 
-> **Network note:** Outbound TCP is restricted to port 443 by default. SSH agent access (unix sockets) is blocked. JVM Attach API sockets (`/tmp/.java_pid*`) are allowed via regex-restricted rule — all other unix sockets in `/tmp` remain blocked. Localhost outbound is blocked to prevent SSRF. Use `--allow-port` for additional ports. SBPL does not support domain-based rules — filesystem isolation is the primary security control.
+> **Network note:** Outbound TCP is restricted to port 443 by default. SSH agent access (unix sockets) is blocked. JVM Attach API sockets (`/tmp/.java_pid*`) are available via `--allow-jvm-attach` (opt-in, regex-restricted to `.java_pid<PID>` only) — all other unix sockets in `/tmp` remain blocked. Localhost outbound is blocked to prevent SSRF. Use `--allow-port` for additional ports. SBPL does not support domain-based rules — filesystem isolation is the primary security control.
 
 **Key design decision**: Deny rules are placed AFTER allow rules. In Seatbelt's evaluation model with `(deny default)`, more-specific rules override broader ones, and later rules take precedence for equal specificity. This means our deny rules for `~/.ssh` correctly override the broader temp/system allows.
 

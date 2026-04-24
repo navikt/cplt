@@ -38,8 +38,8 @@ Always run `mise run check` at the end of a coding session.
 - `src/main.rs` — CLI entry point, orchestration
 - `src/lib.rs` — library crate root (re-exports modules for test access)
 - `src/proxy.rs` + `src/proxy/` — CONNECT proxy, domain blocking
-- `tests/unit_tests.rs` — cross-platform unit tests (128 tests)
-- `tests/integration.rs` — macOS sandbox-exec kernel-level tests (33 tests)
+- `tests/unit_tests.rs` — cross-platform unit tests (137 tests)
+- `tests/integration.rs` — macOS sandbox-exec kernel-level tests (36 tests)
 - `tests/e2e.rs` — end-to-end with compiled binary + smoke tests
 - `tests/e2e_projects.rs` — e2e tests with realistic project scaffolding (28 tests)
 - `SECURITY.md` — threat model, defense layers, honest gaps

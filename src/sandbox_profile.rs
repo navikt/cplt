@@ -40,6 +40,8 @@ pub struct ProfileOptions<'a> {
     /// Allow GPG commit/tag signing. When true, grants read-only access to
     /// the public keyring and GPG agent socket. Private keys stay denied.
     pub allow_gpg_signing: bool,
+    /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
+    pub allow_jvm_attach: bool,
     /// Electron app bundle Contents directory (e.g., VS Code .app/Contents).
     /// Needed when Copilot CLI is installed as a VS Code extension and uses
     /// VS Code's Electron runtime. Allows read + file-map-executable so dyld
@@ -67,7 +69,12 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_copilot_install(&mut sb, opts.copilot_install_dir);
     emit_electron_app(&mut sb, opts.electron_app_dir);
     emit_system_files(&mut sb);
-    emit_temp_rules(&mut sb, opts.allow_tmp_exec, opts.scratch_dir);
+    emit_temp_rules(
+        &mut sb,
+        opts.allow_tmp_exec,
+        opts.allow_jvm_attach,
+        opts.scratch_dir,
+    );
     emit_user_allows(&mut sb, opts.extra_read, opts.extra_write);
     emit_deny_rules(&mut sb, &home, opts.extra_deny);
     emit_gpg_signing_rules(&mut sb, &home, opts.allow_gpg_signing, opts.extra_deny);
@@ -432,28 +439,35 @@ fn emit_system_files(sb: &mut String) {
     writeln!(sb).unwrap();
 }
 
-fn emit_temp_rules(sb: &mut String, allow_tmp_exec: bool, scratch_dir: Option<&Path>) {
+fn emit_temp_rules(
+    sb: &mut String,
+    allow_tmp_exec: bool,
+    allow_jvm_attach: bool,
+    scratch_dir: Option<&Path>,
+) {
     writeln!(sb, ";; Temp directories").unwrap();
     writeln!(sb, "(allow file-read* (subpath \"/private/tmp\"))").unwrap();
     writeln!(sb, "(allow file-write* (subpath \"/private/tmp\"))").unwrap();
     writeln!(sb, "(allow file-read* (subpath \"/private/var/folders\"))").unwrap();
     writeln!(sb, "(allow file-write* (subpath \"/private/var/folders\"))").unwrap();
-    // Allow Unix domain socket operations ONLY for JVM Attach API sockets.
-    // The JVM creates a socket at /tmp/.java_pid<PID> for inter-process agent
-    // loading (used by MockK, Mockito inline, ByteBuddy, JMX tools).
-    // SECURITY: regex-restricted to .java_pid<PID> pattern only — a broad
-    // (subpath "/private/tmp") would expose SSH_AUTH_SOCK which lives at
-    // /private/tmp/com.apple.launchd.*/Listeners on macOS.
-    writeln!(
-        sb,
-        r#"(allow network-bind (local unix-socket (regex #"^/private/tmp/\.java_pid[0-9]+$")))"#
-    )
-    .unwrap();
-    writeln!(
-        sb,
-        r#"(allow network-outbound (remote unix-socket (regex #"^/private/tmp/\.java_pid[0-9]+$")))"#
-    )
-    .unwrap();
+    if allow_jvm_attach {
+        // Allow Unix domain socket operations ONLY for JVM Attach API sockets.
+        // The JVM creates a socket at /tmp/.java_pid<PID> for inter-process agent
+        // loading (used by MockK, Mockito inline, ByteBuddy, JMX tools).
+        // SECURITY: regex-restricted to .java_pid<PID> pattern only — a broad
+        // (subpath "/private/tmp") would expose SSH_AUTH_SOCK which lives at
+        // /private/tmp/com.apple.launchd.*/Listeners on macOS.
+        writeln!(
+            sb,
+            r#"(allow network-bind (local unix-socket (regex #"^/private/tmp/\.java_pid[0-9]+$")))"#
+        )
+        .unwrap();
+        writeln!(
+            sb,
+            r#"(allow network-outbound (remote unix-socket (regex #"^/private/tmp/\.java_pid[0-9]+$")))"#
+        )
+        .unwrap();
+    }
     if !allow_tmp_exec {
         // Deny direct execution and dlopen from writable temp dirs.
         // Prevents write-then-exec attacks (drop binary → execute it).

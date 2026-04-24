@@ -81,6 +81,12 @@ pub struct SandboxConfig {
     /// Private keys remain protected — only the agent socket and public
     /// keyring are accessible. See SECURITY.md for risk analysis.
     pub allow_gpg_signing: Option<bool>,
+    /// Allow JVM Attach API unix sockets in /tmp (default: false).
+    /// Needed for JVM testing frameworks that use runtime self-attach
+    /// (MockK inline mocking, Mockito inline, ByteBuddy agent loading).
+    /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
+    /// all other unix sockets remain blocked.
+    pub allow_jvm_attach: Option<bool>,
     /// Allow process execution from system temp directories (default: false).
     /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
     pub allow_tmp_exec: Option<bool>,
@@ -113,6 +119,7 @@ pub struct Resolved {
     pub inherit_env: bool,
     pub allow_lifecycle_scripts: bool,
     pub allow_gpg_signing: bool,
+    pub allow_jvm_attach: bool,
     pub allow_tmp_exec: bool,
     pub scratch_dir: bool,
     pub quiet: bool,
@@ -142,6 +149,7 @@ pub struct CliFlags {
     pub inherit_env: bool,
     pub allow_lifecycle_scripts: bool,
     pub allow_gpg_signing: bool,
+    pub allow_jvm_attach: bool,
     pub allow_tmp_exec: bool,
     pub scratch_dir: bool,
     pub no_scratch_dir: bool,
@@ -334,6 +342,13 @@ impl Config {
             self.sandbox.allow_gpg_signing.unwrap_or(false)
         };
 
+        // Allow-jvm-attach: CLI flag wins, then config, then false (blocked by default)
+        let allow_jvm_attach = if cli.allow_jvm_attach {
+            true
+        } else {
+            self.sandbox.allow_jvm_attach.unwrap_or(false)
+        };
+
         // Allow-tmp-exec: CLI flag wins, then config, then false (blocked by default)
         let allow_tmp_exec = if cli.allow_tmp_exec {
             true
@@ -386,6 +401,7 @@ impl Config {
             inherit_env,
             allow_lifecycle_scripts,
             allow_gpg_signing,
+            allow_jvm_attach,
             allow_tmp_exec,
             scratch_dir,
             quiet,
@@ -490,6 +506,11 @@ impl Resolved {
         } else {
             eprintln!(
                 "{blue}[cplt]{nc}    SSH/GPG/cloud: blocked     {dim}~/.ssh, ~/.gnupg, ~/.aws, ...{nc}"
+            );
+        }
+        if self.allow_jvm_attach {
+            eprintln!(
+                "{blue}[cplt]{nc}    JVM attach:    {yellow}allowed{nc}     {dim}.java_pid* sockets (--allow-jvm-attach){nc}"
             );
         }
         eprintln!("{blue}[cplt]{nc}    Copilot dir:   {green}allowed{nc}     {dim}~/.copilot{nc}");
@@ -683,6 +704,14 @@ pub fn default_config_contents() -> String {
 # but it CAN request arbitrary signatures while the session is active.
 # allow_gpg_signing = false
 #
+# Allow JVM Attach API unix sockets in /tmp.
+# Needed for JVM testing frameworks that use runtime self-attach:
+# MockK inline mocking, Mockito inline agents, ByteBuddy, JMX tools.
+# Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
+# all other unix sockets in /tmp remain blocked.
+# Enable this if you work with Kotlin/Java projects that use inline mocking.
+# allow_jvm_attach = false
+#
 # Allow outbound TCP to localhost on ALL ports.
 # Needed for build tools like Turbopack (Next.js), Vite, and esbuild
 # that spawn workers communicating via TCP on random localhost ports.
@@ -769,6 +798,7 @@ const VALID_SANDBOX_KEYS: &[&str] = &[
     "inherit_env",
     "allow_lifecycle_scripts",
     "allow_gpg_signing",
+    "allow_jvm_attach",
     "allow_tmp_exec",
     "scratch_dir",
     "quiet",

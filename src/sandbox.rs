@@ -84,6 +84,8 @@ pub struct SandboxConfig<'a> {
     /// Global git hooks directory from `core.hooksPath`.
     pub git_hooks_path: Option<&'a Path>,
     pub allow_gpg_signing: bool,
+    /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
+    pub allow_jvm_attach: bool,
     /// Electron app bundle Contents directory (macOS only, ignored on Linux).
     pub electron_app_dir: Option<&'a Path>,
 }
@@ -154,6 +156,7 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         copilot_install_dir: config.copilot_install_dir,
         git_hooks_path: config.git_hooks_path,
         allow_gpg_signing: config.allow_gpg_signing,
+        allow_jvm_attach: config.allow_jvm_attach,
         electron_app_dir: config.electron_app_dir,
     });
 

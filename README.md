@@ -211,6 +211,7 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | `--inherit-env`    | ⚠️ **Dangerous.** Inherit the full parent environment (only strips `NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`). Use only for debugging. |
 | `--allow-lifecycle-scripts` | Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run. Blocked by default. Use when `npm install` needs postinstall hooks.         |
 | `--allow-gpg-signing`       | Allow GPG commit/tag signing inside the sandbox. Grants read-only access to public keyring and GPG agent socket (private keys stay denied). See [GPG signing](#gpg-commit-signing). |
+| `--allow-jvm-attach`        | Allow JVM Attach API unix sockets in `/tmp`. Needed for MockK inline mocking, Mockito inline agents, ByteBuddy. See [JVM Attach API](#jvm-attach-api). |
 | `--no-scratch-dir`          | Disable the per-session scratch directory (on by default). TMPDIR will not be redirected.                                                    |
 | `--scratch-dir`             | Explicitly enable per-session scratch directory (already the default). Useful to override `scratch_dir = false` in config.                   |
 | `--allow-tmp-exec`          | ⚠️ **Dangerous.** Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer scratch dir.                             |
@@ -627,7 +628,7 @@ Tools that compile-then-execute from `$TMPDIR` are **blocked by default** becaus
 
 **Fix:** The scratch dir is now **on by default** — cplt creates `~/Library/Caches/cplt/tmp/{session-id}/` with `rwx` permissions, redirects `TMPDIR`, `TMP`, `TEMP`, and `GOTMPDIR` there, and cleans up on exit. Stale directories older than 24 hours are garbage-collected on startup.
 
-**JVM note:** On macOS, the JVM ignores `TMPDIR` — it reads `java.io.tmpdir` from `confstr(_CS_DARWIN_USER_TEMP_DIR)` which always returns `/var/folders/...`. cplt automatically injects `-Djava.io.tmpdir=<scratch> -Djansi.tmpdir=<scratch> -Djava.rmi.server.hostname=localhost` via `JAVA_TOOL_OPTIONS` so that Maven Surefire forks, the Kotlin compiler daemon, and Jansi native lib extraction all use the scratch dir. The RMI hostname flag ensures the Kotlin daemon's Java RMI communication stays on `localhost` (without it, `InetAddress.getLocalHost()` may resolve to a non-loopback IP via mDNS, which the sandbox blocks). Override with `--pass-env JAVA_TOOL_OPTIONS` if you need custom JVM flags.
+**JVM note:** On macOS, the JVM ignores `TMPDIR` — it reads `java.io.tmpdir` from `confstr(_CS_DARWIN_USER_TEMP_DIR)` which always returns `/var/folders/...`. cplt automatically injects `-Djava.io.tmpdir=<scratch> -Djansi.tmpdir=<scratch> -Djava.rmi.server.hostname=localhost` via `JAVA_TOOL_OPTIONS` so that Maven Surefire forks, the Kotlin compiler daemon, and Jansi native lib extraction all use the scratch dir. The RMI hostname flag ensures the Kotlin daemon's Java RMI communication stays on `localhost` (without it, `InetAddress.getLocalHost()` may resolve to a non-loopback IP via mDNS, which the sandbox blocks). Override with `--pass-env JAVA_TOOL_OPTIONS` if you need custom JVM flags. For inline mocking (MockK, Mockito, ByteBuddy), also add `--allow-jvm-attach` — see [JVM Attach API](#jvm-attach-api).
 
 If you're still seeing this error, check that you haven't set `scratch_dir = false` in your config:
 
@@ -799,6 +800,33 @@ If all of that works, `cplt --allow-gpg-signing` will work too. The `gpg-agent` 
 - **GPG-only.** This flag does not enable SSH signing (`gpg.format=ssh`). SSH keys and `SSH_AUTH_SOCK` remain blocked.
 - **`--deny-path` wins.** If you specify `--deny-path ~/.gnupg` alongside `--allow-gpg-signing`, the deny takes precedence — all GPG allows are suppressed.
 - **`GNUPGHOME`** is not supported yet — only the default `~/.gnupg` location is allowed.
+
+### JVM Attach API
+
+JVM testing frameworks like **MockK** (inline mocking), **Mockito** (inline agents), and **ByteBuddy** use the JVM Attach API for runtime class instrumentation. This API creates a Unix domain socket at `/tmp/.java_pid<PID>` — which the sandbox blocks by default.
+
+Enable it with `--allow-jvm-attach`:
+
+```bash
+cplt --allow-jvm-attach -- -p "run the tests"
+```
+
+Or permanently in config:
+
+```bash
+cplt config set sandbox.allow_jvm_attach true
+```
+
+**When to enable:**
+
+- Kotlin/Java projects using **MockK** with `mockk()` or `mockkStatic()` inline mocking
+- Projects using **Mockito** with `Mockito.mock()` on final classes (requires ByteBuddy agent)
+- Any test suite that gets `"Could not self-attach to current VM using external process"` errors
+- JMX monitoring tools that attach to running JVMs
+
+**How it works:** The JVM creates a socket at `/tmp/.java_pid<PID>` (hardcoded path, not affected by `java.io.tmpdir`). A helper JVM process connects to this socket to load an instrumentation agent. The sandbox rule uses a regex pattern that only allows sockets matching `.java_pid<PID>` — all other Unix sockets in `/tmp` (including SSH agent, tmux, PostgreSQL) remain blocked.
+
+**Security note:** This opens a narrow IPC channel for `.java_pid*`-named sockets only. SSH agent access (`SSH_AUTH_SOCK`) is NOT exposed — on macOS it lives at `/private/tmp/com.apple.launchd.*/Listeners` which does not match the pattern.
 
 ### Port restriction
 

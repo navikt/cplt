@@ -178,6 +178,14 @@ struct Cli {
     #[arg(long)]
     allow_gpg_signing: bool,
 
+    /// Allow JVM Attach API unix sockets in /tmp.
+    /// Needed for JVM testing frameworks that use runtime self-attach:
+    /// MockK inline mocking, Mockito inline agents, ByteBuddy, JMX tools.
+    /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
+    /// all other unix sockets remain blocked.
+    #[arg(long)]
+    allow_jvm_attach: bool,
+
     /// Allow process execution from system temp directories.
     /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
     /// Prefer --scratch-dir which creates a controlled executable temp dir.
@@ -571,6 +579,7 @@ fn main() -> ExitCode {
         inherit_env: cli.inherit_env,
         allow_lifecycle_scripts: cli.allow_lifecycle_scripts,
         allow_gpg_signing: cli.allow_gpg_signing,
+        allow_jvm_attach: cli.allow_jvm_attach,
         allow_tmp_exec: cli.allow_tmp_exec,
         scratch_dir: cli.scratch_dir,
         no_scratch_dir: cli.no_scratch_dir,
@@ -723,6 +732,7 @@ fn main() -> ExitCode {
         copilot_install_dir: copilot_install_dir.as_deref(),
         git_hooks_path: git_hooks_path.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
+        allow_jvm_attach: resolved.allow_jvm_attach,
         electron_app_dir: electron_app_dir.as_deref(),
     }) {
         Ok(s) => s,
