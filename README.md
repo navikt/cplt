@@ -295,11 +295,41 @@ After this, every `cplt` invocation starts the proxy automatically. Use `--no-pr
 | `-y, --yes`       | Skip the interactive confirmation prompt. The configuration summary is still printed for auditability. Required when stdin is not a TTY (CI, scripts). |
 | `--init-config`   | Create a starter config file at `~/.config/cplt/config.toml` and exit.                                                                                 |
 
+### Copilot session flags
+
+These flags are forwarded directly to the copilot process for convenience — no `--` separator needed.
+
+| Flag                 | What it does                                                                                      |
+| -------------------- | ------------------------------------------------------------------------------------------------- |
+| `--resume[=SESSION]` | Resume a previous session. Use `--resume` to pick interactively, or `--resume=NAME` by name/ID.  |
+| `--continue`         | Resume the most recent session in the current directory.                                          |
+| `--remote`           | Enable remote control — monitor and steer the session from GitHub.com or mobile.                  |
+| `--name SESSION`     | Name the session for later resumption with `--resume=NAME`.                                       |
+
+You can combine these with cplt sandbox flags and `--` pass-through args:
+
+```bash
+cplt --resume=my-task                          # resume by name
+cplt --remote --name my-task -- -p "fix tests" # remote + named + prompt
+```
+
 ### Examples
 
 ```bash
 # Most common: run Copilot in sandbox
 cplt -- -p "fix the tests"
+
+# Resume a previous session
+cplt --resume
+
+# Resume a named session
+cplt --resume=my-refactor
+
+# Resume the most recent session in this directory
+cplt --continue
+
+# Start a named remote session
+cplt --remote --name my-task -- -p "fix the tests"
 
 # Check environment before first run
 cplt --doctor

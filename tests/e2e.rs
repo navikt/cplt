@@ -2072,4 +2072,141 @@ mod e2e_tests {
             "should report version status: {stderr}"
         );
     }
+
+    // --- Copilot flag forwarding tests ---
+
+    /// Create a fake copilot script that prints its argv (one per line) and exits.
+    fn create_fake_copilot_argv() -> PathBuf {
+        let id = FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = project_dir().join(format!(".cplt-fake-copilot-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("copilot");
+        // Print each argument on its own line, prefixed with "ARG:" for easy grep
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nfor arg in \"$@\"; do echo \"ARG:$arg\"; done\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    /// Run cplt with fake copilot that prints args, return (stdout, stderr).
+    fn run_fake_copilot_argv(cplt_args: &[&str]) -> (String, String) {
+        let fake_dir = create_fake_copilot_argv();
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.display());
+
+        let output = Command::new(binary_path())
+            .args(["--yes", "--no-validate"])
+            .args(cplt_args)
+            .current_dir(project_dir())
+            .env("PATH", &new_path)
+            .output()
+            .expect("binary should run");
+        std::fs::remove_dir_all(&fake_dir).ok();
+
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
+    fn extract_args(stdout: &str) -> Vec<&str> {
+        stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("ARG:"))
+            .collect()
+    }
+
+    #[test]
+    fn e2e_forward_resume_interactive() {
+        require_sandbox!();
+        let (stdout, stderr) = run_fake_copilot_argv(&["--resume"]);
+        let args = extract_args(&stdout);
+        assert!(
+            args.contains(&"--no-auto-update"),
+            "should inject --no-auto-update: {args:?}\nstderr: {stderr}"
+        );
+        assert!(
+            args.contains(&"--resume"),
+            "should forward --resume: {args:?}\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_forward_resume_with_name() {
+        require_sandbox!();
+        let (stdout, stderr) = run_fake_copilot_argv(&["--resume=my-task"]);
+        let args = extract_args(&stdout);
+        assert!(
+            args.contains(&"--resume=my-task"),
+            "should forward --resume=my-task: {args:?}\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_forward_continue() {
+        require_sandbox!();
+        let (stdout, stderr) = run_fake_copilot_argv(&["--continue"]);
+        let args = extract_args(&stdout);
+        assert!(
+            args.contains(&"--continue"),
+            "should forward --continue: {args:?}\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_forward_remote() {
+        require_sandbox!();
+        let (stdout, stderr) = run_fake_copilot_argv(&["--remote"]);
+        let args = extract_args(&stdout);
+        assert!(
+            args.contains(&"--remote"),
+            "should forward --remote: {args:?}\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_forward_name() {
+        require_sandbox!();
+        let (stdout, stderr) = run_fake_copilot_argv(&["--name", "my-refactor"]);
+        let args = extract_args(&stdout);
+        assert!(
+            args.contains(&"--name"),
+            "should forward --name: {args:?}\nstderr: {stderr}"
+        );
+        assert!(
+            args.contains(&"my-refactor"),
+            "should forward session name: {args:?}\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_forward_combined_with_passthrough() {
+        require_sandbox!();
+        let (stdout, stderr) =
+            run_fake_copilot_argv(&["--remote", "--name", "task", "--", "-p", "fix tests"]);
+        let args = extract_args(&stdout);
+        assert!(
+            args.contains(&"--remote"),
+            "should forward --remote: {args:?}\nstderr: {stderr}"
+        );
+        assert!(
+            args.contains(&"--name"),
+            "should forward --name: {args:?}\nstderr: {stderr}"
+        );
+        assert!(
+            args.contains(&"-p"),
+            "should pass through -p: {args:?}\nstderr: {stderr}"
+        );
+        assert!(
+            args.contains(&"fix tests"),
+            "should pass through prompt: {args:?}\nstderr: {stderr}"
+        );
+    }
 }

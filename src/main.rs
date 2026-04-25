@@ -265,6 +265,31 @@ struct Cli {
     #[arg(long)]
     no_quiet: bool,
 
+    // --- Copilot pass-through flags ---
+    // These are forwarded directly to the copilot process for convenience,
+    // avoiding the need for -- when using common session-level flags.
+    /// Resume a previous copilot session. Use --resume to pick interactively,
+    /// or --resume=NAME to resume a specific session by name or ID.
+    /// Forwarded to copilot as --resume[=SESSION].
+    #[arg(long, value_name = "SESSION", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+    resume: Option<String>,
+
+    /// Resume the most recent copilot session in this directory.
+    /// Forwarded to copilot as --continue.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    continue_session: bool,
+
+    /// Enable remote control for the copilot session.
+    /// Allows monitoring and steering from GitHub.com or mobile.
+    /// Forwarded to copilot as --remote.
+    #[arg(long)]
+    remote: bool,
+
+    /// Name the copilot session for later resumption with --resume=NAME.
+    /// Forwarded to copilot as --name SESSION.
+    #[arg(long = "name", value_name = "SESSION")]
+    session_name: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -907,11 +932,14 @@ fn main() -> ExitCode {
     eprintln!("{YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}");
     eprintln!();
 
+    // Build copilot args: forwarded convenience flags + explicit -- args
+    let copilot_args = build_copilot_args(&cli);
+
     // Run copilot inside sandbox
     let exit_code = sandbox::exec_sandboxed(
         &prepared,
         &copilot_bin,
-        &cli.copilot_args,
+        &copilot_args,
         &resolved.pass_env,
         resolved.inherit_env,
         &disabled_categories,
@@ -927,6 +955,33 @@ fn main() -> ExitCode {
     }
 
     ExitCode::from(exit_code)
+}
+
+/// Build the copilot argument vector by prepending forwarded convenience
+/// flags (--resume, --continue, --remote, --name) before explicit -- args.
+fn build_copilot_args(cli: &Cli) -> Vec<String> {
+    let mut args = Vec::new();
+
+    if cli.remote {
+        args.push("--remote".into());
+    }
+    if let Some(ref session) = cli.resume {
+        if session.is_empty() {
+            args.push("--resume".into());
+        } else {
+            args.push(format!("--resume={session}"));
+        }
+    }
+    if cli.continue_session {
+        args.push("--continue".into());
+    }
+    if let Some(ref name) = cli.session_name {
+        args.push("--name".into());
+        args.push(name.clone());
+    }
+
+    args.extend(cli.copilot_args.iter().cloned());
+    args
 }
 
 fn run_doctor() -> ExitCode {
@@ -1687,4 +1742,76 @@ fn is_editor_shim(path: &Path) -> bool {
         return false;
     };
     content.starts_with("#!") && content.contains("copilotCLIShim.js")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("cplt").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn no_forwarded_flags() {
+        let cli = parse(&["--", "-p", "fix tests"]);
+        let args = build_copilot_args(&cli);
+        assert_eq!(args, vec!["-p", "fix tests"]);
+    }
+
+    #[test]
+    fn resume_interactive() {
+        let cli = parse(&["--resume"]);
+        let args = build_copilot_args(&cli);
+        assert_eq!(args, vec!["--resume"]);
+    }
+
+    #[test]
+    fn resume_with_session_name() {
+        let cli = parse(&["--resume=my-task"]);
+        let args = build_copilot_args(&cli);
+        assert_eq!(args, vec!["--resume=my-task"]);
+    }
+
+    #[test]
+    fn continue_session() {
+        let cli = parse(&["--continue"]);
+        let args = build_copilot_args(&cli);
+        assert_eq!(args, vec!["--continue"]);
+    }
+
+    #[test]
+    fn remote_flag() {
+        let cli = parse(&["--remote"]);
+        let args = build_copilot_args(&cli);
+        assert_eq!(args, vec!["--remote"]);
+    }
+
+    #[test]
+    fn name_session() {
+        let cli = parse(&["--name", "my-refactor"]);
+        let args = build_copilot_args(&cli);
+        assert_eq!(args, vec!["--name", "my-refactor"]);
+    }
+
+    #[test]
+    fn combined_forwarded_and_passthrough() {
+        let cli = parse(&["--remote", "--name", "task", "--", "-p", "fix tests"]);
+        let args = build_copilot_args(&cli);
+        assert_eq!(args, vec!["--remote", "--name", "task", "-p", "fix tests"]);
+    }
+
+    #[test]
+    fn resume_and_continue_conflict() {
+        let result = Cli::try_parse_from(["cplt", "--resume", "--continue"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn forwarded_flags_prepended_before_passthrough() {
+        let cli = parse(&["--resume=s1", "--remote", "--", "--other"]);
+        let args = build_copilot_args(&cli);
+        assert_eq!(args, vec!["--remote", "--resume=s1", "--other"]);
+    }
 }
