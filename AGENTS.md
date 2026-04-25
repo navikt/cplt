@@ -40,8 +40,8 @@ Always run `mise run check` at the end of a coding session.
 - `src/proxy.rs` + `src/proxy/` — CONNECT proxy, domain blocking
 - `tests/unit_tests.rs` — cross-platform unit tests (137 tests)
 - `tests/integration.rs` — macOS sandbox-exec kernel-level tests (36 tests)
-- `tests/e2e.rs` — end-to-end with compiled binary + smoke tests
-- `tests/e2e_projects.rs` — e2e tests with realistic project scaffolding (28 tests)
+- `tests/e2e.rs` — end-to-end with compiled binary + smoke tests (67 tests)
+- `tests/e2e_projects.rs` — e2e tests with realistic project scaffolding (37 tests)
 - `SECURITY.md` — threat model, defense layers, honest gaps
 
 ## Testing

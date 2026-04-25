@@ -396,6 +396,7 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 # allow_env_files = false
 # allow_lifecycle_scripts = false
 # allow_gpg_signing = false    # Allow GPG commit signing (see SECURITY.md)
+# allow_jvm_attach = false     # Allow JVM Attach API unix sockets (MockK, Mockito)
 # allow_localhost_any = false
 # scratch_dir = true           # On by default; set false to disable
 # allow_tmp_exec = false       # Dangerous — prefer scratch_dir
