@@ -133,7 +133,7 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 - A compromised agent CAN make HTTPS requests to attacker-controlled servers on port 443
 - A compromised agent CANNOT exfiltrate cloud credentials from env vars (env is sanitized; only safe allowlist passes through)
 - A compromised agent CAN exfiltrate project source code and Copilot auth tokens
-- A compromised agent CANNOT connect to local services (localhost is blocked)
+- A compromised agent CANNOT connect to local services (localhost is blocked on macOS; on Linux, use `--with-proxy` — see [Linux-specific limitations](#linux-specific-limitations))
 - A compromised agent CANNOT use loaded SSH keys (unix socket is blocked)
 - A compromised agent CANNOT connect on non-standard ports (e.g., 8080, 3000) unless `--allow-port` is used
 - A compromised agent CANNOT exfiltrate SSH keys, cloud credentials, or npm tokens (kernel-blocked from reading them)
@@ -405,6 +405,7 @@ Linux-specific tool directories use XDG-style paths:
 2. **No subpath deny**: Cannot deny `~/.config/gh/extensions` while allowing `~/.config/gh/hosts.yml` — the entire directory must be allowed or denied.
 3. **No auth integration**: Linux v1 supports env token + `gh auth` only (no D-Bus/Secret Service).
 4. **Copilot extraction**: The macOS SEA extraction path is unknown on Linux — `ensure_copilot_extracted()` is skipped.
+5. **No localhost isolation at kernel level**: Landlock network rules are port-based only — they cannot distinguish `localhost:443` from `remote:443`. On macOS, Seatbelt blocks localhost outbound separately. On Linux, use `--with-proxy` for localhost SSRF protection (the proxy resolves DNS and blocks private IPs).
 
 The proxy provides:
 

@@ -261,6 +261,17 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
              within it remain readable. Differs from macOS Seatbelt behavior."
         );
     }
+    // Landlock network rules are port-based, not address-based — localhost
+    // cannot be distinguished from remote hosts at the kernel level.
+    if config.proxy_port.is_none()
+        && (!config.localhost_ports.is_empty() || config.allow_localhost_any)
+    {
+        eprintln!(
+            "\x1b[0;33m[cplt]\x1b[0m Localhost protection limited on Linux without proxy: \
+             Landlock cannot distinguish localhost from remote hosts. \
+             Use --with-proxy for localhost SSRF protection."
+        );
+    }
 
     let policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);

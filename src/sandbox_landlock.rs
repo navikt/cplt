@@ -16,6 +16,9 @@
 //! environment hardening (GIT_CONFIG overrides), not from filesystem rules.
 //!
 //! Landlock network rules (ABI v4+) are port-based, not address-based.
+//! This means port 443 allows connecting to ANY host on that port, including
+//! localhost. On macOS, Seatbelt can deny localhost separately, but Landlock
+//! cannot. Use `--with-proxy` on Linux for localhost SSRF protection.
 //! The proxy handles domain-level filtering on both platforms.
 
 use std::fmt::Write as _;
@@ -262,6 +265,32 @@ pub(crate) const LINUX_HOME_TOOL_DIRS: &[HomeToolDir] = &[
     },
 ];
 
+/// Individual home config files that tools need read access to.
+///
+/// These are specific files, NOT directories — Landlock PathBeneath
+/// on a directory would grant recursive access to the entire subtree.
+/// Mirrors the macOS SBPL literal file allows in `emit_system_access()`.
+const LINUX_HOME_CONFIG_FILES: &[&str] = &[
+    // Git configuration
+    ".gitconfig",
+    ".config/git/config",
+    // GitHub CLI auth (specific files only)
+    ".config/gh/hosts.yml",
+    ".config/gh/config.yml",
+    // Tool version managers
+    ".tool-versions",
+    // mise config (tool versions, no secrets)
+    ".config/mise",
+    // Shell startup (tools source these for PATH)
+    ".bashrc",
+    ".zshrc",
+    ".profile",
+    ".bash_profile",
+    ".zprofile",
+    // Node.js REPL history
+    ".node_repl_history",
+];
+
 /// Device and pseudo-filesystem paths that Node.js and common tools need.
 const DEVICE_FILES: &[&str] = &[
     "/dev/null",
@@ -452,28 +481,44 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         }
     }
 
-    // ── Home dir itself: read-only for dotfile enumeration ──
-    // Tools like Node.js resolve config by listing $HOME. Grant read
-    // on the home dir itself (not recursively — Landlock is per-dir).
-    fs_rules.push(FsRule {
-        path: home.to_path_buf(),
-        access: FsAccess {
-            read: true,
-            write: false,
-            execute: false,
-        },
-    });
+    // ── Home config files: individual read-only rules ──
+    // Landlock PathBeneath rules are always recursive — a rule on $HOME
+    // would grant read to the entire home tree including ~/.ssh, ~/.gnupg.
+    // Instead, enumerate the specific config files/dirs that tools need.
+    for &file in LINUX_HOME_CONFIG_FILES {
+        fs_rules.push(FsRule {
+            path: home.join(file),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: false,
+            },
+        });
+    }
 
-    // ── Copilot config dir: read + write ──
-    // Copilot stores auth tokens and config in ~/.copilot/
-    fs_rules.push(FsRule {
-        path: home.join(".copilot"),
-        access: FsAccess {
-            read: true,
-            write: true,
-            execute: false,
-        },
-    });
+    // ── Agent-specific directories ──
+    if config.agent.needs_copilot_dir() {
+        // Copilot config — auth tokens, settings, native modules.
+        // Execute needed for dlopen() of native .node addons (keytar, pty, computer).
+        fs_rules.push(FsRule {
+            path: home.join(".copilot"),
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: true,
+            },
+        });
+    }
+    for dir in config.agent_dirs {
+        fs_rules.push(FsRule {
+            path: dir.path.clone(),
+            access: FsAccess {
+                read: true,
+                write: dir.write,
+                execute: dir.process_exec || dir.map_exec,
+            },
+        });
+    }
 
     // ── Network rules (requires ABI v4+, kernel 6.7+) ──
     // Always allow HTTPS (443) — Copilot needs it to reach GitHub APIs.
@@ -679,6 +724,9 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
 ///
 /// Returns a Vec of BPF instructions ready to be passed to prctl()
 /// in the child. No allocation needed in pre_exec.
+///
+/// Security: The filter validates `seccomp_data.arch` first to prevent
+/// bypass via 32-bit compat syscall ABI (e.g. `int 0x80` on x86_64).
 #[cfg(target_os = "linux")]
 fn build_seccomp_filter() -> Vec<BpfInstruction> {
     // BPF constants
@@ -694,8 +742,15 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
     const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
     const EPERM_VAL: u32 = 1;
 
-    // Offset of `nr` field in seccomp_data struct
+    // seccomp_data field offsets
     const NR_OFFSET: u32 = 0;
+    const ARCH_OFFSET: u32 = 4;
+
+    // Expected architecture audit values
+    #[cfg(target_arch = "x86_64")]
+    const EXPECTED_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const EXPECTED_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 
     const fn stmt(code: u16, k: u32) -> BpfInstruction {
         BpfInstruction {
@@ -712,9 +767,10 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
 
     // Blocked syscall numbers — privilege escalation and system modification
     // syscalls that a sandboxed code assistant should never need.
-    // Cross-architecture: only common syscalls here.
     let mut blocked: Vec<u32> = vec![
         libc::SYS_ptrace as u32,
+        libc::SYS_process_vm_readv as u32,
+        libc::SYS_process_vm_writev as u32,
         libc::SYS_mount as u32,
         libc::SYS_umount2 as u32,
         libc::SYS_unshare as u32,
@@ -732,6 +788,12 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
         libc::SYS_keyctl as u32,
         libc::SYS_request_key as u32,
         libc::SYS_add_key as u32,
+        libc::SYS_io_uring_setup as u32,
+        libc::SYS_io_uring_enter as u32,
+        libc::SYS_io_uring_register as u32,
+        libc::SYS_userfaultfd as u32,
+        libc::SYS_perf_event_open as u32,
+        libc::SYS_bpf as u32,
     ];
 
     // x86_64-only syscalls — these don't exist on aarch64.
@@ -742,9 +804,15 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
         blocked.push(libc::SYS_modify_ldt as u32);
     }
 
-    let mut filter = Vec::with_capacity(blocked.len() * 2 + 2);
+    let mut filter = Vec::with_capacity(blocked.len() * 2 + 4);
 
-    // Load syscall number from seccomp_data.nr
+    // Step 1: Validate architecture — prevent bypass via compat syscall ABI.
+    // If arch doesn't match, return EPERM for all syscalls.
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, ARCH_OFFSET));
+    filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, EXPECTED_ARCH, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
+
+    // Step 2: Load syscall number and check against blocklist.
     filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, NR_OFFSET));
 
     // For each blocked syscall: compare and jump to EPERM if match
@@ -761,19 +829,13 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
 
 /// Apply the pre-computed sandbox to the current process.
 ///
-/// Called in the child's `pre_exec` hook. All file descriptors are
-/// pre-opened in the parent, and BPF instructions pre-built, so this
-/// function only makes syscalls (Landlock, prctl) — no allocation,
-/// no file I/O, no CString construction.
+/// Called in the child's `pre_exec` hook. File descriptors are pre-opened
+/// and BPF instructions pre-built in the parent via `precompute()`.
 ///
-/// # Safety context
-///
-/// Safe for `pre_exec` because:
-/// - Landlock crate API internally uses only syscalls + stack structs
-/// - File descriptors are pre-opened in parent (via `precompute()`)
-/// - `BorrowedFd::borrow_raw()` is zero-cost, no allocation
-/// - Seccomp filter is pre-built; only prctl() is called here
-/// - All error messages are static strings (no allocation)
+/// Note: The Landlock crate API does heap-allocate internally (Ruleset,
+/// add_rule, etc.). In practice this is safe because our fork happens
+/// before any proxy thread starts, so no mutex contention. The seccomp
+/// filter application is allocation-free (raw prctl syscall).
 #[cfg(target_os = "linux")]
 pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     use std::os::fd::BorrowedFd;
@@ -827,6 +889,12 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
                 | AccessFs::MakeSym
                 | AccessFs::MakeFifo
                 | AccessFs::MakeSock;
+            if abi_version >= 2 {
+                // Refer controls rename()/link() across different Landlock
+                // domains. Without it, build tools (cargo, git) that move
+                // files between directories would fail.
+                write_flags |= AccessFs::Refer;
+            }
             if abi_version >= 3 {
                 write_flags |= AccessFs::Truncate;
             }
@@ -907,6 +975,8 @@ fn apply_seccomp_filter(filter: &[BpfInstruction]) -> std::io::Result<()> {
 /// via `blocked_syscall_names()` to match `build_seccomp_filter()`.
 const BLOCKED_SYSCALL_NAMES_COMMON: &[&str] = &[
     "ptrace",
+    "process_vm_readv",
+    "process_vm_writev",
     "mount",
     "umount2",
     "unshare",
@@ -924,6 +994,12 @@ const BLOCKED_SYSCALL_NAMES_COMMON: &[&str] = &[
     "keyctl",
     "request_key",
     "add_key",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+    "userfaultfd",
+    "perf_event_open",
+    "bpf",
 ];
 
 /// Return the full list of blocked syscall names for the current architecture.
@@ -1363,31 +1439,40 @@ mod tests {
     fn blocked_syscall_names_not_empty() {
         let names = blocked_syscall_names();
         assert!(
-            names.len() >= 18,
-            "should block at least 18 dangerous syscalls, got {}",
+            names.len() >= 26,
+            "should block at least 26 dangerous syscalls, got {}",
             names.len()
         );
     }
 
     #[test]
-    fn home_dir_itself_is_readable() {
+    fn home_config_files_are_readable() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
         let config = test_config(&project, &home);
         let policy = generate_policy(&config);
 
-        let rule = policy
-            .fs_rules
-            .iter()
-            .find(|r| r.path == home)
-            .expect("home dir should be in rules");
-        assert!(rule.access.read);
-        assert!(!rule.access.write);
-        assert!(!rule.access.execute);
+        for &file in LINUX_HOME_CONFIG_FILES {
+            let path = home.join(file);
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == path)
+                .unwrap_or_else(|| panic!("home config file {file} should be in rules"));
+            assert!(rule.access.read, "{file} should have read");
+            assert!(!rule.access.write, "{file} should NOT have write");
+            assert!(!rule.access.execute, "{file} should NOT have execute");
+        }
+
+        // $HOME itself must NOT be in the ruleset (would grant recursive read)
+        assert!(
+            !policy.fs_rules.iter().any(|r| r.path == home),
+            "$HOME must not have a blanket rule (Landlock is recursive)"
+        );
     }
 
     #[test]
-    fn copilot_config_dir_is_writable() {
+    fn copilot_config_dir_is_writable_and_executable() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
         let config = test_config(&project, &home);
@@ -1400,5 +1485,70 @@ mod tests {
             .expect(".copilot dir should be in rules");
         assert!(rule.access.read);
         assert!(rule.access.write);
+        assert!(
+            rule.access.execute,
+            ".copilot needs execute for native .node module dlopen()"
+        );
+    }
+
+    #[test]
+    fn copilot_dir_absent_for_non_copilot_agent() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.agent = crate::agent::Agent::OpenCode;
+        let policy = generate_policy(&config);
+
+        assert!(
+            !policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == home.join(".copilot")),
+            ".copilot should NOT be in rules for non-Copilot agent"
+        );
+    }
+
+    #[test]
+    fn agent_dirs_added_to_policy() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let agent_dirs = vec![
+            crate::agent::AgentDir {
+                path: home.join(".config/opencode"),
+                write: false,
+                map_exec: false,
+                process_exec: false,
+            },
+            crate::agent::AgentDir {
+                path: home.join(".local/share/opencode"),
+                write: true,
+                map_exec: false,
+                process_exec: false,
+            },
+        ];
+        let mut config = test_config(&project, &home);
+        config.agent = crate::agent::Agent::OpenCode;
+        config.agent_dirs = &agent_dirs;
+        let policy = generate_policy(&config);
+
+        let config_rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == home.join(".config/opencode"))
+            .expect("OpenCode config dir should be in rules");
+        assert!(config_rule.access.read);
+        assert!(!config_rule.access.write, "config dir should be read-only");
+
+        let data_rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == home.join(".local/share/opencode"))
+            .expect("OpenCode data dir should be in rules");
+        assert!(data_rule.access.read);
+        assert!(data_rule.access.write, "data dir should be writable");
+        assert!(
+            !data_rule.access.execute,
+            "data dir should NOT be executable"
+        );
     }
 }

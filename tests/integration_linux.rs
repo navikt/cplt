@@ -517,22 +517,46 @@ else:
     fn project_home_secrets_blocked() {
         require_landlock!();
         let project = create_test_project();
-        // Try to read various sensitive paths
+        // Create a hermetic fake HOME with sensitive directories populated.
+        // This ensures the test doesn't pass vacuously when dirs don't exist.
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        for dir in &[".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker"] {
+            let path = fake_home.path().join(dir);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("secret"), "sensitive-data").unwrap();
+        }
+
         let script = r#"
             fail=0
-            for path in ~/.ssh ~/.gnupg ~/.aws ~/.azure ~/.kube ~/.docker ~/.nais; do
-                if [ -d "$path" ] && ls "$path" 2>/dev/null; then
-                    echo "FAIL: could list $path"
+            for path in ~/.ssh ~/.gnupg ~/.aws ~/.azure ~/.kube ~/.docker; do
+                if cat "$path/secret" 2>/dev/null; then
+                    echo "FAIL: could read $path/secret"
                     fail=1
                 fi
             done
             exit $fail
         "#;
-        let (code, _, _) = run_sandboxed(project.path(), script);
-        // If all paths don't exist, that's also fine (code 0 means none were accessible)
+
+        let output = Command::new(binary_path())
+            .args([
+                "--no-validate",
+                "--quiet",
+                "-C",
+                &project.path().to_string_lossy(),
+                "--",
+                "sh",
+                "-c",
+                script,
+            ])
+            .env("HOME", fake_home.path())
+            .output()
+            .expect("Failed to execute cplt");
+
+        let code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
             code, 0,
-            "Should not be able to list sensitive home directories"
+            "Should not be able to read sensitive home directories — stdout: {stdout}"
         );
     }
 
