@@ -89,7 +89,10 @@ fn configure_command(
     // Tell mise to ignore config files in ancestor directories that the sandbox blocks.
     let ignored = compute_mise_ignored_paths(project_dir, home_dir);
     if !ignored.is_empty() {
-        let paths: Vec<String> = ignored.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let paths: Vec<String> = ignored
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         cmd.env("MISE_IGNORED_CONFIG_PATHS", paths.join(":"));
     }
 
