@@ -65,12 +65,14 @@ mod linux_tests {
     fn run_sandboxed(project_dir: &Path, script: &str) -> (i32, String, String) {
         let output = Command::new(binary_path())
             .args([
+                "--yes",
                 "--no-validate",
                 "--quiet",
+                "--agent",
+                "shell",
                 "-C",
                 &project_dir.to_string_lossy(),
                 "--",
-                "sh",
                 "-c",
                 script,
             ])
@@ -92,9 +94,17 @@ mod linux_tests {
         script: &str,
     ) -> (i32, String, String) {
         let dir_str = project_dir.to_string_lossy().into_owned();
-        let mut args: Vec<&str> = vec!["--no-validate", "--quiet", "-C", &dir_str];
+        let mut args: Vec<&str> = vec![
+            "--yes",
+            "--no-validate",
+            "--quiet",
+            "--agent",
+            "shell",
+            "-C",
+            &dir_str,
+        ];
         args.extend_from_slice(extra_flags);
-        args.extend_from_slice(&["--", "sh", "-c", script]);
+        args.extend_from_slice(&["--", "-c", script]);
 
         let output = Command::new(binary_path())
             .args(&args)
@@ -144,12 +154,14 @@ mod linux_tests {
 
         let output = Command::new(binary_path())
             .args([
+                "--yes",
                 "--no-validate",
                 "--quiet",
+                "--agent",
+                "shell",
                 "-C",
                 &project.path().to_string_lossy(),
                 "--",
-                "sh",
                 "-c",
                 "cat ~/.ssh/test_key 2>&1",
             ])
@@ -277,12 +289,14 @@ mod linux_tests {
 
         let output = Command::new(binary_path())
             .args([
+                "--yes",
                 "--no-validate",
                 "--quiet",
+                "--agent",
+                "shell",
                 "-C",
                 &project.path().to_string_lossy(),
                 "--",
-                "sh",
                 "-c",
                 "ln -sf ~/.ssh/test_key symlink_test && cat symlink_test 2>&1",
             ])
@@ -310,12 +324,14 @@ mod linux_tests {
 
         let output = Command::new(binary_path())
             .args([
+                "--yes",
                 "--no-validate",
                 "--quiet",
+                "--agent",
+                "shell",
                 "-C",
                 &project.path().to_string_lossy(),
                 "--",
-                "sh",
                 "-c",
                 "bash -c 'bash -c \"cat ~/.ssh/test_key 2>&1\"'",
             ])
@@ -492,12 +508,14 @@ else:
         // Set a dangerous env var and verify it's stripped
         let output = Command::new(binary_path())
             .args([
+                "--yes",
                 "--no-validate",
                 "--quiet",
+                "--agent",
+                "shell",
                 "-C",
                 &project.path().to_string_lossy(),
                 "--",
-                "sh",
                 "-c",
                 "echo \"AWS=$AWS_SECRET_ACCESS_KEY\"",
             ])
@@ -539,12 +557,14 @@ else:
 
         let output = Command::new(binary_path())
             .args([
+                "--yes",
                 "--no-validate",
                 "--quiet",
+                "--agent",
+                "shell",
                 "-C",
                 &project.path().to_string_lossy(),
                 "--",
-                "sh",
                 "-c",
                 script,
             ])
