@@ -19,3 +19,4 @@ src/utils.rs
 src/test/
 tests/test_new.py
 .DS_Store
+.idea
