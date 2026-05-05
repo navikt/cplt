@@ -8,8 +8,8 @@
 //!
 //! All checks are read-only, local (no network), and fast (<500ms total).
 
-use std::path::{Path, PathBuf};
 use crate::sandbox::{DENIED_DOTFILES, DENIED_FILES};
+use std::path::{Path, PathBuf};
 
 // ── Result types ────────────────────────────────────────────────
 
@@ -544,7 +544,7 @@ fn print_sandbox_mechanism_status() -> bool {
                     eprintln!("      Network security provided by proxy only.");
                 }
                 true
-            },
+            }
             Err(_) => {
                 eprintln!("  {RED}✗{NC} Landlock: not available");
                 eprintln!("      Requires Linux 5.13+ with Landlock enabled.");

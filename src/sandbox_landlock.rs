@@ -647,10 +647,11 @@ pub fn describe_policy(policy: &LandlockPolicy) -> String {
 
 // ── Linux-only: Landlock kernel application ────────────────────
 
-/// Check Landlock availability and return the ABI version.
+/// Check Landlock availability and return the highest supported ABI version.
 ///
-/// Reads `/sys/kernel/security/landlock/abi_version` to determine
-/// which Landlock features the running kernel supports.
+/// Probes the kernel by attempting to create a Ruleset for each ABI level
+/// (V6 down to V1) with `HardRequirement` compatibility. Returns the highest
+/// ABI that the kernel successfully supports.
 ///
 /// Called in the parent process during `prepare()` — never in `pre_exec`.
 #[cfg(target_os = "linux")]
@@ -671,7 +672,7 @@ pub fn check_availability() -> Result<landlock::ABI, String> {
 
     match last_error {
         None => {
-            panic!("This should be impossible")
+            unreachable!("ABI_PROBE_ORDER is non-empty")
         }
         Some(e) => Err(format!(
             "Landlock is not available on this system: {e}\n\
@@ -729,9 +730,9 @@ fn probe_abi_candidate(abi: landlock::ABI) -> Result<(), String> {
 /// cloned into the `pre_exec` closure.
 #[cfg(target_os = "linux")]
 pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> {
+    use landlock::ABI;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    use landlock::ABI;
 
     let abi_version = check_availability()?;
     let seccomp_filter = build_seccomp_filter();
@@ -906,8 +907,8 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     use std::os::fd::BorrowedFd;
 
     use landlock::{
-        Access, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus, ABI,
+        ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus,
     };
 
     // Map the detected kernel ABI to the landlock crate's ABI enum.
@@ -916,7 +917,8 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
         2 => ABI::V2,
         3 => ABI::V3,
         4 => ABI::V4,
-        _ => ABI::V5,
+        5 => ABI::V5,
+        _ => ABI::V6,
     };
     let abi_version = sandbox.abi_version;
 
