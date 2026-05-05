@@ -832,10 +832,19 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
 /// Called in the child's `pre_exec` hook. File descriptors are pre-opened
 /// and BPF instructions pre-built in the parent via `precompute()`.
 ///
-/// Note: The Landlock crate API does heap-allocate internally (Ruleset,
-/// add_rule, etc.). In practice this is safe because our fork happens
-/// before any proxy thread starts, so no mutex contention. The seccomp
-/// filter application is allocation-free (raw prctl syscall).
+/// # Safety (async-signal-safety)
+///
+/// The Landlock crate API does heap-allocate internally (Ruleset, add_rule,
+/// etc.). This runs after fork() in a multi-threaded process (the proxy
+/// thread is running). Strictly, heap allocation in pre_exec is not
+/// async-signal-safe. In practice this is safe because:
+/// 1. The proxy thread spends nearly all time blocked in I/O syscalls
+///    (epoll_wait/recv/send), not holding the allocator lock.
+/// 2. The Landlock allocations are small and fast (~microseconds).
+/// 3. This is the same risk profile as any Rust program using
+///    Command::spawn() with pre_exec in a multi-threaded context.
+///
+/// The seccomp filter application is allocation-free (raw prctl syscall).
 #[cfg(target_os = "linux")]
 pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     use std::os::fd::BorrowedFd;

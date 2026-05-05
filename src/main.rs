@@ -12,11 +12,15 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
-/// Run AI coding agents inside a macOS sandbox.
+/// Run AI coding agents inside a kernel-level sandbox.
 ///
 /// The agent can read and write your project files, but cannot access your
 /// SSH keys, cloud credentials, or other secrets. The sandbox is enforced
-/// by the macOS kernel — the agent (and any process it spawns) cannot bypass it.
+/// by the OS kernel — the agent (and any process it spawns) cannot bypass it.
+///
+/// Platform enforcement:
+/// - macOS: Apple Seatbelt/SBPL via sandbox-exec
+/// - Linux: Landlock LSM + seccomp-BPF (kernel 5.13+, full network filtering on 6.7+)
 ///
 /// Supports GitHub Copilot CLI, OpenCode, and Google Gemini CLI. Auto-detects
 /// which agent to use, or specify explicitly with --agent.
@@ -569,14 +573,6 @@ fn main() -> ExitCode {
     // Handle --doctor: run diagnostics and exit (works on all platforms)
     if cli.doctor {
         return run_doctor();
-    }
-
-    // Linux sandbox is not yet implemented — gate at runtime until Landlock backend lands.
-    // Uses cfg!() instead of #[cfg()] so the compiler still type-checks the code below
-    // on Linux without triggering unreachable-code warnings.
-    if cfg!(not(target_os = "macos")) {
-        error("Linux sandbox support is not yet implemented (see issue #16)");
-        return ExitCode::FAILURE;
     }
 
     // Load config file and merge with CLI flags

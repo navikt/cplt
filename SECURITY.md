@@ -42,10 +42,26 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | **Process-group escape** | Kill parent, children continue unsandboxed | Signal forwarding (SIGTERM, SIGHUP) |
 | **Env var credential theft** | Read `AWS_SECRET_ACCESS_KEY` from env | `env_clear()` + safe allowlist |
 | **Persistence via native modules** | Replace `keytar.node` with malware | Deny writes to `~/.copilot/pkg` |
-| **Git hook injection** | Write post-checkout hook that runs outside sandbox | Deny writes to `.git/hooks/` and global `core.hooksPath` dir |
-| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Deny writes to `.git/config`; global hooks path validated |
-| **Submodule supply chain** | Modify `.gitmodules` to point to malicious repo | Deny writes to `.gitmodules` |
+| **Git hook injection** | Write post-checkout hook that runs outside sandbox | Seatbelt deny rules (macOS); env hardening `GIT_CONFIG_NOSYSTEM` + proxy exfiltration blocking (Linux — project-internal `.git/hooks` is writable) |
+| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Seatbelt deny rules (macOS); env hardening (Linux — `.git/config` writable within project, but proxy blocks redirected fetches) |
+| **Submodule supply chain** | Modify `.gitmodules` to point to malicious repo | Seatbelt deny rules (macOS); proxy domain filtering (Linux — `.gitmodules` writable within project) |
 | **Syscall abuse** | `ptrace`, `mount`, `kexec_load` | seccomp-BPF filter (Linux) |
+
+### Platform enforcement comparison
+
+| Protection | macOS (Seatbelt) | Linux (Landlock + seccomp) |
+|---|---|---|
+| Credential files (~/.ssh, ~/.aws) | ✅ Kernel deny | ✅ Not in ruleset (deny-by-default) |
+| Project .env file reads | ✅ Kernel deny | ⚠️ Proxy blocks exfiltration |
+| .git/hooks write in project | ✅ Kernel deny | ⚠️ Env hardening (GIT_CONFIG_NOSYSTEM) |
+| .git/config write in project | ✅ Kernel deny | ⚠️ Env hardening + proxy |
+| Network: outbound port filtering | ✅ Kernel (all versions) | ✅ Kernel (6.7+) / ⚠️ Proxy only (<6.7) |
+| Network: localhost isolation | ✅ Kernel deny | ⚠️ Proxy domain filtering |
+| Exec from /tmp | ✅ Kernel deny | ✅ Landlock deny |
+| Dangerous syscalls | N/A (Seatbelt covers) | ✅ seccomp-BPF |
+| --deny-path | ✅ Kernel deny | ❌ No effect (warned) |
+
+Legend: ✅ = kernel-enforced, ⚠️ = defense-in-depth (proxy/env), ❌ = not available
 
 ### Out of scope
 

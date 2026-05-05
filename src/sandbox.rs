@@ -272,6 +272,24 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
              Use --with-proxy for localhost SSRF protection."
         );
     }
+    if config.allow_docker {
+        eprintln!(
+            "\x1b[0;33m[cplt]\x1b[0m --allow-docker has no effect on Linux: \
+             Docker socket access is not yet implemented in the Landlock backend."
+        );
+    }
+    if config.allow_jvm_attach {
+        eprintln!(
+            "\x1b[0;33m[cplt]\x1b[0m --allow-jvm-attach has no effect on Linux: \
+             JVM attach socket patterns are macOS-specific."
+        );
+    }
+    if !config.allow_cache_exec.is_empty() || config.allow_cache_exec_any {
+        eprintln!(
+            "\x1b[0;33m[cplt]\x1b[0m --allow-cache-exec has no effect on Linux: \
+             ~/Library/Caches is a macOS-specific path."
+        );
+    }
 
     let policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);

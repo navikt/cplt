@@ -9,7 +9,7 @@
 Sandbox wrapper for AI coding agents. Runs GitHub Copilot CLI, OpenCode, or a plain shell inside a kernel-level sandbox so the agent can work on your project but cannot access your secrets.
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
-- **Linux**: Landlock LSM + seccomp-BPF (kernel 5.13+)
+- **Linux**: Landlock LSM + seccomp-BPF (kernel 5.13+; full network filtering on 6.7+)
 
 ![cplt banner](./assets/cplt.png)
 
@@ -1104,7 +1104,9 @@ Only port 443 is allowed by default. Services on other ports need `--allow-port`
 
 - **Kernel 5.13+ required** — Landlock LSM must be enabled (`cat /sys/kernel/security/lsm`)
 - **TCP port filtering requires kernel 6.7+** — older kernels get filesystem-only enforcement; network security via proxy only
-- **Landlock cannot deny subpaths within allowed paths** — different granularity than Seatbelt
+- **Landlock cannot deny subpaths within allowed paths** — unlike macOS Seatbelt, Landlock cannot deny `.env` reads or `.git/hooks` writes *inside* the project directory at the kernel level. Defense-in-depth comes from the proxy (blocks exfiltration) and env hardening (`GIT_CONFIG_NOSYSTEM`, etc.)
+- **`--deny-path` has no effect** — Landlock is allowlist-only; a runtime warning is emitted
+- **Some macOS flags are not applicable** — `--allow-docker`, `--allow-jvm-attach`, `--allow-cache-exec` emit warnings and are ignored on Linux
 - **No audit logs** — `--show-denials` is macOS-only; use `strace -f -e trace=file,network` for debugging
 - **Auth scoped to env + gh CLI** — no D-Bus/Secret Service integration for v1
 
