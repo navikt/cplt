@@ -374,7 +374,7 @@ cplt requires ABI v1 minimum. On ABI < v4, network security relies on the CONNEC
 | Audit logs | Full Seatbelt violation log | None (no audit mode) |
 | Privilege | Requires `sandbox-exec` (deprecated) | Unprivileged (any user) |
 
-**Pre-exec safety:** Because the proxy thread makes the process multi-threaded, Landlock rules and seccomp filters are pre-computed in the parent process (`PrecomputedSandbox`) and applied in the child's `pre_exec` callback using only async-signal-safe raw syscalls.
+**Pre-exec safety:** The proxy thread makes the process multi-threaded before `fork`. Landlock rules are pre-computed in the parent process (`PrecomputedSandbox`), and the seccomp filter is installed via raw syscall. The Landlock crate performs small heap allocations in `pre_exec` which is technically not async-signal-safe, but works reliably in practice (the proxy thread is blocked in I/O syscalls during fork, minimizing allocator contention).
 
 #### seccomp-BPF (syscall filtering)
 
@@ -383,6 +383,7 @@ A BPF filter blocks dangerous syscalls that could be used to escape the sandbox 
 | Blocked syscall | Reason |
 |----------------|--------|
 | `ptrace` | Prevents debugging/injecting into other processes |
+| `process_vm_readv`, `process_vm_writev` | Prevents cross-process memory access |
 | `mount`, `umount2` | Prevents filesystem namespace manipulation |
 | `pivot_root`, `chroot` | Prevents root filesystem escape |
 | `unshare` | Prevents creating new namespaces |
@@ -393,6 +394,10 @@ A BPF filter blocks dangerous syscalls that could be used to escape the sandbox 
 | `swapon`, `swapoff` | Prevents swap manipulation |
 | `personality` | Prevents ABI personality changes |
 | `add_key`, `keyctl`, `request_key` | Prevents kernel keyring manipulation |
+| `io_uring_setup`, `io_uring_enter`, `io_uring_register` | Prevents io_uring (bypass of seccomp/Landlock) |
+| `userfaultfd` | Prevents userfaultfd exploitation |
+| `perf_event_open` | Prevents perf-based side channels |
+| `bpf` | Prevents BPF program loading |
 | `iopl`, `ioperm` | Prevents I/O port access (x86_64 only) |
 | `modify_ldt` | Prevents LDT modification (x86_64 only) |
 
