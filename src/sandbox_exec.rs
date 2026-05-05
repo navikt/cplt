@@ -110,9 +110,15 @@ fn configure_command(
         cmd.env("HTTPS_PROXY", &proxy_url);
         cmd.env("http_proxy", &proxy_url);
         cmd.env("https_proxy", &proxy_url);
-        // Exclude loopback from proxying — MCP servers, dev servers, etc.
-        cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
-        cmd.env("no_proxy", "localhost,127.0.0.1,::1");
+        // On macOS, exclude loopback from proxying — Seatbelt enforces localhost
+        // isolation at the kernel level, and MCP servers/dev servers need direct access.
+        // On Linux, do NOT exclude localhost — the proxy is the only mechanism to
+        // mediate/deny loopback connections (Landlock cannot filter by IP).
+        #[cfg(target_os = "macos")]
+        {
+            cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+            cmd.env("no_proxy", "localhost,127.0.0.1,::1");
+        }
     }
 }
 
@@ -333,6 +339,11 @@ pub fn exec(
     );
 
     // Apply pre-computed sandbox in the child process, between fork and exec.
+    // Safety: The proxy thread is running (multi-threaded at fork), making this
+    // technically not async-signal-safe. The Landlock crate performs small heap
+    // allocations internally. This works reliably in practice because the proxy
+    // thread is blocked in I/O syscalls during fork, minimizing allocator lock
+    // contention. See SECURITY.md "Pre-exec safety" for full analysis.
     let precomputed = sandbox.precomputed.clone();
     unsafe {
         cmd.pre_exec(move || super::landlock_mod::apply_precomputed(&precomputed));

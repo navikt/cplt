@@ -265,10 +265,14 @@ pub(crate) const LINUX_HOME_TOOL_DIRS: &[HomeToolDir] = &[
     },
 ];
 
-/// Individual home config files that tools need read access to.
+/// Individual home config files (and select config directories) that tools
+/// need read access to.
 ///
-/// These are specific files, NOT directories — Landlock PathBeneath
-/// on a directory would grant recursive access to the entire subtree.
+/// File entries grant access to a single file. Directory entries (e.g.
+/// `.config/mise`) grant recursive read access to the subtree — this is
+/// acceptable because these directories contain only tool configuration,
+/// not secrets.
+///
 /// Mirrors the macOS SBPL literal file allows in `emit_system_access()`.
 const LINUX_HOME_CONFIG_FILES: &[&str] = &[
     // Git configuration
@@ -279,7 +283,7 @@ const LINUX_HOME_CONFIG_FILES: &[&str] = &[
     ".config/gh/config.yml",
     // Tool version managers
     ".tool-versions",
-    // mise config (tool versions, no secrets)
+    // mise config directory (tool versions, env settings — no secrets)
     ".config/mise",
     // Shell startup (tools source these for PATH)
     ".bashrc",
@@ -388,14 +392,17 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
-    // ── Scratch directory: read + write, execute only if allowed ──
+    // ── Scratch directory: read + write + execute (always) ──
+    // The scratch dir is the controlled alternative to /tmp for compile-then-exec
+    // workflows (e.g. node-gyp, cargo). Execute is always allowed here regardless
+    // of allow_tmp_exec, which controls only system temp dirs like /tmp.
     if let Some(dir) = config.scratch_dir {
         fs_rules.push(FsRule {
             path: dir.to_path_buf(),
             access: FsAccess {
                 read: true,
                 write: true,
-                execute: config.allow_tmp_exec,
+                execute: true,
             },
         });
     }
@@ -691,10 +698,20 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     let seccomp_filter = build_seccomp_filter();
 
     if abi_version < 4 {
-        eprintln!(
-            "\x1b[0;33m[cplt]\x1b[0m Landlock ABI v{abi_version} (kernel < 6.7): \
-             TCP port filtering unavailable. Network security provided by proxy only."
-        );
+        // Check if proxy is configured (proxy_port would have been added to net_rules)
+        let has_proxy = policy.net_rules.iter().any(|r| r.port != 443);
+        if has_proxy {
+            eprintln!(
+                "\x1b[0;33m[cplt]\x1b[0m Landlock ABI v{abi_version} (kernel < 6.7): \
+                 TCP port filtering unavailable. Network security provided by proxy only."
+            );
+        } else {
+            eprintln!(
+                "\x1b[0;31m[cplt]\x1b[0m WARNING: Landlock ABI v{abi_version} (kernel < 6.7) \
+                 and no proxy configured — outbound network is UNRESTRICTED. \
+                 Use --with-proxy or upgrade to kernel 6.7+ for network isolation."
+            );
+        }
     }
 
     // Pre-open all filesystem paths in the parent process.
@@ -1170,11 +1187,14 @@ mod tests {
     }
 
     #[test]
-    fn scratch_dir_gets_write_and_conditional_exec() {
+    fn scratch_dir_always_has_exec() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
         let scratch = PathBuf::from("/home/user/.cache/cplt/tmp/session-1");
 
+        // Scratch dir should always have exec, regardless of allow_tmp_exec.
+        // The scratch dir is the controlled alternative to /tmp for
+        // compile-then-exec workflows (node-gyp, cargo).
         let mut config = test_config(&project, &home);
         config.scratch_dir = Some(&scratch);
         config.allow_tmp_exec = false;
@@ -1188,20 +1208,8 @@ mod tests {
         assert!(rule.access.read);
         assert!(rule.access.write);
         assert!(
-            !rule.access.execute,
-            "exec should be off when allow_tmp_exec=false"
-        );
-
-        config.allow_tmp_exec = true;
-        let policy = generate_policy(&config);
-        let rule = policy
-            .fs_rules
-            .iter()
-            .find(|r| r.path == scratch)
-            .expect("scratch dir should be in rules");
-        assert!(
             rule.access.execute,
-            "exec should be on when allow_tmp_exec=true"
+            "scratch dir should always have exec (independent of allow_tmp_exec)"
         );
     }
 

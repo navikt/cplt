@@ -594,7 +594,7 @@ cplt config set sandbox.quiet --unset
 └──────────────────────────────────┘
 ```
 
-**Security model**: deny-by-default filesystem with kernel enforcement. Network is restricted to port 443 (HTTPS) by default (use `--allow-port` for extras). SSH agent access and localhost outbound are blocked at the kernel level. The profile generator auto-discovers your environment (`--doctor`) and only includes tool directories that actually exist on disk — fewer rules means a tighter sandbox.
+**Security model**: deny-by-default filesystem with kernel enforcement. On macOS and Linux with kernel 6.7+ (Landlock ABI v4), network is restricted to port 443 (HTTPS) by default (use `--allow-port` for extras). On older Linux kernels, network restriction is provided by the CONNECT proxy (enabled by default). SSH agent access and localhost outbound are blocked at the kernel level (macOS) or via the proxy (Linux). The profile generator auto-discovers your environment (`--doctor`) and only includes tool directories that actually exist on disk — fewer rules means a tighter sandbox.
 
 Platform-specific details:
 - **macOS**: Seatbelt/SBPL profile generated and passed to `sandbox-exec`

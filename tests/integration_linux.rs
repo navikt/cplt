@@ -121,6 +121,61 @@ mod linux_tests {
 
     // ── Filesystem enforcement tests ──────────────────────────────
 
+    /// Run a shell command inside the sandbox with a custom HOME directory.
+    fn run_sandboxed_home(project_dir: &Path, home: &Path, script: &str) -> (i32, String, String) {
+        let output = Command::new(binary_path())
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "-C",
+                &project_dir.to_string_lossy(),
+                "--",
+                "-c",
+                script,
+            ])
+            .env("HOME", home)
+            .output()
+            .expect("Failed to execute cplt");
+
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
+    /// Create a fake HOME with populated sensitive directories for hermetic testing.
+    fn create_fake_home_with_secrets() -> tempfile::TempDir {
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        for dir in &[".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker"] {
+            let path = fake_home.path().join(dir);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("secret"), "sensitive-data").unwrap();
+        }
+        // Create specific credential files that tests check
+        fs::write(
+            fake_home.path().join(".aws/credentials"),
+            "[default]\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\n",
+        )
+        .unwrap();
+        fs::write(
+            fake_home.path().join(".kube/config"),
+            "apiVersion: v1\nclusters:\n- cluster:\n    server: https://k8s.example.com\n",
+        )
+        .unwrap();
+        fs::write(
+            fake_home.path().join(".docker/config.json"),
+            r#"{"auths":{"registry.example.com":{"auth":"dGVzdDp0ZXN0"}}}"#,
+        )
+        .unwrap();
+        // Also create .cache for cache-writable tests
+        fs::create_dir_all(fake_home.path().join(".cache")).unwrap();
+        fake_home
+    }
+
     #[test]
     fn landlock_allows_project_file_read() {
         require_landlock!();
@@ -181,15 +236,15 @@ mod linux_tests {
     fn landlock_blocks_aws_read() {
         require_landlock!();
         let project = create_test_project();
-        let aws_dir = home_dir().join(".aws");
-        if !aws_dir.exists() {
-            eprintln!("SKIPPED: ~/.aws does not exist");
-            return;
-        }
-        let (code, stdout, _) = run_sandboxed(project.path(), "cat ~/.aws/credentials 2>&1");
+        let fake_home = create_fake_home_with_secrets();
+        let (code, stdout, _) = run_sandboxed_home(
+            project.path(),
+            fake_home.path(),
+            "cat ~/.aws/credentials 2>&1",
+        );
         assert!(
             code != 0 || stdout.contains("Permission denied"),
-            "Should not be able to read ~/.aws/credentials"
+            "Should not be able to read ~/.aws/credentials — code: {code}, stdout: {stdout}"
         );
     }
 
@@ -197,15 +252,12 @@ mod linux_tests {
     fn landlock_blocks_kube_read() {
         require_landlock!();
         let project = create_test_project();
-        let kube_dir = home_dir().join(".kube");
-        if !kube_dir.exists() {
-            eprintln!("SKIPPED: ~/.kube does not exist");
-            return;
-        }
-        let (code, stdout, _) = run_sandboxed(project.path(), "cat ~/.kube/config 2>&1");
+        let fake_home = create_fake_home_with_secrets();
+        let (code, stdout, _) =
+            run_sandboxed_home(project.path(), fake_home.path(), "cat ~/.kube/config 2>&1");
         assert!(
             code != 0 || stdout.contains("Permission denied"),
-            "Should not be able to read ~/.kube/config"
+            "Should not be able to read ~/.kube/config — code: {code}, stdout: {stdout}"
         );
     }
 
@@ -213,15 +265,15 @@ mod linux_tests {
     fn landlock_blocks_docker_read() {
         require_landlock!();
         let project = create_test_project();
-        let docker_dir = home_dir().join(".docker");
-        if !docker_dir.exists() {
-            eprintln!("SKIPPED: ~/.docker does not exist");
-            return;
-        }
-        let (code, stdout, _) = run_sandboxed(project.path(), "cat ~/.docker/config.json 2>&1");
+        let fake_home = create_fake_home_with_secrets();
+        let (code, stdout, _) = run_sandboxed_home(
+            project.path(),
+            fake_home.path(),
+            "cat ~/.docker/config.json 2>&1",
+        );
         assert!(
             code != 0 || stdout.contains("Permission denied"),
-            "Should not be able to read ~/.docker/config.json"
+            "Should not be able to read ~/.docker/config.json — code: {code}, stdout: {stdout}"
         );
     }
 
@@ -262,15 +314,12 @@ mod linux_tests {
     fn landlock_blocks_gnupg_read() {
         require_landlock!();
         let project = create_test_project();
-        let gnupg_dir = home_dir().join(".gnupg");
-        if !gnupg_dir.exists() {
-            eprintln!("SKIPPED: ~/.gnupg does not exist");
-            return;
-        }
-        let (code, stdout, _) = run_sandboxed(project.path(), "ls ~/.gnupg 2>&1");
+        let fake_home = create_fake_home_with_secrets();
+        let (code, stdout, _) =
+            run_sandboxed_home(project.path(), fake_home.path(), "ls ~/.gnupg 2>&1");
         assert!(
             code != 0 || stdout.contains("Permission denied"),
-            "Should not be able to list ~/.gnupg"
+            "Should not be able to list ~/.gnupg — code: {code}, stdout: {stdout}"
         );
     }
 
@@ -435,12 +484,24 @@ else:
     fn landlock_blocks_outbound_tcp() {
         require_landlock!(4);
         let project = create_test_project();
-        // Try to connect to a random port — should fail
-        let (code, _, _) = run_sandboxed(
-            project.path(),
-            "bash -c 'echo > /dev/tcp/127.0.0.1/12345' 2>/dev/null",
+
+        // Start a real listener so we can distinguish "blocked by Landlock" (EPERM)
+        // from "nothing listening" (ECONNREFUSED).
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
+        let port = listener.local_addr().unwrap().port();
+
+        // Try to connect to the listening port — should fail with Permission denied
+        let script =
+            format!("bash -c 'echo > /dev/tcp/127.0.0.1/{port}' 2>&1 || echo CONNECT_FAILED");
+        let (code, stdout, _) = run_sandboxed(project.path(), &script);
+        drop(listener);
+
+        // The connection must fail (non-zero exit or explicit failure message)
+        assert!(
+            code != 0 || stdout.contains("CONNECT_FAILED"),
+            "Outbound TCP to port {port} should be blocked by Landlock — code: {code}, stdout: {stdout}"
         );
-        assert_ne!(code, 0, "Outbound TCP to arbitrary port should be blocked");
     }
 
     // ── E2E binary tests ──────────────────────────────────────────
@@ -605,12 +666,10 @@ else:
     fn project_cache_dir_writable() {
         require_landlock!();
         let project = create_test_project();
-        let cache_dir = home_dir().join(".cache");
-        if !cache_dir.exists() {
-            fs::create_dir_all(&cache_dir).ok();
-        }
-        let (code, _, _) = run_sandboxed(
+        let fake_home = create_fake_home_with_secrets();
+        let (code, _, _) = run_sandboxed_home(
             project.path(),
+            fake_home.path(),
             "mkdir -p ~/.cache/cplt-test && echo ok > ~/.cache/cplt-test/probe && rm -rf ~/.cache/cplt-test",
         );
         assert_eq!(code, 0, "~/.cache should be writable");
