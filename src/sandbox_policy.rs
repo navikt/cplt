@@ -141,13 +141,27 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "LOGNAME",
     "SHELL",
     "TMPDIR",
-    // Terminal
+    // Terminal — base capabilities
     "TERM",
     "COLORTERM",
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
     "COLUMNS",
     "LINES",
+    // Terminal multiplexers — without these, Copilot (Node.js/ink) doesn't know it's
+    // inside a multiplexer and sends bare OSC 10/11 color queries. The multiplexer
+    // intercepts the queries but can't deliver the response back to the process,
+    // so the raw response bytes appear on screen and the process hangs.
+    "TMUX",                // tmux: socket path (e.g. /tmp/tmux-1000/default,1234,0)
+    "TMUX_PANE",           // tmux: pane identifier (e.g. %0)
+    "STY",                 // GNU screen: session name
+    "ZELLIJ",              // Zellij: present when running inside Zellij
+    "ZELLIJ_SESSION_NAME", // Zellij: session name
+    // Terminal emulator identification — lets Copilot/Node.js detect color/feature
+    // support without falling back to OSC color queries.
+    "VTE_VERSION",     // GNOME Terminal, Tilix, Terminator (VTE-based)
+    "KITTY_WINDOW_ID", // Kitty terminal
+    "WEZTERM_PANE",    // WezTerm
     // Path
     "PATH",
     // Copilot auth — accepted trade-off: Copilot needs a GitHub token to function.
