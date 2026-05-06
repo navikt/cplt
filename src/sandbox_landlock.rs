@@ -28,11 +28,22 @@ use std::path::PathBuf;
 // ── Cross-platform types ───────────────────────────────────────
 
 /// Filesystem access flags for a Landlock rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FsAccess {
     pub read: bool,
     pub write: bool,
     pub execute: bool,
+    /// Grant `LANDLOCK_ACCESS_FS_IOCTL_DEV` (Landlock ABI v5+, kernel ≥ 6.8).
+    ///
+    /// Required for character and block devices that need `ioctl()` — most
+    /// importantly `/dev/tty` and `/dev/pts/*` for `tcsetattr()` (raw mode).
+    /// Without this flag on ABI v5+, the terminal stays in cooked/echo mode:
+    /// OSC colour-query responses are echoed as visible text and the process
+    /// hangs waiting for a response it already "missed".
+    ///
+    /// For non-device files and directories `IoctlDev` is a no-op; set it
+    /// only on device paths to keep the policy least-privilege.
+    pub ioctl: bool,
 }
 
 /// A filesystem access rule: allow `access` on `path` and its subtree.
@@ -274,9 +285,9 @@ pub(crate) const LINUX_HOME_TOOL_DIRS: &[HomeToolDir] = &[
 ///
 /// Mirrors the macOS SBPL literal file allows in `emit_system_access()`.
 const LINUX_HOME_CONFIG_FILES: &[&str] = &[
-    // Git configuration
+    // Git configuration (includes user-config, attributes, ignore, etc.)
     ".gitconfig",
-    ".config/git/config",
+    ".config/git",
     // GitHub CLI auth (specific files only)
     ".config/gh/hosts.yml",
     ".config/gh/config.yml",
@@ -300,9 +311,10 @@ const DEVICE_FILES: &[&str] = &[
     "/dev/urandom",
     "/dev/zero",
     "/dev/random",
-    "/dev/tty", // Terminal device (interactive tools)
-    "/dev/pts", // Pseudo-terminal devices
-    "/dev/shm", // POSIX shared memory (Node.js, Chromium)
+    "/dev/tty",  // Terminal device (interactive tools)
+    "/dev/ptmx", // PTY master multiplexer — required by forkpty(3)
+    "/dev/pts",  // Pseudo-terminal slave devices
+    "/dev/shm",  // POSIX shared memory (Node.js, Chromium)
 ];
 
 // ── Policy generation (cross-platform, pure logic) ─────────────
@@ -326,6 +338,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             read: true,
             write: true,
             execute: true,
+            ioctl: false,
         },
     });
 
@@ -337,6 +350,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: false,
                 execute: false,
+                ioctl: false,
             },
         });
     }
@@ -349,6 +363,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: false,
                 execute: true,
+                ioctl: false,
             },
         });
     }
@@ -362,6 +377,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     read: true,
                     write: dir.write,
                     execute: dir.process_exec || dir.map_exec,
+                    ioctl: false,
                 },
             });
         }
@@ -375,6 +391,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: false,
                 execute: true,
+                ioctl: false,
             },
         });
     }
@@ -387,6 +404,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: false,
                 execute: true,
+                ioctl: false,
             },
         });
     }
@@ -402,6 +420,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: true,
                 execute: true,
+                ioctl: false,
             },
         });
     }
@@ -413,10 +432,14 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             read: true,
             write: true,
             execute: config.allow_tmp_exec,
+            ioctl: false,
         },
     });
 
-    // ── Device files: read + write (no execute) ──
+    // ── Device files: read + write + ioctl (no execute) ──
+    // ioctl: true grants LANDLOCK_ACCESS_FS_IOCTL_DEV (ABI v5+, kernel ≥ 6.8).
+    // Without it, tcsetattr() on /dev/tty and /dev/pts/* is denied — the
+    // terminal stays in cooked/echo mode and Copilot's TUI hangs.
     for &dev in DEVICE_FILES {
         fs_rules.push(FsRule {
             path: PathBuf::from(dev),
@@ -424,6 +447,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: true,
                 execute: false,
+                ioctl: true,
             },
         });
     }
@@ -435,6 +459,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             read: true,
             write: false,
             execute: false,
+            ioctl: false,
         },
     });
 
@@ -446,6 +471,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: false,
                 execute: false,
+                ioctl: false,
             },
         });
     }
@@ -458,6 +484,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: true,
                 execute: false,
+                ioctl: false,
             },
         });
     }
@@ -471,6 +498,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     read: true,
                     write: false,
                     execute: false,
+                    ioctl: false,
                 },
             });
         }
@@ -482,6 +510,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     read: true,
                     write: true,
                     execute: false,
+                    ioctl: false,
                 },
             });
         }
@@ -498,6 +527,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: false,
                 execute: false,
+                ioctl: false,
             },
         });
     }
@@ -512,6 +542,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: true,
                 execute: true,
+                ioctl: false,
             },
         });
     }
@@ -522,6 +553,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: dir.write,
                 execute: dir.process_exec || dir.map_exec,
+                ioctl: false,
             },
         });
     }
@@ -736,7 +768,6 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
 
     let abi_version = check_availability()?;
     let seccomp_filter = build_seccomp_filter();
-
     if abi_version < ABI::V4 {
         // Check if proxy is configured (proxy_port would have been added to net_rules)
         let has_proxy = policy.net_rules.iter().any(|r| r.port != 443);
@@ -970,6 +1001,14 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
 
         if access.execute {
             access_flags |= AccessFs::Execute;
+        }
+
+        if access.ioctl && abi_version >= 5 {
+            // Landlock ABI v5 (kernel ≥ 6.8) enforces IOCTL_DEV for character
+            // and block devices. Grant it for device paths so tcsetattr() on
+            // /dev/tty and /dev/pts/* succeeds — without this, raw mode fails,
+            // the terminal stays in cooked/echo mode and Copilot's TUI hangs.
+            access_flags |= AccessFs::IoctlDev;
         }
 
         // Safety: raw_fd was opened in precompute() and is still valid

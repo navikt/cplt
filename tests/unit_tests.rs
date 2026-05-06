@@ -7,7 +7,8 @@ use cplt::discover::copilot_pkg_dir;
 use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
-    HardeningCategory, ProfileOptions, build_sandbox_env, generate_profile, validate_sbpl_path,
+    HardeningCategory, ProfileOptions, SandboxConfig, build_sandbox_env, generate_policy,
+    generate_profile, validate_sbpl_path,
 };
 
 // ============================================================
@@ -513,6 +514,70 @@ fn profile_allows_tty_ioctl() {
         p.contains("(allow file-ioctl)"),
         "Profile must allow file-ioctl for terminal raw mode"
     );
+}
+
+#[test]
+fn landlock_policy_device_files_have_ioctl() {
+    // Regression test: Landlock ABI v5 (kernel ≥ 6.8) enforces IoctlDev for
+    // character devices. Without IoctlDev on /dev/tty, /dev/ptmx, and /dev/pts,
+    // tcsetattr() and forkpty(3) are denied — the terminal stays in cooked/echo
+    // mode, OSC colour-query responses are echoed as visible text, and Copilot's
+    // TUI hangs. /dev/ptmx is the PTY master multiplexer; ioctl is required for
+    // TIOCGPTN and TIOCSPTLCK (used by forkpty/grantpt/unlockpt).
+    let policy = generate_policy(&SandboxConfig {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/home/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        git_hooks_path: None,
+        allow_gpg_signing: false,
+        allow_jvm_attach: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+
+    let device_paths = ["/dev/tty", "/dev/ptmx", "/dev/pts"];
+    for dev in &device_paths {
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == std::path::Path::new(dev))
+            .unwrap_or_else(|| panic!("Device rule for {dev} must exist in Landlock policy"));
+        assert!(
+            rule.access.ioctl,
+            "{dev}: ioctl must be true — tcsetattr() requires IoctlDev on ABI v5+ (kernel ≥ 6.8)"
+        );
+    }
+
+    // Non-device paths must NOT have ioctl set (least-privilege).
+    let non_device_paths = ["/tmp", "/proc/self"];
+    for path in &non_device_paths {
+        if let Some(rule) = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == std::path::Path::new(path))
+        {
+            assert!(
+                !rule.access.ioctl,
+                "{path}: ioctl should be false for non-device paths"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1505,6 +1570,28 @@ fn env_allowlist_includes_new_runtime_vars() {
     assert!(ENV_PREFIX_ALLOWLIST.contains(&"PYENV_"));
     assert!(ENV_PREFIX_ALLOWLIST.contains(&"YARN_"));
     assert!(ENV_PREFIX_ALLOWLIST.contains(&"COREPACK_"));
+}
+
+#[test]
+fn env_allowlist_includes_terminal_multiplexers() {
+    use cplt::sandbox::ENV_ALLOWLIST;
+
+    // tmux — without TMUX set, Node.js/ink sends bare OSC 10/11 color queries
+    // that tmux intercepts but can't deliver back, causing a visible hang.
+    assert!(ENV_ALLOWLIST.contains(&"TMUX"));
+    assert!(ENV_ALLOWLIST.contains(&"TMUX_PANE"));
+
+    // GNU screen
+    assert!(ENV_ALLOWLIST.contains(&"STY"));
+
+    // Zellij
+    assert!(ENV_ALLOWLIST.contains(&"ZELLIJ"));
+    assert!(ENV_ALLOWLIST.contains(&"ZELLIJ_SESSION_NAME"));
+
+    // Terminal emulator identification
+    assert!(ENV_ALLOWLIST.contains(&"VTE_VERSION"));
+    assert!(ENV_ALLOWLIST.contains(&"KITTY_WINDOW_ID"));
+    assert!(ENV_ALLOWLIST.contains(&"WEZTERM_PANE"));
 }
 
 // ============================================================
