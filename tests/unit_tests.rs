@@ -2151,6 +2151,41 @@ fn profile_denies_git_persistence_vectors() {
     );
 }
 
+#[test]
+fn profile_denies_write_to_cplt_toml() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        git_hooks_path: None,
+        allow_gpg_signing: false,
+        allow_jvm_attach: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+    assert!(
+        p.contains("(deny file-write* (literal \"/projects/app/.cplt.toml\"))"),
+        "Profile must deny write to .cplt.toml to prevent agent tampering"
+    );
+}
+
 // ============================================================
 // HomeToolDir permissions in profile
 // ============================================================
@@ -2403,6 +2438,13 @@ fn env_sanitized_injects_hardening_vars() {
     let git = env.vars.iter().find(|(k, _)| k == "GIT_TERMINAL_PROMPT");
     assert!(git.is_some(), "should inject GIT_TERMINAL_PROMPT");
     assert_eq!(git.unwrap().1, "0");
+
+    let trust_lock = env.vars.iter().find(|(k, _)| k == "__CPLT_TRUST_LOCKED");
+    assert!(
+        trust_lock.is_some(),
+        "should inject __CPLT_TRUST_LOCKED to block cplt trust inside sandbox"
+    );
+    assert_eq!(trust_lock.unwrap().1, "1");
 }
 
 #[test]

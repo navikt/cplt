@@ -481,6 +481,34 @@ mod macos_tests {
         );
     }
 
+    #[test]
+    fn real_profile_blocks_cplt_toml_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".cplt-toml-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join(".cplt.toml"), "").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let toml_path = tmp.join(".cplt.toml");
+        let cmd = format!(
+            "echo 'tampered' >> '{}' 2>&1; echo EXIT:$?",
+            toml_path.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "writing to .cplt.toml should be blocked, got: {output}"
+        );
+    }
+
     // ── Temp exec denial (write-then-exec attack) ─────────────────
 
     #[test]
