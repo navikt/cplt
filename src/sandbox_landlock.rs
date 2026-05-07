@@ -1784,4 +1784,53 @@ mod tests {
             "data dir should NOT be executable"
         );
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_self_is_deferred_not_pre_opened() {
+        let policy = LandlockPolicy {
+            fs_rules: vec![
+                FsRule {
+                    path: PathBuf::from("/proc/self"),
+                    access: FsAccess {
+                        read: true,
+                        write: false,
+                        execute: false,
+                        ioctl: false,
+                    },
+                },
+                FsRule {
+                    path: PathBuf::from("/tmp"),
+                    access: FsAccess {
+                        read: true,
+                        write: false,
+                        execute: false,
+                        ioctl: false,
+                    },
+                },
+            ],
+            net_rules: vec![],
+            restrict_net_connect: false,
+        };
+
+        let precomputed = precompute(policy).expect("precompute should succeed");
+
+        assert_eq!(
+            precomputed.deferred_paths.len(),
+            1,
+            "exactly one path should be deferred"
+        );
+        let (c_path, _) = &precomputed.deferred_paths[0];
+        assert_eq!(
+            c_path.to_str().unwrap(),
+            "/proc/self",
+            "/proc/self should be in deferred_paths"
+        );
+
+        assert_eq!(
+            precomputed.pre_opened_fds.len(),
+            1,
+            "/tmp should be pre-opened; /proc/self must not be"
+        );
+    }
 }
