@@ -1011,10 +1011,12 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     // Add filesystem rules for deferred paths (e.g. /proc/self).
     // These are magic symlinks that resolve per-process — opened here in the
     // child so /proc/self resolves to the child's pid, not the parent's.
+    // Deferred paths should only be used in special cases (such as /proc/self),
+    // and are probably required for proper operation so failing to open is an error.
     for (c_path, access) in &sandbox.deferred_paths {
         let raw_fd: RawFd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if raw_fd < 0 {
-            continue;
+            return Err(std::io::Error::last_os_error());
         }
         let path_beneath_rule = create_path_beneath_rule(sandbox.abi_version, &raw_fd, access);
         created = created
