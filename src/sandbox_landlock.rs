@@ -1645,6 +1645,12 @@ mod tests {
                 map_exec: false,
                 process_exec: false,
             },
+            crate::agent::AgentDir {
+                path: home.join(".local/state/opencode"),
+                write: true,
+                map_exec: false,
+                process_exec: false,
+            },
         ];
         let mut config = test_config(&project, &home);
         config.agent = crate::agent::Agent::OpenCode;
@@ -1669,6 +1675,18 @@ mod tests {
         assert!(
             !data_rule.access.execute,
             "data dir should NOT be executable"
+        );
+
+        let state_rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == home.join(".local/state/opencode"))
+            .expect("OpenCode state data dir should be in rules");
+        assert!(state_rule.access.read);
+        assert!(state_rule.access.write, "state data dir should be writable");
+        assert!(
+            !state_rule.access.execute,
+            "state data dir should NOT be executable"
         );
     }
 

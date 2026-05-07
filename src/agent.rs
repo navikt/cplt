@@ -138,6 +138,13 @@ impl Agent {
                     .unwrap_or_else(|| home.join(".local/share"));
                 let data_dir = data_base.join("opencode");
 
+                // Respect XDG_STATE_HOME for state data dir (locks, history, statistics)
+                let state_base = std::env::var("XDG_STATE_HOME")
+                    .ok()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| home.join(".local/state"));
+                let state_dir = state_base.join("opencode");
+
                 vec![
                     AgentDir {
                         path: config_dir,
@@ -150,6 +157,13 @@ impl Agent {
                         write: true,
                         map_exec: false,
                         // Explicitly deny exec on writable data dir
+                        process_exec: false,
+                    },
+                    AgentDir {
+                        path: state_dir,
+                        write: true,
+                        map_exec: false,
+                        // Explicitly deny exec on writable state data dir
                         process_exec: false,
                     },
                 ]
