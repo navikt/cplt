@@ -21,6 +21,7 @@ Sandbox wrapper for AI coding agents. Runs GitHub Copilot CLI, OpenCode, or a pl
 - [What it does](#what-it-does)
 - [Usage](#usage)
 - [Configuration file](#configuration-file)
+- [Per-repo configuration](#per-repo-configuration-cplttoml)
 - [Architecture](#architecture)
 - [Security](#security)
 - [Domain filtering](#domain-filtering)
@@ -539,7 +540,8 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 
 1. CLI flags (`--with-proxy`, `--no-proxy`, `--proxy-port`, etc.)
 2. Config file (`~/.config/cplt/config.toml`)
-3. Built-in defaults
+3. Per-repo config (`.cplt.toml` approved proposals)
+4. Built-in defaults
 
 CLI flags always override the config file. Use `--no-proxy` to disable the proxy for a single run.
 
@@ -589,6 +591,65 @@ cplt config set allow.read ~/Desktop --unset
 cplt config set allow.read --unset
 cplt config set sandbox.quiet --unset
 ```
+
+## Per-repo configuration (`.cplt.toml`)
+
+Commit a `.cplt.toml` file to your repository for project-specific sandbox settings. This eliminates the need for every developer to configure the same CLI flags or global config.
+
+### Security model
+
+- **`[deny]`** — always applied without approval (can only tighten the sandbox)
+- **`[propose]`** — relaxes the sandbox, requires explicit user trust approval
+- Read from `git HEAD` (committed state) — the agent cannot tamper with its own config mid-session
+- Write to `.cplt.toml` is kernel-denied inside the sandbox
+
+### Example `.cplt.toml`
+
+```toml
+# Deny section — always applied, no approval needed
+[deny]
+paths = ["~/secrets", "~/.vault"]
+env = ["VAULT_TOKEN", "MY_SECRET"]
+
+# Propose section — requires user approval
+[propose]
+allow_jvm_attach = true          # For MockK/Mockito tests
+allow_docker = true              # Container access
+allow_localhost_any = true       # Dev servers on any port
+
+[propose.allow]
+read = ["~/.gradle/gradle.properties"]
+ports = [8080, 5432]
+localhost = [5432]
+
+[propose.proxy]
+allow_private_domains = ["intern.nav.no"]
+```
+
+### Trust management
+
+```bash
+cplt trust                                # Show proposals and approval status
+cplt trust accept allow_jvm_attach        # Approve specific keys
+cplt trust accept --all                   # Approve everything
+cplt trust revoke allow_docker            # Revoke a specific key
+cplt trust revoke --all                   # Revoke all trust for this repo
+```
+
+Trust decisions are stored in `~/.config/cplt/trust/` (protected from the sandbox).
+
+**For CI/scripts** where interactive approval isn't possible:
+
+```bash
+cplt --accept-repo-config -- -p "run tests"
+```
+
+### Precedence
+
+1. CLI flags (highest)
+2. Global config (`~/.config/cplt/config.toml`)
+3. Approved repo proposals (`.cplt.toml [propose]`)
+4. Built-in defaults
 
 ## Architecture
 
