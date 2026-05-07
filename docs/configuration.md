@@ -1,0 +1,163 @@
+# Configuration
+
+## Configuration file
+
+Save your preferred defaults to `~/.config/cplt/config.toml` so you don't need to pass flags every time.
+
+**Create the default config:**
+
+```bash
+cplt --init-config
+```
+
+This creates a commented template at `~/.config/cplt/config.toml`:
+
+```toml
+[proxy]
+# enabled = true             # Default: true — disable with --no-proxy or set false
+# port = 0                   # Default: 0 (OS-assigned ephemeral port)
+# blocked_domains = "~/.config/cplt/blocked-domains.txt"
+# allowed_domains = "~/.config/cplt/allowed-domains.txt"
+# log_file = "~/.config/cplt/proxy.log"
+# log_level = "none"             # Stderr verbosity: none, error, blocked, all
+# allow_private_domains = ["intern.nav.no"]  # Allow internal/intranet domains to resolve to private IPs
+
+[sandbox]
+# validate = true
+# allow_env_files = false
+# allow_lifecycle_scripts = false
+# allow_gpg_signing = false    # Allow GPG commit signing (see SECURITY.md)
+# allow_jvm_attach = false     # Allow JVM Attach API unix sockets (MockK, Mockito)
+# allow_localhost_any = false
+# scratch_dir = true           # On by default; set false to disable
+# allow_tmp_exec = false       # Dangerous — prefer scratch_dir
+# allow_cache_exec = []        # Allow exec from specific ~/Library/Caches subdirs, e.g. ["ms-playwright", "pnpm/dlx"]
+# allow_cache_exec_any = false # Dangerous — allow exec from all of ~/Library/Caches
+# inherit_env = false          # Dangerous — exposes all env vars
+# pass_env = ["MY_CUSTOM_VAR"]
+
+[allow]
+# read = ["~/some/path"]
+# write = ["~/another/path"]
+# ports = [8080]
+# localhost = [3000, 8080]
+
+[deny]
+# paths = ["~/extra/secret"]
+```
+
+**Precedence** (highest to lowest):
+
+1. CLI flags (`--with-proxy`, `--no-proxy`, `--proxy-port`, etc.)
+2. Config file (`~/.config/cplt/config.toml`)
+3. Per-repo config (`.cplt.toml` approved proposals)
+4. Built-in defaults
+
+CLI flags always override the config file. Use `--no-proxy` to disable the proxy for a single run.
+
+**Environment variable override:**
+
+Set `CPLT_CONFIG` to use a config file at a custom location:
+
+```bash
+CPLT_CONFIG=/path/to/custom.toml cplt -- --version
+```
+
+**Path expansion:** Paths in `[allow]` and `[deny]` support `~/` expansion and are resolved relative to the config file directory. `proxy.blocked_domains` supports `~/` expansion only.
+
+### Managing config from the CLI
+
+Instead of editing TOML by hand, use `cplt config`:
+
+```bash
+cplt config show                          # show effective config (file + defaults)
+cplt config get sandbox.quiet             # get a single value
+cplt config explain                       # list all keys with descriptions
+cplt config explain sandbox.pass_env      # explain a specific key
+cplt config validate                      # check for syntax errors and unknown keys
+```
+
+**Setting values:**
+
+```bash
+# Scalar keys — set replaces the value
+cplt config set sandbox.quiet true
+cplt config set proxy.port 9090
+
+# Array keys — set appends (idempotent, no duplicates)
+cplt config set allow.read ~/Desktop
+cplt config set allow.read ~/Documents    # adds a second entry
+cplt config set allow.read ~/Desktop      # no-op, already present
+cplt config set allow.ports 8080
+```
+
+**Removing values:**
+
+```bash
+# Remove a single element from an array
+cplt config set allow.read ~/Desktop --unset
+
+# Remove an entire key (reverts to default)
+cplt config set allow.read --unset
+cplt config set sandbox.quiet --unset
+```
+
+## Per-repo configuration (`.cplt.toml`)
+
+Commit a `.cplt.toml` file to your repository for project-specific sandbox settings. This eliminates the need for every developer to configure the same CLI flags or global config.
+
+### Security model
+
+- **`[deny]`** — always applied without approval (can only tighten the sandbox)
+- **`[propose]`** — relaxes the sandbox, requires explicit user trust approval
+- Read from `git HEAD` (committed state) — the agent cannot tamper with its own config mid-session
+- Write to `.cplt.toml` is kernel-denied inside the sandbox
+- Trust approvals are content-pinned — if proposal values change, approvals are invalidated
+
+### Example `.cplt.toml`
+
+```toml
+# Deny section — always applied, no approval needed
+[deny]
+paths = ["~/secrets", "~/.vault"]
+env = ["VAULT_TOKEN", "MY_SECRET"]
+
+# Propose section — requires user approval
+[propose]
+allow_jvm_attach = true          # For MockK/Mockito tests
+allow_docker = true              # Container access
+allow_localhost_any = true       # Dev servers on any port
+
+[propose.allow]
+read = ["~/.gradle/gradle.properties"]
+ports = [8080, 5432]
+localhost = [5432]
+
+[propose.proxy]
+allow_private_domains = ["intern.nav.no"]
+```
+
+### Trust management
+
+```bash
+cplt trust                                # Show proposals and approval status
+cplt trust accept allow_jvm_attach        # Approve specific keys
+cplt trust accept --all                   # Approve everything
+cplt trust revoke allow_docker            # Revoke a specific key
+cplt trust revoke --all                   # Revoke all trust for this repo
+```
+
+Trust decisions are stored in `~/.config/cplt/trust/` (protected from the sandbox).
+
+**For CI/scripts** where interactive approval isn't possible:
+
+```bash
+cplt --accept-repo-config -- -p "run tests"
+```
+
+### Precedence
+
+1. CLI flags (highest)
+2. Global config (`~/.config/cplt/config.toml`)
+3. Approved repo proposals (`.cplt.toml [propose]`)
+4. Built-in defaults

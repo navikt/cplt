@@ -17,19 +17,16 @@ Sandbox wrapper for AI coding agents. Runs GitHub Copilot CLI, OpenCode, or a pl
 
 - [Quick start](#quick-start)
 - [Install](#install)
-  - [Shell setup](#shell-setup-recommended)
 - [What it does](#what-it-does)
 - [Usage](#usage)
-- [Configuration file](#configuration-file)
-- [Per-repo configuration](#per-repo-configuration-cplttoml)
+- [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Security](#security)
-- [Domain filtering](#domain-filtering)
-- [Proxy operations](#proxy-operations)
-- [Known impacts](#known-impacts)
-- [Limitations](#limitations)
 - [Contributing](#contributing)
 - [References](#references)
+
+**Detailed docs:**
+[Configuration](docs/configuration.md) · [Proxy & domain filtering](docs/proxy.md) · [Known impacts](docs/known-impacts.md) · [Security details](docs/security.md)
 
 ## Quick start
 
@@ -80,7 +77,7 @@ cplt --agent shell
 | Localhost outbound                                                               | 🔒 Kernel-blocked                         | Prevents local service access; inbound still works for proxy                            |
 | SSH agent (unix socket)                                                          | 🔒 Kernel-blocked                         | Prevents signing git operations or SSH to hosts                                         |
 | Developer tools (`~/.cargo`, `~/.mise`, `~/.gradle`, `~/.m2`, `~/.sdkman`, `~/.jenv`, `~/.pyenv`, `~/.konan`, etc.) | ✅ Allowed (read+write for caches)        | Only dirs that exist on disk; tightened at runtime via `--doctor`                       |
-| Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked (macOS)                 | Override with `--allow-read`; see [Private registries](#private-registries)              |
+| Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked (macOS)                 | Override with `--allow-read`; see [Private registries](docs/known-impacts.md#private-registries) |
 | Go source code (`~/go/src`)                                                      | 🔒 Kernel-blocked                         | Only `~/go/bin` and `~/go/pkg` are readable                                             |
 | Read `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`                                  | 🔒 Kernel-blocked                         |                                                                                         |
 | Read `~/.kube`, `~/.docker`, `~/.nais`                                           | 🔒 Kernel-blocked                         |                                                                                         |
@@ -251,8 +248,8 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | `--pass-env <VAR>` | Explicitly pass an environment variable through to Copilot. Can be repeated.                                                                            |
 | `--inherit-env`    | ⚠️ **Dangerous.** Inherit the full parent environment (only strips `NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`). Use only for debugging. |
 | `--allow-lifecycle-scripts` | Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run. Blocked by default. Use when `npm install` needs postinstall hooks.         |
-| `--allow-gpg-signing`       | Allow GPG commit/tag signing inside the sandbox. Grants read-only access to public keyring and GPG agent socket (private keys stay denied). See [GPG signing](#gpg-commit-signing). |
-| `--allow-jvm-attach`        | Allow JVM Attach API unix sockets in `/tmp`. Needed for MockK inline mocking, Mockito inline agents, ByteBuddy. See [JVM Attach API](#jvm-attach-api). |
+| `--allow-gpg-signing`       | Allow GPG commit/tag signing inside the sandbox. Grants read-only access to public keyring and GPG agent socket (private keys stay denied). See [GPG signing](docs/known-impacts.md#gpg-commit-signing). |
+| `--allow-jvm-attach`        | Allow JVM Attach API unix sockets in `/tmp`. Needed for MockK inline mocking, Mockito inline agents, ByteBuddy. See [JVM Attach API](docs/known-impacts.md#jvm-attach-api). |
 | `--no-scratch-dir`          | Disable the per-session scratch directory (on by default). TMPDIR will not be redirected.                                                    |
 | `--scratch-dir`             | Explicitly enable per-session scratch directory (already the default). Useful to override `scratch_dir = false` in config.                   |
 | `--allow-tmp-exec`          | ⚠️ **Dangerous.** Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer scratch dir.                             |
@@ -490,166 +487,45 @@ cplt --agent shell
 cplt --agent shell -- -c 'npm test'
 ```
 
-## Configuration file
+## Configuration
 
 Save your preferred defaults to `~/.config/cplt/config.toml` so you don't need to pass flags every time.
 
-**Create the default config:**
-
 ```bash
-cplt --init-config
-```
-
-This creates a commented template at `~/.config/cplt/config.toml`:
-
-```toml
-[proxy]
-# enabled = true             # Default: true — disable with --no-proxy or set false
-# port = 0                   # Default: 0 (OS-assigned ephemeral port)
-# blocked_domains = "~/.config/cplt/blocked-domains.txt"
-# allowed_domains = "~/.config/cplt/allowed-domains.txt"
-# log_file = "~/.config/cplt/proxy.log"
-# log_level = "none"             # Stderr verbosity: none, error, blocked, all
-# allow_private_domains = ["intern.nav.no"]  # Allow internal/intranet domains to resolve to private IPs
-
-[sandbox]
-# validate = true
-# allow_env_files = false
-# allow_lifecycle_scripts = false
-# allow_gpg_signing = false    # Allow GPG commit signing (see SECURITY.md)
-# allow_jvm_attach = false     # Allow JVM Attach API unix sockets (MockK, Mockito)
-# allow_localhost_any = false
-# scratch_dir = true           # On by default; set false to disable
-# allow_tmp_exec = false       # Dangerous — prefer scratch_dir
-# allow_cache_exec = []        # Allow exec from specific ~/Library/Caches subdirs, e.g. ["ms-playwright", "pnpm/dlx"]
-# allow_cache_exec_any = false # Dangerous — allow exec from all of ~/Library/Caches
-# inherit_env = false          # Dangerous — exposes all env vars
-# pass_env = ["MY_CUSTOM_VAR"]
-
-[allow]
-# read = ["~/some/path"]
-# write = ["~/another/path"]
-# ports = [8080]
-# localhost = [3000, 8080]
-
-[deny]
-# paths = ["~/extra/secret"]
+cplt --init-config    # create a starter config file
+cplt config show      # show effective config (file + defaults)
+cplt config explain   # list all keys with descriptions
 ```
 
 **Precedence** (highest to lowest):
 
-1. CLI flags (`--with-proxy`, `--no-proxy`, `--proxy-port`, etc.)
+1. CLI flags
 2. Config file (`~/.config/cplt/config.toml`)
 3. Per-repo config (`.cplt.toml` approved proposals)
 4. Built-in defaults
 
-CLI flags always override the config file. Use `--no-proxy` to disable the proxy for a single run.
+### Per-repo configuration (`.cplt.toml`)
 
-**Environment variable override:**
-
-Set `CPLT_CONFIG` to use a config file at a custom location:
-
-```bash
-CPLT_CONFIG=/path/to/custom.toml cplt -- --version
-```
-
-**Path expansion:** Paths in `[allow]` and `[deny]` support `~/` expansion and are resolved relative to the config file directory. `proxy.blocked_domains` supports `~/` expansion only.
-
-### Managing config from the CLI
-
-Instead of editing TOML by hand, use `cplt config`:
-
-```bash
-cplt config show                          # show effective config (file + defaults)
-cplt config get sandbox.quiet             # get a single value
-cplt config explain                       # list all keys with descriptions
-cplt config explain sandbox.pass_env      # explain a specific key
-cplt config validate                      # check for syntax errors and unknown keys
-```
-
-**Setting values:**
-
-```bash
-# Scalar keys — set replaces the value
-cplt config set sandbox.quiet true
-cplt config set proxy.port 9090
-
-# Array keys — set appends (idempotent, no duplicates)
-cplt config set allow.read ~/Desktop
-cplt config set allow.read ~/Documents    # adds a second entry
-cplt config set allow.read ~/Desktop      # no-op, already present
-cplt config set allow.ports 8080
-```
-
-**Removing values:**
-
-```bash
-# Remove a single element from an array
-cplt config set allow.read ~/Desktop --unset
-
-# Remove an entire key (reverts to default)
-cplt config set allow.read --unset
-cplt config set sandbox.quiet --unset
-```
-
-## Per-repo configuration (`.cplt.toml`)
-
-Commit a `.cplt.toml` file to your repository for project-specific sandbox settings. This eliminates the need for every developer to configure the same CLI flags or global config.
-
-### Security model
-
-- **`[deny]`** — always applied without approval (can only tighten the sandbox)
-- **`[propose]`** — relaxes the sandbox, requires explicit user trust approval
-- Read from `git HEAD` (committed state) — the agent cannot tamper with its own config mid-session
-- Write to `.cplt.toml` is kernel-denied inside the sandbox
-
-### Example `.cplt.toml`
+Commit a `.cplt.toml` to your repository for project-specific settings:
 
 ```toml
-# Deny section — always applied, no approval needed
 [deny]
-paths = ["~/secrets", "~/.vault"]
-env = ["VAULT_TOKEN", "MY_SECRET"]
+paths = ["~/secrets"]
+env = ["VAULT_TOKEN"]
 
-# Propose section — requires user approval
 [propose]
-allow_jvm_attach = true          # For MockK/Mockito tests
-allow_docker = true              # Container access
-allow_localhost_any = true       # Dev servers on any port
+allow_jvm_attach = true
+allow_docker = true
 
 [propose.allow]
 read = ["~/.gradle/gradle.properties"]
-ports = [8080, 5432]
-localhost = [5432]
-
-[propose.proxy]
-allow_private_domains = ["intern.nav.no"]
 ```
 
-### Trust management
+- **`[deny]`** — always applied (can only tighten)
+- **`[propose]`** — requires trust approval: `cplt trust accept --all`
+- Read from `git HEAD` — tamper-proof; content-pinned approvals
 
-```bash
-cplt trust                                # Show proposals and approval status
-cplt trust accept allow_jvm_attach        # Approve specific keys
-cplt trust accept --all                   # Approve everything
-cplt trust revoke allow_docker            # Revoke a specific key
-cplt trust revoke --all                   # Revoke all trust for this repo
-```
-
-Trust decisions are stored in `~/.config/cplt/trust/` (protected from the sandbox).
-
-**For CI/scripts** where interactive approval isn't possible:
-
-```bash
-cplt --accept-repo-config -- -p "run tests"
-```
-
-### Precedence
-
-1. CLI flags (highest)
-2. Global config (`~/.config/cplt/config.toml`)
-3. Approved repo proposals (`.cplt.toml [propose]`)
-4. Built-in defaults
+📖 **Full details:** [docs/configuration.md](docs/configuration.md)
 
 ## Architecture
 
@@ -689,7 +565,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model, defense layers, and ho
 
 ## Security
 
-~2500 lines of Rust. Four dependencies (clap, libc, serde, toml). No runtime services, no telemetry. Every security boundary is kernel-enforced and tested. Every design decision is documented with the threat it mitigates and the prior art it builds on.
+~2500 lines of Rust. Four dependencies (clap, libc, serde, toml). No runtime services, no telemetry. Every security boundary is kernel-enforced and tested.
 
 **Our priorities, in order:**
 
@@ -698,206 +574,42 @@ See [SECURITY.md](SECURITY.md) for the full threat model, defense layers, and ho
 3. **Simple** — single static binary, zero config required, sane defaults
 4. **Useful** — get out of the way and let Copilot do its job, safely
 
-For the full security model, threat analysis, and test strategy, see **[SECURITY.md](SECURITY.md)**.
-
-### `~/.config/gh/hosts.yml` is readable
-
-Copilot spawns `gh auth token` to authenticate. This reads `~/.config/gh/hosts.yml` which contains a GitHub OAuth token. We allow reading only `hosts.yml` and `config.yml` (not the entire `.config/gh` directory) because:
-
-- **Required for auth**: Without `gh` auth, Copilot falls back to Keychain only. Many users rely on `gh` CLI for auth.
-- **Read-only**: The sandbox cannot modify the token file.
-- **Minimal access**: Only the two files `gh` actually reads — extensions, state, and other gh data are blocked.
-- **Same-destination token**: The token is a GitHub token that Copilot already sends to GitHub's API. An attacker would need to exfiltrate it to a *different* server.
-- **Risk**: A compromised Copilot could exfiltrate this token via port 443. Use `--deny-path ~/.config/gh` if this concerns you (Copilot will use Keychain auth instead).
-
-### Outbound network is port-restricted
-
-SBPL (Seatbelt Profile Language) does not support wildcard port filtering by IP range. Copilot connects to multiple CDN-backed endpoints with changing IPs (`api.business.githubcopilot.com`, `api.githubcopilot.com`, `proxy.business.githubcopilot.com`). We cannot enumerate these IPs. Therefore:
-
-- **Only port 443 (HTTPS) is allowed** — all other outbound TCP ports are blocked at the kernel level
-- **Localhost outbound is blocked** — prevents access to local services (databases, dev servers, etc.)
-- **SSH agent is blocked** — unix socket access is denied, preventing use of loaded SSH keys
-- **Filesystem isolation is the primary control** — credentials are kernel-blocked regardless of network
-- **The proxy is on by default** — logs and filters all outbound connections (Copilot, gh, curl)
-- **Use `--allow-port`** to add extra ports when needed (e.g., `--allow-port 8080` for a dev server)
-
-See [SECURITY.md](SECURITY.md) for the full threat model and honest gaps.
-
-## Domain filtering
-
-When the proxy is enabled, it supports both **blocking** (deny known-bad domains) and **allowlisting** (permit only known-good domains).
-
-### Blocklist
-
-Block domains commonly used for data exfiltration. A default blocklist is included based on real attack infrastructure observed in 2025–2026 supply chain incidents:
-
-```bash
-cplt --blocked-domains blocked-domains.txt -- -p "fix tests"
-```
-
-The blocklist covers webhook capture services, paste sites, file sharing, tunneling services, and IP recon endpoints. See [`blocked-domains.txt`](blocked-domains.txt) for the full list with sources.
-
-### Allowlist
-
-Restrict connections to only specific domains. When set, the proxy blocks everything not in the list:
-
-```bash
-cplt --allowed-domains allowed-domains.txt -- -p "fix tests"
-```
-
-Example `allowed-domains.txt` for Copilot-only access:
-
-```
-api.github.com
-api.githubcopilot.com
-api.business.githubcopilot.com
-proxy.business.githubcopilot.com
-telemetry.business.githubcopilot.com
-```
-
-Both blocklist and allowlist can be used together — allowlist is checked first, then blocklist.
-
-Set either permanently in `~/.config/cplt/config.toml`:
-
-```toml
-[proxy]
-enabled = true
-blocked_domains = "~/.config/cplt/blocked-domains.txt"
-# allowed_domains = "~/.config/cplt/allowed-domains.txt"
-```
-
-> **Note:** Both the allowlist and blocklist are re-read from disk every ~5 seconds (TTL-cached), so you can edit them live mid-session. Changes take effect within seconds without restarting cplt. If a file becomes unreadable at runtime, the last-known-good list is kept (fail-safe). At startup, an unreadable allowlist causes cplt to exit with an error (fail-closed).
->
-> The `allow_private_domains` list in `config.toml` is also re-read every ~5 seconds. Domains added via `--allow-private-domain` CLI flags are always preserved regardless of config changes.
-
-## Proxy operations
-
-### Connection log
-
-Every connection attempt is printed to stderr in real time:
-
-```
-[proxy] 14:23:01 CONNECT api.githubcopilot.com:443 → CONNECTED
-[proxy] 14:23:04 CONNECT pastebin.com:443 → BLOCKED
-[proxy] 14:23:07 CONNECT mcp-onboarding.intern.nav.no:443 → BLOCKED-PRIVATE-RESOLVED
-```
-
-To write a persistent audit log:
-
-```bash
-cplt --proxy-log ~/.config/cplt/proxy.log -- -p "fix tests"
-```
-
-Log file format (one line per connection):
-
-```
-2025-01-15T14:23:01Z CONNECT api.githubcopilot.com:443 CONNECTED
-2025-01-15T14:23:04Z CONNECT pastebin.com:443 BLOCKED
-```
-
-### Status codes
-
-| Status | Meaning | Action |
-|---|---|---|
-| `CONNECTED` | Connection succeeded | — |
-| `BLOCKED` | Domain matched blocklist | Check `--blocked-domains` file |
-| `BLOCKED-ALLOWLIST` | Domain not in allowlist | Add domain to `--allowed-domains` file |
-| `BLOCKED-PORT` | Port not in allowed list | Add with `--allow-port <PORT>` |
-| `BLOCKED-PRIVATE` | Pre-DNS private IP (`.local`, `127.*`, IP literals) | Use `--allow-localhost` for local ports |
-| `BLOCKED-PRIVATE-RESOLVED` | DNS resolved to a private IP | Use `--allow-private-domain <DOMAIN>` |
-| `DNS-FAIL` | DNS resolution failed | Check domain spelling or network |
-| `CONNECT-FAIL:...` | TCP connection to target failed | Target may be down |
-| `UNSUPPORTED` | Non-CONNECT HTTP method | Only CONNECT tunnels are supported |
-| `LIMIT` | 64 concurrent connections reached | Reduce parallelism |
-
-### Troubleshooting
-
-**Tool blocked with `BLOCKED-PRIVATE-RESOLVED`** — a domain (typically corporate intranet) resolved to a private IP:
-
-```bash
-cplt --allow-private-domain mcp-onboarding.intern.nav.no -- -p "use the MCP server"
-# Or match all subdomains:
-cplt --allow-private-domain intern.nav.no -- -p "use the MCP server"
-```
-
-**MCP server on localhost blocked** — use `--allow-localhost` (not `--allow-private-domain`):
-
-```bash
-cplt --allow-localhost 3000 -- -p "use local MCP server"
-```
-
-**Tool needs a non-443 port** — add it explicitly:
-
-```bash
-cplt --allow-port 8443 -- -p "test the API"
-```
-
-**Nothing connects — check if proxy is running:**
-
-```bash
-cplt --print-profile | grep localhost   # shows the proxy port rule in the Seatbelt profile
-```
-
-**Disable the proxy entirely for debugging:**
-
-```bash
-cplt --no-proxy -- -p "fix tests"
-```
-
-### Corporate proxy environments
-
-cplt injects its own `HTTP_PROXY`/`HTTPS_PROXY` into the sandbox environment, replacing any corporate proxy you may have set. The sandbox environment is cleared by default (sensitive env vars stripped), so your external `HTTP_PROXY` does not flow in.
-
-If you need to chain through a corporate proxy instead of using cplt's built-in proxy:
-
-```bash
-cplt --no-proxy --pass-env HTTP_PROXY --pass-env HTTPS_PROXY -- -p "fix tests"
-```
-
-Note that `--no-proxy` disables domain filtering, connection logging, and port enforcement. Use `--allowed-domains` or `--blocked-domains` as compensating controls when possible.
-
-## Copilot CLI network endpoints
-
-Copilot CLI 1.0.21 connects directly to these endpoints (empirically verified):
-
-| Endpoint                           | Purpose                                  |
-| ---------------------------------- | ---------------------------------------- |
-| `api.github.com`                   | GitHub API (user info, token validation) |
-| `api.githubcopilot.com`            | Copilot API                              |
-| `api.business.githubcopilot.com`   | Copilot Business API (enterprise users)  |
-| `proxy.business.githubcopilot.com` | Copilot Business proxy                   |
+📖 **Full details:** [docs/security.md](docs/security.md) · [SECURITY.md](SECURITY.md)
 
 ## Known impacts
 
-The sandbox is kernel-enforced — **all restrictions apply to every process spawned inside it**, including dev servers, test runners, build tools, and package managers. This is by design (a sandboxed agent could otherwise escape by spawning a child process), but it affects some workflows:
+The sandbox blocks some workflows by design. Common issues and fixes:
 
-### `.env` file blocking
+| Impact | Fix |
+|---|---|
+| `.env` files blocked | `--allow-env-files` |
+| npm postinstall hooks blocked | `--allow-lifecycle-scripts` |
+| `go test` / `mise run` blocked (temp exec) | Scratch dir is on by default; use `--allow-tmp-exec` if needed |
+| Localhost connections blocked | `--allow-localhost <PORT>` or `--allow-localhost-any` |
+| Docker blocked | `--allow-docker` ⚠️ |
+| SSH blocked | Use HTTPS remotes instead |
+| GPG signing disabled | `--allow-gpg-signing` |
+| JVM MockK/Mockito fails | `--allow-jvm-attach` |
+| Private registry creds blocked | `--allow-read ~/.m2/settings.xml` |
 
-`.env*`, `.pem`, `.key`, `.p12`, `.pfx`, `.jks` files in the project directory are **blocked from reading** by default. This prevents a rogue agent from exfiltrating secrets, but has side effects:
+📖 **Full details with tables and troubleshooting:** [docs/known-impacts.md](docs/known-impacts.md)
 
-| Operation                      | Impact     | Why                                                                   |
-| ------------------------------ | ---------- | --------------------------------------------------------------------- |
-| `npm install`                  | ✅ Works    | Does not read `.env` files                                            |
-| `cargo build`, `go build`      | ✅ Works    | Does not read `.env` files                                            |
-| `next build` / `next dev`      | ⚠️ May fail | Next.js auto-loads `.env`, `.env.local`, `.env.production` at startup |
-| `npm run dev` (Node.js)        | ⚠️ May fail | Apps using `dotenv` to load config will get `undefined` env vars      |
-| `npm test` / `vitest`          | ⚠️ May fail | Tests that depend on `.env` for config won't find the values          |
-| TLS dev servers (`.pem` certs) | ⚠️ Blocked  | Local HTTPS certs in `.pem`/`.key` files can't be read                |
-| `.env.example`                 | ⚠️ Blocked  | Matches `.env.*` pattern — use `--allow-env-files` if needed          |
-| Writing `.env` files           | ✅ Works    | Only read is denied; Copilot can create `.env` from templates         |
+## Proxy
 
-**Fix:** Use `--allow-env-files` when working on projects that need env file loading:
+The proxy is **on by default** — logs and filters all outbound connections. Features:
+
+- **Connection logging** — see every domain the agent connects to
+- **Domain blocking** — block exfiltration infrastructure (paste sites, webhooks)
+- **Domain allowlisting** — restrict to known-safe domains only
+- **Audit log** — persistent file log for post-session review
 
 ```bash
-cplt --allow-env-files -- -p "start the dev server and fix the failing test"
+cplt --no-proxy -- -p "fix tests"                    # disable for one run
+cplt --blocked-domains blocked-domains.txt -- -p "x"  # block known-bad domains
+cplt --allowed-domains allowed-domains.txt -- -p "x"  # allowlist mode
 ```
 
-Or set it permanently in config:
-
-```toml
-[sandbox]
-allow_env_files = true
-```
+📖 **Full details:** [docs/proxy.md](docs/proxy.md)
 
 ### Lifecycle scripts (postinstall hooks)
 
@@ -1281,6 +993,394 @@ read = ["~/.m2/settings.xml", "~/.gradle/gradle.properties"]
 > **Note:** `.npmrc` cannot be overridden — it is in the hard-deny list alongside `.netrc` and `.pypirc`. If you need npm private registry access, consider using project-level `.npmrc` (which is readable as part of the project directory) with a token injected via environment variable.
 
 > **Linux limitation:** These file-level denials are only enforced on macOS (via SBPL literal deny rules). On Linux, Landlock cannot deny individual files within an allowed directory — the parent dirs (`.m2`, `.gradle`, `.cargo`) remain fully readable for dependency resolution.
+||||||| parent of 5cee74e (docs: split README into docs/ for maintainability)
+Or set it permanently in config:
+
+```toml
+[sandbox]
+allow_env_files = true
+```
+
+### Lifecycle scripts (postinstall hooks)
+
+npm/yarn/pnpm lifecycle scripts are **blocked by default** via `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false`. This prevents supply chain attacks through postinstall hooks, but may break packages that require post-install steps:
+
+| Operation                        | Impact      | Why                                                            |
+| -------------------------------- | ----------- | -------------------------------------------------------------- |
+| `npm install` (download only)    | ✅ Works     | Packages are downloaded and extracted normally                 |
+| `npm install` (with native deps) | ⚠️ May fail  | Packages like `node-gyp`, `sharp`, `bcrypt` need postinstall  |
+| `npm run build` / `npm test`     | ✅ Works     | Explicit scripts are not blocked, only lifecycle hooks         |
+| `yarn install` (Yarn Berry)      | ⚠️ May fail  | If packages have install scripts                               |
+
+**Fix:** Use `--allow-lifecycle-scripts` when the project needs postinstall hooks:
+
+```bash
+cplt --allow-lifecycle-scripts -- -p "install dependencies and build the project"
+```
+
+Or set it permanently in config:
+
+```toml
+[sandbox]
+allow_lifecycle_scripts = true
+```
+
+### Temp dir execution (go test, mise, node-gyp)
+
+Tools that compile-then-execute from `$TMPDIR` are **blocked by default** because the sandbox denies `process-exec` and `file-map-executable` from `/private/tmp` and `/private/var/folders`. This affects:
+
+| Tool                      | Impact      | Why                                                                   |
+| ------------------------- | ----------- | --------------------------------------------------------------------- |
+| `go test`                 | ❌ Blocked   | Compiles test binaries to `$TMPDIR`, then executes them               |
+| `go run`                  | ❌ Blocked   | Compiles to `$TMPDIR` then executes — same as `go test`               |
+| `go generate`             | ❌ Blocked   | If the generator is a Go binary compiled to `$TMPDIR`                 |
+| `mise run` (inline tasks) | ❌ Blocked   | Writes script to temp file, then executes it                          |
+| `node-gyp` (native addons)| ❌ Blocked  | Compiles C/C++ to temp, then loads via dlopen                         |
+| `go build`                | ✅ Works     | Output binary goes to project dir or `$GOBIN`, not `$TMPDIR`         |
+| `cargo test`              | ✅ Works     | Rust builds in `target/`, not `$TMPDIR`                               |
+| `npm test` / `vitest`     | ✅ Works     | JavaScript runs via interpreter, not compiled to temp                 |
+
+**Fix:** The scratch dir is now **on by default** — cplt creates `~/Library/Caches/cplt/tmp/{session-id}/` with `rwx` permissions, redirects `TMPDIR`, `TMP`, `TEMP`, and `GOTMPDIR` there, and cleans up on exit. Stale directories older than 24 hours are garbage-collected on startup.
+
+**JVM note:** On macOS, the JVM ignores `TMPDIR` — it reads `java.io.tmpdir` from `confstr(_CS_DARWIN_USER_TEMP_DIR)` which always returns `/var/folders/...`. cplt automatically injects `-Djava.io.tmpdir=<scratch> -Djansi.tmpdir=<scratch> -Djava.rmi.server.hostname=localhost` via `JAVA_TOOL_OPTIONS` so that Maven Surefire forks, the Kotlin compiler daemon, and Jansi native lib extraction all use the scratch dir. The RMI hostname flag ensures the Kotlin daemon's Java RMI communication stays on `localhost` (without it, `InetAddress.getLocalHost()` may resolve to a non-loopback IP via mDNS, which the sandbox blocks). Override with `--pass-env JAVA_TOOL_OPTIONS` if you need custom JVM flags. For inline mocking (MockK, Mockito, ByteBuddy), also add `--allow-jvm-attach` — see [JVM Attach API](#jvm-attach-api).
+
+**Gradle/JVM still failing?** Some JVM native libraries (e.g. `libjli.dylib`, JNI libs) use `dlopen` from the system temp dir *before* `JAVA_TOOL_OPTIONS` takes effect. If you see "Operation not permitted" during JVM startup itself (not Gradle build), add `--allow-tmp-exec`:
+
+```bash
+# Recommended for Gradle projects (localhost + tmp exec + JVM attach):
+cplt --allow-localhost-any --allow-tmp-exec --allow-jvm-attach -- -p "run tests"
+
+# Or set permanently:
+cplt config set sandbox.allow_localhost_any true
+cplt config set sandbox.allow_tmp_exec true
+cplt config set sandbox.allow_jvm_attach true
+```
+
+**Kotlin daemon on Linux:** The Kotlin compiler daemon writes marker files to `~/.local/share/kotlin/daemon/` and communicates via localhost. If you see `AccessDeniedException: .../kotlin-daemon-client-tsmarker*.tmp`, cplt grants write access to `~/.local/share/kotlin/` automatically. If the daemon still can't connect (falls back to non-daemon compilation with garbled Unicode paths), ensure `--allow-localhost-any` is set — the daemon uses ephemeral ports:
+
+```bash
+# Recommended for Kotlin/Gradle on Linux:
+cplt config set sandbox.allow_localhost_any true
+cplt config set sandbox.allow_jvm_attach true
+
+# If you need additional write paths (e.g. custom Kotlin data dir):
+cplt config set sandbox.allow_write '["~/.local/share/kotlin"]'
+```
+
+If you're still seeing this error, check that you haven't set `scratch_dir = false` in your config:
+
+```bash
+cplt config explain sandbox.scratch_dir
+```
+
+### Cache exec (Playwright, pnpm dlx, etc.)
+
+Some tools unpack and execute binaries directly from `~/Library/Caches`, which is exec-blocked by default:
+
+| Tool | Cache path | Fix |
+|---|---|---|
+| Playwright (browsers) | `~/Library/Caches/ms-playwright/` | `--allow-cache-exec ms-playwright` |
+| pnpm dlx | `~/Library/Caches/pnpm/dlx/` | `--allow-cache-exec pnpm/dlx` |
+
+```bash
+# Allow Playwright browser binaries
+cplt --allow-cache-exec ms-playwright -- -p "run the e2e tests"
+
+# Allow pnpm dlx-cached binaries
+cplt --allow-cache-exec pnpm/dlx -- -p "run the scripts"
+
+# Both at once
+cplt --allow-cache-exec ms-playwright --allow-cache-exec pnpm/dlx -- -p "run tests"
+```
+
+Or set permanently in config:
+
+```toml
+[sandbox]
+allow_cache_exec = ["ms-playwright", "pnpm/dlx"]
+```
+
+`--allow-cache-exec-any` opens exec for all of `~/Library/Caches` — use only as a last resort.
+
+### Localhost blocking
+
+Localhost outbound is blocked by default, which prevents sandboxed processes from connecting to local services:
+
+| Operation                      | Impact            | Why                                                  |
+| ------------------------------ | ----------------- | ---------------------------------------------------- |
+| `npm install` (registry)       | ✅ Works           | Uses HTTPS to `registry.npmjs.org:443`               |
+| `gradle build` (Maven Central) | ✅ Works           | Uses HTTPS to `repo1.maven.org:443`                  |
+| Gradle daemon (ephemeral port) | ❌ Blocked         | Use `--allow-localhost-any` (daemon uses random ports) |
+| Gradle/JVM startup (native libs)| ❌ Blocked        | Use scratch dir (default) or `--allow-tmp-exec` — see [JVM note](#temp-dir-exec) |
+| Local PostgreSQL (`:5432`)     | ❌ Blocked         | Use `--allow-localhost 5432`                         |
+| Local Redis (`:6379`)          | ❌ Blocked         | Use `--allow-localhost 6379`                         |
+| Local Kafka (`:9092`)          | ❌ Blocked         | Use `--allow-localhost 9092`                         |
+| MCP servers                    | ❌ Blocked         | Use `--allow-localhost 3000`                         |
+| Local API/dev server           | ❌ Blocked         | Use `--allow-localhost 8080`                         |
+| Spring Boot (`:8080`)          | ❌ Blocked         | Use `--allow-localhost 8080`                         |
+| Next.js/Turbopack build        | ❌ Workers blocked | Use `--allow-localhost-any` (random ephemeral ports) |
+
+**Fix:** Use `--allow-localhost <PORT>` for specific services, or `--allow-localhost-any` for build tools that use random ports (Next.js, Vite, esbuild).
+
+### Docker and Testcontainers
+
+Docker is **intentionally blocked** — `~/.docker` is denied and the Docker socket is not accessible. This is by design: Docker gives near-root access to the host system, which defeats the purpose of sandboxing.
+
+- Docker commands, `docker compose`, and Testcontainers will fail
+- Local databases via Docker Compose need `--allow-localhost <PORT>` for the exposed port (the database container runs outside the sandbox)
+- Consider running database/Kafka containers before starting cplt, then use `--allow-localhost` for the ports
+
+**Opting in (⚠️ dangerous):** If you understand the risks (container mounts bypass the sandbox entirely), you can allow Docker access:
+
+```bash
+cplt config set sandbox.allow_docker true
+# or per-session:
+cplt --allow-docker
+```
+
+### SSH agent blocking
+
+SSH agent access is blocked (unix socket denied), which means:
+
+- `git clone` over SSH will fail — use HTTPS clones instead
+- `ssh` commands spawned by the agent will fail
+- `gh` CLI uses HTTPS by default and is unaffected
+
+### macOS protected folders (Desktop, Documents)
+
+macOS TCC (Transparency, Consent, and Control) protects certain folders at the kernel level. Without Full Disk Access, Copilot CLI cannot access `~/Desktop` or `~/Documents` **with or without cplt** — this is a macOS restriction, not a sandbox limitation. The cplt sandbox remains fully active regardless of FDA status.
+
+| Path | Without FDA | With FDA | Notes |
+| ---- | :---: | :---: | --- |
+| `~/Desktop` | ❌ | ✅ | TCC-protected |
+| `~/Documents` | ❌ | ✅ | TCC-protected |
+| `~/Downloads` | ✅ | ✅ | Less restrictive TCC policy |
+| Dragged screenshots | ❌ | ✅ | `TemporaryItems/NSIRD_*` are per-process isolated |
+
+**Fix: Grant Full Disk Access to your terminal** (recommended):
+
+1. Open **System Settings → Privacy & Security → Full Disk Access**
+2. Enable your terminal app (Terminal.app, iTerm2, Ghostty, etc.)
+3. **Restart the terminal** — TCC grants only take effect for new processes
+
+This lifts TCC restrictions for all child processes while the cplt sandbox continues to enforce its own deny-by-default rules (write protection, network filtering, dotfile access, etc.).
+
+**Alternatives** (if you prefer not to grant FDA):
+
+1. **Copy files into your project**:
+   ```bash
+   cp ~/Desktop/screenshot.png .
+   ```
+
+2. **Use a non-protected folder** for screenshots:
+   ```bash
+   defaults write com.apple.screencapture location ~/Screenshots
+   mkdir -p ~/Screenshots
+   ```
+   Then add to config:
+   ```toml
+   [sandbox]
+   allow_read = ["~/Screenshots"]
+   ```
+
+### Git workflow (commit & push)
+
+Git commit and push **work out of the box** over HTTPS — no extra flags needed.
+
+**Prerequisites:**
+
+1. **Use HTTPS remotes** (not SSH). Check with `git remote -v`:
+   ```bash
+   # If you see git@github.com:org/repo.git, switch to HTTPS:
+   git remote set-url origin https://github.com/org/repo.git
+   ```
+   Or rewrite globally for all repos (no remote changes needed):
+   ```bash
+   git config --global url."https://github.com/".insteadOf "git@github.com:"
+   ```
+   This makes git transparently use HTTPS even when remotes are configured as SSH. The rewrite is read from `~/.gitconfig` which is readable inside the sandbox.
+2. **Authenticate with `gh`** — cplt allows the agent to read `gh auth token`:
+   ```bash
+   gh auth login   # one-time setup outside the sandbox
+   ```
+3. **Configure git credential helper** (if not already set by `gh auth setup-git`):
+   ```bash
+   gh auth setup-git   # sets credential.helper to use gh
+   ```
+
+That's it. The agent can now `git add`, `git commit`, `git push`, create branches, and fetch — all inside the sandbox.
+
+**Optional: signed commits** — add `--allow-gpg-signing` (see [GPG signing](#gpg-commit-signing)).
+
+> **Why is SSH blocked?** The SSH agent socket gives access to *all* loaded keys, which could authenticate to any host. HTTPS with `gh auth token` is scoped to GitHub only. See [SSH agent blocking](#ssh-agent-blocking).
+
+> **Tip:** Protect your `main` branch with [branch protection rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-a-branch-protection-rule/about-branch-protection-rules) to prevent the agent from pushing directly to main or force-pushing. This is good practice regardless of cplt.
+
+### Git restrictions
+
+Certain git operations are blocked to prevent persistence attacks that survive the sandbox session:
+
+| Operation                          | Impact      | Why                                                               |
+| ---------------------------------- | ----------- | ----------------------------------------------------------------- |
+| `git add/commit/status/diff/log`   | ✅ Works     | Local operations, no writes to protected paths                    |
+| `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
+| `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth token` provides credentials            |
+| `git fetch/pull/push` (SSH)        | ❌ Blocked   | SSH agent socket denied — use HTTPS                               |
+| `git config` (local)               | ❌ Blocked   | `.git/config` is write-protected (prevents `url.*.insteadOf` hijacking) |
+| `git config --global`              | ❌ Blocked   | `~/.gitconfig` is read-only                                      |
+| `git remote set-url`               | ❌ Blocked   | Writes to `.git/config`                                           |
+| `git submodule add`                | ❌ Blocked   | `.gitmodules` is write-protected (supply chain vector)            |
+| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected (hooks run unsandboxed)          |
+| Signed commits/tags                | ❌ Disabled  | `commit.gpgsign` and `tag.gpgsign` overridden to `false` via env; use `--allow-gpg-signing` to enable |
+
+**Global git hooks**: If `core.hooksPath` is set in `~/.gitconfig`, cplt auto-detects the hooks directory and allows reading it so git operations succeed. Write access is explicitly denied to prevent persistence attacks. The hooks path must be under `$HOME` with at least 3 path components (e.g. `~/.config/git/hooks`) to prevent overly broad read access.
+
+**Commit signing**: `~/.ssh` and `~/.gnupg` are blocked, so GPG/SSH signing would fail. Instead of opening private key directories, cplt injects `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_N`/`GIT_CONFIG_VALUE_N` env vars to disable `commit.gpgsign` and `tag.gpgsign` inside the sandbox. Commits made by Copilot are unsigned — this is expected since users typically re-sign on merge/squash. Use `--allow-gpg-signing` to override this (see [GPG signing](#gpg-commit-signing)).
+
+### GPG commit signing
+
+GPG commit/tag signing is **disabled by default** because `~/.gnupg` is blocked. Copilot commits are unsigned — you re-sign on merge/squash.
+
+If you want Copilot commits to be signed (e.g. branch protection requires signatures), use `--allow-gpg-signing`:
+
+```bash
+cplt --allow-gpg-signing -- -p "commit your changes"
+```
+
+Or set it permanently in config:
+
+```toml
+[sandbox]
+allow_gpg_signing = true
+```
+
+**Setup checklist:**
+
+Before using this flag, verify GPG signing works outside the sandbox:
+
+```bash
+# 1. Check your signing key is configured
+git config --get user.signingkey          # should show your key ID
+
+# 2. Check gpg-agent is running
+gpg-connect-agent 'GETINFO version' /bye  # should print version + OK
+
+# 3. Cache your passphrase (so signing doesn't hang)
+echo "test" | gpg --clearsign > /dev/null  # triggers passphrase prompt
+
+# 4. Verify git signing works
+git commit --allow-empty -S -m "test signed commit"
+git log --show-signature -1               # should show "Good signature"
+git reset HEAD~1                          # undo the test commit
+```
+
+If all of that works, `cplt --allow-gpg-signing` will work too. The `gpg-agent` runs **outside** the sandbox, so pinentry prompts appear normally — the sandbox only needs to reach the agent socket.
+
+> **Note:** Signature *verification* (`git log --show-signature`) won't work inside the sandbox because GPG opens `trustdb.gpg` for writing during verification. This is harmless — signing works correctly, and signatures can be verified outside the sandbox or in CI.
+
+**Troubleshooting:**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `error: gpg failed to sign the data` | Agent not running or passphrase not cached | Run `gpg-connect-agent 'GETINFO version' /bye` and `echo test \| gpg --clearsign` outside cplt |
+| `signing failed: No secret key` | Wrong `user.signingkey` in git config | Run `gpg --list-secret-keys` and set `git config --global user.signingkey <KEY_ID>` |
+| `signing failed: Operation not permitted` | Flag not set, or `--deny-path` overriding | Check `cplt --doctor` output for GPG signing status |
+| Commits unsigned despite flag | `gpg.format=ssh` in git config | This flag is GPG-only; SSH signing is not supported |
+| `GNUPGHOME` set to non-default path | SBPL rules only cover `~/.gnupg` | Unset `GNUPGHOME` or symlink to `~/.gnupg` |
+| `git log --show-signature` shows `Fatal: can't open trustdb.gpg` | GPG opens `trustdb.gpg` for writing during *verification*, which the sandbox denies | This is expected — **signing works**, only verification is affected. Verify signatures outside the sandbox or in CI |
+
+**What this does:**
+
+| Resource | Access | Why |
+|---|---|---|
+| `~/.gnupg/pubring.kbx`, `pubring.gpg` | Read-only | Public key lookup |
+| `~/.gnupg/trustdb.gpg` | Read-only | Trust validation |
+| `~/.gnupg/gpg.conf`, `common.conf` | Read-only | GPG config |
+| `~/.gnupg/S.gpg-agent` | Read + socket connect | IPC to agent daemon |
+| `~/.gnupg/S.keyboxd` | Read + socket connect | IPC to keyboxd (GnuPG 2.4+ public key daemon) |
+| `~/.gnupg/private-keys-v1.d/` | **DENIED** | Private keys stay locked |
+| `~/.gnupg/secring.gpg` | **DENIED** | Legacy private keyring stays locked |
+| `~/.gnupg/*` (writes) | **DENIED** | No modifications |
+
+**Security notes:**
+
+- **Private keys are NOT exposed.** GPG agent holds keys in memory — the Assuan IPC protocol has no command to export private key material. The `private-keys-v1.d/` directory remains denied even with this flag.
+- **Risk: signature impersonation and decryption.** A compromised process with agent socket access can request signatures on arbitrary data (adding a "Verified" badge) and, if an encryption subkey exists, decrypt arbitrary ciphertext. This is the same level of impersonation Copilot already has for unsigned commits — signing just adds the badge.
+- **GPG-only.** This flag does not enable SSH signing (`gpg.format=ssh`). SSH keys and `SSH_AUTH_SOCK` remain blocked.
+- **`--deny-path` wins.** If you specify `--deny-path ~/.gnupg` alongside `--allow-gpg-signing`, the deny takes precedence — all GPG allows are suppressed.
+- **`GNUPGHOME`** is not supported yet — only the default `~/.gnupg` location is allowed.
+
+### JVM Attach API
+
+JVM testing frameworks like **MockK** (inline mocking), **Mockito** (inline agents), and **ByteBuddy** use the JVM Attach API for runtime class instrumentation. This API creates a Unix domain socket at `/tmp/.java_pid<PID>` — which the sandbox blocks by default.
+
+Enable it with `--allow-jvm-attach`:
+
+```bash
+cplt --allow-jvm-attach -- -p "run the tests"
+```
+
+Or permanently in config:
+
+```bash
+cplt config set sandbox.allow_jvm_attach true
+```
+
+**When to enable:**
+
+- Kotlin/Java projects using **MockK** with `mockk()` or `mockkStatic()` inline mocking
+- Projects using **Mockito** with `Mockito.mock()` on final classes (requires ByteBuddy agent)
+- Any test suite that gets `"Could not self-attach to current VM using external process"` errors
+- JMX monitoring tools that attach to running JVMs
+
+**How it works:** The JVM creates a socket at `/tmp/.java_pid<PID>` (hardcoded path, not affected by `java.io.tmpdir`). A helper JVM process connects to this socket to load an instrumentation agent. The sandbox rule uses a regex pattern that only allows sockets matching `.java_pid<PID>` — all other Unix sockets in `/tmp` (including SSH agent, tmux, PostgreSQL) remain blocked.
+
+**Security note:** This opens a narrow IPC channel for `.java_pid*`-named sockets only. SSH agent access (`SSH_AUTH_SOCK`) is NOT exposed — on macOS it lives at `/private/tmp/com.apple.launchd.*/Listeners` which does not match the pattern.
+
+### Port restriction
+
+Only port 443 is allowed by default. Services on other ports need `--allow-port`:
+
+- `npm install` from private registries on non-standard ports
+- API calls to services not on 443
+- FTP, SMTP, or other protocol connections
+
+### Private registries
+
+Registry credential files are **blocked by default** because they typically contain passwords or tokens that a rogue agent could exfiltrate:
+
+| File | Purpose |
+|------|---------|
+| `~/.npmrc` | npm registry auth (hard deny — not overridable) |
+| `~/.m2/settings.xml` | Maven repository credentials |
+| `~/.m2/settings-security.xml` | Maven master password |
+| `~/.gradle/gradle.properties` | Gradle/Nexus/Artifactory credentials |
+| `~/.cargo/credentials` | Cargo crate registry tokens |
+| `~/.cargo/credentials.toml` | Cargo crate registry tokens (TOML format) |
+
+For Maven, Gradle, and Cargo files, you can override this with `--allow-read`:
+
+```bash
+# Per session — Maven
+cplt --allow-read ~/.m2/settings.xml -- -p "build with Maven"
+
+# Per session — Gradle
+cplt --allow-read ~/.gradle/gradle.properties -- -p "build with Gradle"
+
+# Multiple files
+cplt --allow-read ~/.m2/settings.xml --allow-read ~/.gradle/gradle.properties -- -p "build"
+```
+
+To allow permanently, add to `~/.config/cplt/config.toml`:
+
+```toml
+[allow]
+read = ["~/.m2/settings.xml", "~/.gradle/gradle.properties"]
+```
+
+> **Note:** `.npmrc` cannot be overridden — it is in the hard-deny list alongside `.netrc` and `.pypirc`. If you need npm private registry access, consider using project-level `.npmrc` (which is readable as part of the project directory) with a token injected via environment variable.
+
+> **Linux limitation:** These file-level denials are only enforced on macOS (via SBPL literal deny rules). On Linux, Landlock cannot deny individual files within an allowed directory — the parent dirs (`.m2`, `.gradle`, `.cargo`) remain fully readable for dependency resolution.
 
 ## Limitations
 
@@ -1288,25 +1388,15 @@ read = ["~/.m2/settings.xml", "~/.gradle/gradle.properties"]
 
 - **`sandbox-exec` is deprecated** — Apple has not removed it but may in future macOS versions
 - **SBPL has no domain-based filtering** — the optional CONNECT proxy provides domain blocking
-- **Keychain access required** — Copilot stores auth tokens in macOS Keychain
 
 ### Linux
 
-- **Kernel 5.13+ required** — Landlock LSM must be enabled (`cat /sys/kernel/security/lsm`)
-- **TCP port filtering requires kernel 6.7+** — older kernels get filesystem-only enforcement; network security via proxy only
-- **Landlock network rules are port-based only** — cannot distinguish localhost from remote. When `--allow-localhost-any` is set, kernel TCP connect filtering is disabled entirely (the proxy still enforces domain filtering and port restrictions for remote connections)
-- **Gradle/JVM on Linux** — Gradle daemon uses ephemeral localhost ports. Use `--allow-localhost-any` or `cplt config set sandbox.allow_localhost_any true` to allow Gradle client↔daemon communication. If JVM startup itself fails, also add `--allow-tmp-exec` (native lib loading from temp)
-- **Landlock cannot deny subpaths within allowed paths** — unlike macOS Seatbelt, Landlock cannot deny `.env` reads or `.git/hooks` writes *inside* the project directory at the kernel level. Defense-in-depth comes from the proxy (blocks exfiltration) and env hardening (`GIT_CONFIG_NOSYSTEM`, etc.)
-- **`--deny-path` has no effect** — Landlock is allowlist-only; a runtime warning is emitted
-- **Some macOS flags are not applicable** — `--allow-docker`, `--allow-jvm-attach`, `--allow-cache-exec` emit warnings and are ignored on Linux
-- **No audit logs** — `--show-denials` is macOS-only; use `strace -f -e trace=file,network` for debugging
-- **Auth scoped to env + gh CLI** — no D-Bus/Secret Service integration for v1
+- **Kernel 5.13+ required** — Landlock LSM must be enabled
+- **TCP port filtering requires kernel 6.7+** — older kernels get filesystem-only enforcement
+- **Landlock cannot deny subpaths within allowed paths** — `.env` reads and `.git/hooks` writes inside the project dir are not kernel-enforced
+- **`--deny-path` has no effect** — Landlock is allowlist-only
 
-### Both platforms
-
-- **No TLS inspection** — the proxy sees domain names (via CONNECT) but not request bodies
-
-For known attack vectors, out-of-scope threats, and prior art, see [SECURITY.md](SECURITY.md).
+📖 **Full details:** [docs/security.md](docs/security.md#limitations)
 
 ## Contributing
 
