@@ -236,6 +236,7 @@ pub fn exec(
     extra_pass_env: &[String],
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
+    deny_env: &[String],
 ) -> u8 {
     let profile_path = match write_temp_profile(&sandbox.profile_text) {
         Ok(p) => p,
@@ -260,6 +261,11 @@ pub fn exec(
         sandbox.proxy_port,
         sandbox.agent,
     );
+
+    // Strip repo-config denied env vars
+    for var in deny_env {
+        cmd.env_remove(var);
+    }
 
     let exit_code = spawn_and_wait(&mut cmd);
     let _ = std::fs::remove_file(&profile_path);
@@ -320,6 +326,7 @@ pub fn exec(
     extra_pass_env: &[String],
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
+    deny_env: &[String],
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;
 
@@ -337,6 +344,11 @@ pub fn exec(
         sandbox.proxy_port,
         sandbox.agent,
     );
+
+    // Strip repo-config denied env vars
+    for var in deny_env {
+        cmd.env_remove(var);
+    }
 
     // Apply pre-computed sandbox in the child process, between fork and exec.
     // Safety: The proxy thread is running (multi-threaded at fork), making this

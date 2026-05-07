@@ -188,6 +188,7 @@ pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
 ///
 /// Environment handling is controlled by `extra_pass_env`, `inherit_env`,
 /// and `disabled_categories` — see [`build_sandbox_env()`] for details.
+/// `deny_env` contains additional env vars to strip (from repo config [deny] section).
 pub fn exec_sandboxed(
     sandbox: &PreparedSandbox,
     copilot_bin: &Path,
@@ -195,6 +196,7 @@ pub fn exec_sandboxed(
     extra_pass_env: &[String],
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
+    deny_env: &[String],
 ) -> u8 {
     exec::exec(
         sandbox,
@@ -203,6 +205,7 @@ pub fn exec_sandboxed(
         extra_pass_env,
         inherit_env,
         disabled_categories,
+        deny_env,
     )
 }
 

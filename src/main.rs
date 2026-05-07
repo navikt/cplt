@@ -318,6 +318,12 @@ struct Cli {
     #[arg(long, short = 'y')]
     yes: bool,
 
+    /// Auto-approve all proposals from .cplt.toml without prompting.
+    /// For CI/scripts where interactive approval isn't possible.
+    /// Equivalent to running `cplt trust accept --all` first.
+    #[arg(long)]
+    accept_repo_config: bool,
+
     /// Suppress the startup configuration summary and non-essential messages.
     /// Errors and warnings are always shown. Use when you've reviewed the
     /// sandbox settings and don't need to see them every time.
@@ -789,6 +795,58 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // ── Load and apply per-repo config (.cplt.toml) ──────────────
+    let mut unapproved_proposals: Vec<String> = Vec::new();
+    match repo_config::load_repo_config(&project_dir) {
+        Ok(Some(loaded)) => {
+            if !resolved.quiet {
+                let source_note = match loaded.source {
+                    repo_config::RepoConfigSource::GitHead => "",
+                    repo_config::RepoConfigSource::WorkingTree => {
+                        warn(
+                            ".cplt.toml read from working tree (not committed — not tamper-proof)",
+                        );
+                        " (working tree)"
+                    }
+                };
+                info(&format!("Repo config: .cplt.toml{source_note}"));
+            }
+
+            // Determine approved keys
+            let approved_keys: Vec<String> = if cli.accept_repo_config {
+                // --accept-repo-config: approve everything
+                repo_config::proposed_keys(&loaded.config.propose)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                // Check trust store
+                trust::load_trust(&project_dir)
+                    .map(|t| t.accepted.keys)
+                    .unwrap_or_default()
+            };
+
+            let approved_refs: Vec<&str> = approved_keys.iter().map(|s| s.as_str()).collect();
+            unapproved_proposals = resolved.apply_repo_config(&loaded.config, &approved_refs);
+        }
+        Ok(None) => {} // No .cplt.toml — nothing to do
+        Err(e) => {
+            warn(&format!("Failed to load .cplt.toml: {e}"));
+        }
+    }
+
+    // Show unapproved proposals warning (non-fatal)
+    if !unapproved_proposals.is_empty() && !resolved.quiet {
+        warn(&format!(
+            ".cplt.toml proposes {} unapproved setting(s):",
+            unapproved_proposals.len()
+        ));
+        for key in &unapproved_proposals {
+            eprintln!("  {YELLOW}○{NC} {key}");
+        }
+        eprintln!("  Run: {GREEN}cplt trust accept --all{NC}  (or select specific keys)");
+    }
+
     if !resolved.quiet {
         info(&format!("Project:  {}", project_dir.display()));
         info(&format!("Home:     {}", home_dir.display()));
@@ -1179,6 +1237,7 @@ fn main() -> ExitCode {
         &resolved.pass_env,
         resolved.inherit_env,
         &disabled_categories,
+        &resolved.deny_env,
     );
 
     // Cleanup
