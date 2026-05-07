@@ -22,9 +22,10 @@
 //! The proxy handles domain-level filtering on both platforms.
 
 use super::policy::{self, HomeToolDir};
+use landlock::PathBeneath;
 use std::fmt::Write as _;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::path::PathBuf;
-
 // ── Cross-platform types ───────────────────────────────────────
 
 /// Filesystem access flags for a Landlock rule.
@@ -102,7 +103,7 @@ pub struct PrecomputedSandbox {
     /// Opened in `precompute()` (parent), used in `apply_precomputed()` (child).
     /// Raw fds (i32) so the struct remains Clone-able. Closed on exec via
     /// `O_CLOEXEC`; the parent leaks them (harmless — ~30 fds, program exits).
-    pub pre_opened_fds: Vec<(i32, FsAccess)>,
+    pub pre_opened_fds: Vec<(RawFd, FsAccess)>,
     /// Paths that must be opened in the child process because they are magic
     /// symlinks that resolve differently per-process (e.g. `/proc/self` resolves
     /// to `/proc/<pid>` — the parent's pid, not the child's).
@@ -984,11 +985,9 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
 /// The seccomp filter application is allocation-free (raw prctl syscall).
 #[cfg(target_os = "linux")]
 pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
-    use std::os::fd::BorrowedFd;
-
     use landlock::{
-        ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus,
+        ABI, Access, AccessFs, AccessNet, NetPort, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus,
     };
 
     // Map the detected kernel ABI to the landlock crate's ABI enum.
@@ -1019,66 +1018,26 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
 
     let mut created = ruleset.create().map_err(std::io::Error::other)?;
 
-    let mut opened_fds = sandbox.pre_opened_fds.clone();
-
-    // Add fds for deferred paths (e.g. /proc/self).
+    // Add filesystem rules for deferred paths (e.g. /proc/self).
     // These are magic symlinks that resolve per-process — opened here in the
     // child so /proc/self resolves to the child's pid, not the parent's.
     for (c_path, access) in &sandbox.deferred_paths {
-        let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        let raw_fd: RawFd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if raw_fd < 0 {
             continue;
         }
-        opened_fds.push((raw_fd, *access))
+        let path_beneath_rule = create_path_beneath_rule(abi_version, &raw_fd, access);
+        created = created
+            .add_rule(path_beneath_rule)
+            .map_err(std::io::Error::other)?;
     }
 
-    // Add filesystem rules using opened file descriptors.
+    // Add filesystem rules using pre-opened file descriptors.
     // No open() or CString allocation — just borrow the raw fd.
-    for &(raw_fd, access) in &opened_fds {
-        let mut access_flags = if access.read {
-            AccessFs::ReadFile | AccessFs::ReadDir
-        } else {
-            landlock::BitFlags::EMPTY
-        };
-
-        if access.write {
-            let mut write_flags = AccessFs::WriteFile
-                | AccessFs::RemoveDir
-                | AccessFs::RemoveFile
-                | AccessFs::MakeDir
-                | AccessFs::MakeReg
-                | AccessFs::MakeSym
-                | AccessFs::MakeFifo
-                | AccessFs::MakeSock;
-            if abi_version >= 2 {
-                // Refer controls rename()/link() across different Landlock
-                // domains. Without it, build tools (cargo, git) that move
-                // files between directories would fail.
-                write_flags |= AccessFs::Refer;
-            }
-            if abi_version >= 3 {
-                write_flags |= AccessFs::Truncate;
-            }
-            access_flags |= write_flags;
-        }
-
-        if access.execute {
-            access_flags |= AccessFs::Execute;
-        }
-
-        if access.ioctl && abi_version >= 5 {
-            // Landlock ABI v5 (kernel ≥ 6.8) enforces IOCTL_DEV for character
-            // and block devices. Grant it for device paths so tcsetattr() on
-            // /dev/tty and /dev/pts/* succeeds — without this, raw mode fails,
-            // the terminal stays in cooked/echo mode and Copilot's TUI hangs.
-            access_flags |= AccessFs::IoctlDev;
-        }
-
-        // Safety: raw_fd was opened in precompute() and is still valid
-        // (O_CLOEXEC keeps it alive until exec, fork inherits it).
-        let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+    for &(raw_fd, access) in &sandbox.pre_opened_fds {
+        let path_beneath_rule = create_path_beneath_rule(abi_version, &raw_fd, &access);
         created = created
-            .add_rule(PathBeneath::new(fd, access_flags))
+            .add_rule(path_beneath_rule)
             .map_err(std::io::Error::other)?;
     }
 
@@ -1104,6 +1063,61 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     apply_seccomp_filter(&sandbox.seccomp_filter)?;
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_path_beneath_rule<'fd>(
+    abi_version: u32,
+    raw_fd: &'fd RawFd,
+    access: &FsAccess,
+) -> PathBeneath<BorrowedFd<'fd>> {
+    use std::os::fd::BorrowedFd;
+
+    use landlock::{AccessFs, PathBeneath};
+
+    let mut access_flags = if access.read {
+        AccessFs::ReadFile | AccessFs::ReadDir
+    } else {
+        landlock::BitFlags::EMPTY
+    };
+
+    if access.write {
+        let mut write_flags = AccessFs::WriteFile
+            | AccessFs::RemoveDir
+            | AccessFs::RemoveFile
+            | AccessFs::MakeDir
+            | AccessFs::MakeReg
+            | AccessFs::MakeSym
+            | AccessFs::MakeFifo
+            | AccessFs::MakeSock;
+        if abi_version >= 2 {
+            // Refer controls rename()/link() across different Landlock
+            // domains. Without it, build tools (cargo, git) that move
+            // files between directories would fail.
+            write_flags |= AccessFs::Refer;
+        }
+        if abi_version >= 3 {
+            write_flags |= AccessFs::Truncate;
+        }
+        access_flags |= write_flags;
+    }
+
+    if access.execute {
+        access_flags |= AccessFs::Execute;
+    }
+
+    if access.ioctl && abi_version >= 5 {
+        // Landlock ABI v5 (kernel ≥ 6.8) enforces IOCTL_DEV for character
+        // and block devices. Grant it for device paths so tcsetattr() on
+        // /dev/tty and /dev/pts/* succeeds — without this, raw mode fails,
+        // the terminal stays in cooked/echo mode and Copilot's TUI hangs.
+        access_flags |= AccessFs::IoctlDev;
+    }
+
+    // Safety: raw_fd was opened in precompute() and is still valid
+    // (O_CLOEXEC keeps it alive until exec, fork inherits it).
+    let fd = unsafe { BorrowedFd::borrow_raw(*raw_fd) };
+    PathBeneath::new(fd, access_flags)
 }
 
 /// Apply a pre-built seccomp BPF filter via prctl.
