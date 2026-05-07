@@ -84,12 +84,16 @@ pub struct LandlockPolicy {
 ///
 /// Everything here is computed in the parent (where allocation and I/O
 /// are safe). The `pre_exec` hook only receives this immutable data and
-/// makes raw syscalls — no allocation, no file I/O.
+/// makes raw syscalls — no allocation, no file I/O, with one exception:
+/// paths in `deferred_paths` are magic symlinks (e.g. `/proc/self`) that
+/// must be opened in the child after fork so they resolve to the child's
+/// pid rather than the parent's.
 ///
 /// File descriptors in `pre_opened_fds` are opened with `O_PATH | O_CLOEXEC`
 /// in `precompute()`. They survive `fork()` and are used by
 /// `apply_precomputed()` via `BorrowedFd` — no `open()` or allocation
-/// in the async-signal-unsafe post-fork context.
+/// in the async-signal-unsafe post-fork context, except for the deferred
+/// paths described above.
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub struct PrecomputedSandbox {
@@ -99,6 +103,12 @@ pub struct PrecomputedSandbox {
     /// Raw fds (i32) so the struct remains Clone-able. Closed on exec via
     /// `O_CLOEXEC`; the parent leaks them (harmless — ~30 fds, program exits).
     pub pre_opened_fds: Vec<(i32, FsAccess)>,
+    /// Paths that must be opened in the child process because they are magic
+    /// symlinks that resolve differently per-process (e.g. `/proc/self` resolves
+    /// to `/proc/<pid>` — the parent's pid, not the child's).
+    /// `CString` allocation happens in `precompute()` (parent, safe).
+    /// The actual `open()` call happens in `apply_precomputed()` (child).
+    pub deferred_paths: Vec<(std::ffi::CString, FsAccess)>,
     pub net_rules: Vec<NetRule>,
     /// Whether to restrict TCP connect at the kernel level.
     pub restrict_net_connect: bool,
@@ -460,12 +470,11 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
-    // ── /proc: read-only access to the proc filesystem; /proc/self is a magic symlink
-    // that resolves per-process, so pre-opening /proc/self in the parent would give
-    // the parent's pid directory, not the child's. Granting /proc read access covers
-    // /proc/self/cgroup, /proc/self/exe, /proc/self/maps, and similar needs. ──
+    // ── /proc/self: Node.js reads /proc/self/exe, /proc/self/maps, /proc/self/cgroup ──
+    // This path is a magic symlink resolved per-process. It is deferred to the
+    // child in apply_precomputed() where it resolves to the correct pid.
     fs_rules.push(FsRule {
-        path: PathBuf::from("/proc"),
+        path: PathBuf::from("/proc/self"),
         access: FsAccess {
             read: true,
             write: false,
@@ -779,6 +788,11 @@ fn probe_abi_candidate(abi: landlock::ABI) -> Result<(), String> {
 /// `CString` allocation for path conversion happens safely in the parent.
 /// The child's `pre_exec` hook receives only raw fd numbers.
 ///
+/// Exception: paths that are magic symlinks (e.g. `/proc/self`) cannot
+/// be resolved in the parent because they would yield the parent's pid.
+/// These are stored in `deferred_paths` and opened with a single `open()`
+/// call in the child after fork.
+///
 /// Called once in `prepare()`. The returned `PrecomputedSandbox` is
 /// cloned into the `pre_exec` closure.
 #[cfg(target_os = "linux")]
@@ -808,10 +822,17 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
 
     // Pre-open all filesystem paths in the parent process.
     // This avoids CString allocation and open() calls in pre_exec.
+    // Paths under /proc/self are magic symlinks that resolve to /proc/<pid> —
+    // the parent's pid, not the child's. Defer those to apply_precomputed().
     let mut pre_opened_fds = Vec::new();
+    let mut deferred_paths = Vec::new();
     for rule in &policy.fs_rules {
         let c_path = CString::new(rule.path.as_os_str().as_bytes())
             .map_err(|_| format!("Path contains null byte: {}", rule.path.display()))?;
+        if rule.path.starts_with("/proc/self") {
+            deferred_paths.push((c_path, rule.access));
+            continue;
+        }
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if fd >= 0 {
             pre_opened_fds.push((fd, rule.access));
@@ -825,6 +846,7 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     Ok(PrecomputedSandbox {
         abi_version: abi_version as u32,
         pre_opened_fds,
+        deferred_paths,
         net_rules,
         restrict_net_connect,
         seccomp_filter,
@@ -955,6 +977,10 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
 /// 3. This is the same risk profile as any Rust program using
 ///    Command::spawn() with pre_exec in a multi-threaded context.
 ///
+/// Deferred paths (magic symlinks like `/proc/self`) also require one
+/// `open()` call per path in the child.
+/// The risk profile is the same as the heap allocation above.
+///
 /// The seccomp filter application is allocation-free (raw prctl syscall).
 #[cfg(target_os = "linux")]
 pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
@@ -993,9 +1019,22 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
 
     let mut created = ruleset.create().map_err(std::io::Error::other)?;
 
-    // Add filesystem rules using pre-opened file descriptors.
+    let mut opened_fds = sandbox.pre_opened_fds.clone();
+
+    // Add fds for deferred paths (e.g. /proc/self).
+    // These are magic symlinks that resolve per-process — opened here in the
+    // child so /proc/self resolves to the child's pid, not the parent's.
+    for (c_path, access) in &sandbox.deferred_paths {
+        let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if raw_fd < 0 {
+            continue;
+        }
+        opened_fds.push((raw_fd, *access))
+    }
+
+    // Add filesystem rules using opened file descriptors.
     // No open() or CString allocation — just borrow the raw fd.
-    for &(raw_fd, access) in &sandbox.pre_opened_fds {
+    for &(raw_fd, access) in &opened_fds {
         let mut access_flags = if access.read {
             AccessFs::ReadFile | AccessFs::ReadDir
         } else {
@@ -1575,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn proc_is_readonly() {
+    fn proc_self_is_readonly() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
         let config = test_config(&project, &home);
@@ -1584,8 +1623,8 @@ mod tests {
         let rule = policy
             .fs_rules
             .iter()
-            .find(|r| r.path == Path::new("/proc"))
-            .expect("/proc should be in rules");
+            .find(|r| r.path == Path::new("/proc/self"))
+            .expect("/proc/self should be in rules");
         assert!(rule.access.read);
         assert!(!rule.access.write);
         assert!(!rule.access.execute);
