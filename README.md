@@ -230,16 +230,16 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 
 **What passes through:**
 
-| Category | Examples | How |
-|---|---|---|
-| Core system | `HOME`, `USER`, `PATH`, `SHELL`, `TMPDIR`, `LANG` | Explicit allowlist |
-| Terminal | `TERM`, `COLORTERM`, `TERM_PROGRAM` | Explicit allowlist |
-| Editor | `EDITOR`, `VISUAL`, `PAGER` | Explicit allowlist |
-| Auth tokens | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` | Explicit allowlist (needed for Copilot) |
-| Copilot config | `COPILOT_DEBUG`, `COPILOT_*` | Prefix allowlist |
-| Language runtimes | `NODE_*`, `GOPATH`, `CARGO_HOME`, `JAVA_HOME`, `VIRTUAL_ENV`, `PYTHONPATH` | Explicit allowlist |
-| Tool managers | `NVM_*`, `PYENV_*`, `MISE_*`, `SDKMAN_*`, `COREPACK_*`, `YARN_*` | Prefix allowlist |
-| XDG dirs | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` | Explicit allowlist |
+| Category          | Examples                                                                   | How                                     |
+|-------------------|----------------------------------------------------------------------------|-----------------------------------------|
+| Core system       | `HOME`, `USER`, `PATH`, `SHELL`, `TMPDIR`, `LANG`                          | Explicit allowlist                      |
+| Terminal          | `TERM`, `COLORTERM`, `TERM_PROGRAM`                                        | Explicit allowlist                      |
+| Editor            | `EDITOR`, `VISUAL`, `PAGER`                                                | Explicit allowlist                      |
+| Auth tokens       | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`                         | Explicit allowlist (needed for Copilot) |
+| Copilot config    | `COPILOT_DEBUG`, `COPILOT_*`                                               | Prefix allowlist                        |
+| Language runtimes | `NODE_*`, `GOPATH`, `CARGO_HOME`, `JAVA_HOME`, `VIRTUAL_ENV`, `PYTHONPATH` | Explicit allowlist                      |
+| Tool managers     | `NVM_*`, `PYENV_*`, `MISE_*`, `SDKMAN_*`, `COREPACK_*`, `YARN_*`           | Prefix allowlist                        |
+| XDG dirs          | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`     | Explicit allowlist                      |
 
 **Prefix allowlist with secret-suffix protection:** Variables matching allowed prefixes (e.g. `COPILOT_*`, `YARN_*`) are passed through *unless* they end with a secret-bearing suffix: `_TOKEN`, `_AUTH`, `_SECRET`, `_SECRET_KEY`, `_KEY`, `_PASSWORD`, or `_CREDENTIALS`. For example, `COPILOT_DEBUG` passes through but `COPILOT_API_KEY` is blocked.
 
