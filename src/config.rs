@@ -150,6 +150,8 @@ pub struct Resolved {
     pub allow_browser: bool,
     pub scratch_dir: bool,
     pub quiet: bool,
+    /// Env vars to strip from the sandbox environment (from repo config [deny] section).
+    pub deny_env: Vec<String>,
 }
 
 /// CLI flag values to merge with the config file.
@@ -520,6 +522,7 @@ impl Config {
             allow_browser,
             scratch_dir,
             quiet,
+            deny_env: Vec::new(),
         })
     }
 }
@@ -786,6 +789,126 @@ impl Resolved {
             "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet or: cplt config set sandbox.quiet true{nc}"
         );
         eprintln!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
+    }
+
+    /// Apply per-repo config (.cplt.toml) to the resolved configuration.
+    ///
+    /// - `[deny]` section is always applied (tightens the sandbox).
+    /// - `[propose]` section only applies for keys that are approved in the trust store.
+    ///
+    /// Approved proposals are additive — they can set boolean flags to `true` but
+    /// never override an explicit `true` back to `false`. Path/port proposals extend
+    /// the existing lists.
+    ///
+    /// Returns a list of unapproved proposal keys (for display to the user).
+    pub fn apply_repo_config(
+        &mut self,
+        repo_config: &crate::repo_config::RepoConfig,
+        approved_keys: &[&str],
+    ) -> Vec<String> {
+        // ── Deny section: always applied ──────────────────────────
+        for path_str in &repo_config.deny.paths {
+            let path = expand_tilde(path_str);
+            if !self.deny_paths.contains(&path) {
+                self.deny_paths.push(path);
+            }
+        }
+        // deny.env is stored separately — the caller must use it when building
+        // the sandbox environment (strip these vars). We store them on the resolved
+        // struct for that purpose.
+        self.deny_env.extend(repo_config.deny.env.iter().cloned());
+        self.deny_env.sort_unstable();
+        self.deny_env.dedup();
+
+        // ── Propose section: only approved keys ──────────────────
+        let is_approved = |key: &str| approved_keys.contains(&key);
+        let all_proposed = crate::repo_config::proposed_keys(&repo_config.propose);
+
+        // Boolean proposals (additive: false→true only)
+        if repo_config.propose.allow_localhost_any == Some(true)
+            && is_approved("allow_localhost_any")
+        {
+            self.allow_localhost_any = true;
+        }
+        if repo_config.propose.allow_jvm_attach == Some(true) && is_approved("allow_jvm_attach") {
+            self.allow_jvm_attach = true;
+        }
+        if repo_config.propose.allow_docker == Some(true) && is_approved("allow_docker") {
+            self.allow_docker = true;
+        }
+        if repo_config.propose.allow_tmp_exec == Some(true) && is_approved("allow_tmp_exec") {
+            self.allow_tmp_exec = true;
+        }
+        if repo_config.propose.allow_gpg_signing == Some(true) && is_approved("allow_gpg_signing") {
+            self.allow_gpg_signing = true;
+        }
+        if repo_config.propose.allow_lifecycle_scripts == Some(true)
+            && is_approved("allow_lifecycle_scripts")
+        {
+            self.allow_lifecycle_scripts = true;
+        }
+        if repo_config.propose.allow_browser == Some(true) && is_approved("allow_browser") {
+            self.allow_browser = true;
+        }
+        if repo_config.propose.allow_env_files == Some(true) && is_approved("allow_env_files") {
+            self.allow_env_files = true;
+        }
+
+        // Path proposals
+        if is_approved("allow.read") {
+            for path_str in &repo_config.propose.allow.read {
+                let path = expand_tilde(path_str);
+                if !self.allow_read.contains(&path) {
+                    self.allow_read.push(path);
+                }
+            }
+        }
+        if is_approved("allow.write") {
+            for path_str in &repo_config.propose.allow.write {
+                let path = expand_tilde(path_str);
+                if !self.allow_write.contains(&path) {
+                    self.allow_write.push(path);
+                }
+            }
+        }
+
+        // Port proposals
+        if is_approved("allow.ports") {
+            for &port in &repo_config.propose.allow.ports {
+                if !self.allow_ports.contains(&port) {
+                    self.allow_ports.push(port);
+                }
+            }
+            self.allow_ports.sort_unstable();
+            self.allow_ports.dedup();
+        }
+        if is_approved("allow.localhost") {
+            for &port in &repo_config.propose.allow.localhost {
+                if !self.allow_localhost.contains(&port) {
+                    self.allow_localhost.push(port);
+                }
+            }
+            self.allow_localhost.sort_unstable();
+            self.allow_localhost.dedup();
+        }
+
+        // Proxy proposals
+        if is_approved("proxy.allow_private_domains") {
+            for domain in &repo_config.propose.proxy.allow_private_domains {
+                if !self.allow_private_domains.contains(domain) {
+                    self.allow_private_domains.push(domain.clone());
+                }
+            }
+            self.allow_private_domains.sort_unstable();
+            self.allow_private_domains.dedup();
+        }
+
+        // Return unapproved keys for display
+        all_proposed
+            .into_iter()
+            .filter(|key| !is_approved(key))
+            .map(|s| s.to_string())
+            .collect()
     }
 }
 
@@ -2995,5 +3118,132 @@ quiet = false
 
         let quiet = lookup_key("sandbox.quiet").unwrap();
         assert!(!quiet.dangerous);
+    }
+
+    #[test]
+    fn apply_repo_config_deny_always_applied() {
+        let config = Config::default();
+        let mut resolved = config.merge(CliFlags::default()).unwrap();
+
+        let repo_config = crate::repo_config::RepoConfig {
+            deny: crate::repo_config::DenySection {
+                paths: vec!["~/secrets".to_string()],
+                env: vec!["MY_SECRET".to_string(), "VAULT_TOKEN".to_string()],
+            },
+            ..Default::default()
+        };
+
+        // Apply with NO approved keys — deny should still work
+        let unapproved = resolved.apply_repo_config(&repo_config, &[]);
+        assert!(unapproved.is_empty()); // no proposals, so nothing unapproved
+        assert!(
+            resolved
+                .deny_paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("secrets"))
+        );
+        assert!(resolved.deny_env.contains(&"MY_SECRET".to_string()));
+        assert!(resolved.deny_env.contains(&"VAULT_TOKEN".to_string()));
+    }
+
+    #[test]
+    fn apply_repo_config_proposals_need_approval() {
+        let config = Config::default();
+        let mut resolved = config.merge(CliFlags::default()).unwrap();
+
+        let repo_config = crate::repo_config::RepoConfig {
+            propose: crate::repo_config::ProposeSection {
+                allow_jvm_attach: Some(true),
+                allow_docker: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // No keys approved
+        let unapproved = resolved.apply_repo_config(&repo_config, &[]);
+        assert!(!resolved.allow_jvm_attach);
+        assert!(!resolved.allow_docker);
+        assert_eq!(unapproved.len(), 2);
+        assert!(unapproved.contains(&"allow_jvm_attach".to_string()));
+        assert!(unapproved.contains(&"allow_docker".to_string()));
+    }
+
+    #[test]
+    fn apply_repo_config_approved_proposals_take_effect() {
+        let config = Config::default();
+        let mut resolved = config.merge(CliFlags::default()).unwrap();
+
+        let repo_config = crate::repo_config::RepoConfig {
+            propose: crate::repo_config::ProposeSection {
+                allow_jvm_attach: Some(true),
+                allow_docker: Some(true),
+                allow_localhost_any: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Only approve jvm_attach and localhost_any
+        let unapproved =
+            resolved.apply_repo_config(&repo_config, &["allow_jvm_attach", "allow_localhost_any"]);
+        assert!(resolved.allow_jvm_attach);
+        assert!(resolved.allow_localhost_any);
+        assert!(!resolved.allow_docker); // not approved
+        assert_eq!(unapproved, vec!["allow_docker"]);
+    }
+
+    #[test]
+    fn apply_repo_config_path_proposals() {
+        let config = Config::default();
+        let mut resolved = config.merge(CliFlags::default()).unwrap();
+
+        let repo_config = crate::repo_config::RepoConfig {
+            propose: crate::repo_config::ProposeSection {
+                allow: crate::repo_config::ProposeAllowSection {
+                    read: vec!["~/.gradle/gradle.properties".to_string()],
+                    ports: vec![8080, 5432],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Approve read and ports
+        let unapproved = resolved.apply_repo_config(&repo_config, &["allow.read", "allow.ports"]);
+        assert!(unapproved.is_empty());
+        assert!(
+            resolved
+                .allow_read
+                .iter()
+                .any(|p| p.to_string_lossy().contains("gradle.properties"))
+        );
+        assert!(resolved.allow_ports.contains(&8080));
+        assert!(resolved.allow_ports.contains(&5432));
+    }
+
+    #[test]
+    fn apply_repo_config_proxy_proposals() {
+        let config = Config::default();
+        let mut resolved = config.merge(CliFlags::default()).unwrap();
+
+        let repo_config = crate::repo_config::RepoConfig {
+            propose: crate::repo_config::ProposeSection {
+                proxy: crate::repo_config::ProposeProxySection {
+                    allow_private_domains: vec!["intern.nav.no".to_string()],
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let unapproved = resolved.apply_repo_config(&repo_config, &["proxy.allow_private_domains"]);
+        assert!(unapproved.is_empty());
+        assert!(
+            resolved
+                .allow_private_domains
+                .contains(&"intern.nav.no".to_string())
+        );
     }
 }
