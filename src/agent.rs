@@ -436,8 +436,8 @@ mod tests {
     fn opencode_config_dirs_xdg_default() {
         let home = Path::new("/Users/test");
         let dirs = Agent::OpenCode.config_dirs(home);
-        assert!(dirs.len() >= 2, "should have config + data dirs");
-        // Config dir is read-only, data dir is writable
+        assert!(dirs.len() >= 2, "should have config + data + state dirs");
+        // Config dir is read-only, data dir and state dir are writable
         let config_dir = dirs
             .iter()
             .find(|d| d.path.to_str().unwrap().contains("config"))
@@ -446,9 +446,14 @@ mod tests {
             .iter()
             .find(|d| d.path.to_str().unwrap().contains("share"))
             .unwrap();
+        let state_dir = dirs
+            .iter()
+            .find(|d| d.path.to_str().unwrap().contains("state"))
+            .unwrap();
         assert!(!config_dir.write, "config dir should be read-only");
         assert!(data_dir.write, "data dir should be writable");
-        // Neither should be executable
+        assert!(state_dir.write, "state data dir should be writable");
+        // None should be executable
         assert!(dirs.iter().all(|d| !d.process_exec && !d.map_exec));
     }
 
