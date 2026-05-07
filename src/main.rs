@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use cplt::{agent, config, discover, proxy, sandbox, scratch, update};
+use cplt::{agent, config, discover, proxy, repo_config, sandbox, scratch, trust, update};
 #[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -64,6 +64,12 @@ EXAMPLES:
 
   cplt update
     Update cplt to the latest release from GitHub
+
+  cplt trust
+    Show per-repo config proposals and their approval status
+
+  cplt trust accept allow_jvm_attach allow_docker
+    Approve specific proposals from .cplt.toml
 
   eval \"$(cplt --shell-setup)\"
     Add to your shell rc so 'copilot' runs the sandboxed version
@@ -385,6 +391,15 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+
+    /// Manage per-repo trust for .cplt.toml proposals.
+    ///
+    /// Shows, approves, or revokes trust for sandbox-relaxing proposals
+    /// in the current repository's .cplt.toml file.
+    Trust {
+        #[command(subcommand)]
+        action: Option<TrustAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -456,6 +471,42 @@ enum ConfigAction {
     Explain {
         /// Config key to explain (omit to list all)
         key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Show trust status for the current repository.
+    ///
+    /// Displays what .cplt.toml proposes and which proposals are approved.
+    Show,
+
+    /// Approve specific proposals from .cplt.toml.
+    ///
+    /// Example: cplt trust accept allow_jvm_attach allow_docker
+    Accept {
+        /// Proposal keys to approve (e.g. allow_jvm_attach, allow_docker).
+        /// Use --all to approve everything.
+        #[arg(required_unless_present = "all")]
+        keys: Vec<String>,
+
+        /// Approve all proposals.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Revoke trust for specific proposals.
+    ///
+    /// Example: cplt trust revoke allow_docker
+    Revoke {
+        /// Keys to revoke (e.g. allow_docker).
+        /// Use --all to revoke all trust for this repo.
+        #[arg(required_unless_present = "all")]
+        keys: Vec<String>,
+
+        /// Revoke all trust for this repo.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -572,6 +623,7 @@ fn main() -> ExitCode {
         return match command {
             Command::Config { action } => run_config_command(action),
             Command::Update { check, force } => run_update(check, force),
+            Command::Trust { action } => run_trust_command(action),
         };
     }
 
@@ -1525,6 +1577,237 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+fn run_trust_command(action: Option<TrustAction>) -> ExitCode {
+    // Determine project directory (current working directory)
+    let project_dir = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            error(&format!("Cannot determine current directory: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Check if inside sandbox — trust commands are blocked there
+    if std::env::var("__CPLT_TRUST_LOCKED").is_ok() {
+        error("Cannot modify trust from inside the sandbox.");
+        eprintln!("  Run `cplt trust` outside the sandbox (before launching the agent).");
+        return ExitCode::FAILURE;
+    }
+
+    // Load repo config
+    let loaded = match repo_config::load_repo_config(&project_dir) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            info("No .cplt.toml found in this repository.");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            error(&format!("Failed to load .cplt.toml: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let action = action.unwrap_or(TrustAction::Show);
+
+    match action {
+        TrustAction::Show => trust_show(&project_dir, &loaded),
+        TrustAction::Accept { keys, all } => trust_accept(&project_dir, &loaded, &keys, all),
+        TrustAction::Revoke { keys, all } => trust_revoke(&project_dir, &loaded, &keys, all),
+    }
+}
+
+fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoConfig) -> ExitCode {
+    let proposed = repo_config::proposed_keys(&loaded.config.propose);
+    let trust_entry = trust::load_trust(project_dir);
+
+    let source_label = match loaded.source {
+        repo_config::RepoConfigSource::GitHead => "git HEAD (tamper-proof)",
+        repo_config::RepoConfigSource::WorkingTree => "working tree (⚠ not committed)",
+    };
+
+    eprintln!("{BLUE}[cplt]{NC} ── Repo Config Trust ──────────────────────────────");
+    eprintln!("{BLUE}[cplt]{NC}  Source: {source_label}");
+    eprintln!();
+
+    // Deny section
+    if !loaded.config.deny.paths.is_empty() || !loaded.config.deny.env.is_empty() {
+        eprintln!("{BLUE}[cplt]{NC}  {GREEN}[deny]{NC} (always applied):");
+        for p in &loaded.config.deny.paths {
+            eprintln!("{BLUE}[cplt]{NC}    path: {p}");
+        }
+        for v in &loaded.config.deny.env {
+            eprintln!("{BLUE}[cplt]{NC}    env:  {v}");
+        }
+        eprintln!();
+    }
+
+    // Proposals
+    if proposed.is_empty() {
+        eprintln!("{BLUE}[cplt]{NC}  No proposals (nothing requires approval).");
+    } else {
+        eprintln!("{BLUE}[cplt]{NC}  {YELLOW}[propose]{NC} (requires approval):");
+        for &key in &proposed {
+            let approved = trust_entry
+                .as_ref()
+                .map(|t| trust::is_key_approved(t, key))
+                .unwrap_or(false);
+            let status = if approved {
+                format!("{GREEN}✓ approved{NC}")
+            } else {
+                format!("{YELLOW}○ pending{NC}")
+            };
+            eprintln!("{BLUE}[cplt]{NC}    {key:<35} {status}");
+        }
+    }
+
+    if let Some(ref entry) = trust_entry
+        && !entry.accepted.approved_at.is_empty()
+    {
+        eprintln!();
+        eprintln!(
+            "{BLUE}[cplt]{NC}  Last approved: {}",
+            entry.accepted.approved_at
+        );
+    }
+
+    eprintln!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");
+    ExitCode::SUCCESS
+}
+
+fn trust_accept(
+    project_dir: &std::path::Path,
+    loaded: &repo_config::LoadedRepoConfig,
+    keys: &[String],
+    all: bool,
+) -> ExitCode {
+    let proposed = repo_config::proposed_keys(&loaded.config.propose);
+
+    if proposed.is_empty() {
+        info("No proposals in .cplt.toml — nothing to approve.");
+        return ExitCode::SUCCESS;
+    }
+
+    // Determine which keys to accept
+    let keys_to_accept: Vec<String> = if all {
+        proposed.iter().map(|s| s.to_string()).collect()
+    } else {
+        // Validate that requested keys are actually proposed
+        for key in keys {
+            if !proposed.contains(&key.as_str()) {
+                error(&format!(
+                    "Key {key:?} is not proposed in .cplt.toml. Available: {}",
+                    proposed
+                        .iter()
+                        .map(|s| format!("{s:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
+        keys.to_vec()
+    };
+
+    // Load or create trust entry
+    let mut entry = trust::load_trust(project_dir).unwrap_or_default();
+
+    // Set identity
+    entry.repo.path = project_dir.to_string_lossy().into_owned();
+    if entry.repo.remote.is_empty()
+        && let Ok(output) = std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(project_dir)
+            .output()
+        && output.status.success()
+        && let Ok(url) = String::from_utf8(output.stdout)
+    {
+        entry.repo.remote = url.trim().to_string();
+    }
+
+    // Add new keys (don't duplicate)
+    for key in &keys_to_accept {
+        if !entry.accepted.keys.contains(key) {
+            entry.accepted.keys.push(key.clone());
+        }
+    }
+    entry.accepted.keys.sort_unstable();
+    entry.accepted.approved_at = trust::now_iso8601();
+
+    // Save
+    if let Err(e) = trust::save_trust(project_dir, &entry) {
+        error(&format!("Failed to save trust: {e}"));
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!(
+        "{GREEN}✓{NC} Approved {} proposal(s) for this repository:",
+        keys_to_accept.len()
+    );
+    for key in &keys_to_accept {
+        eprintln!("  • {key}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn trust_revoke(
+    project_dir: &std::path::Path,
+    loaded: &repo_config::LoadedRepoConfig,
+    keys: &[String],
+    all: bool,
+) -> ExitCode {
+    if all {
+        if let Err(e) = trust::revoke_trust(project_dir) {
+            error(&format!("Failed to revoke trust: {e}"));
+            return ExitCode::FAILURE;
+        }
+        eprintln!("{GREEN}✓{NC} Revoked all trust for this repository.");
+        return ExitCode::SUCCESS;
+    }
+
+    let proposed = repo_config::proposed_keys(&loaded.config.propose);
+    let mut entry = match trust::load_trust(project_dir) {
+        Some(e) => e,
+        None => {
+            info("No trust entry exists for this repository.");
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    // Validate keys
+    for key in keys {
+        if !proposed.contains(&key.as_str()) && !entry.accepted.keys.contains(key) {
+            warn(&format!("Key {key:?} is not in proposals or trust store."));
+        }
+    }
+
+    // Remove keys
+    let before_len = entry.accepted.keys.len();
+    entry.accepted.keys.retain(|k| !keys.contains(k));
+    let removed = before_len - entry.accepted.keys.len();
+
+    if removed == 0 {
+        info("No matching keys found to revoke.");
+        return ExitCode::SUCCESS;
+    }
+
+    if entry.accepted.keys.is_empty() {
+        // No keys left — remove the file entirely
+        if let Err(e) = trust::revoke_trust(project_dir) {
+            error(&format!("Failed to remove trust file: {e}"));
+            return ExitCode::FAILURE;
+        }
+    } else {
+        entry.accepted.approved_at = trust::now_iso8601();
+        if let Err(e) = trust::save_trust(project_dir, &entry) {
+            error(&format!("Failed to save trust: {e}"));
+            return ExitCode::FAILURE;
+        }
+    }
+
+    eprintln!("{GREEN}✓{NC} Revoked {removed} key(s).");
+    ExitCode::SUCCESS
 }
 
 fn run_update(check_only: bool, force: bool) -> ExitCode {
