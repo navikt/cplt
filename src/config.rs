@@ -800,6 +800,17 @@ pub fn config_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(CONFIG_DIR).join(CONFIG_FILE))
 }
 
+/// Return the cplt config directory path (`~/.config/cplt/`).
+pub fn config_dir() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("CPLT_CONFIG") {
+        // If custom config path is set, use its parent directory
+        return expand_tilde(&custom).parent().map(|p| p.to_path_buf());
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(CONFIG_DIR))
+}
+
 /// Generate a default config file with comments explaining each option.
 pub fn default_config_contents() -> String {
     r#"# cplt configuration
