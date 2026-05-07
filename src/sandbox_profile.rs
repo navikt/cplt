@@ -183,6 +183,13 @@ fn emit_project_access(sb: &mut String, project: &str, allow_env_files: bool) {
     writeln!(sb, "(deny file-write* (literal \"{project}/.gitmodules\"))").unwrap();
     writeln!(sb).unwrap();
 
+    // Repo config tamper prevention — agent cannot modify its own sandbox config.
+    // The agent has project write access, but .cplt.toml controls sandbox relaxation.
+    // Writing it would let the agent prepare malicious config for the next session.
+    writeln!(sb, ";; Repo config — deny write to prevent tampering").unwrap();
+    writeln!(sb, "(deny file-write* (literal \"{project}/.cplt.toml\"))").unwrap();
+    writeln!(sb).unwrap();
+
     // Sensitive project files — deny read of .env*, .pem, .key etc.
     // These often contain secrets that could be exfiltrated via HTTPS.
     // Placed after the project allow so deny wins (more specific filter).

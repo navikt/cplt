@@ -277,6 +277,8 @@ pub enum HardeningCategory {
     /// so `--allow-gpg-signing` can re-enable signing without removing
     /// `GIT_TERMINAL_PROMPT=0`.
     GitSigning,
+    /// Always-on markers that signal "you're inside the sandbox". Never disabled.
+    SandboxMarker,
 }
 
 /// A security-hardening environment variable injected into the sandbox.
@@ -342,6 +344,14 @@ pub const HARDENING_ENV_VARS: &[HardeningEnvVar] = &[
         value: "false",
         category: HardeningCategory::GitSigning,
         description: "Disable tag signing (private keys inaccessible)",
+    },
+    // Trust lock — prevents `cplt trust` from running inside the sandbox.
+    // The agent cannot approve its own proposals.
+    HardeningEnvVar {
+        name: "__CPLT_TRUST_LOCKED",
+        value: "1",
+        category: HardeningCategory::SandboxMarker,
+        description: "Block cplt trust commands inside sandbox",
     },
 ];
 
