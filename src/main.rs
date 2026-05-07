@@ -820,10 +820,26 @@ fn main() -> ExitCode {
                     .map(|s| s.to_string())
                     .collect()
             } else {
-                // Check trust store
-                trust::load_trust(&project_dir)
-                    .map(|t| t.accepted.keys)
-                    .unwrap_or_default()
+                // Check trust store — validate content hash
+                match trust::load_trust(&project_dir) {
+                    Some(t) => {
+                        let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+                        if !t.accepted.content_hash.is_empty()
+                            && t.accepted.content_hash != current_hash
+                        {
+                            // Proposals changed since approval — invalidate
+                            if !resolved.quiet {
+                                warn(
+                                    ".cplt.toml proposals changed since last approval — re-approve with `cplt trust accept`",
+                                );
+                            }
+                            Vec::new()
+                        } else {
+                            t.accepted.keys
+                        }
+                    }
+                    None => Vec::new(),
+                }
             };
 
             let approved_refs: Vec<&str> = approved_keys.iter().map(|s| s.as_str()).collect();
@@ -1793,6 +1809,8 @@ fn trust_accept(
     }
     entry.accepted.keys.sort_unstable();
     entry.accepted.approved_at = trust::now_iso8601();
+    // Pin content hash so changes to proposal values invalidate approval
+    entry.accepted.content_hash = trust::proposal_content_hash(&loaded.config.propose);
 
     // Save
     if let Err(e) = trust::save_trust(project_dir, &entry) {

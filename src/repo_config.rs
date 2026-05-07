@@ -101,7 +101,9 @@ pub struct LoadedRepoConfig {
 /// Read `.cplt.toml` from the project directory.
 ///
 /// Prefers reading from git HEAD (committed state) for tamper-proofing.
-/// Falls back to the working tree if git is unavailable or the file isn't tracked.
+/// Falls back to the working tree if git is unavailable or the file isn't tracked
+/// (macOS only — on Linux/Landlock we cannot deny individual file writes within
+/// the project dir, so the fallback is skipped to prevent agent tampering).
 /// Returns `None` if no `.cplt.toml` exists.
 pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, String> {
     // Try git HEAD first (tamper-proof source)
@@ -114,7 +116,13 @@ pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, 
         }));
     }
 
-    // Fallback: working tree
+    // On Linux, skip working tree fallback — Landlock cannot deny individual
+    // file writes within the project dir, so the agent could tamper with the file.
+    if cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+
+    // Fallback: working tree (macOS only — SBPL denies .cplt.toml writes)
     let file_path = project_dir.join(REPO_CONFIG_FILE);
     if file_path.is_file() {
         let content = std::fs::read_to_string(&file_path)

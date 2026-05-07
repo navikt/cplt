@@ -42,6 +42,11 @@ pub struct AcceptedProposals {
     /// When approval was last updated (ISO 8601).
     #[serde(default)]
     pub approved_at: String,
+    /// SHA-256 hash of the proposal values at approval time.
+    /// If the .cplt.toml proposals change, this hash won't match and
+    /// approvals are invalidated (user must re-approve).
+    #[serde(default)]
+    pub content_hash: String,
 }
 
 /// Compute a stable fingerprint for a repository.
@@ -49,15 +54,20 @@ pub struct AcceptedProposals {
 /// Uses the canonical remote URL (preferred) or the absolute project path
 /// as fallback. Returns a hex-encoded SHA-256 prefix (16 chars) for use
 /// as a filename.
+///
+/// Uses SHA-256 (truncated to 64 bits) for cross-version stability.
+/// `DefaultHasher` is explicitly non-portable across Rust versions.
 pub fn repo_fingerprint(project_dir: &Path) -> String {
     let identity =
         canonical_remote(project_dir).unwrap_or_else(|| project_dir.to_string_lossy().into_owned());
 
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    identity.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(identity.as_bytes());
+    // First 8 bytes → 16 hex chars (same length as before)
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]
+    )
 }
 
 /// Get the canonical remote URL for the git repo at `project_dir`.
@@ -206,6 +216,57 @@ pub fn now_iso8601() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Compute a stable content hash of the proposal section.
+///
+/// This hash captures the *values* of all proposals so that if the
+/// `.cplt.toml` changes (e.g. adding new paths to `allow.read`),
+/// existing approvals are invalidated and the user must re-approve.
+pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+
+    // Boolean proposals — sorted by key name for stability
+    let bools: &[(&str, Option<bool>)] = &[
+        ("allow_browser", propose.allow_browser),
+        ("allow_docker", propose.allow_docker),
+        ("allow_env_files", propose.allow_env_files),
+        ("allow_gpg_signing", propose.allow_gpg_signing),
+        ("allow_jvm_attach", propose.allow_jvm_attach),
+        ("allow_lifecycle_scripts", propose.allow_lifecycle_scripts),
+        ("allow_localhost_any", propose.allow_localhost_any),
+        ("allow_tmp_exec", propose.allow_tmp_exec),
+    ];
+    for (name, val) in bools {
+        if let Some(v) = val {
+            hasher.update(format!("{name}={v}\n").as_bytes());
+        }
+    }
+
+    // Path/port proposals
+    for p in &propose.allow.read {
+        hasher.update(format!("allow.read={p}\n").as_bytes());
+    }
+    for p in &propose.allow.write {
+        hasher.update(format!("allow.write={p}\n").as_bytes());
+    }
+    for port in &propose.allow.ports {
+        hasher.update(format!("allow.ports={port}\n").as_bytes());
+    }
+    for port in &propose.allow.localhost {
+        hasher.update(format!("allow.localhost={port}\n").as_bytes());
+    }
+    for d in &propose.proxy.allow_private_domains {
+        hasher.update(format!("proxy.allow_private_domains={d}\n").as_bytes());
+    }
+
+    let hash = hasher.finalize();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,11 +384,74 @@ mod tests {
                     "allow_jvm_attach".to_string(),
                 ],
                 approved_at: "2026-05-07T12:00:00Z".to_string(),
+                content_hash: "a1b2c3d4e5f6a7b8".to_string(),
             },
         };
 
         let serialized = toml::to_string_pretty(&entry).unwrap();
         let deserialized: TrustEntry = toml::from_str(&serialized).unwrap();
         assert_eq!(entry, deserialized);
+    }
+
+    #[test]
+    fn old_trust_file_without_content_hash_deserializes() {
+        // Backward compat: trust files from before content pinning have no content_hash
+        let toml_str = r#"
+[repo]
+remote = "github.com/navikt/spleis"
+path = "/home/user/spleis"
+
+[accepted]
+keys = ["allow_localhost_any"]
+approved_at = "2026-05-01T12:00:00Z"
+"#;
+        let entry: TrustEntry = toml::from_str(toml_str).unwrap();
+        assert_eq!(entry.accepted.content_hash, ""); // empty = legacy, accepted
+        assert_eq!(entry.accepted.keys, vec!["allow_localhost_any"]);
+    }
+
+    #[test]
+    fn proposal_content_hash_is_stable() {
+        use crate::repo_config::{ProposeAllowSection, ProposeSection};
+
+        let propose = ProposeSection {
+            allow_docker: Some(true),
+            allow: ProposeAllowSection {
+                read: vec!["~/.gradle/gradle.properties".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let hash1 = proposal_content_hash(&propose);
+        let hash2 = proposal_content_hash(&propose);
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 16); // 8 bytes = 16 hex chars
+    }
+
+    #[test]
+    fn proposal_content_hash_changes_on_path_change() {
+        use crate::repo_config::{ProposeAllowSection, ProposeSection};
+
+        let propose1 = ProposeSection {
+            allow: ProposeAllowSection {
+                read: vec!["~/.gradle/gradle.properties".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let propose2 = ProposeSection {
+            allow: ProposeAllowSection {
+                read: vec!["/etc/shadow".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_ne!(
+            proposal_content_hash(&propose1),
+            proposal_content_hash(&propose2)
+        );
     }
 }
