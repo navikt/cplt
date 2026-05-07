@@ -22,10 +22,14 @@
 //! The proxy handles domain-level filtering on both platforms.
 
 use super::policy::{self, HomeToolDir};
-use landlock::PathBeneath;
 use std::fmt::Write as _;
-use std::os::fd::{BorrowedFd, RawFd};
 use std::path::PathBuf;
+
+#[cfg(target_os = "linux")]
+use landlock::{ABI, PathBeneath};
+#[cfg(target_os = "linux")]
+use std::os::fd::{BorrowedFd, RawFd};
+
 // ── Cross-platform types ───────────────────────────────────────
 
 /// Filesystem access flags for a Landlock rule.
@@ -98,7 +102,7 @@ pub struct LandlockPolicy {
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub struct PrecomputedSandbox {
-    pub abi_version: u32,
+    pub abi_version: ABI,
     /// Pre-opened `O_PATH` file descriptors for Landlock filesystem rules.
     /// Opened in `precompute()` (parent), used in `apply_precomputed()` (child).
     /// Raw fds (i32) so the struct remains Clone-able. Closed on exec via
@@ -718,9 +722,7 @@ pub fn describe_policy(policy: &LandlockPolicy) -> String {
 ///
 /// Called in the parent process during `prepare()` — never in `pre_exec`.
 #[cfg(target_os = "linux")]
-pub fn check_availability() -> Result<landlock::ABI, String> {
-    use landlock::ABI;
-
+pub fn check_availability() -> Result<ABI, String> {
     const ABI_PROBE_ORDER: [ABI; 6] = [ABI::V6, ABI::V5, ABI::V4, ABI::V3, ABI::V2, ABI::V1];
 
     let mut last_error = None;
@@ -746,7 +748,7 @@ pub fn check_availability() -> Result<landlock::ABI, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn probe_abi_candidate(abi: landlock::ABI) -> Result<(), String> {
+fn probe_abi_candidate(abi: ABI) -> Result<(), String> {
     use landlock::{
         Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr, Scope,
     };
@@ -798,7 +800,6 @@ fn probe_abi_candidate(abi: landlock::ABI) -> Result<(), String> {
 /// cloned into the `pre_exec` closure.
 #[cfg(target_os = "linux")]
 pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> {
-    use landlock::ABI;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -845,7 +846,7 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     let restrict_net_connect = policy.restrict_net_connect;
 
     Ok(PrecomputedSandbox {
-        abi_version: abi_version as u32,
+        abi_version,
         pre_opened_fds,
         deferred_paths,
         net_rules,
@@ -990,25 +991,14 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
         RulesetStatus,
     };
 
-    // Map the detected kernel ABI to the landlock crate's ABI enum.
-    let abi = match sandbox.abi_version {
-        1 => ABI::V1,
-        2 => ABI::V2,
-        3 => ABI::V3,
-        4 => ABI::V4,
-        5 => ABI::V5,
-        _ => ABI::V6,
-    };
-    let abi_version = sandbox.abi_version;
-
     let ruleset = Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))
+        .handle_access(AccessFs::from_all(sandbox.abi_version))
         .map_err(std::io::Error::other)?;
 
     // Handle ConnectTcp on ABI v4+ only when network restriction is enabled.
     // When allow_localhost_any is set, we skip this — Landlock cannot
     // distinguish localhost from remote, so we rely on the proxy instead.
-    let ruleset = if abi_version >= 4 && sandbox.restrict_net_connect {
+    let ruleset = if sandbox.abi_version >= ABI::V4 && sandbox.restrict_net_connect {
         ruleset
             .handle_access(AccessNet::ConnectTcp)
             .map_err(std::io::Error::other)?
@@ -1026,7 +1016,7 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
         if raw_fd < 0 {
             continue;
         }
-        let path_beneath_rule = create_path_beneath_rule(abi_version, &raw_fd, access);
+        let path_beneath_rule = create_path_beneath_rule(sandbox.abi_version, &raw_fd, access);
         created = created
             .add_rule(path_beneath_rule)
             .map_err(std::io::Error::other)?;
@@ -1035,14 +1025,14 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     // Add filesystem rules using pre-opened file descriptors.
     // No open() or CString allocation — just borrow the raw fd.
     for &(raw_fd, access) in &sandbox.pre_opened_fds {
-        let path_beneath_rule = create_path_beneath_rule(abi_version, &raw_fd, &access);
+        let path_beneath_rule = create_path_beneath_rule(sandbox.abi_version, &raw_fd, &access);
         created = created
             .add_rule(path_beneath_rule)
             .map_err(std::io::Error::other)?;
     }
 
     // Add network rules (ABI v4+, only when network restriction is active).
-    if abi_version >= 4 && sandbox.restrict_net_connect {
+    if sandbox.abi_version >= ABI::V4 && sandbox.restrict_net_connect {
         for rule in &sandbox.net_rules {
             created = created
                 .add_rule(NetPort::new(rule.port, AccessNet::ConnectTcp))
@@ -1067,7 +1057,7 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn create_path_beneath_rule<'fd>(
-    abi_version: u32,
+    abi_version: ABI,
     raw_fd: &'fd RawFd,
     access: &FsAccess,
 ) -> PathBeneath<BorrowedFd<'fd>> {
@@ -1090,13 +1080,13 @@ fn create_path_beneath_rule<'fd>(
             | AccessFs::MakeSym
             | AccessFs::MakeFifo
             | AccessFs::MakeSock;
-        if abi_version >= 2 {
+        if abi_version >= ABI::V2 {
             // Refer controls rename()/link() across different Landlock
             // domains. Without it, build tools (cargo, git) that move
             // files between directories would fail.
             write_flags |= AccessFs::Refer;
         }
-        if abi_version >= 3 {
+        if abi_version >= ABI::V3 {
             write_flags |= AccessFs::Truncate;
         }
         access_flags |= write_flags;
@@ -1106,7 +1096,7 @@ fn create_path_beneath_rule<'fd>(
         access_flags |= AccessFs::Execute;
     }
 
-    if access.ioctl && abi_version >= 5 {
+    if access.ioctl && abi_version >= ABI::V5 {
         // Landlock ABI v5 (kernel ≥ 6.8) enforces IOCTL_DEV for character
         // and block devices. Grant it for device paths so tcsetattr() on
         // /dev/tty and /dev/pts/* succeeds — without this, raw mode fails,
