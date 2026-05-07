@@ -460,9 +460,12 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
-    // ── /proc/self: Node.js reads /proc/self/exe, /proc/self/maps ──
+    // ── /proc: read-only access to the proc filesystem; /proc/self is a magic symlink
+    // that resolves per-process, so pre-opening /proc/self in the parent would give
+    // the parent's pid directory, not the child's. Granting /proc read access covers
+    // /proc/self/cgroup, /proc/self/exe, /proc/self/maps, and similar needs. ──
     fs_rules.push(FsRule {
-        path: PathBuf::from("/proc/self"),
+        path: PathBuf::from("/proc"),
         access: FsAccess {
             read: true,
             write: false,
@@ -1572,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn proc_self_is_readonly() {
+    fn proc_is_readonly() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
         let config = test_config(&project, &home);
@@ -1581,8 +1584,8 @@ mod tests {
         let rule = policy
             .fs_rules
             .iter()
-            .find(|r| r.path == Path::new("/proc/self"))
-            .expect("/proc/self should be in rules");
+            .find(|r| r.path == Path::new("/proc"))
+            .expect("/proc should be in rules");
         assert!(rule.access.read);
         assert!(!rule.access.write);
         assert!(!rule.access.execute);
