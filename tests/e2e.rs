@@ -464,11 +464,11 @@ mod e2e_tests {
             .output()
             .expect("binary should run");
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stderr.contains("[doctor]") && stderr.contains("Auth"),
-            "--doctor should print Auth section.\nstderr: {stderr}"
+            stdout.contains("[doctor]") && stdout.contains("Auth"),
+            "--doctor should print Auth section.\nstdout: {stdout}"
         );
     }
 
@@ -481,11 +481,11 @@ mod e2e_tests {
             .output()
             .expect("binary should run");
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stderr.contains("Agents") && stderr.contains("Copilot"),
-            "--doctor should show Agents section with Copilot.\nstderr: {stderr}"
+            stdout.contains("Agents") && stdout.contains("Copilot"),
+            "--doctor should show Agents section with Copilot.\nstdout: {stdout}"
         );
     }
 
@@ -498,11 +498,11 @@ mod e2e_tests {
             .output()
             .expect("binary should run");
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stderr.contains("Tools") && stderr.contains("git"),
-            "--doctor should show Tools section with git.\nstderr: {stderr}"
+            stdout.contains("Tools") && stdout.contains("git"),
+            "--doctor should show Tools section with git.\nstdout: {stdout}"
         );
     }
 
@@ -515,11 +515,11 @@ mod e2e_tests {
             .output()
             .expect("binary should run");
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stderr.contains("Sandbox paths") && stderr.contains("Protected"),
-            "--doctor should show Sandbox paths with protected dirs.\nstderr: {stderr}"
+            stdout.contains("Sandbox paths") && stdout.contains("Protected"),
+            "--doctor should show Sandbox paths with protected dirs.\nstdout: {stdout}"
         );
     }
 
@@ -1558,18 +1558,18 @@ mod e2e_tests {
             .expect("should run");
 
         assert!(output.status.success(), "config show should succeed");
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stderr.contains("9999"),
-            "should show configured port: {stderr}"
+            stdout.contains("9999"),
+            "should show configured port: {stdout}"
         );
         assert!(
-            stderr.contains("[proxy]"),
-            "should show proxy section: {stderr}"
+            stdout.contains("[proxy]"),
+            "should show proxy section: {stdout}"
         );
         assert!(
-            stderr.contains("[sandbox]"),
-            "should show sandbox section: {stderr}"
+            stdout.contains("[sandbox]"),
+            "should show sandbox section: {stdout}"
         );
 
         let _ = std::fs::remove_dir_all(&fake_home);
@@ -1597,10 +1597,10 @@ mod e2e_tests {
             output.status.success(),
             "show with no config should succeed (shows defaults)"
         );
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stderr.contains("(default)"),
-            "should show defaults: {stderr}"
+            stdout.contains("(default)"),
+            "should show defaults: {stdout}"
         );
 
         let _ = std::fs::remove_dir_all(&fake_home);
@@ -2372,16 +2372,16 @@ mod e2e_tests {
             .expect("should run");
 
         assert!(output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stderr.contains("sandbox.quiet"),
+            stdout.contains("sandbox.quiet"),
             "should list sandbox.quiet"
         );
         assert!(
-            stderr.contains("proxy.enabled"),
+            stdout.contains("proxy.enabled"),
             "should list proxy.enabled"
         );
-        assert!(stderr.contains("sandbox"), "should have section headers");
+        assert!(stdout.contains("sandbox"), "should have section headers");
     }
 
     #[test]
@@ -2392,11 +2392,11 @@ mod e2e_tests {
             .expect("should run");
 
         assert!(output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("sandbox.quiet"), "should show key name");
-        assert!(stderr.contains("bool"), "should show type");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("sandbox.quiet"), "should show key name");
+        assert!(stdout.contains("bool"), "should show type");
         assert!(
-            stderr.contains("cplt config set"),
+            stdout.contains("cplt config set"),
             "should show set command"
         );
     }

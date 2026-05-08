@@ -32,17 +32,20 @@ When in doubt: be strict by default, but make relaxation easy and explicit.
 
 ## 1. Naming
 
-### 1.1 Subcommands: noun–verb, plural nouns
+### 1.1 Subcommands: noun–verb, singular nouns
 
 ```
 cplt config show        # noun = config, verb = show
 cplt config validate
-cplt trust add          # noun = trust, verb = add
+cplt trust accept       # noun = trust, verb = accept (security-meaningful)
+cplt trust revoke
 ```
 
-- **Nouns are singular** when they refer to a single resource (`config`, `trust`).
-- **Verbs are imperative**: `show`, `set`, `get`, `init`, `explain` — not `showing`, `setting`.
-- The bare noun is the **list/default action**: `cplt config` → `cplt config show`.
+- **Nouns are singular** for singleton concepts: `config`, `trust`, `update`.
+- **Verbs are imperative**: `show`, `set`, `get`, `init`, `explain`.
+- Use **domain-specific verbs** for security decisions: `trust accept` / `trust revoke`
+  instead of generic `add` / `remove` — the verb should communicate the security meaning.
+- The bare noun is the **default action**: `cplt config` → `cplt config show`.
 - Never create a `*:list` or `* list` subcommand — the bare noun IS the list.
 
 ### 1.2 Flags: `--kebab-case`, consistent prefixes
