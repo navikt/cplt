@@ -1477,7 +1477,129 @@ fn run_config_show() -> ExitCode {
     };
 
     config::display_config(loaded.as_ref());
+
+    // Show repo config if present
+    let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
+    if let Some(ref dir) = project_dir {
+        match repo_config::load_repo_config(dir) {
+            Ok(Some(loaded_repo)) => {
+                display_repo_config(&loaded_repo, dir);
+            }
+            Err(e) => {
+                eprintln!();
+                eprintln!("{YELLOW}[cplt] Repo config error: {e}{NC}");
+            }
+            Ok(None) => {} // No .cplt.toml — nothing to show
+        }
+    }
+
     ExitCode::SUCCESS
+}
+
+fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std::path::Path) {
+    let dim = "\x1b[2m";
+    let green = "\x1b[0;32m";
+    let yellow = "\x1b[0;33m";
+
+    eprintln!();
+    eprintln!("{BLUE}[cplt]{NC} ── Repo Config (.cplt.toml) ────────────────────────");
+    let source_label = match loaded.source {
+        repo_config::RepoConfigSource::GitHead => "git HEAD (tamper-proof)",
+        repo_config::RepoConfigSource::WorkingTree => "working tree (⚠ not committed)",
+    };
+    eprintln!("{BLUE}[cplt]{NC}  {dim}Source:{NC} {source_label}");
+    eprintln!(
+        "{BLUE}[cplt]{NC}  {dim}Path:{NC}   {}/.cplt.toml",
+        project_dir.display()
+    );
+    eprintln!();
+
+    let rc = &loaded.config;
+
+    // [deny]
+    if !rc.deny.paths.is_empty() || !rc.deny.env.is_empty() {
+        eprintln!("{BLUE}[cplt]{NC}  {dim}[deny]{NC} {green}(always applied){NC}");
+        for p in &rc.deny.paths {
+            eprintln!("{BLUE}[cplt]{NC}    paths   = {p}");
+        }
+        for v in &rc.deny.env {
+            eprintln!("{BLUE}[cplt]{NC}    env     = {v}");
+        }
+        eprintln!();
+    }
+
+    // [propose]
+    let proposed = repo_config::proposed_keys(&rc.propose);
+    if !proposed.is_empty() {
+        let trust_entry = crate::trust::load_trust(project_dir);
+
+        eprintln!("{BLUE}[cplt]{NC}  {dim}[propose]{NC} {yellow}(requires trust approval){NC}");
+
+        // Booleans
+        let bools: &[(&str, Option<bool>)] = &[
+            ("allow_localhost_any", rc.propose.allow_localhost_any),
+            ("allow_jvm_attach", rc.propose.allow_jvm_attach),
+            ("allow_docker", rc.propose.allow_docker),
+            ("allow_tmp_exec", rc.propose.allow_tmp_exec),
+            ("allow_gpg_signing", rc.propose.allow_gpg_signing),
+            (
+                "allow_lifecycle_scripts",
+                rc.propose.allow_lifecycle_scripts,
+            ),
+            ("allow_env_files", rc.propose.allow_env_files),
+            ("allow_browser", rc.propose.allow_browser),
+        ];
+        for (name, val) in bools {
+            if let Some(v) = val {
+                let approved = trust_entry
+                    .as_ref()
+                    .map(|t| crate::trust::is_key_approved(t, name))
+                    .unwrap_or(false);
+                let status = if approved {
+                    format!("{green}✓{NC}")
+                } else {
+                    format!("{yellow}○{NC}")
+                };
+                eprintln!("{BLUE}[cplt]{NC}    {name:<30} = {v}  {status}");
+            }
+        }
+
+        // Arrays
+        if !rc.propose.allow.read.is_empty() {
+            eprintln!("{BLUE}[cplt]{NC}    {dim}allow.read:{NC}");
+            for p in &rc.propose.allow.read {
+                eprintln!("{BLUE}[cplt]{NC}      {p}");
+            }
+        }
+        if !rc.propose.allow.write.is_empty() {
+            eprintln!("{BLUE}[cplt]{NC}    {dim}allow.write:{NC}");
+            for p in &rc.propose.allow.write {
+                eprintln!("{BLUE}[cplt]{NC}      {p}");
+            }
+        }
+        if !rc.propose.allow.ports.is_empty() {
+            eprintln!(
+                "{BLUE}[cplt]{NC}    allow.ports            = {:?}",
+                rc.propose.allow.ports
+            );
+        }
+        if !rc.propose.allow.localhost.is_empty() {
+            eprintln!(
+                "{BLUE}[cplt]{NC}    allow.localhost         = {:?}",
+                rc.propose.allow.localhost
+            );
+        }
+        if !rc.propose.proxy.allow_private_domains.is_empty() {
+            eprintln!(
+                "{BLUE}[cplt]{NC}    proxy.allow_private_domains = {:?}",
+                rc.propose.proxy.allow_private_domains
+            );
+        }
+    } else {
+        eprintln!("{BLUE}[cplt]{NC}  {dim}No proposals.{NC}");
+    }
+
+    eprintln!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");
 }
 
 fn run_config_path() -> ExitCode {

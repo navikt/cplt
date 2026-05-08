@@ -3,8 +3,8 @@
 
 [propose.allow]
 # Cargo registry, crate sources, and build caches
-read = ["~/.cargo", "~/.rustup"]
-write = ["~/.cargo/registry"]
+read = ["~/.cargo", "~/.rustup", "/Users/hans/.cargo"]
+write = ["~/.cargo/registry", "/Users/hans/.cargo/registry"]
 
 [propose]
 # Integration tests invoke sandbox-exec which needs localhost
