@@ -647,44 +647,19 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
         .collect()
 }
 
-fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    // Handle --init-config
-    if cli.init_config {
-        return Ok(init_config());
-    }
+/// Resolved configuration, paths, and agent info needed by the sandbox.
+#[allow(dead_code)] // unapproved_proposals is consumed by the warning block in resolve_context
+struct ResolvedContext {
+    resolved: config::Resolved,
+    config_path: Option<PathBuf>,
+    home_dir: PathBuf,
+    project_dir: PathBuf,
+    active_agent: agent::Agent,
+    unapproved_proposals: Vec<String>,
+}
 
-    // Handle --shell-setup: print alias definition and exit
-    if cli.shell_setup {
-        println!("alias copilot=cplt");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Handle --shell-install: append setup line to shell rc file
-    if cli.shell_install {
-        return Ok(shell_install());
-    }
-
-    // Handle subcommands (these don't need macOS or sandbox)
-    if let Some(command) = cli.command {
-        return Ok(match command {
-            Command::Config { action } => run_config_command(action),
-            Command::Update { check, force } => run_update(check, force),
-            Command::Trust { action } => run_trust_command(action),
-        });
-    }
-
-    // Platform check: cplt supports macOS (Seatbelt) and Linux (Landlock).
-    // Other platforms (Windows, FreeBSD, etc.) are not supported.
-    if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
-        bail!("cplt requires macOS or Linux");
-    }
-
-    // Handle --doctor: run diagnostics and exit (works on all platforms)
-    if cli.doctor {
-        return Ok(run_doctor());
-    }
-
-    // Load config file and merge with CLI flags
+/// Load config, merge CLI flags, resolve paths, detect agent, print info messages.
+fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
     // Canonicalize CLI paths for consistency with config path handling
     let cli_allow_read = canonicalize_paths(&cli.allow_read, "--allow-read");
     let cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
@@ -926,6 +901,160 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
     }
 
+    Ok(ResolvedContext {
+        resolved,
+        config_path,
+        home_dir,
+        project_dir,
+        active_agent,
+        unapproved_proposals,
+    })
+}
+
+/// Start the CONNECT proxy if enabled, returning the handle for RAII ownership.
+/// Updates `resolved.proxy_port` with the actual bound port.
+fn start_proxy_if_enabled(
+    resolved: &mut config::Resolved,
+    cli: &Cli,
+    config_path: &Option<PathBuf>,
+) -> anyhow::Result<Option<proxy::ProxyHandle>> {
+    if !resolved.with_proxy || cli.print_profile {
+        return Ok(None);
+    }
+
+    let blocked_file = resolved.blocked_domains.clone().unwrap_or_else(|| {
+        // Look for blocked-domains.txt next to the binary, then blocked.txt
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        if let Some(ref dir) = exe_dir {
+            let preferred = dir.join("blocked-domains.txt");
+            if preferred.exists() {
+                return preferred;
+            }
+            let fallback = dir.join("blocked.txt");
+            if fallback.exists() {
+                return fallback;
+            }
+        }
+        // No blocklist found — return a path that won't exist,
+        // proxy will run without blocking any domains
+        PathBuf::from("/dev/null/no-blocklist")
+    });
+
+    // Validate domain allowlist at startup (fail-closed: abort if unreadable)
+    let allowed_domains_file = resolved.allowed_domains.clone();
+    if let Some(ref path) = allowed_domains_file {
+        if path.exists() {
+            match proxy::parse_domain_file(path) {
+                Ok(domains) => {
+                    if !resolved.quiet {
+                        ui::info(&format!(
+                            "Domain allowlist: {} domains from {}",
+                            domains.len(),
+                            path.display()
+                        ));
+                    }
+                }
+                Err(e) => bail!("Failed to load allowed domains: {e}"),
+            }
+        } else if !resolved.quiet {
+            ui::info(&format!(
+                "Domain allowlist file: {} (not found)",
+                path.display()
+            ));
+        }
+    }
+
+    let port_hint = if resolved.proxy_port == 0 {
+        "ephemeral port".to_string()
+    } else {
+        format!("localhost:{}", resolved.proxy_port)
+    };
+    if !resolved.quiet {
+        ui::info(&format!("Starting proxy on {port_hint}..."));
+    }
+
+    match proxy::start(proxy::ProxyOptions {
+        port: resolved.proxy_port,
+        blocked_file,
+        allowed_ports: resolved.allow_ports.clone(),
+        allowed_domains_file,
+        allowed_domains_initial: Vec::new(),
+        cli_private_domains: cli.allow_private_domains.clone(),
+        config_private_domains: resolved
+            .allow_private_domains
+            .iter()
+            .filter(|d| !cli.allow_private_domains.contains(d))
+            .cloned()
+            .collect(),
+        config_file: config_path.clone(),
+        log_file: resolved.proxy_log_file.clone(),
+        log_level: resolved.proxy_log_level,
+    }) {
+        Ok(handle) => {
+            resolved.proxy_port = handle.port;
+            if !resolved.quiet {
+                ui::ok(&format!(
+                    "Proxy running on localhost:{} (thread)",
+                    handle.port
+                ));
+            }
+            // Proxy env vars (NODE_USE_ENV_PROXY, HTTP_PROXY, HTTPS_PROXY) are
+            // injected by sandbox_exec::exec() when proxy_port is Some.
+            Ok(Some(handle))
+        }
+        Err(e) => bail!("Failed to start proxy: {e}"),
+    }
+}
+
+fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    // Handle --init-config
+    if cli.init_config {
+        return Ok(init_config());
+    }
+
+    // Handle --shell-setup: print alias definition and exit
+    if cli.shell_setup {
+        println!("alias copilot=cplt");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Handle --shell-install: append setup line to shell rc file
+    if cli.shell_install {
+        return Ok(shell_install());
+    }
+
+    // Handle subcommands (these don't need macOS or sandbox)
+    if let Some(command) = cli.command {
+        return Ok(match command {
+            Command::Config { action } => run_config_command(action),
+            Command::Update { check, force } => run_update(check, force),
+            Command::Trust { action } => run_trust_command(action),
+        });
+    }
+
+    // Platform check: cplt supports macOS (Seatbelt) and Linux (Landlock).
+    // Other platforms (Windows, FreeBSD, etc.) are not supported.
+    if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+        bail!("cplt requires macOS or Linux");
+    }
+
+    // Handle --doctor: run diagnostics and exit (works on all platforms)
+    if cli.doctor {
+        return Ok(run_doctor());
+    }
+
+    // Resolve config, paths, and agent
+    let ResolvedContext {
+        mut resolved,
+        config_path,
+        home_dir,
+        project_dir,
+        active_agent,
+        unapproved_proposals: _,
+    } = resolve_context(&cli)?;
+
     // Run auto-discovery to tighten the sandbox profile
     let tool_discovery = discover::discover_tools(&home_dir);
     let existing_dirs = tool_discovery.existing_home_tool_dirs;
@@ -995,96 +1124,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // Compute agent-specific sandbox directories
     let agent_dirs = active_agent.config_dirs(&home_dir);
 
-    // Start proxy before sandbox::prepare() so the actual bound port is known
-    // and can be embedded in the Seatbelt profile. Port 0 lets the OS assign
-    // an ephemeral port, eliminating fixed-port conflicts.
-    let mut proxy_handle: Option<proxy::ProxyHandle> = None;
-    if resolved.with_proxy && !cli.print_profile {
-        let blocked_file = resolved.blocked_domains.clone().unwrap_or_else(|| {
-            // Look for blocked-domains.txt next to the binary, then blocked.txt
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-            if let Some(ref dir) = exe_dir {
-                let preferred = dir.join("blocked-domains.txt");
-                if preferred.exists() {
-                    return preferred;
-                }
-                let fallback = dir.join("blocked.txt");
-                if fallback.exists() {
-                    return fallback;
-                }
-            }
-            // No blocklist found — return a path that won't exist,
-            // proxy will run without blocking any domains
-            PathBuf::from("/dev/null/no-blocklist")
-        });
-
-        // Validate domain allowlist at startup (fail-closed: abort if unreadable)
-        let allowed_domains_file = resolved.allowed_domains.clone();
-        if let Some(ref path) = allowed_domains_file {
-            if path.exists() {
-                match proxy::parse_domain_file(path) {
-                    Ok(domains) => {
-                        if !resolved.quiet {
-                            ui::info(&format!(
-                                "Domain allowlist: {} domains from {}",
-                                domains.len(),
-                                path.display()
-                            ));
-                        }
-                    }
-                    Err(e) => bail!("Failed to load allowed domains: {e}"),
-                }
-            } else if !resolved.quiet {
-                ui::info(&format!(
-                    "Domain allowlist file: {} (not found)",
-                    path.display()
-                ));
-            }
-        }
-
-        let port_hint = if resolved.proxy_port == 0 {
-            "ephemeral port".to_string()
-        } else {
-            format!("localhost:{}", resolved.proxy_port)
-        };
-        if !resolved.quiet {
-            ui::info(&format!("Starting proxy on {port_hint}..."));
-        }
-
-        match proxy::start(proxy::ProxyOptions {
-            port: resolved.proxy_port,
-            blocked_file,
-            allowed_ports: resolved.allow_ports.clone(),
-            allowed_domains_file,
-            allowed_domains_initial: Vec::new(),
-            cli_private_domains: cli.allow_private_domains.clone(),
-            config_private_domains: resolved
-                .allow_private_domains
-                .iter()
-                .filter(|d| !cli.allow_private_domains.contains(d))
-                .cloned()
-                .collect(),
-            config_file: config_path.clone(),
-            log_file: resolved.proxy_log_file.clone(),
-            log_level: resolved.proxy_log_level,
-        }) {
-            Ok(handle) => {
-                resolved.proxy_port = handle.port;
-                if !resolved.quiet {
-                    ui::ok(&format!(
-                        "Proxy running on localhost:{} (thread)",
-                        handle.port
-                    ));
-                }
-                proxy_handle = Some(handle);
-                // Proxy env vars (NODE_USE_ENV_PROXY, HTTP_PROXY, HTTPS_PROXY) are
-                // injected by sandbox_exec::exec() when proxy_port is Some.
-            }
-            Err(e) => bail!("Failed to start proxy: {e}"),
-        }
-    }
+    // Start proxy (handle returned for RAII ownership)
+    let proxy_handle = start_proxy_if_enabled(&mut resolved, &cli, &config_path)?;
 
     // Prepare the sandbox — validates paths, generates platform-specific profile.
     // Path validation (SBPL injection checks on macOS) is handled internally
