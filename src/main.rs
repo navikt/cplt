@@ -532,6 +532,15 @@ const RED: &str = "\x1b[0;31m";
 const BLUE: &str = "\x1b[0;34m";
 const NC: &str = "\x1b[0m";
 
+// ── Display labels (single source of truth for consistent CLI output) ──
+const SOURCE_GIT_HEAD: &str = "git HEAD (tamper-proof)";
+const SOURCE_WORKING_TREE: &str = "working tree (⚠ not committed)";
+const LABEL_DENY_APPLIED: &str = "(applied)";
+const LABEL_PROPOSE_APPROVED: &str = "(approved)";
+const LABEL_PROPOSE_PENDING: &str = "(pending approval)";
+const STATUS_APPROVED: &str = "✓ approved";
+const STATUS_PENDING: &str = "○ pending";
+
 fn info(msg: &str) {
     eprintln!("{BLUE}[cplt]{NC} {msg}");
 }
@@ -546,6 +555,13 @@ fn warn(msg: &str) {
 
 fn error(msg: &str) {
     eprintln!("{RED}[cplt]{NC} {msg}");
+}
+
+fn source_label(source: repo_config::RepoConfigSource) -> &'static str {
+    match source {
+        repo_config::RepoConfigSource::GitHead => SOURCE_GIT_HEAD,
+        repo_config::RepoConfigSource::WorkingTree => SOURCE_WORKING_TREE,
+    }
 }
 
 fn detect_project_root() -> Option<PathBuf> {
@@ -813,9 +829,7 @@ fn main() -> ExitCode {
                 let source_note = match loaded.source {
                     repo_config::RepoConfigSource::GitHead => "",
                     repo_config::RepoConfigSource::WorkingTree => {
-                        warn(
-                            ".cplt.toml read from working tree (not committed — not tamper-proof)",
-                        );
+                        warn(&format!(".cplt.toml source: {SOURCE_WORKING_TREE}",));
                         " (working tree)"
                     }
                 };
@@ -1503,11 +1517,10 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
 
     println!();
     println!("{BLUE}[cplt]{NC} ── Repo Config (.cplt.toml) ────────────────────────");
-    let source_label = match loaded.source {
-        repo_config::RepoConfigSource::GitHead => "git HEAD (tamper-proof)",
-        repo_config::RepoConfigSource::WorkingTree => "working tree (⚠ not committed)",
-    };
-    println!("{BLUE}[cplt]{NC}  {dim}Source:{NC} {source_label}");
+    println!(
+        "{BLUE}[cplt]{NC}  {dim}Source:{NC} {}",
+        source_label(loaded.source)
+    );
     println!(
         "{BLUE}[cplt]{NC}  {dim}Path:{NC}   {}/.cplt.toml",
         project_dir.display()
@@ -1518,7 +1531,7 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
 
     // [deny]
     if !rc.deny.paths.is_empty() || !rc.deny.env.is_empty() {
-        println!("{BLUE}[cplt]{NC}  {dim}[deny]{NC} {green}(applied){NC}");
+        println!("{BLUE}[cplt]{NC}  {dim}[deny]{NC} {green}{LABEL_DENY_APPLIED}{NC}");
         for p in &rc.deny.paths {
             println!("{BLUE}[cplt]{NC}    paths   = {p}");
         }
@@ -1541,9 +1554,9 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
                 .unwrap_or(false)
         });
         let header_status = if all_approved {
-            format!("{green}(approved){NC}")
+            format!("{green}{LABEL_PROPOSE_APPROVED}{NC}")
         } else {
-            format!("{yellow}(pending approval){NC}")
+            format!("{yellow}{LABEL_PROPOSE_PENDING}{NC}")
         };
         println!("{BLUE}[cplt]{NC}  {dim}[propose]{NC} {header_status}");
 
@@ -1568,9 +1581,9 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
                     .map(|t| crate::trust::is_key_approved(t, name))
                     .unwrap_or(false);
                 let status = if approved {
-                    format!("{green}✓{NC}")
+                    format!("{green}{STATUS_APPROVED}{NC}")
                 } else {
-                    format!("{yellow}○{NC}")
+                    format!("{yellow}{STATUS_PENDING}{NC}")
                 };
                 println!("{BLUE}[cplt]{NC}    {name:<30} = {v}  {status}");
             }
@@ -1993,18 +2006,13 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
     let trust_entry = trust::load_trust(project_dir);
 
-    let source_label = match loaded.source {
-        repo_config::RepoConfigSource::GitHead => "git HEAD (tamper-proof)",
-        repo_config::RepoConfigSource::WorkingTree => "working tree (⚠ not committed)",
-    };
-
     println!("{BLUE}[cplt]{NC} ── Repo Config Trust ──────────────────────────────");
-    println!("{BLUE}[cplt]{NC}  Source: {source_label}");
+    println!("{BLUE}[cplt]{NC}  Source: {}", source_label(loaded.source));
     println!();
 
     // Deny section
     if !loaded.config.deny.paths.is_empty() || !loaded.config.deny.env.is_empty() {
-        println!("{BLUE}[cplt]{NC}  {GREEN}[deny]{NC} (applied):");
+        println!("{BLUE}[cplt]{NC}  {GREEN}[deny]{NC} {LABEL_DENY_APPLIED}:");
         for p in &loaded.config.deny.paths {
             println!("{BLUE}[cplt]{NC}    path: {p}");
         }
@@ -2026,9 +2034,9 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         println!("{BLUE}[cplt]{NC}  No proposals (nothing requires approval).");
     } else {
         let section_label = if all_approved {
-            "(approved)"
+            LABEL_PROPOSE_APPROVED
         } else {
-            "(pending approval)"
+            LABEL_PROPOSE_PENDING
         };
         println!("{BLUE}[cplt]{NC}  {YELLOW}[propose]{NC} {section_label}:");
         for &key in &proposed {
@@ -2037,9 +2045,9 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
                 .map(|t| trust::is_key_approved(t, key))
                 .unwrap_or(false);
             let status = if approved {
-                format!("{GREEN}✓ approved{NC}")
+                format!("{GREEN}{STATUS_APPROVED}{NC}")
             } else {
-                format!("{YELLOW}○ pending{NC}")
+                format!("{YELLOW}{STATUS_PENDING}{NC}")
             };
             println!("{BLUE}[cplt]{NC}    {key:<35} {status}");
         }

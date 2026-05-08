@@ -83,7 +83,7 @@ pub struct ProposeProxySection {
 }
 
 /// How the repo config was loaded — used for user-facing messages.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RepoConfigSource {
     /// Read from `git cat-file blob HEAD:.cplt.toml` (tamper-proof).
     GitHead,
