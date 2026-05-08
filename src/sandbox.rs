@@ -26,6 +26,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::{Agent, AgentDir};
+#[cfg(target_os = "linux")]
+use crate::ui;
 
 #[path = "sandbox_env.rs"]
 mod env;
@@ -257,17 +259,17 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     // Warn about config options that Linux cannot enforce at kernel level.
     if !config.extra_deny.is_empty() {
-        eprintln!(
-            "\x1b[0;33m[cplt]\x1b[0m --deny-path has no effect on Linux: \
+        ui::warn(
+            "--deny-path has no effect on Linux: \
              Landlock cannot deny subpaths within allowed directories. \
-             Proxy and env hardening provide defense-in-depth."
+             Proxy and env hardening provide defense-in-depth.",
         );
     }
     if !config.allow_env_files {
-        eprintln!(
-            "\x1b[0;33m[cplt]\x1b[0m allow_env_files=false is not fully enforceable on Linux: \
+        ui::warn(
+            "allow_env_files=false is not fully enforceable on Linux: \
              Landlock grants the project directory full read access, so .env files \
-             within it remain readable. Differs from macOS Seatbelt behavior."
+             within it remain readable. Differs from macOS Seatbelt behavior.",
         );
     }
     // Landlock network rules are port-based, not address-based — localhost
@@ -275,22 +277,22 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     if config.proxy_port.is_none()
         && (!config.localhost_ports.is_empty() || config.allow_localhost_any)
     {
-        eprintln!(
-            "\x1b[0;33m[cplt]\x1b[0m Localhost protection limited on Linux without proxy: \
+        ui::warn(
+            "Localhost protection limited on Linux without proxy: \
              Landlock cannot distinguish localhost from remote hosts. \
-             Use --with-proxy for localhost SSRF protection."
+             Use --with-proxy for localhost SSRF protection.",
         );
     }
     if config.allow_docker {
-        eprintln!(
-            "\x1b[0;33m[cplt]\x1b[0m --allow-docker has no effect on Linux: \
-             Docker socket access is not yet implemented in the Landlock backend."
+        ui::warn(
+            "--allow-docker has no effect on Linux: \
+             Docker socket access is not yet implemented in the Landlock backend.",
         );
     }
     if !config.allow_cache_exec.is_empty() || config.allow_cache_exec_any {
-        eprintln!(
-            "\x1b[0;33m[cplt]\x1b[0m --allow-cache-exec has no effect on Linux: \
-             ~/Library/Caches is a macOS-specific path."
+        ui::warn(
+            "--allow-cache-exec has no effect on Linux: \
+             ~/Library/Caches is a macOS-specific path.",
         );
     }
 

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::ui;
+
 /// Controls how much the proxy logs to stderr.
 /// The audit log file (if configured) always records everything regardless of this level.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -74,11 +76,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often file-backed domain lists are re-read from disk.
 /// Within the TTL window, cached values are returned without I/O.
 const RELOAD_TTL: Duration = Duration::from_secs(5);
-
-const GREEN: &str = "\x1b[0;32m";
-const RED: &str = "\x1b[0;31m";
-const YELLOW: &str = "\x1b[0;33m";
-const NC: &str = "\x1b[0m";
 
 /// Cached domain list with TTL-based refresh.
 struct DomainCache {
@@ -208,7 +205,9 @@ fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
         }
         Err(e) => {
             eprintln!(
-                "{YELLOW}[proxy]{NC} Warning: cannot read {}: {e}",
+                "{}[proxy]{} Warning: cannot read {}: {e}",
+                ui::color(ui::YELLOW),
+                ui::color(ui::RESET),
                 path.display()
             );
             return None;
@@ -230,7 +229,9 @@ fn parse_private_domains_from_toml(path: &Path) -> Option<Vec<String>> {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "{YELLOW}[proxy]{NC} Warning: cannot read config {}: {e}",
+                "{}[proxy]{} Warning: cannot read config {}: {e}",
+                ui::color(ui::YELLOW),
+                ui::color(ui::RESET),
                 path.display()
             );
             return None;
@@ -691,7 +692,9 @@ pub fn is_blocked(hostname: &str, blocked_file: &PathBuf) -> bool {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "{YELLOW}[proxy]{NC} Warning: cannot read blocklist {}: {e}",
+                "{}[proxy]{} Warning: cannot read blocklist {}: {e}",
+                ui::color(ui::YELLOW),
+                ui::color(ui::RESET),
                 blocked_file.display()
             );
             return false;
@@ -835,12 +838,17 @@ fn log_connection(
 ) {
     if level.should_log(status) {
         let color = match status {
-            "BLOCKED" | "BLOCKED-PRIVATE" | "BLOCKED-PORT" | "BLOCKED-ALLOWLIST" | "LIMIT" => RED,
-            "CONNECTED" => GREEN,
-            _ => YELLOW,
+            "BLOCKED" | "BLOCKED-PRIVATE" | "BLOCKED-PORT" | "BLOCKED-ALLOWLIST" | "LIMIT" => {
+                ui::color(ui::RED)
+            }
+            "CONNECTED" => ui::color(ui::GREEN),
+            _ => ui::color(ui::YELLOW),
         };
         let timestamp = chrono_now();
-        eprintln!("{color}[proxy]{NC} {timestamp} {method} {target} → {status}");
+        eprintln!(
+            "{color}[proxy]{} {timestamp} {method} {target} → {status}",
+            ui::color(ui::RESET)
+        );
     }
 
     // Append to audit log file (reopen per-write for rotation compatibility)

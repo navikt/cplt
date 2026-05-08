@@ -7,6 +7,7 @@
 //! Override config location with `CPLT_CONFIG` env var.
 
 use crate::sandbox::{HardeningCategory, validate_sbpl_path};
+use crate::ui;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -216,10 +217,7 @@ impl Config {
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!(
-                    "\x1b[0;34m[cplt]\x1b[0m Cannot read config file {}: {e}",
-                    path.display()
-                );
+                ui::info(&format!("Cannot read config file {}: {e}", path.display()));
                 return Ok(None);
             }
             Err(e) => {
@@ -306,7 +304,7 @@ impl Config {
             match resolve_config_path(s, config_dir.as_ref()) {
                 Ok(p) => allow_read.push(p),
                 Err(e) => {
-                    eprintln!("\x1b[0;33m[cplt]\x1b[0m Warning: allow.read path {s:?}: {e}");
+                    ui::warn(&format!("Warning: allow.read path {s:?}: {e}"));
                 }
             }
         }
@@ -318,7 +316,7 @@ impl Config {
             match resolve_config_path(s, config_dir.as_ref()) {
                 Ok(p) => allow_write.push(p),
                 Err(e) => {
-                    eprintln!("\x1b[0;33m[cplt]\x1b[0m Warning: allow.write path {s:?}: {e}");
+                    ui::warn(&format!("Warning: allow.write path {s:?}: {e}"));
                 }
             }
         }
@@ -551,11 +549,11 @@ impl Resolved {
         home_dir: &std::path::Path,
         agent: crate::agent::Agent,
     ) {
-        let blue = "\x1b[0;34m";
-        let dim = "\x1b[2m";
-        let green = "\x1b[0;32m";
-        let yellow = "\x1b[0;33m";
-        let nc = "\x1b[0m";
+        let blue = ui::color(ui::BLUE);
+        let dim = ui::color(ui::DIM);
+        let green = ui::color(ui::GREEN);
+        let yellow = ui::color(ui::YELLOW);
+        let nc = ui::color(ui::RESET);
 
         eprintln!();
         eprintln!("{blue}[cplt]{nc} ── Sandbox Configuration ─────────────────────────");
@@ -613,13 +611,13 @@ impl Resolved {
             );
         }
         if self.allow_tmp_exec {
-            let red = "\x1b[0;31m";
+            let red = ui::color(ui::RED);
             eprintln!(
                 "{blue}[cplt]{nc}    Tmp exec:      {red}ALLOWED{nc}     {dim}⚠ /tmp + /var/folders exec enabled{nc}"
             );
         }
         if self.allow_cache_exec_any {
-            let red = "\x1b[0;31m";
+            let red = ui::color(ui::RED);
             eprintln!(
                 "{blue}[cplt]{nc}    Cache exec:    {red}ALLOWED{nc}     {dim}⚠ all ~/Library/Caches exec enabled{nc}"
             );
@@ -630,7 +628,7 @@ impl Resolved {
             );
         }
         if self.allow_gpg_signing {
-            let red = "\x1b[0;31m";
+            let red = ui::color(ui::RED);
             eprintln!(
                 "{blue}[cplt]{nc}    GPG signing:   {red}ALLOWED{nc}     {dim}⚠ agent socket exposed (--allow-gpg-signing){nc}"
             );
@@ -643,7 +641,7 @@ impl Resolved {
             );
         }
         if self.allow_docker {
-            let red = "\x1b[0;31m";
+            let red = ui::color(ui::RED);
             eprintln!(
                 "{blue}[cplt]{nc}    Docker:        {red}ALLOWED{nc}     {dim}⚠ container mounts bypass sandbox (--allow-docker){nc}"
             );
@@ -688,7 +686,7 @@ impl Resolved {
             );
         }
         if self.allow_localhost_any && self.allow_jvm_attach {
-            let red = "\x1b[0;31m";
+            let red = ui::color(ui::RED);
             eprintln!(
                 "{blue}[cplt]{nc}    Localhost:     {red}ALL TCP{nc}     {dim}⚠ all outbound TCP (JVM IPv4-mapped workaround){nc}"
             );
@@ -753,7 +751,7 @@ impl Resolved {
         // Environment
         eprintln!("{blue}[cplt]{nc}  {dim}Environment:{nc}");
         if self.inherit_env {
-            let red = "\x1b[0;31m";
+            let red = ui::color(ui::RED);
             eprintln!(
                 "{blue}[cplt]{nc}    Mode:          {red}INHERITED{nc}   {dim}⚠ all env vars passed (--inherit-env){nc}"
             );
@@ -1663,11 +1661,11 @@ fn type_label(vt: ConfigValueType) -> &'static str {
 
 /// Print explanation of a single config key, showing type and current value inline.
 pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
-    let blue = "\x1b[0;34m";
-    let bold = "\x1b[1m";
-    let dim = "\x1b[2m";
-    let yellow = "\x1b[0;33m";
-    let nc = "\x1b[0m";
+    let blue = ui::color(ui::BLUE);
+    let bold = ui::color(ui::BOLD);
+    let dim = ui::color(ui::DIM);
+    let yellow = ui::color(ui::YELLOW);
+    let nc = ui::color(ui::RESET);
 
     let default_display = if key_info.default_display.is_empty() {
         "(unset)"
@@ -1708,11 +1706,11 @@ pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
 /// Print explanation of all config keys, grouped by section.
 /// Shows the effective value inline: dim for default, bold for config-file override.
 pub fn explain_all(loaded: Option<&LoadedConfig>) {
-    let blue = "\x1b[0;34m";
-    let bold = "\x1b[1m";
-    let dim = "\x1b[2m";
-    let yellow = "\x1b[0;33m";
-    let nc = "\x1b[0m";
+    let blue = ui::color(ui::BLUE);
+    let bold = ui::color(ui::BOLD);
+    let dim = ui::color(ui::DIM);
+    let yellow = ui::color(ui::YELLOW);
+    let nc = ui::color(ui::RESET);
 
     let mut current_section = "";
     for key in CONFIG_KEYS {
@@ -2308,11 +2306,11 @@ pub fn set_repo_value_in_doc(
 /// Display the effective configuration from a config file merged with defaults.
 /// Shows what cplt would use at runtime (without CLI flag overrides).
 pub fn display_config(loaded: Option<&LoadedConfig>) {
-    let blue = "\x1b[0;34m";
-    let dim = "\x1b[2m";
-    let green = "\x1b[0;32m";
-    let yellow = "\x1b[0;33m";
-    let nc = "\x1b[0m";
+    let blue = ui::color(ui::BLUE);
+    let dim = ui::color(ui::DIM);
+    let green = ui::color(ui::GREEN);
+    let yellow = ui::color(ui::YELLOW);
+    let nc = ui::color(ui::RESET);
 
     let config = loaded.map(|l| &l.config);
     let c = config.cloned().unwrap_or_default();
@@ -2434,7 +2432,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     }
     let inherit_env = c.sandbox.inherit_env.unwrap_or(false);
     if inherit_env {
-        let red = "\x1b[0;31m";
+        let red = ui::color(ui::RED);
         println!("{blue}[cplt]{nc}    inherit_env           = {red}true{nc} ⚠ DANGEROUS");
     } else {
         println!(
@@ -2450,7 +2448,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     );
     let allow_gpg = c.sandbox.allow_gpg_signing.unwrap_or(false);
     if allow_gpg {
-        let red = "\x1b[0;31m";
+        let red = ui::color(ui::RED);
         println!("{blue}[cplt]{nc}    allow_gpg_signing     = {red}true{nc} ⚠ DANGEROUS");
     } else {
         println!(
@@ -2460,7 +2458,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     }
     let allow_docker = c.sandbox.allow_docker.unwrap_or(false);
     if allow_docker {
-        let red = "\x1b[0;31m";
+        let red = ui::color(ui::RED);
         println!("{blue}[cplt]{nc}    allow_docker          = {red}true{nc} ⚠ DANGEROUS");
     } else {
         println!(
@@ -2470,7 +2468,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     }
     let allow_tmp = c.sandbox.allow_tmp_exec.unwrap_or(false);
     if allow_tmp {
-        let red = "\x1b[0;31m";
+        let red = ui::color(ui::RED);
         println!("{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS");
     } else {
         println!(

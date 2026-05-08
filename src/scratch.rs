@@ -16,6 +16,7 @@
 //! Each session gets a UUID subdirectory for isolation.
 
 use crate::sandbox::validate_sbpl_path;
+use crate::ui;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -148,10 +149,10 @@ impl ScratchDir {
                 && age > STALE_AGE
             {
                 let _ = std::fs::remove_dir_all(&path).map_err(|e| {
-                    eprintln!(
-                        "\x1b[0;33m[cplt]\x1b[0m Warning: cannot remove stale scratch dir {}: {e}",
+                    ui::warn(&format!(
+                        "Warning: cannot remove stale scratch dir {}: {e}",
                         path.display()
-                    );
+                    ));
                 });
             }
         }
@@ -162,10 +163,10 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         if self.path.exists() {
             let _ = std::fs::remove_dir_all(&self.path).map_err(|e| {
-                eprintln!(
-                    "\x1b[0;33m[cplt]\x1b[0m Warning: cannot cleanup scratch dir {}: {e}",
+                ui::warn(&format!(
+                    "Warning: cannot cleanup scratch dir {}: {e}",
                     self.path.display()
-                );
+                ));
             });
         }
     }

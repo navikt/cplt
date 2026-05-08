@@ -6,6 +6,7 @@ pub mod repo_config;
 pub mod sandbox;
 pub mod scratch;
 pub mod trust;
+pub mod ui;
 pub mod update;
 
 /// Safety check: reject overly broad project roots.

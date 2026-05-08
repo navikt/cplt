@@ -1,9 +1,11 @@
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::env::build_sandbox_env;
 use super::policy::HardeningCategory;
 use crate::agent::Agent;
+use crate::ui;
 
 /// Config filenames that mise searches for in ancestor directories.
 const MISE_CONFIG_FILENAMES: &[&str] = &[".tool-versions", ".mise.toml", "mise.toml"];
@@ -138,7 +140,7 @@ fn spawn_and_wait(cmd: &mut Command) -> u8 {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("\x1b[0;31m[cplt]\x1b[0m Failed to start sandboxed process: {e}");
+            ui::error(&format!("Failed to start sandboxed process: {e}"));
             return 1;
         }
     };
@@ -148,10 +150,14 @@ fn spawn_and_wait(cmd: &mut Command) -> u8 {
     // Forward SIGTERM/SIGHUP to the child (these aren't sent by the terminal)
     install_signal_forwarding(child_pid);
 
+    // POSIX: if killed by signal, exit with 128 + signal number
     let status = match child.wait() {
-        Ok(status) => status.code().unwrap_or(1) as u8,
+        Ok(status) => status
+            .code()
+            .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
+            as u8,
         Err(e) => {
-            eprintln!("\x1b[0;31m[cplt]\x1b[0m Error waiting for child: {e}");
+            ui::error(&format!("Error waiting for child: {e}"));
             unsafe {
                 libc::kill(child_pid, libc::SIGTERM);
             }
@@ -241,7 +247,7 @@ pub fn exec(
     let profile_path = match write_temp_profile(&sandbox.profile_text) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("\x1b[0;31m[cplt]\x1b[0m {e}");
+            ui::error(&e.to_string());
             return 1;
         }
     };

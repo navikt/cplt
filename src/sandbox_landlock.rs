@@ -22,6 +22,8 @@
 //! The proxy handles domain-level filtering on both platforms.
 
 use super::policy::{self, HomeToolDir};
+#[cfg(target_os = "linux")]
+use crate::ui;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -714,16 +716,16 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
         // Check if proxy is configured (proxy_port would have been added to net_rules)
         let has_proxy = policy.net_rules.iter().any(|r| r.port != 443);
         if has_proxy {
-            eprintln!(
-                "\x1b[0;33m[cplt]\x1b[0m Landlock ABI v{abi_version} (kernel < 6.7): \
+            ui::warn(&format!(
+                "Landlock ABI v{abi_version} (kernel < 6.7): \
                  TCP port filtering unavailable. Network security provided by proxy only."
-            );
+            ));
         } else {
-            eprintln!(
-                "\x1b[0;31m[cplt]\x1b[0m WARNING: Landlock ABI v{abi_version} (kernel < 6.7) \
+            ui::error(&format!(
+                "WARNING: Landlock ABI v{abi_version} (kernel < 6.7) \
                  and no proxy configured — outbound network is UNRESTRICTED. \
                  Use --with-proxy or upgrade to kernel 6.7+ for network isolation."
-            );
+            ));
         }
     }
 
