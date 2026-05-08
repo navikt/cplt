@@ -92,7 +92,7 @@ fn canonical_remote(project_dir: &Path) -> Option<String> {
 /// - `git@github.com:org/repo.git` → `github.com/org/repo`
 /// - `https://github.com/org/repo.git` → `github.com/org/repo`
 /// - Lowercases the host portion.
-fn normalize_remote_url(url: &str) -> String {
+pub fn normalize_remote_url(url: &str) -> String {
     let url = url.trim();
 
     // SSH scheme: ssh://[user@]host[:port]/org/repo.git

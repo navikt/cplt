@@ -1973,7 +1973,7 @@ fn trust_accept(
         && output.status.success()
         && let Ok(url) = String::from_utf8(output.stdout)
     {
-        entry.repo.remote = url.trim().to_string();
+        entry.repo.remote = trust::normalize_remote_url(url.trim());
     }
 
     // Add new keys (don't duplicate)

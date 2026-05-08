@@ -53,7 +53,7 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 3. Per-repo config (`.cplt.toml` approved proposals)
 4. Built-in defaults
 
-CLI flags always override the config file. Use `--no-proxy` to disable the proxy for a single run.
+CLI flags always override the config file. Per-repo proposals are **additive only** — they can enable features (e.g., `allow_docker = true`) but cannot disable anything set by CLI or global config. The `[deny]` section always tightens the sandbox unconditionally.
 
 **Environment variable override:**
 

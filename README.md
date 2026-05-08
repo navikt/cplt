@@ -504,6 +504,8 @@ cplt config explain   # list all keys with descriptions
 3. Per-repo config (`.cplt.toml` approved proposals)
 4. Built-in defaults
 
+Per-repo proposals are **additive only** — they can enable features but cannot disable anything set by CLI or global config. The `[deny]` section always tightens unconditionally.
+
 ### Per-repo configuration (`.cplt.toml`)
 
 Commit a `.cplt.toml` to your repository for project-specific settings:
