@@ -1,3 +1,4 @@
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use cplt::{agent, config, discover, proxy, repo_config, sandbox, scratch, trust, update};
 #[cfg(target_os = "macos")]
@@ -526,12 +527,6 @@ enum TrustAction {
     },
 }
 
-const GREEN: &str = "\x1b[0;32m";
-const YELLOW: &str = "\x1b[0;33m";
-const RED: &str = "\x1b[0;31m";
-const BLUE: &str = "\x1b[0;34m";
-const NC: &str = "\x1b[0m";
-
 // ── Display labels (single source of truth for consistent CLI output) ──
 const SOURCE_GIT_HEAD: &str = "git HEAD (tamper-proof)";
 const SOURCE_WORKING_TREE: &str = "working tree (⚠ not committed)";
@@ -540,22 +535,6 @@ const LABEL_ALLOW_APPROVED: &str = "(approved)";
 const LABEL_ALLOW_PENDING: &str = "(pending approval)";
 const STATUS_APPROVED: &str = "✓ approved";
 const STATUS_PENDING: &str = "○ pending";
-
-fn info(msg: &str) {
-    eprintln!("{BLUE}[cplt]{NC} {msg}");
-}
-
-fn ok(msg: &str) {
-    eprintln!("{GREEN}[cplt]{NC} {msg}");
-}
-
-fn warn(msg: &str) {
-    eprintln!("{YELLOW}[cplt]{NC} {msg}");
-}
-
-fn error(msg: &str) {
-    eprintln!("{RED}[cplt]{NC} {msg}");
-}
 
 fn source_label(source: repo_config::RepoConfigSource) -> &'static str {
     match source {
@@ -579,6 +558,7 @@ fn detect_project_root() -> Option<PathBuf> {
 
 // Use library's is_unsafe_root
 use cplt::is_unsafe_root;
+use cplt::ui;
 
 /// Prompt the user to confirm the sandbox configuration.
 ///
@@ -587,7 +567,7 @@ use cplt::is_unsafe_root;
 fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     if auto_yes {
         if !quiet {
-            eprintln!("{BLUE}[cplt]{NC} Auto-confirmed (--yes)");
+            ui::info("Auto-confirmed (--yes)");
         }
         return Ok(());
     }
@@ -610,10 +590,16 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
 
     if quiet {
         eprint!(
-            "{BLUE}[cplt]{NC} Proceed with sandboxed Copilot? (run without --quiet to review config) [y/N] "
+            "{}[cplt]{} Proceed with sandboxed Copilot? (run without --quiet to review config) [y/N] ",
+            ui::color(ui::BLUE),
+            ui::color(ui::RESET)
         );
     } else {
-        eprint!("{BLUE}[cplt]{NC} Proceed? [y/N] ");
+        eprint!(
+            "{}[cplt]{} Proceed? [y/N] ",
+            ui::color(ui::BLUE),
+            ui::color(ui::RESET)
+        );
     }
 
     use std::io::BufRead;
@@ -631,95 +617,83 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     }
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-
-    // Handle --init-config
-    if cli.init_config {
-        return init_config();
-    }
-
-    // Handle --shell-setup: print alias definition and exit
-    if cli.shell_setup {
-        println!("alias copilot=cplt");
-        return ExitCode::SUCCESS;
-    }
-
-    // Handle --shell-install: append setup line to shell rc file
-    if cli.shell_install {
-        return shell_install();
-    }
-
-    // Handle subcommands (these don't need macOS or sandbox)
-    if let Some(command) = cli.command {
-        return match command {
-            Command::Config { action } => run_config_command(action),
-            Command::Update { check, force } => run_update(check, force),
-            Command::Trust { action } => run_trust_command(action),
-        };
-    }
-
-    // Platform check: cplt supports macOS (Seatbelt) and Linux (Landlock).
-    // Other platforms (Windows, FreeBSD, etc.) are not supported.
-    if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
-        error("cplt requires macOS or Linux");
-        return ExitCode::FAILURE;
-    }
-
-    // Handle --doctor: run diagnostics and exit (works on all platforms)
-    if cli.doctor {
-        return run_doctor();
-    }
-
-    // Load config file and merge with CLI flags
-    // Canonicalize CLI paths for consistency with config path handling
-    let cli_allow_read: Vec<PathBuf> = cli
-        .allow_read
+/// Canonicalize a list of paths, warning on failures.
+fn canonicalize_paths(paths: &[PathBuf], flag_name: &str) -> Vec<PathBuf> {
+    paths
         .iter()
         .filter_map(|p| match std::fs::canonicalize(p) {
             Ok(c) => Some(c),
             Err(e) => {
-                warn(&format!("--allow-read path {:?}: {e}", p));
+                ui::warn(&format!("{flag_name} path {:?}: {e}", p));
                 None
             }
         })
-        .collect();
-    let cli_allow_write: Vec<PathBuf> = cli
-        .allow_write
-        .iter()
-        .filter_map(|p| match std::fs::canonicalize(p) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                warn(&format!("--allow-write path {:?}: {e}", p));
-                None
-            }
-        })
-        .collect();
-    let cli_deny_paths: Vec<PathBuf> = cli
-        .deny_paths
+        .collect()
+}
+
+/// Canonicalize deny-paths, failing on any error (security: silent drops are dangerous).
+fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    paths
         .iter()
         .map(|p| {
-            std::fs::canonicalize(p).map_err(|e| {
+            std::fs::canonicalize(p).with_context(|| {
                 format!(
-                    "--deny-path {:?} cannot be resolved: {e}\n\
+                    "--deny-path {:?} cannot be resolved.\n\
                      Silently dropping deny rules is a security risk.",
                     p
                 )
             })
         })
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|e| {
-            error(&e);
-            std::process::exit(1);
+        .collect()
+}
+
+fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    // Handle --init-config
+    if cli.init_config {
+        return Ok(init_config());
+    }
+
+    // Handle --shell-setup: print alias definition and exit
+    if cli.shell_setup {
+        println!("alias copilot=cplt");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Handle --shell-install: append setup line to shell rc file
+    if cli.shell_install {
+        return Ok(shell_install());
+    }
+
+    // Handle subcommands (these don't need macOS or sandbox)
+    if let Some(command) = cli.command {
+        return Ok(match command {
+            Command::Config { action } => run_config_command(action),
+            Command::Update { check, force } => run_update(check, force),
+            Command::Trust { action } => run_trust_command(action),
         });
+    }
+
+    // Platform check: cplt supports macOS (Seatbelt) and Linux (Landlock).
+    // Other platforms (Windows, FreeBSD, etc.) are not supported.
+    if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+        bail!("cplt requires macOS or Linux");
+    }
+
+    // Handle --doctor: run diagnostics and exit (works on all platforms)
+    if cli.doctor {
+        return Ok(run_doctor());
+    }
+
+    // Load config file and merge with CLI flags
+    // Canonicalize CLI paths for consistency with config path handling
+    let cli_allow_read = canonicalize_paths(&cli.allow_read, "--allow-read");
+    let cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
+    let cli_deny_paths = canonicalize_deny_paths(&cli.deny_paths)?;
 
     let (cfg, config_path) = match config::Config::load_file() {
         Ok(Some(loaded)) => (loaded.config, Some(loaded.path)),
         Ok(None) => (config::Config::default(), None),
-        Err(e) => {
-            error(&e);
-            return ExitCode::FAILURE;
-        }
+        Err(e) => bail!("{e}"),
     };
     let mut resolved = match cfg.merge(config::CliFlags {
         with_proxy: cli.with_proxy,
@@ -731,10 +705,7 @@ fn main() -> ExitCode {
         proxy_log_level: match cli.proxy_log_level.as_deref() {
             Some(s) => match s.parse::<crate::proxy::ProxyLogLevel>() {
                 Ok(l) => Some(l),
-                Err(e) => {
-                    error(&e);
-                    return ExitCode::FAILURE;
-                }
+                Err(e) => bail!("{e}"),
             },
             None => None,
         },
@@ -763,36 +734,20 @@ fn main() -> ExitCode {
         no_quiet: cli.no_quiet,
     }) {
         Ok(r) => r,
-        Err(e) => {
-            error(&e);
-            return ExitCode::FAILURE;
-        }
+        Err(e) => bail!("{e}"),
     };
 
     // Resolve home directory
     let home_dir = match std::env::var("HOME") {
-        Ok(h) => match std::fs::canonicalize(&h) {
-            Ok(p) => p,
-            Err(e) => {
-                error(&format!("Cannot resolve $HOME ({h}): {e}"));
-                return ExitCode::FAILURE;
-            }
-        },
-        Err(_) => {
-            error("$HOME not set");
-            return ExitCode::FAILURE;
-        }
+        Ok(h) => std::fs::canonicalize(&h)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve $HOME ({h}): {e}"))?,
+        Err(_) => bail!("$HOME not set"),
     };
 
     // Resolve project directory
     let project_dir = match &cli.project_dir {
-        Some(p) => match std::fs::canonicalize(p) {
-            Ok(p) => p,
-            Err(e) => {
-                error(&format!("Cannot resolve project dir: {e}"));
-                return ExitCode::FAILURE;
-            }
-        },
+        Some(p) => std::fs::canonicalize(p)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve project dir: {e}"))?,
         None => {
             if let Some(root) = detect_project_root() {
                 match std::fs::canonicalize(&root) {
@@ -800,25 +755,20 @@ fn main() -> ExitCode {
                     Err(_) => root,
                 }
             } else {
-                warn("No git repo detected, using cwd");
-                match std::env::current_dir().and_then(std::fs::canonicalize) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error(&format!("Cannot resolve cwd: {e}"));
-                        return ExitCode::FAILURE;
-                    }
-                }
+                ui::warn("No git repo detected, using cwd");
+                std::env::current_dir()
+                    .and_then(std::fs::canonicalize)
+                    .map_err(|e| anyhow::anyhow!("Cannot resolve cwd: {e}"))?
             }
         }
     };
 
     // Safety check: reject overly broad project roots
     if is_unsafe_root(&project_dir, &home_dir) {
-        error(&format!(
+        bail!(
             "Refusing to sandbox '{}' — too broad. Use a specific project directory.",
             project_dir.display()
-        ));
-        return ExitCode::FAILURE;
+        );
     }
 
     // ── Load and apply per-repo config (.cplt.toml) ──────────────
@@ -829,11 +779,11 @@ fn main() -> ExitCode {
                 let source_note = match loaded.source {
                     repo_config::RepoConfigSource::GitHead => "",
                     repo_config::RepoConfigSource::WorkingTree => {
-                        warn(&format!(".cplt.toml source: {SOURCE_WORKING_TREE}",));
+                        ui::warn(&format!(".cplt.toml source: {SOURCE_WORKING_TREE}",));
                         " (working tree)"
                     }
                 };
-                info(&format!("Repo config: .cplt.toml{source_note}"));
+                ui::info(&format!("Repo config: .cplt.toml{source_note}"));
             }
 
             // Determine approved keys
@@ -853,7 +803,7 @@ fn main() -> ExitCode {
                         {
                             // Proposals changed since approval — invalidate
                             if !resolved.quiet {
-                                warn(
+                                ui::warn(
                                     ".cplt.toml permissions changed since last approval — re-approve with `cplt trust accept`",
                                 );
                             }
@@ -871,27 +821,31 @@ fn main() -> ExitCode {
         }
         Ok(None) => {} // No .cplt.toml — nothing to do
         Err(e) => {
-            warn(&format!("Failed to load .cplt.toml: {e}"));
+            ui::warn(&format!("Failed to load .cplt.toml: {e}"));
         }
     }
 
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
-        warn(&format!(
+        ui::warn(&format!(
             ".cplt.toml has {} unapproved permission(s):",
             unapproved_proposals.len()
         ));
         for key in &unapproved_proposals {
-            eprintln!("  {YELLOW}○{NC} {key}");
+            eprintln!("  {}○{} {key}", ui::color(ui::YELLOW), ui::color(ui::RESET));
         }
-        eprintln!("  Run: {GREEN}cplt trust accept --all{NC}  (or select specific keys)");
+        eprintln!(
+            "  Run: {}cplt trust accept --all{}  (or select specific keys)",
+            ui::color(ui::GREEN),
+            ui::color(ui::RESET)
+        );
     }
 
     if !resolved.quiet {
-        info(&format!("Project:  {}", project_dir.display()));
-        info(&format!("Home:     {}", home_dir.display()));
+        ui::info(&format!("Project:  {}", project_dir.display()));
+        ui::info(&format!("Home:     {}", home_dir.display()));
         if let Some(ref cp) = config_path {
-            info(&format!("Config:   {}", cp.display()));
+            ui::info(&format!("Config:   {}", cp.display()));
         }
     }
 
@@ -899,10 +853,7 @@ fn main() -> ExitCode {
     let active_agent = match &cli.agent {
         Some(name) => match name.parse::<agent::Agent>() {
             Ok(a) => a,
-            Err(e) => {
-                error(&e);
-                return ExitCode::FAILURE;
-            }
+            Err(e) => bail!("{e}"),
         },
         None => match agent::Agent::auto_detect() {
             Some(a) => a,
@@ -912,21 +863,20 @@ fn main() -> ExitCode {
                 if cli.print_profile || cli.doctor {
                     agent::Agent::Copilot
                 } else {
-                    error(
+                    bail!(
                         "No supported AI coding agent found in PATH. \
                          Install one of:\n\
                          [cplt]   Copilot CLI: brew install --cask copilot-cli\n\
                          [cplt]   OpenCode:    npm i -g opencode-ai\n\
-                         [cplt] Or specify explicitly: cplt --agent copilot|opencode|shell",
+                         [cplt] Or specify explicitly: cplt --agent copilot|opencode|shell"
                     );
-                    return ExitCode::FAILURE;
                 }
             }
         },
     };
 
     if !resolved.quiet {
-        info(&format!("Agent:    {}", active_agent.display_name()));
+        ui::info(&format!("Agent:    {}", active_agent.display_name()));
     }
 
     // Hint about API keys for agents that need them
@@ -937,19 +887,19 @@ fn main() -> ExitCode {
             parent_env.iter().any(|(k, _)| k == *key) && resolved.pass_env.iter().any(|v| v == *key)
         });
         if !has_api_key && !resolved.inherit_env && !hints.is_empty() {
-            warn(&format!(
+            ui::warn(&format!(
                 "No API keys passed. {} needs auth — either:",
                 active_agent.display_name()
             ));
-            warn(&format!(
+            ui::warn(&format!(
                 "  cplt --agent {} --pass-env {}",
                 active_agent.binary_name(),
                 hints[0]
             ));
             if active_agent == agent::Agent::OpenCode {
-                warn("  or use /connect in OpenCode with your GitHub Copilot subscription");
+                ui::warn("  or use /connect in OpenCode with your GitHub Copilot subscription");
             } else if active_agent == agent::Agent::Gemini {
-                warn("  or sign in with Google (OAuth flow on first run)");
+                ui::warn("  or sign in with Google (OAuth flow on first run)");
             }
         }
 
@@ -968,7 +918,7 @@ fn main() -> ExitCode {
         .flatten()
         .collect();
         if !copilot_flags_used.is_empty() {
-            warn(&format!(
+            ui::warn(&format!(
                 "Ignoring Copilot-only flags for {}: {}",
                 active_agent.display_name(),
                 copilot_flags_used.join(", ")
@@ -988,14 +938,11 @@ fn main() -> ExitCode {
         match scratch::ScratchDir::create(&home_dir) {
             Ok(s) => {
                 if !resolved.quiet {
-                    ok(&format!("Scratch dir: {}", s.path().display()));
+                    ui::ok(&format!("Scratch dir: {}", s.path().display()));
                 }
                 Some(s)
             }
-            Err(e) => {
-                error(&format!("Cannot create scratch dir: {e}"));
-                return ExitCode::FAILURE;
-            }
+            Err(e) => bail!("Cannot create scratch dir: {e}"),
         }
     } else {
         None
@@ -1080,20 +1027,17 @@ fn main() -> ExitCode {
                 match proxy::parse_domain_file(path) {
                     Ok(domains) => {
                         if !resolved.quiet {
-                            info(&format!(
+                            ui::info(&format!(
                                 "Domain allowlist: {} domains from {}",
                                 domains.len(),
                                 path.display()
                             ));
                         }
                     }
-                    Err(e) => {
-                        error(&format!("Failed to load allowed domains: {e}"));
-                        return ExitCode::FAILURE;
-                    }
+                    Err(e) => bail!("Failed to load allowed domains: {e}"),
                 }
             } else if !resolved.quiet {
-                info(&format!(
+                ui::info(&format!(
                     "Domain allowlist file: {} (not found)",
                     path.display()
                 ));
@@ -1106,7 +1050,7 @@ fn main() -> ExitCode {
             format!("localhost:{}", resolved.proxy_port)
         };
         if !resolved.quiet {
-            info(&format!("Starting proxy on {port_hint}..."));
+            ui::info(&format!("Starting proxy on {port_hint}..."));
         }
 
         match proxy::start(proxy::ProxyOptions {
@@ -1129,7 +1073,7 @@ fn main() -> ExitCode {
             Ok(handle) => {
                 resolved.proxy_port = handle.port;
                 if !resolved.quiet {
-                    ok(&format!(
+                    ui::ok(&format!(
                         "Proxy running on localhost:{} (thread)",
                         handle.port
                     ));
@@ -1138,10 +1082,7 @@ fn main() -> ExitCode {
                 // Proxy env vars (NODE_USE_ENV_PROXY, HTTP_PROXY, HTTPS_PROXY) are
                 // injected by sandbox_exec::exec() when proxy_port is Some.
             }
-            Err(e) => {
-                error(&format!("Failed to start proxy: {e}"));
-                return ExitCode::FAILURE;
-            }
+            Err(e) => bail!("Failed to start proxy: {e}"),
         }
     }
 
@@ -1178,36 +1119,29 @@ fn main() -> ExitCode {
         allow_browser: resolved.allow_browser,
     }) {
         Ok(s) => s,
-        Err(e) => {
-            error(&e);
-            return ExitCode::FAILURE;
-        }
+        Err(e) => bail!("{e}"),
     };
 
     // --print-profile: dump the sandbox policy and exit (no copilot binary needed)
     if cli.print_profile {
         println!("{}", sandbox::describe(&prepared));
-        return ExitCode::SUCCESS;
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Recursion guard: detect if we're already inside a cplt sandbox.
     // Placed after --print-profile/--doctor/--init-config so those subcommands
     // still work inside the sandbox. Only the actual sandbox launch is blocked.
     if std::env::var("__CPLT_WRAPPED").is_ok() {
-        error(
+        bail!(
             "cplt is already running (recursion detected). \
-             Ensure the real agent binary is in PATH and not aliased to cplt.",
+             Ensure the real agent binary is in PATH and not aliased to cplt."
         );
-        return ExitCode::FAILURE;
     }
 
     // Unwrap the agent binary resolution (deferred from above).
     let agent_bin = match agent_bin_result {
         Ok(path) => path,
-        Err(msg) => {
-            error(&msg);
-            return ExitCode::FAILURE;
-        }
+        Err(msg) => bail!("{msg}"),
     };
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
@@ -1215,11 +1149,8 @@ fn main() -> ExitCode {
     // so extraction must happen here, outside. macOS-only: SEA extraction is a
     // macOS Copilot packaging detail. Skipped for other agents.
     #[cfg(target_os = "macos")]
-    if active_agent.needs_sea_extraction()
-        && let Err(msg) = ensure_copilot_extracted(&agent_bin, &home_dir)
-    {
-        error(&msg);
-        std::process::exit(1);
+    if active_agent.needs_sea_extraction() {
+        ensure_copilot_extracted(&agent_bin, &home_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // Preflight: verify the sandbox mechanism works on this system
@@ -1230,10 +1161,7 @@ fn main() -> ExitCode {
                     print_preflight_ok();
                 }
             }
-            Err(e) => {
-                error(&format!("Sandbox validation failed: {e}"));
-                return ExitCode::FAILURE;
-            }
+            Err(e) => bail!("Sandbox validation failed: {e}"),
         }
     }
 
@@ -1242,8 +1170,7 @@ fn main() -> ExitCode {
         resolved.print_summary(&project_dir, &home_dir, active_agent);
     }
     if let Err(e) = prompt_confirm(cli.yes, resolved.quiet) {
-        error(&e);
-        return ExitCode::FAILURE;
+        bail!("{e}");
     }
 
     // Compute hardening categories for environment sanitization
@@ -1251,7 +1178,7 @@ fn main() -> ExitCode {
 
     // proxy_handle is set up before sandbox::prepare() (see above)
 
-    ok(&format!(
+    ui::ok(&format!(
         "Starting {} in sandbox...",
         active_agent.display_name()
     ));
@@ -1263,7 +1190,11 @@ fn main() -> ExitCode {
         denial_proc = start_denial_stream();
     }
 
-    eprintln!("{YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}");
+    eprintln!(
+        "{}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{}",
+        ui::color(ui::YELLOW),
+        ui::color(ui::RESET)
+    );
     eprintln!();
 
     // Build agent args: extra args (e.g. --no-auto-update) + forwarded convenience flags + explicit -- args
@@ -1289,7 +1220,18 @@ fn main() -> ExitCode {
         let _ = child.wait();
     }
 
-    ExitCode::from(exit_code)
+    Ok(ExitCode::from(exit_code))
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(code) => code,
+        Err(e) => {
+            ui::error(&format!("{e:#}"));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Build the argument vector for the agent binary.
@@ -1346,12 +1288,12 @@ fn run_doctor() -> ExitCode {
         Ok(h) => match std::fs::canonicalize(&h) {
             Ok(p) => p,
             Err(e) => {
-                error(&format!("Cannot resolve $HOME ({h}): {e}"));
+                ui::error(&format!("Cannot resolve $HOME ({h}): {e}"));
                 return ExitCode::FAILURE;
             }
         },
         Err(_) => {
-            error("$HOME not set");
+            ui::error("$HOME not set");
             return ExitCode::FAILURE;
         }
     };
@@ -1364,9 +1306,24 @@ fn run_doctor() -> ExitCode {
             .unwrap_or_else(|_| PathBuf::from("."))
     };
 
-    println!("{BLUE}[cplt]{NC} cplt:     {}", LONG_VERSION);
-    println!("{BLUE}[cplt]{NC} Project:  {}", project_dir.display());
-    println!("{BLUE}[cplt]{NC} Home:     {}", home_dir.display());
+    println!(
+        "{}[cplt]{} cplt:     {}",
+        ui::color(ui::BLUE),
+        ui::color(ui::RESET),
+        LONG_VERSION
+    );
+    println!(
+        "{}[cplt]{} Project:  {}",
+        ui::color(ui::BLUE),
+        ui::color(ui::RESET),
+        project_dir.display()
+    );
+    println!(
+        "{}[cplt]{} Home:     {}",
+        ui::color(ui::BLUE),
+        ui::color(ui::RESET),
+        home_dir.display()
+    );
     println!();
 
     let discovery = discover::discover_all(&home_dir, &project_dir);
@@ -1381,12 +1338,12 @@ fn run_doctor() -> ExitCode {
 
 fn init_config() -> ExitCode {
     let Some(path) = config::config_path() else {
-        error("Cannot determine config path ($HOME not set)");
+        ui::error("Cannot determine config path ($HOME not set)");
         return ExitCode::FAILURE;
     };
 
     if path.exists() {
-        error(&format!(
+        ui::error(&format!(
             "Config file already exists: {}\nEdit it directly, or remove it first to regenerate.",
             path.display()
         ));
@@ -1397,18 +1354,18 @@ fn init_config() -> ExitCode {
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        error(&format!("Cannot create config directory: {e}"));
+        ui::error(&format!("Cannot create config directory: {e}"));
         return ExitCode::FAILURE;
     }
 
     match std::fs::write(&path, config::default_config_contents()) {
         Ok(()) => {
-            ok(&format!("Config file created: {}", path.display()));
-            info("Edit it to customize sandbox defaults.");
+            ui::ok(&format!("Config file created: {}", path.display()));
+            ui::info("Edit it to customize sandbox defaults.");
             ExitCode::SUCCESS
         }
         Err(e) => {
-            error(&format!("Cannot write config file: {e}"));
+            ui::error(&format!("Cannot write config file: {e}"));
             ExitCode::FAILURE
         }
     }
@@ -1441,22 +1398,22 @@ fn run_config_validate() -> ExitCode {
             let path_hint = config::config_path()
                 .map(|p| format!(" (looked for {})", p.display()))
                 .unwrap_or_default();
-            info(&format!("No config file found{path_hint}"));
-            info("Run `cplt config init` to create one.");
+            ui::info(&format!("No config file found{path_hint}"));
+            ui::info("Run `cplt config init` to create one.");
             return ExitCode::SUCCESS;
         }
         Err(e) => {
-            error(&e);
+            ui::error(&e);
             return ExitCode::FAILURE;
         }
     };
 
-    info(&format!("Validating {}", loaded.path.display()));
+    ui::info(&format!("Validating {}", loaded.path.display()));
 
     let diagnostics = config::validate_config(&loaded.raw);
 
     if diagnostics.is_empty() {
-        ok("Config OK ✓");
+        ui::ok("Config OK ✓");
         return ExitCode::SUCCESS;
     }
 
@@ -1465,10 +1422,10 @@ fn run_config_validate() -> ExitCode {
         match d.level {
             config::DiagnosticLevel::Error => {
                 has_errors = true;
-                error(&d.message);
+                ui::error(&d.message);
             }
             config::DiagnosticLevel::Warning => {
-                warn(&d.message);
+                ui::warn(&d.message);
             }
         }
     }
@@ -1476,7 +1433,7 @@ fn run_config_validate() -> ExitCode {
     if has_errors {
         ExitCode::FAILURE
     } else {
-        ok("Config OK ✓ (with warnings)");
+        ui::ok("Config OK ✓ (with warnings)");
         ExitCode::SUCCESS
     }
 }
@@ -1485,7 +1442,7 @@ fn run_config_show() -> ExitCode {
     let loaded = match config::Config::load_file() {
         Ok(l) => l,
         Err(e) => {
-            error(&e);
+            ui::error(&e);
             return ExitCode::FAILURE;
         }
     };
@@ -1501,7 +1458,11 @@ fn run_config_show() -> ExitCode {
             }
             Err(e) => {
                 eprintln!();
-                eprintln!("{YELLOW}[cplt] Repo config error: {e}{NC}");
+                eprintln!(
+                    "{}[cplt] Repo config error: {e}{}",
+                    ui::color(ui::YELLOW),
+                    ui::color(ui::RESET)
+                );
             }
             Ok(None) => {} // No .cplt.toml — nothing to show
         }
@@ -1511,18 +1472,20 @@ fn run_config_show() -> ExitCode {
 }
 
 fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std::path::Path) {
-    let dim = "\x1b[2m";
-    let green = "\x1b[0;32m";
-    let yellow = "\x1b[0;33m";
+    let dim = ui::color(ui::DIM);
+    let green = ui::color(ui::GREEN);
+    let yellow = ui::color(ui::YELLOW);
+    let blue = ui::color(ui::BLUE);
+    let nc = ui::color(ui::RESET);
 
     println!();
-    println!("{BLUE}[cplt]{NC} ── Repo Config (.cplt.toml) ────────────────────────");
+    println!("{blue}[cplt]{nc} ── Repo Config (.cplt.toml) ────────────────────────");
     println!(
-        "{BLUE}[cplt]{NC}  {dim}Source:{NC} {}",
+        "{blue}[cplt]{nc}  {dim}Source:{nc} {}",
         source_label(loaded.source)
     );
     println!(
-        "{BLUE}[cplt]{NC}  {dim}Path:{NC}   {}/.cplt.toml",
+        "{blue}[cplt]{nc}  {dim}Path:{nc}   {}/.cplt.toml",
         project_dir.display()
     );
     println!();
@@ -1531,12 +1494,12 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
 
     // [deny]
     if !rc.deny.paths.is_empty() || !rc.deny.env.is_empty() {
-        println!("{BLUE}[cplt]{NC}  {dim}[deny]{NC} {green}{LABEL_DENY_APPLIED}{NC}");
+        println!("{blue}[cplt]{nc}  {dim}[deny]{nc} {green}{LABEL_DENY_APPLIED}{nc}");
         for p in &rc.deny.paths {
-            println!("{BLUE}[cplt]{NC}    paths   = {p}");
+            println!("{blue}[cplt]{nc}    paths   = {p}");
         }
         for v in &rc.deny.env {
-            println!("{BLUE}[cplt]{NC}    env     = {v}");
+            println!("{blue}[cplt]{nc}    env     = {v}");
         }
         println!();
     }
@@ -1554,11 +1517,11 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
                 .unwrap_or(false)
         });
         let header_status = if all_approved {
-            format!("{green}{LABEL_ALLOW_APPROVED}{NC}")
+            format!("{green}{LABEL_ALLOW_APPROVED}{nc}")
         } else {
-            format!("{yellow}{LABEL_ALLOW_PENDING}{NC}")
+            format!("{yellow}{LABEL_ALLOW_PENDING}{nc}")
         };
-        println!("{BLUE}[cplt]{NC}  {dim}[allow]{NC} {header_status}");
+        println!("{blue}[cplt]{nc}  {dim}[allow]{nc} {header_status}");
 
         // Booleans
         let bools: &[(&str, Option<bool>)] = &[
@@ -1581,50 +1544,50 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
                     .map(|t| crate::trust::is_key_approved(t, name))
                     .unwrap_or(false);
                 let status = if approved {
-                    format!("{green}{STATUS_APPROVED}{NC}")
+                    format!("{green}{STATUS_APPROVED}{nc}")
                 } else {
-                    format!("{yellow}{STATUS_PENDING}{NC}")
+                    format!("{yellow}{STATUS_PENDING}{nc}")
                 };
-                println!("{BLUE}[cplt]{NC}    {name:<30} = {v}  {status}");
+                println!("{blue}[cplt]{nc}    {name:<30} = {v}  {status}");
             }
         }
 
         // Arrays
         if !rc.propose.allow.read.is_empty() {
-            println!("{BLUE}[cplt]{NC}    {dim}allow.read:{NC}");
+            println!("{blue}[cplt]{nc}    {dim}allow.read:{nc}");
             for p in &rc.propose.allow.read {
-                println!("{BLUE}[cplt]{NC}      {p}");
+                println!("{blue}[cplt]{nc}      {p}");
             }
         }
         if !rc.propose.allow.write.is_empty() {
-            println!("{BLUE}[cplt]{NC}    {dim}allow.write:{NC}");
+            println!("{blue}[cplt]{nc}    {dim}allow.write:{nc}");
             for p in &rc.propose.allow.write {
-                println!("{BLUE}[cplt]{NC}      {p}");
+                println!("{blue}[cplt]{nc}      {p}");
             }
         }
         if !rc.propose.allow.ports.is_empty() {
             println!(
-                "{BLUE}[cplt]{NC}    allow.ports            = {:?}",
+                "{blue}[cplt]{nc}    allow.ports            = {:?}",
                 rc.propose.allow.ports
             );
         }
         if !rc.propose.allow.localhost.is_empty() {
             println!(
-                "{BLUE}[cplt]{NC}    allow.localhost         = {:?}",
+                "{blue}[cplt]{nc}    allow.localhost         = {:?}",
                 rc.propose.allow.localhost
             );
         }
         if !rc.propose.proxy.allow_private_domains.is_empty() {
             println!(
-                "{BLUE}[cplt]{NC}    proxy.allow_private_domains = {:?}",
+                "{blue}[cplt]{nc}    proxy.allow_private_domains = {:?}",
                 rc.propose.proxy.allow_private_domains
             );
         }
     } else {
-        println!("{BLUE}[cplt]{NC}  {dim}No additional permissions requested.{NC}");
+        println!("{blue}[cplt]{nc}  {dim}No additional permissions requested.{nc}");
     }
 
-    println!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");
+    println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
 }
 
 fn run_config_path() -> ExitCode {
@@ -1634,7 +1597,7 @@ fn run_config_path() -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            error("Cannot determine config path ($HOME not set)");
+            ui::error("Cannot determine config path ($HOME not set)");
             ExitCode::FAILURE
         }
     }
@@ -1644,7 +1607,7 @@ fn run_config_get(key: &str) -> ExitCode {
     let key_info = match config::lookup_key(key) {
         Ok(k) => k,
         Err(e) => {
-            error(&e);
+            ui::error(&e);
             return ExitCode::FAILURE;
         }
     };
@@ -1652,7 +1615,7 @@ fn run_config_get(key: &str) -> ExitCode {
     let loaded = match config::Config::load_file() {
         Ok(l) => l,
         Err(e) => {
-            error(&e);
+            ui::error(&e);
             return ExitCode::FAILURE;
         }
     };
@@ -1660,7 +1623,11 @@ fn run_config_get(key: &str) -> ExitCode {
     let (value, from_file) = config::get_config_value(key_info, loaded.as_ref());
     println!("{value}");
     if !from_file {
-        eprintln!("{BLUE}[cplt]{NC} (default — not set in config file)");
+        eprintln!(
+            "{}[cplt]{} (default — not set in config file)",
+            ui::color(ui::BLUE),
+            ui::color(ui::RESET)
+        );
     }
     ExitCode::SUCCESS
 }
@@ -1676,22 +1643,22 @@ fn run_config_set(
     let key_info = match config::lookup_key(key) {
         Ok(info) => info,
         Err(e) => {
-            error(&e);
+            ui::error(&e);
             return ExitCode::FAILURE;
         }
     };
 
     // Validate flag combinations
     if unset && value.is_some() && !key_info.value_type.is_array() {
-        error("--unset does not take a value (except for array keys)");
+        ui::error("--unset does not take a value (except for array keys)");
         return ExitCode::FAILURE;
     }
     if unset && append {
-        error("--unset and --append are mutually exclusive");
+        ui::error("--unset and --append are mutually exclusive");
         return ExitCode::FAILURE;
     }
     if !unset && value.is_none() {
-        error(&format!(
+        ui::error(&format!(
             "missing value for {key}\n  Usage: cplt config set {key} <VALUE>"
         ));
         return ExitCode::FAILURE;
@@ -1706,7 +1673,7 @@ fn run_config_set(
 
     // deny.env is repo-local only (not in global config file schema)
     if key_info.section == "deny" && key_info.key == "env" {
-        error(
+        ui::error(
             "deny.env is only supported in repo-local config (.cplt.toml).\n  Use: cplt config set --repo deny.env <VALUE>",
         );
         return ExitCode::FAILURE;
@@ -1715,7 +1682,7 @@ fn run_config_set(
     let op = match config::ConfigSetOp::new(key) {
         Ok(op) => op,
         Err(e) => {
-            error(&e);
+            ui::error(&e);
             return ExitCode::FAILURE;
         }
     };
@@ -1727,7 +1694,7 @@ fn run_config_set(
         && val == "true"
         && !force
     {
-        error(&format!(
+        ui::error(&format!(
             "{key} is a dangerous setting — it weakens sandbox security.\n  \
              Add --force to confirm: cplt config set {key} true --force"
         ));
@@ -1738,7 +1705,7 @@ fn run_config_set(
     let mut doc = match op.load_document() {
         Ok(d) => d,
         Err(e) => {
-            error(&e);
+            ui::error(&e);
             return ExitCode::FAILURE;
         }
     };
@@ -1762,7 +1729,7 @@ fn run_config_set(
     };
 
     if let Err(e) = result {
-        error(&e);
+        ui::error(&e);
         return ExitCode::FAILURE;
     }
 
@@ -1772,13 +1739,13 @@ fn run_config_set(
         && unset
         && op.key_info.value_type.is_array()
     {
-        warn(&format!("{key}: {val} is not set"));
+        ui::warn(&format!("{key}: {val} is not set"));
         return ExitCode::SUCCESS;
     }
 
     // Write back
     if let Err(e) = op.write_document(&doc) {
-        error(&e);
+        ui::error(&e);
         return ExitCode::FAILURE;
     }
 
@@ -1787,19 +1754,19 @@ fn run_config_set(
             && op.key_info.value_type.is_array()
         {
             if let Some(remaining) = config::get_value_from_doc(&doc, op.key_info) {
-                ok(&format!("{key}: removed {val} → {remaining}"));
+                ui::ok(&format!("{key}: removed {val} → {remaining}"));
             } else {
-                ok(&format!("{key}: removed {val} (now empty)"));
+                ui::ok(&format!("{key}: removed {val} (now empty)"));
             }
         } else {
-            ok(&format!("{key} removed (will use default)"));
+            ui::ok(&format!("{key} removed (will use default)"));
         }
     } else if append || op.key_info.value_type.is_array() {
         let current = config::get_value_from_doc(&doc, op.key_info)
             .unwrap_or_else(|| value.unwrap().to_string());
-        ok(&format!("{key} = {current}"));
+        ui::ok(&format!("{key} = {current}"));
     } else {
-        ok(&format!("{key} = {}", value.unwrap()));
+        ui::ok(&format!("{key} = {}", value.unwrap()));
     }
 
     // Hint about repo config if .cplt.toml exists
@@ -1807,9 +1774,12 @@ fn run_config_set(
     if let Some(ref dir) = project_dir
         && dir.join(".cplt.toml").exists()
     {
-        let dim = "\x1b[2m";
+        let dim = ui::color(ui::DIM);
         eprintln!(
-            "{BLUE}[cplt]{NC} {dim}Tip: this repo has .cplt.toml. Use --repo to set project-specific settings.{NC}"
+            "{}[cplt]{} {dim}Tip: this repo has .cplt.toml. Use --repo to set project-specific settings.{}",
+            ui::color(ui::BLUE),
+            ui::color(ui::RESET),
+            ui::color(ui::RESET)
         );
     }
 
@@ -1833,7 +1803,7 @@ fn run_config_set_repo(
         Some(t) => t,
         None => {
             let reason = config::repo_key_rejection_reason(key_info);
-            error(&format!(
+            ui::error(&format!(
                 "{key} is not valid in repo config.\n  \
                  Reason: {reason}.\n  \
                  Use: cplt config set {key} {}",
@@ -1850,7 +1820,7 @@ fn run_config_set_repo(
         && val == "true"
         && !force
     {
-        error(&format!(
+        ui::error(&format!(
             "{key} is dangerous — it requests weakened security for anyone approving this repo config.\n  \
              Add --force to confirm: cplt config set --repo {key} true --force"
         ));
@@ -1862,14 +1832,14 @@ fn run_config_set_repo(
         let raw = match std::fs::read_to_string(&repo_config_path) {
             Ok(r) => r,
             Err(e) => {
-                error(&format!("cannot read {}: {e}", repo_config_path.display()));
+                ui::error(&format!("cannot read {}: {e}", repo_config_path.display()));
                 return ExitCode::FAILURE;
             }
         };
         match raw.parse::<toml_edit::DocumentMut>() {
             Ok(d) => d,
             Err(e) => {
-                error(&format!(
+                ui::error(&format!(
                     "invalid TOML in {}: {e}",
                     repo_config_path.display()
                 ));
@@ -1887,28 +1857,30 @@ fn run_config_set_repo(
         value.unwrap()
     };
     if let Err(e) = config::set_repo_value_in_doc(&mut doc, key_info, target, val, unset) {
-        error(&e);
+        ui::error(&e);
         return ExitCode::FAILURE;
     }
 
     // Write back
     let output = doc.to_string();
     if let Err(e) = std::fs::write(&repo_config_path, &output) {
-        error(&format!("cannot write {}: {e}", repo_config_path.display()));
+        ui::error(&format!("cannot write {}: {e}", repo_config_path.display()));
         return ExitCode::FAILURE;
     }
 
     // Validate the result parses and passes safety checks
     if let Err(e) = repo_config::parse_and_validate(&output) {
         eprintln!(
-            "{YELLOW}[cplt] Warning: written .cplt.toml has validation issues: {e}{NC}\n  The file was saved but may not load correctly."
+            "{}[cplt] Warning: written .cplt.toml has validation issues: {e}{}\n  The file was saved but may not load correctly.",
+            ui::color(ui::YELLOW),
+            ui::color(ui::RESET)
         );
     }
 
     // User feedback
-    let dim = "\x1b[2m";
+    let dim = ui::color(ui::DIM);
     if unset {
-        ok(&format!("{key} removed from .cplt.toml"));
+        ui::ok(&format!("{key} removed from .cplt.toml"));
     } else {
         let section_name = match target {
             config::RepoKeyTarget::ProposeBool
@@ -1916,10 +1888,12 @@ fn run_config_set_repo(
             | config::RepoKeyTarget::ProposeProxy(_) => "propose",
             config::RepoKeyTarget::Deny(_) => "deny",
         };
-        ok(&format!("{key} = {val} → .cplt.toml [{section_name}]"));
+        ui::ok(&format!("{key} = {val} → .cplt.toml [{section_name}]"));
     }
+    let blue = ui::color(ui::BLUE);
+    let nc = ui::color(ui::RESET);
     eprintln!(
-        "{BLUE}[cplt]{NC} {dim}Updated: {}{NC}",
+        "{blue}[cplt]{nc} {dim}Updated: {}{nc}",
         repo_config_path.display()
     );
 
@@ -1932,9 +1906,9 @@ fn run_config_set_repo(
     ) && !unset
     {
         eprintln!(
-            "{BLUE}[cplt]{NC} {dim}Proposed changes require approval: cplt trust accept --all{NC}"
+            "{blue}[cplt]{nc} {dim}Proposed changes require approval: cplt trust accept --all{nc}"
         );
-        eprintln!("{BLUE}[cplt]{NC} {dim}Remember to commit .cplt.toml{NC}");
+        eprintln!("{blue}[cplt]{nc} {dim}Remember to commit .cplt.toml{nc}");
     }
 
     ExitCode::SUCCESS
@@ -1945,7 +1919,11 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
     let loaded = match config::Config::load_file() {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("{YELLOW}[cplt] Warning: {e}; showing defaults only{NC}");
+            eprintln!(
+                "{}[cplt] Warning: {e}; showing defaults only{}",
+                ui::color(ui::YELLOW),
+                ui::color(ui::RESET)
+            );
             None
         }
     };
@@ -1957,7 +1935,7 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                error(&e);
+                ui::error(&e);
                 ExitCode::FAILURE
             }
         },
@@ -1975,7 +1953,7 @@ fn run_trust_command(action: Option<TrustAction>) -> ExitCode {
 
     // Check if inside sandbox — trust commands are blocked there
     if std::env::var("__CPLT_TRUST_LOCKED").is_ok() {
-        error("Cannot modify trust from inside the sandbox.");
+        ui::error("Cannot modify trust from inside the sandbox.");
         eprintln!("  Run `cplt trust` outside the sandbox (before launching the agent).");
         return ExitCode::FAILURE;
     }
@@ -1984,11 +1962,11 @@ fn run_trust_command(action: Option<TrustAction>) -> ExitCode {
     let loaded = match repo_config::load_repo_config(&project_dir) {
         Ok(Some(l)) => l,
         Ok(None) => {
-            info("No .cplt.toml found in this repository.");
+            ui::info("No .cplt.toml found in this repository.");
             return ExitCode::SUCCESS;
         }
         Err(e) => {
-            error(&format!("Failed to load .cplt.toml: {e}"));
+            ui::error(&format!("Failed to load .cplt.toml: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -2006,18 +1984,24 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
     let trust_entry = trust::load_trust(project_dir);
 
-    println!("{BLUE}[cplt]{NC} ── Repo Config Trust ──────────────────────────────");
-    println!("{BLUE}[cplt]{NC}  Source: {}", source_label(loaded.source));
+    let blue = ui::color(ui::BLUE);
+    let nc = ui::color(ui::RESET);
+    let green = ui::color(ui::GREEN);
+    let yellow = ui::color(ui::YELLOW);
+    let red = ui::color(ui::RED);
+
+    println!("{blue}[cplt]{nc} ── Repo Config Trust ──────────────────────────────");
+    println!("{blue}[cplt]{nc}  Source: {}", source_label(loaded.source));
     println!();
 
     // Deny section
     if !loaded.config.deny.paths.is_empty() || !loaded.config.deny.env.is_empty() {
-        println!("{BLUE}[cplt]{NC}  {GREEN}[deny]{NC} {LABEL_DENY_APPLIED}");
+        println!("{blue}[cplt]{nc}  {green}[deny]{nc} {LABEL_DENY_APPLIED}");
         for p in &loaded.config.deny.paths {
-            println!("{BLUE}[cplt]{NC}    path: {p}");
+            println!("{blue}[cplt]{nc}    path: {p}");
         }
         for v in &loaded.config.deny.env {
-            println!("{BLUE}[cplt]{NC}    env:  {v}");
+            println!("{blue}[cplt]{nc}    env:  {v}");
         }
         println!();
     }
@@ -2040,14 +2024,14 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
                 .unwrap_or(false)
         });
     if proposed.is_empty() {
-        println!("{BLUE}[cplt]{NC}  No additional permissions requested.");
+        println!("{blue}[cplt]{nc}  No additional permissions requested.");
     } else {
         let section_label = if all_approved {
             LABEL_ALLOW_APPROVED
         } else {
             LABEL_ALLOW_PENDING
         };
-        println!("{BLUE}[cplt]{NC}  {YELLOW}[allow]{NC} {section_label}");
+        println!("{blue}[cplt]{nc}  {yellow}[allow]{nc} {section_label}");
         for &key in &proposed {
             let approved = !hash_mismatch
                 && trust_entry
@@ -2055,11 +2039,11 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
                     .map(|t| trust::is_key_approved(t, key))
                     .unwrap_or(false);
             let status = if approved {
-                format!("{GREEN}{STATUS_APPROVED}{NC}")
+                format!("{green}{STATUS_APPROVED}{nc}")
             } else {
-                format!("{YELLOW}{STATUS_PENDING}{NC}")
+                format!("{yellow}{STATUS_PENDING}{nc}")
             };
-            println!("{BLUE}[cplt]{NC}    {key:<35} {status}");
+            println!("{blue}[cplt]{nc}    {key:<35} {status}");
         }
     }
 
@@ -2068,17 +2052,17 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     {
         println!();
         println!(
-            "{BLUE}[cplt]{NC}  Last approved: {}",
+            "{blue}[cplt]{nc}  Last approved: {}",
             entry.accepted.approved_at
         );
 
         if hash_mismatch {
-            println!("{BLUE}[cplt]{NC}  {RED}⚠ Permissions have changed since last approval!{NC}");
-            println!("{BLUE}[cplt]{NC}  {RED}  Run `cplt trust accept --all` to re-approve.{NC}");
+            println!("{blue}[cplt]{nc}  {red}⚠ Permissions have changed since last approval!{nc}");
+            println!("{blue}[cplt]{nc}  {red}  Run `cplt trust accept --all` to re-approve.{nc}");
         }
     }
 
-    println!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");
+    println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
     ExitCode::SUCCESS
 }
 
@@ -2091,7 +2075,7 @@ fn trust_accept(
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
 
     if proposed.is_empty() {
-        info("No permissions requested in .cplt.toml — nothing to approve.");
+        ui::info("No permissions requested in .cplt.toml — nothing to approve.");
         return ExitCode::SUCCESS;
     }
 
@@ -2102,7 +2086,7 @@ fn trust_accept(
         // Validate that requested keys are actually proposed
         for key in keys {
             if !proposed.contains(&key.as_str()) {
-                error(&format!(
+                ui::error(&format!(
                     "Key {key:?} is not requested in .cplt.toml. Available: {}",
                     proposed
                         .iter()
@@ -2145,12 +2129,14 @@ fn trust_accept(
 
     // Save
     if let Err(e) = trust::save_trust(project_dir, &entry) {
-        error(&format!("Failed to save trust: {e}"));
+        ui::error(&format!("Failed to save trust: {e}"));
         return ExitCode::FAILURE;
     }
 
     println!(
-        "{GREEN}✓{NC} Approved {} permission(s) for this repository:",
+        "{}✓{} Approved {} permission(s) for this repository:",
+        ui::color(ui::GREEN),
+        ui::color(ui::RESET),
         keys_to_accept.len()
     );
     for key in &keys_to_accept {
@@ -2167,10 +2153,14 @@ fn trust_revoke(
 ) -> ExitCode {
     if all {
         if let Err(e) = trust::revoke_trust(project_dir) {
-            error(&format!("Failed to revoke trust: {e}"));
+            ui::error(&format!("Failed to revoke trust: {e}"));
             return ExitCode::FAILURE;
         }
-        println!("{GREEN}✓{NC} Revoked all trust for this repository.");
+        println!(
+            "{}✓{} Revoked all trust for this repository.",
+            ui::color(ui::GREEN),
+            ui::color(ui::RESET)
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -2178,7 +2168,7 @@ fn trust_revoke(
     let mut entry = match trust::load_trust(project_dir) {
         Some(e) => e,
         None => {
-            info("No trust entry exists for this repository.");
+            ui::info("No trust entry exists for this repository.");
             return ExitCode::SUCCESS;
         }
     };
@@ -2186,7 +2176,7 @@ fn trust_revoke(
     // Validate keys
     for key in keys {
         if !proposed.contains(&key.as_str()) && !entry.accepted.keys.contains(key) {
-            warn(&format!(
+            ui::warn(&format!(
                 "Key {key:?} is not in permissions or trust store."
             ));
         }
@@ -2198,42 +2188,50 @@ fn trust_revoke(
     let removed = before_len - entry.accepted.keys.len();
 
     if removed == 0 {
-        info("No matching keys found to revoke.");
+        ui::info("No matching keys found to revoke.");
         return ExitCode::SUCCESS;
     }
 
     if entry.accepted.keys.is_empty() {
         // No keys left — remove the file entirely
         if let Err(e) = trust::revoke_trust(project_dir) {
-            error(&format!("Failed to remove trust file: {e}"));
+            ui::error(&format!("Failed to remove trust file: {e}"));
             return ExitCode::FAILURE;
         }
     } else {
         entry.accepted.approved_at = trust::now_iso8601();
         if let Err(e) = trust::save_trust(project_dir, &entry) {
-            error(&format!("Failed to save trust: {e}"));
+            ui::error(&format!("Failed to save trust: {e}"));
             return ExitCode::FAILURE;
         }
     }
 
-    println!("{GREEN}✓{NC} Revoked {removed} key(s).");
+    println!(
+        "{}✓{} Revoked {removed} key(s).",
+        ui::color(ui::GREEN),
+        ui::color(ui::RESET)
+    );
     ExitCode::SUCCESS
 }
 
 fn run_update(check_only: bool, force: bool) -> ExitCode {
     // Check for Homebrew-managed install
     if update::is_homebrew_managed() {
-        info("cplt is managed by Homebrew.");
-        println!("  Run: {GREEN}brew upgrade navikt/tap/cplt{NC}");
+        ui::info("cplt is managed by Homebrew.");
+        println!(
+            "  Run: {}brew upgrade navikt/tap/cplt{}",
+            ui::color(ui::GREEN),
+            ui::color(ui::RESET)
+        );
         return ExitCode::SUCCESS;
     }
 
     // Fetch latest release
-    info("Checking for updates...");
+    ui::info("Checking for updates...");
     let latest = match update::fetch_latest_release(LONG_VERSION) {
         Ok(r) => r,
         Err(e) => {
-            error(&e);
+            ui::error(&e);
             return ExitCode::FAILURE;
         }
     };
@@ -2242,7 +2240,7 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
 
     match status {
         update::VersionStatus::UpToDate => {
-            info(&format!("✓ cplt is up to date ({LONG_VERSION})"));
+            ui::info(&format!("✓ cplt is up to date ({LONG_VERSION})"));
             ExitCode::SUCCESS
         }
         update::VersionStatus::UpdateAvailable {
@@ -2250,8 +2248,10 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
             latest: latest_ver,
             tag,
         } => {
-            info(&format!(
-                "Update available: {current} → {GREEN}{latest_ver}{NC}"
+            ui::info(&format!(
+                "Update available: {current} → {}{latest_ver}{}",
+                ui::color(ui::GREEN),
+                ui::color(ui::RESET)
             ));
             if check_only {
                 return ExitCode::SUCCESS;
@@ -2263,14 +2263,14 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
             latest: latest_ver,
             tag,
         } => {
-            info(&format!(
+            ui::info(&format!(
                 "Same date, different build: {current} vs {latest_ver}"
             ));
             if check_only {
                 return ExitCode::SUCCESS;
             }
             if !force {
-                warn("Same-date build. Use --force to reinstall.");
+                ui::warn("Same-date build. Use --force to reinstall.");
                 return ExitCode::SUCCESS;
             }
             do_update(&tag)
@@ -2279,14 +2279,14 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
             latest: latest_ver,
             tag,
         } => {
-            warn(&format!(
+            ui::warn(&format!(
                 "Running dev build (0.0.0). Latest release: {latest_ver}"
             ));
             if check_only {
                 return ExitCode::SUCCESS;
             }
             if !force {
-                warn("Use --force to replace dev build with release.");
+                ui::warn("Use --force to replace dev build with release.");
                 return ExitCode::SUCCESS;
             }
             do_update(&tag)
@@ -2297,11 +2297,11 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
 fn do_update(tag: &str) -> ExitCode {
     match update::perform_update(tag, LONG_VERSION) {
         Ok(path) => {
-            info(&format!("✓ Updated successfully → {path}"));
+            ui::info(&format!("✓ Updated successfully → {path}"));
             ExitCode::SUCCESS
         }
         Err(e) => {
-            error(&e);
+            ui::error(&e);
             ExitCode::FAILURE
         }
     }
@@ -2316,7 +2316,7 @@ fn shell_install() -> ExitCode {
     let home = match std::env::var("HOME") {
         Ok(h) => PathBuf::from(h),
         Err(_) => {
-            error("$HOME not set");
+            ui::error("$HOME not set");
             return ExitCode::FAILURE;
         }
     };
@@ -2337,12 +2337,12 @@ fn shell_install() -> ExitCode {
     if rc_file.exists() {
         match std::fs::read_to_string(&rc_file) {
             Ok(contents) if contents.contains("cplt") => {
-                ok(&format!("Already installed in {}", rc_file.display()));
+                ui::ok(&format!("Already installed in {}", rc_file.display()));
                 return ExitCode::SUCCESS;
             }
             Ok(_) => {}
             Err(e) => {
-                error(&format!("Cannot read {}: {e}", rc_file.display()));
+                ui::error(&format!("Cannot read {}: {e}", rc_file.display()));
                 return ExitCode::FAILURE;
             }
         }
@@ -2353,7 +2353,7 @@ fn shell_install() -> ExitCode {
         && let Some(parent) = rc_file.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        error(&format!("Cannot create {}: {e}", parent.display()));
+        ui::error(&format!("Cannot create {}: {e}", parent.display()));
         return ExitCode::FAILURE;
     }
 
@@ -2365,7 +2365,7 @@ fn shell_install() -> ExitCode {
     {
         Ok(f) => f,
         Err(e) => {
-            error(&format!("Cannot open {}: {e}", rc_file.display()));
+            ui::error(&format!("Cannot open {}: {e}", rc_file.display()));
             return ExitCode::FAILURE;
         }
     };
@@ -2385,18 +2385,18 @@ fn shell_install() -> ExitCode {
 
     match file.write_all(content.as_bytes()) {
         Ok(()) => {
-            ok(&format!(
+            ui::ok(&format!(
                 "Installed 'copilot' alias in {}",
                 rc_file.display()
             ));
-            info(&format!(
+            ui::info(&format!(
                 "Restart your shell or run: source {}",
                 rc_file.display()
             ));
             ExitCode::SUCCESS
         }
         Err(e) => {
-            error(&format!("Cannot write to {}: {e}", rc_file.display()));
+            ui::error(&format!("Cannot write to {}: {e}", rc_file.display()));
             ExitCode::FAILURE
         }
     }
@@ -2435,9 +2435,9 @@ fn discover_electron_app_dir(
 /// Print the preflight success message appropriate for this platform.
 fn print_preflight_ok() {
     #[cfg(target_os = "macos")]
-    ok("Sandbox profile validated ✓");
+    ui::ok("Sandbox profile validated ✓");
     #[cfg(target_os = "linux")]
-    ok("Landlock sandbox ready ✓");
+    ui::ok("Landlock sandbox ready ✓");
 }
 
 /// Start streaming sandbox denial logs (macOS only).
@@ -2447,7 +2447,7 @@ fn print_preflight_ok() {
 fn start_denial_stream() -> Option<std::process::Child> {
     #[cfg(target_os = "macos")]
     {
-        info("Streaming sandbox denial logs (--show-denials)...");
+        ui::info("Streaming sandbox denial logs (--show-denials)...");
         match std::process::Command::new("log")
             .args([
                 "stream",
@@ -2463,17 +2463,17 @@ fn start_denial_stream() -> Option<std::process::Child> {
         {
             Ok(child) => Some(child),
             Err(e) => {
-                warn(&format!("Could not start denial log stream: {e}"));
+                ui::warn(&format!("Could not start denial log stream: {e}"));
                 None
             }
         }
     }
     #[cfg(target_os = "linux")]
     {
-        warn(
+        ui::warn(
             "--show-denials is not available on Linux: Landlock does not produce kernel audit logs.",
         );
-        info("Use `strace -f -e trace=file,network` for filesystem/network debugging.");
+        ui::info("Use `strace -f -e trace=file,network` for filesystem/network debugging.");
         None
     }
 }
@@ -2532,7 +2532,7 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
         }
     }
 
-    info("Extracting Copilot runtime (first run after update)...");
+    ui::info("Extracting Copilot runtime (first run after update)...");
 
     // Ensure pkg_base exists — Copilot needs it for extraction
     let _ = std::fs::create_dir_all(&pkg_base);
@@ -2632,7 +2632,7 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
         let _ = std::fs::create_dir_all(&cache_dir);
         let _ = std::fs::write(&cache_file, format!("{binary_id}\n{dir_name}"));
         if !dirs_before.contains(dir_name) {
-            ok("Copilot runtime extracted");
+            ui::ok("Copilot runtime extracted");
         }
         Ok(())
     } else {

@@ -6,6 +6,7 @@ description = "Sandbox wrapper for GitHub Copilot CLI (macOS Seatbelt, Linux Lan
 license = "MIT"
 
 [dependencies]
+anyhow = "1.0.102"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
