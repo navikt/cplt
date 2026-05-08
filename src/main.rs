@@ -467,6 +467,16 @@ enum ConfigAction {
         /// (sandbox.inherit_env, sandbox.allow_tmp_exec)
         #[arg(long)]
         force: bool,
+
+        /// Write to the repo-local .cplt.toml (proposed/deny settings).
+        /// Relaxations go under [propose], tightenings under [deny].
+        #[arg(long, conflicts_with = "global")]
+        repo: bool,
+
+        /// Write to the global config (~/.config/cplt/config.toml).
+        /// This is the default behavior.
+        #[arg(long, conflicts_with = "repo")]
+        global: bool,
     },
 
     /// Explain what config keys do.
@@ -1403,7 +1413,9 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
             append,
             unset,
             force,
-        } => run_config_set(&key, value.as_deref(), append, unset, force),
+            repo,
+            global: _,
+        } => run_config_set(&key, value.as_deref(), append, unset, force, repo),
         ConfigAction::Explain { key } => run_config_explain(key.as_deref()),
     }
 }
@@ -1512,9 +1524,10 @@ fn run_config_set(
     append: bool,
     unset: bool,
     force: bool,
+    repo: bool,
 ) -> ExitCode {
-    let op = match config::ConfigSetOp::new(key) {
-        Ok(op) => op,
+    let key_info = match config::lookup_key(key) {
+        Ok(info) => info,
         Err(e) => {
             error(&e);
             return ExitCode::FAILURE;
@@ -1522,7 +1535,7 @@ fn run_config_set(
     };
 
     // Validate flag combinations
-    if unset && value.is_some() && !op.key_info.value_type.is_array() {
+    if unset && value.is_some() && !key_info.value_type.is_array() {
         error("--unset does not take a value (except for array keys)");
         return ExitCode::FAILURE;
     }
@@ -1536,6 +1549,20 @@ fn run_config_set(
         ));
         return ExitCode::FAILURE;
     }
+
+    // ── Repo mode ───────────────────────────────────────────────────
+    if repo {
+        return run_config_set_repo(key, key_info, value, unset, force);
+    }
+
+    // ── Global mode (default) ───────────────────────────────────────
+    let op = match config::ConfigSetOp::new(key) {
+        Ok(op) => op,
+        Err(e) => {
+            error(&e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Dangerous key safeguard
     if op.key_info.dangerous
@@ -1566,17 +1593,13 @@ fn run_config_set(
         if let Some(val) = value
             && op.key_info.value_type.is_array()
         {
-            // Array key + value: remove just that element
             config::remove_array_element_in_doc(&mut doc, op.key_info, val)
                 .map(|removed| element_removed = removed)
         } else {
-            // Scalar key, or array key without value: remove entire key
             config::unset_value_in_doc(&mut doc, op.key_info);
             Ok(())
         }
     } else if append || op.key_info.value_type.is_array() {
-        // Array keys always append — `set` adds to the array, not replaces it.
-        // Use `--unset` first to clear, then `set` to start fresh.
         config::append_value_in_doc(&mut doc, op.key_info, value.unwrap())
     } else {
         config::set_value_in_doc(&mut doc, op.key_info, value.unwrap())
@@ -1621,6 +1644,139 @@ fn run_config_set(
         ok(&format!("{key} = {current}"));
     } else {
         ok(&format!("{key} = {}", value.unwrap()));
+    }
+
+    // Hint about repo config if .cplt.toml exists
+    let project_dir = std::env::current_dir().ok();
+    if let Some(ref dir) = project_dir
+        && dir.join(".cplt.toml").exists()
+    {
+        let dim = "\x1b[2m";
+        eprintln!(
+            "{BLUE}[cplt]{NC} {dim}Tip: this repo has .cplt.toml. Use --repo to set project-specific settings.{NC}"
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn run_config_set_repo(
+    key: &str,
+    key_info: &'static config::ConfigKeyInfo,
+    value: Option<&str>,
+    unset: bool,
+    force: bool,
+) -> ExitCode {
+    // Determine repo config path
+    let project_dir = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            error(&format!("cannot determine current directory: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let repo_config_path = project_dir.join(".cplt.toml");
+
+    // Check if key is valid in repo config
+    let target = match config::repo_key_target(key_info) {
+        Some(t) => t,
+        None => {
+            let reason = config::repo_key_rejection_reason(key_info);
+            error(&format!(
+                "{key} is not valid in repo config.\n  \
+                 Reason: {reason}.\n  \
+                 Use: cplt config set {key} {}",
+                value.unwrap_or("<VALUE>")
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Dangerous key safeguard (still applies for repo proposals)
+    if key_info.dangerous
+        && !unset
+        && let Some(val) = value
+        && val == "true"
+        && !force
+    {
+        error(&format!(
+            "{key} is dangerous — it proposes weakened security for anyone approving this repo config.\n  \
+             Add --force to confirm: cplt config set --repo {key} true --force"
+        ));
+        return ExitCode::FAILURE;
+    }
+
+    // Load or create repo config document
+    let mut doc = if repo_config_path.exists() {
+        let raw = match std::fs::read_to_string(&repo_config_path) {
+            Ok(r) => r,
+            Err(e) => {
+                error(&format!("cannot read {}: {e}", repo_config_path.display()));
+                return ExitCode::FAILURE;
+            }
+        };
+        match raw.parse::<toml_edit::DocumentMut>() {
+            Ok(d) => d,
+            Err(e) => {
+                error(&format!(
+                    "invalid TOML in {}: {e}",
+                    repo_config_path.display()
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+
+    // Apply modification
+    let val = if unset {
+        value.unwrap_or("")
+    } else {
+        value.unwrap()
+    };
+    if let Err(e) = config::set_repo_value_in_doc(&mut doc, key_info, target, val, unset) {
+        error(&e);
+        return ExitCode::FAILURE;
+    }
+
+    // Write back
+    let output = doc.to_string();
+    if let Err(e) = std::fs::write(&repo_config_path, &output) {
+        error(&format!("cannot write {}: {e}", repo_config_path.display()));
+        return ExitCode::FAILURE;
+    }
+
+    // User feedback
+    let dim = "\x1b[2m";
+    if unset {
+        ok(&format!("{key} removed from .cplt.toml"));
+    } else {
+        let section_name = match target {
+            config::RepoKeyTarget::ProposeBool
+            | config::RepoKeyTarget::ProposeAllow(_)
+            | config::RepoKeyTarget::ProposeProxy(_) => "propose",
+            config::RepoKeyTarget::Deny(_) => "deny",
+        };
+        ok(&format!("{key} = {val} → .cplt.toml [{section_name}]"));
+    }
+    eprintln!(
+        "{BLUE}[cplt]{NC} {dim}Updated: {}{NC}",
+        repo_config_path.display()
+    );
+
+    // Remind about trust approval for propose keys
+    if matches!(
+        target,
+        config::RepoKeyTarget::ProposeBool
+            | config::RepoKeyTarget::ProposeAllow(_)
+            | config::RepoKeyTarget::ProposeProxy(_)
+    ) && !unset
+    {
+        eprintln!(
+            "{BLUE}[cplt]{NC} {dim}Proposed changes require approval: cplt trust accept --all{NC}"
+        );
+        eprintln!("{BLUE}[cplt]{NC} {dim}Remember to commit .cplt.toml{NC}");
     }
 
     ExitCode::SUCCESS
