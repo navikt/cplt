@@ -2231,7 +2231,7 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
     let latest = match update::fetch_latest_release(LONG_VERSION) {
         Ok(r) => r,
         Err(e) => {
-            ui::error(&e);
+            ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
@@ -2301,7 +2301,7 @@ fn do_update(tag: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            ui::error(&e);
+            ui::error(&e.to_string());
             ExitCode::FAILURE
         }
     }

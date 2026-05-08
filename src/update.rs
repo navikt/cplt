@@ -10,6 +10,88 @@ use std::process::Command;
 const RELEASES_API: &str = "https://api.github.com/repos/navikt/cplt/releases";
 const DOWNLOAD_BASE: &str = "https://github.com/navikt/cplt/releases/download";
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum UpdateError {
+    #[error("Failed to parse GitHub API response: {0}")]
+    ApiParse(#[from] serde_json::Error),
+
+    #[error("No suitable release found on GitHub")]
+    NoRelease,
+
+    #[error("GitHub API rate limit reached. Try again later.")]
+    RateLimited,
+
+    #[error("Cannot reach GitHub. Check your connection.\n  {0}")]
+    NetworkUnreachable(String),
+
+    #[error("Download failed: {0}")]
+    DownloadFailed(String),
+
+    #[error("Invalid UTF-8 in response")]
+    InvalidUtf8(#[from] std::string::FromUtf8Error),
+
+    #[error(
+        "SHA256 verification failed!\n  Expected: {expected}\n  Got:      {actual}\n  Download may be corrupted or tampered with."
+    )]
+    ChecksumMismatch { expected: String, actual: String },
+
+    #[error("No SHA256 checksum found for '{0}' in SHA256SUMS")]
+    NoChecksum(String),
+
+    #[error("SHA256 computation failed")]
+    HashFailed,
+
+    #[error("Cannot parse hash output")]
+    HashParse,
+
+    #[error("Archive appears to be corrupt")]
+    CorruptArchive,
+
+    #[error("Archive is empty")]
+    EmptyArchive,
+
+    #[error(
+        "Release archive has unexpected contents ({count} entries).\n  Expected a single 'cplt' entry."
+    )]
+    UnexpectedArchive { count: usize },
+
+    #[error(
+        "Archive entry is not a regular file: {0}\n  Refusing to extract symlinks or directories."
+    )]
+    NotRegularFile(String),
+
+    #[error("Archive contains unexpected file: '{0}'\n  Expected 'cplt'.")]
+    WrongFilename(String),
+
+    #[error("Extracted archive does not contain 'cplt' binary")]
+    BinaryNotFound,
+
+    #[error("Extracted 'cplt' is not a regular file (symlink?)")]
+    BinaryIsSymlink,
+
+    #[error("Extraction failed: {0}")]
+    ExtractionFailed(String),
+
+    #[error("{0}")]
+    Io(String),
+
+    #[error("sudo not found. Install the binary manually:\n  sudo cp <binary> /usr/local/bin/cplt")]
+    SudoNotFound,
+
+    #[error("sudo cp failed. You can also run manually:\n  sudo cp {src} {dest}")]
+    SudoFailed { src: String, dest: String },
+
+    #[error("sha256sum not found in standard paths (/usr/bin, /usr/sbin, /bin)")]
+    HashToolNotFound,
+
+    #[error("xattr -cr failed")]
+    XattrFailed,
+
+    #[error("codesign failed")]
+    CodesignFailed,
+}
+
 /// A parsed GitHub release.
 #[derive(Debug)]
 pub struct Release {
@@ -39,12 +121,11 @@ pub enum VersionStatus {
 }
 
 /// Fetch the latest release from GitHub.
-pub fn fetch_latest_release(current_version: &str) -> Result<Release, String> {
+pub fn fetch_latest_release(current_version: &str) -> Result<Release, UpdateError> {
     let url = format!("{RELEASES_API}?per_page=20");
     let body = curl_get_json(&url, current_version)?;
 
-    let releases: Vec<serde_json::Value> = serde_json::from_str(&body)
-        .map_err(|e| format!("Failed to parse GitHub API response: {e}"))?;
+    let releases: Vec<serde_json::Value> = serde_json::from_str(&body)?;
 
     for rel in &releases {
         // Skip drafts and prereleases
@@ -72,7 +153,7 @@ pub fn fetch_latest_release(current_version: &str) -> Result<Release, String> {
         }
     }
 
-    Err("No suitable release found on GitHub".to_string())
+    Err(UpdateError::NoRelease)
 }
 
 /// Compare current version against the latest release.
@@ -110,7 +191,7 @@ pub fn check_version(current: &str, latest: &Release) -> VersionStatus {
 }
 
 /// Download, verify, and install the update.
-pub fn perform_update(tag: &str, current_version: &str) -> Result<String, String> {
+pub fn perform_update(tag: &str, current_version: &str) -> Result<String, UpdateError> {
     let arch = std::env::consts::ARCH;
     let asset = asset_name(arch);
     let asset_url = format!("{DOWNLOAD_BASE}/{tag}/{asset}");
@@ -129,32 +210,34 @@ pub fn perform_update(tag: &str, current_version: &str) -> Result<String, String
     let actual_hash = compute_sha256(&archive_path)?;
     if actual_hash != expected_hash {
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(format!(
-            "SHA256 verification failed!\n  Expected: {expected_hash}\n  Got:      {actual_hash}\n  Download may be corrupted or tampered with."
-        ));
+        return Err(UpdateError::ChecksumMismatch {
+            expected: expected_hash,
+            actual: actual_hash,
+        });
     }
 
     // 3. Validate and extract archive
     eprintln!("  Extracting...");
     validate_archive(&archive_path)?;
     let extract_dir = tmp_dir.join("extract");
-    std::fs::create_dir_all(&extract_dir).map_err(|e| format!("Cannot create extract dir: {e}"))?;
+    std::fs::create_dir_all(&extract_dir)
+        .map_err(|e| UpdateError::Io(format!("Cannot create extract dir: {e}")))?;
     extract_archive(&archive_path, &extract_dir)?;
 
     let new_binary = extract_dir.join("cplt");
     // Use symlink_metadata to NOT follow symlinks — reject if it's a symlink
     let meta = std::fs::symlink_metadata(&new_binary).map_err(|_| {
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        "Extracted archive does not contain 'cplt' binary".to_string()
+        UpdateError::BinaryNotFound
     })?;
     if !meta.file_type().is_file() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err("Extracted 'cplt' is not a regular file (symlink?)".to_string());
+        return Err(UpdateError::BinaryIsSymlink);
     }
 
     // 4. Resolve current binary location
     let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Cannot determine current binary path: {e}"))?;
+        .map_err(|e| UpdateError::Io(format!("Cannot determine current binary path: {e}")))?;
     let target_path = std::fs::canonicalize(&current_exe).unwrap_or(current_exe);
 
     // 5. Stage: set permissions and platform-specific postprocessing
@@ -172,12 +255,13 @@ pub fn perform_update(tag: &str, current_version: &str) -> Result<String, String
         sudo_install(&new_binary, &target_path)?;
     } else {
         let staged = target_path.with_extension("new");
-        std::fs::copy(&new_binary, &staged).map_err(|e| format!("Cannot stage binary: {e}"))?;
+        std::fs::copy(&new_binary, &staged)
+            .map_err(|e| UpdateError::Io(format!("Cannot stage binary: {e}")))?;
         set_executable(&staged)?;
         postprocess_binary(&staged);
         std::fs::rename(&staged, &target_path).map_err(|e| {
             let _ = std::fs::remove_file(&staged);
-            format!("Cannot replace binary: {e}")
+            UpdateError::Io(format!("Cannot replace binary: {e}"))
         })?;
     }
 
@@ -271,7 +355,7 @@ pub fn version_date(version: &str) -> &str {
 }
 
 /// Parse SHA256SUMS content and find the hash for a given asset.
-pub fn parse_sha256sums(content: &str, asset_name: &str) -> Result<String, String> {
+pub fn parse_sha256sums(content: &str, asset_name: &str) -> Result<String, UpdateError> {
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -283,15 +367,13 @@ pub fn parse_sha256sums(content: &str, asset_name: &str) -> Result<String, Strin
             return Ok(fields[0].to_lowercase());
         }
     }
-    Err(format!(
-        "No SHA256 checksum found for '{asset_name}' in SHA256SUMS"
-    ))
+    Err(UpdateError::NoChecksum(asset_name.to_string()))
 }
 
 // --- Internal helpers ---
 
 /// HTTP GET returning body as string (for JSON/text).
-fn curl_get(url: &str, version: &str) -> Result<String, String> {
+fn curl_get(url: &str, version: &str) -> Result<String, UpdateError> {
     let output = Command::new("/usr/bin/curl")
         .args([
             "--fail",
@@ -307,21 +389,21 @@ fn curl_get(url: &str, version: &str) -> Result<String, String> {
             url,
         ])
         .output()
-        .map_err(|e| format!("Cannot run /usr/bin/curl: {e}"))?;
+        .map_err(|e| UpdateError::Io(format!("Cannot run /usr/bin/curl: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("403") || stderr.contains("rate limit") {
-            return Err("GitHub API rate limit reached. Try again later.".to_string());
+            return Err(UpdateError::RateLimited);
         }
-        return Err(format!("Download failed: {stderr}"));
+        return Err(UpdateError::DownloadFailed(stderr.into_owned()));
     }
 
-    String::from_utf8(output.stdout).map_err(|e| format!("Invalid UTF-8 in response: {e}"))
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 /// HTTP GET expecting JSON, with Accept header.
-fn curl_get_json(url: &str, version: &str) -> Result<String, String> {
+fn curl_get_json(url: &str, version: &str) -> Result<String, UpdateError> {
     let output = Command::new("/usr/bin/curl")
         .args([
             "--fail",
@@ -339,23 +421,21 @@ fn curl_get_json(url: &str, version: &str) -> Result<String, String> {
             url,
         ])
         .output()
-        .map_err(|e| format!("Cannot run /usr/bin/curl: {e}"))?;
+        .map_err(|e| UpdateError::Io(format!("Cannot run /usr/bin/curl: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("403") || stderr.contains("rate limit") {
-            return Err("GitHub API rate limit reached. Try again later.".to_string());
+            return Err(UpdateError::RateLimited);
         }
-        return Err(format!(
-            "Cannot reach GitHub. Check your connection.\n  {stderr}"
-        ));
+        return Err(UpdateError::NetworkUnreachable(stderr.into_owned()));
     }
 
-    String::from_utf8(output.stdout).map_err(|e| format!("Invalid UTF-8 in response: {e}"))
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 /// Download a file to disk.
-fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), String> {
+fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/curl")
         .args([
             "--fail",
@@ -373,11 +453,11 @@ fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), String> {
             url,
         ])
         .output()
-        .map_err(|e| format!("Cannot run /usr/bin/curl: {e}"))?;
+        .map_err(|e| UpdateError::Io(format!("Cannot run /usr/bin/curl: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Download failed: {stderr}"))
+        Err(UpdateError::DownloadFailed(stderr.into_owned()))
     } else {
         Ok(())
     }
@@ -386,11 +466,11 @@ fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), String> {
 /// Compute SHA256 hash of a file using the platform's hash utility.
 ///
 /// macOS uses `/usr/bin/shasum -a 256`, Linux uses `sha256sum`.
-fn compute_sha256(path: &Path) -> Result<String, String> {
+fn compute_sha256(path: &Path) -> Result<String, UpdateError> {
     let output = sha256_command(path)?;
 
     if !output.status.success() {
-        return Err("SHA256 computation failed".to_string());
+        return Err(UpdateError::HashFailed);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -398,19 +478,19 @@ fn compute_sha256(path: &Path) -> Result<String, String> {
         .split_whitespace()
         .next()
         .map(|h| h.to_lowercase())
-        .ok_or_else(|| "Cannot parse hash output".to_string())
+        .ok_or(UpdateError::HashParse)
 }
 
 #[cfg(target_os = "macos")]
-fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
+fn sha256_command(path: &Path) -> Result<std::process::Output, UpdateError> {
     Command::new("/usr/bin/shasum")
         .args(["-a", "256", &path.to_string_lossy()])
         .output()
-        .map_err(|e| format!("Cannot run shasum: {e}"))
+        .map_err(|e| UpdateError::Io(format!("Cannot run shasum: {e}")))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
+fn sha256_command(path: &Path) -> Result<std::process::Output, UpdateError> {
     // Use absolute paths only — bare PATH lookup could run a malicious binary.
     let candidates = [
         "/usr/bin/sha256sum",
@@ -420,39 +500,38 @@ fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
     let bin = candidates
         .iter()
         .find(|p| std::path::Path::new(p).exists())
-        .ok_or("sha256sum not found in standard paths (/usr/bin, /usr/sbin, /bin)")?;
+        .ok_or(UpdateError::HashToolNotFound)?;
     Command::new(bin)
         .arg(path.to_string_lossy().to_string())
         .output()
-        .map_err(|e| format!("Cannot run sha256sum: {e}"))
+        .map_err(|e| UpdateError::Io(format!("Cannot run sha256sum: {e}")))
 }
 
 /// Validate archive contents before extraction.
 /// Rejects archives with symlinks, directories, or unexpected entries.
 /// Uses verbose listing (`-tvf`) to detect file types — plain `-tzf`
 /// cannot distinguish symlinks from regular files.
-fn validate_archive(path: &Path) -> Result<(), String> {
+fn validate_archive(path: &Path) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/tar")
         .args(["-tvzf", &path.to_string_lossy()])
         .output()
-        .map_err(|e| format!("Cannot list archive contents: {e}"))?;
+        .map_err(|e| UpdateError::Io(format!("Cannot list archive contents: {e}")))?;
 
     if !output.status.success() {
-        return Err("Archive appears to be corrupt".to_string());
+        return Err(UpdateError::CorruptArchive);
     }
 
     let listing = String::from_utf8_lossy(&output.stdout);
     let entries: Vec<&str> = listing.lines().filter(|l| !l.is_empty()).collect();
 
     if entries.is_empty() {
-        return Err("Archive is empty".to_string());
+        return Err(UpdateError::EmptyArchive);
     }
 
     if entries.len() != 1 {
-        return Err(format!(
-            "Release archive has unexpected contents ({} entries).\n  Expected a single 'cplt' entry.",
-            entries.len()
-        ));
+        return Err(UpdateError::UnexpectedArchive {
+            count: entries.len(),
+        });
     }
 
     let entry = entries[0];
@@ -460,24 +539,20 @@ fn validate_archive(path: &Path) -> Result<(), String> {
     // Verbose tar output starts with permissions: "-rwxr-xr-x" for regular files,
     // "l..." for symlinks, "d..." for directories
     if !entry.starts_with('-') {
-        return Err(format!(
-            "Archive entry is not a regular file: {entry}\n  Refusing to extract symlinks or directories."
-        ));
+        return Err(UpdateError::NotRegularFile(entry.to_string()));
     }
 
     // Verify the filename (last field) is exactly "cplt"
     let filename = entry.split_whitespace().last().unwrap_or("");
     if filename != "cplt" {
-        return Err(format!(
-            "Archive contains unexpected file: '{filename}'\n  Expected 'cplt'."
-        ));
+        return Err(UpdateError::WrongFilename(filename.to_string()));
     }
 
     Ok(())
 }
 
 /// Extract archive to a directory.
-fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+fn extract_archive(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/tar")
         .args([
             "-xzf",
@@ -486,31 +561,33 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
             &dest.to_string_lossy(),
         ])
         .output()
-        .map_err(|e| format!("Cannot extract archive: {e}"))?;
+        .map_err(|e| UpdateError::Io(format!("Cannot extract archive: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Extraction failed: {stderr}"))
+        Err(UpdateError::ExtractionFailed(stderr.into_owned()))
     } else {
         Ok(())
     }
 }
 
 /// Create a temporary directory for the update process.
-fn create_temp_dir() -> Result<PathBuf, String> {
+fn create_temp_dir() -> Result<PathBuf, UpdateError> {
     let dir = std::env::temp_dir().join(format!("cplt-update-{}", std::process::id()));
     if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| format!("Cannot clean up old temp dir: {e}"))?;
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| UpdateError::Io(format!("Cannot clean up old temp dir: {e}")))?;
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create temp dir: {e}"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| UpdateError::Io(format!("Cannot create temp dir: {e}")))?;
     Ok(dir)
 }
 
 /// Set executable permissions on a file.
-fn set_executable(path: &Path) -> Result<(), String> {
+fn set_executable(path: &Path) -> Result<(), UpdateError> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("Cannot set permissions: {e}"))
+        .map_err(|e| UpdateError::Io(format!("Cannot set permissions: {e}")))
 }
 
 /// Apply platform-specific binary postprocessing after download.
@@ -532,31 +609,31 @@ fn postprocess_binary(path: &Path) {
 /// Remove macOS quarantine extended attributes.
 /// Remove quarantine attribute (macOS only — required for Gatekeeper).
 #[cfg(target_os = "macos")]
-fn run_xattr(path: &Path) -> Result<(), String> {
+fn run_xattr(path: &Path) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/xattr")
         .args(["-cr", &path.to_string_lossy()])
         .output()
-        .map_err(|e| format!("xattr failed: {e}"))?;
+        .map_err(|e| UpdateError::Io(format!("xattr failed: {e}")))?;
 
     if output.status.success() {
         Ok(())
     } else {
-        Err("xattr -cr failed".to_string())
+        Err(UpdateError::XattrFailed)
     }
 }
 
 /// Ad-hoc code sign the binary (macOS only — required for Gatekeeper).
 #[cfg(target_os = "macos")]
-fn run_codesign(path: &Path) -> Result<(), String> {
+fn run_codesign(path: &Path) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/codesign")
         .args(["--force", "--sign", "-", &path.to_string_lossy()])
         .output()
-        .map_err(|e| format!("codesign failed: {e}"))?;
+        .map_err(|e| UpdateError::Io(format!("codesign failed: {e}")))?;
 
     if output.status.success() {
         Ok(())
     } else {
-        Err("codesign failed".to_string())
+        Err(UpdateError::CodesignFailed)
     }
 }
 
@@ -581,7 +658,7 @@ fn is_writable(path: &Path) -> bool {
 /// Install binary using sudo for the final copy + permission step.
 /// Downloads and verification happen as the current user; only the
 /// file placement requires elevated privileges.
-fn sudo_install(src: &Path, dest: &Path) -> Result<(), String> {
+fn sudo_install(src: &Path, dest: &Path) -> Result<(), UpdateError> {
     let sudo = find_sudo()?;
 
     let output = Command::new(&sudo)
@@ -590,14 +667,13 @@ fn sudo_install(src: &Path, dest: &Path) -> Result<(), String> {
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
-        .map_err(|e| format!("Cannot run sudo: {e}"))?;
+        .map_err(|e| UpdateError::Io(format!("Cannot run sudo: {e}")))?;
 
     if !output.success() {
-        return Err(format!(
-            "sudo cp failed. You can also run manually:\n  sudo cp {} {}",
-            src.display(),
-            dest.display()
-        ));
+        return Err(UpdateError::SudoFailed {
+            src: src.display().to_string(),
+            dest: dest.display().to_string(),
+        });
     }
 
     // Set correct permissions
@@ -609,17 +685,14 @@ fn sudo_install(src: &Path, dest: &Path) -> Result<(), String> {
 }
 
 /// Find sudo binary on the system.
-fn find_sudo() -> Result<PathBuf, String> {
+fn find_sudo() -> Result<PathBuf, UpdateError> {
     for p in ["/usr/bin/sudo", "/bin/sudo"] {
         let path = Path::new(p);
         if path.exists() {
             return Ok(path.to_path_buf());
         }
     }
-    Err(
-        "sudo not found. Install the binary manually:\n  sudo cp <binary> /usr/local/bin/cplt"
-            .to_string(),
-    )
+    Err(UpdateError::SudoNotFound)
 }
 
 #[cfg(test)]
