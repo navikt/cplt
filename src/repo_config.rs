@@ -156,6 +156,14 @@ fn read_from_git_head(project_dir: &Path) -> Option<String> {
     }
 }
 
+/// Parse and validate a `.cplt.toml` content string.
+/// Returns an error if the TOML is invalid or violates safety constraints.
+pub fn parse_and_validate(content: &str) -> Result<RepoConfig, String> {
+    let config = parse_repo_config(content)?;
+    validate_repo_config(&config)?;
+    Ok(config)
+}
+
 /// Parse TOML content into a RepoConfig.
 fn parse_repo_config(content: &str) -> Result<RepoConfig, String> {
     toml::from_str(content).map_err(|e| format!("Invalid .cplt.toml: {e}"))

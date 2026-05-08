@@ -50,10 +50,9 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 
 1. CLI flags (`--with-proxy`, `--no-proxy`, `--proxy-port`, etc.)
 2. Config file (`~/.config/cplt/config.toml`)
-3. Per-repo config (`.cplt.toml` approved permissions)
-4. Built-in defaults
+3. Built-in defaults
 
-CLI flags always override the config file. Per-repo permissions are **additive only** — they can enable features (e.g., `allow_docker = true`) but cannot disable anything set by CLI or global config. The `[deny]` section tightens the sandbox unconditionally.
+Per-repo config (`.cplt.toml`) operates independently: the `[deny]` section tightens the sandbox unconditionally (no approval needed), and approved `[propose]` permissions are **additive** — they can enable features (e.g., `allow_docker = true`) but cannot disable anything set by CLI or global config.
 
 **Environment variable override:**
 
@@ -182,5 +181,8 @@ cplt --accept-repo-config -- -p "run tests"
 
 1. CLI flags (highest)
 2. Global config (`~/.config/cplt/config.toml`)
-3. Approved repo permissions (`.cplt.toml [propose]`)
-4. Built-in defaults
+3. Built-in defaults
+
+Repo config is **not in this hierarchy** — it operates as a separate layer:
+- `[deny]` always tightens the sandbox (no approval needed)
+- Approved `[propose]` permissions are additive (can enable, never disable)

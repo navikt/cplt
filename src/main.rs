@@ -318,9 +318,9 @@ struct Cli {
     #[arg(long, short = 'y')]
     yes: bool,
 
-    /// Auto-approve all permissions from .cplt.toml without prompting.
+    /// Auto-approve all permissions from .cplt.toml for this run only.
     /// For CI/scripts where interactive approval isn't possible.
-    /// Equivalent to running `cplt trust accept --all` first.
+    /// Does not persist trust — approvals apply only to the current invocation.
     #[arg(long)]
     accept_repo_config: bool,
 
@@ -1898,8 +1898,8 @@ fn run_config_set_repo(
         return ExitCode::FAILURE;
     }
 
-    // Validate the result parses as a valid repo config
-    if let Err(e) = toml::from_str::<repo_config::RepoConfig>(&output) {
+    // Validate the result parses and passes safety checks
+    if let Err(e) = repo_config::parse_and_validate(&output) {
         eprintln!(
             "{YELLOW}[cplt] Warning: written .cplt.toml has validation issues: {e}{NC}\n  The file was saved but may not load correctly."
         );
@@ -2022,8 +2022,17 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         println!();
     }
 
+    // Check if proposals have changed since approval (content hash mismatch)
+    let hash_mismatch = trust_entry.as_ref().is_some_and(|t| {
+        !t.accepted.content_hash.is_empty() && {
+            let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+            t.accepted.content_hash != current_hash
+        }
+    });
+
     // Proposals
-    let all_approved = !proposed.is_empty()
+    let all_approved = !hash_mismatch
+        && !proposed.is_empty()
         && proposed.iter().all(|&key| {
             trust_entry
                 .as_ref()
@@ -2040,10 +2049,11 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         };
         println!("{BLUE}[cplt]{NC}  {YELLOW}[allow]{NC} {section_label}");
         for &key in &proposed {
-            let approved = trust_entry
-                .as_ref()
-                .map(|t| trust::is_key_approved(t, key))
-                .unwrap_or(false);
+            let approved = !hash_mismatch
+                && trust_entry
+                    .as_ref()
+                    .map(|t| trust::is_key_approved(t, key))
+                    .unwrap_or(false);
             let status = if approved {
                 format!("{GREEN}{STATUS_APPROVED}{NC}")
             } else {
@@ -2062,17 +2072,9 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             entry.accepted.approved_at
         );
 
-        // Check if proposals have changed since last approval (content hash mismatch)
-        if !entry.accepted.content_hash.is_empty() {
-            let current_hash = trust::proposal_content_hash(&loaded.config.propose);
-            if entry.accepted.content_hash != current_hash {
-                println!(
-                    "{BLUE}[cplt]{NC}  {RED}⚠ Permissions have changed since last approval!{NC}"
-                );
-                println!(
-                    "{BLUE}[cplt]{NC}  {RED}  Run `cplt trust --accept-all` to re-approve.{NC}"
-                );
-            }
+        if hash_mismatch {
+            println!("{BLUE}[cplt]{NC}  {RED}⚠ Permissions have changed since last approval!{NC}");
+            println!("{BLUE}[cplt]{NC}  {RED}  Run `cplt trust accept --all` to re-approve.{NC}");
         }
     }
 

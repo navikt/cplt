@@ -501,10 +501,9 @@ cplt config explain   # list all keys with descriptions
 
 1. CLI flags
 2. Config file (`~/.config/cplt/config.toml`)
-3. Per-repo config (`.cplt.toml` approved permissions)
-4. Built-in defaults
+3. Built-in defaults
 
-Per-repo permissions are **additive only** — they can enable features but cannot disable anything set by CLI or global config. The `[deny]` section tightens unconditionally.
+Per-repo config (`.cplt.toml`) operates as a separate layer: `[deny]` tightens unconditionally, and approved permissions are **additive only** — they can enable features but cannot disable anything set by CLI or global config.
 
 ### Per-repo configuration (`.cplt.toml`)
 
