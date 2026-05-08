@@ -707,7 +707,7 @@ these version checks are sandboxed:
   ✓ Copilot (copilot) v1.0.21: /opt/homebrew/bin/copilot
 ```
 
-### 8.3 Future: machine-readable doctor
+### 8.5 Future: machine-readable doctor
 
 Consider `cplt --doctor --json` for CI integration:
 
@@ -999,8 +999,21 @@ not a generic yes/no prompt.
 
 ### What cplt does well ✅
 
+**Security architecture (aligned with SECURITY.md):**
 - **Deny-by-default** with explicit `--allow-*` grants (Deno pattern)
-- **`(DANGEROUS)` markers** on high-risk flags
+- **Four defense layers** — env sanitization, env hardening, kernel sandbox, CONNECT proxy
+- **Env sanitization** — `env_clear()` + 49-var allowlist, `ENV_ALWAYS_DENY` for SSH/color
+- **Env hardening** — `npm_config_ignore_scripts`, `YARN_ENABLE_SCRIPTS`, git signing off
+- **Native module write protection** — `~/.copilot/pkg/` writes denied
+- **Trust model** — content-pinned (SHA-256), git HEAD source, no interactive approval
+- **Deny-path asymmetry** — allow-path warns on missing, deny-path errors (fail closed)
+- **SBPL injection prevention** — path character validation before profile interpolation
+- **Unsafe root rejection** — refuses `/`, `$HOME`, `/tmp` as project directory
+- **DNS rebinding defense** — post-DNS IP validation, connect to resolved address (TOCTOU-safe)
+- **Scratch directory safety** — 0700 perms, symlink rejection, owner check, SBPL guard
+
+**UX design:**
+- **`(DANGEROUS)` markers** on high-risk flags with security rationale
 - **Columnar banner output** with status colors and alignment
 - **`--doctor` diagnostics** with ✓/⚠/✗ and subsystem grouping
 - **Config validation** with "did you mean?" suggestions (Levenshtein)
@@ -1010,17 +1023,25 @@ not a generic yes/no prompt.
 - **Proxy enabled by default** with ephemeral port to avoid conflicts
 - **Config subcommand suite** (init, show, validate, explain, get, set)
 - **`config set` safeguards** dangerous settings with `--force`
-- **Trust model** for repo-local config with content-hash pinning
 - **Signal forwarding** with SIGTTOU/SIGTTIN suppression
-- **Environment sanitization** with explicit allowlist and secret-suffix filtering
-- **Hardening env vars** for package-manager lifecycle scripts and git signing
 - **Recursion prevention** via `__CPLT_WRAPPED`
-- **Scratch directory** ergonomics for tools needing executable temp space
 - **Auto agent discovery** across Copilot/OpenCode/Gemini/shell
-- **Path validation** against SBPL injection and path traversal
 - **Agent exit code passthrough** — wrapper forwards the child's exit code
 
 ### Areas for improvement ⚠️
+
+**Security UX gaps:**
+
+| Area | Current state | Recommendation |
+|------|---------------|----------------|
+| **Compound flag warnings** | `--allow-localhost-any` + `--allow-jvm-attach` silently broadens to `"*:*"` | Warn about the compound effect explicitly |
+| **Platform enforcement visibility** | Linux limitations not always surfaced in banner | Show enforcement level (kernel/proxy/env) per protection in banner |
+| **Honest gap communication** | Help text doesn't always distinguish kernel-enforced vs. proxy-blocked | Use precise language: "kernel-blocked" vs. "proxy-filtered" |
+| **`--deny-path` on Linux** | Warns but continues | Consider whether this should be an error (deny rule silently dropped) |
+| **DANGEROUS flag warnings** | Marked in help but no runtime warning | Show a colored warning when dangerous flags are active |
+| **`--allow-cache-exec` risk** | Help text describes feature but not accepted risk | State that write+exec in the named subdir is the trade-off |
+
+**General UX gaps:**
 
 | Area | Current state | Recommendation |
 |------|---------------|----------------|
@@ -1029,37 +1050,44 @@ not a generic yes/no prompt.
 | **Help length** | ~50 flags in flat list | Group into categories, progressive disclosure |
 | **`NO_COLOR` / TTY detection** | Manual ANSI constants, no `NO_COLOR` check | Respect `NO_COLOR`, `TERM=dumb`, `is_terminal()` |
 | **Color/prefix duplication** | ANSI constants duplicated across modules | Centralize into a `ui` or `output` module |
-| **Pipe mode** | No TTY detection for output format | Strip ANSI when `!is_terminal()`; replace symbols with `PASS`/`WARN`/`FAIL` |
+| **Pipe mode** | No TTY detection for output format | Strip ANSI when `!is_terminal()` |
 | **JSON output** | Not available | Add `--json` to `--doctor`, `config show`, `trust` |
 | **Broken pipe** | Not handled | Exit 0 on `BrokenPipe`, like ripgrep |
 | **Doctor remediation** | Some warnings lack fix suggestions | Add `Fix:` lines for every ✗ and ⚠ |
 | **Shell completions** | Not yet available | Add `cplt completions <shell>` subcommand |
 | **`--version` detail** | Basic | Add commit hash, build date, sandbox mechanism |
 | **`trust` help text** | References `cplt trust --accept-all` | Update to `cplt trust accept --all` |
-| **Platform degradation UX** | Some Linux warnings say "no effect" but continue | Define when partial enforcement requires `--force` |
 | **`process::exit(1)`** | Some paths use `exit()` directly | Prefer `ExitCode` return for clean drop behavior |
 
 ---
 
 ## 17. Migration priorities
 
-### Phase 1 — Correctness
+### Phase 1 — Security UX correctness
 
+- Add runtime warnings for `(DANGEROUS)` flags (not just help text markers).
+- Add compound warning for `--allow-localhost-any` + `--allow-jvm-attach`.
 - Fix `trust` help text referencing stale command names.
+- Use precise enforcement language in banner: "kernel-blocked" vs. "proxy-filtered".
+- Ensure `--deny-path` on Linux produces a visible warning.
+- Document actual exit code behavior in `--help` and README.
+
+### Phase 2 — Infrastructure
+
 - Centralize ANSI color constants and prefix helpers into one module.
 - Respect `NO_COLOR` env var and `TERM=dumb`.
-- Document actual exit code behavior in `--help` and README.
 - Replace `std::process::exit(1)` calls with `ExitCode` returns.
-
-### Phase 2 — Scriptability
-
 - Return 125 for wrapper failures, 128+N for signal deaths.
 - Handle broken pipe (exit 0).
+
+### Phase 3 — Scriptability
+
 - Add `--json` to `--doctor`, `config show`, `trust show`.
 - Define and enforce the stdout/stderr contract per command type.
 - Add TTY detection: strip ANSI in pipe mode.
+- Add platform enforcement summary to JSON doctor output.
 
-### Phase 3 — Ergonomics
+### Phase 4 — Ergonomics
 
 - Add `cplt completions <shell>` for bash, zsh, fish.
 - Group help output by category with progressive disclosure.
@@ -1071,6 +1099,7 @@ not a generic yes/no prompt.
 
 ## References
 
+- [SECURITY.md](../SECURITY.md) — cplt threat model, defense layers, honest gaps, platform comparison
 - [Command Line Interface Guidelines](https://clig.dev) — the canonical modern reference
 - [Heroku CLI Style Guide](https://devcenter.heroku.com/articles/cli-style-guide)
 - [no-color.org](https://no-color.org) — `NO_COLOR` standard

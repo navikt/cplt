@@ -2596,4 +2596,534 @@ mod e2e_tests {
             "should pass through prompt: {args:?}\nstderr: {stderr}"
         );
     }
+
+    // ============================================================
+    // Trust model e2e tests
+    // ============================================================
+
+    /// Create a git repo with a committed .cplt.toml and an isolated config dir.
+    /// Returns (repo_dir, config_file_path).
+    fn make_trust_repo(label: &str, cplt_toml_content: &str) -> (PathBuf, PathBuf) {
+        let id = FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let repo = std::env::temp_dir().join(format!(".cplt-e2e-trust-{label}-{id}"));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Init git repo and commit .cplt.toml
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+
+        std::fs::write(repo.join(".cplt.toml"), cplt_toml_content).unwrap();
+        Command::new("git")
+            .args(["add", ".cplt.toml"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-m",
+                "init",
+                "--quiet",
+            ])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+
+        // Isolated config dir (no interference from user's real config)
+        let config_dir = repo.join(".cplt-config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_file = config_dir.join("config.toml");
+        std::fs::write(&config_file, "").unwrap();
+
+        (repo, config_file)
+    }
+
+    #[test]
+    fn e2e_trust_show_displays_proposals() {
+        let (repo, config_file) = make_trust_repo(
+            "show",
+            "[propose]\nallow_localhost_any = true\n\n[deny]\nenv = [\"VAULT_TOKEN\"]\n",
+        );
+
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("allow_localhost_any"),
+            "should show proposed key: {stdout}"
+        );
+        assert!(
+            stdout.contains("VAULT_TOKEN"),
+            "should show denied env: {stdout}"
+        );
+        assert!(
+            stdout.contains("pending") || stdout.contains("○"),
+            "should show pending status: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_trust_accept_all_approves_proposals() {
+        let (repo, config_file) =
+            make_trust_repo("accept-all", "[propose]\nallow_localhost_any = true\n");
+
+        // Before accept: should show pending
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("pending") || stdout.contains("○"),
+            "before accept, should be pending: {stdout}"
+        );
+
+        // Accept all
+        let output = Command::new(binary_path())
+            .args(["trust", "accept", "--all"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        assert!(
+            output.status.success(),
+            "accept should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // After accept: should show approved
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("approved") || stdout.contains("✓"),
+            "after accept, should be approved: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_trust_accept_single_key_is_selective() {
+        let (repo, config_file) = make_trust_repo(
+            "accept-key",
+            "[propose]\nallow_localhost_any = true\nallow_docker = true\n",
+        );
+
+        // Accept only one key
+        let output = Command::new(binary_path())
+            .args(["trust", "accept", "allow_localhost_any"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        assert!(output.status.success());
+
+        // Check status: one approved, one pending
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Find lines for each key
+        let localhost_line = stdout
+            .lines()
+            .find(|l| l.contains("allow_localhost_any"))
+            .unwrap_or("");
+        let docker_line = stdout
+            .lines()
+            .find(|l| l.contains("allow_docker"))
+            .unwrap_or("");
+
+        assert!(
+            localhost_line.contains("✓") || localhost_line.contains("approved"),
+            "allow_localhost_any should be approved: {localhost_line}"
+        );
+        assert!(
+            docker_line.contains("○") || docker_line.contains("pending"),
+            "allow_docker should be pending: {docker_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_trust_revoke_removes_approval() {
+        let (repo, config_file) =
+            make_trust_repo("revoke", "[propose]\nallow_localhost_any = true\n");
+
+        // Accept, then revoke
+        Command::new(binary_path())
+            .args(["trust", "accept", "--all"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("accept should run");
+
+        let output = Command::new(binary_path())
+            .args(["trust", "revoke", "--all"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("revoke should run");
+        assert!(output.status.success());
+
+        // After revoke: should show pending
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("pending") || stdout.contains("○"),
+            "after revoke, should be pending: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_trust_content_hash_invalidation() {
+        let (repo, config_file) = make_trust_repo(
+            "hash-invalidation",
+            "[propose]\nallow_localhost_any = true\n",
+        );
+
+        // Accept all
+        Command::new(binary_path())
+            .args(["trust", "accept", "--all"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("accept should run");
+
+        // Modify and re-commit .cplt.toml with different proposals
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\nallow_docker = true\n",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["add", ".cplt.toml"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-m",
+                "change proposals",
+                "--quiet",
+            ])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+
+        // After change: should show changed warning and pending status
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("changed") || stdout.contains("⚠"),
+            "should warn about changed permissions: {stdout}"
+        );
+        // Keys should show pending (not approved) due to hash mismatch
+        assert!(
+            stdout.contains("pending") || stdout.contains("○"),
+            "keys should be pending after hash change: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_trust_isolation_between_repos() {
+        let (repo_a, config_file) =
+            make_trust_repo("isolation-a", "[propose]\nallow_localhost_any = true\n");
+        let (repo_b, _) = make_trust_repo("isolation-b", "[propose]\nallow_localhost_any = true\n");
+
+        // Accept in repo A (using shared config dir)
+        Command::new(binary_path())
+            .args(["trust", "accept", "--all"])
+            .current_dir(&repo_a)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("accept should run");
+
+        // Repo A should show approved
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo_a)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout_a = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout_a.contains("approved") || stdout_a.contains("✓"),
+            "repo A should be approved: {stdout_a}"
+        );
+
+        // Repo B should still show pending (different fingerprint)
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo_b)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout_b = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout_b.contains("pending") || stdout_b.contains("○"),
+            "repo B should be pending (trust is per-repo): {stdout_b}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo_a);
+        let _ = std::fs::remove_dir_all(&repo_b);
+    }
+
+    #[test]
+    fn e2e_trust_deny_env_strips_variable() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo("deny-env", "[deny]\nenv = [\"VAULT_TOKEN\"]\n");
+
+        // Create fake copilot in the project dir (sandbox allows exec there)
+        let fake_dir = project_dir().join(format!(
+            ".cplt-fake-deny-env-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        let script = fake_dir.join("copilot");
+        std::fs::write(&script, "#!/bin/sh\nenv | sort\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.display());
+
+        let output = Command::new(binary_path())
+            .args(["--yes", "--no-validate", "--", "--version"])
+            .current_dir(&repo)
+            .env("PATH", &new_path)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .env("VAULT_TOKEN", "secret-value-123")
+            .output()
+            .expect("should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("secret-value-123"),
+            "VAULT_TOKEN should be stripped by deny.env: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&fake_dir);
+    }
+
+    #[test]
+    fn e2e_accept_repo_config_flag_does_not_persist() {
+        require_sandbox!();
+        let (repo, config_file) =
+            make_trust_repo("accept-flag", "[propose]\nallow_localhost_any = true\n");
+
+        // Create fake copilot in project dir (sandbox allows exec there)
+        let fake_dir = project_dir().join(format!(
+            ".cplt-fake-accept-flag-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        let script = fake_dir.join("copilot");
+        std::fs::write(&script, "#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.display());
+
+        // Run with flag — should succeed
+        let output = Command::new(binary_path())
+            .args([
+                "--yes",
+                "--no-validate",
+                "--accept-repo-config",
+                "--",
+                "--version",
+            ])
+            .current_dir(&repo)
+            .env("PATH", &new_path)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        assert!(
+            output.status.success(),
+            "--accept-repo-config should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // After running with flag, trust should NOT be persisted
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("pending") || stdout.contains("○"),
+            "--accept-repo-config should not persist trust: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&fake_dir);
+    }
+
+    #[test]
+    fn e2e_trust_head_preferred_over_working_tree() {
+        let (repo, config_file) =
+            make_trust_repo("head-vs-wt", "[propose]\nallow_localhost_any = true\n");
+
+        // Modify working tree with different content (not committed)
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\nallow_docker = true\nallow_tmp_exec = true\n",
+        )
+        .unwrap();
+
+        // Trust show should use HEAD version (only allow_localhost_any)
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("allow_localhost_any"),
+            "should show HEAD proposal: {stdout}"
+        );
+        assert!(
+            !stdout.contains("allow_docker"),
+            "should NOT show working-tree-only proposal: {stdout}"
+        );
+        assert!(
+            stdout.contains("git HEAD"),
+            "should indicate source is git HEAD: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_trust_locked_inside_sandbox() {
+        require_sandbox!();
+        let (repo, config_file) =
+            make_trust_repo("trust-locked", "[propose]\nallow_localhost_any = true\n");
+
+        // Create fake copilot in the project dir (sandbox allows exec there)
+        let fake_dir = project_dir().join(format!(
+            ".cplt-fake-trust-locked-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        let cplt_binary = binary_path();
+        let script = fake_dir.join("copilot");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nresult=$({} trust accept --all 2>&1)\nrc=$?\necho \"TRUST_OUTPUT:$result\"\necho \"EXIT:$rc\"\n",
+                cplt_binary.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.display());
+
+        let output = Command::new(binary_path())
+            .args([
+                "--yes",
+                "--no-validate",
+                "--accept-repo-config",
+                "--",
+                "--version",
+            ])
+            .current_dir(&repo)
+            .env("PATH", &new_path)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The inner cplt trust accept should fail (trust locked)
+        assert!(
+            stdout.contains("EXIT:1")
+                || stdout.contains("locked")
+                || stdout.contains("cannot modify"),
+            "cplt trust should be blocked inside sandbox: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Verify trust was NOT actually modified
+        let output = Command::new(binary_path())
+            .args(["trust"])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("pending") || stdout.contains("○"),
+            "trust should remain unapproved after sandbox escape attempt: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&fake_dir);
+    }
 }
