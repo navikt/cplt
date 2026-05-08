@@ -1,3 +1,8 @@
+//! HTTP CONNECT proxy with domain filtering.
+//!
+//! Intercepts outbound HTTPS connections from the sandboxed agent,
+//! enforcing blocked/allowed domain lists and private IP restrictions.
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -9,6 +14,7 @@ use crate::ui;
 /// Controls how much the proxy logs to stderr.
 /// The audit log file (if configured) always records everything regardless of this level.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProxyLogLevel {
     /// No proxy output to stderr (default).
     #[default]
@@ -174,7 +180,9 @@ fn get_cached_domains(
     path: Option<&Path>,
     parser: fn(&Path) -> Option<Vec<String>>,
 ) -> Vec<String> {
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     if !guard.is_stale() {
         return guard.domains.clone();
@@ -554,20 +562,18 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
 
     // Resolve DNS FIRST, then check the resolved IP
     let addr = format!("{host}:{port}");
-    let socket_addr = match addr.to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(a) => a,
-            None => {
-                log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
-                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-                return;
-            }
-        },
-        Err(_) => {
+    let socket_addr = if let Ok(mut addrs) = addr.to_socket_addrs() {
+        if let Some(a) = addrs.next() {
+            a
+        } else {
             log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
+    } else {
+        log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
+        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        return;
     };
 
     // Check the RESOLVED IP address (prevents DNS rebinding attacks).
@@ -621,13 +627,11 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
 }
 
 fn relay(client: TcpStream, remote: TcpStream) {
-    let mut client_read = match client.try_clone() {
-        Ok(c) => c,
-        Err(_) => return,
+    let Ok(mut client_read) = client.try_clone() else {
+        return;
     };
-    let mut remote_write = match remote.try_clone() {
-        Ok(r) => r,
-        Err(_) => return,
+    let Ok(mut remote_write) = remote.try_clone() else {
+        return;
     };
     let mut remote_read = remote;
     let mut client_write = client;
@@ -936,7 +940,9 @@ mod tests {
 
         let cache = Mutex::new(DomainCache {
             domains: vec!["old.com".to_string()],
-            last_attempt: Instant::now() - RELOAD_TTL - Duration::from_millis(100),
+            last_attempt: Instant::now()
+                .checked_sub(RELOAD_TTL + Duration::from_millis(100))
+                .unwrap(),
         });
 
         let result = get_cached_domains(&cache, Some(&path), parse_lines_file);
@@ -944,8 +950,9 @@ mod tests {
 
         // Modify file and force stale
         std::fs::write(&path, "new.com\n").unwrap();
-        cache.lock().unwrap().last_attempt =
-            Instant::now() - RELOAD_TTL - Duration::from_millis(100);
+        cache.lock().unwrap().last_attempt = Instant::now()
+            .checked_sub(RELOAD_TTL + Duration::from_millis(100))
+            .unwrap();
 
         let result = get_cached_domains(&cache, Some(&path), parse_lines_file);
         assert_eq!(result, vec!["new.com"]);
@@ -957,7 +964,9 @@ mod tests {
     fn domain_cache_keeps_last_good_on_failure() {
         let cache = Mutex::new(DomainCache {
             domains: vec!["good.com".to_string()],
-            last_attempt: Instant::now() - RELOAD_TTL - Duration::from_millis(100),
+            last_attempt: Instant::now()
+                .checked_sub(RELOAD_TTL + Duration::from_millis(100))
+                .unwrap(),
         });
 
         let bad_path = Path::new("/tmp/nonexistent-cplt-test-file-xyz.txt");
@@ -973,7 +982,9 @@ mod tests {
     fn domain_cache_resets_ttl_after_failure() {
         let cache = Mutex::new(DomainCache {
             domains: vec!["good.com".to_string()],
-            last_attempt: Instant::now() - RELOAD_TTL - Duration::from_millis(100),
+            last_attempt: Instant::now()
+                .checked_sub(RELOAD_TTL + Duration::from_millis(100))
+                .unwrap(),
         });
 
         let bad_path = Path::new("/tmp/nonexistent-cplt-test-file-xyz.txt");
@@ -1111,7 +1122,9 @@ mod tests {
             blocked_file: path,
             blocked_cache: Mutex::new(DomainCache {
                 domains: Vec::new(),
-                last_attempt: Instant::now() - RELOAD_TTL - Duration::from_millis(100),
+                last_attempt: Instant::now()
+                    .checked_sub(RELOAD_TTL + Duration::from_millis(100))
+                    .unwrap(),
             }),
             allowed_domains_file: None,
             allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
@@ -1148,7 +1161,9 @@ mod tests {
             config_file: Some(config_path.clone()),
             private_domains_cache: Mutex::new(DomainCache {
                 domains: vec!["old.nav.no".to_string()],
-                last_attempt: Instant::now() - RELOAD_TTL - Duration::from_millis(100),
+                last_attempt: Instant::now()
+                    .checked_sub(RELOAD_TTL + Duration::from_millis(100))
+                    .unwrap(),
             }),
             allowed_ports: vec![443],
             log_file: None,
@@ -1168,8 +1183,9 @@ mod tests {
         .unwrap();
 
         // Force TTL expiry
-        state.private_domains_cache.lock().unwrap().last_attempt =
-            Instant::now() - RELOAD_TTL - Duration::from_millis(100);
+        state.private_domains_cache.lock().unwrap().last_attempt = Instant::now()
+            .checked_sub(RELOAD_TTL + Duration::from_millis(100))
+            .unwrap();
 
         let domains = state.get_private_domains();
         assert!(domains.contains(&"new.nav.no".to_string()));
@@ -1254,7 +1270,9 @@ mod tests {
             allowed_domains_file: Some(path.clone()),
             allowlist_cache: Mutex::new(DomainCache {
                 domains: vec!["github.com".to_string()],
-                last_attempt: Instant::now() - RELOAD_TTL - Duration::from_millis(100),
+                last_attempt: Instant::now()
+                    .checked_sub(RELOAD_TTL + Duration::from_millis(100))
+                    .unwrap(),
             }),
             cli_private_domains: Vec::new(),
             config_file: None,
@@ -1270,8 +1288,9 @@ mod tests {
 
         // Edit file
         std::fs::write(&path, "github.com\nnpm.pkg.github.com\n").unwrap();
-        state.allowlist_cache.lock().unwrap().last_attempt =
-            Instant::now() - RELOAD_TTL - Duration::from_millis(100);
+        state.allowlist_cache.lock().unwrap().last_attempt = Instant::now()
+            .checked_sub(RELOAD_TTL + Duration::from_millis(100))
+            .unwrap();
 
         let domains = state.get_allowed_domains();
         assert!(domains.contains(&"npm.pkg.github.com".to_string()));

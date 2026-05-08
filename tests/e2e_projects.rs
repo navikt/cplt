@@ -762,10 +762,10 @@ fi
         let config_path = config_dir.join("config.toml");
         fs::write(
             &config_path,
-            r#"
+            r"
 [sandbox]
 allow_env_files = true
-"#,
+",
         )
         .unwrap();
 
@@ -1502,7 +1502,7 @@ public class App {
             );
             p.write_file(
                 "src/test/java/com/example/AppTest.java",
-                r#"package com.example;
+                r"package com.example;
 
 import org.junit.Test;
 import static org.junit.Assert.assertEquals;
@@ -1513,7 +1513,7 @@ public class AppTest {
         assertEquals(3, new App().add(1, 2));
     }
 }
-"#,
+",
             );
             p.write_file(
                 "src/main/resources/application.properties",

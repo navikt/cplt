@@ -1,3 +1,8 @@
+//! Environment variable construction for sandboxed processes.
+//!
+//! Filters the parent environment through an allowlist and injects
+//! hardening variables (e.g. `TMPDIR`, `NODE_OPTIONS`).
+
 use std::path::Path;
 
 use crate::agent::Agent;

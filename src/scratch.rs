@@ -111,9 +111,8 @@ impl ScratchDir {
             return;
         }
 
-        let entries = match std::fs::read_dir(&base) {
-            Ok(e) => e,
-            Err(_) => return,
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            return;
         };
 
         let now = SystemTime::now();
@@ -127,22 +126,19 @@ impl ScratchDir {
             }
 
             // Only delete entries that look like our session IDs (hex UUID)
-            let name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
             };
             if !is_session_id(&name) {
                 continue;
             }
 
             // Check age via directory modification time
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
+            let Ok(metadata) = entry.metadata() else {
+                continue;
             };
-            let modified = match metadata.modified() {
-                Ok(t) => t,
-                Err(_) => continue,
+            let Ok(modified) = metadata.modified() else {
+                continue;
             };
 
             if let Ok(age) = now.duration_since(modified)

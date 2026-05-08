@@ -1,3 +1,5 @@
+//! Unknown-key detection and typo suggestions.
+
 use super::types::Config;
 
 // ── Config validation (unknown key detection) ────────────────────────
@@ -41,6 +43,7 @@ pub struct ConfigDiagnostic {
 }
 
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum DiagnosticLevel {
     Error,
     Warning,
@@ -110,14 +113,14 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
 
     // Warn about dangerous settings
     if let Some(sandbox) = table.get("sandbox").and_then(|v| v.as_table()) {
-        if sandbox.get("inherit_env").and_then(|v| v.as_bool()) == Some(true) {
+        if sandbox.get("inherit_env").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
                 message: "sandbox.inherit_env = true: all env vars will be exposed (DANGEROUS)"
                     .to_string(),
             });
         }
-        if sandbox.get("allow_tmp_exec").and_then(|v| v.as_bool()) == Some(true) {
+        if sandbox.get("allow_tmp_exec").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
                 message: "sandbox.allow_tmp_exec = true: exec from temp dirs enabled (DANGEROUS)"
@@ -126,7 +129,7 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
         }
         if sandbox
             .get("allow_cache_exec_any")
-            .and_then(|v| v.as_bool())
+            .and_then(toml::Value::as_bool)
             == Some(true)
         {
             diagnostics.push(ConfigDiagnostic {
@@ -135,14 +138,18 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
                     .to_string(),
             });
         }
-        if sandbox.get("allow_gpg_signing").and_then(|v| v.as_bool()) == Some(true) {
+        if sandbox
+            .get("allow_gpg_signing")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
                 message: "sandbox.allow_gpg_signing = true: GPG agent socket exposed — signing requests possible (DANGEROUS)"
                     .to_string(),
             });
         }
-        if sandbox.get("allow_docker").and_then(|v| v.as_bool()) == Some(true) {
+        if sandbox.get("allow_docker").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
                 message: "sandbox.allow_docker = true: Docker socket exposed — container mounts bypass sandbox (DANGEROUS)"
@@ -220,7 +227,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
     }
     for (i, a_char) in a.iter().enumerate() {
         for (j, b_char) in b.iter().enumerate() {
-            let cost = if a_char == b_char { 0 } else { 1 };
+            let cost = usize::from(a_char != b_char);
             matrix[i + 1][j + 1] = (matrix[i][j + 1] + 1)
                 .min(matrix[i + 1][j] + 1)
                 .min(matrix[i][j] + cost);

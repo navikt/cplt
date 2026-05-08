@@ -1,3 +1,8 @@
+//! Sandbox policy constants, deny lists, and environment allowlists.
+//!
+//! Defines the security policy shared by macOS Seatbelt and Linux Landlock:
+//! path validation, tool directory permissions, and hardening env vars.
+
 use std::path::Path;
 
 /// Characters that would break SBPL profile string interpolation.
@@ -268,6 +273,7 @@ pub(super) const SCRATCH_DIR_ENV_VARS: &[&str] = &[
 /// Opt-outs are per-category, not per-variable — users accept a *risk*,
 /// not toggle a specific tool's knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HardeningCategory {
     /// Block npm/yarn/pnpm `postinstall` hooks — the #1 supply chain entry point.
     LifecycleScripts,

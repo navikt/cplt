@@ -1,3 +1,5 @@
+//! TOML document manipulation for `cplt config set/unset/add`.
+
 use std::path::PathBuf;
 
 use super::error::ConfigError;
@@ -31,7 +33,7 @@ fn parse_value_for_key(
                     key_info.section, key_info.key
                 )));
             }
-            Ok(toml_edit::value(n as i64).into_value().unwrap())
+            Ok(toml_edit::value(i64::from(n)).into_value().unwrap())
         }
         ConfigValueType::Str => Ok(toml_edit::value(value).into_value().unwrap()),
         ConfigValueType::U16Array => {
@@ -47,7 +49,7 @@ fn parse_value_for_key(
                 if n == 0 {
                     return Err(ConfigError::Validation("port 0 is not valid".to_string()));
                 }
-                arr.push(n as i64);
+                arr.push(i64::from(n));
             }
             Ok(toml_edit::Value::Array(arr))
         }
@@ -75,7 +77,7 @@ fn parse_element_for_key(
             if n == 0 {
                 return Err(ConfigError::Validation("port 0 is not valid".to_string()));
             }
-            Ok(toml_edit::value(n as i64).into_value().unwrap())
+            Ok(toml_edit::value(i64::from(n)).into_value().unwrap())
         }
         ConfigValueType::StrArray => {
             if value.contains(',') {
@@ -136,30 +138,27 @@ pub fn append_value_in_doc(
             key_info.section
         ))
     })?;
-    match section.get_mut(key_info.key) {
-        Some(item) => {
-            if let Some(arr) = item.as_array_mut() {
-                // Skip if already present (idempotent)
-                if !array_contains(arr, &element) {
-                    arr.push_formatted(element);
-                }
-                Ok(())
-            } else {
-                Err(ConfigError::Validation(format!(
-                    "{}.{} exists but is not an array",
-                    key_info.section, key_info.key
-                )))
+    if let Some(item) = section.get_mut(key_info.key) {
+        if let Some(arr) = item.as_array_mut() {
+            // Skip if already present (idempotent)
+            if !array_contains(arr, &element) {
+                arr.push_formatted(element);
             }
-        }
-        None => {
-            let mut arr = toml_edit::Array::new();
-            arr.push_formatted(element);
-            section.insert(
-                key_info.key,
-                toml_edit::Item::Value(toml_edit::Value::Array(arr)),
-            );
             Ok(())
+        } else {
+            Err(ConfigError::Validation(format!(
+                "{}.{} exists but is not an array",
+                key_info.section, key_info.key
+            )))
         }
+    } else {
+        let mut arr = toml_edit::Array::new();
+        arr.push_formatted(element);
+        section.insert(
+            key_info.key,
+            toml_edit::Item::Value(toml_edit::Value::Array(arr)),
+        );
+        Ok(())
     }
 }
 
@@ -246,14 +245,14 @@ fn format_edit_value(item: &toml_edit::Item) -> String {
             let items: Vec<String> = arr
                 .iter()
                 .map(|v| match v {
-                    toml_edit::Value::String(s) => s.value().to_string(),
+                    toml_edit::Value::String(s) => s.value().clone(),
                     toml_edit::Value::Integer(i) => i.value().to_string(),
                     other => other.to_string(),
                 })
                 .collect();
             format!("[{}]", items.join(", "))
         }
-        toml_edit::Item::Value(toml_edit::Value::String(s)) => s.value().to_string(),
+        toml_edit::Item::Value(toml_edit::Value::String(s)) => s.value().clone(),
         toml_edit::Item::Value(toml_edit::Value::Integer(i)) => i.value().to_string(),
         toml_edit::Item::Value(toml_edit::Value::Boolean(b)) => b.value().to_string(),
         other => other.to_string(),

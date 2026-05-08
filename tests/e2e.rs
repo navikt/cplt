@@ -254,8 +254,10 @@ mod e2e_tests {
             .lines()
             .find(|l| l.contains("Project:"))
             .and_then(|l| l.split("Project:").nth(1))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| project_dir().to_string_lossy().to_string());
+            .map_or_else(
+                || project_dir().to_string_lossy().to_string(),
+                |s| s.trim().to_string(),
+            );
 
         assert!(output.status.success());
         assert!(
@@ -929,19 +931,16 @@ mod e2e_tests {
 
         let handle = std::thread::spawn(move || child.wait_with_output());
 
-        match handle.join() {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                (stdout, stderr, output.status.success())
+        if let Ok(Ok(output)) = handle.join() {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            (stdout, stderr, output.status.success())
+        } else {
+            // Kill the process if the thread panicked
+            unsafe {
+                libc::kill(id as i32, libc::SIGKILL);
             }
-            _ => {
-                // Kill the process if the thread panicked
-                unsafe {
-                    libc::kill(id as i32, libc::SIGKILL);
-                }
-                panic!("cplt timed out after {timeout_secs}s or thread panicked");
-            }
+            panic!("cplt timed out after {timeout_secs}s or thread panicked");
         }
     }
 

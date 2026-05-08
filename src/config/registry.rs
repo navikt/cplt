@@ -1,3 +1,5 @@
+//! Config key metadata registry (names, types, docs).
+
 use super::error::ConfigError;
 use super::validation::suggest_key;
 
@@ -5,6 +7,7 @@ use super::validation::suggest_key;
 
 /// The type of a config value, used for parsing and display.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum ConfigValueType {
     Bool,
     U16,
@@ -281,7 +284,7 @@ pub fn lookup_key(dotted: &str) -> Result<&'static ConfigKeyInfo, ConfigError> {
                 .iter()
                 .map(|k| format!("{}.{}", k.section, k.key))
                 .collect();
-            let all_refs: Vec<&str> = all_dotted.iter().map(|s| s.as_str()).collect();
+            let all_refs: Vec<&str> = all_dotted.iter().map(std::string::String::as_str).collect();
             let suggestion = suggest_key(dotted, &all_refs);
             let hint = suggestion
                 .map(|s| format!("\n  Did you mean '{s}'?"))

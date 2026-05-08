@@ -101,6 +101,7 @@ pub struct Release {
 
 /// Result of comparing current vs latest version.
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum VersionStatus {
     /// Already on the latest version.
     UpToDate,
@@ -129,12 +130,16 @@ pub fn fetch_latest_release(current_version: &str) -> Result<Release, UpdateErro
 
     for rel in &releases {
         // Skip drafts and prereleases
-        if rel.get("draft").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if rel
+            .get("draft")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
             continue;
         }
         if rel
             .get("prerelease")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         {
             continue;
@@ -350,8 +355,7 @@ pub fn looks_like_version(s: &str) -> bool {
 pub fn version_date(version: &str) -> &str {
     version
         .rsplit_once('-')
-        .map(|(prefix, _)| prefix)
-        .unwrap_or(version)
+        .map_or(version, |(prefix, _)| prefix)
 }
 
 /// Parse SHA256SUMS content and find the hash for a given asset.
@@ -455,11 +459,11 @@ fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), UpdateErro
         .output()
         .map_err(|e| UpdateError::Io(format!("Cannot run /usr/bin/curl: {e}")))?;
 
-    if !output.status.success() {
+    if output.status.success() {
+        Ok(())
+    } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(UpdateError::DownloadFailed(stderr.into_owned()))
-    } else {
-        Ok(())
     }
 }
 
@@ -477,7 +481,7 @@ fn compute_sha256(path: &Path) -> Result<String, UpdateError> {
     stdout
         .split_whitespace()
         .next()
-        .map(|h| h.to_lowercase())
+        .map(str::to_lowercase)
         .ok_or(UpdateError::HashParse)
 }
 
@@ -563,11 +567,11 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
         .output()
         .map_err(|e| UpdateError::Io(format!("Cannot extract archive: {e}")))?;
 
-    if !output.status.success() {
+    if output.status.success() {
+        Ok(())
+    } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(UpdateError::ExtractionFailed(stderr.into_owned()))
-    } else {
-        Ok(())
     }
 }
 
@@ -644,14 +648,12 @@ fn is_writable(path: &Path) -> bool {
         std::fs::OpenOptions::new().write(true).open(path).is_ok()
     } else {
         // Check if parent directory is writable
-        path.parent()
-            .map(|p| {
-                let probe = p.join(".cplt_write_probe");
-                let ok = std::fs::File::create(&probe).is_ok();
-                let _ = std::fs::remove_file(&probe);
-                ok
-            })
-            .unwrap_or(false)
+        path.parent().is_some_and(|p| {
+            let probe = p.join(".cplt_write_probe");
+            let ok = std::fs::File::create(&probe).is_ok();
+            let _ = std::fs::remove_file(&probe);
+            ok
+        })
     }
 }
 

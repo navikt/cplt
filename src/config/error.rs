@@ -1,3 +1,5 @@
+//! Typed configuration errors ([`ConfigError`]).
+
 use std::path::PathBuf;
 
 /// Structured error type for configuration operations.

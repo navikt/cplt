@@ -10,6 +10,7 @@ use std::str::FromStr;
 
 /// Supported AI coding agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Agent {
     /// GitHub Copilot CLI (default).
     Copilot,
@@ -92,12 +93,10 @@ impl Agent {
 
                 let config_base = std::env::var("XDG_CONFIG_HOME")
                     .ok()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".config"));
+                    .map_or_else(|| home.join(".config"), PathBuf::from);
                 let data_base = std::env::var("XDG_DATA_HOME")
                     .ok()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local/share"));
+                    .map_or_else(|| home.join(".local/share"), PathBuf::from);
 
                 match shell_name {
                     "fish" => vec![
@@ -127,22 +126,19 @@ impl Agent {
                 // Respect XDG_CONFIG_HOME for config dir
                 let config_base = std::env::var("XDG_CONFIG_HOME")
                     .ok()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".config"));
+                    .map_or_else(|| home.join(".config"), PathBuf::from);
                 let config_dir = config_base.join("opencode");
 
                 // Respect XDG_DATA_HOME for data dir (sessions, SQLite DB)
                 let data_base = std::env::var("XDG_DATA_HOME")
                     .ok()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local/share"));
+                    .map_or_else(|| home.join(".local/share"), PathBuf::from);
                 let data_dir = data_base.join("opencode");
 
                 // Respect XDG_STATE_HOME for state data dir (locks, history, statistics)
                 let state_base = std::env::var("XDG_STATE_HOME")
                     .ok()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local/state"));
+                    .map_or_else(|| home.join(".local/state"), PathBuf::from);
                 let state_dir = state_base.join("opencode");
 
                 vec![

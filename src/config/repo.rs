@@ -1,3 +1,5 @@
+//! Per-repository config overrides (`.cplt.toml`).
+
 use super::error::ConfigError;
 use super::registry::{ConfigKeyInfo, ConfigValueType};
 
@@ -5,6 +7,7 @@ use super::registry::{ConfigKeyInfo, ConfigValueType};
 
 /// Mapping from global config key to repo config location.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum RepoKeyTarget {
     /// Goes under [propose] as a top-level boolean.
     ProposeBool,
@@ -152,13 +155,11 @@ pub fn set_repo_value_in_doc(
                             "expected port number (1-65535), got '{value}'"
                         ))
                     })?;
-                    if !arr.iter().any(|v| v.as_integer() == Some(port as i64)) {
-                        arr.push(port as i64);
+                    if !arr.iter().any(|v| v.as_integer() == Some(i64::from(port))) {
+                        arr.push(i64::from(port));
                     }
-                } else {
-                    if !arr.iter().any(|v| v.as_str() == Some(value)) {
-                        arr.push(value);
-                    }
+                } else if !arr.iter().any(|v| v.as_str() == Some(value)) {
+                    arr.push(value);
                 }
             }
         }

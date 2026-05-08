@@ -27,3 +27,34 @@ lto = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Allow patterns that are idiomatic in this codebase or too noisy:
+missing_errors_doc = "allow"          # 25+ public Result-returning fns
+missing_panics_doc = "allow"          # sandbox code intentionally panics on invariant violations
+module_name_repetitions = "allow"     # e.g. config::ConfigError is clear
+too_many_lines = "allow"              # long functions are sometimes clearer than forced splits
+must_use_candidate = "allow"          # too noisy — we add #[must_use] manually where it matters
+doc_markdown = "allow"                # backtick-wrapping every identifier is excessive
+struct_excessive_bools = "allow"      # Config/CliFlags legitimately use many bools
+cast_possible_truncation = "allow"    # date math and exit code conversions are bounded
+cast_sign_loss = "allow"              # date math conversions are bounded
+cast_possible_wrap = "allow"          # date math conversions are bounded
+unreadable_literal = "allow"          # calendar algorithm constants (146097, 719468)
+items_after_statements = "allow"      # local helper fns after setup are clear
+many_single_char_names = "allow"      # date destructuring (y, m, d, h, s)
+needless_pass_by_value = "allow"      # Arc<T> params in proxy threads need owned values
+match_same_arms = "allow"             # explicit per-variant arms document intent
+trivially_copy_pass_by_ref = "allow"  # small IP-address helper fns are fine with &
+case_sensitive_file_extension_comparisons = "allow" # domain names are not file paths
+comparison_chain = "allow"            # if/else-if date comparisons are clearer than match
+fn_params_excessive_bools = "allow"   # some functions legitimately take multiple bool flags
+similar_names = "allow"               # domain-specific names (e.g. current/latest) are clear
+manual_string_new = "allow"           # String::new() vs "".to_string() are both fine
+format_collect = "allow"              # hex formatting via map(format!).collect() is idiomatic
+unnested_or_patterns = "allow"        # explicit arms with comments are clearer for magic bytes
+

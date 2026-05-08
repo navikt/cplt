@@ -1,3 +1,8 @@
+//! macOS SBPL sandbox profile generation.
+//!
+//! Builds a Seatbelt Profile Language string from [`ProfileOptions`],
+//! encoding filesystem, network, and process rules for `sandbox-exec`.
+
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 

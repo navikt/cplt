@@ -1,3 +1,5 @@
+//! Configuration types: structs, enums, and defaults.
+
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -6,6 +8,7 @@ use std::path::PathBuf;
 /// Keeps Clap's two boolean flags but converts them to a single value
 /// at the merge boundary. `from_pair()` rejects contradictory inputs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FeatureToggle {
     /// Explicitly enabled via CLI flag (e.g. `--with-proxy`).
     ForceOn,
@@ -131,7 +134,7 @@ pub struct SandboxConfig {
     /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
     pub allow_tmp_exec: Option<bool>,
     /// Specific ~/Library/Caches subdirectories to allow process execution from.
-    /// e.g. ["ms-playwright", "pnpm/dlx"] to allow Playwright and pnpm dlx caches.
+    /// e.g. `["ms-playwright", "pnpm/dlx"]` to allow Playwright and pnpm dlx caches.
     /// No exec is allowed from ~/Library/Caches by default (binary-drop staging risk).
     pub allow_cache_exec: Vec<String>,
     /// Allow process execution from ALL ~/Library/Caches subdirectories (default: false).

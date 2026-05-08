@@ -84,6 +84,7 @@ pub struct ProposeProxySection {
 
 /// How the repo config was loaded — used for user-facing messages.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum RepoConfigSource {
     /// Read from `git cat-file blob HEAD:.cplt.toml` (tamper-proof).
     GitHead,
@@ -306,12 +307,12 @@ env = ["MY_SECRET", "VAULT_TOKEN"]
 
     #[test]
     fn parse_propose_booleans() {
-        let toml = r#"
+        let toml = r"
 [propose]
 allow_localhost_any = true
 allow_jvm_attach = true
 allow_docker = true
-"#;
+";
         let config = parse_repo_config(toml).unwrap();
         assert_eq!(config.propose.allow_localhost_any, Some(true));
         assert_eq!(config.propose.allow_jvm_attach, Some(true));
@@ -385,19 +386,19 @@ allow_private_domains = ["intern.nav.no"]
 
     #[test]
     fn reject_unknown_top_level_key() {
-        let toml = r#"
+        let toml = r"
 unknown_key = true
-"#;
+";
         let err = parse_repo_config(toml).unwrap_err();
         assert!(err.contains("unknown field"), "got: {err}");
     }
 
     #[test]
     fn reject_unknown_propose_key() {
-        let toml = r#"
+        let toml = r"
 [propose]
 allow_network = true
-"#;
+";
         let err = parse_repo_config(toml).unwrap_err();
         assert!(err.contains("unknown field"), "got: {err}");
     }

@@ -1,3 +1,5 @@
+//! CLI entry point and subcommand dispatch.
+
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use cplt::{agent, config, discover, proxy, repo_config, sandbox, scratch, trust, update};
@@ -540,6 +542,7 @@ fn source_label(source: repo_config::RepoConfigSource) -> &'static str {
     match source {
         repo_config::RepoConfigSource::GitHead => SOURCE_GIT_HEAD,
         repo_config::RepoConfigSource::WorkingTree => SOURCE_WORKING_TREE,
+        _ => "unknown",
     }
 }
 
@@ -574,18 +577,14 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
 
     // Try to open /dev/tty for the controlling terminal.
     // This works even if stdin is piped.
-    let tty = match std::fs::OpenOptions::new()
+    let Ok(tty) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
-    {
-        Ok(f) => f,
-        Err(_) => {
-            return Err(
-                "No TTY available for confirmation. Use --yes for non-interactive runs."
-                    .to_string(),
-            );
-        }
+    else {
+        return Err(
+            "No TTY available for confirmation. Use --yes for non-interactive runs.".to_string(),
+        );
     };
 
     if quiet {
@@ -624,7 +623,7 @@ fn canonicalize_paths(paths: &[PathBuf], flag_name: &str) -> Vec<PathBuf> {
         .filter_map(|p| match std::fs::canonicalize(p) {
             Ok(c) => Some(c),
             Err(e) => {
-                ui::warn(&format!("{flag_name} path {:?}: {e}", p));
+                ui::warn(&format!("{flag_name} path {}: {e}", p.display()));
                 None
             }
         })
@@ -638,9 +637,9 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
         .map(|p| {
             std::fs::canonicalize(p).with_context(|| {
                 format!(
-                    "--deny-path {:?} cannot be resolved.\n\
+                    "--deny-path {} cannot be resolved.\n\
                      Silently dropping deny rules is a security risk.",
-                    p
+                    p.display()
                 )
             })
         })
@@ -754,6 +753,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                         ui::warn(&format!(".cplt.toml source: {SOURCE_WORKING_TREE}",));
                         " (working tree)"
                     }
+                    _ => "",
                 };
                 ui::info(&format!("Repo config: .cplt.toml{source_note}"));
             }
@@ -763,7 +763,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                 // --accept-repo-config: approve everything
                 repo_config::proposed_keys(&loaded.config.propose)
                     .iter()
-                    .map(|s| s.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect()
             } else {
                 // Check trust store — validate content hash
@@ -788,7 +788,10 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                 }
             };
 
-            let approved_refs: Vec<&str> = approved_keys.iter().map(|s| s.as_str()).collect();
+            let approved_refs: Vec<&str> = approved_keys
+                .iter()
+                .map(std::string::String::as_str)
+                .collect();
             unapproved_proposals = resolved.apply_repo_config(&loaded.config, &approved_refs);
         }
         Ok(None) => {} // No .cplt.toml — nothing to do
@@ -913,7 +916,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
 fn start_proxy_if_enabled(
     resolved: &mut config::Resolved,
     cli: &Cli,
-    config_path: &Option<PathBuf>,
+    config_path: Option<&PathBuf>,
 ) -> anyhow::Result<Option<proxy::ProxyHandle>> {
     if !resolved.with_proxy || cli.print_profile {
         return Ok(None);
@@ -923,7 +926,7 @@ fn start_proxy_if_enabled(
         // Look for blocked-domains.txt next to the binary, then blocked.txt
         let exe_dir = std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
         if let Some(ref dir) = exe_dir {
             let preferred = dir.join("blocked-domains.txt");
             if preferred.exists() {
@@ -985,7 +988,7 @@ fn start_proxy_if_enabled(
             .filter(|d| !cli.allow_private_domains.contains(d))
             .cloned()
             .collect(),
-        config_file: config_path.clone(),
+        config_file: config_path.cloned(),
         log_file: resolved.proxy_log_file.clone(),
         log_level: resolved.proxy_log_level,
     }) {
@@ -1073,7 +1076,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     } else {
         None
     };
-    let scratch_path = scratch_guard.as_ref().map(|s| s.path());
+    let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
 
     // Resolve the agent binary early so its installation directory
     // can be included in the sandbox profile. Failure is deferred —
@@ -1088,7 +1091,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 discover::copilot_pkg_dir(p, &home_dir).or_else(|| {
                     // Fallback: use the binary's parent directory (VS Code extension installs
                     // at ~/Library/Application Support/Code/.../copilotCli/copilot)
-                    p.parent().map(|d| d.to_path_buf())
+                    p.parent().map(std::path::Path::to_path_buf)
                 })
             })
             .filter(|d| !crate::is_unsafe_root(d, &home_dir))
@@ -1097,7 +1100,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         agent_bin_result
             .as_ref()
             .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
             .filter(|d| !crate::is_unsafe_root(d, &home_dir))
     };
 
@@ -1122,7 +1125,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let agent_dirs = active_agent.config_dirs(&home_dir);
 
     // Start proxy (handle returned for RAII ownership)
-    let proxy_handle = start_proxy_if_enabled(&mut resolved, &cli, &config_path)?;
+    let proxy_handle = start_proxy_if_enabled(&mut resolved, &cli, config_path.as_ref())?;
 
     // Prepare the sandbox — validates paths, generates platform-specific profile.
     // Path validation (SBPL injection checks on macOS) is handled internally
@@ -1266,6 +1269,14 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
+            // Broken pipe (e.g. `cplt config show | head`) — exit silently per Unix convention.
+            for cause in e.chain() {
+                if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+                    && io_err.kind() == std::io::ErrorKind::BrokenPipe
+                {
+                    return ExitCode::SUCCESS;
+                }
+            }
             ui::error(&format!("{e:#}"));
             ExitCode::FAILURE
         }
@@ -1322,18 +1333,17 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 }
 
 fn run_doctor() -> ExitCode {
-    let home_dir = match std::env::var("HOME") {
-        Ok(h) => match std::fs::canonicalize(&h) {
+    let home_dir = if let Ok(h) = std::env::var("HOME") {
+        match std::fs::canonicalize(&h) {
             Ok(p) => p,
             Err(e) => {
                 ui::error(&format!("Cannot resolve $HOME ({h}): {e}"));
                 return ExitCode::FAILURE;
             }
-        },
-        Err(_) => {
-            ui::error("$HOME not set");
-            return ExitCode::FAILURE;
         }
+    } else {
+        ui::error("$HOME not set");
+        return ExitCode::FAILURE;
     };
 
     let project_dir = if let Some(root) = detect_project_root() {
@@ -1465,6 +1475,9 @@ fn run_config_validate() -> ExitCode {
             config::DiagnosticLevel::Warning => {
                 ui::warn(&d.message);
             }
+            _ => {
+                ui::info(&d.message);
+            }
         }
     }
 
@@ -1544,15 +1557,16 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
 
     // [propose]
     let proposed = repo_config::proposed_keys(&rc.propose);
-    if !proposed.is_empty() {
+    if proposed.is_empty() {
+        println!("{blue}[cplt]{nc}  {dim}No additional permissions requested.{nc}");
+    } else {
         let trust_entry = crate::trust::load_trust(project_dir);
 
         // Determine overall approval status for the header
         let all_approved = proposed.iter().all(|key| {
             trust_entry
                 .as_ref()
-                .map(|t| crate::trust::is_key_approved(t, key))
-                .unwrap_or(false)
+                .is_some_and(|t| crate::trust::is_key_approved(t, key))
         });
         let header_status = if all_approved {
             format!("{green}{LABEL_ALLOW_APPROVED}{nc}")
@@ -1579,8 +1593,7 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
             if let Some(v) = val {
                 let approved = trust_entry
                     .as_ref()
-                    .map(|t| crate::trust::is_key_approved(t, name))
-                    .unwrap_or(false);
+                    .is_some_and(|t| crate::trust::is_key_approved(t, name));
                 let status = if approved {
                     format!("{green}{STATUS_APPROVED}{nc}")
                 } else {
@@ -1621,23 +1634,18 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
                 rc.propose.proxy.allow_private_domains
             );
         }
-    } else {
-        println!("{blue}[cplt]{nc}  {dim}No additional permissions requested.{nc}");
     }
 
     println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
 }
 
 fn run_config_path() -> ExitCode {
-    match config::config_path() {
-        Some(p) => {
-            println!("{}", p.display());
-            ExitCode::SUCCESS
-        }
-        None => {
-            ui::error("Cannot determine config path ($HOME not set)");
-            ExitCode::FAILURE
-        }
+    if let Some(p) = config::config_path() {
+        println!("{}", p.display());
+        ExitCode::SUCCESS
+    } else {
+        ui::error("Cannot determine config path ($HOME not set)");
+        ExitCode::FAILURE
     }
 }
 
@@ -1837,18 +1845,15 @@ fn run_config_set_repo(
     let repo_config_path = project_dir.join(".cplt.toml");
 
     // Check if key is valid in repo config
-    let target = match config::repo_key_target(key_info) {
-        Some(t) => t,
-        None => {
-            let reason = config::repo_key_rejection_reason(key_info);
-            ui::error(&format!(
-                "{key} is not valid in repo config.\n  \
-                 Reason: {reason}.\n  \
-                 Use: cplt config set {key} {}",
-                value.unwrap_or("<VALUE>")
-            ));
-            return ExitCode::FAILURE;
-        }
+    let Some(target) = config::repo_key_target(key_info) else {
+        let reason = config::repo_key_rejection_reason(key_info);
+        ui::error(&format!(
+            "{key} is not valid in repo config.\n  \
+             Reason: {reason}.\n  \
+             Use: cplt config set {key} {}",
+            value.unwrap_or("<VALUE>")
+        ));
+        return ExitCode::FAILURE;
     };
 
     // Dangerous key safeguard (still applies for repo permissions)
@@ -1925,6 +1930,7 @@ fn run_config_set_repo(
             | config::RepoKeyTarget::ProposeAllow(_)
             | config::RepoKeyTarget::ProposeProxy(_) => "propose",
             config::RepoKeyTarget::Deny(_) => "deny",
+            _ => "unknown",
         };
         ui::ok(&format!("{key} = {val} → .cplt.toml [{section_name}]"));
     }
@@ -1966,8 +1972,8 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
         }
     };
 
-    match key {
-        Some(k) => match config::lookup_key(k) {
+    if let Some(k) = key {
+        match config::lookup_key(k) {
             Ok(info) => {
                 config::explain_key(info, loaded.as_ref());
                 ExitCode::SUCCESS
@@ -1976,11 +1982,10 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
                 ui::error(&e.to_string());
                 ExitCode::FAILURE
             }
-        },
-        None => {
-            config::explain_all(loaded.as_ref());
-            ExitCode::SUCCESS
         }
+    } else {
+        config::explain_all(loaded.as_ref());
+        ExitCode::SUCCESS
     }
 }
 
@@ -2058,8 +2063,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         && proposed.iter().all(|&key| {
             trust_entry
                 .as_ref()
-                .map(|t| trust::is_key_approved(t, key))
-                .unwrap_or(false)
+                .is_some_and(|t| trust::is_key_approved(t, key))
         });
     if proposed.is_empty() {
         println!("{blue}[cplt]{nc}  No additional permissions requested.");
@@ -2074,8 +2078,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             let approved = !hash_mismatch
                 && trust_entry
                     .as_ref()
-                    .map(|t| trust::is_key_approved(t, key))
-                    .unwrap_or(false);
+                    .is_some_and(|t| trust::is_key_approved(t, key));
             let status = if approved {
                 format!("{green}{STATUS_APPROVED}{nc}")
             } else {
@@ -2119,7 +2122,10 @@ fn trust_accept(
 
     // Determine which keys to accept
     let keys_to_accept: Vec<String> = if all {
-        proposed.iter().map(|s| s.to_string()).collect()
+        proposed
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect()
     } else {
         // Validate that requested keys are actually proposed
         for key in keys {
@@ -2203,12 +2209,9 @@ fn trust_revoke(
     }
 
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
-    let mut entry = match trust::load_trust(project_dir) {
-        Some(e) => e,
-        None => {
-            ui::info("No trust entry exists for this repository.");
-            return ExitCode::SUCCESS;
-        }
+    let Some(mut entry) = trust::load_trust(project_dir) else {
+        ui::info("No trust entry exists for this repository.");
+        return ExitCode::SUCCESS;
     };
 
     // Validate keys
@@ -2329,6 +2332,10 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
             }
             do_update(&tag)
         }
+        _ => {
+            ui::info(&format!("✓ cplt is up to date ({LONG_VERSION})"));
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -2351,12 +2358,11 @@ fn do_update(tag: &str) -> ExitCode {
 /// and appends an eval line. Idempotent — won't add duplicates.
 fn shell_install() -> ExitCode {
     let shell = std::env::var("SHELL").unwrap_or_default();
-    let home = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h),
-        Err(_) => {
-            ui::error("$HOME not set");
-            return ExitCode::FAILURE;
-        }
+    let home = if let Ok(h) = std::env::var("HOME") {
+        PathBuf::from(h)
+    } else {
+        ui::error("$HOME not set");
+        return ExitCode::FAILURE;
     };
 
     let (rc_file, setup_line) = if shell.ends_with("/fish") {
@@ -2544,9 +2550,8 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
         return Ok(());
     }
 
-    let binary_id = match binary_identity(copilot_bin) {
-        Some(id) => id,
-        None => return Ok(()),
+    let Some(binary_id) = binary_identity(copilot_bin) else {
+        return Ok(());
     };
 
     let pkg_base = home
@@ -2697,9 +2702,8 @@ fn try_extraction_fallback(
         .stderr(std::process::Stdio::null())
         .spawn();
 
-    let mut child = match child {
-        Ok(c) => c,
-        Err(_) => return None,
+    let Ok(mut child) = child else {
+        return None;
     };
 
     for _ in 0..60 {
@@ -2742,9 +2746,8 @@ fn binary_identity(path: &Path) -> Option<String> {
 #[cfg(target_os = "macos")]
 fn is_macho_binary(path: &Path) -> bool {
     use std::io::Read;
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
     };
     let mut magic = [0u8; 4];
     if f.read_exact(&mut magic).is_err() {

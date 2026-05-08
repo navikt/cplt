@@ -1,3 +1,5 @@
+//! Config file path resolution.
+
 use std::path::PathBuf;
 
 use super::error::ConfigError;
@@ -18,7 +20,9 @@ pub fn config_path() -> Option<PathBuf> {
 pub fn config_dir() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("CPLT_CONFIG") {
         // If custom config path is set, use its parent directory
-        return expand_tilde(&custom).parent().map(|p| p.to_path_buf());
+        return expand_tilde(&custom)
+            .parent()
+            .map(std::path::Path::to_path_buf);
     }
     std::env::var("HOME")
         .ok()

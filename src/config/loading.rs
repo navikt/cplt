@@ -1,3 +1,5 @@
+//! Config file loading, parsing, and CLI-flag merging.
+
 use std::path::PathBuf;
 
 use super::error::ConfigError;
@@ -101,7 +103,7 @@ impl Config {
         }
 
         // Allow-read: merge config + CLI
-        let config_dir = config_path().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let config_dir = config_path().and_then(|p| p.parent().map(std::path::Path::to_path_buf));
         let mut allow_read: Vec<PathBuf> = Vec::new();
         for s in &self.allow.read {
             match resolve_config_path(s, config_dir.as_ref()) {
@@ -472,7 +474,11 @@ impl Resolved {
                 "{blue}[cplt]{nc}    Outbound:      {green}443{nc}          {dim}HTTPS only{nc}"
             );
         } else {
-            let ports: Vec<String> = self.allow_ports.iter().map(|p| p.to_string()).collect();
+            let ports: Vec<String> = self
+                .allow_ports
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
             eprintln!(
                 "{blue}[cplt]{nc}    Outbound:      {green}443, {}{nc}",
                 ports.join(", ")
@@ -704,7 +710,7 @@ impl Resolved {
         all_proposed
             .into_iter()
             .filter(|key| !is_approved(key))
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect()
     }
 }

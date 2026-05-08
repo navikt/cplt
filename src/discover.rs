@@ -103,7 +103,7 @@ pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
     let env_tokens: Vec<String> = AUTH_ENV_VARS
         .iter()
         .filter(|var| std::env::var(var).is_ok_and(|v| !v.is_empty()))
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     let gh_cli_auth = std::process::Command::new("gh")
@@ -278,13 +278,13 @@ pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
     let existing_denied_dirs: Vec<String> = DENIED_DOTFILES
         .iter()
         .filter(|d| home_dir.join(d).exists())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     let existing_denied_files: Vec<String> = DENIED_FILES
         .iter()
         .filter(|f| home_dir.join(f).exists())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     let copilot_dir_exists = home_dir.join(".copilot").exists();
@@ -341,7 +341,13 @@ impl Discovery {
             ui::stdout_color(ui::BOLD),
             ui::stdout_color(ui::RESET)
         );
-        if !self.auth.env_tokens.is_empty() {
+        if self.auth.env_tokens.is_empty() {
+            println!(
+                "  {}⚠{} No env token set (COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN)",
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET)
+            );
+        } else {
             for var in &self.auth.env_tokens {
                 println!(
                     "  {}✓{} Env token: {var} is set",
@@ -349,12 +355,6 @@ impl Discovery {
                     ui::stdout_color(ui::RESET)
                 );
             }
-        } else {
-            println!(
-                "  {}⚠{} No env token set (COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN)",
-                ui::stdout_color(ui::YELLOW),
-                ui::stdout_color(ui::RESET)
-            );
         }
         if self.auth.gh_cli_auth {
             println!(
@@ -376,16 +376,16 @@ impl Discovery {
             );
         }
         print_keychain_status(self.auth.security_cli_exists);
-        if !self.auth.keytar_nodes.is_empty() {
+        if self.auth.keytar_nodes.is_empty() {
             println!(
-                "  {}✓{} keytar.node: found in ~/.copilot/pkg/",
-                ui::stdout_color(ui::GREEN),
+                "  {}⚠{} keytar.node: not found in ~/.copilot/pkg/",
+                ui::stdout_color(ui::YELLOW),
                 ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
-                "  {}⚠{} keytar.node: not found in ~/.copilot/pkg/",
-                ui::stdout_color(ui::YELLOW),
+                "  {}✓{} keytar.node: found in ~/.copilot/pkg/",
+                ui::stdout_color(ui::GREEN),
                 ui::stdout_color(ui::RESET)
             );
         }
@@ -574,7 +574,7 @@ impl Discovery {
             let all: Vec<&str> = dirs
                 .iter()
                 .chain(files.iter())
-                .map(|s| s.as_str())
+                .map(std::string::String::as_str)
                 .collect();
             println!(
                 "  {}✓{} Protected ({n_denied} found): {}",

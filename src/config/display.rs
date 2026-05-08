@@ -1,3 +1,5 @@
+//! Human-readable config display and `cplt config explain`.
+
 use super::path::config_path;
 use super::registry::{ConfigKeyInfo, type_label};
 use super::types::LoadedConfig;

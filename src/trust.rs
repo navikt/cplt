@@ -36,7 +36,7 @@ pub struct RepoIdentity {
 /// Which proposal keys have been approved.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct AcceptedProposals {
-    /// List of approved key names (e.g. ["allow_localhost_any", "allow_jvm_attach"]).
+    /// List of approved key names (e.g. `["allow_localhost_any", "allow_jvm_attach"]`).
     #[serde(default)]
     pub keys: Vec<String>,
     /// When approval was last updated (ISO 8601).
@@ -58,9 +58,10 @@ pub struct AcceptedProposals {
 pub fn repo_fingerprint(project_dir: &Path) -> String {
     let identity = canonical_remote(project_dir).unwrap_or_else(|| {
         // Canonicalize to handle symlinks/relative paths consistently
-        std::fs::canonicalize(project_dir)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| project_dir.to_string_lossy().into_owned())
+        std::fs::canonicalize(project_dir).map_or_else(
+            |_| project_dir.to_string_lossy().into_owned(),
+            |p| p.to_string_lossy().into_owned(),
+        )
     });
 
     use sha2::{Digest, Sha256};
@@ -117,10 +118,7 @@ pub fn normalize_remote_url(url: &str) -> String {
         && !path.starts_with("//")
         && user_host.contains('@')
     {
-        let host = user_host
-            .rsplit_once('@')
-            .map(|(_, h)| h)
-            .unwrap_or(user_host);
+        let host = user_host.rsplit_once('@').map_or(user_host, |(_, h)| h);
         let path = path.trim_end_matches(".git").trim_end_matches('/');
         return format!("{}/{}", host.to_lowercase(), path);
     }
@@ -294,13 +292,23 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
     }
 
     // Path/port proposals — sorted for order-independence
-    let mut read: Vec<&str> = propose.allow.read.iter().map(|s| s.as_str()).collect();
+    let mut read: Vec<&str> = propose
+        .allow
+        .read
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
     read.sort_unstable();
     for p in &read {
         hasher.update(format!("allow.read={p}\n").as_bytes());
     }
 
-    let mut write: Vec<&str> = propose.allow.write.iter().map(|s| s.as_str()).collect();
+    let mut write: Vec<&str> = propose
+        .allow
+        .write
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
     write.sort_unstable();
     for p in &write {
         hasher.update(format!("allow.write={p}\n").as_bytes());
@@ -322,7 +330,7 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
         .proxy
         .allow_private_domains
         .iter()
-        .map(|s| s.as_str())
+        .map(std::string::String::as_str)
         .collect();
     domains.sort_unstable();
     for d in &domains {

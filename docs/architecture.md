@@ -74,19 +74,26 @@ consider merging them.
 
 ### Application boundary (main.rs)
 
-Use `anyhow` for error propagation in `run()` and other orchestration code:
+Use `anyhow` for error propagation in `run()` and other orchestration code.
+Handle `BrokenPipe` errors silently per Unix convention:
 
 ```rust
-fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    let config = load_config(&cli).context("loading config")?;
-    // ...
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => code,
-        Err(e) => { ui::error(&format!("{e:#}")); ExitCode::FAILURE }
+        Err(e) => {
+            // Broken pipe (e.g. `cplt config show | head`) — exit silently.
+            for cause in e.chain() {
+                if let Some(io) = cause.downcast_ref::<std::io::Error>()
+                    && io.kind() == std::io::ErrorKind::BrokenPipe
+                {
+                    return ExitCode::SUCCESS;
+                }
+            }
+            ui::error(&format!("{e:#}"));
+            ExitCode::FAILURE
+        }
     }
 }
 ```
@@ -152,6 +159,58 @@ eprintln!("  {}✓{} passed", ui::color(ui::GREEN), ui::color(ui::RESET));
 - Never write raw `\x1b[` escape sequences. Use `ui::color()`.
 - Data goes to stdout (`println!`). Diagnostics go to stderr (`eprintln!`).
 - `ui::color()` returns `""` when color is disabled — safe to embed in format strings.
+
+---
+
+## Lints
+
+Clippy pedantic lints are enabled in `Cargo.toml`. Targeted allows suppress
+false positives without losing real value:
+
+```toml
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+# ... see Cargo.toml for full list with rationale
+```
+
+**Rules:**
+- All new code must pass `cargo clippy -- -D warnings` with zero warnings.
+- When adding an allow, document _why_ in the comment.
+- Prefer fixing the lint over allowing it unless it's genuinely noise.
+- Use `let...else` for early-return destructuring (not `match` with one arm).
+
+---
+
+## Module Documentation
+
+Every module has a `//!` doc comment explaining its purpose. Keep these
+brief (1–3 lines). Example:
+
+```rust
+//! HTTP CONNECT proxy with domain filtering.
+//!
+//! Intercepts outbound HTTPS connections from the sandboxed agent,
+//! enforcing blocked/allowed domain lists and private IP restrictions.
+```
+
+---
+
+## API Design
+
+### #[non_exhaustive]
+
+All public enums use `#[non_exhaustive]`. This allows adding variants without
+breaking downstream code. Match expressions must include a wildcard arm `_`.
+
+```rust
+#[non_exhaustive]
+pub enum VersionStatus {
+    UpToDate,
+    UpdateAvailable { ... },
+    // Future variants won't break callers
+}
+```
 
 ---
 

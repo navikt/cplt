@@ -1,3 +1,9 @@
+//! cplt — sandbox wrapper for AI coding agents.
+//!
+//! Runs AI agents (GitHub Copilot, OpenCode, Gemini CLI) inside a
+//! deny-by-default OS sandbox (macOS Seatbelt, Linux Landlock+seccomp),
+//! with a filtering CONNECT proxy for network control.
+
 pub mod agent;
 pub mod config;
 pub mod discover;

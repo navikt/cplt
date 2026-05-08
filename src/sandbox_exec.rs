@@ -1,3 +1,8 @@
+//! Sandbox process execution and signal forwarding.
+//!
+//! Launches the agent binary inside the OS sandbox (`sandbox-exec` on macOS,
+//! Landlock+seccomp on Linux), forwarding signals and translating exit codes.
+
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -154,8 +159,7 @@ fn spawn_and_wait(cmd: &mut Command) -> u8 {
     let status = match child.wait() {
         Ok(status) => status
             .code()
-            .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
-            as u8,
+            .unwrap_or_else(|| status.signal().map_or(1, |s| 128 + s)) as u8,
         Err(e) => {
             ui::error(&format!("Error waiting for child: {e}"));
             unsafe {
@@ -247,7 +251,7 @@ pub fn exec(
     let profile_path = match write_temp_profile(&sandbox.profile_text) {
         Ok(p) => p,
         Err(e) => {
-            ui::error(&e.to_string());
+            ui::error(&e.clone());
             return 1;
         }
     };
