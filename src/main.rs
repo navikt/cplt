@@ -875,7 +875,7 @@ fn main() -> ExitCode {
         }
     }
 
-    // Show unapproved proposals warning (non-fatal)
+    // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         warn(&format!(
             ".cplt.toml has {} unapproved permission(s):",

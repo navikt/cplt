@@ -520,6 +520,44 @@ cplt refuses to sandbox overly broad directories that would grant the agent acce
 - **Allow paths** (`--allow-read`, `--allow-write`): canonicalized; unresolvable paths are warned and skipped
 - **Deny paths** (`--deny-path`): canonicalized; unresolvable paths cause a **hard error** (silently dropping a deny rule is a security risk)
 
+### Layer 4: Per-Repo Config Trust Model (`.cplt.toml`)
+
+Repository maintainers can commit a `.cplt.toml` to configure sandbox settings for all contributors. This creates an attack surface: a compromised or malicious maintainer could weaken the sandbox for everyone who clones the repo. The trust model addresses this with defense-in-depth.
+
+#### Security design principles
+
+1. **Deny-default for permissions.** The `[propose]` section requests sandbox relaxations, but they have **no effect** until the local user explicitly approves them with `cplt trust accept`. Unapproved permissions are silently ignored — the agent runs safely with the tighter default sandbox.
+
+2. **Deny section is tighten-only.** The `[deny]` section can only add restrictions (block paths, block env vars). It is applied automatically without approval because it cannot weaken the sandbox.
+
+3. **No interactive approval during launch.** cplt deliberately does *not* prompt "approve these? [y/N]" when unapproved permissions exist. This prevents approval fatigue — users reflexively hitting `y` to proceed. Instead, approval requires a separate deliberate command (`cplt trust accept`), matching the security model of Deno workspace trust and VS Code Restricted Mode.
+
+4. **Tamper-proof source.** `.cplt.toml` is read from `git HEAD` (committed state) via `git cat-file`, not from the working tree. The sandboxed agent cannot modify its own config mid-session. Write access to `.cplt.toml` is kernel-denied inside the sandbox.
+
+5. **Content-pinned approvals.** Trust entries store a SHA-256 hash of the approved `[propose]` values. If the maintainer changes any proposed values (even reordering array elements is hash-stable due to pre-sort), previous approvals are automatically invalidated and the user must re-approve.
+
+6. **Additive-only semantics.** Repo config can enable features (`allow_docker = true`) but cannot disable anything set by the user's CLI flags or global config. Precedence: CLI > global config > approved repo permissions > defaults.
+
+7. **Path traversal rejection.** Paths in `.cplt.toml` containing `..` components are rejected at parse time, preventing escape attempts like `../../.ssh`.
+
+#### Trust store integrity
+
+- Trust entries are stored in `~/.config/cplt/trust/` — protected from the sandbox (the agent cannot self-approve).
+- Each entry is keyed by a SHA-256 fingerprint of the canonical repo path + normalized remote URL.
+- Remote URLs are normalized (SSH/HTTPS variants, credentials stripped, ports removed) so the same repo accessed via different URLs shares one trust entry.
+- Trust writes are atomic (temp file + rename) to prevent corruption from interrupted writes.
+
+#### Threat scenarios
+
+| Scenario | Mitigation |
+|---|---|
+| Maintainer adds `allow_docker = true` | No effect until each user explicitly approves |
+| Agent modifies `.cplt.toml` at runtime | Read from `git HEAD`, not working tree; writes kernel-denied |
+| Maintainer changes proposed values after approval | Content hash mismatch invalidates approval |
+| `.cplt.toml` blocks critical env vars via `[deny].env` | `[deny]` can only tighten — removing env vars reduces attack surface |
+| Path traversal in deny/allow paths | `..` components rejected at parse time |
+| Agent self-approves via trust store | Trust dir (`~/.config/cplt/trust/`) is outside the sandbox |
+
 ### GPG Signing Risk Analysis (`--allow-gpg-signing`)
 
 When `--allow-gpg-signing` is enabled, cplt grants targeted access to the GPG subsystem:
