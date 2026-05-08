@@ -31,11 +31,24 @@
 
 ```
 src/
-  main.rs              CLI entry point. Parses args, calls run(), formats errors.
-                        Should NOT contain business logic.
+  main.rs              CLI entry point, orchestration.
+    main()             → parse CLI, call run(), format errors (10 lines)
+    run()              → orchestrate: resolve → proxy → sandbox → execute (~250 lines)
+    resolve_context()  → config loading, path resolution, agent detection (~240 lines)
+    start_proxy_if_enabled() → proxy startup, domain file resolution (~90 lines)
   lib.rs               Module declarations + is_unsafe_root(). Public API surface.
   ui.rs                All terminal output: colors, prefixed helpers, NO_COLOR/TTY.
-  config.rs            Config file parsing, CLI/config merge, validation, explain.
+  config/              Config module (9 submodules, ~3770 lines total)
+    mod.rs             Re-exports only (32 lines)
+    types.rs           Config, Resolved, CliFlags, LoadedConfig structs
+    error.rs           ConfigError enum (thiserror)
+    loading.rs         load_file(), parse(), merge(), print_summary()
+    path.rs            config_path(), expand_tilde(), resolve helpers
+    validation.rs      Unknown key detection, diagnostics, Levenshtein suggestions
+    registry.rs        ConfigKeyInfo, CONFIG_KEYS metadata, lookup_key()
+    editing.rs         TOML document manipulation (set/append/remove/unset)
+    display.rs         explain_key(), display_config(), get_config_value()
+    repo.rs            Per-repo config set support, RepoKeyTarget
   agent.rs             Agent abstraction: binary discovery, config dirs, auth hints.
   sandbox.rs           Module root: re-exports + SandboxConfig, prepare(), exec_sandboxed().
   sandbox_policy.rs    Constants, deny lists, env allowlists, validation.
@@ -44,7 +57,7 @@ src/
   sandbox_exec.rs      Process execution, signal forwarding.
   sandbox_landlock.rs  Landlock LSM + seccomp-BPF (Linux).
   discover.rs          Runtime probing (--doctor), tool/auth discovery.
-  proxy.rs             CONNECT proxy, domain blocking, audit log.
+  proxy.rs + proxy/    CONNECT proxy, domain blocking, audit log.
   scratch.rs           Per-session scratch directory, TMPDIR redirect.
   trust.rs             Trust store: accept/revoke repo config proposals.
   repo_config.rs       Per-repo .cplt.toml parsing and application.
@@ -78,20 +91,26 @@ fn main() -> ExitCode {
 }
 ```
 
-### Library modules (config.rs, trust.rs, etc.)
+### Library modules
 
-Currently use `Result<T, String>` (60 instances across 12 files). This is
-legacy debt — migrate to `thiserror` error enums as modules are touched:
+Use `thiserror` error enums with `#[non_exhaustive]`:
 
 ```rust
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
-    #[error("cannot read {path}")]
-    ReadFailed { path: PathBuf, #[source] source: std::io::Error },
-    #[error("invalid TOML in {path}")]
-    InvalidToml { path: PathBuf, #[source] source: toml::de::Error },
+    #[error("Cannot read config file {path}: {source}")]
+    FileRead { path: PathBuf, source: std::io::Error },
+    #[error("Invalid TOML in {path}: {source}")]
+    TomlParse { path: String, source: toml::de::Error },
+    #[error("{0}")]
+    Validation(String),  // rich contextual messages
 }
 ```
+
+Completed migrations: `UpdateError` (update.rs), `ConfigError` (config/).
+Remaining `Result<T, String>`: sandbox_policy.rs, proxy.rs, trust.rs, agent.rs
+— migrate as modules are touched.
 
 **Never** use `Result<T, String>` in new code. For quick prototyping, use
 `anyhow::Result<T>` and refine later.
@@ -250,12 +269,14 @@ files. Use `tempfile::TempDir` for filesystem tests.
 ### main.rs structure
 
 ```
-main()              → parse CLI, call run(), format errors (10 lines)
-run()               → orchestrate: config → sandbox → execute (returns anyhow::Result<ExitCode>)
-run_doctor()        → --doctor subflow
-run_config_command()→ config subcommand dispatch
-run_trust_command() → trust subcommand dispatch
-run_update()        → update subcommand dispatch
+main()                     → parse CLI, call run(), format errors (10 lines)
+run()                      → orchestrate: early exits → resolve → proxy → sandbox (~250 lines)
+resolve_context()          → config loading, path resolution, agent detection
+start_proxy_if_enabled()   → proxy startup, domain file validation
+run_doctor()               → --doctor subflow
+run_config_command()       → config subcommand dispatch
+run_trust_command()        → trust subcommand dispatch
+run_update()               → update subcommand dispatch
 ```
 
 ### Naming conventions
@@ -285,36 +306,7 @@ run_update()        → update subcommand dispatch
 - **Don't `pub` by default.** Start private, widen when needed.
 - **Don't use `Result<T, String>` in new code.** Use `anyhow` or `thiserror`.
 - **Don't scatter constants.** Colors in `ui.rs`, policy constants in
-  `sandbox_policy.rs`, config keys in `config.rs`.
+  `sandbox_policy.rs`, config keys in `config/registry.rs`.
 - **Don't comment what, comment why.** `// Create a new vector` is noise.
   `// SBPL uses last-match-wins, so denies must come after allows` is valuable.
 - **Don't weaken deny rules** without updating SECURITY.md and getting review.
-
----
-
-## Known Technical Debt
-
-Tracked in [#38](https://github.com/navikt/cplt/issues/38). Priority order:
-
-### P0 — Do first
-
-1. **`thiserror` error types** for `update.rs` (17 instances) and `config.rs`
-   (14 instances) — eliminates 69% of remaining `Result<T, String>`.
-2. **Fix risky unwraps** — `std::env::var("HOME").unwrap()` in `discover.rs`,
-   `as_table_mut().unwrap()` in `config.rs` (5-7 critical sites).
-
-### P1 — Next
-
-3. **Split `run()`** (576 lines) into phases: `resolve_config()`,
-   `start_proxy()`, `run_sandbox()`.
-4. **Split `config.rs`** (3488 lines) into submodules: parse, merge, validate,
-   edit.
-5. **Replace boolean flag pairs** with enums: `with_proxy`/`no_proxy` →
-   `ProxyMode`, `scratch_dir`/`no_scratch_dir` → `ScratchMode`, etc.
-
-### P2 — Backlog
-
-6. **Visibility cleanup** — ~25-30 items unnecessarily `pub`, should be
-   `pub(crate)`.
-7. **Reduce cloning** — ~80 `.clone()` calls, many avoidable with references
-   or builders.
