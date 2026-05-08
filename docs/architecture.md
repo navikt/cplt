@@ -40,7 +40,7 @@ src/
   ui.rs                All terminal output: colors, prefixed helpers, NO_COLOR/TTY.
   config/              Config module (9 submodules, ~3770 lines total)
     mod.rs             Re-exports only (32 lines)
-    types.rs           Config, Resolved, CliFlags, LoadedConfig structs
+    types.rs           Config, Resolved, CliFlags, FeatureToggle, LoadedConfig structs
     error.rs           ConfigError enum (thiserror)
     loading.rs         load_file(), parse(), merge(), print_summary()
     path.rs            config_path(), expand_tilde(), resolve helpers
@@ -175,14 +175,19 @@ by sibling modules but not tests, it's `pub(crate)`. If tests need it, it's `pub
 
 ### Prefer enums over boolean pairs
 
-```rust
-// ✗ Two bools can be contradictory
-pub scratch_dir: bool,
-pub no_scratch_dir: bool,
+CLI flag pairs like `--with-proxy` / `--no-proxy` use `FeatureToggle`:
 
-// ✓ One enum, impossible to conflict
-pub enum ScratchMode { Default, Enabled, Disabled }
+```rust
+pub enum FeatureToggle {
+    ForceOn,     // --with-proxy
+    ForceOff,    // --no-proxy
+    #[default]
+    UseDefault,  // neither flag → use config/default
+}
 ```
+
+Clap keeps two boolean flags. `FeatureToggle::from_pair(on, off)` converts them
+at the merge boundary. `resolve(config_default)` produces the final `bool`.
 
 ### Use newtypes for domain concepts
 
