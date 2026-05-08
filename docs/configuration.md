@@ -50,10 +50,10 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 
 1. CLI flags (`--with-proxy`, `--no-proxy`, `--proxy-port`, etc.)
 2. Config file (`~/.config/cplt/config.toml`)
-3. Per-repo config (`.cplt.toml` approved proposals)
+3. Per-repo config (`.cplt.toml` approved permissions)
 4. Built-in defaults
 
-CLI flags always override the config file. Per-repo proposals are **additive only** — they can enable features (e.g., `allow_docker = true`) but cannot disable anything set by CLI or global config. The `[deny]` section always tightens the sandbox unconditionally.
+CLI flags always override the config file. Per-repo permissions are **additive only** — they can enable features (e.g., `allow_docker = true`) but cannot disable anything set by CLI or global config. The `[deny]` section tightens the sandbox unconditionally.
 
 **Environment variable override:**
 
@@ -107,7 +107,7 @@ cplt config set sandbox.quiet --unset
 Use `--repo` to write project-specific settings to `.cplt.toml` instead of global config:
 
 ```bash
-# Propose sandbox relaxations (requires team approval via `cplt trust accept`)
+# Request sandbox permissions (requires approval via `cplt trust accept`)
 cplt config set --repo sandbox.allow_jvm_attach true
 cplt config set --repo sandbox.allow_localhost_any true
 cplt config set --repo allow.read "~/.gradle/gradle.properties"
@@ -117,11 +117,11 @@ cplt config set --repo allow.ports 8080
 cplt config set --repo deny.paths "~/secrets"
 cplt config set --repo deny.env "VAULT_TOKEN"
 
-# Remove a proposal
+# Remove a permission request
 cplt config set --repo sandbox.allow_jvm_attach --unset
 ```
 
-Settings are mapped automatically: relaxations go under `[propose]`, restrictions under `[deny]`. Keys that are machine-specific (like `sandbox.quiet`, `proxy.port`) are rejected with a clear explanation.
+Settings are mapped automatically: permission requests go under `[propose]`, restrictions under `[deny]`. Keys that are machine-specific (like `sandbox.quiet`, `proxy.port`) are rejected with a clear explanation.
 
 > **Note:** Global config remains the default. Use `--repo` explicitly for project settings.
 
@@ -132,10 +132,10 @@ Commit a `.cplt.toml` file to your repository for project-specific sandbox setti
 ### Security model
 
 - **`[deny]`** — applied automatically (can only tighten the sandbox, no approval needed)
-- **`[propose]`** — relaxes the sandbox, requires explicit user approval via `cplt trust accept`
+- **`[propose]`** — requested permissions, requires explicit user approval via `cplt trust accept`
 - Read from `git HEAD` (committed state) — the agent cannot tamper with its own config mid-session
 - Write to `.cplt.toml` is kernel-denied inside the sandbox
-- Trust approvals are content-pinned — if proposal values change, approvals are invalidated
+- Trust approvals are content-pinned — if requested values change, approvals are invalidated
 
 ### Example `.cplt.toml`
 
@@ -145,7 +145,7 @@ Commit a `.cplt.toml` file to your repository for project-specific sandbox setti
 paths = ["~/secrets", "~/.vault"]
 env = ["VAULT_TOKEN", "MY_SECRET"]
 
-# Propose section — requires approval via `cplt trust accept`
+# Requested permissions — requires approval via `cplt trust accept`
 [propose]
 allow_jvm_attach = true          # For MockK/Mockito tests
 allow_docker = true              # Container access
@@ -163,7 +163,7 @@ allow_private_domains = ["intern.nav.no"]
 ### Trust management
 
 ```bash
-cplt trust                                # Show proposals and approval status
+cplt trust                                # Show permissions and approval status
 cplt trust accept allow_jvm_attach        # Approve specific keys
 cplt trust accept --all                   # Approve everything
 cplt trust revoke allow_docker            # Revoke a specific key
@@ -182,5 +182,5 @@ cplt --accept-repo-config -- -p "run tests"
 
 1. CLI flags (highest)
 2. Global config (`~/.config/cplt/config.toml`)
-3. Approved repo proposals (`.cplt.toml [propose]`)
+3. Approved repo permissions (`.cplt.toml [propose]`)
 4. Built-in defaults

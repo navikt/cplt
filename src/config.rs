@@ -2176,8 +2176,8 @@ pub fn set_repo_value_in_doc(
                 if !b {
                     return Err(format!(
                         "{}.{} = false has no effect in repo config.\n  \
-                         Repo config can only propose enabling settings.\n  \
-                         Use --unset to remove the proposal.",
+                         Repo config can only request enabling permissions.\n  \
+                         Use --unset to remove it.",
                         key_info.section, key_info.key
                     ));
                 }

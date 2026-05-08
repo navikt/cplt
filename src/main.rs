@@ -66,10 +66,10 @@ EXAMPLES:
     Update cplt to the latest release from GitHub
 
   cplt trust
-    Show per-repo config proposals and their approval status
+    Show per-repo config permissions and their approval status
 
   cplt trust accept allow_jvm_attach allow_docker
-    Approve specific proposals from .cplt.toml
+    Approve specific permissions from .cplt.toml
 
   eval \"$(cplt --shell-setup)\"
     Add to your shell rc so 'copilot' runs the sandboxed version
@@ -318,7 +318,7 @@ struct Cli {
     #[arg(long, short = 'y')]
     yes: bool,
 
-    /// Auto-approve all proposals from .cplt.toml without prompting.
+    /// Auto-approve all permissions from .cplt.toml without prompting.
     /// For CI/scripts where interactive approval isn't possible.
     /// Equivalent to running `cplt trust accept --all` first.
     #[arg(long)]
@@ -398,10 +398,10 @@ enum Command {
         force: bool,
     },
 
-    /// Manage per-repo trust for .cplt.toml proposals.
+    /// Manage per-repo trust for .cplt.toml permissions.
     ///
-    /// Shows, approves, or revokes trust for sandbox-relaxing proposals
-    /// in the current repository's .cplt.toml file.
+    /// Shows, approves, or revokes trust for sandbox permissions
+    /// requested in the current repository's .cplt.toml file.
     Trust {
         #[command(subcommand)]
         action: Option<TrustAction>,
@@ -494,24 +494,24 @@ enum ConfigAction {
 enum TrustAction {
     /// Show trust status for the current repository.
     ///
-    /// Displays what .cplt.toml proposes and which proposals are approved.
+    /// Displays what .cplt.toml requests and which permissions are approved.
     Show,
 
-    /// Approve specific proposals from .cplt.toml.
+    /// Approve specific permissions from .cplt.toml.
     ///
     /// Example: cplt trust accept allow_jvm_attach allow_docker
     Accept {
-        /// Proposal keys to approve (e.g. allow_jvm_attach, allow_docker).
+        /// Permission keys to approve (e.g. allow_jvm_attach, allow_docker).
         /// Use --all to approve everything.
         #[arg(required_unless_present = "all")]
         keys: Vec<String>,
 
-        /// Approve all proposals.
+        /// Approve all permissions.
         #[arg(long)]
         all: bool,
     },
 
-    /// Revoke trust for specific proposals.
+    /// Revoke trust for specific permissions.
     ///
     /// Example: cplt trust revoke allow_docker
     Revoke {
@@ -854,7 +854,7 @@ fn main() -> ExitCode {
                             // Proposals changed since approval — invalidate
                             if !resolved.quiet {
                                 warn(
-                                    ".cplt.toml proposals changed since last approval — re-approve with `cplt trust accept`",
+                                    ".cplt.toml permissions changed since last approval — re-approve with `cplt trust accept`",
                                 );
                             }
                             Vec::new()
@@ -878,7 +878,7 @@ fn main() -> ExitCode {
     // Show unapproved proposals warning (non-fatal)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         warn(&format!(
-            ".cplt.toml proposes {} unapproved setting(s):",
+            ".cplt.toml has {} unapproved permission(s):",
             unapproved_proposals.len()
         ));
         for key in &unapproved_proposals {
@@ -1843,7 +1843,7 @@ fn run_config_set_repo(
         }
     };
 
-    // Dangerous key safeguard (still applies for repo proposals)
+    // Dangerous key safeguard (still applies for repo permissions)
     if key_info.dangerous
         && !unset
         && let Some(val) = value
@@ -1851,7 +1851,7 @@ fn run_config_set_repo(
         && !force
     {
         error(&format!(
-            "{key} is dangerous — it proposes weakened security for anyone approving this repo config.\n  \
+            "{key} is dangerous — it requests weakened security for anyone approving this repo config.\n  \
              Add --force to confirm: cplt config set --repo {key} true --force"
         ));
         return ExitCode::FAILURE;
@@ -2067,7 +2067,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             let current_hash = trust::proposal_content_hash(&loaded.config.propose);
             if entry.accepted.content_hash != current_hash {
                 println!(
-                    "{BLUE}[cplt]{NC}  {RED}⚠ Proposals have changed since last approval!{NC}"
+                    "{BLUE}[cplt]{NC}  {RED}⚠ Permissions have changed since last approval!{NC}"
                 );
                 println!(
                     "{BLUE}[cplt]{NC}  {RED}  Run `cplt trust --accept-all` to re-approve.{NC}"
@@ -2101,7 +2101,7 @@ fn trust_accept(
         for key in keys {
             if !proposed.contains(&key.as_str()) {
                 error(&format!(
-                    "Key {key:?} is not proposed in .cplt.toml. Available: {}",
+                    "Key {key:?} is not requested in .cplt.toml. Available: {}",
                     proposed
                         .iter()
                         .map(|s| format!("{s:?}"))
@@ -2148,7 +2148,7 @@ fn trust_accept(
     }
 
     println!(
-        "{GREEN}✓{NC} Approved {} proposal(s) for this repository:",
+        "{GREEN}✓{NC} Approved {} permission(s) for this repository:",
         keys_to_accept.len()
     );
     for key in &keys_to_accept {
@@ -2184,7 +2184,9 @@ fn trust_revoke(
     // Validate keys
     for key in keys {
         if !proposed.contains(&key.as_str()) && !entry.accepted.keys.contains(key) {
-            warn(&format!("Key {key:?} is not in proposals or trust store."));
+            warn(&format!(
+                "Key {key:?} is not in permissions or trust store."
+            ));
         }
     }
 

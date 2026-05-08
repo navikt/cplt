@@ -501,10 +501,10 @@ cplt config explain   # list all keys with descriptions
 
 1. CLI flags
 2. Config file (`~/.config/cplt/config.toml`)
-3. Per-repo config (`.cplt.toml` approved proposals)
+3. Per-repo config (`.cplt.toml` approved permissions)
 4. Built-in defaults
 
-Per-repo proposals are **additive only** — they can enable features but cannot disable anything set by CLI or global config. The `[deny]` section always tightens unconditionally.
+Per-repo permissions are **additive only** — they can enable features but cannot disable anything set by CLI or global config. The `[deny]` section tightens unconditionally.
 
 ### Per-repo configuration (`.cplt.toml`)
 
@@ -524,7 +524,7 @@ read = ["~/.gradle/gradle.properties"]
 ```
 
 - **`[deny]`** — applied automatically (can only tighten)
-- **`[propose]`** — requires approval: `cplt trust accept --all`
+- **`[propose]`** — requested permissions, requires approval: `cplt trust accept --all`
 - Read from `git HEAD` — tamper-proof; content-pinned approvals
 
 Use `cplt config set --repo` to manage without editing TOML by hand:
