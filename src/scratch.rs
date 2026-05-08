@@ -147,13 +147,12 @@ impl ScratchDir {
 
             if let Ok(age) = now.duration_since(modified)
                 && age > STALE_AGE
+                && let Err(e) = std::fs::remove_dir_all(&path)
             {
-                let _ = std::fs::remove_dir_all(&path).map_err(|e| {
-                    ui::warn(&format!(
-                        "Warning: cannot remove stale scratch dir {}: {e}",
-                        path.display()
-                    ));
-                });
+                ui::warn(&format!(
+                    "Warning: cannot remove stale scratch dir {}: {e}",
+                    path.display()
+                ));
             }
         }
     }
@@ -161,13 +160,13 @@ impl ScratchDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        if self.path.exists() {
-            let _ = std::fs::remove_dir_all(&self.path).map_err(|e| {
-                ui::warn(&format!(
-                    "Warning: cannot cleanup scratch dir {}: {e}",
-                    self.path.display()
-                ));
-            });
+        if self.path.exists()
+            && let Err(e) = std::fs::remove_dir_all(&self.path)
+        {
+            ui::warn(&format!(
+                "Warning: cannot cleanup scratch dir {}: {e}",
+                self.path.display()
+            ));
         }
     }
 }

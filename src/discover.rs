@@ -335,65 +335,65 @@ impl Discovery {
         // Auth section
         println!(
             "{}{}[doctor]{} {}Auth{}",
-            ui::color(ui::BOLD),
-            ui::color(ui::BLUE),
-            ui::color(ui::RESET),
-            ui::color(ui::BOLD),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::BLUE),
+            ui::stdout_color(ui::RESET),
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::RESET)
         );
         if !self.auth.env_tokens.is_empty() {
             for var in &self.auth.env_tokens {
                 println!(
                     "  {}✓{} Env token: {var} is set",
-                    ui::color(ui::GREEN),
-                    ui::color(ui::RESET)
+                    ui::stdout_color(ui::GREEN),
+                    ui::stdout_color(ui::RESET)
                 );
             }
         } else {
             println!(
                 "  {}⚠{} No env token set (COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN)",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET)
             );
         }
         if self.auth.gh_cli_auth {
             println!(
                 "  {}✓{} gh CLI: authenticated (gh auth token succeeds)",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
             );
         } else if self.auth.gh_config_exists {
             println!(
                 "  {}⚠{} gh CLI: config exists (~/.config/gh/hosts.yml) but gh auth token fails",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
                 "  {}⚠{} gh CLI: no config found (~/.config/gh/hosts.yml)",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET)
             );
         }
         print_keychain_status(self.auth.security_cli_exists);
         if !self.auth.keytar_nodes.is_empty() {
             println!(
                 "  {}✓{} keytar.node: found in ~/.copilot/pkg/",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
                 "  {}⚠{} keytar.node: not found in ~/.copilot/pkg/",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET)
             );
         }
         if !self.auth.any_auth_available() {
             println!(
                 "  {}✗{} No auth mechanism available — Copilot will fail to authenticate",
-                ui::color(ui::RED),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::RED),
+                ui::stdout_color(ui::RESET)
             );
             critical_ok = false;
         }
@@ -402,17 +402,17 @@ impl Discovery {
         // Agents section
         println!(
             "{}{}[doctor]{} {}Agents{}",
-            ui::color(ui::BOLD),
-            ui::color(ui::BLUE),
-            ui::color(ui::RESET),
-            ui::color(ui::BOLD),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::BLUE),
+            ui::stdout_color(ui::RESET),
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::RESET)
         );
         if self.agents.is_empty() {
             println!(
                 "  {}✗{} No supported agents found in PATH",
-                ui::color(ui::RED),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::RED),
+                ui::stdout_color(ui::RESET)
             );
             critical_ok = false;
         } else {
@@ -420,8 +420,8 @@ impl Discovery {
                 if let Some(ref ver) = agent.version {
                     println!(
                         "  {}✓{} {} ({}) v{ver}: {}",
-                        ui::color(ui::GREEN),
-                        ui::color(ui::RESET),
+                        ui::stdout_color(ui::GREEN),
+                        ui::stdout_color(ui::RESET),
                         agent.name,
                         agent.binary_name,
                         agent.path.display()
@@ -429,8 +429,8 @@ impl Discovery {
                 } else {
                     println!(
                         "  {}✓{} {} ({}): {}",
-                        ui::color(ui::GREEN),
-                        ui::color(ui::RESET),
+                        ui::stdout_color(ui::GREEN),
+                        ui::stdout_color(ui::RESET),
                         agent.name,
                         agent.binary_name,
                         agent.path.display()
@@ -447,8 +447,8 @@ impl Discovery {
                 .collect();
             println!(
                 "  {}✓{} Copilot native modules: {}",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET),
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET),
                 names.join(", ")
             );
         }
@@ -457,17 +457,17 @@ impl Discovery {
         // Tools section
         println!(
             "{}{}[doctor]{} {}Tools{}",
-            ui::color(ui::BOLD),
-            ui::color(ui::BLUE),
-            ui::color(ui::RESET),
-            ui::color(ui::BOLD),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::BLUE),
+            ui::stdout_color(ui::RESET),
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::RESET)
         );
         for tool in &self.tools.tools {
             println!(
                 "  {}✓{} {}: {}",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET),
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET),
                 tool.name,
                 tool.path.display()
             );
@@ -479,23 +479,23 @@ impl Discovery {
         for name in &missing {
             println!(
                 "  {}⚠{} {name}: not found",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET)
             );
         }
         if let Some(ref prefix) = self.tools.homebrew_prefix {
             println!(
                 "  {}✓{} Homebrew: {}",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET),
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET),
                 prefix.display()
             );
         }
         if !self.tools.existing_home_tool_dirs.is_empty() {
             println!(
                 "  {}✓{} Tool dirs: ~/{}",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET),
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET),
                 self.tools.existing_home_tool_dirs.join(", ~/")
             );
         }
@@ -508,8 +508,8 @@ impl Discovery {
             let joined: Vec<String> = missing_dirs.iter().map(|d| format!("~/{d}")).collect();
             println!(
                 "  {}⚠{} Not found (skippable): {}",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET),
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET),
                 joined.join(", ")
             );
         }
@@ -518,36 +518,36 @@ impl Discovery {
         // Paths section
         println!(
             "{}{}[doctor]{} {}Sandbox paths{}",
-            ui::color(ui::BOLD),
-            ui::color(ui::BLUE),
-            ui::color(ui::RESET),
-            ui::color(ui::BOLD),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::BLUE),
+            ui::stdout_color(ui::RESET),
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::RESET)
         );
         if self.paths.is_git_repo {
             println!(
                 "  {}✓{} Project: inside a git repository",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
                 "  {}⚠{} Project: not a git repo (using cwd)",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET)
             );
         }
         if self.paths.copilot_dir_exists {
             println!(
                 "  {}✓{} ~/.copilot exists",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
                 "  {}✗{} ~/.copilot not found — Copilot CLI may not be installed",
-                ui::color(ui::RED),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::RED),
+                ui::stdout_color(ui::RESET)
             );
             critical_ok = false;
         }
@@ -578,8 +578,8 @@ impl Discovery {
                 .collect();
             println!(
                 "  {}✓{} Protected ({n_denied} found): {}",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET),
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET),
                 all.join(", ")
             );
         }
@@ -588,11 +588,11 @@ impl Discovery {
         // Sandbox mechanism section
         println!(
             "{}{}[doctor]{} {}Sandbox mechanism{}",
-            ui::color(ui::BOLD),
-            ui::color(ui::BLUE),
-            ui::color(ui::RESET),
-            ui::color(ui::BOLD),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::BLUE),
+            ui::stdout_color(ui::RESET),
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::RESET)
         );
         if !print_sandbox_mechanism_status() {
             critical_ok = false;
@@ -603,14 +603,14 @@ impl Discovery {
         if critical_ok {
             println!(
                 "{}[doctor]{} All critical checks passed ✓",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
                 "{}[doctor]{} Critical issues found — sandbox may not work correctly",
-                ui::color(ui::RED),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::RED),
+                ui::stdout_color(ui::RESET)
             );
         }
 
@@ -665,14 +665,14 @@ fn print_keychain_status(security_cli_exists: bool) {
     if security_cli_exists {
         println!(
             "  {}✓{} Keychain CLI: /usr/bin/security exists",
-            ui::color(ui::GREEN),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::GREEN),
+            ui::stdout_color(ui::RESET)
         );
     } else {
         println!(
             "  {}⚠{} Keychain CLI: /usr/bin/security not found",
-            ui::color(ui::YELLOW),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::YELLOW),
+            ui::stdout_color(ui::RESET)
         );
     }
     #[cfg(not(target_os = "macos"))]
@@ -688,21 +688,21 @@ fn print_macos_path_status(keychains_dir_exists: bool, security_db_exists: bool)
         if keychains_dir_exists {
             println!(
                 "  {}✓{} ~/Library/Keychains exists",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
                 "  {}⚠{} ~/Library/Keychains not found",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET)
             );
         }
         if security_db_exists {
             println!(
                 "  {}✓{} /private/var/db/mds exists (Security framework)",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
             );
         }
     }
@@ -720,14 +720,14 @@ fn print_sandbox_mechanism_status() -> bool {
         if sandbox_exec_exists {
             println!(
                 "  {}✓{} Seatbelt: /usr/bin/sandbox-exec available",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
             );
         } else {
             println!(
                 "  {}✗{} Seatbelt: /usr/bin/sandbox-exec not found",
-                ui::color(ui::RED),
-                ui::color(ui::RESET)
+                ui::stdout_color(ui::RED),
+                ui::stdout_color(ui::RESET)
             );
         }
         sandbox_exec_exists
@@ -741,14 +741,14 @@ fn print_sandbox_mechanism_status() -> bool {
             Ok(abi_version) => {
                 println!(
                     "  {}✓{} Landlock: ABI v{abi_version}",
-                    ui::color(ui::GREEN),
-                    ui::color(ui::RESET)
+                    ui::stdout_color(ui::GREEN),
+                    ui::stdout_color(ui::RESET)
                 );
                 if abi_version < ABI::V4 {
                     println!(
                         "  {}⚠{} Landlock ABI < v4: TCP port filtering unavailable (kernel < 6.7)",
-                        ui::color(ui::YELLOW),
-                        ui::color(ui::RESET)
+                        ui::stdout_color(ui::YELLOW),
+                        ui::stdout_color(ui::RESET)
                     );
                     println!("      Network security provided by proxy only.");
                 }
@@ -757,8 +757,8 @@ fn print_sandbox_mechanism_status() -> bool {
             Err(_) => {
                 println!(
                     "  {}✗{} Landlock: not available",
-                    ui::color(ui::RED),
-                    ui::color(ui::RESET)
+                    ui::stdout_color(ui::RED),
+                    ui::stdout_color(ui::RESET)
                 );
                 println!("      Requires Linux 5.13+ with Landlock enabled.");
                 println!("      Check: cat /sys/kernel/security/lsm (should include 'landlock')");
@@ -771,15 +771,15 @@ fn print_sandbox_mechanism_status() -> bool {
             let kernel = String::from_utf8_lossy(&uname.stdout);
             println!(
                 "  {}✓{} Kernel: {}",
-                ui::color(ui::GREEN),
-                ui::color(ui::RESET),
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET),
                 kernel.trim()
             );
         }
         println!(
             "  {}✓{} seccomp: available (built-in on modern kernels)",
-            ui::color(ui::GREEN),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::GREEN),
+            ui::stdout_color(ui::RESET)
         );
         ok
     }

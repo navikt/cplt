@@ -5,11 +5,11 @@ use crate::ui;
 
 /// Print explanation of a single config key, showing type and current value inline.
 pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
-    let blue = ui::color(ui::BLUE);
-    let bold = ui::color(ui::BOLD);
-    let dim = ui::color(ui::DIM);
-    let yellow = ui::color(ui::YELLOW);
-    let nc = ui::color(ui::RESET);
+    let blue = ui::stdout_color(ui::BLUE);
+    let bold = ui::stdout_color(ui::BOLD);
+    let dim = ui::stdout_color(ui::DIM);
+    let yellow = ui::stdout_color(ui::YELLOW);
+    let nc = ui::stdout_color(ui::RESET);
 
     let default_display = if key_info.default_display.is_empty() {
         "(unset)"
@@ -52,11 +52,11 @@ pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
 pub fn explain_all(loaded: Option<&LoadedConfig>) {
     use super::registry::CONFIG_KEYS;
 
-    let blue = ui::color(ui::BLUE);
-    let bold = ui::color(ui::BOLD);
-    let dim = ui::color(ui::DIM);
-    let yellow = ui::color(ui::YELLOW);
-    let nc = ui::color(ui::RESET);
+    let blue = ui::stdout_color(ui::BLUE);
+    let bold = ui::stdout_color(ui::BOLD);
+    let dim = ui::stdout_color(ui::DIM);
+    let yellow = ui::stdout_color(ui::YELLOW);
+    let nc = ui::stdout_color(ui::RESET);
 
     let mut current_section = "";
     for key in CONFIG_KEYS {
@@ -131,11 +131,11 @@ fn format_toml_value(val: &toml::Value) -> String {
 /// Display the effective configuration from a config file merged with defaults.
 /// Shows what cplt would use at runtime (without CLI flag overrides).
 pub fn display_config(loaded: Option<&LoadedConfig>) {
-    let blue = ui::color(ui::BLUE);
-    let dim = ui::color(ui::DIM);
-    let green = ui::color(ui::GREEN);
-    let yellow = ui::color(ui::YELLOW);
-    let nc = ui::color(ui::RESET);
+    let blue = ui::stdout_color(ui::BLUE);
+    let dim = ui::stdout_color(ui::DIM);
+    let green = ui::stdout_color(ui::GREEN);
+    let yellow = ui::stdout_color(ui::YELLOW);
+    let nc = ui::stdout_color(ui::RESET);
 
     let config = loaded.map(|l| &l.config);
     let c = config.cloned().unwrap_or_default();
@@ -257,7 +257,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     }
     let inherit_env = c.sandbox.inherit_env.unwrap_or(false);
     if inherit_env {
-        let red = ui::color(ui::RED);
+        let red = ui::stdout_color(ui::RED);
         println!("{blue}[cplt]{nc}    inherit_env           = {red}true{nc} ⚠ DANGEROUS");
     } else {
         println!(
@@ -273,7 +273,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     );
     let allow_gpg = c.sandbox.allow_gpg_signing.unwrap_or(false);
     if allow_gpg {
-        let red = ui::color(ui::RED);
+        let red = ui::stdout_color(ui::RED);
         println!("{blue}[cplt]{nc}    allow_gpg_signing     = {red}true{nc} ⚠ DANGEROUS");
     } else {
         println!(
@@ -283,7 +283,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     }
     let allow_docker = c.sandbox.allow_docker.unwrap_or(false);
     if allow_docker {
-        let red = ui::color(ui::RED);
+        let red = ui::stdout_color(ui::RED);
         println!("{blue}[cplt]{nc}    allow_docker          = {red}true{nc} ⚠ DANGEROUS");
     } else {
         println!(
@@ -293,7 +293,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     }
     let allow_tmp = c.sandbox.allow_tmp_exec.unwrap_or(false);
     if allow_tmp {
-        let red = ui::color(ui::RED);
+        let red = ui::stdout_color(ui::RED);
         println!("{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS");
     } else {
         println!(

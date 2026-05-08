@@ -56,9 +56,9 @@ pub struct Config {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ProxyConfig {
-    /// Enable the CONNECT proxy (default: false).
+    /// Enable the CONNECT proxy (default: true when not set in config).
     pub enabled: Option<bool>,
-    /// Proxy listen port (default: 18080).
+    /// Proxy listen port (default: 0, OS-assigned ephemeral port).
     pub port: Option<u16>,
     /// Path to blocked domains file.
     pub blocked_domains: Option<String>,

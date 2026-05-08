@@ -67,8 +67,8 @@ pub enum UpdateError {
     #[error("Extracted archive does not contain 'cplt' binary")]
     BinaryNotFound,
 
-    #[error("Extracted 'cplt' is not a regular file (symlink?)")]
-    BinaryIsSymlink,
+    #[error("Extracted 'cplt' is not a regular file (symlink or directory)")]
+    BinaryNotRegularFile,
 
     #[error("Extraction failed: {0}")]
     ExtractionFailed(String),
@@ -232,7 +232,7 @@ pub fn perform_update(tag: &str, current_version: &str) -> Result<String, Update
     })?;
     if !meta.file_type().is_file() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(UpdateError::BinaryIsSymlink);
+        return Err(UpdateError::BinaryNotRegularFile);
     }
 
     // 4. Resolve current binary location

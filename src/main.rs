@@ -1346,20 +1346,20 @@ fn run_doctor() -> ExitCode {
 
     println!(
         "{}[cplt]{} cplt:     {}",
-        ui::color(ui::BLUE),
-        ui::color(ui::RESET),
+        ui::stdout_color(ui::BLUE),
+        ui::stdout_color(ui::RESET),
         LONG_VERSION
     );
     println!(
         "{}[cplt]{} Project:  {}",
-        ui::color(ui::BLUE),
-        ui::color(ui::RESET),
+        ui::stdout_color(ui::BLUE),
+        ui::stdout_color(ui::RESET),
         project_dir.display()
     );
     println!(
         "{}[cplt]{} Home:     {}",
-        ui::color(ui::BLUE),
-        ui::color(ui::RESET),
+        ui::stdout_color(ui::BLUE),
+        ui::stdout_color(ui::RESET),
         home_dir.display()
     );
     println!();
@@ -1510,11 +1510,11 @@ fn run_config_show() -> ExitCode {
 }
 
 fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std::path::Path) {
-    let dim = ui::color(ui::DIM);
-    let green = ui::color(ui::GREEN);
-    let yellow = ui::color(ui::YELLOW);
-    let blue = ui::color(ui::BLUE);
-    let nc = ui::color(ui::RESET);
+    let dim = ui::stdout_color(ui::DIM);
+    let green = ui::stdout_color(ui::GREEN);
+    let yellow = ui::stdout_color(ui::YELLOW);
+    let blue = ui::stdout_color(ui::BLUE);
+    let nc = ui::stdout_color(ui::RESET);
 
     println!();
     println!("{blue}[cplt]{nc} ── Repo Config (.cplt.toml) ────────────────────────");
@@ -2022,11 +2022,11 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
     let trust_entry = trust::load_trust(project_dir);
 
-    let blue = ui::color(ui::BLUE);
-    let nc = ui::color(ui::RESET);
-    let green = ui::color(ui::GREEN);
-    let yellow = ui::color(ui::YELLOW);
-    let red = ui::color(ui::RED);
+    let blue = ui::stdout_color(ui::BLUE);
+    let nc = ui::stdout_color(ui::RESET);
+    let green = ui::stdout_color(ui::GREEN);
+    let yellow = ui::stdout_color(ui::YELLOW);
+    let red = ui::stdout_color(ui::RED);
 
     println!("{blue}[cplt]{nc} ── Repo Config Trust ──────────────────────────────");
     println!("{blue}[cplt]{nc}  Source: {}", source_label(loaded.source));
@@ -2173,8 +2173,8 @@ fn trust_accept(
 
     println!(
         "{}✓{} Approved {} permission(s) for this repository:",
-        ui::color(ui::GREEN),
-        ui::color(ui::RESET),
+        ui::stdout_color(ui::GREEN),
+        ui::stdout_color(ui::RESET),
         keys_to_accept.len()
     );
     for key in &keys_to_accept {
@@ -2196,8 +2196,8 @@ fn trust_revoke(
         }
         println!(
             "{}✓{} Revoked all trust for this repository.",
-            ui::color(ui::GREEN),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::GREEN),
+            ui::stdout_color(ui::RESET)
         );
         return ExitCode::SUCCESS;
     }
@@ -2246,8 +2246,8 @@ fn trust_revoke(
 
     println!(
         "{}✓{} Revoked {removed} key(s).",
-        ui::color(ui::GREEN),
-        ui::color(ui::RESET)
+        ui::stdout_color(ui::GREEN),
+        ui::stdout_color(ui::RESET)
     );
     ExitCode::SUCCESS
 }
@@ -2258,8 +2258,8 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
         ui::info("cplt is managed by Homebrew.");
         println!(
             "  Run: {}brew upgrade navikt/tap/cplt{}",
-            ui::color(ui::GREEN),
-            ui::color(ui::RESET)
+            ui::stdout_color(ui::GREEN),
+            ui::stdout_color(ui::RESET)
         );
         return ExitCode::SUCCESS;
     }
