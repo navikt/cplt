@@ -2012,7 +2012,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
 
     // Deny section
     if !loaded.config.deny.paths.is_empty() || !loaded.config.deny.env.is_empty() {
-        println!("{BLUE}[cplt]{NC}  {GREEN}[deny]{NC} {LABEL_DENY_APPLIED}:");
+        println!("{BLUE}[cplt]{NC}  {GREEN}[deny]{NC} {LABEL_DENY_APPLIED}");
         for p in &loaded.config.deny.paths {
             println!("{BLUE}[cplt]{NC}    path: {p}");
         }
@@ -2038,7 +2038,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         } else {
             LABEL_ALLOW_PENDING
         };
-        println!("{BLUE}[cplt]{NC}  {YELLOW}[allow]{NC} {section_label}:");
+        println!("{BLUE}[cplt]{NC}  {YELLOW}[allow]{NC} {section_label}");
         for &key in &proposed {
             let approved = trust_entry
                 .as_ref()
