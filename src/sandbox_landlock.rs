@@ -637,7 +637,7 @@ pub fn check_availability() -> Result<ABI, String> {
         match probe_abi_candidate(abi) {
             Ok(()) => return Ok(abi),
             Err(err) => {
-                last_error = Some(format!("ABI {:?}: {}", abi, err));
+                last_error = Some(format!("ABI {abi:?}: {err}"));
             }
         }
     }
@@ -664,25 +664,25 @@ fn probe_abi_candidate(abi: ABI) -> Result<(), String> {
 
     ruleset = ruleset
         .handle_access(AccessFs::from_all(abi))
-        .map_err(|e| format!("filesystem access probe failed: {}", e))?;
+        .map_err(|e| format!("filesystem access probe failed: {e}"))?;
 
     let handled_net = AccessNet::from_all(abi);
     if !handled_net.is_empty() {
         ruleset = ruleset
             .handle_access(handled_net)
-            .map_err(|e| format!("network access probe failed: {}", e))?;
+            .map_err(|e| format!("network access probe failed: {e}"))?;
     }
 
     let scopes = Scope::from_all(abi);
     if !scopes.is_empty() {
         ruleset = ruleset
             .scope(scopes)
-            .map_err(|e| format!("scope probe failed: {}", e))?;
+            .map_err(|e| format!("scope probe failed: {e}"))?;
     }
 
     ruleset
         .create()
-        .map_err(|e| format!("ruleset creation probe failed: {}", e))?;
+        .map_err(|e| format!("ruleset creation probe failed: {e}"))?;
 
     Ok(())
 }
@@ -1041,7 +1041,7 @@ fn apply_seccomp_filter(filter: &[BpfInstruction]) -> std::io::Result<()> {
         libc::prctl(
             libc::PR_SET_SECCOMP,
             libc::SECCOMP_MODE_FILTER,
-            &prog as *const SockFprog,
+            &raw const prog,
         )
     };
 
