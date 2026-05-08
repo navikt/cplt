@@ -525,6 +525,13 @@ read = ["~/.gradle/gradle.properties"]
 - **`[propose]`** — requires trust approval: `cplt trust accept --all`
 - Read from `git HEAD` — tamper-proof; content-pinned approvals
 
+Use `cplt config set --repo` to manage without editing TOML by hand:
+
+```bash
+cplt config set --repo sandbox.allow_jvm_attach true
+cplt config set --repo deny.paths "~/secrets"
+```
+
 📖 **Full details:** [docs/configuration.md](docs/configuration.md)
 
 ## Architecture

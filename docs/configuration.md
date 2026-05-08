@@ -102,6 +102,29 @@ cplt config set allow.read --unset
 cplt config set sandbox.quiet --unset
 ```
 
+**Repo-local config (`--repo`):**
+
+Use `--repo` to write project-specific settings to `.cplt.toml` instead of global config:
+
+```bash
+# Propose sandbox relaxations (requires team approval via `cplt trust accept`)
+cplt config set --repo sandbox.allow_jvm_attach true
+cplt config set --repo sandbox.allow_localhost_any true
+cplt config set --repo allow.read "~/.gradle/gradle.properties"
+cplt config set --repo allow.ports 8080
+
+# Deny section — tightens security, applied immediately without approval
+cplt config set --repo deny.paths "~/secrets"
+cplt config set --repo deny.env "VAULT_TOKEN"
+
+# Remove a proposal
+cplt config set --repo sandbox.allow_jvm_attach --unset
+```
+
+Settings are mapped automatically: relaxations go under `[propose]`, restrictions under `[deny]`. Keys that are machine-specific (like `sandbox.quiet`, `proxy.port`) are rejected with a clear explanation.
+
+> **Note:** Global config remains the default. Use `--repo` explicitly for project settings.
+
 ## Per-repo configuration (`.cplt.toml`)
 
 Commit a `.cplt.toml` file to your repository for project-specific sandbox settings. This eliminates the need for every developer to configure the same CLI flags or global config.
