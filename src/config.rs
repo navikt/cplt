@@ -1678,8 +1678,8 @@ pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
     let (current_value, from_file) = get_config_value(key_info, loaded);
     let type_str = type_label(key_info.value_type);
 
-    eprintln!("{bold}{}.{}{nc}", key_info.section, key_info.key);
-    eprintln!("  {}", key_info.description);
+    println!("{bold}{}.{}{nc}", key_info.section, key_info.key);
+    println!("  {}", key_info.description);
 
     // Type and value on one line: "  bool  false" or "  bool  true  (default: false)"
     if from_file {
@@ -1689,17 +1689,17 @@ pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
         } else {
             bold
         };
-        eprintln!(
+        println!(
             "  {dim}{type_str}{nc}  {value_color}{current_value}{nc}  {dim}(default: {default_display}){nc}"
         );
     } else {
-        eprintln!("  {dim}{type_str}  {current_value}{nc}");
+        println!("  {dim}{type_str}  {current_value}{nc}");
     }
 
     if key_info.dangerous {
-        eprintln!("  {yellow}Requires --force to enable{nc}");
+        println!("  {yellow}Requires --force to enable{nc}");
     }
-    eprintln!(
+    println!(
         "  {blue}Set:{nc}  cplt config set {}.{} <value>",
         key_info.section, key_info.key
     );
@@ -1718,9 +1718,9 @@ pub fn explain_all(loaded: Option<&LoadedConfig>) {
     for key in CONFIG_KEYS {
         if key.section != current_section {
             if !current_section.is_empty() {
-                eprintln!();
+                println!();
             }
-            eprintln!("{blue}[{bold}{}{nc}{blue}]{nc}", key.section);
+            println!("{blue}[{bold}{}{nc}{blue}]{nc}", key.section);
             current_section = key.section;
         }
         let danger = if key.dangerous {
@@ -1742,7 +1742,7 @@ pub fn explain_all(loaded: Option<&LoadedConfig>) {
         } else {
             current_value
         };
-        eprintln!(
+        println!(
             "  {bold}{:<25}{nc} {dim}{:<20}{nc} {value_color}{:<14}{nc} {}{danger}",
             format!("{}.{}", key.section, key.key),
             format!("({})", type_label(key.value_type)),

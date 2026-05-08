@@ -1350,10 +1350,10 @@ fn run_doctor() -> ExitCode {
             .unwrap_or_else(|_| PathBuf::from("."))
     };
 
-    info(&format!("cplt:     {}", LONG_VERSION));
-    info(&format!("Project:  {}", project_dir.display()));
-    info(&format!("Home:     {}", home_dir.display()));
-    eprintln!();
+    println!("{BLUE}[cplt]{NC} cplt:     {}", LONG_VERSION);
+    println!("{BLUE}[cplt]{NC} Project:  {}", project_dir.display());
+    println!("{BLUE}[cplt]{NC} Home:     {}", home_dir.display());
+    println!();
 
     let discovery = discover::discover_all(&home_dir, &project_dir);
     let ok = discovery.print_report();
@@ -1998,27 +1998,39 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         repo_config::RepoConfigSource::WorkingTree => "working tree (⚠ not committed)",
     };
 
-    eprintln!("{BLUE}[cplt]{NC} ── Repo Config Trust ──────────────────────────────");
-    eprintln!("{BLUE}[cplt]{NC}  Source: {source_label}");
-    eprintln!();
+    println!("{BLUE}[cplt]{NC} ── Repo Config Trust ──────────────────────────────");
+    println!("{BLUE}[cplt]{NC}  Source: {source_label}");
+    println!();
 
     // Deny section
     if !loaded.config.deny.paths.is_empty() || !loaded.config.deny.env.is_empty() {
-        eprintln!("{BLUE}[cplt]{NC}  {GREEN}[deny]{NC} (always applied):");
+        println!("{BLUE}[cplt]{NC}  {GREEN}[deny]{NC} (applied):");
         for p in &loaded.config.deny.paths {
-            eprintln!("{BLUE}[cplt]{NC}    path: {p}");
+            println!("{BLUE}[cplt]{NC}    path: {p}");
         }
         for v in &loaded.config.deny.env {
-            eprintln!("{BLUE}[cplt]{NC}    env:  {v}");
+            println!("{BLUE}[cplt]{NC}    env:  {v}");
         }
-        eprintln!();
+        println!();
     }
 
     // Proposals
+    let all_approved = !proposed.is_empty()
+        && proposed.iter().all(|&key| {
+            trust_entry
+                .as_ref()
+                .map(|t| trust::is_key_approved(t, key))
+                .unwrap_or(false)
+        });
     if proposed.is_empty() {
-        eprintln!("{BLUE}[cplt]{NC}  No proposals (nothing requires approval).");
+        println!("{BLUE}[cplt]{NC}  No proposals (nothing requires approval).");
     } else {
-        eprintln!("{BLUE}[cplt]{NC}  {YELLOW}[propose]{NC} (requires approval):");
+        let section_label = if all_approved {
+            "(approved)"
+        } else {
+            "(pending approval)"
+        };
+        println!("{BLUE}[cplt]{NC}  {YELLOW}[propose]{NC} {section_label}:");
         for &key in &proposed {
             let approved = trust_entry
                 .as_ref()
@@ -2029,15 +2041,15 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             } else {
                 format!("{YELLOW}○ pending{NC}")
             };
-            eprintln!("{BLUE}[cplt]{NC}    {key:<35} {status}");
+            println!("{BLUE}[cplt]{NC}    {key:<35} {status}");
         }
     }
 
     if let Some(ref entry) = trust_entry
         && !entry.accepted.approved_at.is_empty()
     {
-        eprintln!();
-        eprintln!(
+        println!();
+        println!(
             "{BLUE}[cplt]{NC}  Last approved: {}",
             entry.accepted.approved_at
         );
@@ -2046,17 +2058,17 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         if !entry.accepted.content_hash.is_empty() {
             let current_hash = trust::proposal_content_hash(&loaded.config.propose);
             if entry.accepted.content_hash != current_hash {
-                eprintln!(
+                println!(
                     "{BLUE}[cplt]{NC}  {RED}⚠ Proposals have changed since last approval!{NC}"
                 );
-                eprintln!(
+                println!(
                     "{BLUE}[cplt]{NC}  {RED}  Run `cplt trust --accept-all` to re-approve.{NC}"
                 );
             }
         }
     }
 
-    eprintln!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");
+    println!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");
     ExitCode::SUCCESS
 }
 
@@ -2127,12 +2139,12 @@ fn trust_accept(
         return ExitCode::FAILURE;
     }
 
-    eprintln!(
+    println!(
         "{GREEN}✓{NC} Approved {} proposal(s) for this repository:",
         keys_to_accept.len()
     );
     for key in &keys_to_accept {
-        eprintln!("  • {key}");
+        println!("  • {key}");
     }
     ExitCode::SUCCESS
 }
@@ -2148,7 +2160,7 @@ fn trust_revoke(
             error(&format!("Failed to revoke trust: {e}"));
             return ExitCode::FAILURE;
         }
-        eprintln!("{GREEN}✓{NC} Revoked all trust for this repository.");
+        println!("{GREEN}✓{NC} Revoked all trust for this repository.");
         return ExitCode::SUCCESS;
     }
 
@@ -2192,7 +2204,7 @@ fn trust_revoke(
         }
     }
 
-    eprintln!("{GREEN}✓{NC} Revoked {removed} key(s).");
+    println!("{GREEN}✓{NC} Revoked {removed} key(s).");
     ExitCode::SUCCESS
 }
 
@@ -2200,7 +2212,7 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
     // Check for Homebrew-managed install
     if update::is_homebrew_managed() {
         info("cplt is managed by Homebrew.");
-        eprintln!("  Run: {GREEN}brew upgrade navikt/tap/cplt{NC}");
+        println!("  Run: {GREEN}brew upgrade navikt/tap/cplt{NC}");
         return ExitCode::SUCCESS;
     }
 

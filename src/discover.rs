@@ -339,55 +339,55 @@ impl Discovery {
         let mut critical_ok = true;
 
         // Auth section
-        eprintln!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Auth{NC}");
+        println!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Auth{NC}");
         if !self.auth.env_tokens.is_empty() {
             for var in &self.auth.env_tokens {
-                eprintln!("  {GREEN}✓{NC} Env token: {var} is set");
+                println!("  {GREEN}✓{NC} Env token: {var} is set");
             }
         } else {
-            eprintln!(
+            println!(
                 "  {YELLOW}⚠{NC} No env token set (COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN)"
             );
         }
         if self.auth.gh_cli_auth {
-            eprintln!("  {GREEN}✓{NC} gh CLI: authenticated (gh auth token succeeds)");
+            println!("  {GREEN}✓{NC} gh CLI: authenticated (gh auth token succeeds)");
         } else if self.auth.gh_config_exists {
-            eprintln!(
+            println!(
                 "  {YELLOW}⚠{NC} gh CLI: config exists (~/.config/gh/hosts.yml) but gh auth token fails"
             );
         } else {
-            eprintln!("  {YELLOW}⚠{NC} gh CLI: no config found (~/.config/gh/hosts.yml)");
+            println!("  {YELLOW}⚠{NC} gh CLI: no config found (~/.config/gh/hosts.yml)");
         }
         print_keychain_status(self.auth.security_cli_exists);
         if !self.auth.keytar_nodes.is_empty() {
-            eprintln!("  {GREEN}✓{NC} keytar.node: found in ~/.copilot/pkg/");
+            println!("  {GREEN}✓{NC} keytar.node: found in ~/.copilot/pkg/");
         } else {
-            eprintln!("  {YELLOW}⚠{NC} keytar.node: not found in ~/.copilot/pkg/");
+            println!("  {YELLOW}⚠{NC} keytar.node: not found in ~/.copilot/pkg/");
         }
         if !self.auth.any_auth_available() {
-            eprintln!(
+            println!(
                 "  {RED}✗{NC} No auth mechanism available — Copilot will fail to authenticate"
             );
             critical_ok = false;
         }
-        eprintln!();
+        println!();
 
         // Agents section
-        eprintln!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Agents{NC}");
+        println!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Agents{NC}");
         if self.agents.is_empty() {
-            eprintln!("  {RED}✗{NC} No supported agents found in PATH");
+            println!("  {RED}✗{NC} No supported agents found in PATH");
             critical_ok = false;
         } else {
             for agent in &self.agents {
                 if let Some(ref ver) = agent.version {
-                    eprintln!(
+                    println!(
                         "  {GREEN}✓{NC} {} ({}) v{ver}: {}",
                         agent.name,
                         agent.binary_name,
                         agent.path.display()
                     );
                 } else {
-                    eprintln!(
+                    println!(
                         "  {GREEN}✓{NC} {} ({}): {}",
                         agent.name,
                         agent.binary_name,
@@ -403,30 +403,30 @@ impl Discovery {
                 .iter()
                 .map(|m| m.name.as_str())
                 .collect();
-            eprintln!(
+            println!(
                 "  {GREEN}✓{NC} Copilot native modules: {}",
                 names.join(", ")
             );
         }
-        eprintln!();
+        println!();
 
         // Tools section
-        eprintln!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Tools{NC}");
+        println!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Tools{NC}");
         for tool in &self.tools.tools {
-            eprintln!("  {GREEN}✓{NC} {}: {}", tool.name, tool.path.display());
+            println!("  {GREEN}✓{NC} {}: {}", tool.name, tool.path.display());
         }
         let missing: Vec<&&str> = TOOLS_TO_CHECK
             .iter()
             .filter(|name| !self.tools.tools.iter().any(|t| t.name == **name))
             .collect();
         for name in &missing {
-            eprintln!("  {YELLOW}⚠{NC} {name}: not found");
+            println!("  {YELLOW}⚠{NC} {name}: not found");
         }
         if let Some(ref prefix) = self.tools.homebrew_prefix {
-            eprintln!("  {GREEN}✓{NC} Homebrew: {}", prefix.display());
+            println!("  {GREEN}✓{NC} Homebrew: {}", prefix.display());
         }
         if !self.tools.existing_home_tool_dirs.is_empty() {
-            eprintln!(
+            println!(
                 "  {GREEN}✓{NC} Tool dirs: ~/{}",
                 self.tools.existing_home_tool_dirs.join(", ~/")
             );
@@ -438,24 +438,24 @@ impl Discovery {
             .collect();
         if !missing_dirs.is_empty() {
             let joined: Vec<String> = missing_dirs.iter().map(|d| format!("~/{d}")).collect();
-            eprintln!(
+            println!(
                 "  {YELLOW}⚠{NC} Not found (skippable): {}",
                 joined.join(", ")
             );
         }
-        eprintln!();
+        println!();
 
         // Paths section
-        eprintln!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Sandbox paths{NC}");
+        println!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Sandbox paths{NC}");
         if self.paths.is_git_repo {
-            eprintln!("  {GREEN}✓{NC} Project: inside a git repository");
+            println!("  {GREEN}✓{NC} Project: inside a git repository");
         } else {
-            eprintln!("  {YELLOW}⚠{NC} Project: not a git repo (using cwd)");
+            println!("  {YELLOW}⚠{NC} Project: not a git repo (using cwd)");
         }
         if self.paths.copilot_dir_exists {
-            eprintln!("  {GREEN}✓{NC} ~/.copilot exists");
+            println!("  {GREEN}✓{NC} ~/.copilot exists");
         } else {
-            eprintln!("  {RED}✗{NC} ~/.copilot not found — Copilot CLI may not be installed");
+            println!("  {RED}✗{NC} ~/.copilot not found — Copilot CLI may not be installed");
             critical_ok = false;
         }
         print_macos_path_status(
@@ -483,25 +483,25 @@ impl Discovery {
                 .chain(files.iter())
                 .map(|s| s.as_str())
                 .collect();
-            eprintln!(
+            println!(
                 "  {GREEN}✓{NC} Protected ({n_denied} found): {}",
                 all.join(", ")
             );
         }
-        eprintln!();
+        println!();
 
         // Sandbox mechanism section
-        eprintln!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Sandbox mechanism{NC}");
+        println!("{BOLD}{BLUE}[doctor]{NC} {BOLD}Sandbox mechanism{NC}");
         if !print_sandbox_mechanism_status() {
             critical_ok = false;
         }
-        eprintln!();
+        println!();
 
         // Summary
         if critical_ok {
-            eprintln!("{GREEN}[doctor]{NC} All critical checks passed ✓");
+            println!("{GREEN}[doctor]{NC} All critical checks passed ✓");
         } else {
-            eprintln!("{RED}[doctor]{NC} Critical issues found — sandbox may not work correctly");
+            println!("{RED}[doctor]{NC} Critical issues found — sandbox may not work correctly");
         }
 
         critical_ok
@@ -553,9 +553,9 @@ fn probe_security_db() -> bool {
 fn print_keychain_status(security_cli_exists: bool) {
     #[cfg(target_os = "macos")]
     if security_cli_exists {
-        eprintln!("  {GREEN}✓{NC} Keychain CLI: /usr/bin/security exists");
+        println!("  {GREEN}✓{NC} Keychain CLI: /usr/bin/security exists");
     } else {
-        eprintln!("  {YELLOW}⚠{NC} Keychain CLI: /usr/bin/security not found");
+        println!("  {YELLOW}⚠{NC} Keychain CLI: /usr/bin/security not found");
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -568,12 +568,12 @@ fn print_macos_path_status(keychains_dir_exists: bool, security_db_exists: bool)
     #[cfg(target_os = "macos")]
     {
         if keychains_dir_exists {
-            eprintln!("  {GREEN}✓{NC} ~/Library/Keychains exists");
+            println!("  {GREEN}✓{NC} ~/Library/Keychains exists");
         } else {
-            eprintln!("  {YELLOW}⚠{NC} ~/Library/Keychains not found");
+            println!("  {YELLOW}⚠{NC} ~/Library/Keychains not found");
         }
         if security_db_exists {
-            eprintln!("  {GREEN}✓{NC} /private/var/db/mds exists (Security framework)");
+            println!("  {GREEN}✓{NC} /private/var/db/mds exists (Security framework)");
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -588,9 +588,9 @@ fn print_sandbox_mechanism_status() -> bool {
     {
         let sandbox_exec_exists = Path::new("/usr/bin/sandbox-exec").exists();
         if sandbox_exec_exists {
-            eprintln!("  {GREEN}✓{NC} Seatbelt: /usr/bin/sandbox-exec available");
+            println!("  {GREEN}✓{NC} Seatbelt: /usr/bin/sandbox-exec available");
         } else {
-            eprintln!("  {RED}✗{NC} Seatbelt: /usr/bin/sandbox-exec not found");
+            println!("  {RED}✗{NC} Seatbelt: /usr/bin/sandbox-exec not found");
         }
         sandbox_exec_exists
     }
@@ -601,19 +601,19 @@ fn print_sandbox_mechanism_status() -> bool {
 
         let ok = match check_availability() {
             Ok(abi_version) => {
-                eprintln!("  {GREEN}✓{NC} Landlock: ABI v{abi_version}");
+                println!("  {GREEN}✓{NC} Landlock: ABI v{abi_version}");
                 if abi_version < ABI::V4 {
-                    eprintln!(
+                    println!(
                         "  {YELLOW}⚠{NC} Landlock ABI < v4: TCP port filtering unavailable (kernel < 6.7)"
                     );
-                    eprintln!("      Network security provided by proxy only.");
+                    println!("      Network security provided by proxy only.");
                 }
                 true
             }
             Err(_) => {
-                eprintln!("  {RED}✗{NC} Landlock: not available");
-                eprintln!("      Requires Linux 5.13+ with Landlock enabled.");
-                eprintln!("      Check: cat /sys/kernel/security/lsm (should include 'landlock')");
+                println!("  {RED}✗{NC} Landlock: not available");
+                println!("      Requires Linux 5.13+ with Landlock enabled.");
+                println!("      Check: cat /sys/kernel/security/lsm (should include 'landlock')");
                 false
             }
         };
@@ -621,9 +621,9 @@ fn print_sandbox_mechanism_status() -> bool {
             && uname.status.success()
         {
             let kernel = String::from_utf8_lossy(&uname.stdout);
-            eprintln!("  {GREEN}✓{NC} Kernel: {}", kernel.trim());
+            println!("  {GREEN}✓{NC} Kernel: {}", kernel.trim());
         }
-        eprintln!("  {GREEN}✓{NC} seccomp: available (built-in on modern kernels)");
+        println!("  {GREEN}✓{NC} seccomp: available (built-in on modern kernels)");
         ok
     }
 }
