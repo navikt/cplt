@@ -799,7 +799,7 @@ impl Resolved {
 
     /// Apply per-repo config (.cplt.toml) to the resolved configuration.
     ///
-    /// - `[deny]` section is always applied (tightens the sandbox).
+    /// - `[deny]` section is applied automatically (tightens the sandbox).
     /// - `[propose]` section only applies for keys that are approved in the trust store.
     ///
     /// Approved proposals are additive — they can set boolean flags to `true` but
@@ -812,7 +812,7 @@ impl Resolved {
         repo_config: &crate::repo_config::RepoConfig,
         approved_keys: &[&str],
     ) -> Vec<String> {
-        // ── Deny section: always applied ──────────────────────────
+        // ── Deny section: applied automatically ──────────────────────────
         for path_str in &repo_config.deny.paths {
             let path = expand_tilde(path_str);
             if !self.deny_paths.contains(&path) {

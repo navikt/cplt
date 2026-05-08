@@ -523,8 +523,8 @@ allow_docker = true
 read = ["~/.gradle/gradle.properties"]
 ```
 
-- **`[deny]`** — always applied (can only tighten)
-- **`[propose]`** — requires trust approval: `cplt trust accept --all`
+- **`[deny]`** — applied automatically (can only tighten)
+- **`[propose]`** — requires approval: `cplt trust accept --all`
 - Read from `git HEAD` — tamper-proof; content-pinned approvals
 
 Use `cplt config set --repo` to manage without editing TOML by hand:

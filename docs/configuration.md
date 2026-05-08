@@ -131,8 +131,8 @@ Commit a `.cplt.toml` file to your repository for project-specific sandbox setti
 
 ### Security model
 
-- **`[deny]`** — always applied without approval (can only tighten the sandbox)
-- **`[propose]`** — relaxes the sandbox, requires explicit user trust approval
+- **`[deny]`** — applied automatically (can only tighten the sandbox, no approval needed)
+- **`[propose]`** — relaxes the sandbox, requires explicit user approval via `cplt trust accept`
 - Read from `git HEAD` (committed state) — the agent cannot tamper with its own config mid-session
 - Write to `.cplt.toml` is kernel-denied inside the sandbox
 - Trust approvals are content-pinned — if proposal values change, approvals are invalidated
@@ -140,12 +140,12 @@ Commit a `.cplt.toml` file to your repository for project-specific sandbox setti
 ### Example `.cplt.toml`
 
 ```toml
-# Deny section — always applied, no approval needed
+# Deny section — applied automatically, no approval needed
 [deny]
 paths = ["~/secrets", "~/.vault"]
 env = ["VAULT_TOKEN", "MY_SECRET"]
 
-# Propose section — requires user approval
+# Propose section — requires approval via `cplt trust accept`
 [propose]
 allow_jvm_attach = true          # For MockK/Mockito tests
 allow_docker = true              # Container access

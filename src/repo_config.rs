@@ -19,7 +19,7 @@ pub const REPO_CONFIG_FILE: &str = ".cplt.toml";
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
-    /// Keys that tighten the sandbox — always applied without approval.
+    /// Keys that tighten the sandbox — applied automatically without approval.
     pub deny: DenySection,
     /// Keys that relax the sandbox — require user approval.
     pub propose: ProposeSection,
