@@ -349,6 +349,16 @@ When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Libr
 
 A localhost CONNECT proxy intercepts all outbound traffic by default. `HTTP_PROXY`/`HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1` are injected into the sandbox environment, routing traffic from Copilot CLI (Node.js), `gh` (Go), `curl`, and any other tool through the proxy. Use `--no-proxy` to disable.
 
+#### Proxy implementation safety
+
+The proxy handles CONNECT tunnels only (non-CONNECT returns 405). Each TCP connection processes exactly one request — no HTTP keep-alive or request pipelining. This eliminates HTTP request smuggling by design.
+
+- **Buffer:** Fixed 8192 bytes, single read — no allocation amplification
+- **Connection limit:** 64 concurrent connections max (excess dropped)
+- **Binding:** `127.0.0.1` only — not reachable from the network
+- **Invalid UTF-8:** Replaced with U+FFFD via `from_utf8_lossy`, which won't match any domain — fail-safe
+- **Relay timeout:** 60-second read timeout on both directions prevents idle connection resource exhaustion
+
 ### Layer 1L: Landlock + seccomp Kernel Sandbox (Linux)
 
 On Linux, kernel-level enforcement uses two complementary mechanisms:
@@ -625,6 +635,53 @@ The only viable options are `(allow network-outbound (remote tcp))` (allow all) 
 - **Outbound TCP is allowed** in the sandbox profile, restricted to port 443 (+ `--allow-port`)
 - **Filesystem isolation is the primary security control** — credentials are kernel-blocked regardless of network policy
 - **The proxy** (when enabled) provides connection logging, domain blocking, port enforcement, and DNS rebinding protection for all traffic including Copilot
+
+### Self-Update Security (`cplt update`)
+
+The update mechanism downloads releases from GitHub, verifies SHA256 checksums, and atomically replaces the binary.
+
+**Verified:**
+- SHA256 checksum is mandatory — update aborts on mismatch
+- `--proto-redir =https` prevents HTTP downgrade on redirects
+- Archive validation: must contain exactly one regular file named `cplt` (no symlinks, no directories)
+- Extracted binary verified via `symlink_metadata` (rejects symlinks)
+- Uses absolute paths for system tools on macOS (`/usr/bin/curl`, `/usr/bin/shasum`, `/usr/bin/tar`) and Linux (`/usr/bin/sha256sum`, standard paths only — no bare PATH lookup)
+- Atomic replacement: stage to `.new`, set permissions, rename
+
+**Not verified:**
+- No cryptographic signature (GPG or Sigstore). `SHA256SUMS` and binary come from the same GitHub release — a compromised release controls both. This is consistent with most Go/Rust CLI tools but weaker than signed package managers.
+- Temp directory uses `/tmp/cplt-update-{PID}` — predictable by local attackers, but extracted binary is checked for symlinks before installation.
+
+The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS.
+
+### Install Script Security (`install.sh`)
+
+The install script downloads from GitHub Releases and verifies SHA256 checksums.
+
+**Caveat:** If the `SHA256SUMS` file cannot be downloaded, or no hash utility is available, the script prints a warning and **continues without verification**. This is a deliberate trade-off for usability in minimal CI environments.
+
+For high-security environments, verify the binary manually:
+```bash
+curl -fsSL -o cplt.tar.gz "https://github.com/navikt/cplt/releases/latest/..."
+curl -fsSL -o SHA256SUMS "https://github.com/navikt/cplt/releases/latest/.../SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+### Discovery and `--doctor`
+
+`cplt --doctor` probes the environment by running `--version` on all known agent binaries found in PATH (copilot, opencode, gemini, claude). These commands run **outside the sandbox** with full user privileges.
+
+Trust model: cplt trusts that binaries in your PATH are legitimate. This is the same trust model as typing `copilot --version` yourself. If you don't trust a binary in your PATH, remove it before running `--doctor`.
+
+### Config File Trust Model
+
+`~/.config/cplt/config.toml` and `~/.config/cplt/trust/*.toml` are trusted inputs read before sandboxing. They are not permission-checked — the trust model assumes `$HOME` is protected by OS-level permissions (0700 or 0755).
+
+On shared systems, ensure `~/.config/cplt/` has restrictive permissions (0700). A user who can write to this directory can weaken the sandbox configuration.
+
+### Scratch Directory Session IDs
+
+Session IDs for per-session scratch directories are generated from `/dev/urandom` (16 random bytes, hex-encoded). Fallback to PID + nanosecond timestamp if `/dev/urandom` is unavailable (not expected on standard macOS/Linux). The fallback is predictable but the failure mode is denial-of-service (directory creation fails if it already exists), not compromise.
 
 ## Test Strategy
 

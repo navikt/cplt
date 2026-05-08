@@ -411,12 +411,16 @@ fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
 
 #[cfg(not(target_os = "macos"))]
 fn sha256_command(path: &Path) -> Result<std::process::Output, String> {
-    // Try /usr/bin/sha256sum first, fall back to PATH lookup.
-    let bin = if std::path::Path::new("/usr/bin/sha256sum").exists() {
-        "/usr/bin/sha256sum"
-    } else {
-        "sha256sum"
-    };
+    // Use absolute paths only — bare PATH lookup could run a malicious binary.
+    let candidates = [
+        "/usr/bin/sha256sum",
+        "/usr/sbin/sha256sum",
+        "/bin/sha256sum",
+    ];
+    let bin = candidates
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .ok_or("sha256sum not found in standard paths (/usr/bin, /usr/sbin, /bin)")?;
     Command::new(bin)
         .arg(path.to_string_lossy().to_string())
         .output()
