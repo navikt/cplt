@@ -1,0 +1,15 @@
+# Per-repo sandbox config for cplt development
+# Allows the Rust toolchain paths needed for cargo build/test
+
+[propose.allow]
+# Cargo registry, crate sources, and build caches
+read = ["~/.cargo", "~/.rustup"]
+write = ["~/.cargo/registry"]
+
+[propose]
+# Integration tests invoke sandbox-exec which needs localhost
+allow_localhost_any = true
+
+[deny]
+# No secrets needed for this project
+env = ["AWS_SECRET_ACCESS_KEY", "NPM_TOKEN", "DOCKER_PASSWORD"]
