@@ -536,8 +536,8 @@ const NC: &str = "\x1b[0m";
 const SOURCE_GIT_HEAD: &str = "git HEAD (tamper-proof)";
 const SOURCE_WORKING_TREE: &str = "working tree (⚠ not committed)";
 const LABEL_DENY_APPLIED: &str = "(applied)";
-const LABEL_PROPOSE_APPROVED: &str = "(approved)";
-const LABEL_PROPOSE_PENDING: &str = "(pending approval)";
+const LABEL_ALLOW_APPROVED: &str = "(approved)";
+const LABEL_ALLOW_PENDING: &str = "(pending approval)";
 const STATUS_APPROVED: &str = "✓ approved";
 const STATUS_PENDING: &str = "○ pending";
 
@@ -1554,11 +1554,11 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
                 .unwrap_or(false)
         });
         let header_status = if all_approved {
-            format!("{green}{LABEL_PROPOSE_APPROVED}{NC}")
+            format!("{green}{LABEL_ALLOW_APPROVED}{NC}")
         } else {
-            format!("{yellow}{LABEL_PROPOSE_PENDING}{NC}")
+            format!("{yellow}{LABEL_ALLOW_PENDING}{NC}")
         };
-        println!("{BLUE}[cplt]{NC}  {dim}[propose]{NC} {header_status}");
+        println!("{BLUE}[cplt]{NC}  {dim}[allow]{NC} {header_status}");
 
         // Booleans
         let bools: &[(&str, Option<bool>)] = &[
@@ -1621,7 +1621,7 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
             );
         }
     } else {
-        println!("{BLUE}[cplt]{NC}  {dim}No proposals.{NC}");
+        println!("{BLUE}[cplt]{NC}  {dim}No additional permissions requested.{NC}");
     }
 
     println!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");
@@ -2031,14 +2031,14 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
                 .unwrap_or(false)
         });
     if proposed.is_empty() {
-        println!("{BLUE}[cplt]{NC}  No proposals (nothing requires approval).");
+        println!("{BLUE}[cplt]{NC}  No additional permissions requested.");
     } else {
         let section_label = if all_approved {
-            LABEL_PROPOSE_APPROVED
+            LABEL_ALLOW_APPROVED
         } else {
-            LABEL_PROPOSE_PENDING
+            LABEL_ALLOW_PENDING
         };
-        println!("{BLUE}[cplt]{NC}  {YELLOW}[propose]{NC} {section_label}:");
+        println!("{BLUE}[cplt]{NC}  {YELLOW}[allow]{NC} {section_label}:");
         for &key in &proposed {
             let approved = trust_entry
                 .as_ref()
@@ -2089,7 +2089,7 @@ fn trust_accept(
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
 
     if proposed.is_empty() {
-        info("No proposals in .cplt.toml — nothing to approve.");
+        info("No permissions requested in .cplt.toml — nothing to approve.");
         return ExitCode::SUCCESS;
     }
 
