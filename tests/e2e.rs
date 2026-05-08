@@ -1981,6 +1981,389 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    // ── config set --repo e2e tests ──────────────────────────────
+
+    fn make_repo_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            ".cplt-e2e-repo-{label}-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Initialize git repo (required for repo detection)
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn e2e_config_set_repo_creates_cplt_toml_with_propose() {
+        let repo = make_repo_dir("set-repo-create");
+        let cplt_toml = repo.join(".cplt.toml");
+        assert!(!cplt_toml.exists());
+
+        let output = Command::new(binary_path())
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "sandbox.allow_jvm_attach",
+                "true",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "set --repo should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(cplt_toml.exists(), ".cplt.toml should be created");
+
+        let content = std::fs::read_to_string(&cplt_toml).unwrap();
+        assert!(
+            content.contains("[propose]"),
+            "should have [propose] section: {content}"
+        );
+        assert!(
+            content.contains("allow_jvm_attach = true"),
+            "should have the key: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_deny_paths() {
+        let repo = make_repo_dir("set-repo-deny");
+
+        let output = Command::new(binary_path())
+            .args(["config", "set", "--repo", "deny.paths", "~/secrets"])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "set --repo deny: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(
+            content.contains("[deny]"),
+            "should have [deny] section: {content}"
+        );
+        assert!(
+            content.contains("\"~/secrets\""),
+            "should have the path: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_propose_allow_array() {
+        let repo = make_repo_dir("set-repo-allow-arr");
+
+        // Set first read path
+        Command::new(binary_path())
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.read",
+                "~/.gradle/gradle.properties",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        // Append second
+        let output = Command::new(binary_path())
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "allow.read",
+                "~/.m2/settings.xml",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "append: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(
+            content.contains("[propose.allow]"),
+            "should have [propose.allow]: {content}"
+        );
+        assert!(
+            content.contains("~/.gradle/gradle.properties"),
+            "should have first path: {content}"
+        );
+        assert!(
+            content.contains("~/.m2/settings.xml"),
+            "should have second path: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_rejects_invalid_key() {
+        let repo = make_repo_dir("set-repo-invalid");
+
+        let output = Command::new(binary_path())
+            .args(["config", "set", "--repo", "sandbox.quiet", "true"])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(!output.status.success(), "should fail for invalid repo key");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not valid in repo config"),
+            "should explain why: {stderr}"
+        );
+        assert!(
+            stderr.contains("local CLI output"),
+            "should give reason: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_rejects_false_proposal() {
+        let repo = make_repo_dir("set-repo-false");
+
+        let output = Command::new(binary_path())
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "sandbox.allow_jvm_attach",
+                "false",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(!output.status.success(), "should reject false proposals");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no effect"),
+            "should explain false has no effect: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_dangerous_requires_force() {
+        let repo = make_repo_dir("set-repo-danger");
+
+        // Without --force
+        let output = Command::new(binary_path())
+            .args(["config", "set", "--repo", "sandbox.allow_docker", "true"])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(!output.status.success(), "should fail without --force");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("dangerous"),
+            "should warn about danger: {stderr}"
+        );
+
+        // With --force
+        let output = Command::new(binary_path())
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "sandbox.allow_docker",
+                "true",
+                "--force",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "should succeed with --force: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(
+            content.contains("allow_docker = true"),
+            "should be set: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_unset_removes_proposal() {
+        let repo = make_repo_dir("set-repo-unset");
+
+        // Set a value first
+        Command::new(binary_path())
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "sandbox.allow_jvm_attach",
+                "true",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        // Unset it
+        let output = Command::new(binary_path())
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "sandbox.allow_jvm_attach",
+                "--unset",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "unset: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(
+            !content.contains("allow_jvm_attach"),
+            "key should be removed: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_port_array() {
+        let repo = make_repo_dir("set-repo-ports");
+
+        let output = Command::new(binary_path())
+            .args(["config", "set", "--repo", "allow.ports", "8080"])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "port set: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(content.contains("8080"), "should have port: {content}");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_idempotent_no_duplicates() {
+        let repo = make_repo_dir("set-repo-idem");
+
+        // Set same value twice
+        for _ in 0..2 {
+            Command::new(binary_path())
+                .args(["config", "set", "--repo", "allow.read", "~/.gradle"])
+                .current_dir(&repo)
+                .output()
+                .expect("should run");
+        }
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        let count = content.matches("~/.gradle").count();
+        assert_eq!(count, 1, "should not duplicate: {content}");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_proxy_private_domains() {
+        let repo = make_repo_dir("set-repo-proxy");
+
+        let output = Command::new(binary_path())
+            .args([
+                "config",
+                "set",
+                "--repo",
+                "proxy.allow_private_domains",
+                "intern.nav.no",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "proxy domain: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(
+            content.contains("[propose.proxy]"),
+            "should have [propose.proxy]: {content}"
+        );
+        assert!(
+            content.contains("intern.nav.no"),
+            "should have domain: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn e2e_config_set_repo_deny_env() {
+        let repo = make_repo_dir("set-repo-deny-env");
+
+        let output = Command::new(binary_path())
+            .args(["config", "set", "--repo", "deny.env", "VAULT_TOKEN"])
+            .current_dir(&repo)
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "deny.env: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let content = std::fs::read_to_string(repo.join(".cplt.toml")).unwrap();
+        assert!(content.contains("[deny]"), "should have [deny]: {content}");
+        assert!(
+            content.contains("\"VAULT_TOKEN\""),
+            "should have env var: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     #[test]
     fn e2e_config_explain_all_lists_keys() {
         let output = Command::new(binary_path())

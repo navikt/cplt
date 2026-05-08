@@ -4497,3 +4497,232 @@ fn validate_config_warns_on_allow_cache_exec_any() {
         "validate_config should warn when allow_cache_exec_any = true"
     );
 }
+
+// ── repo_key_target mapping tests ────────────────────────────────────
+
+#[test]
+fn repo_key_target_maps_sandbox_booleans_to_propose() {
+    use cplt::config::{RepoKeyTarget, lookup_key, repo_key_target};
+
+    let propose_keys = [
+        "sandbox.allow_jvm_attach",
+        "sandbox.allow_localhost_any",
+        "sandbox.allow_docker",
+        "sandbox.allow_tmp_exec",
+        "sandbox.allow_gpg_signing",
+        "sandbox.allow_lifecycle_scripts",
+        "sandbox.allow_browser",
+        "sandbox.allow_env_files",
+    ];
+
+    for key_str in propose_keys {
+        let info = lookup_key(key_str).unwrap();
+        assert_eq!(
+            repo_key_target(info),
+            Some(RepoKeyTarget::ProposeBool),
+            "{key_str} should map to ProposeBool"
+        );
+    }
+}
+
+#[test]
+fn repo_key_target_maps_allow_arrays_to_propose_allow() {
+    use cplt::config::{RepoKeyTarget, lookup_key, repo_key_target};
+
+    let cases = [
+        ("allow.read", "read"),
+        ("allow.write", "write"),
+        ("allow.ports", "ports"),
+        ("allow.localhost", "localhost"),
+    ];
+
+    for (key_str, expected_field) in cases {
+        let info = lookup_key(key_str).unwrap();
+        assert_eq!(
+            repo_key_target(info),
+            Some(RepoKeyTarget::ProposeAllow(expected_field)),
+            "{key_str} should map to ProposeAllow(\"{expected_field}\")"
+        );
+    }
+}
+
+#[test]
+fn repo_key_target_maps_deny_keys() {
+    use cplt::config::{RepoKeyTarget, lookup_key, repo_key_target};
+
+    let info = lookup_key("deny.paths").unwrap();
+    assert_eq!(repo_key_target(info), Some(RepoKeyTarget::Deny("paths")));
+
+    let info = lookup_key("deny.env").unwrap();
+    assert_eq!(repo_key_target(info), Some(RepoKeyTarget::Deny("env")));
+}
+
+#[test]
+fn repo_key_target_maps_proxy_private_domains() {
+    use cplt::config::{RepoKeyTarget, lookup_key, repo_key_target};
+
+    let info = lookup_key("proxy.allow_private_domains").unwrap();
+    assert_eq!(
+        repo_key_target(info),
+        Some(RepoKeyTarget::ProposeProxy("allow_private_domains"))
+    );
+}
+
+#[test]
+fn repo_key_target_rejects_machine_specific_keys() {
+    use cplt::config::{lookup_key, repo_key_target};
+
+    let rejected = [
+        "sandbox.quiet",
+        "sandbox.validate",
+        "sandbox.scratch_dir",
+        "sandbox.inherit_env",
+        "sandbox.pass_env",
+        "proxy.enabled",
+        "proxy.port",
+        "proxy.log_file",
+        "proxy.log_level",
+        "proxy.blocked_domains",
+        "proxy.allowed_domains",
+    ];
+
+    for key_str in rejected {
+        let info = lookup_key(key_str).unwrap();
+        assert_eq!(
+            repo_key_target(info),
+            None,
+            "{key_str} should be rejected in repo config"
+        );
+    }
+}
+
+#[test]
+fn set_repo_value_propose_bool_true() {
+    use cplt::config::{lookup_key, repo_key_target, set_repo_value_in_doc};
+
+    let mut doc = toml_edit::DocumentMut::new();
+    let info = lookup_key("sandbox.allow_jvm_attach").unwrap();
+    let target = repo_key_target(info).unwrap();
+
+    set_repo_value_in_doc(&mut doc, info, target, "true", false).unwrap();
+
+    let output = doc.to_string();
+    assert!(
+        output.contains("[propose]"),
+        "should have [propose]: {output}"
+    );
+    assert!(
+        output.contains("allow_jvm_attach = true"),
+        "should have key=true: {output}"
+    );
+}
+
+#[test]
+fn set_repo_value_propose_bool_false_rejected() {
+    use cplt::config::{lookup_key, repo_key_target, set_repo_value_in_doc};
+
+    let mut doc = toml_edit::DocumentMut::new();
+    let info = lookup_key("sandbox.allow_jvm_attach").unwrap();
+    let target = repo_key_target(info).unwrap();
+
+    let result = set_repo_value_in_doc(&mut doc, info, target, "false", false);
+    assert!(result.is_err(), "false should be rejected");
+    assert!(
+        result.unwrap_err().contains("no effect"),
+        "error should mention no effect"
+    );
+}
+
+#[test]
+fn set_repo_value_propose_allow_array() {
+    use cplt::config::{lookup_key, repo_key_target, set_repo_value_in_doc};
+
+    let mut doc = toml_edit::DocumentMut::new();
+    let info = lookup_key("allow.read").unwrap();
+    let target = repo_key_target(info).unwrap();
+
+    set_repo_value_in_doc(&mut doc, info, target, "~/.gradle", false).unwrap();
+    set_repo_value_in_doc(&mut doc, info, target, "~/.m2", false).unwrap();
+    // Duplicate should be idempotent
+    set_repo_value_in_doc(&mut doc, info, target, "~/.gradle", false).unwrap();
+
+    let output = doc.to_string();
+    assert!(
+        output.contains("[propose.allow]"),
+        "needs section: {output}"
+    );
+    assert_eq!(
+        output.matches("~/.gradle").count(),
+        1,
+        "no duplicates: {output}"
+    );
+    assert!(output.contains("~/.m2"), "second value: {output}");
+}
+
+#[test]
+fn set_repo_value_propose_port_array() {
+    use cplt::config::{lookup_key, repo_key_target, set_repo_value_in_doc};
+
+    let mut doc = toml_edit::DocumentMut::new();
+    let info = lookup_key("allow.ports").unwrap();
+    let target = repo_key_target(info).unwrap();
+
+    set_repo_value_in_doc(&mut doc, info, target, "8080", false).unwrap();
+    set_repo_value_in_doc(&mut doc, info, target, "9090", false).unwrap();
+
+    let output = doc.to_string();
+    assert!(output.contains("8080"), "should have 8080: {output}");
+    assert!(output.contains("9090"), "should have 9090: {output}");
+}
+
+#[test]
+fn set_repo_value_deny_paths() {
+    use cplt::config::{lookup_key, repo_key_target, set_repo_value_in_doc};
+
+    let mut doc = toml_edit::DocumentMut::new();
+    let info = lookup_key("deny.paths").unwrap();
+    let target = repo_key_target(info).unwrap();
+
+    set_repo_value_in_doc(&mut doc, info, target, "~/secrets", false).unwrap();
+
+    let output = doc.to_string();
+    assert!(output.contains("[deny]"), "needs [deny]: {output}");
+    assert!(output.contains("\"~/secrets\""), "needs path: {output}");
+}
+
+#[test]
+fn set_repo_value_unset_removes_bool() {
+    use cplt::config::{lookup_key, repo_key_target, set_repo_value_in_doc};
+
+    let mut doc = toml_edit::DocumentMut::new();
+    let info = lookup_key("sandbox.allow_jvm_attach").unwrap();
+    let target = repo_key_target(info).unwrap();
+
+    // Set then unset
+    set_repo_value_in_doc(&mut doc, info, target, "true", false).unwrap();
+    set_repo_value_in_doc(&mut doc, info, target, "", true).unwrap();
+
+    let output = doc.to_string();
+    assert!(
+        !output.contains("allow_jvm_attach"),
+        "key should be gone: {output}"
+    );
+}
+
+#[test]
+fn set_repo_value_unset_removes_array_element() {
+    use cplt::config::{lookup_key, repo_key_target, set_repo_value_in_doc};
+
+    let mut doc = toml_edit::DocumentMut::new();
+    let info = lookup_key("allow.read").unwrap();
+    let target = repo_key_target(info).unwrap();
+
+    set_repo_value_in_doc(&mut doc, info, target, "~/.gradle", false).unwrap();
+    set_repo_value_in_doc(&mut doc, info, target, "~/.m2", false).unwrap();
+    // Remove one element
+    set_repo_value_in_doc(&mut doc, info, target, "~/.gradle", true).unwrap();
+
+    let output = doc.to_string();
+    assert!(!output.contains("~/.gradle"), "removed: {output}");
+    assert!(output.contains("~/.m2"), "kept: {output}");
+}
