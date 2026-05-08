@@ -27,6 +27,7 @@ pub use path::{config_dir, config_path, default_config_contents, expand_tilde};
 pub use registry::{ConfigKeyInfo, ConfigValueType, lookup_key};
 pub use repo::{RepoKeyTarget, repo_key_rejection_reason, repo_key_target, set_repo_value_in_doc};
 pub use types::{
-    AllowConfig, CliFlags, Config, DenyConfig, LoadedConfig, ProxyConfig, Resolved, SandboxConfig,
+    AllowConfig, CliFlags, Config, DenyConfig, FeatureToggle, LoadedConfig, ProxyConfig, Resolved,
+    SandboxConfig,
 };
 pub use validation::{ConfigDiagnostic, DiagnosticLevel, validate_config};

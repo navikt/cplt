@@ -53,14 +53,8 @@ impl Config {
     /// Returns an error if a deny path from config cannot be resolved
     /// (security-critical: silently dropping deny rules is dangerous).
     pub fn merge(&self, cli: CliFlags) -> Result<Resolved, ConfigError> {
-        // Proxy: --no-proxy always wins, then --with-proxy, then config, then true (default on).
-        let with_proxy = if cli.no_proxy {
-            false
-        } else if cli.with_proxy {
-            true
-        } else {
-            self.proxy.enabled.unwrap_or(true)
-        };
+        // Proxy: FeatureToggle resolves --with-proxy/--no-proxy against config default (true).
+        let with_proxy = cli.proxy.resolve(self.proxy.enabled.unwrap_or(true));
 
         // Port: CLI (if provided) > config > 0 (OS-assigned ephemeral port)
         let proxy_port = cli.proxy_port.or(self.proxy.port).unwrap_or(0);
@@ -249,23 +243,13 @@ impl Config {
             self.sandbox.allow_browser.unwrap_or(false)
         };
 
-        // Scratch-dir: --no-scratch-dir always wins, then --scratch-dir, then config, then true (on by default)
-        let scratch_dir = if cli.no_scratch_dir {
-            false
-        } else if cli.scratch_dir {
-            true
-        } else {
-            self.sandbox.scratch_dir.unwrap_or(true)
-        };
+        // Scratch-dir: FeatureToggle resolves --scratch-dir/--no-scratch-dir (default: on)
+        let scratch_dir = cli
+            .scratch
+            .resolve(self.sandbox.scratch_dir.unwrap_or(true));
 
-        // Quiet: --no-quiet always wins, then --quiet, then config, then false
-        let quiet = if cli.no_quiet {
-            false
-        } else if cli.quiet {
-            true
-        } else {
-            self.sandbox.quiet.unwrap_or(false)
-        };
+        // Quiet: FeatureToggle resolves --quiet/--no-quiet (default: off)
+        let quiet = cli.quiet.resolve(self.sandbox.quiet.unwrap_or(false));
 
         // Validate all paths for SBPL injection characters
         for p in allow_read
@@ -727,6 +711,7 @@ impl Resolved {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::FeatureToggle;
     use super::*;
 
     #[test]
@@ -784,7 +769,7 @@ validate = false
         let config: Config = toml::from_str("[proxy]\nenabled = false\n").unwrap();
         let resolved = config
             .merge(CliFlags {
-                with_proxy: true,
+                proxy: FeatureToggle::ForceOn,
                 ..Default::default()
             })
             .unwrap();
@@ -796,7 +781,7 @@ validate = false
         let config: Config = toml::from_str("[proxy]\nenabled = true\n").unwrap();
         let resolved = config
             .merge(CliFlags {
-                no_proxy: true,
+                proxy: FeatureToggle::ForceOff,
                 ..Default::default()
             })
             .unwrap();
@@ -953,7 +938,7 @@ validate = false
         let config = Config::default();
         let resolved = config
             .merge(CliFlags {
-                quiet: true,
+                quiet: FeatureToggle::ForceOn,
                 ..Default::default()
             })
             .unwrap();
@@ -972,7 +957,7 @@ validate = false
         let config: Config = toml::from_str("[sandbox]\nquiet = true\n").unwrap();
         let resolved = config
             .merge(CliFlags {
-                no_quiet: true,
+                quiet: FeatureToggle::ForceOff,
                 ..Default::default()
             })
             .unwrap();
@@ -982,10 +967,10 @@ validate = false
     #[test]
     fn no_quiet_wins_over_quiet_flag() {
         let config = Config::default();
+        // FeatureToggle::from_pair(true, true) → ForceOff (off wins)
         let resolved = config
             .merge(CliFlags {
-                quiet: true,
-                no_quiet: true,
+                quiet: FeatureToggle::from_pair(true, true),
                 ..Default::default()
             })
             .unwrap();

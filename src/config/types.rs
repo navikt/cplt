@@ -1,6 +1,44 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Tri-state for CLI flag pairs like `--with-proxy` / `--no-proxy`.
+///
+/// Keeps Clap's two boolean flags but converts them to a single value
+/// at the merge boundary. `from_pair()` rejects contradictory inputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FeatureToggle {
+    /// Explicitly enabled via CLI flag (e.g. `--with-proxy`).
+    ForceOn,
+    /// Explicitly disabled via CLI flag (e.g. `--no-proxy`).
+    ForceOff,
+    /// Neither flag given — use config file value or hardcoded default.
+    #[default]
+    UseDefault,
+}
+
+impl FeatureToggle {
+    /// Convert a Clap boolean pair into a `FeatureToggle`.
+    ///
+    /// Clap's `conflicts_with` should prevent both being true, but we
+    /// handle it defensively: `off` wins if both are set.
+    pub fn from_pair(on: bool, off: bool) -> Self {
+        match (on, off) {
+            (_, true) => Self::ForceOff,
+            (true, false) => Self::ForceOn,
+            (false, false) => Self::UseDefault,
+        }
+    }
+
+    /// Resolve to a concrete bool given the config/default value.
+    pub fn resolve(self, config_default: bool) -> bool {
+        match self {
+            Self::ForceOn => true,
+            Self::ForceOff => false,
+            Self::UseDefault => config_default,
+        }
+    }
+}
+
 /// Default config directory relative to $HOME.
 pub(super) const CONFIG_DIR: &str = ".config/cplt";
 pub(super) const CONFIG_FILE: &str = "config.toml";
@@ -151,8 +189,7 @@ pub struct Resolved {
 /// `true` as an explicit CLI override.
 #[derive(Debug, Default)]
 pub struct CliFlags {
-    pub with_proxy: bool,
-    pub no_proxy: bool,
+    pub proxy: FeatureToggle,
     pub proxy_port: Option<u16>,
     pub blocked_domains: Option<PathBuf>,
     pub allowed_domains: Option<PathBuf>,
@@ -177,10 +214,8 @@ pub struct CliFlags {
     pub allow_cache_exec: Vec<String>,
     pub allow_cache_exec_any: bool,
     pub allow_browser: bool,
-    pub scratch_dir: bool,
-    pub no_scratch_dir: bool,
-    pub quiet: bool,
-    pub no_quiet: bool,
+    pub scratch: FeatureToggle,
+    pub quiet: FeatureToggle,
 }
 
 /// Result of loading a config file from disk.

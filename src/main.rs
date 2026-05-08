@@ -671,8 +671,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         Err(e) => bail!("{e}"),
     };
     let mut resolved = match cfg.merge(config::CliFlags {
-        with_proxy: cli.with_proxy,
-        no_proxy: cli.no_proxy,
+        proxy: config::FeatureToggle::from_pair(cli.with_proxy, cli.no_proxy),
         proxy_port: cli.proxy_port,
         blocked_domains: cli.blocked_domains.clone(),
         allowed_domains: cli.allowed_domains.clone(),
@@ -703,10 +702,8 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         allow_cache_exec: cli.allow_cache_exec.clone(),
         allow_cache_exec_any: cli.allow_cache_exec_any,
         allow_browser: cli.allow_browser,
-        scratch_dir: cli.scratch_dir,
-        no_scratch_dir: cli.no_scratch_dir,
-        quiet: cli.quiet,
-        no_quiet: cli.no_quiet,
+        scratch: config::FeatureToggle::from_pair(cli.scratch_dir, cli.no_scratch_dir),
+        quiet: config::FeatureToggle::from_pair(cli.quiet, cli.no_quiet),
     }) {
         Ok(r) => r,
         Err(e) => bail!("{e}"),
