@@ -4628,7 +4628,7 @@ fn set_repo_value_propose_bool_false_rejected() {
     let result = set_repo_value_in_doc(&mut doc, info, target, "false", false);
     assert!(result.is_err(), "false should be rejected");
     assert!(
-        result.unwrap_err().contains("no effect"),
+        result.unwrap_err().to_string().contains("no effect"),
         "error should mention no effect"
     );
 }

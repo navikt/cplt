@@ -11,6 +11,62 @@ use crate::ui;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Structured error type for configuration operations.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    #[error("Cannot read config file {path}: {source}")]
+    FileRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("cannot write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("Invalid TOML in {path}: {source}")]
+    TomlParse {
+        path: String,
+        source: toml::de::Error,
+    },
+
+    #[error("Invalid TOML: {0}")]
+    Toml(toml::de::Error),
+
+    #[error("invalid TOML in {path}: {source}")]
+    TomlEditParse {
+        path: String,
+        source: toml_edit::TomlError,
+    },
+
+    #[error("cannot determine config path ($HOME not set)")]
+    NoHome,
+
+    #[error("cannot create config directory: {0}")]
+    CreateDir(std::io::Error),
+
+    #[error("modification produced invalid TOML (this is a bug)")]
+    InvalidOutput,
+
+    #[error("{0}")]
+    Validation(String),
+}
+
+impl From<String> for ConfigError {
+    fn from(s: String) -> Self {
+        ConfigError::Validation(s)
+    }
+}
+
 /// Default config directory relative to $HOME.
 const CONFIG_DIR: &str = ".config/cplt";
 const CONFIG_FILE: &str = "config.toml";
@@ -205,7 +261,7 @@ impl Config {
     /// Load config file without printing anything.
     /// Returns `None` if no config file exists (HOME unset or file absent).
     /// Returns `Err` if the file exists but can't be read or parsed.
-    pub fn load_file() -> Result<Option<LoadedConfig>, String> {
+    pub fn load_file() -> Result<Option<LoadedConfig>, ConfigError> {
         let Some(path) = config_path() else {
             return Ok(None);
         };
@@ -221,19 +277,21 @@ impl Config {
                 return Ok(None);
             }
             Err(e) => {
-                return Err(format!("Cannot read config file {}: {e}", path.display()));
+                return Err(ConfigError::FileRead { path, source: e });
             }
         };
 
-        let config: Config =
-            toml::from_str(&raw).map_err(|e| format!("Invalid TOML in {}: {e}", path.display()))?;
+        let config: Config = toml::from_str(&raw).map_err(|e| ConfigError::TomlParse {
+            path: path.display().to_string(),
+            source: e,
+        })?;
 
         Ok(Some(LoadedConfig { config, path, raw }))
     }
 
     /// Parse config from a TOML string (no I/O, no side effects).
-    pub fn parse(s: &str) -> Result<Self, String> {
-        toml::from_str(s).map_err(|e| format!("Invalid TOML: {e}"))
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        toml::from_str(s).map_err(ConfigError::Toml)
     }
 
     /// Merge config file values with CLI flags.
@@ -245,7 +303,7 @@ impl Config {
     ///
     /// Returns an error if a deny path from config cannot be resolved
     /// (security-critical: silently dropping deny rules is dangerous).
-    pub fn merge(&self, cli: CliFlags) -> Result<Resolved, String> {
+    pub fn merge(&self, cli: CliFlags) -> Result<Resolved, ConfigError> {
         // Proxy: --no-proxy always wins, then --with-proxy, then config, then true (default on).
         let with_proxy = if cli.no_proxy {
             false
@@ -293,7 +351,9 @@ impl Config {
         allow_private_domains.dedup();
         for domain in &allow_private_domains {
             if domain.trim().is_empty() {
-                return Err("proxy.allow_private_domains entry must not be empty".to_string());
+                return Err(ConfigError::Validation(
+                    "proxy.allow_private_domains entry must not be empty".to_string(),
+                ));
             }
         }
 
@@ -329,11 +389,11 @@ impl Config {
             match resolve_config_path(s, config_dir.as_ref()) {
                 Ok(p) => deny_paths.push(p),
                 Err(e) => {
-                    return Err(format!(
+                    return Err(ConfigError::Validation(format!(
                         "deny.paths entry {s:?} cannot be resolved: {e}\n\
                          Fix the path in your config or remove it. \
                          Silently dropping deny rules is a security risk."
-                    ));
+                    )));
                 }
             }
         }
@@ -471,23 +531,23 @@ impl Config {
         // that would escape ~/Library/Caches (e.g. "../Applications").
         for subdir in &allow_cache_exec {
             if subdir.trim().is_empty() {
-                return Err(
+                return Err(ConfigError::Validation(
                     "allow_cache_exec subdir must not be empty (would grant exec to all of ~/Library/Caches)"
                         .to_string(),
-                );
+                ));
             }
             for c in ['"', ')', '(', ';', '\\', '\n', '\r', '\0'] {
                 if subdir.contains(c) {
-                    return Err(format!(
+                    return Err(ConfigError::Validation(format!(
                         "allow_cache_exec subdir {subdir:?} contains unsafe characters"
-                    ));
+                    )));
                 }
             }
             for component in subdir.trim_matches('/').split('/') {
                 if component == ".." || component == "." {
-                    return Err(format!(
+                    return Err(ConfigError::Validation(format!(
                         "allow_cache_exec subdir {subdir:?} contains path traversal"
-                    ));
+                    )));
                 }
             }
         }
@@ -1101,7 +1161,7 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 }
 
 /// Expand tilde, resolve relative paths against config dir, and canonicalize.
-fn resolve_config_path(path: &str, config_dir: Option<&PathBuf>) -> Result<PathBuf, String> {
+fn resolve_config_path(path: &str, config_dir: Option<&PathBuf>) -> Result<PathBuf, ConfigError> {
     let expanded = expand_tilde(path);
 
     // If relative and we know the config dir, resolve from there
@@ -1115,7 +1175,12 @@ fn resolve_config_path(path: &str, config_dir: Option<&PathBuf>) -> Result<PathB
         expanded
     };
 
-    std::fs::canonicalize(&full).map_err(|e| format!("path does not exist or is inaccessible: {e}"))
+    std::fs::canonicalize(&full).map_err(|_| {
+        ConfigError::Validation(format!(
+            "path does not exist or is inaccessible: {}",
+            full.display()
+        ))
+    })
 }
 
 // ── Config validation (unknown key detection) ────────────────────────
@@ -1623,9 +1688,11 @@ const CONFIG_KEYS: &[ConfigKeyInfo] = &[
 ];
 
 /// Look up a config key by "section.key" dotted notation.
-pub fn lookup_key(dotted: &str) -> Result<&'static ConfigKeyInfo, String> {
+pub fn lookup_key(dotted: &str) -> Result<&'static ConfigKeyInfo, ConfigError> {
     let (section, key) = dotted.split_once('.').ok_or_else(|| {
-        format!("invalid key format '{dotted}': expected section.key (e.g., sandbox.quiet)")
+        ConfigError::Validation(format!(
+            "invalid key format '{dotted}': expected section.key (e.g., sandbox.quiet)"
+        ))
     })?;
 
     CONFIG_KEYS
@@ -1642,10 +1709,10 @@ pub fn lookup_key(dotted: &str) -> Result<&'static ConfigKeyInfo, String> {
             let hint = suggestion
                 .map(|s| format!("\n  Did you mean '{s}'?"))
                 .unwrap_or_default();
-            format!(
+            ConfigError::Validation(format!(
                 "unknown config key '{dotted}'{hint}\n  Valid keys: {}",
                 all_dotted.join(", ")
-            )
+            ))
         })
 }
 
@@ -1781,28 +1848,31 @@ fn format_toml_value(val: &toml::Value) -> String {
 }
 
 /// Parse a CLI value string into the correct TOML type for the given key.
-fn parse_value_for_key(key_info: &ConfigKeyInfo, value: &str) -> Result<toml_edit::Value, String> {
+fn parse_value_for_key(
+    key_info: &ConfigKeyInfo,
+    value: &str,
+) -> Result<toml_edit::Value, ConfigError> {
     match key_info.value_type {
         ConfigValueType::Bool => match value {
             "true" => Ok(toml_edit::value(true).into_value().unwrap()),
             "false" => Ok(toml_edit::value(false).into_value().unwrap()),
-            _ => Err(format!(
+            _ => Err(ConfigError::Validation(format!(
                 "invalid boolean value '{value}' for {}.{}: expected 'true' or 'false'",
                 key_info.section, key_info.key
-            )),
+            ))),
         },
         ConfigValueType::U16 => {
             let n: u16 = value.parse().map_err(|_| {
-                format!(
+                ConfigError::Validation(format!(
                     "invalid port value '{value}' for {}.{}: expected 1-65535",
                     key_info.section, key_info.key
-                )
+                ))
             })?;
             if n == 0 {
-                return Err(format!(
+                return Err(ConfigError::Validation(format!(
                     "port 0 is not valid for {}.{}",
                     key_info.section, key_info.key
-                ));
+                )));
             }
             Ok(toml_edit::value(n as i64).into_value().unwrap())
         }
@@ -1812,11 +1882,13 @@ fn parse_value_for_key(key_info: &ConfigKeyInfo, value: &str) -> Result<toml_edi
             let mut arr = toml_edit::Array::new();
             for item in value.split(',') {
                 let item = item.trim();
-                let n: u16 = item
-                    .parse()
-                    .map_err(|_| format!("invalid port value '{item}': expected 1-65535"))?;
+                let n: u16 = item.parse().map_err(|_| {
+                    ConfigError::Validation(format!(
+                        "invalid port value '{item}': expected 1-65535"
+                    ))
+                })?;
                 if n == 0 {
-                    return Err("port 0 is not valid".to_string());
+                    return Err(ConfigError::Validation("port 0 is not valid".to_string()));
                 }
                 arr.push(n as i64);
             }
@@ -1837,24 +1909,24 @@ fn parse_value_for_key(key_info: &ConfigKeyInfo, value: &str) -> Result<toml_edi
 fn parse_element_for_key(
     key_info: &ConfigKeyInfo,
     value: &str,
-) -> Result<toml_edit::Value, String> {
+) -> Result<toml_edit::Value, ConfigError> {
     match key_info.value_type {
         ConfigValueType::U16Array => {
-            let n: u16 = value
-                .parse()
-                .map_err(|_| format!("invalid port value '{value}': expected 1-65535"))?;
+            let n: u16 = value.parse().map_err(|_| {
+                ConfigError::Validation(format!("invalid port value '{value}': expected 1-65535"))
+            })?;
             if n == 0 {
-                return Err("port 0 is not valid".to_string());
+                return Err(ConfigError::Validation("port 0 is not valid".to_string()));
             }
             Ok(toml_edit::value(n as i64).into_value().unwrap())
         }
         ConfigValueType::StrArray => {
             if value.contains(',') {
-                return Err(format!(
+                return Err(ConfigError::Validation(format!(
                     "value contains a comma — add one value at a time:\n  \
                      cplt config set {}.{} <VALUE>",
                     key_info.section, key_info.key
-                ));
+                )));
             }
             // Expand ~ so stored values are always absolute paths.
             // For non-path keys (e.g. pass_env), expand_tilde is a no-op.
@@ -1863,10 +1935,10 @@ fn parse_element_for_key(
                 .into_value()
                 .unwrap())
         }
-        _ => Err(format!(
+        _ => Err(ConfigError::Validation(format!(
             "{}.{} is not an array key — use 'set' without --append",
             key_info.section, key_info.key
-        )),
+        ))),
     }
 }
 
@@ -1875,7 +1947,7 @@ pub fn set_value_in_doc(
     doc: &mut toml_edit::DocumentMut,
     key_info: &ConfigKeyInfo,
     value: &str,
-) -> Result<(), String> {
+) -> Result<(), ConfigError> {
     let typed_value = parse_value_for_key(key_info, value)?;
 
     // Ensure section exists
@@ -1893,7 +1965,7 @@ pub fn append_value_in_doc(
     doc: &mut toml_edit::DocumentMut,
     key_info: &ConfigKeyInfo,
     value: &str,
-) -> Result<(), String> {
+) -> Result<(), ConfigError> {
     let element = parse_element_for_key(key_info, value)?;
 
     // Ensure section exists
@@ -1901,7 +1973,12 @@ pub fn append_value_in_doc(
         doc[key_info.section] = toml_edit::Item::Table(toml_edit::Table::new());
     }
 
-    let section = doc[key_info.section].as_table_mut().unwrap();
+    let section = doc[key_info.section].as_table_mut().ok_or_else(|| {
+        ConfigError::Validation(format!(
+            "[{}] is not a table in the config file",
+            key_info.section
+        ))
+    })?;
     match section.get_mut(key_info.key) {
         Some(item) => {
             if let Some(arr) = item.as_array_mut() {
@@ -1911,10 +1988,10 @@ pub fn append_value_in_doc(
                 }
                 Ok(())
             } else {
-                Err(format!(
+                Err(ConfigError::Validation(format!(
                     "{}.{} exists but is not an array",
                     key_info.section, key_info.key
-                ))
+                )))
             }
         }
         None => {
@@ -1936,7 +2013,7 @@ pub fn remove_array_element_in_doc(
     doc: &mut toml_edit::DocumentMut,
     key_info: &ConfigKeyInfo,
     value: &str,
-) -> Result<bool, String> {
+) -> Result<bool, ConfigError> {
     let element = parse_element_for_key(key_info, value)?;
 
     let Some(section) = doc.get_mut(key_info.section).and_then(|s| s.as_table_mut()) else {
@@ -1948,10 +2025,10 @@ pub fn remove_array_element_in_doc(
     };
 
     let Some(arr) = item.as_array_mut() else {
-        return Err(format!(
+        return Err(ConfigError::Validation(format!(
             "{}.{} exists but is not an array",
             key_info.section, key_info.key
-        ));
+        )));
     };
 
     // Find and remove all matching elements (handles manual duplicates)
@@ -2034,19 +2111,24 @@ pub struct ConfigSetOp {
 }
 
 impl ConfigSetOp {
-    pub fn new(dotted_key: &str) -> Result<Self, String> {
+    pub fn new(dotted_key: &str) -> Result<Self, ConfigError> {
         let key_info = lookup_key(dotted_key)?;
-        let path = config_path().ok_or("cannot determine config path ($HOME not set)")?;
+        let path = config_path().ok_or(ConfigError::NoHome)?;
         Ok(Self { key_info, path })
     }
 
     /// Load the existing TOML document, or create an empty one.
-    pub fn load_document(&self) -> Result<toml_edit::DocumentMut, String> {
+    pub fn load_document(&self) -> Result<toml_edit::DocumentMut, ConfigError> {
         if self.path.exists() {
-            let raw = std::fs::read_to_string(&self.path)
-                .map_err(|e| format!("cannot read {}: {e}", self.path.display()))?;
+            let raw = std::fs::read_to_string(&self.path).map_err(|e| ConfigError::Read {
+                path: self.path.clone(),
+                source: e,
+            })?;
             raw.parse::<toml_edit::DocumentMut>()
-                .map_err(|e| format!("invalid TOML in {}: {e}", self.path.display()))
+                .map_err(|e| ConfigError::TomlEditParse {
+                    path: self.path.display().to_string(),
+                    source: e,
+                })
         } else {
             Ok(toml_edit::DocumentMut::new())
         }
@@ -2055,22 +2137,23 @@ impl ConfigSetOp {
     /// Write the document back, creating parent dirs if needed.
     /// Only verifies the result is valid TOML (not full key validation —
     /// an existing typo elsewhere shouldn't block a valid set operation).
-    pub fn write_document(&self, doc: &toml_edit::DocumentMut) -> Result<(), String> {
+    pub fn write_document(&self, doc: &toml_edit::DocumentMut) -> Result<(), ConfigError> {
         let output = doc.to_string();
 
         // Sanity check: the result must still be valid TOML
         if output.parse::<toml::Table>().is_err() {
-            return Err("modification produced invalid TOML (this is a bug)".to_string());
+            return Err(ConfigError::InvalidOutput);
         }
 
         // Create parent dirs
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create config directory: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(ConfigError::CreateDir)?;
         }
 
-        std::fs::write(&self.path, output)
-            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
+        std::fs::write(&self.path, output).map_err(|e| ConfigError::Write {
+            path: self.path.clone(),
+            source: e,
+        })
     }
 }
 
@@ -2154,7 +2237,7 @@ pub fn set_repo_value_in_doc(
     target: RepoKeyTarget,
     value: &str,
     unset: bool,
-) -> Result<(), String> {
+) -> Result<(), ConfigError> {
     use toml_edit::{Array, Item, Table, Value};
 
     match target {
@@ -2163,21 +2246,21 @@ pub fn set_repo_value_in_doc(
                 .entry("propose")
                 .or_insert(Item::Table(Table::new()))
                 .as_table_mut()
-                .ok_or("invalid [propose] section")?;
+                .ok_or_else(|| ConfigError::Validation("invalid [propose] section".to_string()))?;
 
             if unset {
                 section.remove(key_info.key);
             } else {
-                let b: bool = value
-                    .parse()
-                    .map_err(|_| format!("expected 'true' or 'false', got '{value}'"))?;
+                let b: bool = value.parse().map_err(|_| {
+                    ConfigError::Validation(format!("expected 'true' or 'false', got '{value}'"))
+                })?;
                 if !b {
-                    return Err(format!(
+                    return Err(ConfigError::Validation(format!(
                         "{}.{} = false has no effect in repo config.\n  \
                          Repo config can only request enabling permissions.\n  \
                          Use --unset to remove it.",
                         key_info.section, key_info.key
-                    ));
+                    )));
                 }
                 section[key_info.key] = toml_edit::value(b);
             }
@@ -2187,12 +2270,14 @@ pub fn set_repo_value_in_doc(
                 .entry("propose")
                 .or_insert(Item::Table(Table::new()))
                 .as_table_mut()
-                .ok_or("invalid [propose] section")?;
+                .ok_or_else(|| ConfigError::Validation("invalid [propose] section".to_string()))?;
             let allow = propose
                 .entry("allow")
                 .or_insert(Item::Table(Table::new()))
                 .as_table_mut()
-                .ok_or("invalid [propose.allow] section")?;
+                .ok_or_else(|| {
+                    ConfigError::Validation("invalid [propose.allow] section".to_string())
+                })?;
 
             if unset {
                 if value.is_empty() {
@@ -2214,13 +2299,15 @@ pub fn set_repo_value_in_doc(
                     .entry(array_key)
                     .or_insert(Item::Value(Value::Array(Array::new())))
                     .as_array_mut()
-                    .ok_or("expected array")?;
+                    .ok_or_else(|| ConfigError::Validation("expected array".to_string()))?;
 
                 // Parse as u16 for port arrays, string otherwise
                 if key_info.value_type == ConfigValueType::U16Array {
-                    let port: u16 = value
-                        .parse()
-                        .map_err(|_| format!("expected port number (1-65535), got '{value}'"))?;
+                    let port: u16 = value.parse().map_err(|_| {
+                        ConfigError::Validation(format!(
+                            "expected port number (1-65535), got '{value}'"
+                        ))
+                    })?;
                     if !arr.iter().any(|v| v.as_integer() == Some(port as i64)) {
                         arr.push(port as i64);
                     }
@@ -2236,12 +2323,14 @@ pub fn set_repo_value_in_doc(
                 .entry("propose")
                 .or_insert(Item::Table(Table::new()))
                 .as_table_mut()
-                .ok_or("invalid [propose] section")?;
+                .ok_or_else(|| ConfigError::Validation("invalid [propose] section".to_string()))?;
             let proxy = propose
                 .entry("proxy")
                 .or_insert(Item::Table(Table::new()))
                 .as_table_mut()
-                .ok_or("invalid [propose.proxy] section")?;
+                .ok_or_else(|| {
+                    ConfigError::Validation("invalid [propose.proxy] section".to_string())
+                })?;
 
             if unset {
                 if value.is_empty() {
@@ -2260,7 +2349,7 @@ pub fn set_repo_value_in_doc(
                     .entry(array_key)
                     .or_insert(Item::Value(Value::Array(Array::new())))
                     .as_array_mut()
-                    .ok_or("expected array")?;
+                    .ok_or_else(|| ConfigError::Validation("expected array".to_string()))?;
                 if !arr.iter().any(|v| v.as_str() == Some(value)) {
                     arr.push(value);
                 }
@@ -2271,7 +2360,7 @@ pub fn set_repo_value_in_doc(
                 .entry("deny")
                 .or_insert(Item::Table(Table::new()))
                 .as_table_mut()
-                .ok_or("invalid [deny] section")?;
+                .ok_or_else(|| ConfigError::Validation("invalid [deny] section".to_string()))?;
 
             if unset {
                 if value.is_empty() {
@@ -2291,7 +2380,7 @@ pub fn set_repo_value_in_doc(
                     .entry(array_key)
                     .or_insert(Item::Value(Value::Array(Array::new())))
                     .as_array_mut()
-                    .ok_or("expected array")?;
+                    .ok_or_else(|| ConfigError::Validation("expected array".to_string()))?;
                 if !arr.iter().any(|v| v.as_str() == Some(value)) {
                     arr.push(value);
                 }
@@ -2681,7 +2770,12 @@ validate = false
             toml::from_str("[deny]\npaths = [\"/nonexistent/path/xyz\"]\n").unwrap();
         let result = config.merge(CliFlags::default());
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("cannot be resolved"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be resolved")
+        );
     }
 
     #[test]
@@ -3059,13 +3153,16 @@ quiet = false
     #[test]
     fn lookup_key_unknown_suggests() {
         let err = lookup_key("sandbox.queit").unwrap_err();
-        assert!(err.contains("quiet"), "should suggest 'quiet': {err}");
+        assert!(
+            err.to_string().contains("quiet"),
+            "should suggest 'quiet': {err}"
+        );
     }
 
     #[test]
     fn lookup_key_unknown_section() {
         let err = lookup_key("bogus.key").unwrap_err();
-        assert!(err.contains("unknown config key"), "{err}");
+        assert!(err.to_string().contains("unknown config key"), "{err}");
     }
 
     #[test]
@@ -3322,7 +3419,7 @@ quiet = false
         let info = lookup_key("sandbox.quiet").unwrap();
         let result = remove_array_element_in_doc(&mut doc, info, "true");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not an array"));
+        assert!(result.unwrap_err().to_string().contains("not an array"));
     }
 
     #[test]
@@ -3345,7 +3442,7 @@ quiet = false
         let info = lookup_key("allow.read").unwrap();
         let result = append_value_in_doc(&mut doc, info, "/tmp/a,/tmp/b");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("comma"));
+        assert!(result.unwrap_err().to_string().contains("comma"));
     }
 
     #[test]

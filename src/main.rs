@@ -1403,7 +1403,7 @@ fn run_config_validate() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(e) => {
-            ui::error(&e);
+            ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
@@ -1442,7 +1442,7 @@ fn run_config_show() -> ExitCode {
     let loaded = match config::Config::load_file() {
         Ok(l) => l,
         Err(e) => {
-            ui::error(&e);
+            ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
@@ -1607,7 +1607,7 @@ fn run_config_get(key: &str) -> ExitCode {
     let key_info = match config::lookup_key(key) {
         Ok(k) => k,
         Err(e) => {
-            ui::error(&e);
+            ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
@@ -1615,7 +1615,7 @@ fn run_config_get(key: &str) -> ExitCode {
     let loaded = match config::Config::load_file() {
         Ok(l) => l,
         Err(e) => {
-            ui::error(&e);
+            ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
@@ -1643,7 +1643,7 @@ fn run_config_set(
     let key_info = match config::lookup_key(key) {
         Ok(info) => info,
         Err(e) => {
-            ui::error(&e);
+            ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
@@ -1682,7 +1682,7 @@ fn run_config_set(
     let op = match config::ConfigSetOp::new(key) {
         Ok(op) => op,
         Err(e) => {
-            ui::error(&e);
+            ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
@@ -1705,7 +1705,7 @@ fn run_config_set(
     let mut doc = match op.load_document() {
         Ok(d) => d,
         Err(e) => {
-            ui::error(&e);
+            ui::error(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
@@ -1729,7 +1729,7 @@ fn run_config_set(
     };
 
     if let Err(e) = result {
-        ui::error(&e);
+        ui::error(&e.to_string());
         return ExitCode::FAILURE;
     }
 
@@ -1745,7 +1745,7 @@ fn run_config_set(
 
     // Write back
     if let Err(e) = op.write_document(&doc) {
-        ui::error(&e);
+        ui::error(&e.to_string());
         return ExitCode::FAILURE;
     }
 
@@ -1857,7 +1857,7 @@ fn run_config_set_repo(
         value.unwrap()
     };
     if let Err(e) = config::set_repo_value_in_doc(&mut doc, key_info, target, val, unset) {
-        ui::error(&e);
+        ui::error(&e.to_string());
         return ExitCode::FAILURE;
     }
 
@@ -1935,7 +1935,7 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                ui::error(&e);
+                ui::error(&e.to_string());
                 ExitCode::FAILURE
             }
         },
