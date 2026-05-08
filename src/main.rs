@@ -1556,6 +1556,15 @@ fn run_config_set(
     }
 
     // ── Global mode (default) ───────────────────────────────────────
+
+    // deny.env is repo-local only (not in global config file schema)
+    if key_info.section == "deny" && key_info.key == "env" {
+        error(
+            "deny.env is only supported in repo-local config (.cplt.toml).\n  Use: cplt config set --repo deny.env <VALUE>",
+        );
+        return ExitCode::FAILURE;
+    }
+
     let op = match config::ConfigSetOp::new(key) {
         Ok(op) => op,
         Err(e) => {
@@ -1647,7 +1656,7 @@ fn run_config_set(
     }
 
     // Hint about repo config if .cplt.toml exists
-    let project_dir = std::env::current_dir().ok();
+    let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
     if let Some(ref dir) = project_dir
         && dir.join(".cplt.toml").exists()
     {
@@ -1667,14 +1676,9 @@ fn run_config_set_repo(
     unset: bool,
     force: bool,
 ) -> ExitCode {
-    // Determine repo config path
-    let project_dir = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            error(&format!("cannot determine current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
-    };
+    // Determine repo config path (git root preferred, fallback to cwd)
+    let project_dir = detect_project_root()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let repo_config_path = project_dir.join(".cplt.toml");
 
     // Check if key is valid in repo config
@@ -1747,6 +1751,13 @@ fn run_config_set_repo(
         return ExitCode::FAILURE;
     }
 
+    // Validate the result parses as a valid repo config
+    if let Err(e) = toml::from_str::<repo_config::RepoConfig>(&output) {
+        eprintln!(
+            "{YELLOW}[cplt] Warning: written .cplt.toml has validation issues: {e}{NC}\n  The file was saved but may not load correctly."
+        );
+    }
+
     // User feedback
     let dim = "\x1b[2m";
     if unset {
@@ -1811,14 +1822,9 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
 }
 
 fn run_trust_command(action: Option<TrustAction>) -> ExitCode {
-    // Determine project directory (current working directory)
-    let project_dir = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            error(&format!("Cannot determine current directory: {e}"));
-            return ExitCode::FAILURE;
-        }
-    };
+    // Determine project directory (git root preferred, fallback to cwd)
+    let project_dir = detect_project_root()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     // Check if inside sandbox — trust commands are blocked there
     if std::env::var("__CPLT_TRUST_LOCKED").is_ok() {
@@ -1901,6 +1907,19 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             "{BLUE}[cplt]{NC}  Last approved: {}",
             entry.accepted.approved_at
         );
+
+        // Check if proposals have changed since last approval (content hash mismatch)
+        if !entry.accepted.content_hash.is_empty() {
+            let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+            if entry.accepted.content_hash != current_hash {
+                eprintln!(
+                    "{BLUE}[cplt]{NC}  {RED}⚠ Proposals have changed since last approval!{NC}"
+                );
+                eprintln!(
+                    "{BLUE}[cplt]{NC}  {RED}  Run `cplt trust --accept-all` to re-approve.{NC}"
+                );
+            }
+        }
     }
 
     eprintln!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");

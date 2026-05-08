@@ -773,6 +773,12 @@ impl Resolved {
         eprintln!(
             "{blue}[cplt]{nc}    Stripped:      {dim}AWS_*, NPM_TOKEN, DATABASE_URL, SSH_AUTH_SOCK, ...{nc}"
         );
+        if !self.deny_env.is_empty() {
+            eprintln!(
+                "{blue}[cplt]{nc}    Repo deny:     {dim}{}{nc}",
+                self.deny_env.join(", ")
+            );
+        }
         eprintln!();
 
         eprintln!(
@@ -2191,7 +2197,10 @@ pub fn set_repo_value_in_doc(
                 .ok_or("invalid [propose.allow] section")?;
 
             if unset {
-                if let Some(arr) = allow.get_mut(array_key).and_then(|v| v.as_array_mut()) {
+                if value.is_empty() {
+                    // --unset without value: remove the entire array
+                    allow.remove(array_key);
+                } else if let Some(arr) = allow.get_mut(array_key).and_then(|v| v.as_array_mut()) {
                     arr.retain(|v| {
                         v.as_str() != Some(value)
                             && v.as_integer().map(|i| i.to_string()).as_deref() != Some(value)
@@ -2237,7 +2246,10 @@ pub fn set_repo_value_in_doc(
                 .ok_or("invalid [propose.proxy] section")?;
 
             if unset {
-                if let Some(arr) = proxy.get_mut(array_key).and_then(|v| v.as_array_mut()) {
+                if value.is_empty() {
+                    // --unset without value: remove the entire array
+                    proxy.remove(array_key);
+                } else if let Some(arr) = proxy.get_mut(array_key).and_then(|v| v.as_array_mut()) {
                     arr.retain(|v| v.as_str() != Some(value));
                     if arr.is_empty() {
                         proxy.remove(array_key);
@@ -2264,7 +2276,11 @@ pub fn set_repo_value_in_doc(
                 .ok_or("invalid [deny] section")?;
 
             if unset {
-                if let Some(arr) = section.get_mut(array_key).and_then(|v| v.as_array_mut()) {
+                if value.is_empty() {
+                    // --unset without value: remove the entire array
+                    section.remove(array_key);
+                } else if let Some(arr) = section.get_mut(array_key).and_then(|v| v.as_array_mut())
+                {
                     arr.retain(|v| v.as_str() != Some(value));
                     if arr.is_empty() {
                         section.remove(array_key);

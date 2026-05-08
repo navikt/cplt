@@ -51,23 +51,22 @@ pub struct AcceptedProposals {
 
 /// Compute a stable fingerprint for a repository.
 ///
-/// Uses the canonical remote URL (preferred) or the absolute project path
-/// as fallback. Returns a hex-encoded SHA-256 prefix (16 chars) for use
-/// as a filename.
-///
-/// Uses SHA-256 (truncated to 64 bits) for cross-version stability.
-/// `DefaultHasher` is explicitly non-portable across Rust versions.
+/// Uses the canonical remote URL (preferred) or the canonicalized absolute
+/// project path as fallback. Returns a hex-encoded SHA-256 (full 64 chars)
+/// for use as a filename. This ensures collision resistance and stability
+/// across Rust versions/platforms.
 pub fn repo_fingerprint(project_dir: &Path) -> String {
-    let identity =
-        canonical_remote(project_dir).unwrap_or_else(|| project_dir.to_string_lossy().into_owned());
+    let identity = canonical_remote(project_dir).unwrap_or_else(|| {
+        // Canonicalize to handle symlinks/relative paths consistently
+        std::fs::canonicalize(project_dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| project_dir.to_string_lossy().into_owned())
+    });
 
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(identity.as_bytes());
-    // First 8 bytes → 16 hex chars (same length as before)
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]
-    )
+    // Full SHA-256 hex (64 chars) — collision-resistant
+    hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Get the canonical remote URL for the git repo at `project_dir`.
@@ -123,7 +122,8 @@ fn normalize_remote_url(url: &str) -> String {
 
 /// Resolve the trust store directory path.
 ///
-/// Returns `~/.config/cplt/trust/` (or `$CPLT_CONFIG/../trust/` if overridden).
+/// Returns `~/.config/cplt/trust/` by default, or `<parent of $CPLT_CONFIG>/trust/`
+/// if the `CPLT_CONFIG` env var overrides the config file location.
 pub fn trust_dir() -> Option<PathBuf> {
     let config_dir = crate::config::config_dir()?;
     Some(config_dir.join(TRUST_DIR))
@@ -143,17 +143,23 @@ pub fn load_trust(project_dir: &Path) -> Option<TrustEntry> {
 /// Save a trust entry for a repository.
 ///
 /// Creates the trust directory if it doesn't exist.
+/// Uses atomic write (temp file + rename) to prevent corruption on crash.
 pub fn save_trust(project_dir: &Path, entry: &TrustEntry) -> Result<(), String> {
     let dir = trust_dir().ok_or("Cannot determine trust store directory")?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create trust directory: {e}"))?;
 
     let fingerprint = repo_fingerprint(project_dir);
     let trust_file = dir.join(format!("{fingerprint}.toml"));
+    let tmp_file = dir.join(format!(".{fingerprint}.toml.tmp"));
 
     let content =
         toml::to_string_pretty(entry).map_err(|e| format!("Cannot serialize trust entry: {e}"))?;
 
-    std::fs::write(&trust_file, content).map_err(|e| format!("Cannot write trust file: {e}"))?;
+    // Write to temp file first, then atomically rename
+    std::fs::write(&tmp_file, &content)
+        .map_err(|e| format!("Cannot write temp trust file: {e}"))?;
+    std::fs::rename(&tmp_file, &trust_file)
+        .map_err(|e| format!("Cannot rename trust file: {e}"))?;
 
     Ok(())
 }
@@ -195,25 +201,37 @@ pub fn filter_unapproved<'a>(proposed: &[&'a str], trust: &TrustEntry) -> Vec<&'
         .collect()
 }
 
-/// Get the current timestamp in ISO 8601 format.
+/// Get the current timestamp in ISO 8601 format (UTC).
+///
+/// Uses `std::time::SystemTime` — no external dependencies or shell-outs.
 pub fn now_iso8601() -> String {
-    // Simple implementation without chrono dependency
-    let output = std::process::Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .ok();
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    output
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "unknown".to_string())
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+
+    // Convert unix timestamp to UTC date components
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Civil date from days since epoch (algorithm from Howard Hinnant)
+    let z = days as i64 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 /// Compute a stable content hash of the proposal section.
@@ -221,6 +239,10 @@ pub fn now_iso8601() -> String {
 /// This hash captures the *values* of all proposals so that if the
 /// `.cplt.toml` changes (e.g. adding new paths to `allow.read`),
 /// existing approvals are invalidated and the user must re-approve.
+///
+/// Arrays are sorted before hashing so reordering entries does not
+/// invalidate approvals. Full SHA-256 hex is used (64 chars) for
+/// collision resistance.
 pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> String {
     use sha2::{Digest, Sha256};
 
@@ -243,28 +265,45 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
         }
     }
 
-    // Path/port proposals
-    for p in &propose.allow.read {
+    // Path/port proposals — sorted for order-independence
+    let mut read: Vec<&str> = propose.allow.read.iter().map(|s| s.as_str()).collect();
+    read.sort_unstable();
+    for p in &read {
         hasher.update(format!("allow.read={p}\n").as_bytes());
     }
-    for p in &propose.allow.write {
+
+    let mut write: Vec<&str> = propose.allow.write.iter().map(|s| s.as_str()).collect();
+    write.sort_unstable();
+    for p in &write {
         hasher.update(format!("allow.write={p}\n").as_bytes());
     }
-    for port in &propose.allow.ports {
+
+    let mut ports: Vec<u16> = propose.allow.ports.clone();
+    ports.sort_unstable();
+    for port in &ports {
         hasher.update(format!("allow.ports={port}\n").as_bytes());
     }
-    for port in &propose.allow.localhost {
+
+    let mut localhost: Vec<u16> = propose.allow.localhost.clone();
+    localhost.sort_unstable();
+    for port in &localhost {
         hasher.update(format!("allow.localhost={port}\n").as_bytes());
     }
-    for d in &propose.proxy.allow_private_domains {
+
+    let mut domains: Vec<&str> = propose
+        .proxy
+        .allow_private_domains
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    domains.sort_unstable();
+    for d in &domains {
         hasher.update(format!("proxy.allow_private_domains={d}\n").as_bytes());
     }
 
     let hash = hasher.finalize();
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]
-    )
+    // Full SHA-256 hex (64 chars) — collision-resistant content pinning
+    hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -316,7 +355,7 @@ mod tests {
         let fp1 = repo_fingerprint(Path::new("/home/user/project"));
         let fp2 = repo_fingerprint(Path::new("/home/user/project"));
         assert_eq!(fp1, fp2);
-        assert_eq!(fp1.len(), 16);
+        assert_eq!(fp1.len(), 64); // Full SHA-256 hex
     }
 
     #[test]
@@ -426,7 +465,7 @@ approved_at = "2026-05-01T12:00:00Z"
         let hash1 = proposal_content_hash(&propose);
         let hash2 = proposal_content_hash(&propose);
         assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 16); // 8 bytes = 16 hex chars
+        assert_eq!(hash1.len(), 64); // Full SHA-256 hex
     }
 
     #[test]
@@ -453,5 +492,44 @@ approved_at = "2026-05-01T12:00:00Z"
             proposal_content_hash(&propose1),
             proposal_content_hash(&propose2)
         );
+    }
+
+    #[test]
+    fn proposal_content_hash_order_independent() {
+        use crate::repo_config::{ProposeAllowSection, ProposeSection};
+
+        let propose1 = ProposeSection {
+            allow: ProposeAllowSection {
+                read: vec!["b.txt".to_string(), "a.txt".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let propose2 = ProposeSection {
+            allow: ProposeAllowSection {
+                read: vec!["a.txt".to_string(), "b.txt".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            proposal_content_hash(&propose1),
+            proposal_content_hash(&propose2)
+        );
+    }
+
+    #[test]
+    fn now_iso8601_format_valid() {
+        let ts = now_iso8601();
+        // Should match YYYY-MM-DDTHH:MM:SSZ
+        assert_eq!(ts.len(), 20);
+        assert!(ts.ends_with('Z'));
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[7..8], "-");
+        assert_eq!(&ts[10..11], "T");
+        assert_eq!(&ts[13..14], ":");
+        assert_eq!(&ts[16..17], ":");
     }
 }

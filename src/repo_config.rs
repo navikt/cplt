@@ -191,6 +191,20 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
         }
     }
 
+    // Validate private domains: must be non-empty, no whitespace
+    for domain in &config.propose.proxy.allow_private_domains {
+        if domain.is_empty() || domain.trim().is_empty() {
+            return Err(
+                "propose.proxy.allow_private_domains contains empty domain name".to_string(),
+            );
+        }
+        if domain.contains(char::is_whitespace) {
+            return Err(format!(
+                "propose.proxy.allow_private_domains entry {domain:?} contains whitespace"
+            ));
+        }
+    }
+
     Ok(())
 }
 
