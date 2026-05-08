@@ -161,10 +161,23 @@ fn parse_repo_config(content: &str) -> Result<RepoConfig, String> {
     toml::from_str(content).map_err(|e| format!("Invalid .cplt.toml: {e}"))
 }
 
+/// Reject paths containing `..` components which could bypass SBPL literal matching.
+fn reject_path_traversal(path: &str, context: &str) -> Result<(), String> {
+    for component in std::path::Path::new(path).components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!(
+                "{context} entry {path:?} contains '..' traversal (not allowed in repo config)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate the repo config for safety.
 fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
-    // Validate deny paths don't contain SBPL injection characters
+    // Validate deny paths don't contain SBPL injection characters or traversal
     for path in &config.deny.paths {
+        reject_path_traversal(path, "deny.paths")?;
         crate::sandbox::validate_sbpl_path(&PathBuf::from(path))?;
     }
 
@@ -176,6 +189,7 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
         .iter()
         .chain(config.propose.allow.write.iter())
     {
+        reject_path_traversal(path, "propose.allow.read/write")?;
         crate::sandbox::validate_sbpl_path(&PathBuf::from(path))?;
     }
 
@@ -429,5 +443,43 @@ allow_network = true
     fn proposed_keys_empty_for_default() {
         let keys = proposed_keys(&ProposeSection::default());
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn rejects_path_traversal_in_deny() {
+        let toml_str = r#"
+[deny]
+paths = ["~/secrets/../.ssh"]
+"#;
+        let config = parse_repo_config(toml_str).unwrap();
+        let result = validate_repo_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("'..'"));
+    }
+
+    #[test]
+    fn rejects_path_traversal_in_propose_read() {
+        let toml_str = r#"
+[propose.allow]
+read = ["~/.gradle/../../.ssh/id_rsa"]
+"#;
+        let config = parse_repo_config(toml_str).unwrap();
+        let result = validate_repo_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("'..'"));
+    }
+
+    #[test]
+    fn accepts_normal_paths() {
+        let toml_str = r#"
+[deny]
+paths = ["~/secrets", "/tmp/sensitive"]
+
+[propose.allow]
+read = ["~/.gradle/gradle.properties"]
+write = ["~/.m2/repository"]
+"#;
+        let config = parse_repo_config(toml_str).unwrap();
+        assert!(validate_repo_config(&config).is_ok());
     }
 }

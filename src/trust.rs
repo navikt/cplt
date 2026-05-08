@@ -95,20 +95,48 @@ fn canonical_remote(project_dir: &Path) -> Option<String> {
 fn normalize_remote_url(url: &str) -> String {
     let url = url.trim();
 
-    // SSH: git@host:org/repo.git
-    if let Some(rest) = url.strip_prefix("git@")
-        && let Some((host, path)) = rest.split_once(':')
+    // SSH scheme: ssh://[user@]host[:port]/org/repo.git
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        // Strip user@ prefix if present
+        let rest = if let Some((_user, after)) = rest.split_once('@') {
+            after
+        } else {
+            rest
+        };
+        // Strip optional :port before path
+        let rest = rest.trim_end_matches(".git").trim_end_matches('/');
+        if let Some((host_port, path)) = rest.split_once('/') {
+            let host = host_port.split(':').next().unwrap_or(host_port);
+            return format!("{}/{}", host.to_lowercase(), path);
+        }
+        return rest.to_lowercase();
+    }
+
+    // SSH shorthand: git@host:org/repo.git (also handles user@host:path)
+    if let Some((user_host, path)) = url.split_once(':')
+        && !path.starts_with("//")
+        && user_host.contains('@')
     {
+        let host = user_host
+            .rsplit_once('@')
+            .map(|(_, h)| h)
+            .unwrap_or(user_host);
         let path = path.trim_end_matches(".git").trim_end_matches('/');
         return format!("{}/{}", host.to_lowercase(), path);
     }
 
-    // HTTPS: https://host/org/repo.git
+    // HTTPS/HTTP: https://host/org/repo.git
     if let Some(rest) = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
     {
         let rest = rest.trim_end_matches(".git").trim_end_matches('/');
+        // Strip optional user@ (e.g., https://token@github.com/org/repo)
+        let rest = if let Some((_cred, after)) = rest.split_once('@') {
+            after
+        } else {
+            rest
+        };
         // Lowercase only the host portion
         if let Some((host, path)) = rest.split_once('/') {
             return format!("{}/{}", host.to_lowercase(), path);
@@ -348,6 +376,57 @@ mod tests {
             normalize_remote_url("https://GitHub.COM/navikt/spleis.git"),
             "github.com/navikt/spleis"
         );
+    }
+
+    #[test]
+    fn normalize_ssh_scheme_url() {
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com/navikt/spleis.git"),
+            "github.com/navikt/spleis"
+        );
+    }
+
+    #[test]
+    fn normalize_ssh_scheme_with_port() {
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com:22/navikt/spleis.git"),
+            "github.com/navikt/spleis"
+        );
+    }
+
+    #[test]
+    fn normalize_ssh_deploy_user() {
+        // deploy@ instead of git@
+        assert_eq!(
+            normalize_remote_url("deploy@github.com:navikt/spleis.git"),
+            "github.com/navikt/spleis"
+        );
+    }
+
+    #[test]
+    fn normalize_https_with_token() {
+        // CI often uses https://x-access-token:TOKEN@github.com/org/repo
+        assert_eq!(
+            normalize_remote_url("https://x-access-token:ghp_abc@github.com/navikt/spleis.git"),
+            "github.com/navikt/spleis"
+        );
+    }
+
+    #[test]
+    fn normalize_all_variants_same_fingerprint() {
+        let variants = [
+            "git@github.com:navikt/spleis.git",
+            "https://github.com/navikt/spleis.git",
+            "ssh://git@github.com/navikt/spleis.git",
+            "ssh://git@github.com:22/navikt/spleis.git",
+            "https://github.com/navikt/spleis",
+            "deploy@github.com:navikt/spleis.git",
+            "https://x-token:abc@github.com/navikt/spleis.git",
+        ];
+        let normalized: Vec<_> = variants.iter().map(|u| normalize_remote_url(u)).collect();
+        for n in &normalized {
+            assert_eq!(n, "github.com/navikt/spleis", "failed for variant");
+        }
     }
 
     #[test]
