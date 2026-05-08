@@ -2321,113 +2321,113 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     let src =
         |has_file_value: bool| -> &'static str { if has_file_value { "" } else { " (default)" } };
 
-    eprintln!("{blue}[cplt]{nc} ── Effective Configuration ──────────────────────");
-    eprintln!();
+    println!("{blue}[cplt]{nc} ── Effective Configuration ──────────────────────");
+    println!();
 
     // Config file path
     if let Some(l) = loaded {
-        eprintln!("{blue}[cplt]{nc}  {dim}File:{nc}  {}", l.path.display());
+        println!("{blue}[cplt]{nc}  {dim}File:{nc}  {}", l.path.display());
     } else if let Some(p) = config_path() {
-        eprintln!(
+        println!(
             "{blue}[cplt]{nc}  {dim}File:{nc}  {dim}(not found: {}){nc}",
             p.display()
         );
     } else {
-        eprintln!("{blue}[cplt]{nc}  {dim}File:{nc}  {dim}(no config path — $HOME not set){nc}");
+        println!("{blue}[cplt]{nc}  {dim}File:{nc}  {dim}(no config path — $HOME not set){nc}");
     }
-    eprintln!();
+    println!();
 
     // [proxy]
-    eprintln!("{blue}[cplt]{nc}  {dim}[proxy]{nc}");
+    println!("{blue}[cplt]{nc}  {dim}[proxy]{nc}");
     let proxy_enabled = c.proxy.enabled.unwrap_or(true);
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    enabled          = {}{}{nc}{}",
         if proxy_enabled { green } else { yellow },
         proxy_enabled,
         src(c.proxy.enabled.is_some())
     );
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    port             = {}{}",
         c.proxy.port.unwrap_or(0),
         src(c.proxy.port.is_some())
     );
     if let Some(ref bd) = c.proxy.blocked_domains {
-        eprintln!("{blue}[cplt]{nc}    blocked_domains  = \"{bd}\"");
+        println!("{blue}[cplt]{nc}    blocked_domains  = \"{bd}\"");
     }
     if let Some(ref ad) = c.proxy.allowed_domains {
-        eprintln!("{blue}[cplt]{nc}    allowed_domains  = \"{ad}\"");
+        println!("{blue}[cplt]{nc}    allowed_domains  = \"{ad}\"");
     }
     if let Some(ref lf) = c.proxy.log_file {
-        eprintln!("{blue}[cplt]{nc}    log_file         = \"{lf}\"");
+        println!("{blue}[cplt]{nc}    log_file         = \"{lf}\"");
     }
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    log_level        = \"{}\"{}",
         c.proxy.log_level.as_deref().unwrap_or("none"),
         src(c.proxy.log_level.is_some())
     );
-    eprintln!();
+    println!();
 
     // [allow]
-    eprintln!("{blue}[cplt]{nc}  {dim}[allow]{nc}");
+    println!("{blue}[cplt]{nc}  {dim}[allow]{nc}");
     if c.allow.read.is_empty() {
-        eprintln!("{blue}[cplt]{nc}    read             = {dim}[]{nc}");
+        println!("{blue}[cplt]{nc}    read             = {dim}[]{nc}");
     } else {
-        eprintln!("{blue}[cplt]{nc}    read             = {:?}", c.allow.read);
+        println!("{blue}[cplt]{nc}    read             = {:?}", c.allow.read);
     }
     if c.allow.write.is_empty() {
-        eprintln!("{blue}[cplt]{nc}    write            = {dim}[]{nc}");
+        println!("{blue}[cplt]{nc}    write            = {dim}[]{nc}");
     } else {
-        eprintln!(
+        println!(
             "{blue}[cplt]{nc}    write            = {yellow}{:?}{nc}",
             c.allow.write
         );
     }
     if c.allow.ports.is_empty() {
-        eprintln!("{blue}[cplt]{nc}    ports            = {dim}[]{nc}");
+        println!("{blue}[cplt]{nc}    ports            = {dim}[]{nc}");
     } else {
-        eprintln!("{blue}[cplt]{nc}    ports            = {:?}", c.allow.ports);
+        println!("{blue}[cplt]{nc}    ports            = {:?}", c.allow.ports);
     }
     if c.allow.localhost.is_empty() {
-        eprintln!("{blue}[cplt]{nc}    localhost         = {dim}[]{nc}");
+        println!("{blue}[cplt]{nc}    localhost         = {dim}[]{nc}");
     } else {
-        eprintln!(
+        println!(
             "{blue}[cplt]{nc}    localhost         = {:?}",
             c.allow.localhost
         );
     }
-    eprintln!();
+    println!();
 
     // [deny]
-    eprintln!("{blue}[cplt]{nc}  {dim}[deny]{nc}");
+    println!("{blue}[cplt]{nc}  {dim}[deny]{nc}");
     if c.deny.paths.is_empty() {
-        eprintln!("{blue}[cplt]{nc}    paths            = {dim}[]{nc}");
+        println!("{blue}[cplt]{nc}    paths            = {dim}[]{nc}");
     } else {
-        eprintln!("{blue}[cplt]{nc}    paths            = {:?}", c.deny.paths);
+        println!("{blue}[cplt]{nc}    paths            = {:?}", c.deny.paths);
     }
-    eprintln!();
+    println!();
 
     // [sandbox]
-    eprintln!("{blue}[cplt]{nc}  {dim}[sandbox]{nc}");
+    println!("{blue}[cplt]{nc}  {dim}[sandbox]{nc}");
     let validate = c.sandbox.validate.unwrap_or(true);
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    validate              = {}{}",
         validate,
         src(c.sandbox.validate.is_some())
     );
     let allow_env_files = c.sandbox.allow_env_files.unwrap_or(false);
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    allow_env_files       = {}{}",
         allow_env_files,
         src(c.sandbox.allow_env_files.is_some())
     );
     let allow_localhost_any = c.sandbox.allow_localhost_any.unwrap_or(false);
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    allow_localhost_any    = {}{}",
         allow_localhost_any,
         src(c.sandbox.allow_localhost_any.is_some())
     );
     if !c.sandbox.pass_env.is_empty() {
-        eprintln!(
+        println!(
             "{blue}[cplt]{nc}    pass_env              = {:?}",
             c.sandbox.pass_env
         );
@@ -2435,15 +2435,15 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     let inherit_env = c.sandbox.inherit_env.unwrap_or(false);
     if inherit_env {
         let red = "\x1b[0;31m";
-        eprintln!("{blue}[cplt]{nc}    inherit_env           = {red}true{nc} ⚠ DANGEROUS");
+        println!("{blue}[cplt]{nc}    inherit_env           = {red}true{nc} ⚠ DANGEROUS");
     } else {
-        eprintln!(
+        println!(
             "{blue}[cplt]{nc}    inherit_env           = false{}",
             src(c.sandbox.inherit_env.is_some())
         );
     }
     let allow_lifecycle = c.sandbox.allow_lifecycle_scripts.unwrap_or(false);
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    allow_lifecycle_scripts = {}{}",
         allow_lifecycle,
         src(c.sandbox.allow_lifecycle_scripts.is_some())
@@ -2451,9 +2451,9 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     let allow_gpg = c.sandbox.allow_gpg_signing.unwrap_or(false);
     if allow_gpg {
         let red = "\x1b[0;31m";
-        eprintln!("{blue}[cplt]{nc}    allow_gpg_signing     = {red}true{nc} ⚠ DANGEROUS");
+        println!("{blue}[cplt]{nc}    allow_gpg_signing     = {red}true{nc} ⚠ DANGEROUS");
     } else {
-        eprintln!(
+        println!(
             "{blue}[cplt]{nc}    allow_gpg_signing     = false{}",
             src(c.sandbox.allow_gpg_signing.is_some())
         );
@@ -2461,9 +2461,9 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     let allow_docker = c.sandbox.allow_docker.unwrap_or(false);
     if allow_docker {
         let red = "\x1b[0;31m";
-        eprintln!("{blue}[cplt]{nc}    allow_docker          = {red}true{nc} ⚠ DANGEROUS");
+        println!("{blue}[cplt]{nc}    allow_docker          = {red}true{nc} ⚠ DANGEROUS");
     } else {
-        eprintln!(
+        println!(
             "{blue}[cplt]{nc}    allow_docker          = false{}",
             src(c.sandbox.allow_docker.is_some())
         );
@@ -2471,33 +2471,33 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     let allow_tmp = c.sandbox.allow_tmp_exec.unwrap_or(false);
     if allow_tmp {
         let red = "\x1b[0;31m";
-        eprintln!("{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS");
+        println!("{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS");
     } else {
-        eprintln!(
+        println!(
             "{blue}[cplt]{nc}    allow_tmp_exec        = false{}",
             src(c.sandbox.allow_tmp_exec.is_some())
         );
     }
     let allow_browser = c.sandbox.allow_browser.unwrap_or(false);
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    allow_browser         = {}{}",
         allow_browser,
         src(c.sandbox.allow_browser.is_some())
     );
     let scratch = c.sandbox.scratch_dir.unwrap_or(true);
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    scratch_dir           = {}{}",
         scratch,
         src(c.sandbox.scratch_dir.is_some())
     );
     let quiet = c.sandbox.quiet.unwrap_or(false);
-    eprintln!(
+    println!(
         "{blue}[cplt]{nc}    quiet                 = {}{}",
         quiet,
         src(c.sandbox.quiet.is_some())
     );
 
-    eprintln!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
+    println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
 }
 
 #[cfg(test)]

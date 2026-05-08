@@ -1501,31 +1501,31 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
     let green = "\x1b[0;32m";
     let yellow = "\x1b[0;33m";
 
-    eprintln!();
-    eprintln!("{BLUE}[cplt]{NC} ── Repo Config (.cplt.toml) ────────────────────────");
+    println!();
+    println!("{BLUE}[cplt]{NC} ── Repo Config (.cplt.toml) ────────────────────────");
     let source_label = match loaded.source {
         repo_config::RepoConfigSource::GitHead => "git HEAD (tamper-proof)",
         repo_config::RepoConfigSource::WorkingTree => "working tree (⚠ not committed)",
     };
-    eprintln!("{BLUE}[cplt]{NC}  {dim}Source:{NC} {source_label}");
-    eprintln!(
+    println!("{BLUE}[cplt]{NC}  {dim}Source:{NC} {source_label}");
+    println!(
         "{BLUE}[cplt]{NC}  {dim}Path:{NC}   {}/.cplt.toml",
         project_dir.display()
     );
-    eprintln!();
+    println!();
 
     let rc = &loaded.config;
 
     // [deny]
     if !rc.deny.paths.is_empty() || !rc.deny.env.is_empty() {
-        eprintln!("{BLUE}[cplt]{NC}  {dim}[deny]{NC} {green}(always applied){NC}");
+        println!("{BLUE}[cplt]{NC}  {dim}[deny]{NC} {green}(applied){NC}");
         for p in &rc.deny.paths {
-            eprintln!("{BLUE}[cplt]{NC}    paths   = {p}");
+            println!("{BLUE}[cplt]{NC}    paths   = {p}");
         }
         for v in &rc.deny.env {
-            eprintln!("{BLUE}[cplt]{NC}    env     = {v}");
+            println!("{BLUE}[cplt]{NC}    env     = {v}");
         }
-        eprintln!();
+        println!();
     }
 
     // [propose]
@@ -1533,7 +1533,19 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
     if !proposed.is_empty() {
         let trust_entry = crate::trust::load_trust(project_dir);
 
-        eprintln!("{BLUE}[cplt]{NC}  {dim}[propose]{NC} {yellow}(requires trust approval){NC}");
+        // Determine overall approval status for the header
+        let all_approved = proposed.iter().all(|key| {
+            trust_entry
+                .as_ref()
+                .map(|t| crate::trust::is_key_approved(t, key))
+                .unwrap_or(false)
+        });
+        let header_status = if all_approved {
+            format!("{green}(approved){NC}")
+        } else {
+            format!("{yellow}(pending approval){NC}")
+        };
+        println!("{BLUE}[cplt]{NC}  {dim}[propose]{NC} {header_status}");
 
         // Booleans
         let bools: &[(&str, Option<bool>)] = &[
@@ -1560,46 +1572,46 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
                 } else {
                     format!("{yellow}○{NC}")
                 };
-                eprintln!("{BLUE}[cplt]{NC}    {name:<30} = {v}  {status}");
+                println!("{BLUE}[cplt]{NC}    {name:<30} = {v}  {status}");
             }
         }
 
         // Arrays
         if !rc.propose.allow.read.is_empty() {
-            eprintln!("{BLUE}[cplt]{NC}    {dim}allow.read:{NC}");
+            println!("{BLUE}[cplt]{NC}    {dim}allow.read:{NC}");
             for p in &rc.propose.allow.read {
-                eprintln!("{BLUE}[cplt]{NC}      {p}");
+                println!("{BLUE}[cplt]{NC}      {p}");
             }
         }
         if !rc.propose.allow.write.is_empty() {
-            eprintln!("{BLUE}[cplt]{NC}    {dim}allow.write:{NC}");
+            println!("{BLUE}[cplt]{NC}    {dim}allow.write:{NC}");
             for p in &rc.propose.allow.write {
-                eprintln!("{BLUE}[cplt]{NC}      {p}");
+                println!("{BLUE}[cplt]{NC}      {p}");
             }
         }
         if !rc.propose.allow.ports.is_empty() {
-            eprintln!(
+            println!(
                 "{BLUE}[cplt]{NC}    allow.ports            = {:?}",
                 rc.propose.allow.ports
             );
         }
         if !rc.propose.allow.localhost.is_empty() {
-            eprintln!(
+            println!(
                 "{BLUE}[cplt]{NC}    allow.localhost         = {:?}",
                 rc.propose.allow.localhost
             );
         }
         if !rc.propose.proxy.allow_private_domains.is_empty() {
-            eprintln!(
+            println!(
                 "{BLUE}[cplt]{NC}    proxy.allow_private_domains = {:?}",
                 rc.propose.proxy.allow_private_domains
             );
         }
     } else {
-        eprintln!("{BLUE}[cplt]{NC}  {dim}No proposals.{NC}");
+        println!("{BLUE}[cplt]{NC}  {dim}No proposals.{NC}");
     }
 
-    eprintln!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");
+    println!("{BLUE}[cplt]{NC} ──────────────────────────────────────────────────────");
 }
 
 fn run_config_path() -> ExitCode {
