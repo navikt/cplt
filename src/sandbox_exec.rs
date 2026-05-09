@@ -318,7 +318,10 @@ fn write_temp_profile(profile_text: &str) -> Result<std::path::PathBuf, String> 
 // ── Linux: Landlock + seccomp ─────────────────────────────────
 
 /// Verify Landlock sandbox readiness (no-op: ABI already checked in prepare).
+///
+/// Returns `Result` to match the macOS preflight signature (which can fail).
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)]
 pub fn preflight(_sandbox: &super::PreparedSandbox) -> Result<(), String> {
     Ok(())
 }

@@ -737,33 +737,30 @@ fn print_sandbox_mechanism_status() -> bool {
         use crate::sandbox::landlock_mod::check_availability;
         use landlock::ABI;
 
-        let ok = match check_availability() {
-            Ok(abi_version) => {
+        let ok = if let Ok(abi_version) = check_availability() {
+            println!(
+                "  {}✓{} Landlock: ABI v{abi_version}",
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
+            );
+            if abi_version < ABI::V4 {
                 println!(
-                    "  {}✓{} Landlock: ABI v{abi_version}",
-                    ui::stdout_color(ui::GREEN),
+                    "  {}⚠{} Landlock ABI < v4: TCP port filtering unavailable (kernel < 6.7)",
+                    ui::stdout_color(ui::YELLOW),
                     ui::stdout_color(ui::RESET)
                 );
-                if abi_version < ABI::V4 {
-                    println!(
-                        "  {}⚠{} Landlock ABI < v4: TCP port filtering unavailable (kernel < 6.7)",
-                        ui::stdout_color(ui::YELLOW),
-                        ui::stdout_color(ui::RESET)
-                    );
-                    println!("      Network security provided by proxy only.");
-                }
-                true
+                println!("      Network security provided by proxy only.");
             }
-            Err(_) => {
-                println!(
-                    "  {}✗{} Landlock: not available",
-                    ui::stdout_color(ui::RED),
-                    ui::stdout_color(ui::RESET)
-                );
-                println!("      Requires Linux 5.13+ with Landlock enabled.");
-                println!("      Check: cat /sys/kernel/security/lsm (should include 'landlock')");
-                false
-            }
+            true
+        } else {
+            println!(
+                "  {}✗{} Landlock: not available",
+                ui::stdout_color(ui::RED),
+                ui::stdout_color(ui::RESET)
+            );
+            println!("      Requires Linux 5.13+ with Landlock enabled.");
+            println!("      Check: cat /sys/kernel/security/lsm (should include 'landlock')");
+            false
         };
         if let Ok(uname) = std::process::Command::new("uname").arg("-r").output()
             && uname.status.success()
