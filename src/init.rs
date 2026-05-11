@@ -285,13 +285,28 @@ fn is_home_relative(path: &str) -> bool {
     path.starts_with('~')
 }
 
+/// Escape a string for use in TOML basic strings (double-quoted).
+/// Prevents injection of arbitrary TOML via crafted file content.
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 fn write_string_array(out: &mut String, key: &str, values: &BTreeSet<&str>) {
     if values.len() == 1 {
-        writeln!(out, "{key} = [\"{}\"]", values.iter().next().unwrap()).unwrap();
+        writeln!(
+            out,
+            "{key} = [\"{}\"]",
+            toml_escape(values.iter().next().unwrap())
+        )
+        .unwrap();
     } else {
         writeln!(out, "{key} = [").unwrap();
         for val in values {
-            writeln!(out, "  \"{val}\",").unwrap();
+            writeln!(out, "  \"{}\",", toml_escape(val)).unwrap();
         }
         writeln!(out, "]").unwrap();
     }

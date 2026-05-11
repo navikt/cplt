@@ -191,28 +191,42 @@ impl DetectContext {
     }
 
     /// Check if a relative path exists as a file.
+    /// Rejects symlinks pointing outside the project root.
     pub fn exists(&self, relative: &str) -> bool {
         if Self::is_traversal(relative) {
             return false;
         }
-        self.root.join(relative).is_file()
+        let path = self.root.join(relative);
+        if !self.is_confined(&path) {
+            return false;
+        }
+        path.is_file()
     }
 
     /// Check if a relative path exists as a directory.
+    /// Rejects symlinks pointing outside the project root.
     pub fn dir_exists(&self, relative: &str) -> bool {
         if Self::is_traversal(relative) {
             return false;
         }
-        self.root.join(relative).is_dir()
+        let path = self.root.join(relative);
+        if !self.is_confined(&path) {
+            return false;
+        }
+        path.is_dir()
     }
 
     /// Read file contents (limited size, best-effort).
-    /// Returns None if file doesn't exist, is too large, or can't be read.
+    /// Returns None if file doesn't exist, is too large, can't be read,
+    /// or resolves (via symlink) to a location outside the project root.
     pub fn read_text(&self, relative: &str) -> Option<String> {
         if Self::is_traversal(relative) {
             return None;
         }
         let path = self.root.join(relative);
+        if !self.is_confined(&path) {
+            return None;
+        }
         let meta = std::fs::metadata(&path).ok()?;
         if meta.len() > MAX_READ_SIZE {
             return None;
@@ -225,8 +239,26 @@ impl DetectContext {
         &self.root
     }
 
+    /// Reject path traversal and absolute paths.
     fn is_traversal(relative: &str) -> bool {
-        relative.contains("..")
+        relative.contains("..") || relative.starts_with('/')
+    }
+
+    /// Verify a path's canonical target is within the project root.
+    /// Prevents symlink-based escapes.
+    fn is_confined(&self, path: &Path) -> bool {
+        // Use symlink_metadata first — if the path doesn't exist at all, skip
+        if std::fs::symlink_metadata(path).is_err() {
+            return true; // non-existent paths are fine (exists/read will fail later)
+        }
+        // Canonicalize resolves all symlinks
+        let Ok(canonical) = path.canonicalize() else {
+            return false;
+        };
+        let Ok(root_canonical) = self.root.canonicalize() else {
+            return false;
+        };
+        canonical.starts_with(&root_canonical)
     }
 }
 
@@ -973,6 +1005,9 @@ fn detect_port_in_scripts(package_json: &str) -> Option<u16> {
 
 /// Extract port numbers from docker-compose port mappings.
 /// Handles formats like `"8080:80"`, `"5432:5432"`, `- "3000:3000"`.
+/// Max ports to extract from a single compose file (prevents noise flooding).
+const MAX_COMPOSE_PORTS: usize = 20;
+
 fn extract_compose_ports(content: &str) -> Vec<u16> {
     let mut ports = Vec::new();
     for line in content.lines() {
@@ -987,6 +1022,9 @@ fn extract_compose_ports(content: &str) -> Vec<u16> {
                 && !ports.contains(&port)
             {
                 ports.push(port);
+                if ports.len() >= MAX_COMPOSE_PORTS {
+                    break;
+                }
             }
         }
     }
@@ -1013,6 +1051,45 @@ mod tests {
         assert!(!ctx.exists("../etc/passwd"));
         assert!(ctx.read_text("../../secret").is_none());
         assert!(!ctx.dir_exists("../.."));
+    }
+
+    #[test]
+    fn context_rejects_absolute_paths() {
+        let dir = setup_dir();
+        let ctx = DetectContext::new(dir.path());
+        assert!(!ctx.exists("/etc/passwd"));
+        assert!(ctx.read_text("/etc/hosts").is_none());
+        assert!(!ctx.dir_exists("/tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_rejects_symlink_escape() {
+        let dir = setup_dir();
+        // Create a symlink pointing outside the project
+        let link_path = dir.path().join("escape.txt");
+        std::os::unix::fs::symlink("/etc/hosts", &link_path).unwrap();
+        let ctx = DetectContext::new(dir.path());
+        assert!(
+            !ctx.exists("escape.txt"),
+            "symlink outside root should be rejected"
+        );
+        assert!(
+            ctx.read_text("escape.txt").is_none(),
+            "should not read through symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_allows_symlink_within_project() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("real.txt"), "content").unwrap();
+        let link_path = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), &link_path).unwrap();
+        let ctx = DetectContext::new(dir.path());
+        assert!(ctx.exists("link.txt"), "symlink within root should work");
+        assert_eq!(ctx.read_text("link.txt").unwrap(), "content");
     }
 
     #[test]
