@@ -3189,11 +3189,14 @@ mod e2e_tests {
             .expect("should run");
 
         assert!(output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stdout.contains("No project tooling detected"),
-            "should say nothing detected: {stdout}"
+            stderr.contains("No project tooling detected"),
+            "should say nothing detected on stderr: {stderr}"
         );
+        // stdout should be empty (pipe-friendly)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.is_empty(), "stdout should be empty: {stdout}");
     }
 
     #[test]
