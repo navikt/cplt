@@ -610,9 +610,17 @@ fn detect_env_files(ctx: &DetectContext) -> DetectorOutput {
             continue;
         }
         if let Some(var_name) = line.split('=').next() {
-            let var_upper = var_name.trim().to_uppercase();
+            let var_name = var_name.trim();
+            // Only emit vars matching valid identifier pattern [A-Za-z0-9_]
+            if !var_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let var_upper = var_name.to_uppercase();
             if sensitive_patterns.iter().any(|pat| var_upper.contains(pat)) {
-                deny_vars.push(var_name.trim().to_string());
+                deny_vars.push(var_name.to_string());
             }
         }
     }
@@ -1320,6 +1328,41 @@ services:
                 .detections
                 .iter()
                 .all(|d| d.name != "Environment secrets")
+        );
+    }
+
+    #[test]
+    fn env_skips_invalid_var_names() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join(".env.example"),
+            "SECRET-KEY=foo\nSECRET.TOKEN=bar\nDB_PASSWORD=xxx\nAPI_KEY=yyy\n",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        let det = report
+            .detections
+            .iter()
+            .find(|d| d.name == "Environment secrets")
+            .unwrap();
+        // Only valid identifiers should be suggested
+        let deny_envs: Vec<_> = det
+            .suggestions
+            .iter()
+            .filter_map(|s| match s {
+                Suggestion::DenyEnv(v) => Some(v.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(deny_envs.contains(&"DB_PASSWORD"));
+        assert!(deny_envs.contains(&"API_KEY"));
+        assert!(
+            !deny_envs.contains(&"SECRET-KEY"),
+            "hyphenated name should be skipped"
+        );
+        assert!(
+            !deny_envs.contains(&"SECRET.TOKEN"),
+            "dotted name should be skipped"
         );
     }
 

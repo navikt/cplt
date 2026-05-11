@@ -2044,8 +2044,10 @@ fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
     let report = cplt::detect::detect_project(&project_dir);
 
     if report.detections.is_empty() {
-        println!("No project tooling detected in {}", project_dir.display());
-        println!("Nothing to generate.");
+        if !quiet {
+            eprintln!("No project tooling detected in {}", project_dir.display());
+            eprintln!("Nothing to generate.");
+        }
         return ExitCode::SUCCESS;
     }
 
