@@ -68,6 +68,12 @@ EXAMPLES:
   cplt update
     Update cplt to the latest release from GitHub
 
+  cplt init
+    Detect project tooling and generate a .cplt.toml config
+
+  cplt init --write
+    Write the generated .cplt.toml to disk
+
   cplt trust
     Show per-repo config permissions and their approval status
 
@@ -408,6 +414,27 @@ enum Command {
     Trust {
         #[command(subcommand)]
         action: Option<TrustAction>,
+    },
+
+    /// Detect project tooling and generate a .cplt.toml config.
+    ///
+    /// Scans the project directory for build files, frameworks, and patterns,
+    /// then generates sandbox permissions tailored to your stack.
+    ///
+    /// By default, prints a preview to stdout.
+    /// Use --write to persist the generated .cplt.toml.
+    Init {
+        /// Write the generated config to .cplt.toml (default: preview to stdout).
+        #[arg(long)]
+        write: bool,
+
+        /// Overwrite existing .cplt.toml (requires --write).
+        #[arg(long, requires = "write")]
+        force: bool,
+
+        /// Suppress ecosystem details, only show generated TOML.
+        #[arg(long, short)]
+        quiet: bool,
     },
 }
 
@@ -1040,6 +1067,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Config { action } => run_config_command(action),
             Command::Update { check, force } => run_update(check, force),
             Command::Trust { action } => run_trust_command(action),
+            Command::Init {
+                write,
+                force,
+                quiet,
+            } => run_init_command(write, force, quiet),
         });
     }
 
@@ -1995,6 +2027,74 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
     } else {
         config::explain_all(loaded.as_ref());
         ExitCode::SUCCESS
+    }
+}
+
+fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
+    let project_dir = detect_project_root()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let opts = cplt::init::InitOptions {
+        write,
+        force,
+        quiet,
+    };
+
+    // Run detection first for the report display
+    let report = cplt::detect::detect_project(&project_dir);
+
+    if report.detections.is_empty() {
+        println!("No project tooling detected in {}", project_dir.display());
+        println!("Nothing to generate.");
+        return ExitCode::SUCCESS;
+    }
+
+    // Show ecosystem report unless quiet
+    if !quiet {
+        print!("{}", cplt::init::format_report(&report));
+    }
+
+    let result = cplt::init::run_init(&project_dir, &opts);
+
+    match result {
+        cplt::init::InitResult::Generated {
+            toml: _,
+            path,
+            written: true,
+        } => {
+            println!("Wrote {}", path.display());
+            println!();
+            println!("Next: review the file and run `cplt trust` to approve permissions.");
+            ExitCode::SUCCESS
+        }
+        cplt::init::InitResult::Generated {
+            toml,
+            written: false,
+            ..
+        } => {
+            if !quiet {
+                println!("Generated .cplt.toml:");
+                println!("─────────────────────────────────────────");
+            }
+            print!("{toml}");
+            if !quiet {
+                println!("─────────────────────────────────────────");
+                println!();
+                println!("Run `cplt init --write` to save this to .cplt.toml");
+            }
+            ExitCode::SUCCESS
+        }
+        cplt::init::InitResult::AlreadyExists(path) => {
+            eprintln!(
+                "error: {} already exists (use --force to overwrite)",
+                path.display()
+            );
+            ExitCode::FAILURE
+        }
+        cplt::init::InitResult::NothingDetected => {
+            // Already handled above, but just in case
+            ExitCode::SUCCESS
+        }
     }
 }
 
