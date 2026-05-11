@@ -251,13 +251,13 @@ impl DetectContext {
     /// Verify a path's canonical target is within the project root.
     /// Prevents symlink-based escapes.
     fn is_confined(&self, path: &Path) -> bool {
-        // Use symlink_metadata first — if the path doesn't exist at all, skip
-        if std::fs::symlink_metadata(path).is_err() {
-            return true; // non-existent paths are fine (exists/read will fail later)
-        }
-        // Canonicalize resolves all symlinks
-        let Ok(canonical) = path.canonicalize() else {
-            return false;
+        // Canonicalize resolves all symlinks atomically — no TOCTOU gap.
+        // If the path doesn't exist, canonicalize fails with NotFound;
+        // the caller's subsequent I/O will also fail, so returning true is safe.
+        let canonical = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
         };
         let Ok(root_canonical) = self.root.canonicalize() else {
             return false;
@@ -1028,10 +1028,13 @@ fn extract_compose_ports(content: &str) -> Vec<u16> {
         // Strip protocol suffix (e.g., "/tcp", "/udp")
         let trimmed = trimmed.split('/').next().unwrap_or(trimmed);
         // Formats: "HOST:CONTAINER", "IP:HOST:CONTAINER"
-        let parts: Vec<&str> = trimmed.split(':').collect();
-        let port_str = match parts.len() {
-            2 => parts[0], // HOST:CONTAINER → take HOST
-            3 => parts[1], // IP:HOST:CONTAINER → take HOST
+        let mut parts = trimmed.splitn(3, ':');
+        let first = parts.next();
+        let second = parts.next();
+        let third = parts.next();
+        let port_str = match (first, second, third) {
+            (Some(host), Some(_), None) => host,    // HOST:CONTAINER
+            (Some(_), Some(host), Some(_)) => host, // IP:HOST:CONTAINER
             _ => continue,
         };
         if let Ok(port) = port_str.parse::<u16>()
@@ -1220,12 +1223,8 @@ fn detect_global_agent() -> Option<GlobalDetection> {
 }
 
 fn which_exists(binary: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path_var).any(|dir| dir.join(binary).is_file())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

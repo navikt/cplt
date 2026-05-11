@@ -2150,9 +2150,7 @@ fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
             eprintln!("error: failed to write {}: {err}", path.display());
             ExitCode::FAILURE
         }
-        cplt::init::InitResult::NothingDetected => {
-            unreachable!("handled by early exit above")
-        }
+        cplt::init::InitResult::NothingDetected => ExitCode::SUCCESS,
     }
 }
 
