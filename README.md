@@ -38,7 +38,7 @@ brew install navikt/tap/cplt
 cplt --shell-install
 
 # Check your environment
-cplt --doctor
+cplt doctor
 
 # Run Copilot in sandbox
 cplt -- -p "fix the tests"
@@ -274,7 +274,7 @@ cplt auto-discovers installed tools and configures sandbox rules accordingly. On
 | **Corepack** | — | `COREPACK_*` | — |
 | **mise** | `.mise` | `MISE_*` | `mise` |
 
-To see which tools cplt detected, run `cplt --doctor`.
+To see which tools cplt detected, run `cplt doctor`.
 
 ### Proxy
 
@@ -338,7 +338,7 @@ Then edit `~/.config/cplt/config.toml`:
 
 | Flag              | What it does                                                                                                                                           |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--doctor`        | Run environment diagnostics: checks auth, Copilot install, tools, and sandbox paths. Exits 0 if all critical checks pass.                              |
+| `--doctor`        | **Deprecated** — use `cplt doctor` subcommand instead.                                                                                                 |
 | `--print-profile` | Print the generated sandbox profile (SBPL) and exit.                                                                                                   |
 | `--show-denials`  | Stream macOS sandbox denial logs in real time.                                                                                                         |
 | `--no-validate`   | Skip the startup check that verifies sandbox restrictions are active.                                                                                  |
@@ -470,7 +470,7 @@ cplt --continue
 cplt --remote --name my-task -- -p "fix the tests"
 
 # Check environment before first run
-cplt --doctor
+cplt doctor
 
 # Disable proxy for a single run (proxy is on by default)
 cplt --no-proxy -- -p "fix the tests"
@@ -960,7 +960,7 @@ If all of that works, `cplt --allow-gpg-signing` will work too. The `gpg-agent` 
 |---|---|---|
 | `error: gpg failed to sign the data` | Agent not running or passphrase not cached | Run `gpg-connect-agent 'GETINFO version' /bye` and `echo test \| gpg --clearsign` outside cplt |
 | `signing failed: No secret key` | Wrong `user.signingkey` in git config | Run `gpg --list-secret-keys` and set `git config --global user.signingkey <KEY_ID>` |
-| `signing failed: Operation not permitted` | Flag not set, or `--deny-path` overriding | Check `cplt --doctor` output for GPG signing status |
+| `signing failed: Operation not permitted` | Flag not set, or `--deny-path` overriding | Check `cplt doctor` output for GPG signing status |
 | Commits unsigned despite flag | `gpg.format=ssh` in git config | This flag is GPG-only; SSH signing is not supported |
 | `GNUPGHOME` set to non-default path | SBPL rules only cover `~/.gnupg` | Unset `GNUPGHOME` or symlink to `~/.gnupg` |
 | `git log --show-signature` shows `Fatal: can't open trustdb.gpg` | GPG opens `trustdb.gpg` for writing during *verification*, which the sandbox denies | This is expected — **signing works**, only verification is affected. Verify signatures outside the sandbox or in CI |
@@ -1348,7 +1348,7 @@ If all of that works, `cplt --allow-gpg-signing` will work too. The `gpg-agent` 
 |---|---|---|
 | `error: gpg failed to sign the data` | Agent not running or passphrase not cached | Run `gpg-connect-agent 'GETINFO version' /bye` and `echo test \| gpg --clearsign` outside cplt |
 | `signing failed: No secret key` | Wrong `user.signingkey` in git config | Run `gpg --list-secret-keys` and set `git config --global user.signingkey <KEY_ID>` |
-| `signing failed: Operation not permitted` | Flag not set, or `--deny-path` overriding | Check `cplt --doctor` output for GPG signing status |
+| `signing failed: Operation not permitted` | Flag not set, or `--deny-path` overriding | Check `cplt doctor` output for GPG signing status |
 | Commits unsigned despite flag | `gpg.format=ssh` in git config | This flag is GPG-only; SSH signing is not supported |
 | `GNUPGHOME` set to non-default path | SBPL rules only cover `~/.gnupg` | Unset `GNUPGHOME` or symlink to `~/.gnupg` |
 | `git log --show-signature` shows `Fatal: can't open trustdb.gpg` | GPG opens `trustdb.gpg` for writing during *verification*, which the sandbox denies | This is expected — **signing works**, only verification is affected. Verify signatures outside the sandbox or in CI |

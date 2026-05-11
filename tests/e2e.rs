@@ -525,6 +525,82 @@ mod e2e_tests {
         );
     }
 
+    #[test]
+    fn e2e_doctor_subcommand_works() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["doctor"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "cplt doctor should exit 0.\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("[doctor]"),
+            "should have doctor output.\nstdout: {stdout}"
+        );
+        // No deprecation warning for subcommand form
+        assert!(
+            !stderr.contains("deprecated"),
+            "subcommand should not warn.\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_doctor_flag_shows_deprecation() {
+        require_copilot!();
+        let output = Command::new(binary_path())
+            .args(["--doctor"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "--doctor should still work.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("deprecated") && stderr.contains("cplt doctor"),
+            "--doctor should show deprecation warning.\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_doctor_shows_project_ecosystems() {
+        // Create a project with a Cargo.toml so ecosystems are detected
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["doctor"])
+            .current_dir(dir.path())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            output.status.success(),
+            "cplt doctor should exit 0 in project dir"
+        );
+        assert!(
+            stdout.contains("Project ecosystems") && stdout.contains("Rust"),
+            "should detect Rust ecosystem.\nstdout: {stdout}"
+        );
+    }
+
     // ============================================================
     // CLI flag profile tests — new scenarios
     // ============================================================

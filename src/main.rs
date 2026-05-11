@@ -315,10 +315,10 @@ struct Cli {
     #[arg(long)]
     shell_install: bool,
 
-    /// Run environment diagnostics and report what the sandbox will do.
-    /// Checks auth mechanisms, Copilot CLI install, tool availability,
-    /// and sandbox-critical paths. Exits 0 if all critical checks pass.
-    #[arg(long)]
+    /// [DEPRECATED: use `cplt doctor`] Run environment diagnostics and report
+    /// what the sandbox will do. Checks auth mechanisms, Copilot CLI install,
+    /// tool availability, and sandbox-critical paths. Exits 0 if all critical checks pass.
+    #[arg(long, hide = true)]
     doctor: bool,
 
     /// Skip the interactive confirmation prompt and proceed immediately.
@@ -441,6 +441,12 @@ enum Command {
         #[arg(long)]
         global: bool,
     },
+
+    /// Run environment diagnostics.
+    ///
+    /// Checks auth mechanisms, agent install, tool availability,
+    /// and sandbox-critical paths. Exits 0 if all critical checks pass.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -1084,6 +1090,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     run_init_command(write, force, quiet)
                 }
             }
+            Command::Doctor => run_doctor(),
         });
     }
 
@@ -1094,7 +1101,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
 
     // Handle --doctor: run diagnostics and exit (works on all platforms)
+    // DEPRECATED: use `cplt doctor` subcommand instead
     if cli.doctor {
+        ui::warn("--doctor is deprecated, use `cplt doctor` instead");
         return Ok(run_doctor());
     }
 
@@ -1429,6 +1438,36 @@ fn run_doctor() -> ExitCode {
 
     let discovery = discover::discover_all(&home_dir, &project_dir);
     let ok = discovery.print_report();
+
+    // Show project ecosystem detection summary
+    let report = cplt::detect::detect_project(&project_dir);
+    if !report.detections.is_empty() {
+        println!();
+        println!(
+            "{}{}[doctor]{} {}Project ecosystems{}",
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::BLUE),
+            ui::stdout_color(ui::RESET),
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::RESET)
+        );
+        for d in &report.detections {
+            println!(
+                "  {}✓{} {}",
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET),
+                d.name
+            );
+        }
+        let has_repo_config = project_dir.join(".cplt.toml").exists();
+        if !has_repo_config {
+            println!(
+                "  {}→{} Run `cplt init` to generate .cplt.toml",
+                ui::stdout_color(ui::BLUE),
+                ui::stdout_color(ui::RESET),
+            );
+        }
+    }
 
     if ok {
         ExitCode::SUCCESS
