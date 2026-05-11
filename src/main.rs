@@ -80,7 +80,7 @@ EXAMPLES:
 )]
 struct Cli {
     /// Which AI coding agent to sandbox.
-    /// Auto-detected from PATH if not specified (prefers copilot, falls back to opencode, then gemini).
+    /// Resolved in order: this flag > sandbox.agent config > auto-detect from PATH.
     /// Supported: copilot, opencode, gemini, pi, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,

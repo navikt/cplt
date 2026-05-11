@@ -253,12 +253,20 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
             if dir.map_exec {
                 sbpl!(sb, "(allow file-map-executable (subpath \"{path}\"))");
             }
+            if dir.process_exec {
+                sbpl!(sb, "(allow process-exec (subpath \"{path}\"))");
+            }
             // Explicitly deny exec on writable agent data dirs (write+exec = persistence risk)
             if dir.write && !dir.process_exec {
                 sbpl!(sb, "(deny process-exec (subpath \"{path}\"))");
             }
             if dir.write && !dir.map_exec {
                 sbpl!(sb, "(deny file-map-executable (subpath \"{path}\"))");
+            }
+            // Explicitly deny writes on exec-only dirs (prevents write+exec persistence
+            // even when a parent dir is writable — SBPL uses most-specific match)
+            if !dir.write && dir.process_exec {
+                sbpl!(sb, "(deny file-write* (subpath \"{path}\"))");
             }
         }
         sbpl!(sb);

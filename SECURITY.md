@@ -39,7 +39,7 @@ cplt sandboxes AI coding agents — currently **GitHub Copilot CLI**, **[OpenCod
 - **Not auto-detected**: the `pi` binary name is generic and may collide with other tools. Pi must be explicitly selected via `--agent pi` or `sandbox.agent = "pi"` in config.
 - **API keys are opt-in**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` are never passed through by default. Users must explicitly use `--pass-env` for each key.
 - **Config dir is read/write**: `~/.pi/` stores settings, auth, sessions, and themes.
-- **Managed binaries have exec**: `~/.pi/agent/bin/` (bundled `fd`, `rg`) has process-exec permission but is read-only (no write+exec).
+- **Managed binaries have exec**: `~/.pi/agent/bin/` (bundled `fd`, `rg`) has process-exec permission with an explicit write deny (prevents write+exec persistence even though the parent `~/.pi/` is writable).
 - **Copilot env vars isolated**: `GH_TOKEN`, `GITHUB_TOKEN`, and `COPILOT_*` are suppressed for Pi.
 
 ## Threat Model
