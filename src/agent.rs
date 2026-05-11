@@ -18,7 +18,7 @@ pub enum Agent {
     OpenCode,
     /// Google Gemini CLI — AI coding agent powered by Gemini models.
     Gemini,
-    /// Pi coding agent (@earendil-works/pi-coding-agent).
+    /// Pi coding agent (https://github.com/earendil-works/pi).
     Pi,
     /// Plain sandboxed shell — no AI agent, just a secure shell session.
     Shell,
