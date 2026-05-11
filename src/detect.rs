@@ -7,7 +7,7 @@
 //! - Each ecosystem has a standalone detector function
 //! - Detectors are registered in `DETECTORS` — adding a new one is one function + one entry
 //! - Detection is pure: no I/O formatting, no side effects beyond reading files
-//! - A `DetectContext` provides safe file access with size limits and caching
+//! - A `DetectContext` provides safe file access with size limits
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -105,6 +105,8 @@ pub enum Suggestion {
 pub enum Signal {
     /// A file exists at this relative path.
     FileExists { path: String },
+    /// A directory exists at this relative path.
+    DirExists { path: String },
     /// A file contains relevant content.
     FileContains { path: String, reason: &'static str },
 }
@@ -112,7 +114,7 @@ pub enum Signal {
 impl std::fmt::Display for Signal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Signal::FileExists { path } => write!(f, "{path}"),
+            Signal::FileExists { path } | Signal::DirExists { path } => write!(f, "{path}"),
             Signal::FileContains { path, reason } => write!(f, "{path} ({reason})"),
         }
     }
@@ -241,7 +243,9 @@ impl DetectContext {
 
     /// Reject path traversal and absolute paths.
     fn is_traversal(relative: &str) -> bool {
-        relative.contains("..") || relative.starts_with('/')
+        use std::path::Component;
+        let path = Path::new(relative);
+        path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir))
     }
 
     /// Verify a path's canonical target is within the project root.
@@ -712,28 +716,32 @@ fn detect_env_files(ctx: &DetectContext) -> DetectorOutput {
 
 fn detect_spring_boot(ctx: &DetectContext) -> DetectorOutput {
     // Detect Spring Boot specifically (beyond generic JVM)
-    let has_application_yml = ctx.exists("src/main/resources/application.yml")
-        || ctx.exists("src/main/resources/application.yaml");
-
-    if !has_application_yml {
+    let app_file = if ctx.exists("src/main/resources/application.yml") {
+        "src/main/resources/application.yml"
+    } else if ctx.exists("src/main/resources/application.yaml") {
+        "src/main/resources/application.yaml"
+    } else {
         return DetectorOutput::none();
-    }
+    };
 
     // Verify it's actually Spring Boot
-    let gradle_content = ctx
-        .read_text("build.gradle.kts")
-        .or_else(|| ctx.read_text("build.gradle"));
+    let (gradle_file, gradle_content) = if let Some(c) = ctx.read_text("build.gradle.kts") {
+        ("build.gradle.kts", c)
+    } else if let Some(c) = ctx.read_text("build.gradle") {
+        ("build.gradle", c)
+    } else {
+        return DetectorOutput::none();
+    };
 
-    let is_spring = gradle_content
-        .as_deref()
-        .is_some_and(|c| c.contains("spring-boot") || c.contains("org.springframework"));
+    let is_spring =
+        gradle_content.contains("spring-boot") || gradle_content.contains("org.springframework");
 
     if !is_spring {
         return DetectorOutput::none();
     }
 
     let mut signals = vec![Signal::FileContains {
-        path: "build.gradle.kts".to_string(),
+        path: gradle_file.to_string(),
         reason: "Spring Boot project",
     }];
     let mut suggestions = vec![
@@ -742,26 +750,24 @@ fn detect_spring_boot(ctx: &DetectContext) -> DetectorOutput {
     ];
 
     // Check application.yml for specific features
-    let app_content = ctx
-        .read_text("src/main/resources/application.yml")
-        .or_else(|| ctx.read_text("src/main/resources/application.yaml"));
+    let app_content = ctx.read_text(app_file);
 
     if let Some(content) = &app_content {
         if content.contains("flyway") {
             signals.push(Signal::FileContains {
-                path: "application.yml".to_string(),
+                path: app_file.to_string(),
                 reason: "Flyway migrations enabled",
             });
         }
         if content.contains("kafka") {
             signals.push(Signal::FileContains {
-                path: "application.yml".to_string(),
+                path: app_file.to_string(),
                 reason: "Kafka configured",
             });
         }
         if content.contains("datasource") || content.contains("postgresql") {
             signals.push(Signal::FileContains {
-                path: "application.yml".to_string(),
+                path: app_file.to_string(),
                 reason: "PostgreSQL datasource",
             });
             suggestions.push(Suggestion::AllowPort(5432));
@@ -779,20 +785,22 @@ fn detect_ktor(ctx: &DetectContext) -> DetectorOutput {
     // Ktor uses application.conf (HOCON) instead of Spring's application.yml
     let has_app_conf = ctx.exists("src/main/resources/application.conf");
 
-    let gradle_content = ctx
-        .read_text("build.gradle.kts")
-        .or_else(|| ctx.read_text("build.gradle"));
+    let (gradle_file, gradle_content) = if let Some(c) = ctx.read_text("build.gradle.kts") {
+        ("build.gradle.kts", c)
+    } else if let Some(c) = ctx.read_text("build.gradle") {
+        ("build.gradle", c)
+    } else {
+        return DetectorOutput::none();
+    };
 
-    let is_ktor = gradle_content
-        .as_deref()
-        .is_some_and(|c| c.contains("ktor") || c.contains("io.ktor"));
+    let is_ktor = gradle_content.contains("ktor") || gradle_content.contains("io.ktor");
 
     if !is_ktor {
         return DetectorOutput::none();
     }
 
     let mut signals = vec![Signal::FileContains {
-        path: "build.gradle.kts".to_string(),
+        path: gradle_file.to_string(),
         reason: "Ktor project",
     }];
 
@@ -808,11 +816,9 @@ fn detect_ktor(ctx: &DetectContext) -> DetectorOutput {
     ];
 
     // Scan gradle for test dependencies
-    if let Some(content) = &gradle_content
-        && content.contains("testcontainers")
-    {
+    if gradle_content.contains("testcontainers") {
         signals.push(Signal::FileContains {
-            path: "build.gradle.kts".to_string(),
+            path: gradle_file.to_string(),
             reason: "TestContainers in test dependencies",
         });
         suggestions.push(Suggestion::Propose(SandboxFlag::AllowDocker));
@@ -826,11 +832,11 @@ fn detect_ktor(ctx: &DetectContext) -> DetectorOutput {
 }
 
 fn detect_testcontainers(ctx: &DetectContext) -> DetectorOutput {
-    let gradle_content = ctx
-        .read_text("build.gradle.kts")
-        .or_else(|| ctx.read_text("build.gradle"));
-
-    let Some(content) = gradle_content else {
+    let (gradle_file, content) = if let Some(c) = ctx.read_text("build.gradle.kts") {
+        ("build.gradle.kts", c)
+    } else if let Some(c) = ctx.read_text("build.gradle") {
+        ("build.gradle", c)
+    } else {
         return DetectorOutput::none();
     };
 
@@ -839,7 +845,7 @@ fn detect_testcontainers(ctx: &DetectContext) -> DetectorOutput {
     }
 
     let mut signals = vec![Signal::FileContains {
-        path: "build.gradle.kts".to_string(),
+        path: gradle_file.to_string(),
         reason: "TestContainers dependency",
     }];
 
@@ -848,13 +854,13 @@ fn detect_testcontainers(ctx: &DetectContext) -> DetectorOutput {
         || content.contains("testcontainers.postgresql")
     {
         signals.push(Signal::FileContains {
-            path: "build.gradle.kts".to_string(),
+            path: gradle_file.to_string(),
             reason: "PostgreSQL TestContainer",
         });
     }
     if content.contains("testcontainers:kafka") || content.contains("testcontainers.kafka") {
         signals.push(Signal::FileContains {
-            path: "build.gradle.kts".to_string(),
+            path: gradle_file.to_string(),
             reason: "Kafka TestContainer",
         });
     }
@@ -934,7 +940,7 @@ fn detect_flyway(ctx: &DetectContext) -> DetectorOutput {
 
     for dir in &migration_dirs {
         if ctx.dir_exists(dir) {
-            signals.push(Signal::FileExists {
+            signals.push(Signal::DirExists {
                 path: (*dir).to_string(),
             });
         }
@@ -952,23 +958,29 @@ fn detect_flyway(ctx: &DetectContext) -> DetectorOutput {
 }
 
 fn detect_cypress(ctx: &DetectContext) -> DetectorOutput {
-    let has_config = ctx.exists("cypress.config.ts")
-        || ctx.exists("cypress.config.js")
-        || ctx.exists("cypress.config.mjs");
+    let config_file = if ctx.exists("cypress.config.ts") {
+        Some("cypress.config.ts")
+    } else if ctx.exists("cypress.config.js") {
+        Some("cypress.config.js")
+    } else if ctx.exists("cypress.config.mjs") {
+        Some("cypress.config.mjs")
+    } else {
+        None
+    };
     let has_dir = ctx.dir_exists("cypress");
 
-    if !has_config && !has_dir {
+    if config_file.is_none() && !has_dir {
         return DetectorOutput::none();
     }
 
     let mut signals = Vec::new();
-    if has_config {
+    if let Some(file) = config_file {
         signals.push(Signal::FileExists {
-            path: "cypress.config.ts".to_string(),
+            path: file.to_string(),
         });
     }
     if has_dir {
-        signals.push(Signal::FileExists {
+        signals.push(Signal::DirExists {
             path: "cypress/".to_string(),
         });
     }
@@ -1013,18 +1025,22 @@ fn extract_compose_ports(content: &str) -> Vec<u16> {
     for line in content.lines() {
         let trimmed = line.trim().trim_start_matches('-').trim();
         let trimmed = trimmed.trim_matches('"').trim_matches('\'');
-        // Match patterns: "HOST:CONTAINER" or "HOST:CONTAINER/protocol"
-        if let Some((host_part, _)) = trimmed.split_once(':') {
-            // Host part might be "IP:PORT" or just "PORT"
-            let port_str = host_part.rsplit_once(':').map_or(host_part, |(_, p)| p);
-            if let Ok(port) = port_str.parse::<u16>()
-                && port > 0
-                && !ports.contains(&port)
-            {
-                ports.push(port);
-                if ports.len() >= MAX_COMPOSE_PORTS {
-                    break;
-                }
+        // Strip protocol suffix (e.g., "/tcp", "/udp")
+        let trimmed = trimmed.split('/').next().unwrap_or(trimmed);
+        // Formats: "HOST:CONTAINER", "IP:HOST:CONTAINER"
+        let parts: Vec<&str> = trimmed.split(':').collect();
+        let port_str = match parts.len() {
+            2 => parts[0], // HOST:CONTAINER → take HOST
+            3 => parts[1], // IP:HOST:CONTAINER → take HOST
+            _ => continue,
+        };
+        if let Ok(port) = port_str.parse::<u16>()
+            && port > 0
+            && !ports.contains(&port)
+        {
+            ports.push(port);
+            if ports.len() >= MAX_COMPOSE_PORTS {
+                break;
             }
         }
     }
@@ -1126,22 +1142,25 @@ fn detect_global_playwright(home: &Path) -> Option<GlobalDetection> {
 }
 
 fn detect_global_gpg(home: &Path) -> Option<GlobalDetection> {
-    // Check if GPG is configured for git commit signing
+    // GPG signing requires sandbox access to gpg-agent socket and keyring
     if !home.join(".gnupg").is_dir() {
         return None;
     }
-    // Check git config for signing
-    let output = std::process::Command::new("git")
+    // Enhance reason with git config info when available
+    let git_signing = std::process::Command::new("git")
         .args(["config", "--global", "commit.gpgsign"])
         .output()
-        .ok()?;
-    let value = String::from_utf8_lossy(&output.stdout);
-    if value.trim() != "true" {
-        return None;
-    }
+        .ok()
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+
+    let reason = if git_signing {
+        "~/.gnupg/ exists and git commit.gpgsign=true"
+    } else {
+        "~/.gnupg/ exists (GPG keyring present)"
+    };
     Some(GlobalDetection {
         name: "GPG signing",
-        reason: "git commit.gpgsign=true and ~/.gnupg/ exists".to_string(),
+        reason: reason.to_string(),
         suggestions: vec![GlobalSuggestion::GpgSigning],
     })
 }

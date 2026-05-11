@@ -2076,9 +2076,11 @@ fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
             path,
             written: true,
         } => {
-            println!("Wrote {}", path.display());
-            println!();
-            println!("Next: review the file and run `cplt trust` to approve permissions.");
+            if !quiet {
+                eprintln!("Wrote {}", path.display());
+                eprintln!();
+                eprintln!("Next: review the file and run `cplt trust` to approve permissions.");
+            }
             ExitCode::SUCCESS
         }
         cplt::init::InitResult::Generated {
@@ -2155,9 +2157,9 @@ fn run_init_global_command(write: bool, force: bool, quiet: bool) -> ExitCode {
             path,
         } => {
             if !quiet {
-                println!("Wrote {}", path.display());
-                println!();
-                println!("Review: cplt config show");
+                eprintln!("Wrote {}", path.display());
+                eprintln!();
+                eprintln!("Review: cplt config show");
             }
             ExitCode::SUCCESS
         }
