@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::detect::{Detection, DetectionReport, Suggestion};
+use crate::detect::{Detection, DetectionReport, SandboxFlag, Suggestion};
 
 /// Options for the init command (mapped from CLI args).
 pub struct InitOptions {
@@ -220,6 +220,13 @@ pub fn generate_toml(report: &DetectionReport) -> String {
     if has_propose {
         writeln!(out, "[propose]").unwrap();
         for flag in &propose_flags {
+            // Look up the SandboxFlag to check for risk warnings
+            let warning = SandboxFlag::iter_all()
+                .find(|f| f.key_name() == *flag)
+                .and_then(SandboxFlag::risk_warning);
+            if let Some(warning) = warning {
+                writeln!(out, "# ⚠️  {warning}").unwrap();
+            }
             writeln!(out, "{flag} = true").unwrap();
         }
         if !propose_flags.is_empty() {

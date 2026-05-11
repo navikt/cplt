@@ -577,7 +577,7 @@ cplt init --write     # write .cplt.toml to disk
 cplt init --quiet     # output only TOML (pipe-friendly)
 ```
 
-Supported ecosystems: JVM (Gradle/Maven), Node.js, Docker, Python, Rust, Go, Playwright, NAIS, Spring Boot, Ktor, TestContainers, Next.js, Vite, Flyway, Cypress, and environment secrets (`.env.example`).
+Supported ecosystems: JVM (Gradle/Maven), Node.js, Docker, Python, Rust, Go, Playwright, Spring Boot, Ktor, TestContainers, Next.js, Vite, Flyway, Cypress, and environment secrets (`.env.example`). Dangerous permissions include risk warnings in the generated TOML.
 
 Use `cplt config set --repo` to manage without editing TOML by hand:
 

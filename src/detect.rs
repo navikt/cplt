@@ -43,6 +43,35 @@ impl SandboxFlag {
             Self::AllowTmpExec => "allow_tmp_exec",
         }
     }
+
+    /// Risk warning for dangerous permissions. None means safe to suggest.
+    pub fn risk_warning(self) -> Option<&'static str> {
+        match self {
+            Self::AllowLifecycleScripts => {
+                Some("runs arbitrary scripts on install — only enable if builds fail without it")
+            }
+            Self::AllowDocker => {
+                Some("grants access to Docker socket — effectively root on the host")
+            }
+            Self::AllowTmpExec => Some("allows code execution from /tmp"),
+            _ => None,
+        }
+    }
+
+    /// Iterate over all variants (for lookup by key name).
+    pub fn iter_all() -> impl Iterator<Item = Self> {
+        [
+            Self::AllowJvmAttach,
+            Self::AllowDocker,
+            Self::AllowLifecycleScripts,
+            Self::AllowBrowser,
+            Self::AllowEnvFiles,
+            Self::AllowLocalhostAny,
+            Self::AllowGpgSigning,
+            Self::AllowTmpExec,
+        ]
+        .into_iter()
+    }
 }
 
 /// A single config suggestion from detection.
@@ -246,10 +275,6 @@ pub const DETECTORS: &[DetectorSpec] = &[
         detect: detect_env_files,
     },
     DetectorSpec {
-        id: "nais",
-        detect: detect_nais,
-    },
-    DetectorSpec {
         id: "spring_boot",
         detect: detect_spring_boot,
     },
@@ -387,10 +412,11 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
         path: "package.json".to_string(),
     }];
     let mut suggestions: Vec<Suggestion> = Vec::new();
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
     // Content scan: look for dev server ports in scripts
     if let Some(content) = ctx.read_text("package.json") {
-        // Check for postinstall/prepare scripts (lifecycle scripts)
+        // Check for postinstall/prepare scripts — warn but don't auto-suggest
         if content.contains("\"postinstall\"")
             || content.contains("\"prepare\"")
             || content.contains("\"preinstall\"")
@@ -399,7 +425,10 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
                 path: "package.json".to_string(),
                 reason: "has lifecycle scripts (postinstall/prepare)",
             });
-            suggestions.push(Suggestion::Propose(SandboxFlag::AllowLifecycleScripts));
+            diagnostics.push(Diagnostic {
+                detector: "node",
+                message: "lifecycle scripts detected — only add allow_lifecycle_scripts if npm install fails without it (runs arbitrary code)".to_string(),
+            });
         }
 
         // Detect common dev server ports from scripts
@@ -420,11 +449,14 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
         }
     }
 
-    DetectorOutput::detected(Detection {
-        name: "Node.js",
-        signals,
-        suggestions,
-    })
+    DetectorOutput {
+        detection: Some(Detection {
+            name: "Node.js",
+            signals,
+            suggestions,
+        }),
+        diagnostics,
+    }
 }
 
 fn detect_docker(ctx: &DetectContext) -> DetectorOutput {
@@ -645,76 +677,6 @@ fn detect_env_files(ctx: &DetectContext) -> DetectorOutput {
 }
 
 // ── NAIS / Nav-specific detectors ────────────────────────────────────
-
-fn detect_nais(ctx: &DetectContext) -> DetectorOutput {
-    let nais_files = ["nais.yaml", "nais.yml"];
-    let nais_dirs = [".nais", "nais"];
-
-    let mut signals = Vec::new();
-    let mut suggestions = Vec::new();
-
-    for file in &nais_files {
-        if ctx.exists(file) {
-            signals.push(Signal::FileExists {
-                path: (*file).to_string(),
-            });
-        }
-    }
-
-    for dir in &nais_dirs {
-        if ctx.dir_exists(dir) {
-            signals.push(Signal::FileExists {
-                path: (*dir).to_string(),
-            });
-        }
-    }
-
-    if signals.is_empty() {
-        return DetectorOutput::none();
-    }
-
-    // Scan nais config for specific features
-    let nais_content_files = [
-        "nais.yaml",
-        "nais.yml",
-        ".nais/nais-dev.yaml",
-        ".nais/nais-prod.yaml",
-        "nais/nais-dev.yaml",
-    ];
-
-    for file in &nais_content_files {
-        let Some(content) = ctx.read_text(file) else {
-            continue;
-        };
-
-        if content.contains("kafka:") && content.contains("pool:") {
-            signals.push(Signal::FileContains {
-                path: (*file).to_string(),
-                reason: "Kafka pool configured",
-            });
-        }
-
-        if content.contains("sqlInstances:") {
-            signals.push(Signal::FileContains {
-                path: (*file).to_string(),
-                reason: "GCP Cloud SQL configured",
-            });
-            suggestions.push(Suggestion::AllowPort(5432));
-        }
-
-        if content.contains("allow_docker:") || content.contains("docker:") {
-            suggestions.push(Suggestion::Propose(SandboxFlag::AllowDocker));
-        }
-
-        break;
-    }
-
-    DetectorOutput::detected(Detection {
-        name: "NAIS",
-        signals,
-        suggestions,
-    })
-}
 
 fn detect_spring_boot(ctx: &DetectContext) -> DetectorOutput {
     // Detect Spring Boot specifically (beyond generic JVM)
@@ -1158,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn node_detects_lifecycle_scripts() {
+    fn node_detects_lifecycle_scripts_as_warning() {
         let dir = setup_dir();
         fs::write(
             dir.path().join("package.json"),
@@ -1166,10 +1128,18 @@ mod tests {
         )
         .unwrap();
         let report = detect_project(dir.path());
+        // Should NOT auto-suggest (dangerous), but should warn via diagnostic
         assert!(
-            report
+            !report
                 .suggestions
                 .contains(&Suggestion::Propose(SandboxFlag::AllowLifecycleScripts))
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("lifecycle scripts")),
+            "should emit a diagnostic warning"
         );
     }
 
@@ -1462,37 +1432,6 @@ services:
         assert_eq!(SandboxFlag::AllowTmpExec.key_name(), "allow_tmp_exec");
     }
 
-    // ── NAIS detector ────────────────────────────────────────────────
-
-    #[test]
-    fn nais_detects_nais_yaml() {
-        let dir = setup_dir();
-        fs::write(
-            dir.path().join("nais.yaml"),
-            "apiVersion: nais.io/v1alpha1\nkind: Application\n",
-        )
-        .unwrap();
-        let report = detect_project(dir.path());
-        assert!(report.detections.iter().any(|d| d.name == "NAIS"));
-    }
-
-    #[test]
-    fn nais_detects_dot_nais_dir() {
-        let dir = setup_dir();
-        fs::create_dir(dir.path().join(".nais")).unwrap();
-        fs::write(
-            dir.path().join(".nais/nais-dev.yaml"),
-            "apiVersion: nais.io/v1alpha1\nspec:\n  gcp:\n    sqlInstances:\n      - type: POSTGRES_17\n",
-        )
-        .unwrap();
-        let report = detect_project(dir.path());
-        let nais = report.detections.iter().find(|d| d.name == "NAIS").unwrap();
-        assert!(nais.signals.iter().any(
-            |s| matches!(s, Signal::FileContains { reason, .. } if reason.contains("Cloud SQL"))
-        ));
-        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
-    }
-
     // ── Spring Boot detector ─────────────────────────────────────────
 
     #[test]
@@ -1696,13 +1635,6 @@ services:
             "CREATE TABLE t(id INT);",
         )
         .unwrap();
-        // NAIS
-        fs::create_dir(dir.path().join(".nais")).unwrap();
-        fs::write(
-            dir.path().join(".nais/nais-dev.yaml"),
-            "apiVersion: nais.io/v1alpha1\nkind: Application\n",
-        )
-        .unwrap();
         // Docker
         fs::write(dir.path().join("Dockerfile"), "FROM eclipse-temurin:21").unwrap();
 
@@ -1710,7 +1642,6 @@ services:
         let names: Vec<&str> = report.detections.iter().map(|d| d.name).collect();
         assert!(names.contains(&"JVM (Gradle)"), "missing JVM: {names:?}");
         assert!(names.contains(&"Docker"), "missing Docker: {names:?}");
-        assert!(names.contains(&"NAIS"), "missing NAIS: {names:?}");
         assert!(
             names.contains(&"Spring Boot"),
             "missing Spring Boot: {names:?}"
