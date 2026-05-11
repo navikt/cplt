@@ -1,8 +1,11 @@
 //! Centralized color and output helpers.
 //!
-//! All terminal styling goes through this module. Respects the `NO_COLOR`
-//! environment variable (<https://no-color.org>) and per-stream TTY detection
-//! so piped output is never polluted with escape sequences.
+//! All terminal styling goes through this module. Color decision respects
+//! (in priority order):
+//! 1. `FORCE_COLOR` env var — forces color even when piped (CI systems)
+//! 2. `NO_COLOR` env var — disables color (<https://no-color.org>)
+//! 3. `TERM=dumb` — disables color (legacy terminals)
+//! 4. TTY detection — color only when writing to an interactive terminal
 //!
 //! - Use [`color()`] for stderr output (the default for `[cplt]` messages).
 //! - Use [`stdout_color()`] for stdout output (`config show`, `doctor`, etc.).
@@ -20,26 +23,54 @@ pub const BOLD: &str = "\x1b[1m";
 pub const DIM: &str = "\x1b[2m";
 pub const RESET: &str = "\x1b[0m";
 
-/// Whether `NO_COLOR` is absent. Cached on first call.
-fn no_color_absent() -> bool {
-    static ABSENT: OnceLock<bool> = OnceLock::new();
-    *ABSENT.get_or_init(|| std::env::var_os("NO_COLOR").is_none())
+/// Whether `FORCE_COLOR` is set and non-empty. Overrides all other checks.
+fn force_color_set() -> bool {
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty()))
+}
+
+/// Whether color should be suppressed by environment variables.
+/// True when NO_COLOR is set (any value) or TERM=dumb.
+fn env_suppresses_color() -> bool {
+    static SUPPRESSED: OnceLock<bool> = OnceLock::new();
+    *SUPPRESSED.get_or_init(|| {
+        if std::env::var_os("NO_COLOR").is_some() {
+            return true;
+        }
+        std::env::var("TERM").is_ok_and(|t| t == "dumb")
+    })
 }
 
 /// Whether color is enabled for **stderr**. Cached on first call.
 ///
-/// Returns `false` when `NO_COLOR` is set (any value) or stderr is not a TTY.
+/// Priority: FORCE_COLOR > NO_COLOR/TERM=dumb > TTY detection.
 pub fn use_color() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| no_color_absent() && std::io::stderr().is_terminal())
+    *ENABLED.get_or_init(|| {
+        if force_color_set() {
+            return true;
+        }
+        if env_suppresses_color() {
+            return false;
+        }
+        std::io::stderr().is_terminal()
+    })
 }
 
 /// Whether color is enabled for **stdout**. Cached on first call.
 ///
-/// Returns `false` when `NO_COLOR` is set (any value) or stdout is not a TTY.
+/// Priority: FORCE_COLOR > NO_COLOR/TERM=dumb > TTY detection.
 pub fn use_stdout_color() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| no_color_absent() && std::io::stdout().is_terminal())
+    *ENABLED.get_or_init(|| {
+        if force_color_set() {
+            return true;
+        }
+        if env_suppresses_color() {
+            return false;
+        }
+        std::io::stdout().is_terminal()
+    })
 }
 
 /// Return the escape code for **stderr** if color is enabled, empty string otherwise.

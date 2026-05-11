@@ -209,11 +209,21 @@ struct Cli {
     #[arg(long)]
     inherit_env: bool,
 
-    /// Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run.
-    /// These are blocked by default to prevent supply chain attacks
-    /// (e.g., malicious postinstall hooks that deploy RATs).
-    /// Enable this if your project needs native module compilation.
-    #[arg(long)]
+    /// Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run (DANGEROUS).
+    /// Blocked by default to prevent supply chain attacks.
+    #[arg(
+        long,
+        long_help = "\
+Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run (DANGEROUS).
+
+These are blocked by default because malicious postinstall hooks are a primary
+supply chain attack vector — they can deploy RATs, exfiltrate env vars, or
+modify source files during `npm install`.
+
+Only enable this if your project needs native module compilation (node-gyp,
+esbuild native, etc.) and `npm install` fails without it. Prefer using
+`--ignore-scripts` in npm and adding specific trusted packages instead."
+    )]
     allow_lifecycle_scripts: bool,
 
     /// Allow GPG commit/tag signing inside the sandbox (DANGEROUS).
@@ -233,18 +243,36 @@ struct Cli {
     allow_jvm_attach: bool,
 
     /// Allow Docker/Colima/OrbStack access inside the sandbox (DANGEROUS).
-    /// Exposes ~/.docker config (read-only) and Docker daemon unix sockets.
-    /// WARNING: Docker container volumes can mount ANY host path, completely
-    /// bypassing sandbox filesystem restrictions. A compromised agent could
-    /// use `docker run -v /:/host` to read all files on your machine.
-    #[arg(long)]
+    #[arg(
+        long,
+        long_help = "\
+Allow Docker/Colima/OrbStack access inside the sandbox (DANGEROUS).
+
+Exposes ~/.docker config (read-only) and Docker daemon unix sockets.
+WARNING: Docker container volumes can mount ANY host path, completely
+bypassing sandbox filesystem restrictions. A compromised agent could
+use `docker run -v /:/host` to read all files on your machine.
+
+Only enable if you trust the agent to manage containers and understand
+that Docker volume mounts are an escape hatch from the sandbox."
+    )]
     allow_docker: bool,
 
-    /// Allow process execution from system temp directories.
-    /// DANGEROUS: re-enables exec from /private/tmp and /private/var/folders.
+    /// Allow process execution from system temp directories (DANGEROUS).
     /// Prefer --scratch-dir which creates a controlled executable temp dir.
-    /// Only use this as a last resort when --scratch-dir is insufficient.
-    #[arg(long)]
+    #[arg(
+        long,
+        long_help = "\
+Allow process execution from system temp directories (DANGEROUS).
+
+Re-enables exec from /private/tmp and /private/var/folders. This weakens
+code-exec isolation significantly — any process can drop a binary in /tmp
+and this flag lets it execute.
+
+Prefer --scratch-dir which creates a per-session controlled executable temp
+directory. Only use --allow-tmp-exec as a last resort when --scratch-dir is
+insufficient (e.g., third-party tools that hardcode /tmp for executables)."
+    )]
     allow_tmp_exec: bool,
 
     /// Allow process execution from a specific ~/Library/Caches subdirectory.
@@ -256,9 +284,18 @@ struct Cli {
     #[arg(long = "allow-cache-exec", value_name = "SUBDIR")]
     allow_cache_exec: Vec<String>,
 
-    /// Allow process execution from ALL ~/Library/Caches subdirectories.
+    /// Allow process execution from ALL ~/Library/Caches subdirectories (DANGEROUS).
     /// Much broader than --allow-cache-exec. Prefer specifying exact subdirs.
-    #[arg(long)]
+    #[arg(
+        long,
+        long_help = "\
+Allow process execution from ALL ~/Library/Caches subdirectories (DANGEROUS).
+
+This is much broader than --allow-cache-exec which targets specific tool caches.
+Grants exec to every binary cached by any application, significantly expanding
+the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
+--allow-cache-exec ms-playwright --allow-cache-exec gradle)."
+    )]
     allow_cache_exec_any: bool,
 
     /// Allow the agent to open URLs in your default browser.
