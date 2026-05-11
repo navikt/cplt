@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod detect;
 pub mod discover;
 pub mod proxy;
 pub mod repo_config;
