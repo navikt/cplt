@@ -251,13 +251,12 @@ impl DetectContext {
     /// Verify a path's canonical target is within the project root.
     /// Prevents symlink-based escapes.
     fn is_confined(&self, path: &Path) -> bool {
-        // Canonicalize resolves all symlinks atomically — no TOCTOU gap.
-        // If the path doesn't exist, canonicalize fails with NotFound;
-        // the caller's subsequent I/O will also fail, so returning true is safe.
-        let canonical = match path.canonicalize() {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
-            Err(_) => return false,
+        // Canonicalize resolves all symlinks atomically.
+        // Non-existent paths return false — the caller's metadata/read will
+        // also fail, and this avoids a TOCTOU gap where a symlink could be
+        // created between this check and the subsequent I/O.
+        let Ok(canonical) = path.canonicalize() else {
+            return false;
         };
         let Ok(root_canonical) = self.root.canonicalize() else {
             return false;
