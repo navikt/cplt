@@ -559,12 +559,25 @@ allow_jvm_attach = true
 allow_docker = true
 
 [propose.allow]
-read = ["~/.gradle/gradle.properties"]
+ports = [5432]
+localhost = [3000]
 ```
 
 - **`[deny]`** — applied automatically (can only tighten)
 - **`[propose]`** — requested permissions, requires approval: `cplt trust accept --all`
 - Read from `git HEAD` — tamper-proof; content-pinned approvals
+
+#### Auto-generate with `cplt init`
+
+Detect your project's tooling and generate a `.cplt.toml` automatically:
+
+```bash
+cplt init             # preview detected permissions
+cplt init --write     # write .cplt.toml to disk
+cplt init --quiet     # output only TOML (pipe-friendly)
+```
+
+Supported ecosystems: JVM (Gradle/Maven), Node.js, Docker, Python, Rust, Go, Playwright, and environment secrets (`.env.example`).
 
 Use `cplt config set --repo` to manage without editing TOML by hand:
 

@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::detect::{self, Detection, DetectionReport, Suggestion};
+use crate::detect::{Detection, DetectionReport, Suggestion};
 
 /// Options for the init command (mapped from CLI args).
 pub struct InitOptions {
@@ -31,26 +31,26 @@ pub enum InitResult {
     AlreadyExists(std::path::PathBuf),
     /// Nothing detected — empty project.
     NothingDetected,
+    /// Write failed.
+    WriteFailed(std::path::PathBuf, std::io::Error),
 }
 
-/// Run the init command: detect ecosystems, generate TOML, optionally write.
-pub fn run_init(project_dir: &Path, opts: &InitOptions) -> InitResult {
-    let report = detect::detect_project(project_dir);
-
+/// Run the init command from a pre-computed detection report.
+/// Avoids redundant filesystem scans when the caller already has the report.
+pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions) -> InitResult {
     if report.detections.is_empty() {
         return InitResult::NothingDetected;
     }
 
-    let toml = generate_toml(&report);
+    let toml = generate_toml(report);
     let config_path = project_dir.join(".cplt.toml");
 
     if opts.write {
         if config_path.exists() && !opts.force {
             return InitResult::AlreadyExists(config_path);
         }
-        // Best-effort write; caller handles error display
-        if std::fs::write(&config_path, &toml).is_err() {
-            eprintln!("error: failed to write {}", config_path.display());
+        if let Err(e) = std::fs::write(&config_path, &toml) {
+            return InitResult::WriteFailed(config_path, e);
         }
         return InitResult::Generated {
             toml,
@@ -119,6 +119,10 @@ fn format_suggestion(s: &Suggestion) -> String {
 }
 
 /// Generate a valid .cplt.toml from a detection report.
+///
+/// Only includes suggestions appropriate for repo-level config.
+/// Machine-specific suggestions (cache_exec, home-relative paths) are emitted
+/// as comments with guidance to add them to personal config.
 pub fn generate_toml(report: &DetectionReport) -> String {
     let mut out = String::new();
 
@@ -136,7 +140,7 @@ pub fn generate_toml(report: &DetectionReport) -> String {
     .unwrap();
     writeln!(out).unwrap();
 
-    // Partition suggestions into deny vs propose
+    // Partition suggestions into repo-appropriate vs personal-config
     let mut deny_env: BTreeSet<&str> = BTreeSet::new();
     let mut deny_paths: BTreeSet<&str> = BTreeSet::new();
     let mut propose_flags: BTreeSet<&str> = BTreeSet::new();
@@ -144,8 +148,10 @@ pub fn generate_toml(report: &DetectionReport) -> String {
     let mut allow_write: BTreeSet<&str> = BTreeSet::new();
     let mut allow_ports: BTreeSet<u16> = BTreeSet::new();
     let mut allow_localhost: BTreeSet<u16> = BTreeSet::new();
-    let mut allow_cache_exec: BTreeSet<&str> = BTreeSet::new();
     let mut proxy_private: BTreeSet<&str> = BTreeSet::new();
+
+    // Machine-specific suggestions → emitted as comments
+    let mut personal_hints: Vec<String> = Vec::new();
 
     for s in &report.suggestions {
         match s {
@@ -153,10 +159,19 @@ pub fn generate_toml(report: &DetectionReport) -> String {
                 propose_flags.insert(flag.key_name());
             }
             Suggestion::AllowRead(p) => {
-                allow_read.insert(p.as_str());
+                if is_home_relative(p) {
+                    personal_hints.push(format!("sandbox.read += [\"{p}\"]  # in personal config"));
+                } else {
+                    allow_read.insert(p.as_str());
+                }
             }
             Suggestion::AllowWrite(p) => {
-                allow_write.insert(p.as_str());
+                if is_home_relative(p) {
+                    personal_hints
+                        .push(format!("sandbox.write += [\"{p}\"]  # in personal config"));
+                } else {
+                    allow_write.insert(p.as_str());
+                }
             }
             Suggestion::AllowPort(p) => {
                 allow_ports.insert(*p);
@@ -165,7 +180,9 @@ pub fn generate_toml(report: &DetectionReport) -> String {
                 allow_localhost.insert(*p);
             }
             Suggestion::AllowCacheExec(p) => {
-                allow_cache_exec.insert(p.as_str());
+                personal_hints.push(format!(
+                    "sandbox.allow_cache_exec += [\"{p}\"]  # in personal config"
+                ));
             }
             Suggestion::DenyEnv(v) => {
                 deny_env.insert(v.as_str());
@@ -198,7 +215,6 @@ pub fn generate_toml(report: &DetectionReport) -> String {
         || !allow_write.is_empty()
         || !allow_ports.is_empty()
         || !allow_localhost.is_empty()
-        || !allow_cache_exec.is_empty()
         || !proxy_private.is_empty();
 
     if has_propose {
@@ -206,14 +222,15 @@ pub fn generate_toml(report: &DetectionReport) -> String {
         for flag in &propose_flags {
             writeln!(out, "{flag} = true").unwrap();
         }
-        writeln!(out).unwrap();
+        if !propose_flags.is_empty() {
+            writeln!(out).unwrap();
+        }
 
         // [propose.allow] sub-section for arrays
         let has_allow = !allow_read.is_empty()
             || !allow_write.is_empty()
             || !allow_ports.is_empty()
-            || !allow_localhost.is_empty()
-            || !allow_cache_exec.is_empty();
+            || !allow_localhost.is_empty();
 
         if has_allow {
             writeln!(out, "[propose.allow]").unwrap();
@@ -229,9 +246,6 @@ pub fn generate_toml(report: &DetectionReport) -> String {
             if !allow_localhost.is_empty() {
                 write_port_array(&mut out, "localhost", &allow_localhost);
             }
-            if !allow_cache_exec.is_empty() {
-                write_string_array(&mut out, "cache_exec", &allow_cache_exec);
-            }
             writeln!(out).unwrap();
         }
 
@@ -243,7 +257,25 @@ pub fn generate_toml(report: &DetectionReport) -> String {
         }
     }
 
+    // Personal config hints (machine-specific settings)
+    if !personal_hints.is_empty() {
+        writeln!(
+            out,
+            "# The following are machine-specific — add to ~/.config/cplt/config.toml:"
+        )
+        .unwrap();
+        for hint in &personal_hints {
+            writeln!(out, "# {hint}").unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+
     out
+}
+
+/// Check if a path starts with ~ (home-relative, not appropriate for repo config).
+fn is_home_relative(path: &str) -> bool {
+    path.starts_with('~')
 }
 
 fn write_string_array(out: &mut String, key: &str, values: &BTreeSet<&str>) {
@@ -329,8 +361,10 @@ mod tests {
         };
 
         let toml = generate_toml(&report);
-        assert!(toml.contains("[propose.allow]"));
+        // Home-relative paths go to personal config hints (comments)
+        assert!(!toml.contains("[propose.allow]"));
         assert!(toml.contains("~/.gradle/gradle.properties"));
+        assert!(toml.contains("# in personal config"));
         assert!(toml.contains("allow_jvm_attach = true"));
     }
 
@@ -420,8 +454,10 @@ mod tests {
     #[test]
     fn init_nothing_detected_on_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
+        let report = crate::detect::detect_project(dir.path());
         let result = run_init(
             dir.path(),
+            &report,
             &InitOptions {
                 write: false,
                 force: false,
@@ -435,8 +471,10 @@ mod tests {
     fn init_generates_preview() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        let report = crate::detect::detect_project(dir.path());
         let result = run_init(
             dir.path(),
+            &report,
             &InitOptions {
                 write: false,
                 force: false,
@@ -453,8 +491,10 @@ mod tests {
     fn init_writes_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+        let report = crate::detect::detect_project(dir.path());
         let result = run_init(
             dir.path(),
+            &report,
             &InitOptions {
                 write: true,
                 force: false,
@@ -477,8 +517,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
         std::fs::write(dir.path().join(".cplt.toml"), "# existing").unwrap();
+        let report = crate::detect::detect_project(dir.path());
         let result = run_init(
             dir.path(),
+            &report,
             &InitOptions {
                 write: true,
                 force: false,
@@ -493,8 +535,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
         std::fs::write(dir.path().join(".cplt.toml"), "# existing").unwrap();
+        let report = crate::detect::detect_project(dir.path());
         let result = run_init(
             dir.path(),
+            &report,
             &InitOptions {
                 write: true,
                 force: true,
@@ -527,5 +571,70 @@ mod tests {
         assert!(text.contains("Node.js"));
         assert!(text.contains("package.json"));
         assert!(text.contains("allow_localhost_any"));
+    }
+
+    #[test]
+    fn cache_exec_goes_to_personal_hint() {
+        let report = DetectionReport {
+            detections: vec![Detection {
+                name: "Playwright",
+                signals: vec![],
+                suggestions: vec![Suggestion::AllowCacheExec("ms-playwright".to_string())],
+            }],
+            suggestions: [Suggestion::AllowCacheExec("ms-playwright".to_string())]
+                .into_iter()
+                .collect(),
+            diagnostics: vec![],
+        };
+
+        let toml = generate_toml(&report);
+        // Should NOT be in [propose.allow] as a real key
+        assert!(!toml.contains("[propose.allow]"));
+        // Should be in personal config hint comment
+        assert!(toml.contains("# sandbox.allow_cache_exec"));
+        assert!(toml.contains("ms-playwright"));
+        assert!(toml.contains("personal config"));
+    }
+
+    #[test]
+    fn generated_toml_parses_as_valid_repo_config() {
+        // Roundtrip: generate TOML → parse with repo_config deserializer
+        let report = DetectionReport {
+            detections: vec![
+                Detection {
+                    name: "Docker",
+                    signals: vec![],
+                    suggestions: vec![
+                        Suggestion::Propose(SandboxFlag::AllowDocker),
+                        Suggestion::AllowPort(5432),
+                        Suggestion::AllowLocalhost(3000),
+                    ],
+                },
+                Detection {
+                    name: "Environment secrets",
+                    signals: vec![],
+                    suggestions: vec![Suggestion::DenyEnv("SECRET_KEY".to_string())],
+                },
+            ],
+            suggestions: [
+                Suggestion::Propose(SandboxFlag::AllowDocker),
+                Suggestion::AllowPort(5432),
+                Suggestion::AllowLocalhost(3000),
+                Suggestion::DenyEnv("SECRET_KEY".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            diagnostics: vec![],
+        };
+
+        let toml_str = generate_toml(&report);
+        // Should parse without error
+        let parsed: crate::repo_config::RepoConfig =
+            toml::from_str(&toml_str).expect("generated TOML should parse as valid RepoConfig");
+
+        assert_eq!(parsed.propose.allow_docker, Some(true));
+        assert_eq!(parsed.propose.allow.ports, vec![5432]);
+        assert_eq!(parsed.propose.allow.localhost, vec![3000]);
+        assert_eq!(parsed.deny.env, vec!["SECRET_KEY"]);
     }
 }

@@ -178,6 +178,32 @@ Trust decisions are stored in `~/.config/cplt/trust/` (protected from the sandbo
 cplt --accept-repo-config -- -p "run tests"
 ```
 
+### Auto-generate with `cplt init`
+
+Instead of writing `.cplt.toml` by hand, detect your project's ecosystem:
+
+```bash
+cplt init                   # Preview detected permissions
+cplt init --write           # Write .cplt.toml to disk
+cplt init --write --force   # Overwrite existing file
+cplt init --quiet           # Output only TOML (pipe-friendly)
+```
+
+**Supported ecosystems:**
+
+| Ecosystem | Detected via | Suggests |
+|-----------|-------------|----------|
+| JVM (Gradle/Maven) | `build.gradle*`, `pom.xml` | `allow_jvm_attach`, read gradle properties |
+| Node.js | `package.json` | `allow_lifecycle_scripts`, localhost ports, `allow_localhost_any` (for Next.js/Vite) |
+| Docker | `Dockerfile`, `compose.yml` | `allow_docker`, exposed ports |
+| Python | `pyproject.toml`, `requirements.txt` | localhost ports (for Django/FastAPI) |
+| Rust | `Cargo.toml` | (works with defaults) |
+| Go | `go.mod` | (works with defaults) |
+| Playwright | `@playwright/test` in package.json | `allow_cache_exec` (personal config hint) |
+| Environment secrets | `.env.example` | `deny.env` for sensitive variables |
+
+**Machine-specific suggestions** (like `allow_cache_exec` or home-relative read paths) are emitted as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
+
 ### Precedence
 
 1. CLI flags (highest)

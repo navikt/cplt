@@ -2040,7 +2040,7 @@ fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
         quiet,
     };
 
-    // Run detection first for the report display
+    // Detect once, use for both display and generation
     let report = cplt::detect::detect_project(&project_dir);
 
     if report.detections.is_empty() {
@@ -2054,7 +2054,7 @@ fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
         print!("{}", cplt::init::format_report(&report));
     }
 
-    let result = cplt::init::run_init(&project_dir, &opts);
+    let result = cplt::init::run_init(&project_dir, &report, &opts);
 
     match result {
         cplt::init::InitResult::Generated {
@@ -2091,9 +2091,12 @@ fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
             );
             ExitCode::FAILURE
         }
+        cplt::init::InitResult::WriteFailed(path, err) => {
+            eprintln!("error: failed to write {}: {err}", path.display());
+            ExitCode::FAILURE
+        }
         cplt::init::InitResult::NothingDetected => {
-            // Already handled above, but just in case
-            ExitCode::SUCCESS
+            unreachable!("handled by early exit above")
         }
     }
 }
