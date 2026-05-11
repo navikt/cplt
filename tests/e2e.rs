@@ -3311,4 +3311,76 @@ mod e2e_tests {
             "should have deny section: {stdout}"
         );
     }
+
+    #[test]
+    fn e2e_init_global_outputs_config() {
+        let home = tempfile::tempdir().unwrap();
+        // Create gradle wrapper dir so detection triggers
+        std::fs::create_dir_all(home.path().join(".gradle/wrapper/dists/gradle-8.5")).unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init", "--global"])
+            .env("HOME", home.path())
+            .env("CPLT_CONFIG", home.path().join("config.toml"))
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success(), "exit: {:?}", output.status);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("allow_cache_exec"),
+            "should suggest cache_exec: {stdout}"
+        );
+        assert!(stdout.contains("gradle"), "should detect gradle: {stdout}");
+    }
+
+    #[test]
+    fn e2e_init_global_write() {
+        let home = tempfile::tempdir().unwrap();
+        // Create gradle wrapper to trigger detection
+        std::fs::create_dir_all(home.path().join(".gradle/wrapper/dists/gradle-8.5")).unwrap();
+        let config_path = home.path().join("cplt/config.toml");
+
+        let output = Command::new(binary_path())
+            .args(["init", "--global", "--write"])
+            .env("HOME", home.path())
+            .env("CPLT_CONFIG", &config_path)
+            .output()
+            .expect("should run");
+
+        assert!(
+            output.status.success(),
+            "exit: {:?}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(config_path.exists(), "config file should be created");
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("[sandbox]"));
+        assert!(content.contains("allow_cache_exec"));
+    }
+
+    #[test]
+    fn e2e_init_global_empty_home() {
+        let home = tempfile::tempdir().unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init", "--global"])
+            .env("HOME", home.path())
+            .env("CPLT_CONFIG", home.path().join("config.toml"))
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No machine-level"),
+            "should report nothing detected: {stderr}"
+        );
+        // stdout should be empty
+        assert!(
+            output.stdout.is_empty(),
+            "stdout should be empty when nothing detected"
+        );
+    }
 }

@@ -189,6 +189,24 @@ cplt init --write --force   # Overwrite existing file
 cplt init --quiet           # Output only TOML (pipe-friendly)
 ```
 
+#### Personal config with `cplt init --global`
+
+Scan your machine for installed tools and generate `~/.config/cplt/config.toml`:
+
+```bash
+cplt init --global          # Preview personal config suggestions
+cplt init --global --write  # Write to ~/.config/cplt/config.toml
+```
+
+Detects:
+| Tool | Probes | Suggests |
+|------|--------|----------|
+| Gradle wrapper | `~/.gradle/wrapper/dists/` | `allow_cache_exec = ["gradle"]` |
+| Playwright browsers | `~/Library/Caches/ms-playwright/` | `allow_cache_exec = ["ms-playwright"]` |
+| GPG signing | `~/.gnupg/` + git config | `allow_gpg_signing = true` |
+| Gradle registry | `~/.gradle/gradle.properties` | `allow.read` for credentials file |
+| Alternative agents | `opencode`/`aider` in PATH | `agent = "..."` |
+
 **Supported ecosystems:**
 
 | Ecosystem | Detected via | Suggests |

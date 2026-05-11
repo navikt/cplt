@@ -428,13 +428,18 @@ enum Command {
         #[arg(long)]
         write: bool,
 
-        /// Overwrite existing .cplt.toml (requires --write).
+        /// Overwrite existing file (requires --write).
         #[arg(long, requires = "write")]
         force: bool,
 
         /// Suppress ecosystem details, only show generated TOML.
         #[arg(long, short)]
         quiet: bool,
+
+        /// Scan machine-level tools and generate personal config
+        /// (~/.config/cplt/config.toml) instead of per-repo .cplt.toml.
+        #[arg(long)]
+        global: bool,
     },
 }
 
@@ -1071,7 +1076,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 write,
                 force,
                 quiet,
-            } => run_init_command(write, force, quiet),
+                global,
+            } => {
+                if global {
+                    run_init_global_command(write, force, quiet)
+                } else {
+                    run_init_command(write, force, quiet)
+                }
+            }
         });
     }
 
@@ -2099,6 +2111,84 @@ fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
         }
         cplt::init::InitResult::NothingDetected => {
             unreachable!("handled by early exit above")
+        }
+    }
+}
+
+fn run_init_global_command(write: bool, force: bool, quiet: bool) -> ExitCode {
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("error: $HOME not set");
+        return ExitCode::FAILURE;
+    };
+    let home_dir = PathBuf::from(home);
+
+    let config_path =
+        cplt::config::config_path().unwrap_or_else(|| home_dir.join(".config/cplt/config.toml"));
+
+    let report = cplt::detect::detect_global(&home_dir);
+
+    if report.detections.is_empty() {
+        if !quiet {
+            eprintln!("No machine-level configuration detected.");
+            eprintln!("Your setup works with cplt defaults — no personal config needed.");
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // Show report unless quiet
+    if !quiet {
+        print!("{}", cplt::init::format_global_report(&report));
+    }
+
+    let opts = cplt::init::InitOptions {
+        write,
+        force,
+        quiet,
+    };
+
+    let result = cplt::init::run_init_global(&config_path, &report, &opts);
+
+    match result {
+        cplt::init::GlobalInitResult::Generated {
+            toml: _,
+            written: true,
+            path,
+        } => {
+            if !quiet {
+                println!("Wrote {}", path.display());
+                println!();
+                println!("Review: cplt config show");
+            }
+            ExitCode::SUCCESS
+        }
+        cplt::init::GlobalInitResult::Generated {
+            toml,
+            written: false,
+            path,
+            ..
+        } => {
+            if !quiet {
+                println!("Generated {}:", path.display());
+                println!("─────────────────────────────────────────");
+            }
+            print!("{toml}");
+            if !quiet {
+                println!("─────────────────────────────────────────");
+                println!();
+                println!("Run `cplt init --global --write` to save this config");
+            }
+            ExitCode::SUCCESS
+        }
+        cplt::init::GlobalInitResult::AlreadyExists(path) => {
+            eprintln!(
+                "error: {} already exists (use --force to overwrite)",
+                path.display()
+            );
+            ExitCode::FAILURE
+        }
+        cplt::init::GlobalInitResult::WriteFailed(path, err) => {
+            eprintln!("error: failed to write {}: {err}", path.display());
+            ExitCode::FAILURE
         }
     }
 }

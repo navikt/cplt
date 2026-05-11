@@ -1031,6 +1031,184 @@ fn extract_compose_ports(content: &str) -> Vec<u16> {
     ports
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// Global (machine-level) detection — for `cplt init --global`
+// ══════════════════════════════════════════════════════════════════════
+
+/// Suggestions specific to personal/global config (~/.config/cplt/config.toml).
+/// These map to `[sandbox]` and `[allow]` keys in the global config file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub enum GlobalSuggestion {
+    /// `sandbox.allow_cache_exec += [...]`
+    CacheExec(String),
+    /// `sandbox.allow_gpg_signing = true`
+    GpgSigning,
+    /// `allow.read += [...]`
+    AllowRead(String),
+    /// `sandbox.agent = "..."`
+    SetAgent(String),
+}
+
+/// Result of a global (machine-level) detection.
+#[derive(Debug, Clone)]
+pub struct GlobalDetection {
+    pub name: &'static str,
+    pub reason: String,
+    pub suggestions: Vec<GlobalSuggestion>,
+}
+
+/// Full report from global machine scanning.
+#[derive(Debug)]
+pub struct GlobalDetectionReport {
+    pub detections: Vec<GlobalDetection>,
+}
+
+/// Scan the user's home directory and environment for tool configurations
+/// that need personal config settings. Only detects tools commonly used
+/// by Nav developers.
+pub fn detect_global(home: &Path) -> GlobalDetectionReport {
+    let mut detections = Vec::new();
+
+    // Gradle cache exec (for wrapper downloads)
+    if let Some(d) = detect_global_gradle(home) {
+        detections.push(d);
+    }
+
+    // Playwright browser cache
+    if let Some(d) = detect_global_playwright(home) {
+        detections.push(d);
+    }
+
+    // GPG signing configuration
+    if let Some(d) = detect_global_gpg(home) {
+        detections.push(d);
+    }
+
+    // Gradle credentials (private registry access)
+    if let Some(d) = detect_global_gradle_credentials(home) {
+        detections.push(d);
+    }
+
+    // Preferred agent from PATH
+    if let Some(d) = detect_global_agent() {
+        detections.push(d);
+    }
+
+    GlobalDetectionReport { detections }
+}
+
+fn detect_global_gradle(home: &Path) -> Option<GlobalDetection> {
+    // Gradle wrapper downloads executables to ~/.gradle/wrapper/dists/
+    let wrapper_dir = home.join(".gradle/wrapper/dists");
+    if !wrapper_dir.is_dir() {
+        return None;
+    }
+    Some(GlobalDetection {
+        name: "Gradle wrapper",
+        reason: "~/.gradle/wrapper/dists/ exists (Gradle wrapper executables)".to_string(),
+        suggestions: vec![GlobalSuggestion::CacheExec("gradle".to_string())],
+    })
+}
+
+fn detect_global_playwright(home: &Path) -> Option<GlobalDetection> {
+    // Playwright installs browsers to ~/Library/Caches/ms-playwright/ (macOS)
+    // or ~/.cache/ms-playwright/ (Linux)
+    let mac_path = home.join("Library/Caches/ms-playwright");
+    let linux_path = home.join(".cache/ms-playwright");
+    if !mac_path.is_dir() && !linux_path.is_dir() {
+        return None;
+    }
+    Some(GlobalDetection {
+        name: "Playwright browsers",
+        reason: "ms-playwright cache directory exists".to_string(),
+        suggestions: vec![GlobalSuggestion::CacheExec("ms-playwright".to_string())],
+    })
+}
+
+fn detect_global_gpg(home: &Path) -> Option<GlobalDetection> {
+    // Check if GPG is configured for git commit signing
+    if !home.join(".gnupg").is_dir() {
+        return None;
+    }
+    // Check git config for signing
+    let output = std::process::Command::new("git")
+        .args(["config", "--global", "commit.gpgsign"])
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&output.stdout);
+    if value.trim() != "true" {
+        return None;
+    }
+    Some(GlobalDetection {
+        name: "GPG signing",
+        reason: "git commit.gpgsign=true and ~/.gnupg/ exists".to_string(),
+        suggestions: vec![GlobalSuggestion::GpgSigning],
+    })
+}
+
+fn detect_global_gradle_credentials(home: &Path) -> Option<GlobalDetection> {
+    // ~/.gradle/gradle.properties is denied by default (may contain Nexus passwords).
+    // If it exists and contains repository credentials, suggest allowing read access.
+    let props_path = home.join(".gradle/gradle.properties");
+    if !props_path.is_file() {
+        return None;
+    }
+    // Check if it actually contains credential-like entries
+    let content = std::fs::read_to_string(&props_path).ok()?;
+    let has_registry = content.lines().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("repository") || lower.contains("nexus") || lower.contains("artifactory")
+    });
+    if !has_registry {
+        return None;
+    }
+    Some(GlobalDetection {
+        name: "Gradle registry credentials",
+        reason: "~/.gradle/gradle.properties contains repository configuration".to_string(),
+        suggestions: vec![GlobalSuggestion::AllowRead(
+            "~/.gradle/gradle.properties".to_string(),
+        )],
+    })
+}
+
+fn detect_global_agent() -> Option<GlobalDetection> {
+    // Detect which agent binary is available in PATH
+    let agents = [
+        ("copilot", "copilot"),
+        ("opencode", "opencode"),
+        ("gemini", "gemini"),
+        ("claude", "claude"),
+    ];
+
+    let mut found: Vec<&str> = Vec::new();
+    for (name, binary) in &agents {
+        if which_exists(binary) {
+            found.push(name);
+        }
+    }
+
+    // Only suggest if exactly one agent is found (clear default)
+    // or if a non-copilot agent is the only one (copilot is already the default)
+    if found.len() == 1 && found[0] != "copilot" {
+        return Some(GlobalDetection {
+            name: "Default agent",
+            reason: format!("{} found in PATH", found[0]),
+            suggestions: vec![GlobalSuggestion::SetAgent(found[0].to_string())],
+        });
+    }
+
+    None
+}
+
+fn which_exists(binary: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(binary)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1745,6 +1923,94 @@ services:
             report
                 .suggestions
                 .contains(&Suggestion::AllowLocalhost(8080))
+        );
+    }
+
+    // ── Global detector tests ────────────────────────────────────────
+
+    #[test]
+    fn global_detect_gradle_wrapper() {
+        let home = tempfile::tempdir().unwrap();
+        let dists = home.path().join(".gradle/wrapper/dists");
+        std::fs::create_dir_all(&dists).unwrap();
+        std::fs::write(dists.join("gradle-8.5-bin"), "").unwrap();
+
+        let report = detect_global(home.path());
+        assert!(report.detections.iter().any(|d| d.name == "Gradle wrapper"));
+        assert!(
+            report
+                .detections
+                .iter()
+                .flat_map(|d| &d.suggestions)
+                .any(|s| matches!(s, GlobalSuggestion::CacheExec(v) if v == "gradle"))
+        );
+    }
+
+    #[test]
+    fn global_detect_gradle_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let report = detect_global(home.path());
+        assert!(!report.detections.iter().any(|d| d.name == "Gradle wrapper"));
+    }
+
+    #[test]
+    fn global_detect_playwright_cache() {
+        let home = tempfile::tempdir().unwrap();
+        // macOS path
+        let pw = home.path().join("Library/Caches/ms-playwright");
+        std::fs::create_dir_all(&pw).unwrap();
+
+        let report = detect_global(home.path());
+        assert!(
+            report
+                .detections
+                .iter()
+                .any(|d| d.name == "Playwright browsers")
+        );
+    }
+
+    #[test]
+    fn global_detect_gpg_dir() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".gnupg")).unwrap();
+
+        let report = detect_global(home.path());
+        // GPG dir alone triggers detection (even without git config)
+        assert!(report.detections.iter().any(|d| d.name == "GPG signing"));
+    }
+
+    #[test]
+    fn global_detect_gradle_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let props = home.path().join(".gradle/gradle.properties");
+        std::fs::create_dir_all(props.parent().unwrap()).unwrap();
+        std::fs::write(&props, "nexusUrl=https://maven.nav.no\n").unwrap();
+
+        let report = detect_global(home.path());
+        assert!(
+            report
+                .detections
+                .iter()
+                .any(|d| d.name == "Gradle registry credentials")
+        );
+        assert!(report.detections.iter().flat_map(|d| &d.suggestions).any(
+            |s| matches!(s, GlobalSuggestion::AllowRead(p) if p.contains("gradle.properties"))
+        ));
+    }
+
+    #[test]
+    fn global_detect_gradle_credentials_no_match() {
+        let home = tempfile::tempdir().unwrap();
+        let props = home.path().join(".gradle/gradle.properties");
+        std::fs::create_dir_all(props.parent().unwrap()).unwrap();
+        std::fs::write(&props, "org.gradle.daemon=true\n").unwrap();
+
+        let report = detect_global(home.path());
+        assert!(
+            !report
+                .detections
+                .iter()
+                .any(|d| d.name == "Gradle registry credentials")
         );
     }
 }
