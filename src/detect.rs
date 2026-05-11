@@ -1198,6 +1198,7 @@ fn detect_global_agent() -> Option<GlobalDetection> {
     let agents = [
         ("copilot", "copilot"),
         ("opencode", "opencode"),
+        ("aider", "aider"),
         ("gemini", "gemini"),
         ("claude", "claude"),
     ];
