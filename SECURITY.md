@@ -4,18 +4,19 @@ This document describes the security architecture of cplt, the threat model it a
 
 ## Supported Agents
 
-cplt sandboxes AI coding agents — currently **GitHub Copilot CLI** and **[OpenCode](https://opencode.ai/)** (anomalyco/opencode). OpenCode is [officially supported by GitHub](https://github.blog/changelog/2026-01-16-github-copilot-now-supports-opencode/) as a Copilot client. Both share the same core sandbox infrastructure (deny-default Seatbelt profile, env sanitization, scratch dir), with agent-specific adaptations:
+cplt sandboxes AI coding agents — currently **GitHub Copilot CLI**, **[OpenCode](https://opencode.ai/)**, **Google Gemini CLI**, and **[Pi](https://github.com/earendil-works/pi)**. All share the same core sandbox infrastructure (deny-default Seatbelt/Landlock profile, env sanitization, scratch dir), with agent-specific adaptations:
 
-| Property        | Copilot                             | OpenCode                                                            |
-|-----------------|-------------------------------------|---------------------------------------------------------------------|
-| Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow → `auth.json`, or API keys                   |
-| Auth in sandbox | Token auto-passed via env allowlist | Copilot auth stored in data dir; third-party keys need `--pass-env` |
-| Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    |
-| Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          |
-| State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          |
-| Keychain access | Yes (required for token storage)    | No                                                                  |
-| SEA extraction  | Yes (pre-sandbox)                   | No                                                                  |
-| Env isolation   | `GH_TOKEN`, `COPILOT_*` passed      | `GH_TOKEN`, `COPILOT_*` suppressed                                  |
+| Property        | Copilot                             | OpenCode                                                            | Gemini                                    | Pi                                          |
+|-----------------|-------------------------------------|---------------------------------------------------------------------|-------------------------------------------|---------------------------------------------|
+| Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow → `auth.json`, or API keys                   | Google OAuth (browser) or API key         | API keys (Anthropic, OpenAI, Gemini, etc.)  |
+| Auth in sandbox | Token auto-passed via env allowlist | Copilot auth stored in data dir; third-party keys need `--pass-env` | OAuth stored in `~/.gemini/`; key needs `--pass-env` | Keys need `--pass-env`             |
+| Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini` (read/write)                  | `~/.pi` (read/write)                       |
+| Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          | N/A (in config dir)                       | `~/.pi/agent/bin` (read + exec)             |
+| State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          | N/A                                       | N/A                                         |
+| Keychain access | Yes (required for token storage)    | No                                                                  | Yes (extension integrity)                 | No                                          |
+| SEA extraction  | Yes (pre-sandbox)                   | No                                                                  | No                                        | No                                          |
+| Env isolation   | `GH_TOKEN`, `COPILOT_*` passed      | `GH_TOKEN`, `COPILOT_*` suppressed                                  | `GH_TOKEN`, `COPILOT_*` suppressed        | `GH_TOKEN`, `COPILOT_*` suppressed          |
+| Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                          | No (explicit only — name collision risk)    |
 
 ### OpenCode-specific security notes
 
@@ -25,6 +26,21 @@ cplt sandboxes AI coding agents — currently **GitHub Copilot CLI** and **[Open
 - **State data dir is write+no-exec**: `~/.local/state/opencode/` (locks, history, statistics) is writable but has both `(deny process-exec)` and `(deny file-map-executable)` to prevent write+exec persistence attacks.
 - **Config dir is read-only**: `~/.config/opencode/opencode.json` and related config are readable but not writable, preventing config tampering across unsandboxed runs.
 - **Copilot env vars isolated**: `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, and all `COPILOT_*` env vars are suppressed for non-Copilot agents. OpenCode's Copilot provider uses its own auth file instead.
+
+### Gemini-specific security notes
+
+- **OAuth browser flow**: Gemini uses Google OAuth by default, requiring `--allow-browser` for first-time login. Auth tokens are stored in `~/.gemini/`.
+- **API key alternative**: `GEMINI_API_KEY` or `GOOGLE_CLOUD_PROJECT` can be used instead of OAuth — must be passed via `--pass-env`.
+- **Keychain access enabled**: Gemini uses macOS Keychain for extension integrity verification.
+- **Config dir is read/write**: `~/.gemini/` stores auth, settings, sessions, and agents.
+
+### Pi-specific security notes
+
+- **Not auto-detected**: the `pi` binary name is generic and may collide with other tools. Pi must be explicitly selected via `--agent pi` or `sandbox.agent = "pi"` in config.
+- **API keys are opt-in**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` are never passed through by default. Users must explicitly use `--pass-env` for each key.
+- **Config dir is read/write**: `~/.pi/` stores settings, auth, sessions, and themes.
+- **Managed binaries have exec**: `~/.pi/agent/bin/` (bundled `fd`, `rg`) has process-exec permission but is read-only (no write+exec).
+- **Copilot env vars isolated**: `GH_TOKEN`, `GITHUB_TOKEN`, and `COPILOT_*` are suppressed for Pi.
 
 ## Threat Model
 

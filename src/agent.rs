@@ -1,7 +1,7 @@
 //! Agent abstraction for different AI coding tools.
 //!
 //! cplt can sandbox multiple AI coding agents — currently GitHub Copilot CLI,
-//! OpenCode, and Google Gemini CLI. Each agent has different binary names,
+//! OpenCode, Google Gemini CLI, and Pi. Each agent has different binary names,
 //! config directories, and runtime requirements, but shares the same core
 //! sandbox infrastructure.
 

@@ -23,6 +23,7 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 # allow_private_domains = ["intern.nav.no"]  # Allow internal/intranet domains to resolve to private IPs
 
 [sandbox]
+# agent = "copilot"          # Preferred agent: copilot, opencode, gemini, pi, shell (auto-detected if not set)
 # validate = true
 # allow_env_files = false
 # allow_lifecycle_scripts = false

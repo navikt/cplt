@@ -6,7 +6,7 @@
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-Sandbox wrapper for AI coding agents. Runs GitHub Copilot CLI, OpenCode, or a plain shell inside a kernel-level sandbox so the agent can work on your project but cannot access your secrets.
+Sandbox wrapper for AI coding agents. Runs GitHub Copilot CLI, OpenCode, Google Gemini CLI, Pi, or a plain shell inside a kernel-level sandbox so the agent can work on your project but cannot access your secrets.
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
 - **Linux**: Landlock LSM + seccomp-BPF (kernel 5.13+; full network filtering on 6.7+)
@@ -393,6 +393,46 @@ cplt --agent opencode --pass-env OPENAI_API_KEY --pass-env OPENAI_ORG_ID
 - OpenCode data (`~/.local/share/opencode/`) is writable but execution is denied (write+exec prevention)
 - Keychain access is disabled (OpenCode uses its own auth file, not macOS Keychain)
 - `--resume`, `--continue`, `--remote`, `--name` flags are Copilot-specific and ignored for OpenCode
+
+### Gemini CLI support
+
+cplt can sandbox [Google Gemini CLI](https://github.com/google-gemini/gemini-cli). Gemini uses Google OAuth (browser flow) by default, or an API key.
+
+```bash
+# Run Gemini CLI
+cplt --agent gemini
+
+# With API key instead of OAuth
+cplt --agent gemini --pass-env GEMINI_API_KEY
+```
+
+**Security notes for Gemini:**
+- Gemini config/auth (`~/.gemini/`) is writable in the sandbox
+- Keychain access is enabled (used for extension integrity verification)
+- OAuth browser flow requires `--allow-browser` for first-time login
+- `--resume`, `--continue`, `--remote`, `--name` flags are Copilot-specific and ignored for Gemini
+
+### Pi agent support
+
+cplt can sandbox [Pi](https://github.com/earendil-works/pi) (`@earendil-works/pi-coding-agent`). Pi supports multiple LLM providers via API keys.
+
+```bash
+# Run Pi (must be explicit — not auto-detected due to binary name collision risk)
+cplt --agent pi
+
+# Pass your provider API key
+cplt --agent pi --pass-env ANTHROPIC_API_KEY
+
+# Set Pi as your default agent
+cplt config set sandbox.agent pi
+```
+
+**Security notes for Pi:**
+- **Not auto-detected**: the `pi` binary name is too generic and may collide with other tools. Use `--agent pi` or set `sandbox.agent = "pi"` in config
+- **API keys are opt-in**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` must be explicitly passed via `--pass-env`
+- Pi config/auth (`~/.pi/`) is writable in the sandbox
+- Pi managed binaries (`~/.pi/agent/bin/`) have process-exec permission (for bundled `fd`, `rg`)
+- Keychain access is disabled
 
 ### Shell mode
 
