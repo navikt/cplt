@@ -245,6 +245,38 @@ pub const DETECTORS: &[DetectorSpec] = &[
         id: "env_files",
         detect: detect_env_files,
     },
+    DetectorSpec {
+        id: "nais",
+        detect: detect_nais,
+    },
+    DetectorSpec {
+        id: "spring_boot",
+        detect: detect_spring_boot,
+    },
+    DetectorSpec {
+        id: "ktor",
+        detect: detect_ktor,
+    },
+    DetectorSpec {
+        id: "testcontainers",
+        detect: detect_testcontainers,
+    },
+    DetectorSpec {
+        id: "next_config",
+        detect: detect_next_config,
+    },
+    DetectorSpec {
+        id: "vite_config",
+        detect: detect_vite_config,
+    },
+    DetectorSpec {
+        id: "flyway",
+        detect: detect_flyway,
+    },
+    DetectorSpec {
+        id: "cypress",
+        detect: detect_cypress,
+    },
 ];
 
 /// Run all detectors against a project directory.
@@ -601,6 +633,351 @@ fn detect_env_files(ctx: &DetectContext) -> DetectorOutput {
             reason: "contains sensitive variable names",
         }],
         suggestions,
+    })
+}
+
+// ── NAIS / Nav-specific detectors ────────────────────────────────────
+
+fn detect_nais(ctx: &DetectContext) -> DetectorOutput {
+    let nais_files = ["nais.yaml", "nais.yml"];
+    let nais_dirs = [".nais", "nais"];
+
+    let mut signals = Vec::new();
+    let mut suggestions = Vec::new();
+
+    for file in &nais_files {
+        if ctx.exists(file) {
+            signals.push(Signal::FileExists {
+                path: (*file).to_string(),
+            });
+        }
+    }
+
+    for dir in &nais_dirs {
+        if ctx.dir_exists(dir) {
+            signals.push(Signal::FileExists {
+                path: (*dir).to_string(),
+            });
+        }
+    }
+
+    if signals.is_empty() {
+        return DetectorOutput::none();
+    }
+
+    // Scan nais config for specific features
+    let nais_content_files = [
+        "nais.yaml",
+        "nais.yml",
+        ".nais/nais-dev.yaml",
+        ".nais/nais-prod.yaml",
+        "nais/nais-dev.yaml",
+    ];
+
+    for file in &nais_content_files {
+        let Some(content) = ctx.read_text(file) else {
+            continue;
+        };
+
+        if content.contains("kafka:") && content.contains("pool:") {
+            signals.push(Signal::FileContains {
+                path: (*file).to_string(),
+                reason: "Kafka pool configured",
+            });
+        }
+
+        if content.contains("sqlInstances:") {
+            signals.push(Signal::FileContains {
+                path: (*file).to_string(),
+                reason: "GCP Cloud SQL configured",
+            });
+            suggestions.push(Suggestion::AllowPort(5432));
+        }
+
+        if content.contains("allow_docker:") || content.contains("docker:") {
+            suggestions.push(Suggestion::Propose(SandboxFlag::AllowDocker));
+        }
+
+        break;
+    }
+
+    DetectorOutput::detected(Detection {
+        name: "NAIS",
+        signals,
+        suggestions,
+    })
+}
+
+fn detect_spring_boot(ctx: &DetectContext) -> DetectorOutput {
+    // Detect Spring Boot specifically (beyond generic JVM)
+    let has_application_yml = ctx.exists("src/main/resources/application.yml")
+        || ctx.exists("src/main/resources/application.yaml");
+
+    if !has_application_yml {
+        return DetectorOutput::none();
+    }
+
+    // Verify it's actually Spring Boot
+    let gradle_content = ctx
+        .read_text("build.gradle.kts")
+        .or_else(|| ctx.read_text("build.gradle"));
+
+    let is_spring = gradle_content
+        .as_deref()
+        .is_some_and(|c| c.contains("spring-boot") || c.contains("org.springframework"));
+
+    if !is_spring {
+        return DetectorOutput::none();
+    }
+
+    let mut signals = vec![Signal::FileContains {
+        path: "build.gradle.kts".to_string(),
+        reason: "Spring Boot project",
+    }];
+    let mut suggestions = vec![
+        Suggestion::Propose(SandboxFlag::AllowJvmAttach),
+        Suggestion::AllowLocalhost(8080),
+    ];
+
+    // Check application.yml for specific features
+    let app_content = ctx
+        .read_text("src/main/resources/application.yml")
+        .or_else(|| ctx.read_text("src/main/resources/application.yaml"));
+
+    if let Some(content) = &app_content {
+        if content.contains("flyway") {
+            signals.push(Signal::FileContains {
+                path: "application.yml".to_string(),
+                reason: "Flyway migrations enabled",
+            });
+        }
+        if content.contains("kafka") {
+            signals.push(Signal::FileContains {
+                path: "application.yml".to_string(),
+                reason: "Kafka configured",
+            });
+        }
+        if content.contains("datasource") || content.contains("postgresql") {
+            signals.push(Signal::FileContains {
+                path: "application.yml".to_string(),
+                reason: "PostgreSQL datasource",
+            });
+            suggestions.push(Suggestion::AllowPort(5432));
+        }
+    }
+
+    DetectorOutput::detected(Detection {
+        name: "Spring Boot",
+        signals,
+        suggestions,
+    })
+}
+
+fn detect_ktor(ctx: &DetectContext) -> DetectorOutput {
+    // Ktor uses application.conf (HOCON) instead of Spring's application.yml
+    let has_app_conf = ctx.exists("src/main/resources/application.conf");
+
+    let gradle_content = ctx
+        .read_text("build.gradle.kts")
+        .or_else(|| ctx.read_text("build.gradle"));
+
+    let is_ktor = gradle_content
+        .as_deref()
+        .is_some_and(|c| c.contains("ktor") || c.contains("io.ktor"));
+
+    if !is_ktor {
+        return DetectorOutput::none();
+    }
+
+    let mut signals = vec![Signal::FileContains {
+        path: "build.gradle.kts".to_string(),
+        reason: "Ktor project",
+    }];
+
+    if has_app_conf {
+        signals.push(Signal::FileExists {
+            path: "src/main/resources/application.conf".to_string(),
+        });
+    }
+
+    let mut suggestions = vec![
+        Suggestion::Propose(SandboxFlag::AllowJvmAttach),
+        Suggestion::AllowLocalhost(8080),
+    ];
+
+    // Scan gradle for test dependencies
+    if let Some(content) = &gradle_content
+        && content.contains("testcontainers")
+    {
+        signals.push(Signal::FileContains {
+            path: "build.gradle.kts".to_string(),
+            reason: "TestContainers in test dependencies",
+        });
+        suggestions.push(Suggestion::Propose(SandboxFlag::AllowDocker));
+    }
+
+    DetectorOutput::detected(Detection {
+        name: "Ktor",
+        signals,
+        suggestions,
+    })
+}
+
+fn detect_testcontainers(ctx: &DetectContext) -> DetectorOutput {
+    let gradle_content = ctx
+        .read_text("build.gradle.kts")
+        .or_else(|| ctx.read_text("build.gradle"));
+
+    let Some(content) = gradle_content else {
+        return DetectorOutput::none();
+    };
+
+    if !content.contains("testcontainers") {
+        return DetectorOutput::none();
+    }
+
+    let mut signals = vec![Signal::FileContains {
+        path: "build.gradle.kts".to_string(),
+        reason: "TestContainers dependency",
+    }];
+
+    // Detect which containers are used
+    if content.contains("testcontainers:postgresql")
+        || content.contains("testcontainers.postgresql")
+    {
+        signals.push(Signal::FileContains {
+            path: "build.gradle.kts".to_string(),
+            reason: "PostgreSQL TestContainer",
+        });
+    }
+    if content.contains("testcontainers:kafka") || content.contains("testcontainers.kafka") {
+        signals.push(Signal::FileContains {
+            path: "build.gradle.kts".to_string(),
+            reason: "Kafka TestContainer",
+        });
+    }
+
+    DetectorOutput::detected(Detection {
+        name: "TestContainers",
+        signals,
+        suggestions: vec![
+            Suggestion::Propose(SandboxFlag::AllowDocker),
+            Suggestion::Propose(SandboxFlag::AllowLocalhostAny),
+        ],
+    })
+}
+
+fn detect_next_config(ctx: &DetectContext) -> DetectorOutput {
+    let config_files = ["next.config.ts", "next.config.js", "next.config.mjs"];
+
+    let mut found = None;
+    for file in &config_files {
+        if ctx.exists(file) {
+            found = Some(*file);
+            break;
+        }
+    }
+
+    let Some(config_file) = found else {
+        return DetectorOutput::none();
+    };
+
+    DetectorOutput::detected(Detection {
+        name: "Next.js",
+        signals: vec![Signal::FileExists {
+            path: config_file.to_string(),
+        }],
+        suggestions: vec![
+            Suggestion::Propose(SandboxFlag::AllowLocalhostAny),
+            Suggestion::AllowLocalhost(3000),
+        ],
+    })
+}
+
+fn detect_vite_config(ctx: &DetectContext) -> DetectorOutput {
+    let config_files = ["vite.config.ts", "vite.config.js", "vite.config.mjs"];
+
+    let mut found = None;
+    for file in &config_files {
+        if ctx.exists(file) {
+            found = Some(*file);
+            break;
+        }
+    }
+
+    let Some(config_file) = found else {
+        return DetectorOutput::none();
+    };
+
+    DetectorOutput::detected(Detection {
+        name: "Vite",
+        signals: vec![Signal::FileExists {
+            path: config_file.to_string(),
+        }],
+        suggestions: vec![
+            Suggestion::Propose(SandboxFlag::AllowLocalhostAny),
+            Suggestion::AllowLocalhost(5173),
+        ],
+    })
+}
+
+fn detect_flyway(ctx: &DetectContext) -> DetectorOutput {
+    // Two common directory patterns in navikt repos
+    let migration_dirs = [
+        "src/main/resources/db/migration",
+        "src/main/resources/db/migrations",
+    ];
+
+    let mut signals = Vec::new();
+
+    for dir in &migration_dirs {
+        if ctx.dir_exists(dir) {
+            signals.push(Signal::FileExists {
+                path: (*dir).to_string(),
+            });
+        }
+    }
+
+    if signals.is_empty() {
+        return DetectorOutput::none();
+    }
+
+    DetectorOutput::detected(Detection {
+        name: "Flyway",
+        signals,
+        suggestions: vec![Suggestion::AllowPort(5432)],
+    })
+}
+
+fn detect_cypress(ctx: &DetectContext) -> DetectorOutput {
+    let has_config = ctx.exists("cypress.config.ts")
+        || ctx.exists("cypress.config.js")
+        || ctx.exists("cypress.config.mjs");
+    let has_dir = ctx.dir_exists("cypress");
+
+    if !has_config && !has_dir {
+        return DetectorOutput::none();
+    }
+
+    let mut signals = Vec::new();
+    if has_config {
+        signals.push(Signal::FileExists {
+            path: "cypress.config.ts".to_string(),
+        });
+    }
+    if has_dir {
+        signals.push(Signal::FileExists {
+            path: "cypress/".to_string(),
+        });
+    }
+
+    DetectorOutput::detected(Detection {
+        name: "Cypress",
+        signals,
+        suggestions: vec![
+            Suggestion::Propose(SandboxFlag::AllowBrowser),
+            Suggestion::Propose(SandboxFlag::AllowLocalhostAny),
+        ],
     })
 }
 
@@ -1040,5 +1417,283 @@ services:
         );
         assert_eq!(SandboxFlag::AllowGpgSigning.key_name(), "allow_gpg_signing");
         assert_eq!(SandboxFlag::AllowTmpExec.key_name(), "allow_tmp_exec");
+    }
+
+    // ── NAIS detector ────────────────────────────────────────────────
+
+    #[test]
+    fn nais_detects_nais_yaml() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("nais.yaml"),
+            "apiVersion: nais.io/v1alpha1\nkind: Application\n",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        assert!(report.detections.iter().any(|d| d.name == "NAIS"));
+    }
+
+    #[test]
+    fn nais_detects_dot_nais_dir() {
+        let dir = setup_dir();
+        fs::create_dir(dir.path().join(".nais")).unwrap();
+        fs::write(
+            dir.path().join(".nais/nais-dev.yaml"),
+            "apiVersion: nais.io/v1alpha1\nspec:\n  gcp:\n    sqlInstances:\n      - type: POSTGRES_17\n",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        let nais = report.detections.iter().find(|d| d.name == "NAIS").unwrap();
+        assert!(nais.signals.iter().any(
+            |s| matches!(s, Signal::FileContains { reason, .. } if reason.contains("Cloud SQL"))
+        ));
+        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
+    }
+
+    // ── Spring Boot detector ─────────────────────────────────────────
+
+    #[test]
+    fn spring_boot_detected() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("build.gradle.kts"),
+            r#"plugins { id("org.springframework.boot") version "4.0" }"#,
+        )
+        .unwrap();
+        let res_dir = dir.path().join("src/main/resources");
+        fs::create_dir_all(&res_dir).unwrap();
+        fs::write(
+            res_dir.join("application.yml"),
+            "spring:\n  datasource:\n    url: jdbc:postgresql://localhost/db\n",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        assert!(report.detections.iter().any(|d| d.name == "Spring Boot"));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(8080))
+        );
+        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
+    }
+
+    #[test]
+    fn spring_boot_not_detected_without_gradle() {
+        let dir = setup_dir();
+        let res_dir = dir.path().join("src/main/resources");
+        fs::create_dir_all(&res_dir).unwrap();
+        fs::write(
+            res_dir.join("application.yml"),
+            "spring:\n  profiles: dev\n",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        assert!(report.detections.iter().all(|d| d.name != "Spring Boot"));
+    }
+
+    // ── Ktor detector ────────────────────────────────────────────────
+
+    #[test]
+    fn ktor_detected() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("build.gradle.kts"),
+            "plugins {\n  alias(libs.plugins.ktor)\n}\ndependencies {\n  implementation(libs.ktor.server.core)\n}\n",
+        )
+        .unwrap();
+        let res_dir = dir.path().join("src/main/resources");
+        fs::create_dir_all(&res_dir).unwrap();
+        fs::write(res_dir.join("application.conf"), "ktor { }").unwrap();
+        let report = detect_project(dir.path());
+        assert!(report.detections.iter().any(|d| d.name == "Ktor"));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(8080))
+        );
+    }
+
+    // ── TestContainers detector ──────────────────────────────────────
+
+    #[test]
+    fn testcontainers_detected() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("build.gradle.kts"),
+            "dependencies {\n  testImplementation(\"org.testcontainers:postgresql:1.19\")\n  testImplementation(\"org.testcontainers:kafka:1.19\")\n}\n",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        let tc = report
+            .detections
+            .iter()
+            .find(|d| d.name == "TestContainers")
+            .unwrap();
+        assert!(tc.signals.iter().any(
+            |s| matches!(s, Signal::FileContains { reason, .. } if reason.contains("PostgreSQL"))
+        ));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
+        );
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowLocalhostAny))
+        );
+    }
+
+    // ── Next.js config detector ──────────────────────────────────────
+
+    #[test]
+    fn nextjs_config_detected() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("next.config.ts"), "export default {}").unwrap();
+        let report = detect_project(dir.path());
+        assert!(report.detections.iter().any(|d| d.name == "Next.js"));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(3000))
+        );
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowLocalhostAny))
+        );
+    }
+
+    // ── Vite config detector ─────────────────────────────────────────
+
+    #[test]
+    fn vite_config_detected() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("vite.config.ts"), "export default {}").unwrap();
+        let report = detect_project(dir.path());
+        assert!(report.detections.iter().any(|d| d.name == "Vite"));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(5173))
+        );
+    }
+
+    // ── Flyway detector ──────────────────────────────────────────────
+
+    #[test]
+    fn flyway_detected_from_migration_dir() {
+        let dir = setup_dir();
+        let migration_dir = dir.path().join("src/main/resources/db/migration");
+        fs::create_dir_all(&migration_dir).unwrap();
+        fs::write(
+            migration_dir.join("V1__init.sql"),
+            "CREATE TABLE t(id INT);",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        assert!(report.detections.iter().any(|d| d.name == "Flyway"));
+        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
+    }
+
+    #[test]
+    fn flyway_detected_ktor_style() {
+        let dir = setup_dir();
+        let migration_dir = dir.path().join("src/main/resources/db/migrations");
+        fs::create_dir_all(&migration_dir).unwrap();
+        fs::write(
+            migration_dir.join("V1__init.sql"),
+            "CREATE TABLE t(id INT);",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        assert!(report.detections.iter().any(|d| d.name == "Flyway"));
+    }
+
+    // ── Cypress detector ─────────────────────────────────────────────
+
+    #[test]
+    fn cypress_detected() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("cypress.config.ts"), "export default {}").unwrap();
+        fs::create_dir(dir.path().join("cypress")).unwrap();
+        let report = detect_project(dir.path());
+        assert!(report.detections.iter().any(|d| d.name == "Cypress"));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowBrowser))
+        );
+    }
+
+    // ── Nav full-stack archetype ──────────────────────────────────────
+
+    #[test]
+    fn nav_spring_boot_archetype() {
+        let dir = setup_dir();
+        // Gradle + Spring Boot
+        fs::write(
+            dir.path().join("build.gradle.kts"),
+            "plugins { id(\"org.springframework.boot\") }\ndependencies { testImplementation(\"org.testcontainers:postgresql:1.19\") }\n",
+        )
+        .unwrap();
+        // application.yml
+        let res_dir = dir.path().join("src/main/resources");
+        fs::create_dir_all(&res_dir).unwrap();
+        fs::write(
+            res_dir.join("application.yml"),
+            "spring:\n  datasource:\n    url: jdbc:postgresql://localhost\n",
+        )
+        .unwrap();
+        // Flyway
+        let migration_dir = res_dir.join("db/migration");
+        fs::create_dir_all(&migration_dir).unwrap();
+        fs::write(
+            migration_dir.join("V1__init.sql"),
+            "CREATE TABLE t(id INT);",
+        )
+        .unwrap();
+        // NAIS
+        fs::create_dir(dir.path().join(".nais")).unwrap();
+        fs::write(
+            dir.path().join(".nais/nais-dev.yaml"),
+            "apiVersion: nais.io/v1alpha1\nkind: Application\n",
+        )
+        .unwrap();
+        // Docker
+        fs::write(dir.path().join("Dockerfile"), "FROM eclipse-temurin:21").unwrap();
+
+        let report = detect_project(dir.path());
+        let names: Vec<&str> = report.detections.iter().map(|d| d.name).collect();
+        assert!(names.contains(&"JVM (Gradle)"), "missing JVM: {names:?}");
+        assert!(names.contains(&"Docker"), "missing Docker: {names:?}");
+        assert!(names.contains(&"NAIS"), "missing NAIS: {names:?}");
+        assert!(
+            names.contains(&"Spring Boot"),
+            "missing Spring Boot: {names:?}"
+        );
+        assert!(
+            names.contains(&"TestContainers"),
+            "missing TestContainers: {names:?}"
+        );
+        assert!(names.contains(&"Flyway"), "missing Flyway: {names:?}");
+
+        // Merged suggestions
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowJvmAttach))
+        );
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowDocker))
+        );
+        assert!(report.suggestions.contains(&Suggestion::AllowPort(5432)));
+        assert!(
+            report
+                .suggestions
+                .contains(&Suggestion::AllowLocalhost(8080))
+        );
     }
 }

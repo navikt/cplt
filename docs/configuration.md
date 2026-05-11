@@ -201,6 +201,14 @@ cplt init --quiet           # Output only TOML (pipe-friendly)
 | Go | `go.mod` | (works with defaults) |
 | Playwright | `@playwright/test` in package.json | `allow_cache_exec` (personal config hint) |
 | Environment secrets | `.env.example` | `deny.env` for sensitive variables |
+| NAIS | `nais.yaml`, `.nais/` directory | Kafka ports, Cloud SQL (port 5432) |
+| Spring Boot | `application.yml` + Spring in Gradle | localhost 8080, PostgreSQL port |
+| Ktor | `application.conf` + Ktor in Gradle | localhost 8080 |
+| TestContainers | `testcontainers` in Gradle deps | `allow_docker`, `allow_localhost_any` |
+| Next.js | `next.config.ts/js` | localhost 3000, `allow_localhost_any` |
+| Vite | `vite.config.ts/js` | localhost 5173, `allow_localhost_any` |
+| Flyway | `db/migration(s)` directories | PostgreSQL port 5432 |
+| Cypress | `cypress.config.ts` + `cypress/` dir | `allow_browser`, `allow_localhost_any` |
 
 **Machine-specific suggestions** (like `allow_cache_exec` or home-relative read paths) are emitted as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
 
