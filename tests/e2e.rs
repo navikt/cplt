@@ -3125,4 +3125,187 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&fake_dir);
     }
+
+    // ── cplt init e2e tests ────────────────────────────────────────
+
+    #[test]
+    fn e2e_init_detects_node_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"test","scripts":{"dev":"next dev --port 3001"},"dependencies":{"next":"^14"}}"#,
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Node.js"),
+            "should detect Node.js: {stdout}"
+        );
+        assert!(
+            stdout.contains("allow_localhost_any"),
+            "should suggest localhost_any for next: {stdout}"
+        );
+        assert!(stdout.contains("3001"), "should detect port 3001: {stdout}");
+    }
+
+    #[test]
+    fn e2e_init_detects_multi_ecosystem() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM rust:1.80").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Rust"), "should detect Rust: {stdout}");
+        assert!(stdout.contains("Docker"), "should detect Docker: {stdout}");
+        assert!(
+            stdout.contains("allow_docker"),
+            "should suggest allow_docker: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_init_empty_project_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("No project tooling detected"),
+            "should say nothing detected: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_init_write_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init", "--write"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let config_path = dir.path().join(".cplt.toml");
+        assert!(config_path.exists(), ".cplt.toml should be created");
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("allow_docker"),
+            "should contain allow_docker: {content}"
+        );
+    }
+
+    #[test]
+    fn e2e_init_write_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+        std::fs::write(dir.path().join(".cplt.toml"), "# existing").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init", "--write"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("already exists"),
+            "should mention file exists: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_init_write_force_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+        std::fs::write(dir.path().join(".cplt.toml"), "# old content").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init", "--write", "--force"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let content = std::fs::read_to_string(dir.path().join(".cplt.toml")).unwrap();
+        assert!(
+            content.contains("allow_docker"),
+            "should overwrite with new content: {content}"
+        );
+    }
+
+    #[test]
+    fn e2e_init_quiet_outputs_only_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Should NOT have the "Detected ecosystems:" header
+        assert!(
+            !stdout.contains("Detected ecosystems"),
+            "quiet mode should suppress report: {stdout}"
+        );
+        // Should have TOML content
+        assert!(
+            stdout.contains("allow_docker"),
+            "should output TOML: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_init_detects_env_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env.example"),
+            "DATABASE_URL=x\nSECRET_KEY=y\nDEBUG=true\n",
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("SECRET_KEY"),
+            "should detect SECRET_KEY: {stdout}"
+        );
+        assert!(
+            stdout.contains("[deny]"),
+            "should have deny section: {stdout}"
+        );
+    }
 }
