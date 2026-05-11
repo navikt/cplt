@@ -17,6 +17,7 @@ const VALID_PROXY_KEYS: &[&str] = &[
 const VALID_ALLOW_KEYS: &[&str] = &["read", "write", "ports", "localhost"];
 const VALID_DENY_KEYS: &[&str] = &["paths"];
 const VALID_SANDBOX_KEYS: &[&str] = &[
+    "agent",
     "validate",
     "allow_env_files",
     "allow_localhost_any",

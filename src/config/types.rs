@@ -100,6 +100,9 @@ pub struct DenyConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct SandboxConfig {
+    /// Preferred AI coding agent (default: auto-detect from PATH).
+    /// Use this instead of always passing --agent on the command line.
+    pub agent: Option<String>,
     /// Run sandbox-exec validation test on startup (default: true).
     pub validate: Option<bool>,
     /// Allow reading .env files and private keys in project dir (default: false).
@@ -182,6 +185,8 @@ pub struct Resolved {
     pub allow_browser: bool,
     pub scratch_dir: bool,
     pub quiet: bool,
+    /// Preferred agent from config (None = auto-detect).
+    pub agent: Option<String>,
     /// Env vars to strip from the sandbox environment (from repo config [deny] section).
     pub deny_env: Vec<String>,
 }

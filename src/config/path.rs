@@ -90,6 +90,10 @@ pub fn default_config_contents() -> String {
 
 # ─── Sandbox behavior ───────────────────────────────────────
 [sandbox]
+# Preferred AI coding agent. Auto-detected from PATH if not set.
+# Supported: copilot, opencode, gemini, pi, shell
+# agent = "copilot"
+#
 # Run sandbox-exec validation test on every launch (default: true).
 # Disable to save ~200ms startup if you trust your config.
 # validate = true

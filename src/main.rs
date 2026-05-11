@@ -81,7 +81,7 @@ EXAMPLES:
 struct Cli {
     /// Which AI coding agent to sandbox.
     /// Auto-detected from PATH if not specified (prefers copilot, falls back to opencode, then gemini).
-    /// Supported: copilot, opencode, gemini, shell
+    /// Supported: copilot, opencode, gemini, pi, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 
@@ -825,28 +825,37 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
     }
 
     // Resolve which agent to sandbox
+    // Precedence: CLI --agent > config sandbox.agent > auto_detect > error
     let active_agent = match &cli.agent {
         Some(name) => match name.parse::<agent::Agent>() {
             Ok(a) => a,
             Err(e) => bail!("{e}"),
         },
-        None => match agent::Agent::auto_detect() {
-            Some(a) => a,
-            None => {
-                // --print-profile and --doctor don't need a real agent binary.
-                // Default to Copilot so they work without anything installed.
-                if cli.print_profile || cli.doctor {
-                    agent::Agent::Copilot
-                } else {
-                    bail!(
-                        "No supported AI coding agent found in PATH. \
-                         Install one of:\n\
-                         [cplt]   Copilot CLI: brew install --cask copilot-cli\n\
-                         [cplt]   OpenCode:    npm i -g opencode-ai\n\
-                         [cplt] Or specify explicitly: cplt --agent copilot|opencode|shell"
-                    );
+        None => match &resolved.agent {
+            Some(name) => match name.parse::<agent::Agent>() {
+                Ok(a) => a,
+                Err(e) => bail!("Invalid sandbox.agent config value: {e}"),
+            },
+            None => match agent::Agent::auto_detect() {
+                Some(a) => a,
+                None => {
+                    // --print-profile and --doctor don't need a real agent binary.
+                    // Default to Copilot so they work without anything installed.
+                    if cli.print_profile || cli.doctor {
+                        agent::Agent::Copilot
+                    } else {
+                        bail!(
+                            "No supported AI coding agent found in PATH. \
+                             Install one of:\n\
+                             [cplt]   Copilot CLI: brew install --cask copilot-cli\n\
+                             [cplt]   OpenCode:    npm i -g opencode-ai\n\
+                             [cplt]   Gemini CLI:  npm i -g @google/gemini-cli\n\
+                             [cplt]   Pi:          npm i -g @earendil-works/pi-coding-agent\n\
+                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|gemini|pi|shell"
+                        );
+                    }
                 }
-            }
+            },
         },
     };
 

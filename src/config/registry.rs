@@ -147,6 +147,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     // [sandbox]
     ConfigKeyInfo {
         section: "sandbox",
+        key: "agent",
+        value_type: ConfigValueType::Str,
+        dangerous: false,
+        default_display: "",
+        description: "Preferred AI coding agent (copilot, opencode, gemini, pi, shell). Auto-detected from PATH if not set.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "validate",
         value_type: ConfigValueType::Bool,
         dangerous: false,

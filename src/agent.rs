@@ -18,6 +18,8 @@ pub enum Agent {
     OpenCode,
     /// Google Gemini CLI — AI coding agent powered by Gemini models.
     Gemini,
+    /// Pi coding agent (@earendil-works/pi-coding-agent).
+    Pi,
     /// Plain sandboxed shell — no AI agent, just a secure shell session.
     Shell,
 }
@@ -29,6 +31,7 @@ impl Agent {
             Agent::Copilot => "copilot",
             Agent::OpenCode => "opencode",
             Agent::Gemini => "gemini",
+            Agent::Pi => "pi",
             Agent::Shell => "shell",
         }
     }
@@ -39,6 +42,7 @@ impl Agent {
             Agent::Copilot => "Copilot",
             Agent::OpenCode => "OpenCode",
             Agent::Gemini => "Gemini",
+            Agent::Pi => "Pi",
             Agent::Shell => "Shell",
         }
     }
@@ -55,7 +59,7 @@ impl Agent {
     pub fn extra_args(&self) -> &'static [&'static str] {
         match self {
             Agent::Copilot => &["--no-auto-update"],
-            Agent::OpenCode | Agent::Gemini | Agent::Shell => &[],
+            Agent::OpenCode | Agent::Gemini | Agent::Pi | Agent::Shell => &[],
         }
     }
 
@@ -173,6 +177,25 @@ impl Agent {
                     process_exec: false,
                 }]
             }
+            Agent::Pi => {
+                // ~/.pi/agent stores settings, auth, sessions, themes
+                // ~/.pi/agent/bin contains managed tool binaries (fd, rg)
+                vec![
+                    AgentDir {
+                        path: home.join(".pi"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                    },
+                    AgentDir {
+                        path: home.join(".pi/agent/bin"),
+                        write: false,
+                        map_exec: false,
+                        // Pi installs managed binaries here (fd, rg)
+                        process_exec: true,
+                    },
+                ]
+            }
         }
     }
 
@@ -197,6 +220,13 @@ impl Agent {
             // Gemini uses Google OAuth by default (browser flow, stored in ~/.gemini/).
             // API key or Vertex AI project are alternatives.
             Agent::Gemini => &["GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"],
+            // Pi supports multiple LLM providers via API keys.
+            Agent::Pi => &[
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "OPENROUTER_API_KEY",
+            ],
             Agent::Shell => &[],
         }
     }
@@ -270,6 +300,7 @@ impl Agent {
             Agent::Gemini => {
                 "Install Gemini CLI: npm i -g @google/gemini-cli, or brew install gemini-cli"
             }
+            Agent::Pi => "Install Pi: npm i -g @earendil-works/pi-coding-agent",
             Agent::Shell => unreachable!("Shell is resolved via $SHELL above"),
         };
 
@@ -345,9 +376,10 @@ impl FromStr for Agent {
             "copilot" => Ok(Agent::Copilot),
             "opencode" => Ok(Agent::OpenCode),
             "gemini" | "gem" => Ok(Agent::Gemini),
+            "pi" => Ok(Agent::Pi),
             "shell" | "sh" | "bash" | "zsh" => Ok(Agent::Shell),
             _ => Err(format!(
-                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, shell"
+                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, pi, shell"
             )),
         }
     }
@@ -492,5 +524,68 @@ mod tests {
         assert_eq!(format!("{}", Agent::Copilot), "Copilot");
         assert_eq!(format!("{}", Agent::OpenCode), "OpenCode");
         assert_eq!(format!("{}", Agent::Gemini), "Gemini");
+        assert_eq!(format!("{}", Agent::Pi), "Pi");
+    }
+
+    #[test]
+    fn parse_pi_agent() {
+        assert_eq!(Agent::from_str("pi").unwrap(), Agent::Pi);
+        assert_eq!(Agent::from_str("Pi").unwrap(), Agent::Pi);
+        assert_eq!(Agent::from_str("PI").unwrap(), Agent::Pi);
+    }
+
+    #[test]
+    fn pi_binary_name() {
+        assert_eq!(Agent::Pi.binary_name(), "pi");
+    }
+
+    #[test]
+    fn pi_no_sea_extraction() {
+        assert!(!Agent::Pi.needs_sea_extraction());
+    }
+
+    #[test]
+    fn pi_no_extra_args() {
+        assert!(Agent::Pi.extra_args().is_empty());
+    }
+
+    #[test]
+    fn pi_no_keychain() {
+        assert!(!Agent::Pi.needs_keychain());
+    }
+
+    #[test]
+    fn pi_no_copilot_dir() {
+        assert!(!Agent::Pi.needs_copilot_dir());
+    }
+
+    #[test]
+    fn pi_config_dirs() {
+        let home = Path::new("/Users/test");
+        let dirs = Agent::Pi.config_dirs(home);
+        assert_eq!(dirs.len(), 2, "should have ~/.pi and ~/.pi/agent/bin");
+        // Main dir is writable
+        assert_eq!(dirs[0].path, home.join(".pi"));
+        assert!(dirs[0].write);
+        assert!(!dirs[0].process_exec);
+        // Bin dir has process_exec for managed binaries
+        assert_eq!(dirs[1].path, home.join(".pi/agent/bin"));
+        assert!(!dirs[1].write);
+        assert!(dirs[1].process_exec);
+    }
+
+    #[test]
+    fn pi_auth_env_hints() {
+        let hints = Agent::Pi.auth_env_hint();
+        assert!(hints.contains(&"ANTHROPIC_API_KEY"));
+        assert!(hints.contains(&"OPENAI_API_KEY"));
+        assert!(hints.contains(&"GEMINI_API_KEY"));
+        assert!(hints.contains(&"OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn unknown_agent_error_lists_pi() {
+        let err = Agent::from_str("nope").unwrap_err();
+        assert!(err.contains("pi"), "error should mention pi: {err}");
     }
 }

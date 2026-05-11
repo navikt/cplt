@@ -315,6 +315,7 @@ impl Config {
             allow_browser,
             scratch_dir,
             quiet,
+            agent: self.sandbox.agent.clone(),
             deny_env: Vec::new(),
         })
     }
