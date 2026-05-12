@@ -99,15 +99,20 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     // When true, extra system-level permissions (syscall*, system-socket,
     // iokit-open-user-client, mach-register) are emitted so Chromium can start.
     //
-    // Detection requires an exact match on "ms-playwright" — the well-known
-    // Playwright cache directory name. Substring matching is avoided to prevent
-    // a rogue agent from escalating privileges by creating a directory whose
-    // name contains "playwright".
+    // Detection matches "ms-playwright" exactly or any subpath entry whose first
+    // component is "ms-playwright" (e.g. "ms-playwright/chromium-1217"). This
+    // covers users who pin a specific versioned subdirectory in allow_cache_exec.
+    // Substring matching (e.g. contains("playwright")) is intentionally avoided:
+    // matching on the first path component prevents a rogue agent from escalating
+    // privileges by creating a directory like "evil-ms-playwright-hook/".
     //
     // allow_cache_exec_any does NOT trigger these rules: it grants process-exec
     // broadly, but Chromium's extra IPC/syscall permissions should only be
     // emitted when the user explicitly signals browser testing intent.
-    let allow_chromium_runtime = opts.allow_cache_exec.iter().any(|s| s == "ms-playwright");
+    let allow_chromium_runtime = opts
+        .allow_cache_exec
+        .iter()
+        .any(|s| s == "ms-playwright" || s.starts_with("ms-playwright/"));
 
     emit_header(&mut sb, &project);
     emit_process_rules(&mut sb);
