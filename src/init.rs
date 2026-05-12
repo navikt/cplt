@@ -496,6 +496,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
         };
 
         let toml = generate_toml(&report);
@@ -515,6 +517,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
         };
 
         let toml = generate_toml(&report);
@@ -540,6 +544,8 @@ mod tests {
             .into_iter()
             .collect(),
             diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
         };
 
         let toml = generate_toml(&report);
@@ -570,6 +576,8 @@ mod tests {
             .into_iter()
             .collect(),
             diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
         };
 
         let toml = generate_toml(&report);
@@ -603,6 +611,8 @@ mod tests {
             .into_iter()
             .collect(),
             diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
         };
 
         let toml = generate_toml(&report);
@@ -624,6 +634,8 @@ mod tests {
             }],
             suggestions: BTreeSet::new(),
             diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
         };
 
         let toml = generate_toml(&report);
@@ -747,6 +759,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
         };
 
         let text = format_report(&report);
@@ -767,6 +781,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
         };
 
         let toml = generate_toml(&report);
@@ -807,6 +823,8 @@ mod tests {
             .into_iter()
             .collect(),
             diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
         };
 
         let toml_str = generate_toml(&report);

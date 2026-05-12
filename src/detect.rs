@@ -9,7 +9,7 @@
 //! - Detection is pure: no I/O formatting, no side effects beyond reading files
 //! - A `DetectContext` provides safe file access with size limits
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 // ── Permission types ─────────────────────────────────────────────────
@@ -169,6 +169,29 @@ pub struct DetectionReport {
     pub suggestions: BTreeSet<Suggestion>,
     /// Non-fatal diagnostics from detection.
     pub diagnostics: Vec<Diagnostic>,
+    /// Workspace members discovered (empty for non-monorepo projects).
+    pub workspace_members: Vec<WorkspaceMember>,
+    /// Maps each suggestion to the relative paths that produced it.
+    /// Empty when `detect_project()` is used (no provenance tracking).
+    pub provenance: BTreeMap<Suggestion, BTreeSet<String>>,
+}
+
+impl DetectionReport {
+    /// Create a report from detections, suggestions, and diagnostics.
+    /// Initializes workspace fields to empty (for non-monorepo use).
+    pub fn new(
+        detections: Vec<Detection>,
+        suggestions: BTreeSet<Suggestion>,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        Self {
+            detections,
+            suggestions,
+            diagnostics,
+            workspace_members: Vec::new(),
+            provenance: BTreeMap::new(),
+        }
+    }
 }
 
 // ── Detection context ────────────────────────────────────────────────
@@ -358,11 +381,7 @@ pub fn detect_project(dir: &Path) -> DetectionReport {
         .flat_map(|d| d.suggestions.iter().cloned())
         .collect::<BTreeSet<_>>();
 
-    DetectionReport {
-        detections,
-        suggestions,
-        diagnostics,
-    }
+    DetectionReport::new(detections, suggestions, diagnostics)
 }
 
 // ── Ecosystem detectors ──────────────────────────────────────────────
@@ -1050,7 +1069,644 @@ fn extract_compose_ports(content: &str) -> Vec<u16> {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Global (machine-level) detection — for `cplt init --global`
+// Workspace / monorepo discovery
+// ══════════════════════════════════════════════════════════════════════
+
+/// How a workspace member was discovered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceSource {
+    /// Parsed from `package.json` `"workspaces"` field.
+    PackageJson,
+    /// Parsed from `pnpm-workspace.yaml` `packages` field.
+    PnpmWorkspace,
+    /// Parsed from `Cargo.toml` `[workspace].members`.
+    CargoWorkspace,
+    /// Parsed from `settings.gradle(.kts)` `include(...)` calls.
+    GradleSettings,
+    /// Parsed from `go.work` `use` directives.
+    GoWork,
+    /// Found by heuristic directory scan (no workspace config).
+    Fallback,
+}
+
+impl std::fmt::Display for WorkspaceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PackageJson => write!(f, "package.json workspaces"),
+            Self::PnpmWorkspace => write!(f, "pnpm-workspace.yaml"),
+            Self::CargoWorkspace => write!(f, "Cargo.toml [workspace]"),
+            Self::GradleSettings => write!(f, "settings.gradle"),
+            Self::GoWork => write!(f, "go.work"),
+            Self::Fallback => write!(f, "heuristic scan"),
+        }
+    }
+}
+
+/// A discovered workspace member directory.
+#[derive(Debug, Clone)]
+pub struct WorkspaceMember {
+    /// Relative path from repo root (e.g., `apps/web`).
+    pub relative_path: String,
+    /// How this member was discovered.
+    pub source: WorkspaceSource,
+    /// Ecosystems detected in this member (filled after detection).
+    pub detections: Vec<Detection>,
+}
+
+/// Directories to skip during heuristic fallback scan.
+const SCAN_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    "build",
+    ".turbo",
+    ".nx",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    ".gradle",
+    ".idea",
+    ".vscode",
+    ".next",
+    "out",
+    "coverage",
+    ".cache",
+];
+
+/// Manifest files that indicate a project root.
+const MANIFEST_FILES: &[&str] = &[
+    "package.json",
+    "Cargo.toml",
+    "build.gradle",
+    "build.gradle.kts",
+    "go.mod",
+    "pyproject.toml",
+];
+
+/// Max depth for heuristic fallback scan.
+const SCAN_MAX_DEPTH: usize = 4;
+
+/// Max directory entries to visit during fallback scan.
+const SCAN_MAX_ENTRIES: usize = 10_000;
+
+/// Discover workspace members from explicit workspace configuration files.
+///
+/// Checks for workspace definitions in this order:
+/// 1. `pnpm-workspace.yaml` (pnpm)
+/// 2. `package.json` workspaces (npm/yarn/bun)
+/// 3. `Cargo.toml` `[workspace]` (Rust)
+/// 4. `settings.gradle(.kts)` (Gradle/JVM)
+/// 5. `go.work` (Go)
+///
+/// Returns discovered members and any diagnostics. Members are deduplicated
+/// by canonical path. Paths outside the repo root are rejected with a diagnostic.
+pub fn discover_workspace_members(root: &Path) -> (Vec<WorkspaceMember>, Vec<Diagnostic>) {
+    let mut members = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    // Try each workspace format — they can coexist (e.g., pnpm + turbo)
+    parse_pnpm_workspace(root, &mut members, &mut diagnostics);
+    parse_package_json_workspaces(root, &mut members, &mut diagnostics);
+    parse_cargo_workspace(root, &mut members, &mut diagnostics);
+    parse_gradle_settings(root, &mut members, &mut diagnostics);
+    parse_go_work(root, &mut members, &mut diagnostics);
+
+    // Deduplicate by relative path (multiple workspace configs may overlap)
+    let mut seen = BTreeSet::new();
+    members.retain(|m| seen.insert(m.relative_path.clone()));
+
+    (members, diagnostics)
+}
+
+/// Validate and add a workspace member path. Rejects traversal, absolute paths,
+/// symlinks escaping root, and the root directory itself.
+fn try_add_member(
+    root: &Path,
+    relative: &str,
+    source: WorkspaceSource,
+    members: &mut Vec<WorkspaceMember>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // Reject traversal and absolute paths
+    if DetectContext::is_traversal(relative) {
+        diagnostics.push(Diagnostic {
+            detector: "workspace",
+            message: format!(
+                "Skipped workspace member {relative:?} — path traversal or absolute path"
+            ),
+        });
+        return;
+    }
+
+    // Skip root itself (`.` or empty)
+    let trimmed = relative.trim_matches('/');
+    if trimmed.is_empty() || trimmed == "." {
+        return;
+    }
+
+    let abs_path = root.join(trimmed);
+
+    // Must be a directory
+    if !abs_path.is_dir() {
+        return;
+    }
+
+    // Canonicalize and verify within root
+    let Ok(canonical) = abs_path.canonicalize() else {
+        return;
+    };
+    let Ok(root_canonical) = root.canonicalize() else {
+        return;
+    };
+    if !canonical.starts_with(&root_canonical) {
+        diagnostics.push(Diagnostic {
+            detector: "workspace",
+            message: format!(
+                "Skipped workspace member {relative:?} — resolves outside repository root"
+            ),
+        });
+        return;
+    }
+
+    members.push(WorkspaceMember {
+        relative_path: trimmed.to_string(),
+        source,
+        detections: Vec::new(),
+    });
+}
+
+/// Expand a simple glob pattern with a single `*` wildcard.
+/// Only supports patterns like `packages/*` — one trailing `*` matching
+/// direct subdirectories. Returns matching directory names.
+fn expand_simple_glob(root: &Path, pattern: &str) -> Vec<String> {
+    // Skip negation patterns (pnpm `!` prefix)
+    if pattern.starts_with('!') {
+        return Vec::new();
+    }
+
+    let pattern = pattern.trim_matches('/');
+
+    // If no wildcard, treat as literal path
+    if !pattern.contains('*') {
+        return vec![pattern.to_string()];
+    }
+
+    // Only support trailing `/*` (one level) — e.g., `packages/*`
+    // For `**` or mid-pattern wildcards, fall back to literal sans wildcard
+    if !pattern.ends_with("/*") && !pattern.ends_with("\\*") {
+        // Unsupported pattern — skip
+        return Vec::new();
+    }
+
+    let prefix = &pattern[..pattern.len() - 2]; // strip `/*`
+
+    // Reject traversal in prefix
+    if DetectContext::is_traversal(prefix) {
+        return Vec::new();
+    }
+
+    let dir = root.join(prefix);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::new();
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|ft| ft.is_dir())
+            && let Some(name) = entry.file_name().to_str()
+        {
+            // Skip hidden directories
+            if !name.starts_with('.') {
+                results.push(format!("{prefix}/{name}"));
+            }
+        }
+    }
+    results
+}
+
+// ── Workspace parsers ────────────────────────────────────────────────
+
+/// Parse `pnpm-workspace.yaml` for workspace members.
+fn parse_pnpm_workspace(
+    root: &Path,
+    members: &mut Vec<WorkspaceMember>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let path = root.join("pnpm-workspace.yaml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+
+    // Simple YAML parsing — look for `packages:` array.
+    // We don't pull in a YAML dependency; the format is simple enough.
+    let mut in_packages = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "packages:" {
+            in_packages = true;
+            continue;
+        }
+        if in_packages {
+            // End of array: non-indented, non-dash line
+            if !trimmed.starts_with('-') && !trimmed.is_empty() {
+                break;
+            }
+            if let Some(pattern) = trimmed.strip_prefix('-') {
+                let pattern = pattern.trim().trim_matches(|c| c == '\'' || c == '"');
+                if pattern.is_empty() || pattern.starts_with('!') {
+                    continue;
+                }
+                for expanded in expand_simple_glob(root, pattern) {
+                    try_add_member(
+                        root,
+                        &expanded,
+                        WorkspaceSource::PnpmWorkspace,
+                        members,
+                        diagnostics,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Parse `package.json` `"workspaces"` field for workspace members.
+/// Handles both array form and Yarn Classic object form `{packages: [...]}`.
+fn parse_package_json_workspaces(
+    root: &Path,
+    members: &mut Vec<WorkspaceMember>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let path = root.join("package.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Try array form first: { "workspaces": ["packages/*"] }
+    // Then Yarn Classic object form: { "workspaces": { "packages": ["..."] } }
+    let patterns: Vec<&str> = if let Some(arr) = json.get("workspaces").and_then(|w| w.as_array()) {
+        arr.iter().filter_map(|v| v.as_str()).collect()
+    } else if let Some(arr) = json
+        .get("workspaces")
+        .and_then(|w| w.get("packages"))
+        .and_then(|p| p.as_array())
+    {
+        arr.iter().filter_map(|v| v.as_str()).collect()
+    } else {
+        return;
+    };
+
+    for pattern in patterns {
+        for expanded in expand_simple_glob(root, pattern) {
+            try_add_member(
+                root,
+                &expanded,
+                WorkspaceSource::PackageJson,
+                members,
+                diagnostics,
+            );
+        }
+    }
+}
+
+/// Parse `Cargo.toml` `[workspace].members` and `[workspace].exclude`.
+fn parse_cargo_workspace(
+    root: &Path,
+    members: &mut Vec<WorkspaceMember>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let path = root.join("Cargo.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+
+    let toml: toml::Value = match content.parse() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let Some(workspace) = toml.get("workspace") else {
+        return;
+    };
+
+    // Collect exclude patterns for filtering
+    let excludes: BTreeSet<String> = workspace
+        .get("exclude")
+        .and_then(|e| e.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim_matches('/').to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let Some(member_patterns) = workspace.get("members").and_then(|m| m.as_array()) else {
+        return;
+    };
+
+    for pattern in member_patterns {
+        let Some(pattern) = pattern.as_str() else {
+            continue;
+        };
+        for expanded in expand_simple_glob(root, pattern) {
+            if !excludes.contains(&expanded) {
+                try_add_member(
+                    root,
+                    &expanded,
+                    WorkspaceSource::CargoWorkspace,
+                    members,
+                    diagnostics,
+                );
+            }
+        }
+    }
+}
+
+/// Parse `settings.gradle` or `settings.gradle.kts` for `include(...)` calls.
+/// Converts Gradle colon-separated paths (`:services:api`) to filesystem paths (`services/api`).
+fn parse_gradle_settings(
+    root: &Path,
+    members: &mut Vec<WorkspaceMember>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let content = if let Ok(c) = std::fs::read_to_string(root.join("settings.gradle.kts")) {
+        c
+    } else if let Ok(c) = std::fs::read_to_string(root.join("settings.gradle")) {
+        c
+    } else {
+        return;
+    };
+
+    // Match both: include("app", "lib") and include 'app', 'lib'
+    // Also: include(":services:api") → services/api
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Skip comments
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Match `include(...)` or `include '...'` or `include "..."`
+        let args = if let Some(rest) = trimmed.strip_prefix("include(") {
+            rest.trim_end_matches(')')
+        } else if let Some(rest) = trimmed.strip_prefix("include ") {
+            rest
+        } else {
+            continue;
+        };
+
+        // Extract quoted strings from the arguments
+        for part in args.split(',') {
+            let part = part
+                .trim()
+                .trim_matches(|c: char| c == '\'' || c == '"' || c.is_whitespace());
+            if part.is_empty() {
+                continue;
+            }
+
+            // Convert Gradle colon path to filesystem path:
+            // ":services:api" → "services/api"
+            // "app" → "app"
+            let fs_path = part.trim_start_matches(':').replace(':', "/");
+            try_add_member(
+                root,
+                &fs_path,
+                WorkspaceSource::GradleSettings,
+                members,
+                diagnostics,
+            );
+        }
+    }
+}
+
+/// Parse `go.work` for `use` directives.
+fn parse_go_work(
+    root: &Path,
+    members: &mut Vec<WorkspaceMember>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let path = root.join("go.work");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+
+    let mut in_block = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Skip comments and empty lines
+        if trimmed.starts_with("//") || trimmed.is_empty() {
+            continue;
+        }
+
+        // Block form: use ( ... )
+        if trimmed == "use (" {
+            in_block = true;
+            continue;
+        }
+        if in_block && trimmed == ")" {
+            in_block = false;
+            continue;
+        }
+
+        let use_path = if in_block {
+            trimmed
+        } else if let Some(rest) = trimmed.strip_prefix("use ") {
+            rest.trim()
+        } else {
+            continue;
+        };
+
+        // Strip leading `./`
+        let relative = use_path.strip_prefix("./").unwrap_or(use_path);
+        try_add_member(
+            root,
+            relative,
+            WorkspaceSource::GoWork,
+            members,
+            diagnostics,
+        );
+    }
+}
+
+// ── Heuristic fallback scan ──────────────────────────────────────────
+
+/// Bounded directory scan for subprojects when no workspace config is found.
+/// Walks up to [`SCAN_MAX_DEPTH`] levels, skipping known non-project directories,
+/// and looks for manifest files that indicate a project root.
+pub fn scan_for_subprojects(root: &Path) -> (Vec<WorkspaceMember>, Vec<Diagnostic>) {
+    let mut members = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut entry_count: usize = 0;
+    let mut limit_hit = false;
+
+    let Ok(root_canonical) = root.canonicalize() else {
+        return (members, diagnostics);
+    };
+
+    scan_dir_recursive(
+        root,
+        &root_canonical,
+        0,
+        &mut members,
+        &mut entry_count,
+        &mut limit_hit,
+    );
+
+    if limit_hit {
+        diagnostics.push(Diagnostic {
+            detector: "workspace",
+            message: format!(
+                "Heuristic scan stopped after {SCAN_MAX_ENTRIES} entries; \
+                 some subprojects may not have been detected"
+            ),
+        });
+    }
+
+    (members, diagnostics)
+}
+
+fn scan_dir_recursive(
+    dir: &Path,
+    root_canonical: &Path,
+    depth: usize,
+    members: &mut Vec<WorkspaceMember>,
+    entry_count: &mut usize,
+    limit_hit: &mut bool,
+) {
+    if depth > SCAN_MAX_DEPTH || *limit_hit {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        *entry_count += 1;
+        if *entry_count > SCAN_MAX_ENTRIES {
+            *limit_hit = true;
+            return;
+        }
+
+        // Only process directories (don't follow symlinks)
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+
+        // Skip hidden dirs and known non-project dirs
+        if name_str.starts_with('.') || SCAN_SKIP_DIRS.contains(&name_str) {
+            continue;
+        }
+
+        let subdir = entry.path();
+
+        // Check if this directory contains a manifest file
+        let has_manifest = MANIFEST_FILES
+            .iter()
+            .any(|manifest| subdir.join(manifest).is_file());
+
+        if has_manifest {
+            // Verify it's within root (no symlink escape)
+            if let Ok(canonical) = subdir.canonicalize()
+                && canonical.starts_with(root_canonical)
+                && let Ok(relative) = subdir.strip_prefix(root_canonical)
+                && let Some(rel_str) = relative.to_str()
+            {
+                members.push(WorkspaceMember {
+                    relative_path: rel_str.to_string(),
+                    source: WorkspaceSource::Fallback,
+                    detections: Vec::new(),
+                });
+            }
+        }
+
+        // Continue scanning deeper
+        scan_dir_recursive(
+            &subdir,
+            root_canonical,
+            depth + 1,
+            members,
+            entry_count,
+            limit_hit,
+        );
+    }
+}
+
+// ── Recursive (monorepo-aware) detection ─────────────────────────────
+
+/// Run all detectors against a project directory and its workspace members.
+///
+/// This is the monorepo-aware version of [`detect_project`]. It:
+/// 1. Detects ecosystems at the repo root
+/// 2. Discovers workspace members (explicit configs, or heuristic fallback)
+/// 3. Runs all detectors on each member subdirectory
+/// 4. Merges suggestions with provenance tracking
+pub fn detect_project_recursive(root: &Path) -> DetectionReport {
+    // Step 1: root-level detection
+    let mut report = detect_project(root);
+
+    // Step 2: discover workspace members
+    let (mut members, ws_diagnostics) = discover_workspace_members(root);
+    report.diagnostics.extend(ws_diagnostics);
+
+    // If no explicit workspace config found, try heuristic scan
+    if members.is_empty() {
+        let (fallback_members, fb_diagnostics) = scan_for_subprojects(root);
+        members = fallback_members;
+        report.diagnostics.extend(fb_diagnostics);
+    }
+
+    // Step 3: run detectors on each member
+    let mut provenance: BTreeMap<Suggestion, BTreeSet<String>> = BTreeMap::new();
+
+    // Record root-level provenance
+    for suggestion in &report.suggestions {
+        provenance
+            .entry(suggestion.clone())
+            .or_default()
+            .insert(".".to_string());
+    }
+
+    for member in &mut members {
+        let member_dir = root.join(&member.relative_path);
+        let member_report = detect_project(&member_dir);
+
+        // Record per-member provenance
+        for suggestion in &member_report.suggestions {
+            provenance
+                .entry(suggestion.clone())
+                .or_default()
+                .insert(member.relative_path.clone());
+        }
+
+        // Merge suggestions and detections
+        report.suggestions.extend(member_report.suggestions);
+        member.detections = member_report.detections;
+        report.diagnostics.extend(member_report.diagnostics);
+    }
+
+    report.workspace_members = members;
+    report.provenance = provenance;
+    report
+}
+
 // ══════════════════════════════════════════════════════════════════════
 
 /// Suggestions specific to personal/global config (~/.config/cplt/config.toml).
