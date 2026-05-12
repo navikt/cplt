@@ -1212,7 +1212,8 @@ fn try_add_member(
         return;
     }
 
-    // Canonicalize and verify within root
+    // Canonicalize and verify within root.
+    // Use canonical relative path for consistent dedup with scan_dir_recursive.
     let Ok(canonical) = abs_path.canonicalize() else {
         return;
     };
@@ -1228,9 +1229,15 @@ fn try_add_member(
         });
         return;
     }
+    let Ok(canonical_relative) = canonical.strip_prefix(&root_canonical) else {
+        return;
+    };
+    let Some(canonical_rel_str) = canonical_relative.to_str() else {
+        return;
+    };
 
     members.push(WorkspaceMember {
-        relative_path: trimmed.to_string(),
+        relative_path: canonical_rel_str.to_string(),
         source,
         detections: Vec::new(),
     });
