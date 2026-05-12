@@ -94,12 +94,27 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     let home = opts.home_dir.to_string_lossy();
     let project = opts.project_dir.to_string_lossy();
 
+    // Detect Chromium browser runtime: the user has opted in to executing
+    // Playwright's Chromium binaries from ~/Library/Caches/ via allow_cache_exec.
+    // When true, extra system-level permissions (syscall*, system-socket,
+    // iokit-open-user-client, mach-register) are emitted so Chromium can start.
+    //
+    // Detection requires an exact match on "ms-playwright" — the well-known
+    // Playwright cache directory name. Substring matching is avoided to prevent
+    // a rogue agent from escalating privileges by creating a directory whose
+    // name contains "playwright".
+    //
+    // allow_cache_exec_any does NOT trigger these rules: it grants process-exec
+    // broadly, but Chromium's extra IPC/syscall permissions should only be
+    // emitted when the user explicitly signals browser testing intent.
+    let allow_chromium_runtime = opts.allow_cache_exec.iter().any(|s| s == "ms-playwright");
+
     emit_header(&mut sb, &project);
     emit_process_rules(&mut sb);
     emit_project_access(&mut sb, &project, opts.allow_env_files);
     emit_home_access(&mut sb, &home, opts.agent, opts.agent_dirs);
     emit_git_hooks(&mut sb, opts.git_hooks_path);
-    emit_system_access(&mut sb, &home, opts.allow_browser);
+    emit_system_access(&mut sb, &home, opts.allow_browser, allow_chromium_runtime);
     emit_tool_dirs(
         &mut sb,
         &home,
@@ -117,6 +132,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         opts.allow_tmp_exec,
         opts.allow_jvm_attach,
         opts.scratch_dir,
+        allow_chromium_runtime,
     );
     emit_user_allows(&mut sb, opts.extra_read, opts.extra_write);
     emit_deny_rules(&mut sb, &home, opts.extra_deny);
@@ -319,12 +335,69 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
     sbpl!(sb);
 }
 
-fn emit_system_access(sb: &mut String, home: &str, allow_browser: bool) {
+fn emit_system_access(
+    sb: &mut String,
+    home: &str,
+    allow_browser: bool,
+    allow_chromium_runtime: bool,
+) {
     // Mach IPC — Node.js and macOS frameworks need service lookups
     // (Keychain, security framework, DNS, system services)
     sbpl!(sb, ";; Mach IPC (required for Node.js, Keychain, DNS)");
     sbpl!(sb, "(allow mach-lookup)");
     sbpl!(sb);
+
+    // Chromium browser runtime support (Playwright headless testing).
+    //
+    // When allow_cache_exec contains "ms-playwright" (exact match), extra
+    // system-level permissions are needed beyond process-exec and file-map-executable.
+    // Without these, chrome-headless-shell segfaults (SEGV_ACCERR at 0x10)
+    // during early browser initialization.
+    //
+    // Determined empirically by bisecting between (deny default) and (allow default):
+    //
+    // 1. syscall* — system.sb guards `(allow syscall*)` with `(unless *import-path*
+    //    ...)`, so it is NOT included when bsd.sb is imported. Most programs work
+    //    without it because the sandbox only filters a small subset of syscalls
+    //    (Mach traps, certain security-sensitive calls). Chromium's multi-process
+    //    architecture uses filtered Mach traps that Node.js and git do not.
+    //
+    // 2. system-socket — Chromium creates sockets for IPC between its browser,
+    //    renderer, and GPU processes. Without this, internal IPC setup fails.
+    //
+    // 3. iokit-open-user-client — Chromium probes GPU capabilities via IOKit
+    //    user clients during renderer init, even in headless mode (SwiftShader
+    //    fallback still queries IOKit before deciding to use software rendering).
+    //
+    // 4. mach-register — Chromium registers Mach services under the org.chromium.*
+    //    namespace for IPC between browser, renderer, GPU, and Crashpad processes.
+    //    Crashpad's child_port_handshake uses bootstrap_check_in() which requires
+    //    this permission; without it, EPERM (1100) cascades into a segfault.
+    //    Scoped to org.chromium.* — the narrowest pattern that covers all of
+    //    Chromium's registered services (crashpad.* alone is insufficient).
+    //
+    // SECURITY: these rules only activate when the user has explicitly opted in
+    // to browser execution via allow_cache_exec = ["ms-playwright"] (exact match).
+    // syscall* is the broadest rule — Chrome uses undocumented Mach traps that
+    // cannot be individually enumerated in a stable allowlist across OS versions.
+    // iokit-open-user-client is unscoped because IOKit class names vary by GPU
+    // hardware and macOS version; scoping would break on different machines.
+    // mach-register is scoped to the org.chromium.* namespace to prevent
+    // registration of arbitrary global Mach services.
+    if allow_chromium_runtime {
+        sbpl!(
+            sb,
+            ";; Chromium browser runtime (Playwright headless testing)"
+        );
+        sbpl!(sb, "(allow syscall*)");
+        sbpl!(sb, "(allow system-socket)");
+        sbpl!(sb, "(allow iokit-open-user-client)");
+        sbpl!(
+            sb,
+            r#"(allow mach-register (global-name-regex #"^org\.chromium\."))"#
+        );
+        sbpl!(sb);
+    }
 
     // System info — Node.js queries CPU count, memory, OS version
     sbpl!(sb, ";; System info (Node.js runtime needs these)");
@@ -585,12 +658,35 @@ fn emit_temp_rules(
     allow_tmp_exec: bool,
     allow_jvm_attach: bool,
     scratch_dir: Option<&Path>,
+    allow_chromium_runtime: bool,
 ) {
     sbpl!(sb, ";; Temp directories");
     sbpl!(sb, "(allow file-read* (subpath \"/private/tmp\"))");
     sbpl!(sb, "(allow file-write* (subpath \"/private/tmp\"))");
     sbpl!(sb, "(allow file-read* (subpath \"/private/var/folders\"))");
     sbpl!(sb, "(allow file-write* (subpath \"/private/var/folders\"))");
+    if allow_chromium_runtime {
+        // Chrome's ProcessSingleton binds a Unix socket in the macOS user temp dir
+        // to prevent multiple Chrome instances sharing the same profile directory.
+        // Three operations are required (same pattern as the JVM attach rules below):
+        //   - network-bind:    Chrome creates the socket on first launch
+        //   - network-inbound: Chrome accepts "already running" probes
+        //   - network-outbound: a second Chrome instance connects to check the first
+        //
+        // Path follows Chrome for Testing's bundle ID convention:
+        //   /private/var/folders/.../T/com.google.chrome.for.testing.<random>/SingletonSocket
+        //
+        // SECURITY: regex is anchored to the exact bundle-ID prefix and filename,
+        // so it does not expose SSH_AUTH_SOCK or other sensitive launchd sockets.
+        for op in &[
+            r#"(allow network-bind (local unix-socket (regex #"^/private/var/folders/.+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")))"#,
+            r#"(allow network-inbound (local unix-socket (regex #"^/private/var/folders/.+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")))"#,
+            r#"(allow network-outbound (remote unix-socket (regex #"^/private/var/folders/.+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")))"#,
+        ] {
+            sbpl!(sb, "{op}");
+        }
+        sbpl!(sb);
+    }
     if allow_jvm_attach {
         // Allow Unix domain socket operations for JVM Attach API.
         //
