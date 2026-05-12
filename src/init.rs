@@ -262,7 +262,8 @@ pub fn generate_toml(report: &DetectionReport) -> String {
         writeln!(out, "[propose]").unwrap();
         for flag in &propose_flags {
             // Check if this is a dangerous flag from fallback-only sources
-            let should_comment = should_comment_out_flag(flag, &report.provenance);
+            let should_comment =
+                should_comment_out_flag(flag, &report.provenance, &report.workspace_members);
             let provenance_comment = format_provenance(flag, &report.provenance);
 
             // Look up the SandboxFlag to check for risk warnings
@@ -342,6 +343,7 @@ pub fn generate_toml(report: &DetectionReport) -> String {
 fn should_comment_out_flag(
     flag_key: &str,
     provenance: &BTreeMap<Suggestion, BTreeSet<String>>,
+    workspace_members: &[crate::detect::WorkspaceMember],
 ) -> bool {
     // Only comment out dangerous flags
     let is_dangerous = SandboxFlag::iter_all()
@@ -366,11 +368,12 @@ fn should_comment_out_flag(
         return false;
     }
 
-    // Check if all sources are from fallback detection
-    // (We can't tell from provenance alone, so we check workspace_members is empty —
-    // if it's non-empty, we have real workspace config)
-    // For now, we're conservative: only comment out if no provenance at all from root
-    false
+    // Check if all contributing paths come from fallback-discovered members
+    sources.iter().all(|path| {
+        workspace_members.iter().any(|m| {
+            m.relative_path == *path && m.source == crate::detect::WorkspaceSource::Fallback
+        })
+    })
 }
 
 /// Format provenance for a flag as a human-readable string.

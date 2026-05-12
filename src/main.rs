@@ -4,6 +4,8 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use cplt::{agent, config, discover, proxy, repo_config, sandbox, scratch, trust, update};
 #[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1499,11 +1501,19 @@ fn run_doctor() -> ExitCode {
 
         // Show workspace member ecosystems
         if !report.workspace_members.is_empty() {
+            // Collect unique sources for the header
+            let sources: BTreeSet<String> = report
+                .workspace_members
+                .iter()
+                .map(|m| m.source.to_string())
+                .collect();
+            let source_label = sources.into_iter().collect::<Vec<_>>().join(", ");
+
             println!();
             println!(
                 "  {}Workspace members ({}){}",
                 ui::stdout_color(ui::BOLD),
-                report.workspace_members[0].source,
+                source_label,
                 ui::stdout_color(ui::RESET),
             );
             for member in &report.workspace_members {

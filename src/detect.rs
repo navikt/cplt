@@ -1159,8 +1159,8 @@ const SCAN_MAX_ENTRIES: usize = 10_000;
 /// 4. `settings.gradle(.kts)` (Gradle/JVM)
 /// 5. `go.work` (Go)
 ///
-/// Returns discovered members and any diagnostics. Members are deduplicated
-/// by canonical path. Paths outside the repo root are rejected with a diagnostic.
+/// Returns discovered members and any diagnostics. Members use canonical relative
+/// paths and are deduplicated. Paths outside the repo root are rejected with a diagnostic.
 pub fn discover_workspace_members(root: &Path) -> (Vec<WorkspaceMember>, Vec<Diagnostic>) {
     let mut members = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1172,7 +1172,7 @@ pub fn discover_workspace_members(root: &Path) -> (Vec<WorkspaceMember>, Vec<Dia
     parse_gradle_settings(root, &mut members, &mut diagnostics);
     parse_go_work(root, &mut members, &mut diagnostics);
 
-    // Deduplicate by relative path (multiple workspace configs may overlap)
+    // Deduplicate by relative path (all paths are canonical from try_add_member)
     let mut seen = BTreeSet::new();
     members.retain(|m| seen.insert(m.relative_path.clone()));
 
