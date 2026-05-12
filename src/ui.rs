@@ -23,10 +23,11 @@ pub const BOLD: &str = "\x1b[1m";
 pub const DIM: &str = "\x1b[2m";
 pub const RESET: &str = "\x1b[0m";
 
-/// Whether `FORCE_COLOR` is set and non-empty. Overrides all other checks.
+/// Whether `FORCE_COLOR` is set (any value). Overrides all other checks.
+/// Presence-only, matching the `NO_COLOR` convention.
 fn force_color_set() -> bool {
     static FORCED: OnceLock<bool> = OnceLock::new();
-    *FORCED.get_or_init(|| std::env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty()))
+    *FORCED.get_or_init(|| std::env::var_os("FORCE_COLOR").is_some())
 }
 
 /// Whether color should be suppressed by environment variables.
