@@ -3535,4 +3535,216 @@ mod e2e_tests {
             "stdout should be empty when nothing detected"
         );
     }
+
+    // ── Monorepo workspace detection e2e tests ────────────────────────
+
+    #[test]
+    fn e2e_init_detects_npm_monorepo() {
+        let dir = tempfile::tempdir().unwrap();
+        // Root package.json with workspaces and a framework dep
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"mono","workspaces":["apps/*"],"devDependencies":{"vite":"^5"}}"#,
+        )
+        .unwrap();
+        // Workspace member with its own package.json
+        std::fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+        std::fs::write(
+            dir.path().join("apps/web/package.json"),
+            r#"{"name":"web","dependencies":{"next":"^14"}}"#,
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("apps/web"),
+            "should show workspace member: {stdout}"
+        );
+        assert!(
+            stdout.contains("Node.js"),
+            "should detect Node.js: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_init_detects_cargo_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/core")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/core/Cargo.toml"),
+            "[package]\nname = \"core\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/cli")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/cli/Cargo.toml"),
+            "[package]\nname = \"cli\"\n",
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("crates/core"),
+            "should show workspace member core: {stdout}"
+        );
+        assert!(
+            stdout.contains("crates/cli"),
+            "should show workspace member cli: {stdout}"
+        );
+        assert!(stdout.contains("Rust"), "should detect Rust: {stdout}");
+    }
+
+    #[test]
+    fn e2e_init_detects_mixed_monorepo() {
+        let dir = tempfile::tempdir().unwrap();
+        // Root package.json with workspaces
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"mono","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        // Node frontend
+        std::fs::create_dir_all(dir.path().join("packages/frontend")).unwrap();
+        std::fs::write(
+            dir.path().join("packages/frontend/package.json"),
+            r#"{"name":"frontend","dependencies":{"next":"^14"}}"#,
+        )
+        .unwrap();
+        // JVM backend (Gradle)
+        std::fs::create_dir_all(dir.path().join("packages/backend")).unwrap();
+        std::fs::write(
+            dir.path().join("packages/backend/build.gradle.kts"),
+            "plugins { id(\"org.springframework.boot\") }",
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("packages/frontend"),
+            "should show frontend member: {stdout}"
+        );
+        assert!(
+            stdout.contains("packages/backend"),
+            "should show backend member: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_init_fallback_detects_subprojects() {
+        let dir = tempfile::tempdir().unwrap();
+        // No workspace config — pure fallback scan
+        std::fs::create_dir_all(dir.path().join("services/api")).unwrap();
+        std::fs::write(
+            dir.path().join("services/api/Cargo.toml"),
+            "[package]\nname = \"api\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("services/web")).unwrap();
+        std::fs::write(
+            dir.path().join("services/web/package.json"),
+            r#"{"name":"web"}"#,
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Fallback should find subprojects
+        assert!(
+            stdout.contains("api") || stdout.contains("web"),
+            "should detect subprojects via fallback: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_init_monorepo_toml_has_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"mono","workspaces":["apps/*"],"devDependencies":{"vite":"^5"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+        std::fs::write(
+            dir.path().join("apps/web/package.json"),
+            r#"{"name":"web","dependencies":{"next":"^14"}}"#,
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // TOML output should contain provenance comments
+        assert!(
+            stdout.contains("# Suggested by:") || stdout.contains("Workspace members:"),
+            "TOML should include provenance or workspace info: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_doctor_shows_workspace_members() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"mono","workspaces":["apps/*"]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+        std::fs::write(
+            dir.path().join("apps/web/package.json"),
+            r#"{"name":"web"}"#,
+        )
+        .unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["doctor"])
+            .current_dir(dir.path())
+            .output()
+            .expect("should run");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            combined.contains("apps/web"),
+            "doctor should show workspace member: {combined}"
+        );
+    }
 }
