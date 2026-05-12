@@ -38,7 +38,7 @@ pub enum InitResult {
 /// Run the init command from a pre-computed detection report.
 /// Avoids redundant filesystem scans when the caller already has the report.
 pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions) -> InitResult {
-    if report.detections.is_empty() {
+    if report.detections.is_empty() && report.workspace_members.is_empty() {
         return InitResult::NothingDetected;
     }
 
