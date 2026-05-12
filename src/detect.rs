@@ -1386,12 +1386,12 @@ fn parse_cargo_workspace(
         return;
     };
 
-    let toml: toml::Value = match content.parse() {
+    let table: toml::Table = match content.parse() {
         Ok(v) => v,
         Err(_) => return,
     };
 
-    let Some(workspace) = toml.get("workspace") else {
+    let Some(workspace) = table.get("workspace") else {
         return;
     };
 
@@ -1626,7 +1626,7 @@ fn scan_dir_recursive(
             // Verify it's within root (no symlink escape)
             if let Ok(canonical) = subdir.canonicalize()
                 && canonical.starts_with(root_canonical)
-                && let Ok(relative) = subdir.strip_prefix(root_canonical)
+                && let Ok(relative) = canonical.strip_prefix(root_canonical)
                 && let Some(rel_str) = relative.to_str()
             {
                 members.push(WorkspaceMember {
@@ -2685,6 +2685,417 @@ services:
                 .detections
                 .iter()
                 .any(|d| d.name == "Gradle registry credentials")
+        );
+    }
+
+    // ── Workspace discovery tests ───────────────────────────────────
+
+    #[test]
+    fn workspace_npm_workspaces_array() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"mono","workspaces":["packages/*","apps/web"]}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/ui")).unwrap();
+        fs::create_dir_all(dir.path().join("packages/utils")).unwrap();
+        fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+
+        let (members, diagnostics) = discover_workspace_members(dir.path());
+        assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
+
+        let paths: Vec<&str> = members.iter().map(|m| m.relative_path.as_str()).collect();
+        assert!(paths.contains(&"apps/web"), "missing apps/web: {paths:?}");
+        assert!(
+            paths.contains(&"packages/ui"),
+            "missing packages/ui: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"packages/utils"),
+            "missing packages/utils: {paths:?}"
+        );
+        assert!(
+            members
+                .iter()
+                .all(|m| m.source == WorkspaceSource::PackageJson),
+            "wrong source"
+        );
+    }
+
+    #[test]
+    fn workspace_yarn_classic_object_form() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"mono","workspaces":{"packages":["libs/*"]}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("libs/shared")).unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].relative_path, "libs/shared");
+    }
+
+    #[test]
+    fn workspace_pnpm_workspace_yaml() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '!packages/legacy'\n  - 'apps/web'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/ui")).unwrap();
+        fs::create_dir_all(dir.path().join("packages/legacy")).unwrap();
+        fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        let paths: Vec<&str> = members.iter().map(|m| m.relative_path.as_str()).collect();
+        assert!(
+            paths.contains(&"packages/ui"),
+            "missing packages/ui: {paths:?}"
+        );
+        assert!(paths.contains(&"apps/web"), "missing apps/web: {paths:?}");
+        assert!(
+            members
+                .iter()
+                .all(|m| m.source == WorkspaceSource::PnpmWorkspace),
+            "wrong source"
+        );
+    }
+
+    #[test]
+    fn workspace_cargo_workspace() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/experimental\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("crates/core")).unwrap();
+        fs::create_dir_all(dir.path().join("crates/cli")).unwrap();
+        fs::create_dir_all(dir.path().join("crates/experimental")).unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        let paths: Vec<&str> = members.iter().map(|m| m.relative_path.as_str()).collect();
+        assert!(paths.contains(&"crates/core"), "missing crates/core");
+        assert!(paths.contains(&"crates/cli"), "missing crates/cli");
+        assert!(
+            !paths.contains(&"crates/experimental"),
+            "experimental should be excluded"
+        );
+        assert!(
+            members
+                .iter()
+                .all(|m| m.source == WorkspaceSource::CargoWorkspace),
+            "wrong source"
+        );
+    }
+
+    #[test]
+    fn workspace_gradle_settings() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("settings.gradle.kts"),
+            "rootProject.name = \"mono\"\ninclude(\"app\", \"lib\")\ninclude(\":services:api\")\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("app")).unwrap();
+        fs::create_dir_all(dir.path().join("lib")).unwrap();
+        fs::create_dir_all(dir.path().join("services/api")).unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        let paths: Vec<&str> = members.iter().map(|m| m.relative_path.as_str()).collect();
+        assert!(paths.contains(&"app"), "missing app: {paths:?}");
+        assert!(paths.contains(&"lib"), "missing lib: {paths:?}");
+        assert!(
+            paths.contains(&"services/api"),
+            "missing services/api: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_gradle_groovy() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("settings.gradle"),
+            "include 'app', 'core'\ninclude ':services:worker'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("app")).unwrap();
+        fs::create_dir_all(dir.path().join("core")).unwrap();
+        fs::create_dir_all(dir.path().join("services/worker")).unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        let paths: Vec<&str> = members.iter().map(|m| m.relative_path.as_str()).collect();
+        assert!(paths.contains(&"app"), "missing app: {paths:?}");
+        assert!(paths.contains(&"core"), "missing core: {paths:?}");
+        assert!(
+            paths.contains(&"services/worker"),
+            "missing services/worker: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_go_work() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("go.work"),
+            "go 1.23.0\n\nuse (\n    ./service-a\n    ./service-b\n)\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("service-a")).unwrap();
+        fs::create_dir_all(dir.path().join("service-b")).unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        let paths: Vec<&str> = members.iter().map(|m| m.relative_path.as_str()).collect();
+        assert!(paths.contains(&"service-a"), "missing service-a: {paths:?}");
+        assert!(paths.contains(&"service-b"), "missing service-b: {paths:?}");
+        assert!(
+            members.iter().all(|m| m.source == WorkspaceSource::GoWork),
+            "wrong source"
+        );
+    }
+
+    #[test]
+    fn workspace_go_work_single_line() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("go.work"), "go 1.23.0\n\nuse ./mymod\n").unwrap();
+        fs::create_dir_all(dir.path().join("mymod")).unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].relative_path, "mymod");
+    }
+
+    #[test]
+    fn workspace_rejects_traversal() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":["../escape","packages/*"]}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/ok")).unwrap();
+
+        let (members, diagnostics) = discover_workspace_members(dir.path());
+        assert!(
+            !members.iter().any(|m| m.relative_path.contains("escape")),
+            "traversal should be rejected"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("traversal")),
+            "should have traversal diagnostic"
+        );
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].relative_path, "packages/ok");
+    }
+
+    #[test]
+    fn workspace_skips_root_member() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":[".","packages/*"]}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("packages/ui")).unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        assert_eq!(members.len(), 1, "root should be skipped");
+        assert_eq!(members[0].relative_path, "packages/ui");
+    }
+
+    #[test]
+    fn workspace_deduplicates_members() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'apps/web'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":["apps/web"]}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        assert_eq!(members.len(), 1, "duplicate should be removed");
+    }
+
+    #[test]
+    fn workspace_nonexistent_dirs_ignored() {
+        let dir = setup_dir();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":["packages/*","ghost"]}"#,
+        )
+        .unwrap();
+
+        let (members, _) = discover_workspace_members(dir.path());
+        assert!(members.is_empty(), "nonexistent dirs should be skipped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_rejects_symlink_outside_root() {
+        let dir = setup_dir();
+        let outside = setup_dir();
+        fs::create_dir_all(outside.path().join("evil")).unwrap();
+
+        std::os::unix::fs::symlink(outside.path().join("evil"), dir.path().join("escape")).unwrap();
+
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":["escape"]}"#,
+        )
+        .unwrap();
+
+        let (members, diagnostics) = discover_workspace_members(dir.path());
+        assert!(
+            members.is_empty(),
+            "symlink outside root should be rejected"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("outside")),
+            "should have outside-root diagnostic"
+        );
+    }
+
+    // ── Fallback scan tests ─────────────────────────────────────────
+
+    #[test]
+    fn fallback_finds_subprojects() {
+        let dir = setup_dir();
+        fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+        fs::write(dir.path().join("apps/web/package.json"), "{}").unwrap();
+        fs::create_dir_all(dir.path().join("services/api")).unwrap();
+        fs::write(dir.path().join("services/api/Cargo.toml"), "").unwrap();
+
+        let (members, diagnostics) = scan_for_subprojects(dir.path());
+        assert!(diagnostics.is_empty());
+        let paths: Vec<&str> = members.iter().map(|m| m.relative_path.as_str()).collect();
+        assert!(
+            paths.iter().any(|p| p.contains("web")),
+            "missing web: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("api")),
+            "missing api: {paths:?}"
+        );
+        assert!(
+            members
+                .iter()
+                .all(|m| m.source == WorkspaceSource::Fallback),
+            "wrong source"
+        );
+    }
+
+    #[test]
+    fn fallback_skips_node_modules() {
+        let dir = setup_dir();
+        fs::create_dir_all(dir.path().join("node_modules/foo")).unwrap();
+        fs::write(dir.path().join("node_modules/foo/package.json"), "{}").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+
+        let (members, _) = scan_for_subprojects(dir.path());
+        assert!(
+            !members
+                .iter()
+                .any(|m| m.relative_path.contains("node_modules")),
+            "node_modules should be skipped"
+        );
+    }
+
+    #[test]
+    fn fallback_skips_hidden_dirs() {
+        let dir = setup_dir();
+        fs::create_dir_all(dir.path().join(".hidden/sub")).unwrap();
+        fs::write(dir.path().join(".hidden/sub/package.json"), "{}").unwrap();
+
+        let (members, _) = scan_for_subprojects(dir.path());
+        assert!(members.is_empty(), "hidden dirs should be skipped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_skips_symlinks() {
+        let dir = setup_dir();
+        let target = setup_dir();
+        fs::write(target.path().join("package.json"), "{}").unwrap();
+
+        std::os::unix::fs::symlink(target.path(), dir.path().join("linked")).unwrap();
+
+        let (members, _) = scan_for_subprojects(dir.path());
+        assert!(
+            !members.iter().any(|m| m.relative_path.contains("linked")),
+            "symlinks should be skipped in fallback"
+        );
+    }
+
+    // ── Recursive detection tests ───────────────────────────────────
+
+    #[test]
+    fn recursive_detects_monorepo_ecosystems() {
+        let dir = setup_dir();
+        // Root package.json with workspace config and vite dependency (triggers AllowLocalhostAny)
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"mono","workspaces":["apps/*"],"devDependencies":{"vite":"^5"}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("apps/backend")).unwrap();
+        fs::write(
+            dir.path().join("apps/backend/Cargo.toml"),
+            "[package]\nname = \"backend\"\n",
+        )
+        .unwrap();
+
+        let report = detect_project_recursive(dir.path());
+
+        assert!(
+            report.detections.iter().any(|d| d.name.contains("Node")),
+            "root should detect Node"
+        );
+        assert_eq!(report.workspace_members.len(), 1);
+        assert!(
+            report.workspace_members[0]
+                .detections
+                .iter()
+                .any(|d| d.name.contains("Rust")),
+            "workspace member should detect Rust"
+        );
+        assert!(
+            !report.suggestions.is_empty(),
+            "vite should generate suggestions"
+        );
+        assert!(
+            !report.provenance.is_empty(),
+            "provenance should track suggestion origins"
+        );
+    }
+
+    #[test]
+    fn recursive_falls_back_to_heuristic() {
+        let dir = setup_dir();
+        fs::create_dir_all(dir.path().join("services/api")).unwrap();
+        fs::write(
+            dir.path().join("services/api/Cargo.toml"),
+            "[package]\nname = \"api\"\n",
+        )
+        .unwrap();
+
+        let report = detect_project_recursive(dir.path());
+        assert!(
+            !report.workspace_members.is_empty(),
+            "fallback should find subprojects"
+        );
+        assert!(
+            report.workspace_members[0].source == WorkspaceSource::Fallback,
+            "should be marked as fallback"
         );
     }
 }
