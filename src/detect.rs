@@ -1150,6 +1150,9 @@ const SCAN_MAX_DEPTH: usize = 4;
 /// Max directory entries to visit during fallback scan.
 const SCAN_MAX_ENTRIES: usize = 10_000;
 
+/// Max file size for workspace config files (512 KiB — same as DetectContext).
+const WORKSPACE_MAX_FILE_SIZE: usize = 512 * 1024;
+
 /// Discover workspace members from explicit workspace configuration files.
 ///
 /// Checks for workspace definitions in this order:
@@ -1305,22 +1308,35 @@ fn parse_pnpm_workspace(
         return;
     };
 
+    // Bound file size
+    if content.len() > WORKSPACE_MAX_FILE_SIZE {
+        return;
+    }
+
     // Simple YAML parsing — look for `packages:` array.
     // We don't pull in a YAML dependency; the format is simple enough.
     let mut in_packages = false;
     for line in content.lines() {
         let trimmed = line.trim();
+
+        // Skip YAML comments
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
         if trimmed == "packages:" {
             in_packages = true;
             continue;
         }
         if in_packages {
-            // End of array: non-indented, non-dash line
+            // End of array: non-indented, non-dash, non-empty, non-comment line
             if !trimmed.starts_with('-') && !trimmed.is_empty() {
                 break;
             }
             if let Some(pattern) = trimmed.strip_prefix('-') {
-                let pattern = pattern.trim().trim_matches(|c| c == '\'' || c == '"');
+                // Strip inline comments (e.g., `- 'apps/*' # comment`)
+                let pattern = pattern.split('#').next().unwrap_or("").trim();
+                let pattern = pattern.trim_matches(|c| c == '\'' || c == '"');
                 if pattern.is_empty() || pattern.starts_with('!') {
                     continue;
                 }
@@ -1349,6 +1365,9 @@ fn parse_package_json_workspaces(
     let Ok(content) = std::fs::read_to_string(&path) else {
         return;
     };
+    if content.len() > WORKSPACE_MAX_FILE_SIZE {
+        return;
+    }
 
     let json: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
@@ -1392,6 +1411,9 @@ fn parse_cargo_workspace(
     let Ok(content) = std::fs::read_to_string(&path) else {
         return;
     };
+    if content.len() > WORKSPACE_MAX_FILE_SIZE {
+        return;
+    }
 
     let table: toml::Table = match content.parse() {
         Ok(v) => v,
@@ -1450,6 +1472,9 @@ fn parse_gradle_settings(
     } else {
         return;
     };
+    if content.len() > WORKSPACE_MAX_FILE_SIZE {
+        return;
+    }
 
     // Match both: include("app", "lib") and include 'app', 'lib'
     // Also: include(":services:api") → services/api
@@ -1504,6 +1529,9 @@ fn parse_go_work(
     let Ok(content) = std::fs::read_to_string(&path) else {
         return;
     };
+    if content.len() > WORKSPACE_MAX_FILE_SIZE {
+        return;
+    }
 
     let mut in_block = false;
     for line in content.lines() {

@@ -3719,6 +3719,7 @@ mod e2e_tests {
 
     #[test]
     fn e2e_doctor_shows_workspace_members() {
+        require_copilot!();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("package.json"),
