@@ -71,6 +71,8 @@ pub struct ToolDiscovery {
     pub homebrew_prefix: Option<PathBuf>,
     /// Which HOME_TOOL_DIRS actually exist on disk.
     pub existing_home_tool_dirs: Vec<String>,
+    /// Which APP_DIRS actually exist on disk.
+    pub existing_app_dirs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -238,11 +240,13 @@ const TOOLS_TO_CHECK: &[&str] = &[
     "gh", "git", "node", "mise", "cargo", "python3", "java", "go", "gradle", "yarn", "pnpm",
 ];
 
+use crate::sandbox::app_dirs;
 use crate::sandbox::home_tool_dirs;
 
 pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
     let tools: Vec<ToolInfo> = TOOLS_TO_CHECK
         .iter()
+        .chain(app_dirs().iter().map(|app_dir| &app_dir.application))
         .filter_map(|name| {
             which_resolved(name).map(|path| ToolInfo {
                 name: name.to_string(),
@@ -265,10 +269,26 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
         .map(|d| d.path.to_string())
         .collect();
 
+    // Writable app dirs are always included (may be created on first use);
+    // non-writable dirs are pruned to paths that already exist on disk.
+    let existing_app_dirs: Vec<String> = app_dirs()
+        .iter()
+        .flat_map(|app_dir| {
+            let write_set: std::collections::HashSet<_> =
+                app_dir.write_paths().into_iter().collect();
+            app_dir
+                .all_paths()
+                .into_iter()
+                .filter(move |p| write_set.contains(p) || p.exists())
+        })
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
     ToolDiscovery {
         tools,
         homebrew_prefix,
         existing_home_tool_dirs,
+        existing_app_dirs,
     }
 }
 

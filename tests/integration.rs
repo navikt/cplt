@@ -374,6 +374,7 @@ mod macos_tests {
             extra_write: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
+            existing_app_dirs: None,
             extra_ports: &[],
             localhost_ports: &[],
             proxy_port: None,

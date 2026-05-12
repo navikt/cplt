@@ -45,9 +45,9 @@ mod profile;
 // These are platform-agnostic and used by tests, discover, config, etc.
 
 pub use policy::{
-    DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST,
-    HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar, HomeToolDir,
-    home_tool_dirs, validate_sbpl_path,
+    AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
+    ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
+    HomeToolDir, app_dirs, home_tool_dirs, validate_sbpl_path,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -85,6 +85,9 @@ pub struct SandboxConfig<'a> {
     /// If `Some`, only include these home tool dirs (tighter profile via discovery).
     /// If `None`, all known home tool dirs are included.
     pub existing_home_tool_dirs: Option<&'a [String]>,
+    /// If `Some`, only include these app dirs (tighter profile via discovery).
+    /// If `None`, all known app dirs are included.
+    pub existing_app_dirs: Option<&'a [String]>,
     pub extra_ports: &'a [u16],
     pub localhost_ports: &'a [u16],
     pub proxy_port: Option<u16>,
@@ -224,6 +227,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         extra_write: config.extra_write,
         extra_deny: config.extra_deny,
         existing_home_tool_dirs: config.existing_home_tool_dirs,
+        existing_app_dirs: config.existing_app_dirs,
         extra_ports: config.extra_ports,
         localhost_ports: config.localhost_ports,
         proxy_port: config.proxy_port,

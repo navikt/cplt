@@ -22,7 +22,7 @@ macro_rules! sbpl {
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     GPG_SIGNING_ALLOW_FILES, HOME_TOOL_DIRS, HomeToolDir, SENSITIVE_PROJECT_PATTERNS,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, app_dirs, validate_sbpl_path,
 };
 
 /// Options for generating an SBPL sandbox profile.
@@ -37,6 +37,9 @@ pub struct ProfileOptions<'a> {
     /// If `Some`, only include these home tool dirs (tighter profile via discovery).
     /// If `None`, all known home tool dirs are included.
     pub existing_home_tool_dirs: Option<&'a [String]>,
+    /// If `Some`, only include these app dirs (tighter profile via discovery).
+    /// If `None`, all known app dirs are included.
+    pub existing_app_dirs: Option<&'a [String]>,
     pub extra_ports: &'a [u16],
     pub localhost_ports: &'a [u16],
     pub proxy_port: Option<u16>,
@@ -124,6 +127,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         &mut sb,
         &home,
         opts.existing_home_tool_dirs,
+        opts.existing_app_dirs,
         opts.agent,
         opts.allow_cache_exec,
         opts.allow_cache_exec_any,
@@ -483,6 +487,7 @@ fn emit_tool_dirs(
     sb: &mut String,
     home: &str,
     existing_home_tool_dirs: Option<&[String]>,
+    existing_app_dirs: Option<&[String]>,
     agent: Agent,
     allow_cache_exec: &[String],
     allow_cache_exec_any: bool,
@@ -500,6 +505,7 @@ fn emit_tool_dirs(
             .collect(),
         None => HOME_TOOL_DIRS.iter().collect(),
     };
+
     for dir in &active_dirs {
         let p = dir.path;
         sbpl!(sb, "(allow file-read* (subpath \"{home}/{p}\"))");
@@ -524,6 +530,68 @@ fn emit_tool_dirs(
         }
         if dir.write && !dir.map_exec {
             sbpl!(sb, "(deny file-map-executable (subpath \"{home}/{p}\"))");
+        }
+    }
+
+    // App dirs: absolute paths resolved from XDG/macOS conventions.
+    // Use discovered existing dirs if available, else include all.
+    for dir in app_dirs() {
+        let all_paths = dir.all_paths();
+        let include = match existing_app_dirs {
+            Some(existing) => all_paths
+                .iter()
+                .any(|p| existing.iter().any(|e| e == p.to_string_lossy().as_ref())),
+            None => true,
+        };
+        if !include {
+            continue;
+        }
+        let read_paths = dir.read_paths();
+        let write_paths = dir.write_paths();
+        let process_exec_paths = dir.process_exec_paths();
+        let map_exec_paths = dir.map_exec_paths();
+
+        // Allow rules first
+        for path in &read_paths {
+            if validate_sbpl_path(path).is_err() {
+                continue;
+            }
+            let p = path.display();
+            sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
+        }
+        for path in &write_paths {
+            if validate_sbpl_path(path).is_err() {
+                continue;
+            }
+            let p = path.display();
+            sbpl!(sb, "(allow file-write* (subpath \"{p}\"))");
+        }
+        for path in &process_exec_paths {
+            if validate_sbpl_path(path).is_err() {
+                continue;
+            }
+            let p = path.display();
+            sbpl!(sb, "(allow process-exec (subpath \"{p}\"))");
+        }
+        for path in &map_exec_paths {
+            if validate_sbpl_path(path).is_err() {
+                continue;
+            }
+            let p = path.display();
+            sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
+        }
+        // Deny exec on writable paths that are not in exec lists (last-match-wins)
+        for path in &write_paths {
+            if validate_sbpl_path(path).is_err() {
+                continue;
+            }
+            let p = path.display();
+            if !process_exec_paths.contains(path) {
+                sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
+            }
+            if !map_exec_paths.contains(path) {
+                sbpl!(sb, "(deny file-map-executable (subpath \"{p}\"))");
+            }
         }
     }
 

@@ -3,7 +3,8 @@
 //! Defines the security policy shared by macOS Seatbelt and Linux Landlock:
 //! path validation, tool directory permissions, and hardening env vars.
 
-use std::path::Path;
+use directories::ProjectDirs;
+use std::path::{Path, PathBuf};
 
 /// Characters that would break SBPL profile string interpolation.
 const SBPL_UNSAFE_CHARS: &[char] = &['"', ')', '(', ';', '\\', '\n', '\r', '\0'];
@@ -371,6 +372,185 @@ pub const GPG_SIGNING_ALLOW_FILES: &[&str] = &[
     "gpg.conf",    // User GPG configuration
     "common.conf", // Shared config (GnuPG 2.3+)
 ];
+
+/// Application directory kinds according to relevant platform specifications.
+/// See https://docs.rs/directories for more details
+pub enum AppDirKind {
+    Cache,
+    Config,
+    ConfigLocal,
+    Data,
+    DataLocal,
+    Preference,
+    Runtime,
+    State,
+}
+
+impl AppDirKind {
+    pub fn resolve(
+        &self,
+        qualifier: &str,
+        organization: &str,
+        application: &str,
+    ) -> Option<PathBuf> {
+        let project_dir = ProjectDirs::from(qualifier, organization, application)?;
+        let use_xdg = qualifier.is_empty();
+        let home_dir = directories::BaseDirs::new()?.home_dir().to_owned();
+        type Lookup = (
+            &'static str,
+            &'static str,
+            fn(project_dir: ProjectDirs) -> Option<PathBuf>,
+        );
+        let lookup: Lookup = match self {
+            AppDirKind::Cache => ("XDG_CACHE_HOME", ".cache", |project_dir| {
+                Some(project_dir.cache_dir().to_owned())
+            }),
+            AppDirKind::Config => ("XDG_CONFIG_HOME", ".config", |project_dir| {
+                Some(project_dir.config_dir().to_owned())
+            }),
+            AppDirKind::ConfigLocal => ("XDG_CONFIG_HOME", ".config", |project_dir| {
+                Some(project_dir.config_local_dir().to_owned())
+            }),
+            AppDirKind::Data => ("XDG_DATA_HOME", ".local/share", |project_dir| {
+                Some(project_dir.data_dir().to_owned())
+            }),
+            AppDirKind::DataLocal => ("XDG_DATA_HOME", ".local/share", |project_dir| {
+                Some(project_dir.data_local_dir().to_owned())
+            }),
+            AppDirKind::Preference => ("XDG_CONFIG_HOME", ".config", |project_dir| {
+                Some(project_dir.preference_dir().to_owned())
+            }),
+            AppDirKind::Runtime => ("XDG_RUNTIME_DIR", "", |project_dir| {
+                project_dir.runtime_dir().map(ToOwned::to_owned)
+            }),
+            AppDirKind::State => ("XDG_STATE_HOME", ".local/state", |project_dir| {
+                project_dir.state_dir().map(ToOwned::to_owned)
+            }),
+        };
+        if use_xdg {
+            let xdg_dir = std::env::var_os(lookup.0)
+                .map(PathBuf::from)
+                .or_else(|| {
+                    if lookup.1.is_empty() {
+                        None
+                    } else {
+                        Some(home_dir.join(lookup.1))
+                    }
+                })?
+                .join(application);
+            Some(xdg_dir)
+        } else {
+            lookup.2(project_dir)
+        }
+    }
+}
+
+/// Application directories with granular sandbox permissions.
+///
+/// The fields control permissions given to each application directory kind:
+/// - `process_exec`: allow direct binary execution (`process-exec`)
+/// - `map_exec`: allow shared library loading (`file-map-executable`) for native addons
+/// - `write`: allow file writes (`file-write*`) for build caches, dependency stores, etc.
+/// - `read`: allow file reads (`file-read*`) for configuration, etc.
+///
+/// Security principle: every writable+executable directory is a potential
+/// binary-drop staging path (see SECURITY.md axios case study). Grant exec
+/// only where tools genuinely install executables.
+pub struct AppDir {
+    pub qualifier: &'static str,
+    pub organization: &'static str,
+    pub application: &'static str,
+    pub process_exec: &'static [AppDirKind],
+    pub map_exec: &'static [AppDirKind],
+    pub write: &'static [AppDirKind],
+    pub read: &'static [AppDirKind],
+}
+
+impl AppDir {
+    pub fn process_exec_paths(&self) -> Vec<PathBuf> {
+        self.process_exec
+            .iter()
+            .filter_map(|k| k.resolve(self.qualifier, self.organization, self.application))
+            .collect()
+    }
+
+    pub fn map_exec_paths(&self) -> Vec<PathBuf> {
+        self.map_exec
+            .iter()
+            .filter_map(|k| k.resolve(self.qualifier, self.organization, self.application))
+            .collect()
+    }
+
+    pub fn write_paths(&self) -> Vec<PathBuf> {
+        self.write
+            .iter()
+            .filter_map(|k| k.resolve(self.qualifier, self.organization, self.application))
+            .collect()
+    }
+
+    pub fn read_paths(&self) -> Vec<PathBuf> {
+        self.read
+            .iter()
+            .filter_map(|k| k.resolve(self.qualifier, self.organization, self.application))
+            .collect()
+    }
+
+    /// Union of all category paths, deduplicated.
+    pub fn all_paths(&self) -> Vec<PathBuf> {
+        let mut seen = std::collections::HashSet::new();
+        let mut paths = Vec::new();
+        for p in self
+            .process_exec_paths()
+            .into_iter()
+            .chain(self.map_exec_paths())
+            .chain(self.write_paths())
+            .chain(self.read_paths())
+        {
+            if seen.insert(p.clone()) {
+                paths.push(p);
+            }
+        }
+        paths
+    }
+}
+
+pub const DEFAULT_WRITE_APP_DIRS: &[AppDirKind] = &[
+    AppDirKind::Cache,
+    AppDirKind::Data,
+    AppDirKind::DataLocal,
+    AppDirKind::Runtime,
+    AppDirKind::State,
+];
+
+pub const DEFAULT_READ_APP_DIRS: &[AppDirKind] = &[
+    AppDirKind::Cache,
+    AppDirKind::Config,
+    AppDirKind::ConfigLocal,
+    AppDirKind::Data,
+    AppDirKind::DataLocal,
+    AppDirKind::Preference,
+    AppDirKind::Runtime,
+    AppDirKind::State,
+];
+
+pub const APP_DIRS: &[AppDir] = &[AppDir {
+    qualifier: "",
+    organization: "",
+    application: "mise",
+    process_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
+    map_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
+    write: DEFAULT_WRITE_APP_DIRS,
+    read: DEFAULT_READ_APP_DIRS,
+}];
+
+/// Return the application directory list.
+///
+/// A single unified list covers both macOS and Linux paths. Entries for
+/// paths that don't exist on a given platform are harmlessly skipped at
+/// runtime (the profile generator checks `dir.exists()` before emitting rules).
+pub fn app_dirs() -> &'static [AppDir] {
+    APP_DIRS
+}
 
 /// Tool directory under $HOME with granular sandbox permissions.
 ///

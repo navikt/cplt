@@ -21,7 +21,7 @@
 //! cannot. Use `--with-proxy` on Linux for localhost SSRF protection.
 //! The proxy handles domain-level filtering on both platforms.
 
-use super::policy::{self, HomeToolDir};
+use super::policy::{self, AppDir, HomeToolDir};
 #[cfg(target_os = "linux")]
 use crate::ui;
 use std::fmt::Write as _;
@@ -280,6 +280,29 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
+    // ── Application directories (filtered by discovery) ──
+    for dir in policy::app_dirs() {
+        if should_include_app_dir(dir, config) {
+            let process_exec = dir.process_exec_paths();
+            let map_exec = dir.map_exec_paths();
+            let write = dir.write_paths();
+            // all_paths() returns deduplicated union of all categories
+            for path in dir.all_paths() {
+                let execute = process_exec.contains(&path) || map_exec.contains(&path);
+                let writable = write.contains(&path);
+                fs_rules.push(FsRule {
+                    path,
+                    access: FsAccess {
+                        read: true,
+                        write: writable,
+                        execute,
+                        ioctl: false,
+                    },
+                });
+            }
+        }
+    }
+
     // ── Home tool directories (filtered by discovery) ──
     for dir in policy::home_tool_dirs() {
         if should_include_tool_dir(dir, config) {
@@ -535,6 +558,17 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 fn should_include_tool_dir(dir: &HomeToolDir, config: &super::SandboxConfig) -> bool {
     match &config.existing_home_tool_dirs {
         Some(existing) => existing.iter().any(|e| e == dir.path),
+        None => true,
+    }
+}
+
+/// Check if a app directory should be included based on discovery data.
+fn should_include_app_dir(dir: &AppDir, config: &super::SandboxConfig) -> bool {
+    match &config.existing_app_dirs {
+        Some(existing) => dir
+            .all_paths()
+            .iter()
+            .any(|p| existing.iter().any(|e| e == p.to_string_lossy().as_ref())),
         None => true,
     }
 }
@@ -1114,6 +1148,7 @@ mod tests {
             extra_write: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
+            existing_app_dirs: None,
             extra_ports: &[],
             localhost_ports: &[],
             proxy_port: None,

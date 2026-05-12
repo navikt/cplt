@@ -1157,7 +1157,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Run auto-discovery to tighten the sandbox profile
     let tool_discovery = discover::discover_tools(&home_dir);
-    let existing_dirs = tool_discovery.existing_home_tool_dirs;
+    let existing_home_tool_dirs = tool_discovery.existing_home_tool_dirs;
+    let existing_app_dirs = tool_discovery.existing_app_dirs;
 
     // Create per-session scratch directory if enabled
     let scratch_guard = if resolved.scratch_dir {
@@ -1238,7 +1239,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         extra_read: &resolved.allow_read,
         extra_write: &resolved.allow_write,
         extra_deny: &resolved.deny_paths,
-        existing_home_tool_dirs: Some(&existing_dirs),
+        existing_home_tool_dirs: Some(&existing_home_tool_dirs),
+        existing_app_dirs: Some(&existing_app_dirs),
         extra_ports: &resolved.allow_ports,
         localhost_ports: &resolved.allow_localhost,
         proxy_port: proxy_port_for_profile,
