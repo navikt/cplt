@@ -1477,8 +1477,8 @@ fn run_doctor() -> ExitCode {
     let ok = discovery.print_report();
 
     // Show project ecosystem detection summary
-    let report = cplt::detect::detect_project(&project_dir);
-    if !report.detections.is_empty() {
+    let report = cplt::detect::detect_project_recursive(&project_dir);
+    if !report.detections.is_empty() || !report.workspace_members.is_empty() {
         println!();
         println!(
             "{}{}[doctor]{} {}Project ecosystems{}",
@@ -1496,6 +1496,37 @@ fn run_doctor() -> ExitCode {
                 d.name
             );
         }
+
+        // Show workspace member ecosystems
+        if !report.workspace_members.is_empty() {
+            println!();
+            println!(
+                "  {}Workspace members ({}){}",
+                ui::stdout_color(ui::BOLD),
+                report.workspace_members[0].source,
+                ui::stdout_color(ui::RESET),
+            );
+            for member in &report.workspace_members {
+                let ecosystems: Vec<&str> = member.detections.iter().map(|d| d.name).collect();
+                if ecosystems.is_empty() {
+                    println!(
+                        "    {}•{} {}",
+                        ui::stdout_color(ui::DIM),
+                        ui::stdout_color(ui::RESET),
+                        member.relative_path
+                    );
+                } else {
+                    println!(
+                        "    {}✓{} {} — {}",
+                        ui::stdout_color(ui::GREEN),
+                        ui::stdout_color(ui::RESET),
+                        member.relative_path,
+                        ecosystems.join(", ")
+                    );
+                }
+            }
+        }
+
         let has_repo_config = project_dir.join(".cplt.toml").exists();
         if !has_repo_config {
             println!(
@@ -2128,10 +2159,10 @@ fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
         quiet,
     };
 
-    // Detect once, use for both display and generation
-    let report = cplt::detect::detect_project(&project_dir);
+    // Detect once, use for both display and generation (monorepo-aware)
+    let report = cplt::detect::detect_project_recursive(&project_dir);
 
-    if report.detections.is_empty() {
+    if report.detections.is_empty() && report.workspace_members.is_empty() {
         if !quiet {
             eprintln!("No project tooling detected in {}", project_dir.display());
             eprintln!("Nothing to generate.");
