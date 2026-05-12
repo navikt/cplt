@@ -3,7 +3,6 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use cplt::{agent, config, discover, proxy, repo_config, sandbox, scratch, trust, update};
-#[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
 use std::path::Path;
