@@ -2195,7 +2195,9 @@ fn run_init_command(write: bool, force: bool, quiet: bool) -> ExitCode {
             if !quiet {
                 eprintln!("Wrote {}", path.display());
                 eprintln!();
-                eprintln!("Next: review the file and run `cplt trust` to approve permissions.");
+                eprintln!(
+                    "Next: review the file and run `cplt trust accept --all` to approve permissions."
+                );
             }
             ExitCode::SUCCESS
         }
@@ -2408,6 +2410,9 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         }
     }
 
+    // Show actionable hint for unapproved permissions
+    let has_pending = !proposed.is_empty() && !all_approved;
+
     if let Some(ref entry) = trust_entry
         && !entry.accepted.approved_at.is_empty()
     {
@@ -2421,6 +2426,28 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
             println!("{blue}[cplt]{nc}  {red}⚠ Permissions have changed since last approval!{nc}");
             println!("{blue}[cplt]{nc}  {red}  Run `cplt trust accept --all` to re-approve.{nc}");
         }
+    } else if has_pending {
+        println!();
+        println!("{blue}[cplt]{nc}  {yellow}To approve all pending permissions:{nc}");
+        println!("{blue}[cplt]{nc}    cplt trust accept --all");
+        println!();
+        println!("{blue}[cplt]{nc}  {yellow}Or approve specific keys:{nc}");
+        let pending_keys: Vec<&&str> = proposed
+            .iter()
+            .filter(|&&key| {
+                !trust_entry
+                    .as_ref()
+                    .is_some_and(|t| trust::is_key_approved(t, key))
+            })
+            .collect();
+        println!(
+            "{blue}[cplt]{nc}    cplt trust accept {}",
+            pending_keys
+                .iter()
+                .map(|k| **k)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
 
     println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
