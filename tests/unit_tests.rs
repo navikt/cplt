@@ -4752,10 +4752,9 @@ fn set_repo_value_unset_removes_array_element() {
 }
 
 // ============================================================
-// Chromium runtime rules (allow_cache_exec = ["ms-playwright"])
+// Chromium runtime rules (allow_cache_exec = ["ms-playwright"] or subpath)
 // ============================================================
 
-#[cfg(target_os = "macos")]
 #[test]
 fn chromium_runtime_rules_emitted_for_ms_playwright() {
     let p = generate_profile(&ProfileOptions {
@@ -4807,7 +4806,6 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
     );
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
     // A user who pins a versioned subdirectory in allow_cache_exec should also
@@ -4850,7 +4848,6 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
     );
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn chromium_runtime_rules_absent_by_default() {
     let p = generate_profile(&ProfileOptions {
@@ -4890,7 +4887,6 @@ fn chromium_runtime_rules_absent_by_default() {
     );
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
     // An unrelated allow_cache_exec entry must not trigger Chromium runtime rules.
@@ -4931,7 +4927,6 @@ fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
     );
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
     // allow_cache_exec_any grants broad process-exec but must NOT trigger the
@@ -4971,4 +4966,55 @@ fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
         !p.contains("SingletonSocket"),
         "SingletonSocket rules must not be emitted when only allow_cache_exec_any is set"
     );
+}
+
+#[test]
+fn chromium_runtime_rules_absent_for_near_miss_names() {
+    // Near-miss entries that look similar to "ms-playwright" but differ in the
+    // first path component must NOT trigger Chromium runtime rules. This guards
+    // against future refactors that might loosen the check (e.g., contains() or
+    // starts_with without the trailing slash).
+    for name in &[
+        "ms-playwright-evil",
+        "ms-playwrightx",
+        "MS-PLAYWRIGHT",
+        "not-ms-playwright",
+        "xms-playwright",
+    ] {
+        let p = generate_profile(&ProfileOptions {
+            project_dir: std::path::Path::new("/projects/app"),
+            home_dir: std::path::Path::new("/Users/test"),
+            extra_read: &[],
+            extra_write: &[],
+            extra_deny: &[],
+            existing_home_tool_dirs: None,
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            allow_tmp_exec: false,
+            copilot_install_dir: None,
+            java_home: None,
+            git_hooks_path: None,
+            allow_gpg_signing: false,
+            allow_jvm_attach: false,
+            allow_docker: false,
+            electron_app_dir: None,
+            agent: cplt::agent::Agent::Copilot,
+            agent_dirs: &[],
+            allow_cache_exec: &[name.to_string()],
+            allow_cache_exec_any: false,
+            allow_browser: false,
+        });
+        assert!(
+            !p.contains("(allow syscall*)"),
+            "syscall* must not be emitted for near-miss entry {name:?}"
+        );
+        assert!(
+            !p.contains("SingletonSocket"),
+            "SingletonSocket must not be emitted for near-miss entry {name:?}"
+        );
+    }
 }

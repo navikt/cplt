@@ -354,10 +354,11 @@ fn emit_system_access(
 
     // Chromium browser runtime support (Playwright headless testing).
     //
-    // When allow_cache_exec contains "ms-playwright" (exact match), extra
-    // system-level permissions are needed beyond process-exec and file-map-executable.
-    // Without these, chrome-headless-shell segfaults (SEGV_ACCERR at 0x10)
-    // during early browser initialization.
+    // When allow_cache_exec has an entry whose first path component is
+    // "ms-playwright" (i.e. "ms-playwright" exactly or "ms-playwright/<subdir>"),
+    // extra system-level permissions are needed beyond process-exec and
+    // file-map-executable. Without these, chrome-headless-shell segfaults
+    // (SEGV_ACCERR at 0x10) during early browser initialization.
     //
     // Determined empirically by bisecting between (deny default) and (allow default):
     //
@@ -382,7 +383,8 @@ fn emit_system_access(
     //    Chromium's registered services (crashpad.* alone is insufficient).
     //
     // SECURITY: these rules only activate when the user has explicitly opted in
-    // to browser execution via allow_cache_exec = ["ms-playwright"] (exact match).
+    // to browser execution via allow_cache_exec containing "ms-playwright" or a
+    // subpath like "ms-playwright/chromium-1217" (first component must match exactly).
     // syscall* is the broadest rule — Chrome uses undocumented Mach traps that
     // cannot be individually enumerated in a stable allowlist across OS versions.
     // iokit-open-user-client is unscoped because IOKit class names vary by GPU
