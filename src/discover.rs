@@ -1067,16 +1067,14 @@ mod tests {
 
     #[test]
     fn auth_discovery_detects_env_vars() {
-        // Temporarily set a test env var
-        unsafe { std::env::set_var("COPILOT_GITHUB_TOKEN", "test-token-value") };
         let home = PathBuf::from(std::env::var("HOME").unwrap());
-        let auth = discover_auth(&home);
-        unsafe { std::env::remove_var("COPILOT_GITHUB_TOKEN") };
-
-        assert!(
-            auth.env_tokens
-                .contains(&"COPILOT_GITHUB_TOKEN".to_string())
-        );
+        temp_env::with_var("COPILOT_GITHUB_TOKEN", Some("test-token-value"), || {
+            let auth = discover_auth(&home);
+            assert!(
+                auth.env_tokens
+                    .contains(&"COPILOT_GITHUB_TOKEN".to_string())
+            );
+        });
     }
 
     #[test]

@@ -27,6 +27,7 @@ strip = true
 lto = true
 
 [dev-dependencies]
+temp-env = "0.3"
 tempfile = "3"
 
 [lints.rust]
