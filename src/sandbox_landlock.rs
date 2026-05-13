@@ -1778,6 +1778,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn app_dirs_included_when_existing_is_none() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let config = test_config(&project, &home);
+        let policy = generate_policy(&config);
+
+        // Resolve at least one mise app dir path; skip if no home dir
+        let mise_paths: Vec<PathBuf> = policy::app_dirs()[0].all_paths();
+        if mise_paths.is_empty() {
+            return;
+        }
+
+        let found = mise_paths
+            .iter()
+            .any(|p| policy.fs_rules.iter().any(|r| &r.path == p));
+        assert!(
+            found,
+            "With existing_app_dirs=None, at least one mise app dir path should appear in policy"
+        );
+    }
+
+    #[test]
+    fn app_dirs_excluded_when_no_match() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        let nonexistent = vec!["/nonexistent".to_string()];
+        config.existing_app_dirs = Some(&nonexistent);
+        let policy = generate_policy(&config);
+
+        let mise_paths: Vec<PathBuf> = policy::app_dirs()[0].all_paths();
+        for p in &mise_paths {
+            assert!(
+                !policy.fs_rules.iter().any(|r| &r.path == p),
+                "With non-matching existing_app_dirs, mise path {} should NOT appear in policy",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn app_dir_fsaccess_flags_match_permissions() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let config = test_config(&project, &home);
+        let policy = generate_policy(&config);
+
+        let mise = &policy::app_dirs()[0];
+        let all_paths = mise.all_paths();
+        if all_paths.is_empty() {
+            return;
+        }
+
+        let write_paths = mise.write_paths();
+        let process_exec_paths = mise.process_exec_paths();
+        let map_exec_paths = mise.map_exec_paths();
+        let read_paths = mise.read_paths();
+
+        for path in &all_paths {
+            let rule = policy.fs_rules.iter().find(|r| &r.path == path);
+            let Some(rule) = rule else {
+                continue;
+            };
+
+            if write_paths.contains(path) {
+                assert!(
+                    rule.access.write,
+                    "path {} is in write_paths but FsRule.write is false",
+                    path.display()
+                );
+            }
+
+            if process_exec_paths.contains(path) || map_exec_paths.contains(path) {
+                assert!(
+                    rule.access.execute,
+                    "path {} is in exec paths but FsRule.execute is false",
+                    path.display()
+                );
+            }
+
+            if read_paths.contains(path)
+                && !write_paths.contains(path)
+                && !process_exec_paths.contains(path)
+                && !map_exec_paths.contains(path)
+            {
+                assert!(
+                    !rule.access.write,
+                    "path {} is read-only but FsRule.write is true",
+                    path.display()
+                );
+                assert!(
+                    !rule.access.execute,
+                    "path {} is read-only but FsRule.execute is true",
+                    path.display()
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn proc_self_is_deferred_not_pre_opened() {

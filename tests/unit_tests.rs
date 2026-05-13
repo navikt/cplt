@@ -5190,3 +5190,138 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
         );
     }
 }
+
+// ============================================================
+// existing_app_dirs filtering — SBPL profile
+// ============================================================
+
+#[test]
+fn existing_app_dirs_none_includes_all() {
+    // Resolve a known mise app dir path at test time
+    let data_path = cplt::sandbox::AppDirKind::Data.resolve("", "", "mise");
+    let Some(data_path) = data_path else {
+        // No home dir in this environment — skip
+        return;
+    };
+    let data_str = data_path.to_string_lossy().to_string();
+
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/tmp/proj"),
+        home_dir: std::path::Path::new("/home/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        git_hooks_path: None,
+        allow_gpg_signing: false,
+        allow_jvm_attach: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+    assert!(
+        p.contains(&data_str),
+        "With existing_app_dirs=None, mise data dir path should appear in profile"
+    );
+}
+
+#[test]
+fn existing_app_dirs_matching_includes_dir() {
+    let data_path = cplt::sandbox::AppDirKind::Data.resolve("", "", "mise");
+    let Some(data_path) = data_path else {
+        return;
+    };
+    let data_str = data_path.to_string_lossy().to_string();
+
+    let existing = vec![data_str.clone()];
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/tmp/proj"),
+        home_dir: std::path::Path::new("/home/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: Some(&existing),
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        git_hooks_path: None,
+        allow_gpg_signing: false,
+        allow_jvm_attach: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+    assert!(
+        p.contains(&data_str),
+        "With existing_app_dirs containing a matching path, mise data dir should appear in profile"
+    );
+}
+
+#[test]
+fn existing_app_dirs_nonmatching_excludes_dir() {
+    // Resolve any mise path to confirm what we'd expect to see
+    let data_path = cplt::sandbox::AppDirKind::Data.resolve("", "", "mise");
+    let Some(data_path) = data_path else {
+        return;
+    };
+    let data_str = data_path.to_string_lossy().to_string();
+
+    let existing = vec!["/nonexistent".to_string()];
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/tmp/proj"),
+        home_dir: std::path::Path::new("/home/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: Some(&existing),
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        git_hooks_path: None,
+        allow_gpg_signing: false,
+        allow_jvm_attach: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+    assert!(
+        !p.contains(&data_str),
+        "With existing_app_dirs containing only non-matching paths, mise data dir should NOT appear in profile"
+    );
+}
