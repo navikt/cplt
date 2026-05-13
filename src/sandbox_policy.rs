@@ -438,6 +438,17 @@ impl AppDirKind {
                     }
                 })?
                 .join(application);
+            // Security: reject relative XDG paths. A relative value would produce a
+            // relative sandbox path, potentially widening access beyond the intended
+            // directory (e.g. path traversal via a malicious XDG env var).
+            if !xdg_dir.is_absolute() {
+                eprintln!(
+                    "Ignoring relative XDG-directory {} from env-variable {:?}",
+                    xdg_dir.display(),
+                    lookup.0
+                );
+                return None;
+            }
             Some(xdg_dir)
         } else {
             lookup.2(project_dir)
@@ -784,4 +795,39 @@ pub fn validate_sbpl_path(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate environment variables to prevent races.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resolve_rejects_relative_xdg_cache_home() {
+        // A relative XDG_CACHE_HOME must be rejected to prevent sandbox path widening.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("XDG_CACHE_HOME", "relative/path") };
+        let result = AppDirKind::Cache.resolve("", "", "myapp");
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+        assert!(
+            result.is_none(),
+            "resolve() must return None for a relative XDG path, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_absolute_xdg_cache_home() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("XDG_CACHE_HOME", "/tmp/test-cache") };
+        let result = AppDirKind::Cache.resolve("", "", "myapp");
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+        assert!(
+            result.is_some(),
+            "resolve() must return Some for an absolute XDG path"
+        );
+        assert!(result.unwrap().is_absolute());
+    }
 }
