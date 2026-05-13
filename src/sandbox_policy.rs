@@ -556,9 +556,9 @@ pub const APP_DIRS: &[AppDir] = &[AppDir {
 
 /// Return the application directory list.
 ///
-/// A single unified list covers both macOS and Linux paths. Entries for
-/// paths that don't exist on a given platform are harmlessly skipped at
-/// runtime (the profile generator checks `dir.exists()` before emitting rules).
+/// A single unified list covers both macOS and Linux paths. Some entries may
+/// not exist on a given platform or system, but they remain in the shared list
+/// and are handled by the platform-specific sandbox implementations at runtime.
 pub fn app_dirs() -> &'static [AppDir] {
     APP_DIRS
 }

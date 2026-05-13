@@ -269,8 +269,10 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
         .map(|d| d.path.to_string())
         .collect();
 
-    // Writable app dirs are always included (may be created on first use);
+    // On macOS, writable app dirs are always included (may be created on first use);
     // non-writable dirs are pruned to paths that already exist on disk.
+    // On Linux, dirs are pruned to paths that already exist on disk, since Landlock
+    // operates on file descriptors and consequently cannot apply to dirs that do not exist.
     let existing_app_dirs: Vec<String> = app_dirs()
         .iter()
         .flat_map(|app_dir| {
