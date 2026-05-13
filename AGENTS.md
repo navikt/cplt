@@ -5,14 +5,15 @@ Rust project — macOS Seatbelt sandbox wrapper for GitHub Copilot CLI.
 ## Build & test
 
 ```bash
-mise run check          # fmt + clippy + unit/lib tests (works inside sandbox)
-mise run test:all       # all suites except live smoke tests (macOS only, sandbox-safe)
-mise run test:everything # ALL tests including live smoke (macOS only, NOT sandbox-safe)
-mise run test           # all tests via cargo test (macOS only)
-mise run test:unit      # unit tests only (cross-platform, sandbox-safe)
-mise run test:lib       # library crate module tests (cross-platform, sandbox-safe)
-mise run clippy         # linter
-mise run fmt            # auto-format
+mise run check             # fmt + clippy + unit/lib tests (works inside sandbox)
+mise run test:all          # all suites except live smoke tests (macOS only, sandbox-safe)
+mise run test:everything   # ALL tests including live smoke (macOS only, NOT sandbox-safe)
+mise run test              # all tests via cargo test (macOS only)
+mise run test:unit         # unit tests only (cross-platform, sandbox-safe)
+mise run test:lib          # library crate module tests (cross-platform, sandbox-safe)
+mise run clippy            # linter
+mise run fmt               # auto-format
+mise run check:all-targets # Cargo check all release targets to catch compilation issues on non-native targets (requires user setup)
 ```
 
 Always run `mise run check` at the end of a coding session.
