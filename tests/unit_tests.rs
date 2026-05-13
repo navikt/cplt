@@ -1387,6 +1387,88 @@ fn profile_env_deny_comes_after_project_allow() {
     );
 }
 
+#[test]
+fn profile_env_deny_comes_after_user_allows() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[std::path::PathBuf::from("/projects")],
+        extra_write: &[std::path::PathBuf::from("/projects")],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        git_hooks_path: None,
+        allow_gpg_signing: false,
+        allow_jvm_attach: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+    let user_read_allow = p
+        .find("(allow file-read* (subpath \"/projects\"))")
+        .unwrap();
+    let user_write_allow = p
+        .find("(allow file-write* (subpath \"/projects\"))")
+        .unwrap();
+
+    // .env denies must come after user allows
+    let env_deny = p.find(r#"(deny file-read* (regex #"/\.env$"))"#).unwrap();
+    let env_dot_deny = p
+        .find(r#"(deny file-read* (regex #"/\.env\..*"))"#)
+        .unwrap();
+    assert!(
+        env_deny > user_read_allow,
+        "env deny must come AFTER user allow for SBPL last-match-wins"
+    );
+    assert!(
+        env_dot_deny > user_read_allow,
+        ".env.* deny must come AFTER user allow for SBPL last-match-wins"
+    );
+
+    // Git persistence denies must come after user write allows
+    let hooks_deny = p
+        .find("(deny file-write* (subpath \"/projects/app/.git/hooks\"))")
+        .unwrap();
+    let git_config_deny = p
+        .find("(deny file-write* (literal \"/projects/app/.git/config\"))")
+        .unwrap();
+    let gitmodules_deny = p
+        .find("(deny file-write* (literal \"/projects/app/.gitmodules\"))")
+        .unwrap();
+    let cplt_toml_deny = p
+        .find("(deny file-write* (literal \"/projects/app/.cplt.toml\"))")
+        .unwrap();
+
+    assert!(
+        hooks_deny > user_write_allow,
+        ".git/hooks deny must come AFTER user write allow for SBPL last-match-wins"
+    );
+    assert!(
+        git_config_deny > user_write_allow,
+        ".git/config deny must come AFTER user write allow for SBPL last-match-wins"
+    );
+    assert!(
+        gitmodules_deny > user_write_allow,
+        ".gitmodules deny must come AFTER user write allow for SBPL last-match-wins"
+    );
+    assert!(
+        cplt_toml_deny > user_write_allow,
+        ".cplt.toml deny must come AFTER user write allow for SBPL last-match-wins"
+    );
+}
+
 // ============================================================
 // Allow-localhost-any
 // ============================================================
