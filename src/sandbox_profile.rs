@@ -370,6 +370,8 @@ fn emit_system_access(
     //
     // 2. system-socket — Chromium creates sockets for IPC between its browser,
     //    renderer, and GPU processes. Without this, internal IPC setup fails.
+    //    Scoped to AF_UNIX (Unix domain sockets) — Chromium's multi-process IPC
+    //    uses Unix sockets, not TCP/UDP between its child processes.
     //
     // 3. iokit-open-user-client — Chromium probes GPU capabilities via IOKit
     //    user clients during renderer init, even in headless mode (SwiftShader
@@ -379,8 +381,9 @@ fn emit_system_access(
     //    namespace for IPC between browser, renderer, GPU, and Crashpad processes.
     //    Crashpad's child_port_handshake uses bootstrap_check_in() which requires
     //    this permission; without it, EPERM (1100) cascades into a segfault.
-    //    Scoped to org.chromium.* — the narrowest pattern that covers all of
-    //    Chromium's registered services (crashpad.* alone is insufficient).
+    //    Scoped to ^org\.chromium\..+$ — the trailing \. prevents matching
+    //    "org.chromiumevil" and the .+$ ensures at least one character follows
+    //    (Chromium uses variable-depth subnamespaces like crashpad.*, Chromium.*).
     //
     // SECURITY: these rules only activate when the user has explicitly opted in
     // to browser execution via allow_cache_exec containing "ms-playwright" or a
@@ -389,19 +392,20 @@ fn emit_system_access(
     // cannot be individually enumerated in a stable allowlist across OS versions.
     // iokit-open-user-client is unscoped because IOKit class names vary by GPU
     // hardware and macOS version; scoping would break on different machines.
-    // mach-register is scoped to the org.chromium.* namespace to prevent
-    // registration of arbitrary global Mach services.
+    // system-socket is scoped to AF_UNIX — only Unix domain sockets, not TCP/UDP.
+    // mach-register is scoped to ^org\.chromium\..+$ to prevent registration
+    // of arbitrary global Mach services.
     if allow_chromium_runtime {
         sbpl!(
             sb,
             ";; Chromium browser runtime (Playwright headless testing)"
         );
         sbpl!(sb, "(allow syscall*)");
-        sbpl!(sb, "(allow system-socket)");
+        sbpl!(sb, "(allow system-socket (socket-domain AF_UNIX))");
         sbpl!(sb, "(allow iokit-open-user-client)");
         sbpl!(
             sb,
-            r#"(allow mach-register (global-name-regex #"^org\.chromium\."))"#
+            r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#
         );
         sbpl!(sb);
     }
@@ -683,12 +687,13 @@ fn emit_temp_rules(
         // Path follows Chrome for Testing's bundle ID convention:
         //   /private/var/folders/.../T/com.google.chrome.for.testing.<random>/SingletonSocket
         //
-        // SECURITY: regex is anchored to the exact bundle-ID prefix and filename,
-        // so it does not expose SSH_AUTH_SOCK or other sensitive launchd sockets.
+        // SECURITY: regex is anchored with ^ and $ to the exact bundle-ID prefix
+        // and filename. Path segments use [^/]+ (not .+) to prevent matching across
+        // directory boundaries, matching the known macOS 2-segment var/folders layout.
         for op in &[
-            r#"(allow network-bind (local unix-socket (regex #"^/private/var/folders/.+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")))"#,
-            r#"(allow network-inbound (local unix-socket (regex #"^/private/var/folders/.+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")))"#,
-            r#"(allow network-outbound (remote unix-socket (regex #"^/private/var/folders/.+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")))"#,
+            r#"(allow network-bind (local unix-socket (regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")))"#,
+            r#"(allow network-inbound (local unix-socket (regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")))"#,
+            r#"(allow network-outbound (remote unix-socket (regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")))"#,
         ] {
             sbpl!(sb, "{op}");
         }

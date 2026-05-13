@@ -4789,20 +4789,20 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
         "syscall* required for Chromium Mach traps"
     );
     assert!(
-        p.contains("(allow system-socket)"),
-        "system-socket required for Chromium IPC"
+        p.contains("(allow system-socket (socket-domain AF_UNIX))"),
+        "system-socket must be scoped to AF_UNIX for Chromium IPC"
     );
     assert!(
         p.contains("(allow iokit-open-user-client)"),
         "iokit-open-user-client required for GPU probing"
     );
     assert!(
-        p.contains(r#"(allow mach-register (global-name-regex #"^org\.chromium\."))"#),
-        "mach-register scoped to org.chromium.* required for Crashpad and inter-process IPC"
+        p.contains(r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#),
+        "mach-register must be anchored with ^...$ and scoped to org.chromium.*"
     );
     assert!(
-        p.contains("SingletonSocket"),
-        "ProcessSingleton unix socket rules must be present"
+        p.contains(r#"(regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")"#),
+        "SingletonSocket regex must use [^/]+/[^/]+ for var/folders segments and be fully anchored"
     );
 }
 
@@ -4843,8 +4843,12 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
         "syscall* must be present for subpath entry"
     );
     assert!(
-        p.contains("SingletonSocket"),
-        "SingletonSocket rules must be present for subpath entry"
+        p.contains("(allow system-socket (socket-domain AF_UNIX))"),
+        "system-socket must be scoped to AF_UNIX for subpath entry"
+    );
+    assert!(
+        p.contains(r#"(regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")"#),
+        "SingletonSocket regex must use [^/]+/[^/]+ for subpath entry"
     );
 }
 
