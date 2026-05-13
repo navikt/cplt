@@ -376,13 +376,21 @@ pub const GPG_SIGNING_ALLOW_FILES: &[&str] = &[
 /// Application directory kinds according to relevant platform specifications.
 /// See https://docs.rs/directories for more details
 pub enum AppDirKind {
+    /// macOS: `~/Library/Caches/<app>` · Linux/macOS when using XDG: `~/.cache/<app>`
     Cache,
+    /// macOS: `~/Library/Application Support/<app>` · Linux/macOS when using XDG: `~/.config/<app>`
     Config,
+    /// macOS: `~/Library/Application Support/<app>` · Linux/macOS when using XDG: `~/.config/<app>`
     ConfigLocal,
+    /// macOS: `~/Library/Application Support/<app>` · Linux/macOS when using XDG: `~/.local/share/<app>`
     Data,
+    /// macOS: `~/Library/Application Support/<app>` · Linux/macOS when using XDG: `~/.local/share/<app>`
     DataLocal,
+    /// macOS: `~/Library/Preferences/<app>` · Linux/macOS when using XDG: `~/.config/<app>`
     Preference,
+    /// macOS: None · Linux: `/run/user/<uid>/<app>` (via `XDG_RUNTIME_DIR`)
     Runtime,
+    /// macOS: None · Linux/macOS when using XDG: `~/.local/state/<app>`
     State,
 }
 
@@ -544,15 +552,26 @@ pub const DEFAULT_READ_APP_DIRS: &[AppDirKind] = &[
     AppDirKind::State,
 ];
 
-pub const APP_DIRS: &[AppDir] = &[AppDir {
-    qualifier: "",
-    organization: "",
-    application: "mise",
-    process_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
-    map_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
-    write: DEFAULT_WRITE_APP_DIRS,
-    read: DEFAULT_READ_APP_DIRS,
-}];
+pub const APP_DIRS: &[AppDir] = &[
+    AppDir {
+        qualifier: "",
+        organization: "",
+        application: "mise",
+        process_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
+        map_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
+        write: DEFAULT_WRITE_APP_DIRS,
+        read: DEFAULT_READ_APP_DIRS,
+    },
+    AppDir {
+        qualifier: "",
+        organization: "",
+        application: "pnpm",
+        process_exec: &[],
+        map_exec: &[],
+        write: DEFAULT_WRITE_APP_DIRS,
+        read: DEFAULT_READ_APP_DIRS,
+    },
+];
 
 /// Return the application directory list.
 ///
@@ -597,12 +616,6 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     // Agent needs to run their binaries but should not modify installations.
     HomeToolDir {
         path: ".local",
-        process_exec: true,
-        map_exec: true,
-        write: false,
-    },
-    HomeToolDir {
-        path: ".mise",
         process_exec: true,
         map_exec: true,
         write: false,
@@ -740,16 +753,9 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         write: true,
     },
     // pnpm global store: contains packages + executable shims
-    // macOS-native path
+    // macOS-native path not following conventions set out by AppDirs
     HomeToolDir {
         path: "Library/pnpm",
-        process_exec: true,
-        map_exec: true,
-        write: true,
-    },
-    // XDG path (Linux)
-    HomeToolDir {
-        path: ".local/share/pnpm",
         process_exec: true,
         map_exec: true,
         write: true,
