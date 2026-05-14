@@ -346,4 +346,24 @@ mod bwrap_tests {
             "Landlock should still block sensitive paths with bwrap"
         );
     }
+
+    #[test]
+    fn bwrap_preserves_environment_variables() {
+        if !bwrap_available() {
+            eprintln!("SKIPPED: bwrap not available");
+            return;
+        }
+
+        let project = create_test_project();
+
+        // Test that essential environment variables are preserved
+        let (exit, stdout, _) = run_sandboxed_with_bwrap(
+            project.path(),
+            "echo HOME=$HOME; echo PATH=$PATH | grep -q '/bin' && echo 'path ok'",
+        );
+
+        assert_eq!(exit, 0);
+        assert!(stdout.contains("HOME="), "HOME should be set");
+        assert!(stdout.contains("path ok"), "PATH should contain /bin");
+    }
 }

@@ -132,8 +132,10 @@ pub fn build_bwrap_args(
 
     // ── Filesystem setup ───────────────────────────────────────
 
-    // Start with empty root filesystem
-    args.push("--clearenv".to_string());
+    // Note: We do NOT use --clearenv because cplt sets environment variables
+    // via Command::env() after this function returns, and those need to be
+    // preserved through bwrap to the sandboxed process. Bwrap will inherit
+    // the environment from the parent Command.
 
     // Mount essential system directories (read-only)
     for sys_dir in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {

@@ -9,7 +9,7 @@
 **Kernel-enforced sandbox for AI coding agents.** Wraps GitHub Copilot CLI, OpenCode, Gemini CLI, Antigravity CLI, Pi, or any shell so agents can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
-- **Linux**: Landlock LSM + seccomp-BPF (kernel 5.13+; full network filtering on 6.7+)
+- **Linux**: Landlock LSM + seccomp-BPF + optional Bubblewrap namespace isolation (kernel 5.13+; full network filtering on 6.7+)
 
 ![cplt banner](./assets/cplt.png)
 
