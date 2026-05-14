@@ -16,6 +16,7 @@ Sandbox wrapper for AI coding agents. Runs GitHub Copilot CLI, OpenCode, Google 
 ## Table of contents
 
 - [Quick start](#quick-start)
+- [Why cplt?](#why-cplt)
 - [Install](#install)
 - [What it does](#what-it-does)
 - [Usage](#usage)
@@ -90,6 +91,53 @@ cplt --agent shell
 This table is a summary. The sandbox also allows access to system files (SSL certs, `/etc/hosts`), temp directories (read/write but no exec), and system tool paths (`/usr/bin`, `/opt/homebrew`). Run `cplt --print-profile` to see the complete SBPL rules.
 
 For the full security model, threat analysis, and test strategy, see **[SECURITY.md](SECURITY.md)**.
+
+## Why cplt?
+
+If you are comparing sandbox options for coding agents, cplt is built for a specific setup: keep the normal local CLI workflow, but add kernel-enforced restrictions around what the agent can read, write, execute, and connect to.
+
+It is not the broadest isolation model in every category. The value is the combination: fast startup, no Docker dependency, repo-aware policy, outbound filtering, and secret-focused defaults that work on a developer laptop.
+
+### Compared with Codex CLI's sandbox
+
+| Area | cplt | Codex CLI sandbox |
+| --- | --- | --- |
+| Outbound network control | CONNECT proxy with domain allow/block lists | No domain-level filtering |
+| Environment handling | Allowlist + hardening env injection | More basic pass-through model |
+| Secret file protection | Deny patterns such as `.env*`, `.pem`, `.key` inside the repo | Primarily directory-scoped access |
+| Repo policy | `.cplt.toml` with explicit trust/approval flow | No repo-level policy file |
+| Agent support | Copilot, OpenCode, Gemini CLI, Pi, or shell | Codex only |
+
+cplt is not stronger everywhere. Codex CLI has Linux namespace isolation today, and it already exposes explicit sandbox modes such as read-only and workspace-write. cplt does not yet have that mode matrix.
+
+### Compared with Docker-based sandboxes
+
+| Area | cplt | Docker-based sandbox |
+| --- | --- | --- |
+| Startup time | Roughly instant for normal CLI use | Usually slower container startup |
+| Network control | Per-request outbound filtering via proxy | Usually all-or-nothing network access |
+| File controls | Per-path and per-pattern rules | Per-mount controls |
+| Host requirements | Single binary | Docker daemon required |
+| Corporate laptop fit | Works where Docker is unavailable or restricted | Often blocked by local policy |
+
+Docker still gives you stronger isolation boundaries in some environments, especially if you want a fully separate filesystem and process namespace. cplt makes a different trade-off: lighter setup and tighter integration with the developer machine you already use.
+
+### Compared with VS Code agent mode permissions
+
+Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces restrictions in the kernel, so the agent cannot talk its way around them with a prompt or a modified instruction.
+
+That matters most for CLI agents and credential exposure:
+
+- cplt works outside the IDE
+- env vars are filtered before the agent starts
+- sensitive files can be blocked even when they live inside the repo
+- the same restrictions apply to child processes
+
+### Honest gaps
+
+- macOS has the strongest file-level enforcement today; Linux coverage is improving but not identical
+- cplt does not yet offer simple read-only / workspace-write / full-access policy presets
+- if you want full container isolation, cplt is not trying to replace Docker
 
 ## Install
 
