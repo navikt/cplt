@@ -105,8 +105,8 @@ It is not the broadest isolation model in every category. The value is the combi
 | Outbound network control | CONNECT proxy with domain allow/block lists | No domain-level filtering |
 | Environment handling | Allowlist + hardening env injection | More basic pass-through model |
 | Secret file protection | Deny patterns such as `.env*`, `.pem`, `.key` inside the repo | Primarily directory-scoped access |
-| Repo policy | `.cplt.toml` with explicit trust/approval flow | No repo-level policy file |
-| Agent support | Copilot, OpenCode, Gemini CLI, Pi, or shell | Codex only |
+| Repo policy | [`.cplt.toml`](docs/configuration.md#per-repo-configuration-cplttoml) with explicit trust/approval flow | No repo-level policy file |
+| Agent support | Copilot, OpenCode, Gemini CLI, Pi agent, or shell | Codex only |
 
 cplt is not stronger everywhere. Codex CLI has Linux namespace isolation today, and it already exposes explicit sandbox modes such as read-only and workspace-write. cplt does not yet have that mode matrix.
 
