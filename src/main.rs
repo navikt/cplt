@@ -364,6 +364,19 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
     #[arg(long)]
     no_git_guard: bool,
 
+    /// Use Bubblewrap for namespace isolation on Linux (auto-detect if not specified).
+    /// Provides defense-in-depth: PID, mount, network, and user namespaces on top
+    /// of Landlock + seccomp-BPF. Falls back to Landlock+seccomp if bwrap unavailable.
+    /// Only effective on Linux — ignored on macOS.
+    #[arg(long)]
+    use_bubblewrap: bool,
+
+    /// Disable Bubblewrap namespace isolation even if available (Linux only).
+    /// Falls back to Landlock + seccomp-BPF. Use when Bubblewrap causes compatibility
+    /// issues with specific tools or environments.
+    #[arg(long)]
+    no_bubblewrap: bool,
+
     /// Skip the startup check that verifies the sandbox is working.
     /// The check runs a quick test command inside the sandbox to confirm
     /// that file and network restrictions are active.
@@ -989,6 +1002,13 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         allow_cache_exec_any: cli.allow_cache_exec_any,
         allow_browser: cli.allow_browser,
         scratch: config::FeatureToggle::from_pair(cli.scratch_dir, cli.no_scratch_dir),
+        use_bubblewrap: if cli.use_bubblewrap {
+            Some(true)
+        } else if cli.no_bubblewrap {
+            Some(false)
+        } else {
+            None
+        },
         quiet: config::FeatureToggle::from_pair(cli.quiet, cli.no_quiet),
         yes: config::FeatureToggle::from_pair(cli.yes, cli.no_yes),
         gh_guard: config::FeatureToggle::from_pair(cli.gh_guard, cli.no_gh_guard),
@@ -1609,6 +1629,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         allow_cache_exec: &resolved.allow_cache_exec,
         allow_cache_exec_any: resolved.allow_cache_exec_any,
         allow_browser: resolved.allow_browser,
+        use_bubblewrap: resolved.use_bubblewrap,
     }) {
         Ok(s) => s,
         Err(e) => bail!("{e}"),
@@ -2121,6 +2142,7 @@ fn run_exec_command(
         allow_cache_exec: &resolved.allow_cache_exec,
         allow_cache_exec_any: resolved.allow_cache_exec_any,
         allow_browser: resolved.allow_browser,
+        use_bubblewrap: resolved.use_bubblewrap,
     }) {
         Ok(s) => s,
         Err(e) => bail!("{e}"),

@@ -538,9 +538,12 @@ pub fn preflight(_sandbox: &super::PreparedSandbox) -> Result<(), String> {
     Ok(())
 }
 
-/// Execute copilot inside a Landlock + seccomp sandbox.
+/// Execute copilot inside a Landlock + seccomp sandbox, optionally wrapped with Bubblewrap.
 ///
-/// The sandbox is applied via a `pre_exec` hook that runs in the child
+/// If bubblewrap is configured in the PreparedSandbox, the execution flow becomes:
+///   cplt → bwrap (namespaces) → copilot (Landlock+seccomp via pre_exec)
+///
+/// Otherwise, Landlock+seccomp are applied via a `pre_exec` hook that runs in the child
 /// process between fork() and exec(). All allocation and I/O was done
 /// in the parent via `precompute()` — the hook only makes raw syscalls.
 #[cfg(target_os = "linux")]
@@ -558,11 +561,27 @@ pub fn exec(
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;
 
-    let mut cmd = Command::new(copilot_bin);
+    // Determine if we're using bubblewrap
+    let (cmd_bin, cmd_args): (PathBuf, Vec<String>) = if let Some(ref bwrap) = sandbox.bwrap_wrapper
+    {
+        // Build bwrap command: bwrap [bwrap_args] -- copilot_bin [copilot_args]
+        let mut full_args = bwrap.bwrap_args.clone();
+        full_args.push("--".to_string());
+        full_args.push(copilot_bin.to_string_lossy().to_string());
+        full_args.extend(copilot_args.iter().cloned());
+
+        (bwrap.bwrap_path.clone(), full_args)
+    } else {
+        // Direct execution without bwrap
+        (copilot_bin.to_path_buf(), copilot_args.to_vec())
+    };
+
+    let mut cmd = Command::new(&cmd_bin);
+    cmd.args(&cmd_args);
 
     configure_command(
         &mut cmd,
-        copilot_args,
+        &[], // Args already included in cmd_args
         &sandbox.project_dir,
         &sandbox.home_dir,
         extra_pass_env,

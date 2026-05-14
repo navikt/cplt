@@ -29,6 +29,8 @@ use crate::agent::{Agent, AgentDir};
 #[cfg(target_os = "linux")]
 use crate::ui;
 
+#[path = "sandbox_bubblewrap.rs"]
+mod bubblewrap;
 #[path = "sandbox_env.rs"]
 mod env;
 #[path = "sandbox_exec.rs"]
@@ -122,6 +124,11 @@ pub struct SandboxConfig<'a> {
     pub allow_cache_exec_any: bool,
     /// Allow Launch Services (`open` command) for OAuth browser flows.
     pub allow_browser: bool,
+    /// Use Bubblewrap for namespace isolation (Linux only).
+    /// - `Some(true)`: Always use bwrap (fail if unavailable)
+    /// - `Some(false)`: Never use bwrap (Landlock+seccomp only)
+    /// - `None`: Auto-detect and use if available (graceful degradation)
+    pub use_bubblewrap: Option<bool>,
 }
 
 /// A validated, platform-specific sandbox ready for execution.
@@ -149,6 +156,20 @@ pub struct PreparedSandbox {
     /// Built in the parent process; applied in pre_exec.
     #[cfg(target_os = "linux")]
     precomputed: landlock_mod::PrecomputedSandbox,
+    /// Bubblewrap execution wrapper (Linux only).
+    /// If Some, bwrap is used to wrap the execution.
+    #[cfg(target_os = "linux")]
+    bwrap_wrapper: Option<BubblewrapWrapper>,
+}
+
+/// Bubblewrap execution wrapper configuration (Linux only).
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct BubblewrapWrapper {
+    /// Path to the bwrap binary.
+    bwrap_path: PathBuf,
+    /// Pre-built command arguments for bwrap.
+    bwrap_args: Vec<String>,
 }
 
 impl PreparedSandbox {
@@ -320,6 +341,66 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     // The pre_exec hook only makes raw syscalls.
     let precomputed = landlock_mod::precompute(policy)?;
 
+    // Check if bubblewrap should be used
+    let bwrap_wrapper = match config.use_bubblewrap {
+        Some(true) => {
+            // User explicitly requested bwrap — fail if unavailable
+            let bwrap_path = bubblewrap::check_availability().ok_or_else(|| {
+                "Bubblewrap (bwrap) explicitly requested but not found in PATH. \
+                     Install bubblewrap or remove --use-bubblewrap flag."
+                    .to_string()
+            })?;
+            bubblewrap::test_functionality(&bwrap_path)?;
+
+            let bwrap_args = bubblewrap::build_bwrap_args(
+                config.project_dir,
+                config.home_dir,
+                config.scratch_dir,
+                config.extra_read,
+                config.extra_write,
+            );
+
+            Some(BubblewrapWrapper {
+                bwrap_path,
+                bwrap_args,
+            })
+        }
+        Some(false) => {
+            // User explicitly disabled bwrap
+            None
+        }
+        None => {
+            // Auto-detect: use bwrap if available, fall back if not
+            if let Some(bwrap_path) = bubblewrap::check_availability() {
+                match bubblewrap::test_functionality(&bwrap_path) {
+                    Ok(()) => {
+                        let bwrap_args = bubblewrap::build_bwrap_args(
+                            config.project_dir,
+                            config.home_dir,
+                            config.scratch_dir,
+                            config.extra_read,
+                            config.extra_write,
+                        );
+
+                        Some(BubblewrapWrapper {
+                            bwrap_path,
+                            bwrap_args,
+                        })
+                    }
+                    Err(e) => {
+                        ui::warn(&format!(
+                            "Bubblewrap detected but not functional ({e}). \
+                             Falling back to Landlock+seccomp only."
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+    };
+
     Ok(PreparedSandbox {
         project_dir: config.project_dir.to_path_buf(),
         home_dir: config.home_dir.to_path_buf(),
@@ -330,6 +411,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
         precomputed,
+        bwrap_wrapper,
     })
 }
 

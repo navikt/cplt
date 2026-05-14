@@ -92,19 +92,59 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 
 ### Platform enforcement comparison
 
-| Protection | macOS (Seatbelt) | Linux (Landlock + seccomp) |
-|---|---|---|
-| Credential files (~/.ssh, ~/.aws) | ✅ Kernel deny | ✅ Not in ruleset (deny-by-default) |
-| Project .env file read/write/delete | ✅ Kernel deny | ⚠️ Proxy blocks exfiltration |
-| .git/hooks write in project | ✅ Kernel deny | ⚠️ Env hardening (GIT_CONFIG_NOSYSTEM) |
-| .git/config write in project | ✅ Kernel deny | ⚠️ Env hardening + proxy |
-| Network: outbound port filtering | ✅ Kernel (all versions) | ✅ Kernel (6.7+) / ⚠️ Proxy only (<6.7) |
-| Network: localhost isolation | ✅ Kernel deny | ⚠️ Proxy domain filtering |
-| Exec from /tmp | ✅ Kernel deny | ✅ Landlock deny |
-| Dangerous syscalls | N/A (Seatbelt covers) | ✅ seccomp-BPF |
-| --deny-path | ✅ Kernel deny | ❌ No effect (warned) |
+| Protection | macOS (Seatbelt) | Linux (Landlock + seccomp) | Linux (+ Bubblewrap) |
+|---|---|---|---|
+| Credential files (~/.ssh, ~/.aws) | ✅ Kernel deny | ✅ Not in ruleset (deny-by-default) | ✅ Namespace + Landlock |
+| Project .env file read/write/delete | ✅ Kernel deny | ⚠️ Proxy blocks exfiltration | ⚠️ Proxy blocks exfiltration |
+| .git/hooks write in project | ✅ Kernel deny | ⚠️ Env hardening (GIT_CONFIG_NOSYSTEM) | ⚠️ Env hardening |
+| .git/config write in project | ✅ Kernel deny | ⚠️ Env hardening + proxy | ⚠️ Env hardening + proxy |
+| Network: outbound port filtering | ✅ Kernel (all versions) | ✅ Kernel (6.7+) / ⚠️ Proxy only (<6.7) | ✅ Network namespace |
+| Network: localhost isolation | ✅ Kernel deny | ⚠️ Proxy domain filtering | ✅ Network namespace |
+| Exec from /tmp | ✅ Kernel deny | ✅ Landlock deny | ✅ Landlock deny |
+| Dangerous syscalls | N/A (Seatbelt covers) | ✅ seccomp-BPF | ✅ seccomp-BPF |
+| PID namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
+| Mount namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
+| User namespace (unprivileged) | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
+| --deny-path | ✅ Kernel deny | ❌ No effect (warned) | ❌ No effect (warned) |
 
 Legend: ✅ = kernel-enforced, ⚠️ = defense-in-depth (proxy/env), ❌ = not available
+
+### Linux namespace isolation (Bubblewrap)
+
+On Linux, cplt can optionally layer **Bubblewrap** (`bwrap`) on top of Landlock + seccomp-BPF for defense-in-depth namespace isolation. Bubblewrap is used by Flatpak and provides battle-tested container functionality.
+
+**Namespace layers:**
+
+1. **PID namespace** — agent cannot see or signal host processes. `ps` shows only the agent's own process tree, preventing process enumeration attacks.
+2. **Mount namespace** — only necessary paths are mounted; everything else is invisible. Provides additional filesystem isolation beyond Landlock's deny-by-default model.
+3. **Network namespace** — only loopback interface is available. All external network access is blocked at the kernel level; the proxy is accessible via `127.0.0.1`. This provides localhost SSRF protection comparable to macOS Seatbelt.
+4. **User namespace** — runs unprivileged (no root needed). The agent appears as UID 0 inside the namespace but has no real root capabilities outside.
+
+**Activation:**
+
+- **Auto-detect (default):** If `bwrap` is in PATH and functional, it's used automatically. Falls back to Landlock+seccomp if unavailable.
+- **Explicit enable:** `--use-bubblewrap` or `sandbox.use_bubblewrap = true` in config — fails if bwrap unavailable.
+- **Explicit disable:** `--no-bubblewrap` or `sandbox.use_bubblewrap = false` — uses Landlock+seccomp only.
+
+**Graceful degradation:** Bubblewrap requires kernel 3.8+ with user namespaces enabled. On systems without bwrap or namespace support, cplt falls back to Landlock + seccomp-BPF (still providing strong filesystem and syscall isolation).
+
+**Security model:** Bubblewrap provides namespace isolation; Landlock + seccomp-BPF are still applied inside the namespace via `pre_exec` hook. This creates multiple defense layers:
+- Filesystem: Landlock (deny-by-default) + mount namespace (path visibility)
+- Network: Network namespace (kernel-level isolation) + Landlock port filtering (6.7+) + proxy (domain filtering)
+- Syscalls: seccomp-BPF (ptrace, mount, kexec_load blocked)
+- Processes: PID namespace (host process tree invisible)
+
+**Installation:**
+```bash
+# Debian/Ubuntu
+sudo apt install bubblewrap
+
+# Fedora/RHEL
+sudo dnf install bubblewrap
+
+# Arch
+sudo pacman -S bubblewrap
+```
 
 ### Out of scope
 

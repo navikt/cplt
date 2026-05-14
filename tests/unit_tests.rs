@@ -564,6 +564,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        use_bubblewrap: None,
     });
 
     let device_paths = ["/dev/tty", "/dev/ptmx", "/dev/pts"];
@@ -2358,6 +2359,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        use_bubblewrap: None,
     });
     assert!(
         !landlock_policy.restrict_net_connect,
@@ -2410,6 +2412,7 @@ fn config_options_parity_across_backends() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        use_bubblewrap: None,
     };
 
     // ── Landlock policy ──

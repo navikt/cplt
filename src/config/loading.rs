@@ -272,6 +272,9 @@ impl Config {
             .scratch
             .resolve(self.sandbox.scratch_dir.unwrap_or(true));
 
+        // Use-bubblewrap: CLI flag wins (if set), then config, then None (auto-detect)
+        let use_bubblewrap = cli.use_bubblewrap.or(self.sandbox.use_bubblewrap);
+
         // Quiet: FeatureToggle resolves --quiet/--no-quiet (default: off)
         let quiet = cli.quiet.resolve(self.sandbox.quiet.unwrap_or(false));
 
@@ -392,6 +395,7 @@ impl Config {
             allow_cache_exec_any,
             allow_browser,
             scratch_dir,
+            use_bubblewrap,
             quiet,
             yes,
             gh_guard,
