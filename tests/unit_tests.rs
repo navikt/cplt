@@ -1416,6 +1416,7 @@ fn profile_env_deny_comes_after_user_allows() {
         extra_write: &[std::path::PathBuf::from("/projects")],
         extra_deny: &[],
         existing_home_tool_dirs: None,
+        existing_app_dirs: None,
         extra_ports: &[],
         localhost_ports: &[],
         proxy_port: None,
