@@ -125,7 +125,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_system_access(&mut sb, &home, opts.allow_browser, allow_chromium_runtime);
     emit_tool_dirs(
         &mut sb,
-        &home,
+        opts.home_dir,
         opts.existing_home_tool_dirs,
         opts.existing_app_dirs,
         opts.agent,
@@ -485,13 +485,14 @@ fn emit_git_hooks(sb: &mut String, git_hooks_path: Option<&Path>) {
 
 fn emit_tool_dirs(
     sb: &mut String,
-    home: &str,
+    home_dir: &std::path::Path,
     existing_home_tool_dirs: Option<&[String]>,
     existing_app_dirs: Option<&[String]>,
     agent: Agent,
     allow_cache_exec: &[String],
     allow_cache_exec_any: bool,
 ) {
+    let home = home_dir.to_string_lossy();
     sbpl!(sb, ";; Developer tools");
     for dir in TOOL_READ_DIRS {
         sbpl!(sb, "(allow file-read* (subpath \"{dir}\"))");
@@ -536,7 +537,7 @@ fn emit_tool_dirs(
     // App dirs: absolute paths resolved from XDG/macOS conventions.
     // Use discovered existing dirs if available, else include all.
     for dir in app_dirs() {
-        let all_paths = dir.all_paths();
+        let all_paths = dir.all_paths(home_dir);
         let include = match existing_app_dirs {
             Some(existing) => all_paths
                 .iter()
@@ -546,10 +547,10 @@ fn emit_tool_dirs(
         if !include {
             continue;
         }
-        let read_paths = dir.read_paths();
-        let write_paths = dir.write_paths();
-        let process_exec_paths = dir.process_exec_paths();
-        let map_exec_paths = dir.map_exec_paths();
+        let read_paths = dir.read_paths(home_dir);
+        let write_paths = dir.write_paths(home_dir);
+        let process_exec_paths = dir.process_exec_paths(home_dir);
+        let map_exec_paths = dir.map_exec_paths(home_dir);
 
         // Allow rules first
         for path in &read_paths {

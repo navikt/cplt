@@ -5204,7 +5204,8 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
 #[test]
 fn existing_app_dirs_none_includes_all() {
     // Resolve a known mise app dir path at test time
-    let data_path = cplt::sandbox::AppDirKind::Data.resolve("", "", "mise");
+    let data_path =
+        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/home/test"));
     let Some(data_path) = data_path else {
         // No home dir in this environment — skip
         return;
@@ -5247,7 +5248,8 @@ fn existing_app_dirs_none_includes_all() {
 
 #[test]
 fn existing_app_dirs_matching_includes_dir() {
-    let data_path = cplt::sandbox::AppDirKind::Data.resolve("", "", "mise");
+    let data_path =
+        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/home/test"));
     let Some(data_path) = data_path else {
         return;
     };
@@ -5291,7 +5293,8 @@ fn existing_app_dirs_matching_includes_dir() {
 #[test]
 fn existing_app_dirs_nonmatching_excludes_dir() {
     // Resolve any mise path to confirm what we'd expect to see
-    let data_path = cplt::sandbox::AppDirKind::Data.resolve("", "", "mise");
+    let data_path =
+        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/home/test"));
     let Some(data_path) = data_path else {
         return;
     };

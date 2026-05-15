@@ -283,17 +283,21 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // ── Application directories (filtered by discovery) ──
     for dir in policy::app_dirs() {
         if should_include_app_dir(dir, config) {
-            let process_exec = dir.process_exec_paths();
-            let map_exec = dir.map_exec_paths();
-            let write = dir.write_paths();
+            let process_exec = dir.process_exec_paths(home);
+            let map_exec = dir.map_exec_paths(home);
+            let write = dir.write_paths(home);
+            let read = dir.read_paths(home);
             // all_paths() returns deduplicated union of all categories
-            for path in dir.all_paths() {
+            for path in dir.all_paths(home) {
                 let execute = process_exec.contains(&path) || map_exec.contains(&path);
                 let writable = write.contains(&path);
+                // read permission mirrors SBPL: only paths in read_paths() get file-read*.
+                // A write-only path (not in read_paths) does not get read access.
+                let readable = read.contains(&path);
                 fs_rules.push(FsRule {
                     path,
                     access: FsAccess {
-                        read: true,
+                        read: readable,
                         write: writable,
                         execute,
                         ioctl: false,
@@ -562,11 +566,11 @@ fn should_include_tool_dir(dir: &HomeToolDir, config: &super::SandboxConfig) -> 
     }
 }
 
-/// Check if a app directory should be included based on discovery data.
+/// Check if an app directory should be included based on discovery data.
 fn should_include_app_dir(dir: &AppDir, config: &super::SandboxConfig) -> bool {
     match &config.existing_app_dirs {
         Some(existing) => dir
-            .all_paths()
+            .all_paths(config.home_dir)
             .iter()
             .any(|p| existing.iter().any(|e| e == p.to_string_lossy().as_ref())),
         None => true,
@@ -1786,7 +1790,7 @@ mod tests {
         let policy = generate_policy(&config);
 
         // Resolve at least one mise app dir path; skip if no home dir
-        let mise_paths: Vec<PathBuf> = policy::app_dirs()[0].all_paths();
+        let mise_paths: Vec<PathBuf> = policy::app_dirs()[0].all_paths(&home);
         if mise_paths.is_empty() {
             return;
         }
@@ -1809,7 +1813,7 @@ mod tests {
         config.existing_app_dirs = Some(&nonexistent);
         let policy = generate_policy(&config);
 
-        let mise_paths: Vec<PathBuf> = policy::app_dirs()[0].all_paths();
+        let mise_paths: Vec<PathBuf> = policy::app_dirs()[0].all_paths(&home);
         for p in &mise_paths {
             assert!(
                 !policy.fs_rules.iter().any(|r| &r.path == p),
@@ -1827,15 +1831,15 @@ mod tests {
         let policy = generate_policy(&config);
 
         let mise = &policy::app_dirs()[0];
-        let all_paths = mise.all_paths();
+        let all_paths = mise.all_paths(&home);
         if all_paths.is_empty() {
             return;
         }
 
-        let write_paths = mise.write_paths();
-        let process_exec_paths = mise.process_exec_paths();
-        let map_exec_paths = mise.map_exec_paths();
-        let read_paths = mise.read_paths();
+        let write_paths = mise.write_paths(&home);
+        let process_exec_paths = mise.process_exec_paths(&home);
+        let map_exec_paths = mise.map_exec_paths(&home);
+        let read_paths = mise.read_paths(&home);
 
         for path in &all_paths {
             let rule = policy.fs_rules.iter().find(|r| &r.path == path);
@@ -1855,6 +1859,20 @@ mod tests {
                 assert!(
                     rule.access.execute,
                     "path {} is in exec paths but FsRule.execute is false",
+                    path.display()
+                );
+            }
+
+            if read_paths.contains(path) {
+                assert!(
+                    rule.access.read,
+                    "path {} is in read_paths but FsRule.read is false",
+                    path.display()
+                );
+            } else {
+                assert!(
+                    !rule.access.read,
+                    "path {} is NOT in read_paths but FsRule.read is true",
                     path.display()
                 );
             }

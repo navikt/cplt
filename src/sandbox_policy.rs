@@ -400,10 +400,10 @@ impl AppDirKind {
         qualifier: &str,
         organization: &str,
         application: &str,
+        home_dir: &std::path::Path,
     ) -> Option<PathBuf> {
         let project_dir = ProjectDirs::from(qualifier, organization, application)?;
         let use_xdg = qualifier.is_empty();
-        let home_dir = directories::BaseDirs::new()?.home_dir().to_owned();
         type Lookup = (
             &'static str,
             &'static str,
@@ -486,44 +486,72 @@ pub struct AppDir {
 }
 
 impl AppDir {
-    pub fn process_exec_paths(&self) -> Vec<PathBuf> {
+    pub fn process_exec_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
         self.process_exec
             .iter()
-            .filter_map(|k| k.resolve(self.qualifier, self.organization, self.application))
+            .filter_map(|k| {
+                k.resolve(
+                    self.qualifier,
+                    self.organization,
+                    self.application,
+                    home_dir,
+                )
+            })
             .collect()
     }
 
-    pub fn map_exec_paths(&self) -> Vec<PathBuf> {
+    pub fn map_exec_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
         self.map_exec
             .iter()
-            .filter_map(|k| k.resolve(self.qualifier, self.organization, self.application))
+            .filter_map(|k| {
+                k.resolve(
+                    self.qualifier,
+                    self.organization,
+                    self.application,
+                    home_dir,
+                )
+            })
             .collect()
     }
 
-    pub fn write_paths(&self) -> Vec<PathBuf> {
+    pub fn write_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
         self.write
             .iter()
-            .filter_map(|k| k.resolve(self.qualifier, self.organization, self.application))
+            .filter_map(|k| {
+                k.resolve(
+                    self.qualifier,
+                    self.organization,
+                    self.application,
+                    home_dir,
+                )
+            })
             .collect()
     }
 
-    pub fn read_paths(&self) -> Vec<PathBuf> {
+    pub fn read_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
         self.read
             .iter()
-            .filter_map(|k| k.resolve(self.qualifier, self.organization, self.application))
+            .filter_map(|k| {
+                k.resolve(
+                    self.qualifier,
+                    self.organization,
+                    self.application,
+                    home_dir,
+                )
+            })
             .collect()
     }
 
     /// Union of all category paths, deduplicated.
-    pub fn all_paths(&self) -> Vec<PathBuf> {
+    pub fn all_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
         let mut seen = std::collections::HashSet::new();
         let mut paths = Vec::new();
         for p in self
-            .process_exec_paths()
+            .process_exec_paths(home_dir)
             .into_iter()
-            .chain(self.map_exec_paths())
-            .chain(self.write_paths())
-            .chain(self.read_paths())
+            .chain(self.map_exec_paths(home_dir))
+            .chain(self.write_paths(home_dir))
+            .chain(self.read_paths(home_dir))
         {
             if seen.insert(p.clone()) {
                 paths.push(p);
@@ -781,8 +809,9 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
 /// Return the home tool directory list.
 ///
 /// A single unified list covers both macOS and Linux paths. Entries for
-/// paths that don't exist on a given platform are harmlessly skipped at
-/// runtime (the profile generator checks `dir.exists()` before emitting rules).
+/// paths that don't exist on a given platform are harmlessly skipped because
+/// `discover.rs` filters them via `existing_home_tool_dirs` before they reach
+/// the profile generator.
 pub fn home_tool_dirs() -> &'static [HomeToolDir] {
     HOME_TOOL_DIRS
 }
@@ -810,8 +839,9 @@ mod tests {
     #[test]
     fn resolve_rejects_relative_xdg_cache_home() {
         // A relative XDG_CACHE_HOME must be rejected to prevent sandbox path widening.
+        let home = std::path::Path::new("/tmp/fakehome");
         temp_env::with_var("XDG_CACHE_HOME", Some("relative/path"), || {
-            let result = AppDirKind::Cache.resolve("", "", "myapp");
+            let result = AppDirKind::Cache.resolve("", "", "myapp", home);
             assert!(
                 result.is_none(),
                 "resolve() must return None for a relative XDG path, got: {result:?}"
@@ -821,8 +851,9 @@ mod tests {
 
     #[test]
     fn resolve_accepts_absolute_xdg_cache_home() {
+        let home = std::path::Path::new("/tmp/fakehome");
         temp_env::with_var("XDG_CACHE_HOME", Some("/tmp/test-cache"), || {
-            let result = AppDirKind::Cache.resolve("", "", "myapp");
+            let result = AppDirKind::Cache.resolve("", "", "myapp", home);
             assert!(
                 result.is_some(),
                 "resolve() must return Some for an absolute XDG path"

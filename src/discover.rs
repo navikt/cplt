@@ -269,17 +269,15 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
         .map(|d| d.path.to_string())
         .collect();
 
-    // On macOS, writable app dirs are always included (may be created on first use);
+    // Writable app dirs are always included (may be created on first use);
     // non-writable dirs are pruned to paths that already exist on disk.
-    // On Linux, dirs are pruned to paths that already exist on disk, since Landlock
-    // operates on file descriptors and consequently cannot apply to dirs that do not exist.
     let existing_app_dirs: Vec<String> = app_dirs()
         .iter()
         .flat_map(|app_dir| {
             let write_set: std::collections::HashSet<_> =
-                app_dir.write_paths().into_iter().collect();
+                app_dir.write_paths(home_dir).into_iter().collect();
             app_dir
-                .all_paths()
+                .all_paths(home_dir)
                 .into_iter()
                 .filter(move |p| write_set.contains(p) || p.exists())
         })
