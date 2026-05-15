@@ -1866,7 +1866,10 @@ mod tests {
         for path in &all_paths {
             let rule = policy.fs_rules.iter().find(|r| &r.path == path);
             let Some(rule) = rule else {
-                continue;
+                panic!(
+                    "missing FsRule for expected app-dir path {}",
+                    path.display()
+                );
             };
 
             if write_paths.contains(path) {
