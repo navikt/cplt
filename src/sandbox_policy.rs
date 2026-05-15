@@ -594,8 +594,8 @@ pub const APP_DIRS: &[AppDir] = &[
         qualifier: "",
         organization: "",
         application: "pnpm",
-        process_exec: &[],
-        map_exec: &[],
+        process_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
+        map_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
         write: DEFAULT_WRITE_APP_DIRS,
         read: DEFAULT_READ_APP_DIRS,
     },
@@ -644,6 +644,15 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     // Agent needs to run their binaries but should not modify installations.
     HomeToolDir {
         path: ".local",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    // Legacy mise location — many users still have ~/.mise from before the XDG
+    // migration. The AppDir entry covers ~/.local/share/mise (XDG), but this
+    // legacy path must remain to avoid breaking existing installations.
+    HomeToolDir {
+        path: ".mise",
         process_exec: true,
         map_exec: true,
         write: false,

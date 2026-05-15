@@ -1818,11 +1818,28 @@ mod tests {
         config.existing_app_dirs = Some(&nonexistent);
         let policy = generate_policy(&config);
 
-        let mise_paths: Vec<PathBuf> = policy::app_dirs()[0].all_paths(&home);
-        for p in &mise_paths {
+        // Some mise paths may appear from LINUX_HOME_CONFIG_FILES (read-only).
+        // The important property is that writable app-dir paths are excluded.
+        let write_paths = policy::app_dirs()[0].write_paths(&home);
+        for p in &write_paths {
             assert!(
-                !policy.fs_rules.iter().any(|r| &r.path == p),
-                "With non-matching existing_app_dirs, mise path {} should NOT appear in policy",
+                !policy
+                    .fs_rules
+                    .iter()
+                    .any(|r| &r.path == p && r.access.write),
+                "With non-matching existing_app_dirs, mise write path {} should NOT appear in policy with write access",
+                p.display()
+            );
+        }
+        // Also verify process_exec paths are not granted execute
+        let exec_paths = policy::app_dirs()[0].process_exec_paths(&home);
+        for p in &exec_paths {
+            assert!(
+                !policy
+                    .fs_rules
+                    .iter()
+                    .any(|r| &r.path == p && r.access.execute),
+                "With non-matching existing_app_dirs, mise exec path {} should NOT appear in policy with execute",
                 p.display()
             );
         }
