@@ -1291,7 +1291,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // macOS Copilot packaging detail. Skipped for other agents.
     #[cfg(target_os = "macos")]
     if active_agent.needs_sea_extraction() {
-        ensure_copilot_extracted(&agent_bin, &home_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+        ensure_copilot_extracted(&agent_bin, &home_dir, &project_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // Preflight: verify the sandbox mechanism works on this system
@@ -2884,7 +2885,19 @@ fn start_denial_stream() -> Option<std::process::Child> {
 /// Returns Ok(()) if extraction is confirmed or not needed, Err(message) if it
 /// failed and entering the sandbox would cause EPERM on copilot/pkg writes.
 #[cfg(target_os = "macos")]
-fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), String> {
+fn ensure_copilot_extracted(
+    copilot_bin: &Path,
+    home: &Path,
+    project_dir: &Path,
+) -> Result<(), String> {
+    // Never execute a project-controlled wrapper outside the sandbox.
+    // This preflight runs before trust lock/sandbox hardening.
+    if let (Ok(bin), Ok(project)) = (copilot_bin.canonicalize(), project_dir.canonicalize())
+        && bin.starts_with(&project)
+    {
+        return Ok(());
+    }
+
     let arch = match std::env::consts::ARCH {
         "aarch64" => "arm64",
         "x86_64" => "x64",
