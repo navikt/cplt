@@ -20,3 +20,4 @@ src/test/
 tests/test_new.py
 .DS_Store
 .idea
+.cplt-fake-trust-locked-*/

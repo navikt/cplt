@@ -2959,6 +2959,7 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
     // Timeout: 60s (larger SEA payloads in newer versions need more time)
     let mut extracted_dir_name: Option<String> = None;
     let mut saw_extracting = false;
+    let mut child_exit_ok = false;
     for i in 0..120 {
         if let Some(name) = find_new_extracted_dir(&pkg_base, &dirs_before) {
             extracted_dir_name = Some(name);
@@ -2969,6 +2970,7 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
             saw_extracting = true;
         }
         if let Ok(Some(status)) = child.try_wait() {
+            child_exit_ok = status.success();
             // Process exited — check one more time
             extracted_dir_name = find_new_extracted_dir(&pkg_base, &dirs_before);
             if extracted_dir_name.is_some() {
@@ -3003,6 +3005,13 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
     //   2. Lazy SEA: newer copilot versions may not extract on --version alone
     if extracted_dir_name.is_none() {
         extracted_dir_name = find_any_complete_dir(&pkg_base);
+    }
+
+    // If no extraction dir exists anywhere, this copilot doesn't use SEA
+    // extraction (e.g., dev builds, non-SEA wrappers, test fakes).
+    // Only skip if copilot exited cleanly — a crash isn't proof of "no SEA".
+    if extracted_dir_name.is_none() && child_exit_ok && extraction_dirs(&pkg_base).is_empty() {
+        return Ok(());
     }
 
     // Last resort: if no complete dir exists, try `-p exit` which forces full
