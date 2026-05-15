@@ -237,7 +237,7 @@ pub fn discover_agents() -> Vec<AgentInfo> {
 // ── Tool discovery ──────────────────────────────────────────────
 
 const TOOLS_TO_CHECK: &[&str] = &[
-    "gh", "git", "node", "mise", "cargo", "python3", "java", "go", "gradle", "yarn", "pnpm",
+    "gh", "git", "node", "cargo", "python3", "java", "go", "gradle", "yarn",
 ];
 
 use crate::sandbox::app_dirs;
