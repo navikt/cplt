@@ -487,8 +487,10 @@ pub struct AppDir {
 }
 
 impl AppDir {
-    pub fn process_exec_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
-        self.process_exec
+    /// Resolve `kinds` to paths, deduplicating while preserving order.
+    fn resolve_dedup(&self, kinds: &[AppDirKind], home_dir: &Path) -> Vec<PathBuf> {
+        let mut seen = std::collections::HashSet::new();
+        kinds
             .iter()
             .filter_map(|k| {
                 k.resolve(
@@ -498,49 +500,24 @@ impl AppDir {
                     home_dir,
                 )
             })
+            .filter(|p| seen.insert(p.clone()))
             .collect()
     }
 
-    pub fn map_exec_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
-        self.map_exec
-            .iter()
-            .filter_map(|k| {
-                k.resolve(
-                    self.qualifier,
-                    self.organization,
-                    self.application,
-                    home_dir,
-                )
-            })
-            .collect()
+    pub fn process_exec_paths(&self, home_dir: &Path) -> Vec<PathBuf> {
+        self.resolve_dedup(self.process_exec, home_dir)
     }
 
-    pub fn write_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
-        self.write
-            .iter()
-            .filter_map(|k| {
-                k.resolve(
-                    self.qualifier,
-                    self.organization,
-                    self.application,
-                    home_dir,
-                )
-            })
-            .collect()
+    pub fn map_exec_paths(&self, home_dir: &Path) -> Vec<PathBuf> {
+        self.resolve_dedup(self.map_exec, home_dir)
     }
 
-    pub fn read_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
-        self.read
-            .iter()
-            .filter_map(|k| {
-                k.resolve(
-                    self.qualifier,
-                    self.organization,
-                    self.application,
-                    home_dir,
-                )
-            })
-            .collect()
+    pub fn write_paths(&self, home_dir: &Path) -> Vec<PathBuf> {
+        self.resolve_dedup(self.write, home_dir)
+    }
+
+    pub fn read_paths(&self, home_dir: &Path) -> Vec<PathBuf> {
+        self.resolve_dedup(self.read, home_dir)
     }
 
     /// Union of all category paths, deduplicated.
@@ -871,6 +848,39 @@ mod tests {
                 "resolve() must fall back to home/.cache/<app> when XDG_CACHE_HOME is empty"
             );
         });
+    }
+
+    #[test]
+    fn write_paths_deduplicates_when_data_and_data_local_resolve_identically() {
+        // On Linux with XDG defaults, Data and DataLocal both resolve to
+        // ~/.local/share/<app>. write_paths() must return the path only once.
+        let home = std::path::Path::new("/tmp/fakehome");
+        temp_env::with_vars(
+            [
+                ("XDG_DATA_HOME", None::<&str>),
+                ("XDG_CACHE_HOME", None),
+                ("XDG_STATE_HOME", None),
+                ("XDG_RUNTIME_DIR", None),
+            ],
+            || {
+                let app_dir = AppDir {
+                    qualifier: "",
+                    organization: "",
+                    application: "testapp",
+                    process_exec: &[],
+                    map_exec: &[],
+                    write: &[AppDirKind::Data, AppDirKind::DataLocal],
+                    read: &[],
+                };
+                let paths = app_dir.write_paths(home);
+                assert_eq!(
+                    paths.len(),
+                    1,
+                    "write_paths() must deduplicate identical Data/DataLocal paths, got: {paths:?}"
+                );
+                assert_eq!(paths[0], home.join(".local/share/testapp"));
+            },
+        );
     }
 
     #[test]
