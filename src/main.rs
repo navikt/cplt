@@ -2891,28 +2891,29 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
         _ => return Ok(()),
     };
 
-    // Skip extraction for non-Mach-O binaries (e.g. shell script wrappers).
-    // SEA extraction only applies to the compiled Copilot Mach-O binary.
-    if !is_macho_binary(copilot_bin) {
-        return Ok(());
-    }
-
-    let Some(binary_id) = binary_identity(copilot_bin) else {
-        return Ok(());
-    };
-
     let pkg_base = home
         .join("Library/Caches/copilot/pkg")
         .join(format!("darwin-{arch}"));
+
+    // Compute binary identity for the fast-path cache (only works for Mach-O).
+    // npm-installed copilot uses a node/shell wrapper — not Mach-O, so binary_id
+    // will be None. We still need to handle extraction for npm installs.
+    let binary_id = if is_macho_binary(copilot_bin) {
+        binary_identity(copilot_bin)
+    } else {
+        None
+    };
 
     // Fast path: check cplt-managed marker that records both the binary
     // identity and the actual extraction directory from the last successful run.
     let cache_dir = home.join("Library/Caches/cplt");
     let cache_file = cache_dir.join("copilot-extracted");
-    if let Ok(cached) = std::fs::read_to_string(&cache_file) {
+    if let Some(ref bid) = binary_id
+        && let Ok(cached) = std::fs::read_to_string(&cache_file)
+    {
         let mut lines = cached.lines();
         if let (Some(cached_id), Some(cached_dir)) = (lines.next(), lines.next())
-            && cached_id == binary_id
+            && cached_id == bid.as_str()
         {
             // Binary unchanged — verify the extracted dir still exists on disk
             let extracted_marker = pkg_base.join(cached_dir).join(".extraction-complete");
@@ -2920,6 +2921,13 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
                 return Ok(());
             }
         }
+    }
+
+    // For non-Mach-O (npm-installed), check if any valid extraction already exists.
+    // Without a binary identity we can't cache, but we can still skip re-extraction
+    // if there's already a complete directory on disk.
+    if binary_id.is_none() && find_any_complete_dir(&pkg_base).is_some() {
+        return Ok(());
     }
 
     ui::info("Extracting Copilot runtime (first run after update)...");
@@ -3019,8 +3027,12 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
 
     if let Some(ref dir_name) = extracted_dir_name {
         // Persist success: binary identity + extracted dir name
-        let _ = std::fs::create_dir_all(&cache_dir);
-        let _ = std::fs::write(&cache_file, format!("{binary_id}\n{dir_name}"));
+        // Only cache if we have a binary identity (Mach-O installs).
+        // npm installs use find_any_complete_dir as their fast path instead.
+        if let Some(ref bid) = binary_id {
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let _ = std::fs::write(&cache_file, format!("{bid}\n{dir_name}"));
+        }
         if !dirs_before.contains(dir_name) {
             ui::ok("Copilot runtime extracted");
         }
