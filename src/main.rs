@@ -2890,11 +2890,16 @@ fn ensure_copilot_extracted(
     home: &Path,
     project_dir: &Path,
 ) -> Result<(), String> {
-    // Never execute a project-controlled wrapper outside the sandbox.
-    // This preflight runs before trust lock/sandbox hardening.
-    if let (Ok(bin), Ok(project)) = (copilot_bin.canonicalize(), project_dir.canonicalize())
-        && bin.starts_with(&project)
-    {
+    // Security guard: this preflight executes `copilot --version` outside the
+    // sandbox. If PATH resolves to a project-local wrapper script, that script
+    // would run unsandboxed with full user privileges before trust lock applies.
+    let bin = copilot_bin
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve copilot binary path: {e}"))?;
+    let project = project_dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve project directory path: {e}"))?;
+    if bin.starts_with(&project) {
         return Ok(());
     }
 
