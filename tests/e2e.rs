@@ -3224,7 +3224,7 @@ mod e2e_tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nresult=$({} trust accept --all 2>&1)\nrc=$?\necho \"TRUST_OUTPUT:$result\"\necho \"EXIT:$rc\"\n",
+                "#!/bin/sh\n# If not inside sandbox (extraction trigger), just print version\nif [ -z \"$__CPLT_WRAPPED\" ]; then echo \"1.0.0-fake\"; exit 0; fi\n# Inside sandbox: attempt trust modification (should be blocked)\nresult=$({} trust accept --all 2>&1)\nrc=$?\necho \"TRUST_OUTPUT:$result\"\necho \"EXIT:$rc\"\n",
                 cplt_binary.display()
             ),
         )
