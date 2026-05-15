@@ -741,6 +741,11 @@ fn probe_abi_candidate(abi: ABI) -> Result<(), String> {
 /// These are stored in `deferred_paths` and opened with a single `open()`
 /// call in the child after fork.
 ///
+/// Platform difference: Landlock operates on File Descriptors, so a path
+/// that does not exist will not be added to the final Landlock sandbox.
+/// This is contrary to the way it is done on macOS, where paths with write
+/// access will always be included.
+///
 /// Called once in `prepare()`. The returned `PrecomputedSandbox` is
 /// cloned into the `pre_exec` closure.
 #[cfg(target_os = "linux")]

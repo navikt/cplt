@@ -269,7 +269,10 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
         .map(|d| d.path.to_string())
         .collect();
 
-    // Writable app dirs are always included (may be created on first use);
+    // Writable app dirs are always included in this list because they potentially could be created on first use.
+    // On Linux, Landlock does not support adding access to non-existent paths, so even if included here,
+    // a non-existent path would still not be added to the created policy.
+    // See the relevant policy implementation for more details.
     // non-writable dirs are pruned to paths that already exist on disk.
     let existing_app_dirs: Vec<String> = app_dirs()
         .iter()
