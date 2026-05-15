@@ -2895,14 +2895,11 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
         .join("Library/Caches/copilot/pkg")
         .join(format!("darwin-{arch}"));
 
-    // Compute binary identity for the fast-path cache (only works for Mach-O).
-    // npm-installed copilot uses a node/shell wrapper — not Mach-O, so binary_id
-    // will be None. We still need to handle extraction for npm installs.
-    let binary_id = if is_macho_binary(copilot_bin) {
-        binary_identity(copilot_bin)
-    } else {
-        None
-    };
+    // Compute binary identity for the fast-path cache.
+    // Works for any file type: Mach-O binary (Homebrew), node/shell wrapper (npm).
+    // The identity is based on canonicalized path + inode + size + mtime — changes
+    // whenever the copilot binary is updated/reinstalled.
+    let binary_id = binary_identity(copilot_bin);
 
     // Fast path: check cplt-managed marker that records both the binary
     // identity and the actual extraction directory from the last successful run.
@@ -2921,13 +2918,6 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
                 return Ok(());
             }
         }
-    }
-
-    // For non-Mach-O (npm-installed), check if any valid extraction already exists.
-    // Without a binary identity we can't cache, but we can still skip re-extraction
-    // if there's already a complete directory on disk.
-    if binary_id.is_none() && find_any_complete_dir(&pkg_base).is_some() {
-        return Ok(());
     }
 
     ui::info("Extracting Copilot runtime (first run after update)...");
@@ -3026,9 +3016,7 @@ fn ensure_copilot_extracted(copilot_bin: &Path, home: &Path) -> Result<(), Strin
     }
 
     if let Some(ref dir_name) = extracted_dir_name {
-        // Persist success: binary identity + extracted dir name
-        // Only cache if we have a binary identity (Mach-O installs).
-        // npm installs use find_any_complete_dir as their fast path instead.
+        // Persist success: binary identity + extracted dir name.
         if let Some(ref bid) = binary_id {
             let _ = std::fs::create_dir_all(&cache_dir);
             let _ = std::fs::write(&cache_file, format!("{bid}\n{dir_name}"));
@@ -3084,6 +3072,7 @@ fn try_extraction_fallback(
 
 /// Compute a stable identity for a binary based on filesystem metadata.
 /// Uses canonicalized path + inode + size + full mtime (seconds + nanoseconds).
+/// Works for any file type: Mach-O binaries, shell scripts, symlinks (resolved).
 #[cfg(target_os = "macos")]
 fn binary_identity(path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -3099,29 +3088,6 @@ fn binary_identity(path: &Path) -> Option<String> {
     ))
 }
 
-/// Check if a file is a Mach-O binary by reading its magic bytes.
-/// Detects: thin Mach-O (32/64-bit, both endiannesses) and fat/universal binaries.
-/// Returns false for scripts, text files, or unreadable files.
-#[cfg(target_os = "macos")]
-fn is_macho_binary(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0u8; 4];
-    if f.read_exact(&mut magic).is_err() {
-        return false;
-    }
-    matches!(
-        magic,
-        [0xFE, 0xED, 0xFA, 0xCE] // MH_MAGIC (32-bit)
-            | [0xFE, 0xED, 0xFA, 0xCF] // MH_MAGIC_64
-            | [0xCE, 0xFA, 0xED, 0xFE] // MH_CIGAM (32-bit, reversed)
-            | [0xCF, 0xFA, 0xED, 0xFE] // MH_CIGAM_64 (reversed)
-            | [0xCA, 0xFE, 0xBA, 0xBE] // FAT_MAGIC (universal)
-            | [0xBE, 0xBA, 0xFE, 0xCA] // FAT_CIGAM (universal, reversed)
-    )
-}
 /// List non-hidden directory names under `pkg_base` (extraction version dirs).
 #[cfg(target_os = "macos")]
 fn extraction_dirs(pkg_base: &Path) -> std::collections::HashSet<String> {
