@@ -437,6 +437,7 @@ impl AppDirKind {
         };
         if use_xdg {
             let xdg_dir = std::env::var_os(lookup.0)
+                .filter(|v| !v.as_encoded_bytes().trim_ascii().is_empty())
                 .map(PathBuf::from)
                 .or_else(|| {
                     if lookup.1.is_empty() {
@@ -854,6 +855,20 @@ mod tests {
             assert!(
                 result.is_none(),
                 "resolve() must return None for a relative XDG path, got: {result:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_falls_back_when_xdg_cache_home_is_empty() {
+        // An empty XDG_CACHE_HOME must be treated as unset so the home-dir default fires.
+        let home = std::path::Path::new("/tmp/fakehome");
+        temp_env::with_var("XDG_CACHE_HOME", Some(""), || {
+            let result = AppDirKind::Cache.resolve("", "", "myapp", home);
+            assert_eq!(
+                result,
+                Some(home.join(".cache/myapp")),
+                "resolve() must fall back to home/.cache/<app> when XDG_CACHE_HOME is empty"
             );
         });
     }
