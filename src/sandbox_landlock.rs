@@ -21,7 +21,7 @@
 //! cannot. Use `--with-proxy` on Linux for localhost SSRF protection.
 //! The proxy handles domain-level filtering on both platforms.
 
-use super::policy::{self, AppDir, HomeToolDir};
+use super::policy::{self, HomeToolDir};
 #[cfg(target_os = "linux")]
 use crate::ui;
 use std::fmt::Write as _;
@@ -282,13 +282,19 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     // ── Application directories (filtered by discovery) ──
     for dir in policy::app_dirs() {
-        if should_include_app_dir(dir, config) {
-            let process_exec = dir.process_exec_paths(home);
-            let map_exec = dir.map_exec_paths(home);
-            let write = dir.write_paths(home);
-            let read = dir.read_paths(home);
-            // all_paths() returns deduplicated union of all categories
-            for path in dir.all_paths(home) {
+        let process_exec = dir.process_exec_paths(home);
+        let map_exec = dir.map_exec_paths(home);
+        let write = dir.write_paths(home);
+        let read = dir.read_paths(home);
+        // all_paths() returns deduplicated union of all categories
+        for path in dir.all_paths(home) {
+            let include = match &config.existing_app_dirs {
+                Some(existing) => existing
+                    .iter()
+                    .any(|e| e == path.to_string_lossy().as_ref()),
+                None => true,
+            };
+            if include {
                 let execute = process_exec.contains(&path) || map_exec.contains(&path);
                 let writable = write.contains(&path);
                 // read permission mirrors SBPL: only paths in read_paths() get file-read*.
@@ -562,17 +568,6 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 fn should_include_tool_dir(dir: &HomeToolDir, config: &super::SandboxConfig) -> bool {
     match &config.existing_home_tool_dirs {
         Some(existing) => existing.iter().any(|e| e == dir.path),
-        None => true,
-    }
-}
-
-/// Check if an app directory should be included based on discovery data.
-fn should_include_app_dir(dir: &AppDir, config: &super::SandboxConfig) -> bool {
-    match &config.existing_app_dirs {
-        Some(existing) => dir
-            .all_paths(config.home_dir)
-            .iter()
-            .any(|p| existing.iter().any(|e| e == p.to_string_lossy().as_ref())),
         None => true,
     }
 }
