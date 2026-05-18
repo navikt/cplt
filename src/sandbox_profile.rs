@@ -536,53 +536,53 @@ fn emit_tool_dirs(
 
     // App dirs: absolute paths resolved from XDG/macOS conventions.
     // Use discovered existing dirs if available, else include all.
+    // Per-path filtering: each path is checked individually against existing_app_dirs.
     for dir in app_dirs() {
-        let all_paths = dir.all_paths(home_dir);
-        let include = match existing_app_dirs {
-            Some(existing) => all_paths
-                .iter()
-                .any(|p| existing.iter().any(|e| e == p.to_string_lossy().as_ref())),
-            None => true,
-        };
-        if !include {
-            continue;
-        }
         let read_paths = dir.read_paths(home_dir);
         let write_paths = dir.write_paths(home_dir);
         let process_exec_paths = dir.process_exec_paths(home_dir);
         let map_exec_paths = dir.map_exec_paths(home_dir);
 
-        // Allow rules first
-        for path in &read_paths {
-            if validate_sbpl_path(path).is_err() {
+        // Allow rules first — emit only for paths that pass the inclusion check.
+        for path in dir.all_paths(home_dir) {
+            let include = match existing_app_dirs {
+                Some(existing) => existing
+                    .iter()
+                    .any(|e| e == path.to_string_lossy().as_ref()),
+                None => true,
+            };
+            if !include {
+                continue;
+            }
+            if validate_sbpl_path(&path).is_err() {
                 continue;
             }
             let p = path.display();
-            sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
+            if read_paths.contains(&path) {
+                sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
+            }
+            if write_paths.contains(&path) {
+                sbpl!(sb, "(allow file-write* (subpath \"{p}\"))");
+            }
+            if process_exec_paths.contains(&path) {
+                sbpl!(sb, "(allow process-exec (subpath \"{p}\"))");
+            }
+            if map_exec_paths.contains(&path) {
+                sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
+            }
         }
+        // Deny exec on writable paths that are not in exec lists (last-match-wins).
+        // Must come after allows; only emit for included paths.
         for path in &write_paths {
-            if validate_sbpl_path(path).is_err() {
+            let include = match existing_app_dirs {
+                Some(existing) => existing
+                    .iter()
+                    .any(|e| e == path.to_string_lossy().as_ref()),
+                None => true,
+            };
+            if !include {
                 continue;
             }
-            let p = path.display();
-            sbpl!(sb, "(allow file-write* (subpath \"{p}\"))");
-        }
-        for path in &process_exec_paths {
-            if validate_sbpl_path(path).is_err() {
-                continue;
-            }
-            let p = path.display();
-            sbpl!(sb, "(allow process-exec (subpath \"{p}\"))");
-        }
-        for path in &map_exec_paths {
-            if validate_sbpl_path(path).is_err() {
-                continue;
-            }
-            let p = path.display();
-            sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
-        }
-        // Deny exec on writable paths that are not in exec lists (last-match-wins)
-        for path in &write_paths {
             if validate_sbpl_path(path).is_err() {
                 continue;
             }

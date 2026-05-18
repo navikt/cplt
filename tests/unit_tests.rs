@@ -5336,3 +5336,60 @@ fn existing_app_dirs_nonmatching_excludes_dir() {
         "With existing_app_dirs containing only non-matching paths, mise data dir should NOT appear in profile"
     );
 }
+
+#[test]
+fn existing_app_dirs_per_path_filtering() {
+    // Resolve two distinct mise paths from different categories
+    let data_path =
+        cplt::sandbox::AppDirKind::Data.resolve("", "", "mise", std::path::Path::new("/home/test"));
+    let config_path = cplt::sandbox::AppDirKind::Config.resolve(
+        "",
+        "",
+        "mise",
+        std::path::Path::new("/home/test"),
+    );
+    let (Some(data_path), Some(config_path)) = (data_path, config_path) else {
+        return;
+    };
+    let data_str = data_path.to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
+
+    // Only the data dir is "existing" — config dir is absent
+    let existing = vec![data_str.clone()];
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/tmp/proj"),
+        home_dir: std::path::Path::new("/home/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: Some(&existing),
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        git_hooks_path: None,
+        allow_gpg_signing: false,
+        allow_jvm_attach: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+    assert!(
+        p.contains(&data_str),
+        "mise data dir (present in existing_app_dirs) should appear in profile"
+    );
+    assert!(
+        !p.contains(&config_str),
+        "mise config dir (absent from existing_app_dirs) should NOT appear in profile — per-path filtering must work"
+    );
+}
