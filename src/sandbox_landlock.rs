@@ -1916,6 +1916,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn app_dir_effective_permissions_include_parent_rules() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let config = test_config(&project, &home);
+        let policy = generate_policy(&config);
+
+        for app_dir in policy::app_dirs() {
+            let all_paths = app_dir.all_paths(&home);
+            if all_paths.is_empty() {
+                continue;
+            }
+
+            let write_paths = app_dir.write_paths(&home);
+            let process_exec_paths = app_dir.process_exec_paths(&home);
+            let map_exec_paths = app_dir.map_exec_paths(&home);
+
+            for path in &all_paths {
+                // Compute effective access by OR-ing all rules whose path is an ancestor of
+                // or equal to the target path (Landlock rules apply to path and its subtree).
+                let mut effective_read = false;
+                let mut effective_write = false;
+                let mut effective_execute = false;
+                for rule in &policy.fs_rules {
+                    if path.starts_with(&rule.path) {
+                        effective_read |= rule.access.read;
+                        effective_write |= rule.access.write;
+                        effective_execute |= rule.access.execute;
+                    }
+                }
+
+                assert!(
+                    effective_read,
+                    "app-dir path {} should have effective read access",
+                    path.display()
+                );
+
+                if write_paths.contains(path) {
+                    assert!(
+                        effective_write,
+                        "app-dir path {} declares write but effective write is false",
+                        path.display()
+                    );
+                }
+
+                if process_exec_paths.contains(path) || map_exec_paths.contains(path) {
+                    assert!(
+                        effective_execute,
+                        "app-dir path {} declares exec but effective execute is false",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn proc_self_is_deferred_not_pre_opened() {
