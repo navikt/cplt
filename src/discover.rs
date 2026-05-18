@@ -71,7 +71,7 @@ pub struct ToolDiscovery {
     pub homebrew_prefix: Option<PathBuf>,
     /// Which HOME_TOOL_DIRS actually exist on disk.
     pub existing_home_tool_dirs: Vec<String>,
-    /// Which APP_DIRS actually exist on disk.
+    /// Writable APP_DIRS considered during discovery, including paths that may not yet exist.
     pub existing_app_dirs: Vec<String>,
 }
 
