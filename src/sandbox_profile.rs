@@ -323,12 +323,6 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
     );
     sbpl!(sb);
 
-    // mise config — tool version manager reads global config for tool paths and settings.
-    // Contains tool versions and PATH entries, no secrets.
-    sbpl!(sb, ";; mise config (tool versions, no secrets)");
-    sbpl!(sb, "(allow file-read* (subpath \"{home}/.config/mise\"))");
-    sbpl!(sb);
-
     // Microsoft DeviceID — telemetry device identifier
     sbpl!(sb, ";; Microsoft DeviceID");
     sbpl!(
