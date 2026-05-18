@@ -337,12 +337,12 @@ Files always denied:
 
 Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permission model (`HomeToolDir`) with granular `process_exec`, `map_exec`, and `write` flags:
 
-| Directory | process-exec | file-map-executable | file-write | Rationale |
-|---|---|---|---|---|
-| `.local`, `.nvm`, `.pyenv`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
-| `.gradle`, `.m2`, `.konan`, `go/pkg` | ❌ | ✅ | varies | JNI/cgo/Kotlin native libs loaded via dlopen, no direct executables |
-| `.yarn` | ❌ | ❌ | ✅ | Yarn Berry global cache — JavaScript packages only, no native binaries |
-| `Library/Caches` | ❌ | ❌* | ✅ | Broad allow for dev tool caches; browser/app caches denied via regex prefix rules (com.apple.*, com.google.*, org.mozilla.*, etc.) — Xcode dev tools (com.apple.dt.*) re-allowed |
+| Directory                                                                                     | process-exec | file-map-executable | file-write | Rationale |
+|-----------------------------------------------------------------------------------------------|---|---|---|---|
+| `.local`, `.mise`, `.nvm`, `.pyenv`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
+| `.gradle`, `.m2`, `.konan`, `go/pkg`                                                          | ❌ | ✅ | varies | JNI/cgo/Kotlin native libs loaded via dlopen, no direct executables |
+| `.yarn`                                                                                       | ❌ | ❌ | ✅ | Yarn Berry global cache — JavaScript packages only, no native binaries |
+| `Library/Caches`                                                                              | ❌ | ❌* | ✅ | Broad allow for dev tool caches; browser/app caches denied via regex prefix rules (com.apple.*, com.google.*, org.mozilla.*, etc.) — Xcode dev tools (com.apple.dt.*) re-allowed |
 
 \* Exception: `~/Library/Caches/copilot/pkg/` has `file-map-executable` and `process-exec` for Copilot's native modules and helper binaries (`pty.node`, `spawn-helper`, `rg`). A `file-write*` deny prevents write-then-exec attacks. These carve-outs are placed after the broader deny rules (SBPL last-match-wins).
 
