@@ -307,7 +307,10 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 
 ### Supported runtimes
 
-cplt auto-discovers installed tools and configures sandbox rules accordingly. Only directories that exist on disk get rules (no phantom paths).
+cplt auto-discovers installed tools and configures sandbox rules accordingly. 
+In general, only directories that exist on disk get rules (no phantom paths), but on macOS writable app directories are also included when discovered even if they do not exist yet.
+This allows for creation on first use.
+On Linux it is not possible to allow write to a non-existent path, so creation must happen outside the sandbox.
 
 | Runtime | Home dirs                            | Env vars / prefixes | Discovery |
 |---|--------------------------------------|---|---|
@@ -318,9 +321,9 @@ cplt auto-discovers installed tools and configures sandbox rules accordingly. On
 | **Kotlin Native** | `.konan`                             | — | — |
 | **Python** | `.pyenv`                             | `VIRTUAL_ENV`, `PYTHONPATH`, `PYENV_ROOT`, `PYENV_*` | `python3` |
 | **Yarn Berry** | `.yarn`                              | `YARN_*` (hardening overrides `YARN_ENABLE_SCRIPTS`) | `yarn` |
-| **pnpm** | `Library/pnpm`                       | `PNPM_HOME` | `pnpm` |
+| **pnpm** | `Library/pnpm`, `.local/share/pnpm`  | `PNPM_HOME` | `pnpm` |
 | **Corepack** | —                                    | `COREPACK_*` | — |
-| **mise** | `.local/share/mise`                 | `MISE_*` | `mise` |
+| **mise** | `.local/share/mise`, `.mise`              | `MISE_*` | `mise` |
 
 To see which tools cplt detected, run `cplt doctor`.
 
