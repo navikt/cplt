@@ -1655,6 +1655,7 @@ fn home_tool_dirs_has_all_runtime_entries() {
     // Executables: full exec
     for expected in &[
         ".local",
+        ".mise",
         ".asdf",
         ".nvm",
         ".pyenv",
