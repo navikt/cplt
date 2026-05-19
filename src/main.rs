@@ -2,7 +2,9 @@
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use cplt::{agent, config, discover, proxy, repo_config, sandbox, scratch, trust, update};
+use cplt::{
+    agent, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch, trust, update,
+};
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 #[cfg(target_os = "macos")]
@@ -491,6 +493,22 @@ enum Command {
     /// Checks auth mechanisms, agent install, tool availability,
     /// and sandbox-critical paths. Exits 0 if all critical checks pass.
     Doctor,
+
+    /// [internal] Evaluate a gh command against the proxy policy.
+    ///
+    /// Called by the gh wrapper script inside the sandbox. Not intended
+    /// for direct use. Evaluates the command, passes through if allowed,
+    /// or exits with an error if blocked.
+    #[command(hide = true)]
+    GhGate {
+        /// Path to the real gh binary.
+        #[arg(long)]
+        real_gh: PathBuf,
+
+        /// gh arguments to evaluate and potentially pass through.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1153,6 +1171,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
             }
             Command::Doctor => run_doctor(),
+            Command::GhGate { real_gh, args } => run_gh_gate(&real_gh, &args),
         });
     }
 
@@ -1466,6 +1485,31 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 
     args.extend(cli.copilot_args.iter().cloned());
     args
+}
+
+/// Handle `cplt gh-gate` — evaluate a gh command and exec the real binary if allowed.
+///
+/// Called from the wrapper script placed in the sandbox's PATH. If the command
+/// is allowed, this replaces the current process with the real gh binary.
+/// If blocked, prints an error message and exits with code 1.
+fn run_gh_gate(real_gh: &Path, args: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    match gh_proxy::gate(&arg_refs, &cwd) {
+        Ok(()) => {
+            // Allowed — exec the real gh binary (replaces this process)
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(real_gh).args(args).exec();
+            // exec() only returns on error
+            ui::error(&format!("Failed to exec gh: {err}"));
+            ExitCode::FAILURE
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn run_doctor() -> ExitCode {

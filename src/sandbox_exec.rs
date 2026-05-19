@@ -127,6 +127,72 @@ fn configure_command(
             cmd.env("no_proxy", "localhost,127.0.0.1,::1");
         }
     }
+
+    // Install gh proxy wrapper if gh is available and scratch dir exists.
+    // Places a wrapper script in {scratch}/bin/gh that intercepts gh commands
+    // and routes them through cplt's policy engine before the real binary.
+    if let Some(scratch) = scratch_dir {
+        install_gh_proxy(cmd, scratch);
+    }
+}
+
+/// Install the gh proxy wrapper into the scratch dir and prepend it to PATH.
+///
+/// Discovers the real `gh` binary, generates a wrapper script that calls
+/// `cplt gh-gate`, writes it to `{scratch}/bin/gh`, and prepends
+/// `{scratch}/bin` to the command's PATH environment variable.
+fn install_gh_proxy(cmd: &mut Command, scratch_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Find real gh binary
+    let Some(real_gh) = which_gh() else {
+        return; // gh not installed — nothing to proxy
+    };
+
+    // Find cplt binary (ourselves)
+    let Ok(cplt_bin) = std::env::current_exe() else {
+        return;
+    };
+
+    let bin_dir = scratch_dir.join("bin");
+    if std::fs::create_dir_all(&bin_dir).is_err() {
+        return;
+    }
+
+    let wrapper_path = bin_dir.join("gh");
+    let script = crate::gh_proxy::generate_wrapper_script(
+        &real_gh.to_string_lossy(),
+        &cplt_bin.to_string_lossy(),
+    );
+
+    if std::fs::write(&wrapper_path, script).is_err() {
+        return;
+    }
+
+    // Make executable (0755)
+    let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
+
+    // Prepend {scratch}/bin to PATH so the wrapper shadows the real gh.
+    // Read current PATH from the command env (already set by build_sandbox_env).
+    let bin_dir_str = bin_dir.to_string_lossy().to_string();
+    let new_path = if let Some(current_path) = std::env::var_os("PATH") {
+        format!("{}:{}", bin_dir_str, current_path.to_string_lossy())
+    } else {
+        bin_dir_str
+    };
+    cmd.env("PATH", &new_path);
+}
+
+/// Find the real `gh` binary in PATH.
+fn which_gh() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("gh");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Spawn a sandboxed command, forward signals, and wait for exit.
