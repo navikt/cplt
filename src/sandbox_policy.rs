@@ -620,8 +620,11 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     // ── Version managers & runtimes: exec only, no write ──────────────────
     // Pre-installed toolchains managed outside the sandbox (mise, nvm, rustup, etc.).
     // Agent needs to run their binaries but should not modify installations.
+    // XDG user bin directory — standard location for user-installed executables
+    // (pip install --user, pipx, manually installed tools). Only the bin dir
+    // needs exec; other .local subdirs are covered by AppDirs or don't need exec.
     HomeToolDir {
-        path: ".local",
+        path: ".local/bin",
         process_exec: true,
         map_exec: true,
         write: false,

@@ -314,7 +314,7 @@ On Linux it is not possible to allow write to a non-existent path, so creation m
 
 | Runtime | Home dirs                            | Env vars / prefixes | Discovery |
 |---|--------------------------------------|---|---|
-| **Node.js** | `.nvm`, `.local`                     | `NODE_*`, `NPM_*`, `NVM_*` | `node` |
+| **Node.js** | `.nvm`, `.local/bin`                 | `NODE_*`, `NPM_*`, `NVM_*` | `node` |
 | **Rust** | `.cargo`, `.rustup`                  | `CARGO_HOME`, `RUSTUP_HOME` | `cargo` |
 | **Go** | `go/bin`, `go/pkg`                   | `GOPATH`, `GOROOT`, `GOCACHE`, etc. | `go` |
 | **Java/Kotlin (JVM)** | `.sdkman`, `.jenv`, `.gradle`, `.m2` | `JAVA_HOME`, `JAVA_TOOL_OPTIONS`, `GRADLE_*`, `MAVEN_*`, `SDKMAN_*`, `JENV_*` | `java`, `gradle` |

@@ -339,7 +339,7 @@ Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permissio
 
 | Directory                                                                                     | process-exec | file-map-executable | file-write | Rationale |
 |-----------------------------------------------------------------------------------------------|---|---|---|---|
-| `.local`, `.mise`, `.nvm`, `.pyenv`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
+| `.local/bin`, `.mise`, `.nvm`, `.pyenv`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
 | `.gradle`, `.m2`, `.konan`, `go/pkg`                                                          | ❌ | ✅ | varies | JNI/cgo/Kotlin native libs loaded via dlopen, no direct executables |
 | `.yarn`                                                                                       | ❌ | ❌ | ✅ | Yarn Berry global cache — JavaScript packages only, no native binaries |
 | `Library/Caches`                                                                              | ❌ | ❌* | ✅ | Broad allow for dev tool caches; browser/app caches denied via regex prefix rules (com.apple.*, com.google.*, org.mozilla.*, etc.) — Xcode dev tools (com.apple.dt.*) re-allowed |
