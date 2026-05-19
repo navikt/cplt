@@ -869,11 +869,33 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         return None;
     }
 
-    // Skip global flags that appear before the command
+    // Skip global flags that appear before the command.
+    // gh global flags that take a value argument:
+    const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &["--repo", "-R", "--hostname"];
     let mut idx = 0;
+    let mut global_repo_flag: Option<String> = None;
     while idx < args.len() && args[idx].starts_with('-') {
+        let arg = args[idx];
+        // Handle --flag=value forms (skip as single arg)
+        if let Some(val) = arg.strip_prefix("--repo=") {
+            global_repo_flag = Some(val.to_string());
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with("-R") && arg.len() > 2 && !arg.starts_with("-R=") {
+            global_repo_flag = Some(arg[2..].to_string());
+            idx += 1;
+            continue;
+        }
+        if arg.contains('=') {
+            idx += 1;
+            continue;
+        }
         // Skip flag and its value if it takes one
-        if matches!(args[idx], "--repo" | "-R") {
+        if GLOBAL_FLAGS_WITH_VALUE.contains(&arg) {
+            if (arg == "--repo" || arg == "-R") && idx + 1 < args.len() {
+                global_repo_flag = Some(args[idx + 1].to_string());
+            }
             idx += 1; // skip value
         }
         idx += 1;
@@ -892,29 +914,46 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         let mut has_input_flags = false;
         let mut repo_flag = None;
 
-        for i in idx..args.len() {
-            match args[i] {
-                "-X" | "--method" => {
-                    if i + 1 < args.len() {
-                        method = Some(args[i + 1].to_uppercase());
+        let mut i = idx;
+        while i < args.len() {
+            let arg = args[i];
+            // Handle --flag=value forms
+            if let Some(val) = arg.strip_prefix("--method=") {
+                method = Some(val.to_uppercase());
+            } else if arg.starts_with("-X") && arg.len() > 2 {
+                // -XPOST form (short flag with attached value)
+                method = Some(arg[2..].to_uppercase());
+            } else if let Some(val) = arg.strip_prefix("--repo=") {
+                repo_flag = Some(val.to_string());
+            } else if arg.starts_with("-R") && arg.len() > 2 {
+                repo_flag = Some(arg[2..].to_string());
+            } else {
+                match arg {
+                    "-X" | "--method" => {
+                        if i + 1 < args.len() {
+                            method = Some(args[i + 1].to_uppercase());
+                            i += 1;
+                        }
                     }
-                }
-                "-f" | "-F" | "--input" => {
-                    has_input_flags = true;
-                }
-                "-R" | "--repo" => {
-                    if i + 1 < args.len() {
-                        repo_flag = Some(args[i + 1].to_string());
+                    "-f" | "-F" | "--input" | "--field" | "--raw-field" => {
+                        has_input_flags = true;
                     }
+                    "-R" | "--repo" => {
+                        if i + 1 < args.len() {
+                            repo_flag = Some(args[i + 1].to_string());
+                            i += 1;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            i += 1;
         }
 
         return Some(ParsedCommand {
             command,
             subcommand: None,
-            repo_flag,
+            repo_flag: repo_flag.or(global_repo_flag),
             method,
             has_input_flags,
         });
@@ -925,7 +964,19 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
     let mut repo_flag = None;
     let mut i = idx;
     while i < args.len() {
-        match args[i] {
+        let arg = args[i];
+        // Handle --repo=value and -Rvalue forms
+        if let Some(val) = arg.strip_prefix("--repo=") {
+            repo_flag = Some(val.to_string());
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("-R") && arg.len() > 2 {
+            repo_flag = Some(arg[2..].to_string());
+            i += 1;
+            continue;
+        }
+        match arg {
             "-R" | "--repo" => {
                 if i + 1 < args.len() {
                     repo_flag = Some(args[i + 1].to_string());
@@ -933,16 +984,14 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                     continue;
                 }
             }
-            arg if arg.starts_with('-') => {
-                // Skip flags; if it looks like it takes a value, skip next too
-                // We can't know for sure, but single-letter flags with a following
-                // non-flag arg are likely flag+value pairs. We're conservative here.
+            a if a.starts_with('-') => {
+                // Skip flags
                 i += 1;
                 continue;
             }
-            arg => {
+            a => {
                 if subcommand.is_none() {
-                    subcommand = Some(arg.to_string());
+                    subcommand = Some(a.to_string());
                 }
             }
         }
@@ -952,7 +1001,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
     Some(ParsedCommand {
         command,
         subcommand,
-        repo_flag,
+        repo_flag: repo_flag.or(global_repo_flag),
         method: None,
         has_input_flags: false,
     })
@@ -1091,6 +1140,14 @@ fn parse_repo_from_url(url: &str) -> Option<String> {
     }
 }
 
+/// Escape a string for safe inclusion in a POSIX shell script.
+///
+/// Wraps the value in single quotes and escapes any embedded single quotes
+/// using the `'\''` idiom (end quote, literal quote, resume quote).
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Generate the shell wrapper script content.
 ///
 /// The wrapper intercepts `gh` invocations, calls `cplt gh-gate` for
@@ -1100,12 +1157,14 @@ fn parse_repo_from_url(url: &str) -> Option<String> {
 /// `real_gh` is the path to the real `gh` binary.
 /// `cplt_bin` is the path to the cplt binary (for calling `gh-gate`).
 pub fn generate_wrapper_script(real_gh: &str, cplt_bin: &str) -> String {
+    let cplt_escaped = shell_escape(cplt_bin);
+    let gh_escaped = shell_escape(real_gh);
     format!(
         r#"#!/bin/sh
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec "{cplt_bin}" gh-gate --real-gh "{real_gh}" -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} -- "$@"
 "#
     )
 }
@@ -1169,7 +1228,7 @@ pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
 
 /// Git subcommands that perform remote writes.
 /// Blocked by the git wrapper to prevent agents from pushing code.
-const GIT_BLOCKED_SUBCOMMANDS: &[&str] = &["push", "request-pull"];
+const GIT_BLOCKED_SUBCOMMANDS: &[&str] = &["push", "request-pull", "send-pack"];
 
 /// Git subcommands that are always allowed (read-only or local-only).
 const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
@@ -1322,12 +1381,14 @@ pub fn gate_git(args: &[&str]) -> Result<(), String> {
 ///
 /// Like the gh wrapper, this intercepts git invocations and blocks push operations.
 pub fn generate_git_wrapper_script(real_git: &str, cplt_bin: &str) -> String {
+    let cplt_escaped = shell_escape(cplt_bin);
+    let git_escaped = shell_escape(real_git);
     format!(
         r#"#!/bin/sh
 # cplt git proxy — blocks git push in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec "{cplt_bin}" git-gate --real-git "{real_git}" -- "$@"
+exec {cplt_escaped} git-gate --real-git {git_escaped} -- "$@"
 "#
     )
 }
@@ -1752,5 +1813,64 @@ mod tests {
         assert!(script.contains("/usr/bin/git"));
         assert!(script.contains("/usr/local/bin/cplt"));
         assert!(script.contains("git-gate"));
+    }
+
+    #[test]
+    fn shell_escape_handles_quotes() {
+        let script = generate_wrapper_script("/path/with'quote/gh", "/path/with\"dq/cplt");
+        assert!(script.contains("gh-gate"));
+        // Should use single-quote escaping, no unescaped double quotes in paths
+        assert!(!script.contains(r#""/path/with'quote/gh""#));
+    }
+
+    #[test]
+    fn parse_api_method_equals_form() {
+        let cmd = parse_command(&["api", "--method=POST", "/repos/x/y/issues"]).unwrap();
+        assert_eq!(cmd.method.as_deref(), Some("POST"));
+    }
+
+    #[test]
+    fn parse_api_short_method_attached() {
+        let cmd = parse_command(&["api", "-XDELETE", "/repos/x/y/issues/1"]).unwrap();
+        assert_eq!(cmd.method.as_deref(), Some("DELETE"));
+    }
+
+    #[test]
+    fn parse_api_field_long_form() {
+        let cmd = parse_command(&["api", "/repos/x/y/issues", "--field", "title=t"]).unwrap();
+        assert!(cmd.has_input_flags);
+    }
+
+    #[test]
+    fn parse_api_raw_field_long_form() {
+        let cmd = parse_command(&["api", "/repos/x/y/issues", "--raw-field", "body=b"]).unwrap();
+        assert!(cmd.has_input_flags);
+    }
+
+    #[test]
+    fn parse_repo_equals_form() {
+        let cmd = parse_command(&["pr", "list", "--repo=navikt/cplt"]).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("navikt/cplt"));
+    }
+
+    #[test]
+    fn parse_global_repo_before_command() {
+        let cmd = parse_command(&["--repo", "navikt/cplt", "pr", "list"]).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("navikt/cplt"));
+        assert_eq!(cmd.command, "pr");
+    }
+
+    #[test]
+    fn parse_hostname_flag_skipped() {
+        // --hostname takes a value, shouldn't confuse the parser
+        let cmd = parse_command(&["--hostname", "github.example.com", "pr", "list"]).unwrap();
+        assert_eq!(cmd.command, "pr");
+        assert_eq!(cmd.subcommand.as_deref(), Some("list"));
+    }
+
+    #[test]
+    fn git_gate_blocks_send_pack() {
+        let result = gate_git(&["send-pack", "origin", "main"]);
+        assert!(result.is_err());
     }
 }
