@@ -1174,8 +1174,12 @@ exec {cplt_escaped} gh-gate --real-gh {gh_escaped} -- "$@"
 /// This is the entry point used by the `gh-gate` subcommand.
 /// Returns `Ok(())` if the command should be allowed, or `Err(message)` if blocked.
 pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
-    let cmd = parse_command(args)
-        .ok_or_else(|| "gh-proxy: could not parse command (no arguments provided)".to_string())?;
+    let cmd = parse_command(args).ok_or_else(|| {
+        "⚠️ BLOCKED by sandbox: could not parse gh command.\n\
+            This operation is restricted by the cplt sandbox environment.\n\
+            Stop and report this to the human operator."
+            .to_string()
+    })?;
 
     let result = evaluate(&cmd);
 
@@ -1190,7 +1194,12 @@ pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
                 // If no -R flag, allow (command implicitly targets current context).
                 if cmd.repo_flag.is_some() {
                     Err(format!(
-                        "gh-proxy: blocked — cannot verify scope (repo detection failed, but -R flag targets {:?})",
+                        "⚠️ BLOCKED by sandbox: 'gh {} {}' cannot verify target repository scope.\n\
+                         The -R flag targets {:?} but the current repo could not be detected.\n\
+                         This operation is restricted by the cplt sandbox environment.\n\
+                         Stop and report this to the human operator — they can run this command outside the sandbox.",
+                        cmd.command,
+                        cmd.subcommand.as_deref().unwrap_or(""),
                         cmd.repo_flag.as_deref().unwrap_or("unknown")
                     ))
                 } else {
@@ -1200,7 +1209,10 @@ pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
                 Ok(())
             } else {
                 Err(format!(
-                    "blocked by cplt: 'gh {}{}' targets '{}' but current repo is '{}' ({})",
+                    "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the current repo '{}'.\n\
+                     Reason: {}\n\
+                     This operation is restricted by the cplt sandbox environment.\n\
+                     Stop and report this to the human operator — they can run this command outside the sandbox.",
                     cmd.command,
                     cmd.subcommand
                         .as_deref()
@@ -1213,7 +1225,10 @@ pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
             }
         }
         Decision::Block => Err(format!(
-            "blocked by cplt: 'gh {}{}' is not allowed in sandbox ({})",
+            "⚠️ BLOCKED by sandbox: 'gh {}{}' is not allowed in this environment.\n\
+             Reason: {}\n\
+             This operation is restricted by the cplt sandbox to prevent unintended changes.\n\
+             Stop and report this to the human operator — they can run this command outside the sandbox.",
             cmd.command,
             cmd.subcommand
                 .as_deref()
@@ -1359,8 +1374,10 @@ pub fn gate_git(args: &[&str]) -> Result<(), String> {
 
     if GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
         return Err(format!(
-            "blocked by cplt: 'git {sub}' is not allowed in sandbox \
-             (push prevention is enabled — commit locally and let the human push)"
+            "⚠️ BLOCKED by sandbox: 'git {sub}' is not allowed in this environment.\n\
+             Push prevention is enabled — commit your changes locally.\n\
+             This operation is restricted by the cplt sandbox to prevent unintended pushes.\n\
+             Stop and report this to the human operator — they will review and push when ready."
         ));
     }
 
