@@ -509,6 +509,21 @@ enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
+
+    /// [internal] Evaluate a git command against push prevention policy.
+    ///
+    /// Called by the git wrapper script inside the sandbox. Blocks push
+    /// operations while allowing all other git commands.
+    #[command(hide = true)]
+    GitGate {
+        /// Path to the real git binary.
+        #[arg(long)]
+        real_git: PathBuf,
+
+        /// git arguments to evaluate and potentially pass through.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1172,6 +1187,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Command::Doctor => run_doctor(),
             Command::GhGate { real_gh, args } => run_gh_gate(&real_gh, &args),
+            Command::GitGate { real_git, args } => run_git_gate(&real_git, &args),
         });
     }
 
@@ -1503,6 +1519,24 @@ fn run_gh_gate(real_gh: &Path, args: &[String]) -> ExitCode {
             let err = std::process::Command::new(real_gh).args(args).exec();
             // exec() only returns on error
             ui::error(&format!("Failed to exec gh: {err}"));
+            ExitCode::FAILURE
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Handle `cplt git-gate` — evaluate a git command and exec the real binary if allowed.
+fn run_git_gate(real_git: &Path, args: &[String]) -> ExitCode {
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    match gh_proxy::gate_git(&arg_refs) {
+        Ok(()) => {
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(real_git).args(args).exec();
+            ui::error(&format!("Failed to exec git: {err}"));
             ExitCode::FAILURE
         }
         Err(msg) => {

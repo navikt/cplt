@@ -128,26 +128,20 @@ fn configure_command(
         }
     }
 
-    // Install gh proxy wrapper if gh is available and scratch dir exists.
-    // Places a wrapper script in {scratch}/bin/gh that intercepts gh commands
-    // and routes them through cplt's policy engine before the real binary.
+    // Install command wrappers if scratch dir exists.
+    // - gh proxy: intercepts gh commands and blocks destructive operations
+    // - git push prevention: blocks git push while allowing all other git operations
     if let Some(scratch) = scratch_dir {
-        install_gh_proxy(cmd, scratch);
+        install_command_wrappers(cmd, scratch);
     }
 }
 
-/// Install the gh proxy wrapper into the scratch dir and prepend it to PATH.
+/// Install gh and git wrapper scripts into the scratch dir and prepend to PATH.
 ///
-/// Discovers the real `gh` binary, generates a wrapper script that calls
-/// `cplt gh-gate`, writes it to `{scratch}/bin/gh`, and prepends
-/// `{scratch}/bin` to the command's PATH environment variable.
-fn install_gh_proxy(cmd: &mut Command, scratch_dir: &Path) {
+/// Both wrappers follow the same pattern: intercept the command, call back to
+/// cplt for a policy decision, then exec the real binary or block.
+fn install_command_wrappers(cmd: &mut Command, scratch_dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
-
-    // Find real gh binary
-    let Some(real_gh) = which_gh() else {
-        return; // gh not installed — nothing to proxy
-    };
 
     // Find cplt binary (ourselves)
     let Ok(cplt_bin) = std::env::current_exe() else {
@@ -159,35 +153,48 @@ fn install_gh_proxy(cmd: &mut Command, scratch_dir: &Path) {
         return;
     }
 
-    let wrapper_path = bin_dir.join("gh");
-    let script = crate::gh_proxy::generate_wrapper_script(
-        &real_gh.to_string_lossy(),
-        &cplt_bin.to_string_lossy(),
-    );
+    let cplt_str = cplt_bin.to_string_lossy();
+    let mut installed_any = false;
 
-    if std::fs::write(&wrapper_path, script).is_err() {
-        return;
+    // Install gh wrapper
+    if let Some(real_gh) = which_binary("gh") {
+        let script =
+            crate::gh_proxy::generate_wrapper_script(&real_gh.to_string_lossy(), &cplt_str);
+        let wrapper_path = bin_dir.join("gh");
+        if std::fs::write(&wrapper_path, script).is_ok() {
+            let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
+            installed_any = true;
+        }
     }
 
-    // Make executable (0755)
-    let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
+    // Install git push prevention wrapper
+    if let Some(real_git) = which_binary("git") {
+        let script =
+            crate::gh_proxy::generate_git_wrapper_script(&real_git.to_string_lossy(), &cplt_str);
+        let wrapper_path = bin_dir.join("git");
+        if std::fs::write(&wrapper_path, script).is_ok() {
+            let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
+            installed_any = true;
+        }
+    }
 
-    // Prepend {scratch}/bin to PATH so the wrapper shadows the real gh.
-    // Read current PATH from the command env (already set by build_sandbox_env).
-    let bin_dir_str = bin_dir.to_string_lossy().to_string();
-    let new_path = if let Some(current_path) = std::env::var_os("PATH") {
-        format!("{}:{}", bin_dir_str, current_path.to_string_lossy())
-    } else {
-        bin_dir_str
-    };
-    cmd.env("PATH", &new_path);
+    // Prepend {scratch}/bin to PATH so wrappers shadow the real binaries.
+    if installed_any {
+        let bin_dir_str = bin_dir.to_string_lossy().to_string();
+        let new_path = if let Some(current_path) = std::env::var_os("PATH") {
+            format!("{}:{}", bin_dir_str, current_path.to_string_lossy())
+        } else {
+            bin_dir_str
+        };
+        cmd.env("PATH", &new_path);
+    }
 }
 
-/// Find the real `gh` binary in PATH.
-fn which_gh() -> Option<PathBuf> {
+/// Find a binary in PATH by name.
+fn which_binary(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("gh");
+        let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
         }

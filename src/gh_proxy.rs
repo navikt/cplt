@@ -1156,6 +1156,173 @@ pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
     }
 }
 
+// ── Git push prevention ───────────────────────────────────────────────
+
+/// Git subcommands that perform remote writes.
+/// Blocked by the git wrapper to prevent agents from pushing code.
+const GIT_BLOCKED_SUBCOMMANDS: &[&str] = &["push", "request-pull"];
+
+/// Git subcommands that are always allowed (read-only or local-only).
+const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
+    // Porcelain: reading
+    "status",
+    "log",
+    "show",
+    "diff",
+    "shortlog",
+    "describe",
+    "blame",
+    "grep",
+    "bisect",
+    "range-diff",
+    "notes",
+    // Porcelain: branching/local writes
+    "branch",
+    "checkout",
+    "switch",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "revert",
+    "reset",
+    "restore",
+    "stash",
+    "tag",
+    "worktree",
+    // Porcelain: working tree
+    "add",
+    "rm",
+    "mv",
+    "clean",
+    "sparse-checkout",
+    // Porcelain: commits
+    "commit",
+    "am",
+    "apply",
+    // Porcelain: remote reads
+    "fetch",
+    "pull",
+    "clone",
+    "ls-remote",
+    "remote",
+    // Porcelain: inspection
+    "reflog",
+    "fsck",
+    "count-objects",
+    "verify-commit",
+    "verify-tag",
+    // Porcelain: config and misc
+    "config",
+    "help",
+    "version",
+    "init",
+    "archive",
+    "rev-parse",
+    "rev-list",
+    "for-each-ref",
+    // Plumbing: reads
+    "cat-file",
+    "hash-object",
+    "ls-tree",
+    "ls-files",
+    "diff-tree",
+    "diff-files",
+    "diff-index",
+    "merge-base",
+    "name-rev",
+    "symbolic-ref",
+    "show-ref",
+    "var",
+    "check-ref-format",
+    "fmt-merge-msg",
+    "mailinfo",
+    "mailsplit",
+    "stripspace",
+    // Plumbing: packing (local)
+    "pack-objects",
+    "unpack-objects",
+    "index-pack",
+    "pack-refs",
+    "prune",
+    "gc",
+    "maintenance",
+    "rerere",
+    // Misc
+    "submodule",
+    "lfs",
+];
+
+/// Evaluate a git command. Returns Ok(()) if allowed, Err with message if blocked.
+///
+/// Used by the `cplt git-gate` subcommand.
+pub fn gate_git(args: &[&str]) -> Result<(), String> {
+    // Find the subcommand by skipping global flags.
+    // Git global flags that take a value (must skip the next arg too).
+    const FLAGS_WITH_VALUE: &[&str] = &[
+        "-c",
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+    ];
+
+    let mut i = 0;
+    let mut subcommand = None;
+    while i < args.len() {
+        let arg = args[i];
+        if FLAGS_WITH_VALUE.contains(&arg) {
+            i += 2; // skip flag and its value
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        subcommand = Some(arg);
+        break;
+    }
+
+    let Some(sub) = subcommand else {
+        // No subcommand (e.g., `git --version`) — allow
+        return Ok(());
+    };
+
+    if GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
+        return Err(format!(
+            "blocked by cplt: 'git {sub}' is not allowed in sandbox \
+             (push prevention is enabled — commit locally and let the human push)"
+        ));
+    }
+
+    // If it's in the allow list, pass through
+    if GIT_ALLOWED_SUBCOMMANDS.contains(&sub) {
+        return Ok(());
+    }
+
+    // Unknown git subcommand — allow by default.
+    // Git's subcommand space is enormous (plumbing, aliases, extensions).
+    // Unlike gh where unknown = likely new destructive feature,
+    // unknown git commands are usually safe plumbing or aliases.
+    // The explicit block list is sufficient for push prevention.
+    Ok(())
+}
+
+/// Generate the git wrapper script content.
+///
+/// Like the gh wrapper, this intercepts git invocations and blocks push operations.
+pub fn generate_git_wrapper_script(real_git: &str, cplt_bin: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+# cplt git proxy — blocks git push in sandboxed agents.
+# This wrapper is auto-generated. Do not edit.
+
+exec "{cplt_bin}" git-gate --real-git "{real_git}" -- "$@"
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,5 +1687,61 @@ mod tests {
             has_input_flags: false,
         };
         assert_eq!(evaluate(&edit).decision, Decision::Block);
+    }
+
+    // ── git gate tests ──
+
+    #[test]
+    fn git_push_is_blocked() {
+        assert!(gate_git(&["push"]).is_err());
+        assert!(gate_git(&["push", "origin", "main"]).is_err());
+        assert!(gate_git(&["push", "--force"]).is_err());
+        assert!(gate_git(&["-c", "user.name=x", "push"]).is_err());
+    }
+
+    #[test]
+    fn git_request_pull_is_blocked() {
+        assert!(gate_git(&["request-pull", "v1.0", "origin"]).is_err());
+    }
+
+    #[test]
+    fn git_read_operations_allowed() {
+        assert!(gate_git(&["status"]).is_ok());
+        assert!(gate_git(&["log", "--oneline"]).is_ok());
+        assert!(gate_git(&["diff", "HEAD~1"]).is_ok());
+        assert!(gate_git(&["fetch", "origin"]).is_ok());
+        assert!(gate_git(&["pull"]).is_ok());
+        assert!(gate_git(&["branch", "-a"]).is_ok());
+    }
+
+    #[test]
+    fn git_local_writes_allowed() {
+        assert!(gate_git(&["commit", "-m", "fix"]).is_ok());
+        assert!(gate_git(&["add", "."]).is_ok());
+        assert!(gate_git(&["checkout", "-b", "feature"]).is_ok());
+        assert!(gate_git(&["merge", "main"]).is_ok());
+        assert!(gate_git(&["rebase", "main"]).is_ok());
+        assert!(gate_git(&["stash"]).is_ok());
+        assert!(gate_git(&["tag", "v1.0"]).is_ok());
+    }
+
+    #[test]
+    fn git_no_subcommand_allowed() {
+        assert!(gate_git(&["--version"]).is_ok());
+        assert!(gate_git(&[]).is_ok());
+    }
+
+    #[test]
+    fn git_unknown_subcommand_allowed() {
+        // Unknown git commands default to allow (unlike gh which defaults to block)
+        assert!(gate_git(&["some-custom-alias"]).is_ok());
+    }
+
+    #[test]
+    fn git_wrapper_script_contains_paths() {
+        let script = generate_git_wrapper_script("/usr/bin/git", "/usr/local/bin/cplt");
+        assert!(script.contains("/usr/bin/git"));
+        assert!(script.contains("/usr/local/bin/cplt"));
+        assert!(script.contains("git-gate"));
     }
 }
