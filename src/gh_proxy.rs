@@ -634,8 +634,8 @@ static POLICY: &[PolicyEntry] = &[
     PolicyEntry {
         command: "auth",
         subcommand: "token",
-        decision: Decision::Allow,
-        reason: "agent needs for auth flows",
+        decision: Decision::Block,
+        reason: "token already injected via env — blocks exfiltration vector",
     },
     PolicyEntry {
         command: "auth",

@@ -132,7 +132,51 @@ fn configure_command(
     // - gh proxy: intercepts gh commands and blocks destructive operations
     // - git push prevention: blocks git push while allowing all other git operations
     if let Some(scratch) = scratch_dir {
+        // Pre-extract GH token before installing wrappers that block `gh auth token`.
+        // If the user authenticates via `~/.config/gh/hosts.yml` (no GH_TOKEN env var),
+        // the agent would normally call `gh auth token` at runtime. Since the wrapper
+        // blocks that (exfiltration vector), we extract and inject the token here.
+        inject_gh_token_if_needed(cmd, agent);
         install_command_wrappers(cmd, scratch);
+    }
+}
+
+/// Inject GH_TOKEN into the command env if not already present.
+///
+/// Runs `gh auth token` outside the sandbox to extract the token from
+/// `~/.config/gh/hosts.yml`, then injects it as GH_TOKEN. This allows
+/// the gh proxy to safely block `gh auth token` inside the sandbox
+/// while still giving the agent API access.
+///
+/// Only injects for agents that need GitHub access (Copilot).
+fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
+    // Only inject for Copilot — other agents have their own auth
+    if agent != Agent::Copilot {
+        return;
+    }
+
+    // Skip if GH_TOKEN is already set in the environment
+    if std::env::var("GH_TOKEN").is_ok() || std::env::var("GITHUB_TOKEN").is_ok() {
+        return;
+    }
+
+    // Extract token from gh CLI config (outside sandbox)
+    let Ok(output) = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return;
+    };
+
+    if !output.status.success() {
+        return;
+    }
+
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !token.is_empty() {
+        cmd.env("GH_TOKEN", &token);
     }
 }
 

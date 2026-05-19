@@ -65,7 +65,7 @@ gh run list/view/download/watch
 gh workflow list/view
 gh release list/view/download/verify
 gh search *
-gh auth status/token
+gh auth status
 gh config list/get/clear-cache
 gh secret list
 gh variable list/get
@@ -98,7 +98,7 @@ gh secret set/delete
 gh variable set/delete
 gh workflow run/enable/disable
 gh run rerun/cancel/delete
-gh auth login/logout/refresh/setup-git/switch
+gh auth login/logout/refresh/setup-git/switch/token
 gh config set
 gh extension install/remove/upgrade/exec
 gh gist create/edit/delete
@@ -109,6 +109,23 @@ gh cache delete
 gh codespace *
 gh project * (except list/view/field-list/item-list)
 ```
+
+## `gh auth token` and token injection
+
+`gh auth token` is **blocked** to prevent token exfiltration. Instead, cplt
+pre-extracts the token before the sandbox starts:
+
+1. Before launching the sandbox, cplt runs `gh auth token` (outside the sandbox)
+2. Injects the token as `GH_TOKEN` into the sandboxed environment
+3. Blocks `gh auth token` inside the sandbox (no way to exfiltrate the value)
+
+This means the agent has API access via `GH_TOKEN` (needed for operations),
+but cannot extract the raw token string to send to external services.
+
+**When this applies:**
+- Only for Copilot agent (other agents have their own auth mechanisms)
+- Only when `GH_TOKEN`/`GITHUB_TOKEN` is not already set in the environment
+- Falls back gracefully if `gh` is not installed or not authenticated
 
 ## `gh api` handling
 
