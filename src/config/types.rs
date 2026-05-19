@@ -152,6 +152,15 @@ pub struct SandboxConfig {
     /// Suppress the startup configuration summary and non-essential info messages.
     /// Errors and warnings are always shown. (default: false)
     pub quiet: Option<bool>,
+    /// Enable the gh CLI proxy that blocks destructive GitHub operations (default: false).
+    /// When enabled, a wrapper script intercepts `gh` commands and applies a policy that
+    /// blocks destructive write operations (delete repo, merge PR, etc.) while allowing
+    /// safe reads. Default-deny for unrecognized commands.
+    pub gh_proxy: Option<bool>,
+    /// Enable git push prevention (default: false).
+    /// When enabled, a wrapper script intercepts `git` commands and blocks `push` and
+    /// `request-pull` while allowing all other git operations.
+    pub git_push_prevention: Option<bool>,
 }
 
 /// Resolved configuration after merging config file + CLI flags.
@@ -185,6 +194,8 @@ pub struct Resolved {
     pub allow_browser: bool,
     pub scratch_dir: bool,
     pub quiet: bool,
+    pub gh_proxy: bool,
+    pub git_push_prevention: bool,
     /// Preferred agent from config (None = auto-detect).
     pub agent: Option<String>,
     /// Env vars to strip from the sandbox environment (from repo config [deny] section).
@@ -224,6 +235,8 @@ pub struct CliFlags {
     pub allow_browser: bool,
     pub scratch: FeatureToggle,
     pub quiet: FeatureToggle,
+    pub gh_proxy: FeatureToggle,
+    pub git_push_prevention: FeatureToggle,
 }
 
 /// Result of loading a config file from disk.

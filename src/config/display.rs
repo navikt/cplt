@@ -321,6 +321,18 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         quiet,
         src(c.sandbox.quiet.is_some())
     );
+    let gh_proxy = c.sandbox.gh_proxy.unwrap_or(false);
+    println!(
+        "{blue}[cplt]{nc}    gh_proxy              = {}{}",
+        gh_proxy,
+        src(c.sandbox.gh_proxy.is_some())
+    );
+    let git_push_prevention = c.sandbox.git_push_prevention.unwrap_or(false);
+    println!(
+        "{blue}[cplt]{nc}    git_push_prevention   = {}{}",
+        git_push_prevention,
+        src(c.sandbox.git_push_prevention.is_some())
+    );
 
     println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
 }

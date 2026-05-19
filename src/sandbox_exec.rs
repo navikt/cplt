@@ -61,6 +61,8 @@ fn configure_command(
     scratch_dir: Option<&Path>,
     proxy_port: Option<u16>,
     agent: Agent,
+    gh_proxy: bool,
+    git_push_prevention: bool,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -128,16 +130,18 @@ fn configure_command(
         }
     }
 
-    // Install command wrappers if scratch dir exists.
+    // Install command wrappers if scratch dir exists and features are enabled.
     // - gh proxy: intercepts gh commands and blocks destructive operations
     // - git push prevention: blocks git push while allowing all other git operations
     if let Some(scratch) = scratch_dir {
-        // Pre-extract GH token before installing wrappers that block `gh auth token`.
-        // If the user authenticates via `~/.config/gh/hosts.yml` (no GH_TOKEN env var),
-        // the agent would normally call `gh auth token` at runtime. Since the wrapper
-        // blocks that (exfiltration vector), we extract and inject the token here.
-        inject_gh_token_if_needed(cmd, agent);
-        install_command_wrappers(cmd, scratch);
+        if gh_proxy {
+            // Pre-extract GH token before installing wrappers that block `gh auth token`.
+            // If the user authenticates via `~/.config/gh/hosts.yml` (no GH_TOKEN env var),
+            // the agent would normally call `gh auth token` at runtime. Since the wrapper
+            // blocks that (exfiltration vector), we extract and inject the token here.
+            inject_gh_token_if_needed(cmd, agent);
+        }
+        install_command_wrappers(cmd, scratch, gh_proxy, git_push_prevention);
     }
 }
 
@@ -184,7 +188,12 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
 ///
 /// Both wrappers follow the same pattern: intercept the command, call back to
 /// cplt for a policy decision, then exec the real binary or block.
-fn install_command_wrappers(cmd: &mut Command, scratch_dir: &Path) {
+fn install_command_wrappers(
+    cmd: &mut Command,
+    scratch_dir: &Path,
+    gh_proxy: bool,
+    git_push_prevention: bool,
+) {
     use std::os::unix::fs::PermissionsExt;
 
     // Find cplt binary (ourselves)
@@ -200,8 +209,8 @@ fn install_command_wrappers(cmd: &mut Command, scratch_dir: &Path) {
     let cplt_str = cplt_bin.to_string_lossy();
     let mut installed_any = false;
 
-    // Install gh wrapper
-    if let Some(real_gh) = which_binary("gh") {
+    // Install gh wrapper (only if gh_proxy enabled)
+    if let Some(real_gh) = gh_proxy.then(|| which_binary("gh")).flatten() {
         let script =
             crate::gh_proxy::generate_wrapper_script(&real_gh.to_string_lossy(), &cplt_str);
         let wrapper_path = bin_dir.join("gh");
@@ -211,8 +220,8 @@ fn install_command_wrappers(cmd: &mut Command, scratch_dir: &Path) {
         }
     }
 
-    // Install git push prevention wrapper
-    if let Some(real_git) = which_binary("git") {
+    // Install git push prevention wrapper (only if git_push_prevention enabled)
+    if let Some(real_git) = git_push_prevention.then(|| which_binary("git")).flatten() {
         let script =
             crate::gh_proxy::generate_git_wrapper_script(&real_git.to_string_lossy(), &cplt_str);
         let wrapper_path = bin_dir.join("git");
@@ -356,6 +365,7 @@ pub fn preflight(sandbox: &super::PreparedSandbox) -> Result<(), String> {
 /// Writes the SBPL profile to a temp file, invokes `sandbox-exec`, and
 /// cleans up the profile file on exit.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub fn exec(
     sandbox: &super::PreparedSandbox,
     copilot_bin: &Path,
@@ -364,6 +374,8 @@ pub fn exec(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
+    gh_proxy: bool,
+    git_push_prevention: bool,
 ) -> u8 {
     let profile_path = match write_temp_profile(&sandbox.profile_text) {
         Ok(p) => p,
@@ -387,6 +399,8 @@ pub fn exec(
         sandbox.scratch_dir.as_deref(),
         sandbox.proxy_port,
         sandbox.agent,
+        gh_proxy,
+        git_push_prevention,
     );
 
     // Strip repo-config denied env vars
@@ -449,6 +463,7 @@ pub fn preflight(_sandbox: &super::PreparedSandbox) -> Result<(), String> {
 /// process between fork() and exec(). All allocation and I/O was done
 /// in the parent via `precompute()` — the hook only makes raw syscalls.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 pub fn exec(
     sandbox: &super::PreparedSandbox,
     copilot_bin: &Path,
@@ -457,6 +472,8 @@ pub fn exec(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
+    gh_proxy: bool,
+    git_push_prevention: bool,
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;
 
@@ -473,6 +490,8 @@ pub fn exec(
         sandbox.scratch_dir.as_deref(),
         sandbox.proxy_port,
         sandbox.agent,
+        gh_proxy,
+        git_push_prevention,
     );
 
     // Strip repo-config denied env vars

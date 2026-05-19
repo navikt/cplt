@@ -50,6 +50,8 @@ pub struct ProposeSection {
     pub allow_lifecycle_scripts: Option<bool>,
     pub allow_browser: Option<bool>,
     pub allow_env_files: Option<bool>,
+    pub gh_proxy: Option<bool>,
+    pub git_push_prevention: Option<bool>,
 
     /// Proposed path/port expansions.
     #[serde(default)]
@@ -262,6 +264,12 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     }
     if propose.allow_env_files == Some(true) {
         keys.push("allow_env_files");
+    }
+    if propose.gh_proxy == Some(true) {
+        keys.push("gh_proxy");
+    }
+    if propose.git_push_prevention == Some(true) {
+        keys.push("git_push_prevention");
     }
     if !propose.allow.read.is_empty() {
         keys.push("allow.read");

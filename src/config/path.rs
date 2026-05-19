@@ -177,6 +177,17 @@ pub fn default_config_contents() -> String {
 # sandbox settings and don't need to see them every time.
 # Override with --no-quiet for a single run.
 # quiet = false
+#
+# Enable the gh CLI proxy that blocks destructive GitHub operations (default: false).
+# A wrapper script intercepts `gh` commands and blocks destructive writes
+# (delete repo, merge PR, etc.) while allowing safe reads and pre-injecting
+# GH_TOKEN so `gh auth token` can be safely blocked inside the sandbox.
+# gh_proxy = false
+#
+# Enable git push prevention (default: false).
+# Blocks `git push` and `git request-pull` while allowing all other git
+# operations. Prevents agents from accidentally pushing code.
+# git_push_prevention = false
 "#
     .to_string()
 }

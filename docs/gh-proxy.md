@@ -1,4 +1,4 @@
-# gh CLI Proxy
+# gh CLI Proxy & Git Push Prevention
 
 ## Overview
 
@@ -7,8 +7,35 @@ operations through the `gh` CLI. It intercepts all `gh` invocations inside
 the sandbox and enforces a command-level policy before passing through to
 the real binary.
 
-**Enabled automatically** when a scratch directory is active (the default).
-No configuration needed.
+The git guard prevents agents from pushing code by blocking `git push` and
+`git request-pull`.
+
+## Configuration
+
+Both features are **opt-in** (disabled by default) for a safe rollout:
+
+```toml
+# ~/.config/cplt/config.toml
+[sandbox]
+gh_proxy = true             # blocks destructive gh operations
+git_push_prevention = true  # blocks git push
+```
+
+CLI flags (override config for a single run):
+
+```bash
+cplt --gh-proxy          # enable gh proxy
+cplt --no-gh-proxy       # disable gh proxy
+cplt --git-guard         # enable git push prevention
+cplt --no-git-guard      # disable git push prevention
+```
+
+Per-repo via `.cplt.toml`:
+```toml
+[sandbox]
+gh_proxy = true
+git_push_prevention = true
+```
 
 ## How it works
 
@@ -233,14 +260,16 @@ Compare against the commands in `POLICY`.
 ## Rollout plan
 
 ### Phase 1: Current (this PR)
-- Core policy engine with 28 unit tests
-- Automatic wrapper installation via scratch dir
-- Default-deny for all unknown commands
-- No configuration needed — works out of the box
+- Core policy engine with 35 unit tests
+- Opt-in via config: `sandbox.gh_proxy = true` / `sandbox.git_push_prevention = true`
+- CLI flags: `--gh-proxy` / `--no-gh-proxy`, `--git-guard` / `--no-git-guard`
+- Default-deny for all unknown gh commands
+- GH_TOKEN pre-injection (blocks `gh auth token` exfiltration)
+- **Default: off** — users opt-in to test
 
-### Phase 2: Configuration & observability
-- `--no-gh-proxy` flag to disable
-- `[gh-proxy]` config section for per-repo allow/block overrides
+### Phase 2: Flip default to on
+- Once stable, change default from `false` to `true`
+- Users can still opt-out via `--no-gh-proxy` / config
 - Audit logging (append to proxy log file)
 - `cplt doctor` check for gh proxy status
 

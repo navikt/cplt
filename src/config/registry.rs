@@ -273,6 +273,22 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         default_display: "false",
         description: "Allow the agent to open URLs in your default browser (needed for OAuth code flows).",
     },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "gh_proxy",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Enable gh CLI proxy that blocks destructive GitHub operations (delete repo, merge PR, etc.).",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "git_push_prevention",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Enable git push prevention (blocks git push and git request-pull).",
+    },
 ];
 
 /// Look up a config key by "section.key" dotted notation.

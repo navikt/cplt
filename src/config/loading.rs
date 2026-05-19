@@ -253,6 +253,14 @@ impl Config {
         // Quiet: FeatureToggle resolves --quiet/--no-quiet (default: off)
         let quiet = cli.quiet.resolve(self.sandbox.quiet.unwrap_or(false));
 
+        // gh-proxy: FeatureToggle resolves --gh-proxy/--no-gh-proxy (default: off for soft rollout)
+        let gh_proxy = cli.gh_proxy.resolve(self.sandbox.gh_proxy.unwrap_or(false));
+
+        // git-push-prevention: FeatureToggle resolves --git-guard/--no-git-guard (default: off for soft rollout)
+        let git_push_prevention = cli
+            .git_push_prevention
+            .resolve(self.sandbox.git_push_prevention.unwrap_or(false));
+
         // Validate all paths for SBPL injection characters
         for p in allow_read
             .iter()
@@ -315,6 +323,8 @@ impl Config {
             allow_browser,
             scratch_dir,
             quiet,
+            gh_proxy,
+            git_push_prevention,
             agent: self.sandbox.agent.clone(),
             deny_env: Vec::new(),
         })
@@ -579,6 +589,36 @@ impl Resolved {
         }
         eprintln!();
 
+        // Command guards
+        if self.gh_proxy || self.git_push_prevention {
+            eprintln!("{blue}[cplt]{nc}  {dim}Command guards:{nc}");
+            if self.gh_proxy {
+                if self.scratch_dir {
+                    eprintln!(
+                        "{blue}[cplt]{nc}    gh proxy:      {green}on{nc}          {dim}blocks destructive gh operations{nc}"
+                    );
+                } else {
+                    let yellow = ui::color(ui::YELLOW);
+                    eprintln!(
+                        "{blue}[cplt]{nc}    gh proxy:      {yellow}inactive{nc}    {dim}requires scratch_dir{nc}"
+                    );
+                }
+            }
+            if self.git_push_prevention {
+                if self.scratch_dir {
+                    eprintln!(
+                        "{blue}[cplt]{nc}    git guard:     {green}on{nc}          {dim}blocks git push{nc}"
+                    );
+                } else {
+                    let yellow = ui::color(ui::YELLOW);
+                    eprintln!(
+                        "{blue}[cplt]{nc}    git guard:     {yellow}inactive{nc}    {dim}requires scratch_dir{nc}"
+                    );
+                }
+            }
+            eprintln!();
+        }
+
         eprintln!(
             "{blue}[cplt]{nc}  {dim}Home:{nc}           {}",
             home_dir.display()
@@ -656,6 +696,14 @@ impl Resolved {
         }
         if repo_config.propose.allow_env_files == Some(true) && is_approved("allow_env_files") {
             self.allow_env_files = true;
+        }
+        if repo_config.propose.gh_proxy == Some(true) && is_approved("gh_proxy") {
+            self.gh_proxy = true;
+        }
+        if repo_config.propose.git_push_prevention == Some(true)
+            && is_approved("git_push_prevention")
+        {
+            self.git_push_prevention = true;
         }
 
         // Path proposals

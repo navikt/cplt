@@ -194,6 +194,7 @@ pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
 /// Environment handling is controlled by `extra_pass_env`, `inherit_env`,
 /// and `disabled_categories` — see [`build_sandbox_env()`] for details.
 /// `deny_env` contains additional env vars to strip (from repo config [deny] section).
+#[allow(clippy::too_many_arguments)]
 pub fn exec_sandboxed(
     sandbox: &PreparedSandbox,
     copilot_bin: &Path,
@@ -202,6 +203,8 @@ pub fn exec_sandboxed(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
+    gh_proxy: bool,
+    git_push_prevention: bool,
 ) -> u8 {
     exec::exec(
         sandbox,
@@ -211,6 +214,8 @@ pub fn exec_sandboxed(
         inherit_env,
         disabled_categories,
         deny_env,
+        gh_proxy,
+        git_push_prevention,
     )
 }
 

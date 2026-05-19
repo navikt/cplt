@@ -321,6 +321,25 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
     #[arg(long)]
     no_scratch_dir: bool,
 
+    /// Enable the gh CLI proxy that blocks destructive GitHub operations.
+    /// A wrapper script intercepts `gh` commands and blocks destructive writes
+    /// (delete repo, merge PR, etc.) while allowing safe reads.
+    #[arg(long)]
+    gh_proxy: bool,
+
+    /// Disable the gh CLI proxy (overrides config file setting).
+    #[arg(long)]
+    no_gh_proxy: bool,
+
+    /// Enable git push prevention. Blocks `git push` and `git request-pull`
+    /// while allowing all other git operations.
+    #[arg(long)]
+    git_guard: bool,
+
+    /// Disable git push prevention (overrides config file setting).
+    #[arg(long)]
+    no_git_guard: bool,
+
     /// Skip the startup check that verifies the sandbox is working.
     /// The check runs a quick test command inside the sandbox to confirm
     /// that file and network restrictions are active.
@@ -817,6 +836,8 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         allow_browser: cli.allow_browser,
         scratch: config::FeatureToggle::from_pair(cli.scratch_dir, cli.no_scratch_dir),
         quiet: config::FeatureToggle::from_pair(cli.quiet, cli.no_quiet),
+        gh_proxy: config::FeatureToggle::from_pair(cli.gh_proxy, cli.no_gh_proxy),
+        git_push_prevention: config::FeatureToggle::from_pair(cli.git_guard, cli.no_git_guard),
     }) {
         Ok(r) => r,
         Err(e) => bail!("{e}"),
@@ -1421,6 +1442,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         resolved.inherit_env,
         &disabled_categories,
         &resolved.deny_env,
+        resolved.gh_proxy,
+        resolved.git_push_prevention,
     );
 
     // Cleanup
@@ -1871,6 +1894,8 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
             ),
             ("allow_env_files", rc.propose.allow_env_files),
             ("allow_browser", rc.propose.allow_browser),
+            ("gh_proxy", rc.propose.gh_proxy),
+            ("git_push_prevention", rc.propose.git_push_prevention),
         ];
         for (name, val) in bools {
             if let Some(v) = val {

@@ -33,6 +33,8 @@ const VALID_SANDBOX_KEYS: &[&str] = &[
     "allow_cache_exec",
     "allow_cache_exec_any",
     "allow_browser",
+    "gh_proxy",
+    "git_push_prevention",
 ];
 const VALID_SECTIONS: &[&str] = &["proxy", "allow", "deny", "sandbox"];
 
