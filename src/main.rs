@@ -7,7 +7,6 @@ use cplt::{
 };
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
-#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1532,7 +1531,7 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 /// is allowed, this replaces the current process with the real gh binary.
 /// If blocked, prints an error message and exits with code 1.
 fn run_gh_gate(real_gh: &Path, args: &[String]) -> ExitCode {
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     match gh_proxy::gate(&arg_refs, &cwd) {

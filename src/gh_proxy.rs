@@ -1126,8 +1126,17 @@ pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
             let current_repo = detect_current_repo(project_dir).unwrap_or_default();
 
             if current_repo.is_empty() {
-                // Can't determine repo — allow but warn
-                Ok(())
+                // Can't determine current repo.
+                // If -R flag is explicitly targeting another repo, block (fail-closed).
+                // If no -R flag, allow (command implicitly targets current context).
+                if cmd.repo_flag.is_some() {
+                    Err(format!(
+                        "gh-proxy: blocked — cannot verify scope (repo detection failed, but -R flag targets {:?})",
+                        cmd.repo_flag.as_deref().unwrap_or("unknown")
+                    ))
+                } else {
+                    Ok(())
+                }
             } else if is_repo_in_scope(&cmd, &current_repo) {
                 Ok(())
             } else {
