@@ -170,7 +170,11 @@ pub fn set_repo_value_in_doc(
                     } else {
                         value.to_string()
                     };
-                    if !arr.iter().any(|v| v.as_str() == Some(stored.as_str())) {
+                    // Check both forms to avoid duplicates from pre-collapse entries
+                    let already_present = arr
+                        .iter()
+                        .any(|v| v.as_str().is_some_and(|s| s == stored || s == value));
+                    if !already_present {
                         arr.push(stored.as_str());
                     }
                 }
@@ -250,7 +254,11 @@ pub fn set_repo_value_in_doc(
                 } else {
                     value.to_string()
                 };
-                if !arr.iter().any(|v| v.as_str() == Some(stored.as_str())) {
+                // Check both forms to avoid duplicates from pre-collapse entries
+                let already_present = arr
+                    .iter()
+                    .any(|v| v.as_str().is_some_and(|s| s == stored || s == value));
+                if !already_present {
                     arr.push(stored.as_str());
                 }
             }
@@ -445,6 +453,25 @@ mod tests {
         assert!(
             result.contains("~/.ssh"),
             "deny paths should collapse home prefix, got: {result}"
+        );
+    }
+
+    #[test]
+    fn set_repo_value_no_duplicate_when_legacy_absolute_exists() {
+        let home = std::env::var("HOME").unwrap();
+        let abs_path = format!("{home}/.config/gcloud/creds.json");
+        // Simulate a legacy entry with absolute path already in the doc
+        let initial = format!("[propose.allow]\nread = [\"{abs_path}\"]\n");
+        let mut doc = initial.parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        let target = repo_key_target(info).unwrap();
+        // Adding the same path again should NOT create a duplicate
+        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+        let result = doc.to_string();
+        let count = result.matches("creds.json").count();
+        assert_eq!(
+            count, 1,
+            "should not duplicate when legacy absolute entry exists, got: {result}"
         );
     }
 }

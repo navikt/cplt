@@ -2470,6 +2470,18 @@ fn trust_accept(
         return ExitCode::SUCCESS;
     }
 
+    // Guard: refuse to approve uncommitted .cplt.toml changes.
+    // This ensures approved configs are auditable in git history and prevents
+    // a malicious process from injecting permissions and immediately accepting them.
+    if is_cplt_toml_uncommitted(project_dir) {
+        ui::error(
+            ".cplt.toml has uncommitted changes.\n  \
+             Commit the file first so permissions are auditable in git history:\n    \
+             git add .cplt.toml && git commit -m \"chore: update cplt sandbox config\"",
+        );
+        return ExitCode::FAILURE;
+    }
+
     // Determine which keys to accept
     let keys_to_accept: Vec<String> = if all {
         proposed
@@ -2479,19 +2491,42 @@ fn trust_accept(
     } else if keys.is_empty() {
         // Interactive mode: show pending permissions and prompt
         let trust_entry = trust::load_trust(project_dir);
-        let pending: Vec<&str> = proposed
-            .iter()
-            .filter(|&&key| {
-                !trust_entry
-                    .as_ref()
-                    .is_some_and(|t| trust::is_key_approved(t, key))
-            })
-            .copied()
-            .collect();
+
+        // If content hash changed, all keys need re-approval
+        let hash_mismatch = trust_entry.as_ref().is_some_and(|t| {
+            !t.accepted.content_hash.is_empty() && {
+                let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+                t.accepted.content_hash != current_hash
+            }
+        });
+
+        let pending: Vec<&str> = if hash_mismatch {
+            // Values changed — all keys need re-approval
+            proposed.clone()
+        } else {
+            proposed
+                .iter()
+                .filter(|&&key| {
+                    !trust_entry
+                        .as_ref()
+                        .is_some_and(|t| trust::is_key_approved(t, key))
+                })
+                .copied()
+                .collect()
+        };
 
         if pending.is_empty() {
             ui::info("All permissions are already approved.");
             return ExitCode::SUCCESS;
+        }
+
+        if hash_mismatch {
+            println!(
+                "{}[cplt]{} Proposal values have changed since last approval — re-approval needed.",
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET),
+            );
+            println!();
         }
 
         let blue = ui::stdout_color(ui::BLUE);
@@ -2595,6 +2630,18 @@ fn trust_accept(
         println!("  • {key}");
     }
     ExitCode::SUCCESS
+}
+
+/// Check if .cplt.toml has uncommitted changes (staged or unstaged).
+fn is_cplt_toml_uncommitted(project_dir: &std::path::Path) -> bool {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--", ".cplt.toml"])
+        .current_dir(project_dir)
+        .output();
+    match output {
+        Ok(o) if o.status.success() => !o.stdout.is_empty(),
+        _ => false, // If git fails (not a repo, etc.), don't block
+    }
 }
 
 /// Format the proposed values for a key for display.
