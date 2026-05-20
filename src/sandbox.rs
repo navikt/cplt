@@ -203,7 +203,7 @@ pub fn exec_sandboxed(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
-    gh_proxy: bool,
+    gh_proxy: &crate::config::GhProxyPolicy,
     git_push_prevention: bool,
 ) -> u8 {
     exec::exec(

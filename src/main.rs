@@ -523,6 +523,26 @@ enum Command {
         #[arg(long)]
         real_gh: PathBuf,
 
+        /// Enable repository scope checking.
+        #[arg(long, default_value_t = true)]
+        scope_check: bool,
+
+        /// Disable repository scope checking.
+        #[arg(long, conflicts_with = "scope_check")]
+        no_scope_check: bool,
+
+        /// Block `gh auth token` (credential exfiltration prevention).
+        #[arg(long, default_value_t = true)]
+        block_auth_token: bool,
+
+        /// Allow `gh auth token`.
+        #[arg(long, conflicts_with = "block_auth_token")]
+        no_block_auth_token: bool,
+
+        /// Policy for unrecognized commands: "block" or "allow".
+        #[arg(long, default_value = "block")]
+        unknown_command: String,
+
         /// gh arguments to evaluate and potentially pass through.
         #[arg(last = true)]
         args: Vec<String>,
@@ -1206,7 +1226,26 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
             }
             Command::Doctor => run_doctor(),
-            Command::GhGate { real_gh, args } => run_gh_gate(&real_gh, &args),
+            Command::GhGate {
+                real_gh,
+                scope_check,
+                no_scope_check,
+                block_auth_token,
+                no_block_auth_token,
+                unknown_command,
+                args,
+            } => {
+                let policy = gh_proxy::GatePolicy {
+                    scope_check: scope_check && !no_scope_check,
+                    block_auth_token: block_auth_token && !no_block_auth_token,
+                    unknown_command: if unknown_command == "allow" {
+                        gh_proxy::UnknownCommandDecision::Allow
+                    } else {
+                        gh_proxy::UnknownCommandDecision::Block
+                    },
+                };
+                run_gh_gate(&real_gh, &args, &policy)
+            }
             Command::GitGate { real_git, args } => run_git_gate(&real_git, &args),
         });
     }
@@ -1441,7 +1480,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         resolved.inherit_env,
         &disabled_categories,
         &resolved.deny_env,
-        resolved.gh_proxy,
+        &resolved.gh_proxy,
         resolved.git_push_prevention,
     );
 
@@ -1530,11 +1569,11 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 /// Called from the wrapper script placed in the sandbox's PATH. If the command
 /// is allowed, this replaces the current process with the real gh binary.
 /// If blocked, prints an error message and exits with code 1.
-fn run_gh_gate(real_gh: &Path, args: &[String]) -> ExitCode {
+fn run_gh_gate(real_gh: &Path, args: &[String], policy: &gh_proxy::GatePolicy) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match gh_proxy::gate(&arg_refs, &cwd) {
+    match gh_proxy::gate(&arg_refs, &cwd, policy) {
         Ok(()) => {
             // Allowed — exec the real gh binary (replaces this process)
             use std::os::unix::process::CommandExt;

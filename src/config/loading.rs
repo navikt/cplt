@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use super::error::ConfigError;
 use super::path::{config_path, expand_tilde, resolve_config_path};
-use super::types::{CliFlags, Config, LoadedConfig, Resolved};
+use super::types::{CliFlags, Config, GhProxyPolicy, LoadedConfig, Resolved, UnknownCommandPolicy};
 use crate::sandbox::{HardeningCategory, validate_sbpl_path};
 use crate::ui;
 
@@ -253,13 +253,32 @@ impl Config {
         // Quiet: FeatureToggle resolves --quiet/--no-quiet (default: off)
         let quiet = cli.quiet.resolve(self.sandbox.quiet.unwrap_or(false));
 
-        // gh-proxy: FeatureToggle resolves --gh-proxy/--no-gh-proxy (default: off for soft rollout)
-        let gh_proxy = cli.gh_proxy.resolve(self.sandbox.gh_proxy.unwrap_or(false));
+        // gh-proxy: CLI flag overrides enabled; sub-options come from [gh_proxy] config.
+        // Backward compat: old `sandbox.gh_proxy = true` is treated as `gh_proxy.enabled = true`.
+        let gh_proxy_enabled_default = self
+            .gh_proxy
+            .enabled
+            .or(self.sandbox.gh_proxy)
+            .unwrap_or(false);
+        let gh_proxy_enabled = cli.gh_proxy.resolve(gh_proxy_enabled_default);
+        let gh_proxy = GhProxyPolicy {
+            enabled: gh_proxy_enabled,
+            scope_check: self.gh_proxy.scope_check.unwrap_or(true),
+            block_auth_token: self.gh_proxy.block_auth_token.unwrap_or(true),
+            inject_token: self.gh_proxy.inject_token.unwrap_or(false),
+            unknown_command: self
+                .gh_proxy
+                .unknown_command
+                .unwrap_or(UnknownCommandPolicy::Block),
+        };
 
-        // git-push-prevention: FeatureToggle resolves --git-guard/--no-git-guard (default: off for soft rollout)
-        let git_push_prevention = cli
-            .git_push_prevention
-            .resolve(self.sandbox.git_push_prevention.unwrap_or(false));
+        // git-guard: CLI flag overrides enabled. Backward compat from sandbox.git_push_prevention.
+        let git_guard_enabled_default = self
+            .git_guard
+            .enabled
+            .or(self.sandbox.git_push_prevention)
+            .unwrap_or(false);
+        let git_push_prevention = cli.git_push_prevention.resolve(git_guard_enabled_default);
 
         // Validate all paths for SBPL injection characters
         for p in allow_read
@@ -590,12 +609,21 @@ impl Resolved {
         eprintln!();
 
         // Command guards
-        if self.gh_proxy || self.git_push_prevention {
+        if self.gh_proxy.enabled || self.git_push_prevention {
             eprintln!("{blue}[cplt]{nc}  {dim}Command guards:{nc}");
-            if self.gh_proxy {
+            if self.gh_proxy.enabled {
                 if self.scratch_dir {
+                    let policy_note = match self.gh_proxy.unknown_command {
+                        UnknownCommandPolicy::Block => "default-deny",
+                        UnknownCommandPolicy::Allow => "permissive",
+                    };
                     eprintln!(
-                        "{blue}[cplt]{nc}    gh proxy:      {green}on{nc}          {dim}blocks destructive gh operations{nc}"
+                        "{blue}[cplt]{nc}    gh proxy:      {green}on{nc}          {dim}{policy_note}, scope_check={}{nc}",
+                        if self.gh_proxy.scope_check {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     );
                 } else {
                     let yellow = ui::color(ui::YELLOW);
@@ -698,7 +726,7 @@ impl Resolved {
             self.allow_env_files = true;
         }
         if repo_config.propose.gh_proxy == Some(true) && is_approved("gh_proxy") {
-            self.gh_proxy = true;
+            self.gh_proxy.enabled = true;
         }
         if repo_config.propose.git_push_prevention == Some(true)
             && is_approved("git_push_prevention")

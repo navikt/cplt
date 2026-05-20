@@ -279,7 +279,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Enable gh CLI proxy that blocks destructive GitHub operations (delete repo, merge PR, etc.).",
+        description: "DEPRECATED: use [gh_proxy] section instead. Enables gh CLI proxy.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -287,7 +287,57 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Enable git push prevention (blocks git push and git request-pull).",
+        description: "DEPRECATED: use [git_guard] section instead. Enables git push prevention.",
+    },
+    // [gh_proxy]
+    ConfigKeyInfo {
+        section: "gh_proxy",
+        key: "enabled",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Enable gh CLI proxy that blocks destructive GitHub operations (delete repo, merge PR, etc.).",
+    },
+    ConfigKeyInfo {
+        section: "gh_proxy",
+        key: "scope_check",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true",
+        description: "Enforce same-repo check — blocks operations targeting other repositories via -R flag.",
+    },
+    ConfigKeyInfo {
+        section: "gh_proxy",
+        key: "block_auth_token",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true",
+        description: "Block 'gh auth token' command to prevent credential exfiltration.",
+    },
+    ConfigKeyInfo {
+        section: "gh_proxy",
+        key: "inject_token",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Pre-extract GH_TOKEN before sandbox launch (only for Copilot agent).",
+    },
+    ConfigKeyInfo {
+        section: "gh_proxy",
+        key: "unknown_command",
+        value_type: ConfigValueType::Str,
+        dangerous: false,
+        default_display: "block",
+        description: "Policy for commands not in the classification table: \"block\" (default-deny) or \"allow\" (permissive).",
+    },
+    // [git_guard]
+    ConfigKeyInfo {
+        section: "git_guard",
+        key: "enabled",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Enable git push prevention (blocks git push, request-pull, send-pack).",
     },
 ];
 

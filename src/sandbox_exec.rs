@@ -61,7 +61,7 @@ fn configure_command(
     scratch_dir: Option<&Path>,
     proxy_port: Option<u16>,
     agent: Agent,
-    gh_proxy: bool,
+    gh_proxy: &crate::config::GhProxyPolicy,
     git_push_prevention: bool,
 ) {
     for arg in copilot_args {
@@ -134,12 +134,11 @@ fn configure_command(
     // - gh proxy: intercepts gh commands and blocks destructive operations
     // - git push prevention: blocks git push while allowing all other git operations
     if let Some(scratch) = scratch_dir {
-        if gh_proxy {
+        if gh_proxy.enabled {
             // Pre-extract GH token before installing wrappers that block `gh auth token`.
-            // If the user authenticates via `~/.config/gh/hosts.yml` (no GH_TOKEN env var),
-            // the agent would normally call `gh auth token` at runtime. Since the wrapper
-            // blocks that (exfiltration vector), we extract and inject the token here.
-            inject_gh_token_if_needed(cmd, agent);
+            if gh_proxy.inject_token {
+                inject_gh_token_if_needed(cmd, agent);
+            }
         }
         install_command_wrappers(cmd, scratch, gh_proxy, git_push_prevention);
     }
@@ -188,10 +187,11 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
 ///
 /// Both wrappers follow the same pattern: intercept the command, call back to
 /// cplt for a policy decision, then exec the real binary or block.
+/// Policy is baked into the wrapper invocation — not re-read from config at gate time.
 fn install_command_wrappers(
     cmd: &mut Command,
     scratch_dir: &Path,
-    gh_proxy: bool,
+    gh_proxy: &crate::config::GhProxyPolicy,
     git_push_prevention: bool,
 ) {
     use std::os::unix::fs::PermissionsExt;
@@ -210,9 +210,14 @@ fn install_command_wrappers(
     let mut installed_any = false;
 
     // Install gh wrapper (only if gh_proxy enabled)
-    if let Some(real_gh) = gh_proxy.then(|| which_binary("gh")).flatten() {
-        let script =
-            crate::gh_proxy::generate_wrapper_script(&real_gh.to_string_lossy(), &cplt_str);
+    if gh_proxy.enabled
+        && let Some(real_gh) = which_binary("gh")
+    {
+        let script = crate::gh_proxy::generate_wrapper_script(
+            &real_gh.to_string_lossy(),
+            &cplt_str,
+            gh_proxy,
+        );
         let wrapper_path = bin_dir.join("gh");
         if std::fs::write(&wrapper_path, script).is_ok() {
             let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
@@ -374,7 +379,7 @@ pub fn exec(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
-    gh_proxy: bool,
+    gh_proxy: &crate::config::GhProxyPolicy,
     git_push_prevention: bool,
 ) -> u8 {
     let profile_path = match write_temp_profile(&sandbox.profile_text) {
@@ -472,7 +477,7 @@ pub fn exec(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
-    gh_proxy: bool,
+    gh_proxy: &crate::config::GhProxyPolicy,
     git_push_prevention: bool,
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;

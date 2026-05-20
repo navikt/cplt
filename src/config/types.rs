@@ -54,6 +54,62 @@ pub struct Config {
     pub allow: AllowConfig,
     pub deny: DenyConfig,
     pub sandbox: SandboxConfig,
+    pub gh_proxy: GhProxyConfig,
+    pub git_guard: GitGuardConfig,
+}
+
+/// Policy for unknown (unclassified) gh CLI commands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnknownCommandPolicy {
+    /// Block unknown commands (secure default — new gh commands are denied until classified).
+    #[default]
+    Block,
+    /// Allow unknown commands to pass through (permissive — use during testing/adoption).
+    Allow,
+}
+
+impl<'de> Deserialize<'de> for UnknownCommandPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "block" => Ok(Self::Block),
+            "allow" => Ok(Self::Allow),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid unknown_command value '{other}': expected \"block\" or \"allow\""
+            ))),
+        }
+    }
+}
+
+/// `[gh_proxy]` — gh CLI command filtering for sandboxed agents.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct GhProxyConfig {
+    /// Enable the gh CLI proxy (default: false for soft rollout).
+    pub enabled: Option<bool>,
+    /// Enforce repository scope checking for write operations (default: true).
+    /// When enabled, commands like `gh pr merge -R other/repo` are blocked.
+    pub scope_check: Option<bool>,
+    /// Block `gh auth token` to prevent token exfiltration (default: true).
+    pub block_auth_token: Option<bool>,
+    /// Pre-extract GH_TOKEN before sandbox launch for Copilot agent (default: false).
+    /// Only meaningful when block_auth_token is true — provides the token via env var
+    /// while blocking the command that would expose it to arbitrary tools.
+    pub inject_token: Option<bool>,
+    /// Policy for commands not in the classification table (default: "block").
+    /// "block" = secure default-deny; "allow" = permissive pass-through.
+    pub unknown_command: Option<UnknownCommandPolicy>,
+}
+
+/// `[git_guard]` — git push prevention for sandboxed agents.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct GitGuardConfig {
+    /// Enable git push prevention (default: false for soft rollout).
+    pub enabled: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -163,6 +219,29 @@ pub struct SandboxConfig {
     pub git_push_prevention: Option<bool>,
 }
 
+/// Resolved gh proxy policy — immutable once computed at sandbox launch.
+/// Passed to the `gate()` function and baked into wrapper script flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GhProxyPolicy {
+    pub enabled: bool,
+    pub scope_check: bool,
+    pub block_auth_token: bool,
+    pub inject_token: bool,
+    pub unknown_command: UnknownCommandPolicy,
+}
+
+impl Default for GhProxyPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scope_check: true,
+            block_auth_token: true,
+            inject_token: false,
+            unknown_command: UnknownCommandPolicy::Block,
+        }
+    }
+}
+
 /// Resolved configuration after merging config file + CLI flags.
 /// All paths are expanded and canonicalized.
 #[derive(Debug)]
@@ -194,7 +273,7 @@ pub struct Resolved {
     pub allow_browser: bool,
     pub scratch_dir: bool,
     pub quiet: bool,
-    pub gh_proxy: bool,
+    pub gh_proxy: GhProxyPolicy,
     pub git_push_prevention: bool,
     /// Preferred agent from config (None = auto-detect).
     pub agent: Option<String>,

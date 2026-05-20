@@ -22,6 +22,8 @@ pub enum Decision {
     ScopeCheck,
     /// Always blocked — destructive or out-of-scope.
     Block,
+    /// Command not in policy table — decision deferred to GatePolicy.unknown_command.
+    Unknown,
 }
 
 /// Result of evaluating a gh command against the policy.
@@ -634,8 +636,8 @@ static POLICY: &[PolicyEntry] = &[
     PolicyEntry {
         command: "auth",
         subcommand: "token",
-        decision: Decision::Block,
-        reason: "token already injected via env — blocks exfiltration vector",
+        decision: Decision::Allow,
+        reason: "read-only (may be blocked by block_auth_token policy)",
     },
     PolicyEntry {
         command: "auth",
@@ -1036,10 +1038,10 @@ pub fn evaluate(cmd: &ParsedCommand) -> PolicyResult {
         }
     }
 
-    // Default-deny: unknown commands are blocked
+    // Default: unknown commands — decision deferred to GatePolicy
     PolicyResult {
-        decision: Decision::Block,
-        reason: "unknown command — blocked by default",
+        decision: Decision::Unknown,
+        reason: "unknown command — not in policy table",
     }
 }
 
@@ -1156,24 +1158,73 @@ fn shell_escape(s: &str) -> String {
 ///
 /// `real_gh` is the path to the real `gh` binary.
 /// `cplt_bin` is the path to the cplt binary (for calling `gh-gate`).
-pub fn generate_wrapper_script(real_gh: &str, cplt_bin: &str) -> String {
+/// Policy flags are baked into the wrapper invocation so the gate doesn't
+/// re-read config at runtime (security: agent could edit config files).
+pub fn generate_wrapper_script(
+    real_gh: &str,
+    cplt_bin: &str,
+    policy: &crate::config::GhProxyPolicy,
+) -> String {
     let cplt_escaped = shell_escape(cplt_bin);
     let gh_escaped = shell_escape(real_gh);
+    let scope_flag = if policy.scope_check {
+        "--scope-check"
+    } else {
+        "--no-scope-check"
+    };
+    let auth_flag = if policy.block_auth_token {
+        "--block-auth-token"
+    } else {
+        "--no-block-auth-token"
+    };
+    let unknown_flag = match policy.unknown_command {
+        crate::config::UnknownCommandPolicy::Block => "--unknown-command=block",
+        crate::config::UnknownCommandPolicy::Allow => "--unknown-command=allow",
+    };
     format!(
         r#"#!/bin/sh
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {scope_flag} {auth_flag} {unknown_flag} -- "$@"
 "#
     )
+}
+
+/// Immutable policy passed to the gate function at invocation time.
+/// Baked into the wrapper script as CLI flags — never re-read from config.
+#[derive(Debug, Clone, Copy)]
+pub struct GatePolicy {
+    /// Enforce same-repo check for ScopeCheck commands.
+    pub scope_check: bool,
+    /// Block `gh auth token` (token exfiltration prevention).
+    pub block_auth_token: bool,
+    /// Policy for commands not in the classification table.
+    pub unknown_command: UnknownCommandDecision,
+}
+
+/// What to do with commands not in the policy table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownCommandDecision {
+    Block,
+    Allow,
+}
+
+impl Default for GatePolicy {
+    fn default() -> Self {
+        Self {
+            scope_check: true,
+            block_auth_token: true,
+            unknown_command: UnknownCommandDecision::Block,
+        }
+    }
 }
 
 /// Evaluate a full command and return a human-friendly verdict.
 ///
 /// This is the entry point used by the `gh-gate` subcommand.
 /// Returns `Ok(())` if the command should be allowed, or `Err(message)` if blocked.
-pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
+pub fn gate(args: &[&str], project_dir: &Path, policy: &GatePolicy) -> Result<(), String> {
     let cmd = parse_command(args).ok_or_else(|| {
         "⚠️ BLOCKED by sandbox: could not parse gh command.\n\
             This operation is restricted by the cplt sandbox environment.\n\
@@ -1181,17 +1232,31 @@ pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
             .to_string()
     })?;
 
+    // Handle `gh auth token` block (credential exfiltration prevention)
+    if policy.block_auth_token
+        && cmd.command == "auth"
+        && cmd.subcommand.as_deref() == Some("token")
+    {
+        return Err(
+            "⚠️ BLOCKED by sandbox: 'gh auth token' is not allowed in this environment.\n\
+             Reason: token exfiltration prevention — use GH_TOKEN env var instead.\n\
+             This operation is restricted by the cplt sandbox to prevent credential leaks.\n\
+             Stop and report this to the human operator — they can run this command outside the sandbox."
+                .to_string(),
+        );
+    }
+
     let result = evaluate(&cmd);
 
     match result.decision {
         Decision::Allow => Ok(()),
         Decision::ScopeCheck => {
+            if !policy.scope_check {
+                return Ok(());
+            }
             let current_repo = detect_current_repo(project_dir).unwrap_or_default();
 
             if current_repo.is_empty() {
-                // Can't determine current repo.
-                // If -R flag is explicitly targeting another repo, block (fail-closed).
-                // If no -R flag, allow (command implicitly targets current context).
                 if cmd.repo_flag.is_some() {
                     Err(format!(
                         "⚠️ BLOCKED by sandbox: 'gh {} {}' cannot verify target repository scope.\n\
@@ -1236,6 +1301,20 @@ pub fn gate(args: &[&str], project_dir: &Path) -> Result<(), String> {
                 .unwrap_or_default(),
             result.reason,
         )),
+        Decision::Unknown => match policy.unknown_command {
+            UnknownCommandDecision::Allow => Ok(()),
+            UnknownCommandDecision::Block => Err(format!(
+                "⚠️ BLOCKED by sandbox: 'gh {}{}' is not recognized by the policy table.\n\
+                     This command may have been added in a newer gh CLI version.\n\
+                     This operation is restricted by the cplt sandbox (default-deny for unknown commands).\n\
+                     Stop and report this to the human operator — they can run this command outside the sandbox.",
+                cmd.command,
+                cmd.subcommand
+                    .as_deref()
+                    .map(|s| format!(" {s}"))
+                    .unwrap_or_default(),
+            )),
+        },
     }
 }
 
@@ -1568,7 +1647,7 @@ mod tests {
             has_input_flags: false,
         };
         let result = evaluate(&parsed);
-        assert_eq!(result.decision, Decision::Block);
+        assert_eq!(result.decision, Decision::Unknown);
     }
 
     #[test]
@@ -1747,10 +1826,14 @@ mod tests {
 
     #[test]
     fn wrapper_script_contains_paths() {
-        let script = generate_wrapper_script("/usr/bin/gh", "/usr/local/bin/cplt");
+        let policy = crate::config::GhProxyPolicy::default();
+        let script = generate_wrapper_script("/usr/bin/gh", "/usr/local/bin/cplt", &policy);
         assert!(script.contains("/usr/bin/gh"));
         assert!(script.contains("/usr/local/bin/cplt"));
         assert!(script.starts_with("#!/bin/sh"));
+        assert!(script.contains("--scope-check"));
+        assert!(script.contains("--block-auth-token"));
+        assert!(script.contains("--unknown-command=block"));
     }
 
     // ── project group specific ordering ──
@@ -1834,7 +1917,8 @@ mod tests {
 
     #[test]
     fn shell_escape_handles_quotes() {
-        let script = generate_wrapper_script("/path/with'quote/gh", "/path/with\"dq/cplt");
+        let policy = crate::config::GhProxyPolicy::default();
+        let script = generate_wrapper_script("/path/with'quote/gh", "/path/with\"dq/cplt", &policy);
         assert!(script.contains("gh-gate"));
         // Should use single-quote escaping, no unescaped double quotes in paths
         assert!(!script.contains(r#""/path/with'quote/gh""#));
