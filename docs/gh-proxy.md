@@ -16,9 +16,17 @@ Both features are **opt-in** (disabled by default) for a safe rollout:
 
 ```toml
 # ~/.config/cplt/config.toml
-[sandbox]
-gh_proxy = true             # blocks destructive gh operations
-git_push_prevention = true  # blocks git push
+
+[gh_proxy]
+enabled = true              # blocks destructive gh operations
+scope_check = true          # enforce repo-scoping on write commands
+block_auth_token = true     # deny "gh auth token" exfiltration
+inject_token = false        # inject GH_TOKEN into sandbox (opt-in)
+unknown_command = "block"   # block|allow unrecognized gh commands
+
+[git_guard]
+enabled = true              # blocks git push
+prevent_push = true         # block git push/request-pull
 ```
 
 CLI flags (override config for a single run):
@@ -32,10 +40,26 @@ cplt --no-git-guard      # disable git push prevention
 
 Per-repo via `.cplt.toml`:
 ```toml
-[sandbox]
+[propose]
 gh_proxy = true
 git_push_prevention = true
 ```
+
+### Backward compatibility
+
+The old flat config still works:
+```toml
+[sandbox]
+gh_proxy = true              # maps to [gh_proxy] enabled=true with defaults
+git_push_prevention = true   # maps to [git_guard] enabled=true with defaults
+```
+
+### Security: Policy baked at launch
+
+Policy flags are baked into the wrapper script at sandbox launch time.
+The `gh-gate` subcommand receives `--scope-check`, `--block-auth-token`,
+`--unknown-command=block` as CLI flags, preventing the agent from
+influencing policy by editing config files inside the sandbox.
 
 ## How it works
 
