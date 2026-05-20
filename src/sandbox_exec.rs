@@ -62,7 +62,7 @@ fn configure_command(
     proxy_port: Option<u16>,
     agent: Agent,
     gh_proxy: &crate::config::GhProxyPolicy,
-    git_push_prevention: bool,
+    git_guard: &crate::config::GitGuardPolicy,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -140,7 +140,7 @@ fn configure_command(
                 inject_gh_token_if_needed(cmd, agent);
             }
         }
-        install_command_wrappers(cmd, scratch, gh_proxy, git_push_prevention);
+        install_command_wrappers(cmd, scratch, gh_proxy, git_guard);
     }
 }
 
@@ -192,7 +192,7 @@ fn install_command_wrappers(
     cmd: &mut Command,
     scratch_dir: &Path,
     gh_proxy: &crate::config::GhProxyPolicy,
-    git_push_prevention: bool,
+    git_guard: &crate::config::GitGuardPolicy,
 ) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -225,10 +225,15 @@ fn install_command_wrappers(
         }
     }
 
-    // Install git push prevention wrapper (only if git_push_prevention enabled)
-    if let Some(real_git) = git_push_prevention.then(|| which_binary("git")).flatten() {
-        let script =
-            crate::gh_proxy::generate_git_wrapper_script(&real_git.to_string_lossy(), &cplt_str);
+    // Install git guard wrapper (only if git_guard enabled)
+    if git_guard.enabled
+        && let Some(real_git) = which_binary("git")
+    {
+        let script = crate::gh_proxy::generate_git_wrapper_script(
+            &real_git.to_string_lossy(),
+            &cplt_str,
+            git_guard,
+        );
         let wrapper_path = bin_dir.join("git");
         if std::fs::write(&wrapper_path, script).is_ok() {
             let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
@@ -380,7 +385,7 @@ pub fn exec(
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
     gh_proxy: &crate::config::GhProxyPolicy,
-    git_push_prevention: bool,
+    git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
     let profile_path = match write_temp_profile(&sandbox.profile_text) {
         Ok(p) => p,
@@ -405,7 +410,7 @@ pub fn exec(
         sandbox.proxy_port,
         sandbox.agent,
         gh_proxy,
-        git_push_prevention,
+        git_guard,
     );
 
     // Strip repo-config denied env vars
@@ -478,7 +483,7 @@ pub fn exec(
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
     gh_proxy: &crate::config::GhProxyPolicy,
-    git_push_prevention: bool,
+    git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;
 
@@ -496,7 +501,7 @@ pub fn exec(
         sandbox.proxy_port,
         sandbox.agent,
         gh_proxy,
-        git_push_prevention,
+        git_guard,
     );
 
     // Strip repo-config denied env vars

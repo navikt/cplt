@@ -177,17 +177,36 @@ pub fn default_config_contents() -> String {
 # sandbox settings and don't need to see them every time.
 # Override with --no-quiet for a single run.
 # quiet = false
-#
-# Enable the gh CLI proxy that blocks destructive GitHub operations (default: false).
-# A wrapper script intercepts `gh` commands and blocks destructive writes
-# (delete repo, merge PR, etc.) while allowing safe reads and pre-injecting
-# GH_TOKEN so `gh auth token` can be safely blocked inside the sandbox.
-# gh_proxy = false
-#
-# Enable git push prevention (default: false).
-# Blocks `git push` and `git request-pull` while allowing all other git
-# operations. Prevents agents from accidentally pushing code.
-# git_push_prevention = false
+
+# ── gh CLI proxy ────────────────────────────────────────────────────────────
+# Intercepts `gh` commands and enforces a command-level policy.
+# [gh_proxy]
+# enabled = false             # enable the proxy (blocks destructive GitHub operations)
+# mode = "block"              # "block" | "warn" | "audit"
+# scope_check = true          # enforce same-repo check on write commands
+# block_auth_token = true     # deny 'gh auth token' exfiltration
+# inject_token = false        # pre-inject GH_TOKEN into sandbox (opt-in)
+# unknown_command = "block"   # policy for commands not in classification table
+
+# ── git guard ───────────────────────────────────────────────────────────────
+# Intercepts `git` commands to prevent accidental pushes.
+# [git_guard]
+# enabled = false             # enable git command interception
+# mode = "block"              # "block" | "warn" | "audit"
+# prevent_push = true         # block push, request-pull, send-pack
+# prevent_force_push = true   # block force push (only when prevent_push = false)
+# [[git_guard.allow_push]]   # structured push exceptions
+# remote = "fork"
+# branches = ["agent/*"]
+# force = false
+
+# ── audit logging ───────────────────────────────────────────────────────────
+# Global audit log for all sandbox gate decisions.
+# [audit]
+# enabled = false
+# destination = "stderr"      # "stderr" or file path
+# level = "blocked"           # "blocked" | "decisions" | "all"
+# format = "text"             # "text" | "jsonl"
 "#
     .to_string()
 }

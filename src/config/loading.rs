@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use super::error::ConfigError;
 use super::path::{config_path, expand_tilde, resolve_config_path};
-use super::types::{CliFlags, Config, GhProxyPolicy, LoadedConfig, Resolved, UnknownCommandPolicy};
+use super::types::{
+    CliFlags, Config, EnforcementMode, GhProxyPolicy, GitGuardPolicy, LoadedConfig, Resolved,
+    ResolvedPushRule, UnknownCommandPolicy,
+};
 use crate::sandbox::{HardeningCategory, validate_sbpl_path};
 use crate::ui;
 
@@ -263,6 +266,7 @@ impl Config {
         let gh_proxy_enabled = cli.gh_proxy.resolve(gh_proxy_enabled_default);
         let gh_proxy = GhProxyPolicy {
             enabled: gh_proxy_enabled,
+            mode: self.gh_proxy.mode.unwrap_or(EnforcementMode::Block),
             scope_check: self.gh_proxy.scope_check.unwrap_or(true),
             block_auth_token: self.gh_proxy.block_auth_token.unwrap_or(true),
             inject_token: self.gh_proxy.inject_token.unwrap_or(false),
@@ -278,7 +282,23 @@ impl Config {
             .enabled
             .or(self.sandbox.git_push_prevention)
             .unwrap_or(false);
-        let git_push_prevention = cli.git_push_prevention.resolve(git_guard_enabled_default);
+        let git_guard_enabled = cli.git_push_prevention.resolve(git_guard_enabled_default);
+        let git_guard = GitGuardPolicy {
+            enabled: git_guard_enabled,
+            mode: self.git_guard.mode.unwrap_or(EnforcementMode::Block),
+            prevent_push: self.git_guard.prevent_push.unwrap_or(true),
+            prevent_force_push: self.git_guard.prevent_force_push.unwrap_or(true),
+            allow_push: self
+                .git_guard
+                .allow_push
+                .iter()
+                .map(|r| ResolvedPushRule {
+                    remote: r.remote.clone(),
+                    branches: r.branches.clone(),
+                    force: r.force.unwrap_or(false),
+                })
+                .collect(),
+        };
 
         // Validate all paths for SBPL injection characters
         for p in allow_read
@@ -343,7 +363,7 @@ impl Config {
             scratch_dir,
             quiet,
             gh_proxy,
-            git_push_prevention,
+            git_guard,
             agent: self.sandbox.agent.clone(),
             deny_env: Vec::new(),
         })
@@ -609,7 +629,7 @@ impl Resolved {
         eprintln!();
 
         // Command guards
-        if self.gh_proxy.enabled || self.git_push_prevention {
+        if self.gh_proxy.enabled || self.git_guard.enabled {
             eprintln!("{blue}[cplt]{nc}  {dim}Command guards:{nc}");
             if self.gh_proxy.enabled {
                 if self.scratch_dir {
@@ -617,8 +637,13 @@ impl Resolved {
                         UnknownCommandPolicy::Block => "default-deny",
                         UnknownCommandPolicy::Allow => "permissive",
                     };
+                    let mode_note = match self.gh_proxy.mode {
+                        EnforcementMode::Block => "",
+                        EnforcementMode::Warn => " [WARN MODE]",
+                        EnforcementMode::Audit => " [AUDIT MODE]",
+                    };
                     eprintln!(
-                        "{blue}[cplt]{nc}    gh proxy:      {green}on{nc}          {dim}{policy_note}, scope_check={}{nc}",
+                        "{blue}[cplt]{nc}    gh proxy:      {green}on{nc}          {dim}{policy_note}, scope_check={}{mode_note}{nc}",
                         if self.gh_proxy.scope_check {
                             "on"
                         } else {
@@ -632,10 +657,15 @@ impl Resolved {
                     );
                 }
             }
-            if self.git_push_prevention {
+            if self.git_guard.enabled {
                 if self.scratch_dir {
+                    let mode_note = match self.git_guard.mode {
+                        EnforcementMode::Block => "",
+                        EnforcementMode::Warn => " [WARN MODE]",
+                        EnforcementMode::Audit => " [AUDIT MODE]",
+                    };
                     eprintln!(
-                        "{blue}[cplt]{nc}    git guard:     {green}on{nc}          {dim}blocks git push{nc}"
+                        "{blue}[cplt]{nc}    git guard:     {green}on{nc}          {dim}blocks git push{mode_note}{nc}"
                     );
                 } else {
                     let yellow = ui::color(ui::YELLOW);
@@ -731,7 +761,7 @@ impl Resolved {
         if repo_config.propose.git_push_prevention == Some(true)
             && is_approved("git_push_prevention")
         {
-            self.git_push_prevention = true;
+            self.git_guard.enabled = true;
         }
 
         // Path proposals

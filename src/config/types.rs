@@ -50,12 +50,46 @@ pub(super) const CONFIG_FILE: &str = "config.toml";
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Schema/format version for forward compatibility (default: 1).
+    pub config_version: Option<u32>,
     pub proxy: ProxyConfig,
     pub allow: AllowConfig,
     pub deny: DenyConfig,
     pub sandbox: SandboxConfig,
     pub gh_proxy: GhProxyConfig,
     pub git_guard: GitGuardConfig,
+    pub audit: AuditConfig,
+}
+
+/// Enforcement mode for security gates — controls rollout aggressiveness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EnforcementMode {
+    /// Hard block: command is denied and process exits non-zero.
+    #[default]
+    Block,
+    /// Warn: prints a warning to stderr but allows the command through.
+    /// Use during initial adoption to discover what would break.
+    Warn,
+    /// Audit: silently logs the decision without any user-visible output.
+    /// Use in CI or when collecting telemetry before enabling enforcement.
+    Audit,
+}
+
+impl<'de> Deserialize<'de> for EnforcementMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "block" => Ok(Self::Block),
+            "warn" => Ok(Self::Warn),
+            "audit" => Ok(Self::Audit),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid mode '{other}': expected \"block\", \"warn\", or \"audit\""
+            ))),
+        }
+    }
 }
 
 /// Policy for unknown (unclassified) gh CLI commands.
@@ -90,6 +124,9 @@ impl<'de> Deserialize<'de> for UnknownCommandPolicy {
 pub struct GhProxyConfig {
     /// Enable the gh CLI proxy (default: false for soft rollout).
     pub enabled: Option<bool>,
+    /// Enforcement mode: "block" (default), "warn", or "audit".
+    /// Controls how violations are handled across all gh proxy decisions.
+    pub mode: Option<EnforcementMode>,
     /// Enforce repository scope checking for write operations (default: true).
     /// When enabled, commands like `gh pr merge -R other/repo` are blocked.
     pub scope_check: Option<bool>,
@@ -104,12 +141,52 @@ pub struct GhProxyConfig {
     pub unknown_command: Option<UnknownCommandPolicy>,
 }
 
-/// `[git_guard]` — git push prevention for sandboxed agents.
+/// `[git_guard]` — git command prevention for sandboxed agents.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct GitGuardConfig {
-    /// Enable git push prevention (default: false for soft rollout).
+    /// Enable git command interception (default: false for soft rollout).
     pub enabled: Option<bool>,
+    /// Enforcement mode: "block" (default), "warn", or "audit".
+    pub mode: Option<EnforcementMode>,
+    /// Block git push, request-pull, and send-pack (default: true).
+    pub prevent_push: Option<bool>,
+    /// Block git push --force/--force-with-lease (default: true).
+    /// Only meaningful when prevent_push is false — blocks destructive pushes
+    /// while allowing regular pushes.
+    pub prevent_force_push: Option<bool>,
+    /// Structured push exceptions. Each entry specifies conditions under which
+    /// push is allowed despite prevent_push being enabled.
+    pub allow_push: Vec<GitPushRule>,
+}
+
+/// A structured rule that permits `git push` under specific conditions.
+/// All specified fields must match (AND logic).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct GitPushRule {
+    /// Remote name to allow pushing to (e.g. `"fork"`, `"origin"`).
+    pub remote: Option<String>,
+    /// Branch glob patterns to allow (e.g. `["agent/*", "copilot/*"]`).
+    pub branches: Vec<String>,
+    /// Allow force push in this rule (default: false).
+    pub force: Option<bool>,
+}
+
+/// `[audit]` — global audit logging for sandbox decisions.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct AuditConfig {
+    /// Enable audit logging (default: false).
+    pub enabled: Option<bool>,
+    /// Where to write audit entries: "stderr" or a file path (default: "stderr").
+    pub destination: Option<String>,
+    /// What to log: "blocked" (only blocked), "decisions" (all gate decisions),
+    /// "all" (includes allowed passthrough). Default: "blocked".
+    pub level: Option<String>,
+    /// Output format: "text" (human-readable) or "jsonl" (machine-parseable).
+    /// Default: "text".
+    pub format: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -221,9 +298,10 @@ pub struct SandboxConfig {
 
 /// Resolved gh proxy policy — immutable once computed at sandbox launch.
 /// Passed to the `gate()` function and baked into wrapper script flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhProxyPolicy {
     pub enabled: bool,
+    pub mode: EnforcementMode,
     pub scope_check: bool,
     pub block_auth_token: bool,
     pub inject_token: bool,
@@ -234,12 +312,43 @@ impl Default for GhProxyPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: EnforcementMode::Block,
             scope_check: true,
             block_auth_token: true,
             inject_token: false,
             unknown_command: UnknownCommandPolicy::Block,
         }
     }
+}
+
+/// Resolved git guard policy — immutable once computed at sandbox launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitGuardPolicy {
+    pub enabled: bool,
+    pub mode: EnforcementMode,
+    pub prevent_push: bool,
+    pub prevent_force_push: bool,
+    pub allow_push: Vec<ResolvedPushRule>,
+}
+
+impl Default for GitGuardPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: EnforcementMode::Block,
+            prevent_push: true,
+            prevent_force_push: true,
+            allow_push: Vec::new(),
+        }
+    }
+}
+
+/// Resolved push rule (validated at config load time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPushRule {
+    pub remote: Option<String>,
+    pub branches: Vec<String>,
+    pub force: bool,
 }
 
 /// Resolved configuration after merging config file + CLI flags.
@@ -274,7 +383,7 @@ pub struct Resolved {
     pub scratch_dir: bool,
     pub quiet: bool,
     pub gh_proxy: GhProxyPolicy,
-    pub git_push_prevention: bool,
+    pub git_guard: GitGuardPolicy,
     /// Preferred agent from config (None = auto-detect).
     pub agent: Option<String>,
     /// Env vars to strip from the sandbox environment (from repo config [deny] section).

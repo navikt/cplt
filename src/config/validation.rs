@@ -39,13 +39,30 @@ const VALID_SANDBOX_KEYS: &[&str] = &[
 ];
 const VALID_GH_PROXY_KEYS: &[&str] = &[
     "enabled",
+    "mode",
     "scope_check",
     "block_auth_token",
     "inject_token",
     "unknown_command",
 ];
-const VALID_GIT_GUARD_KEYS: &[&str] = &["enabled"];
-const VALID_SECTIONS: &[&str] = &["proxy", "allow", "deny", "sandbox", "gh_proxy", "git_guard"];
+const VALID_GIT_GUARD_KEYS: &[&str] = &[
+    "enabled",
+    "mode",
+    "prevent_push",
+    "prevent_force_push",
+    "allow_push",
+];
+const VALID_AUDIT_KEYS: &[&str] = &["enabled", "destination", "level", "format"];
+const VALID_SECTIONS: &[&str] = &[
+    "proxy",
+    "allow",
+    "deny",
+    "sandbox",
+    "gh_proxy",
+    "git_guard",
+    "audit",
+    "config_version",
+];
 
 /// A single validation diagnostic.
 #[derive(Debug)]
@@ -112,6 +129,7 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
     check_section_keys(&table, "sandbox", VALID_SANDBOX_KEYS, &mut diagnostics);
     check_section_keys(&table, "gh_proxy", VALID_GH_PROXY_KEYS, &mut diagnostics);
     check_section_keys(&table, "git_guard", VALID_GIT_GUARD_KEYS, &mut diagnostics);
+    check_section_keys(&table, "audit", VALID_AUDIT_KEYS, &mut diagnostics);
 
     // Also verify it deserializes correctly (catches type errors)
     if diagnostics
@@ -448,7 +466,12 @@ quiet = false
         }
 
         // Every sandbox key must appear in the default config template
+        // (except deprecated keys that are documented in their own sections)
+        const DEPRECATED_SANDBOX_KEYS: &[&str] = &["gh_proxy", "git_push_prevention"];
         for &key in VALID_SANDBOX_KEYS {
+            if DEPRECATED_SANDBOX_KEYS.contains(&key) {
+                continue;
+            }
             assert!(
                 template.contains(key),
                 "VALID_SANDBOX_KEYS contains '{key}' but default_config_contents() does not mention it"

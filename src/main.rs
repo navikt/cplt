@@ -523,6 +523,10 @@ enum Command {
         #[arg(long)]
         real_gh: PathBuf,
 
+        /// Enforcement mode: block, warn, or audit.
+        #[arg(long, default_value = "block")]
+        mode: String,
+
         /// Enable repository scope checking.
         #[arg(long, default_value_t = true)]
         scope_check: bool,
@@ -557,6 +561,10 @@ enum Command {
         /// Path to the real git binary.
         #[arg(long)]
         real_git: PathBuf,
+
+        /// Enforcement mode: block, warn, or audit.
+        #[arg(long, default_value = "block")]
+        mode: String,
 
         /// git arguments to evaluate and potentially pass through.
         #[arg(last = true)]
@@ -1228,6 +1236,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Doctor => run_doctor(),
             Command::GhGate {
                 real_gh,
+                mode,
                 scope_check,
                 no_scope_check,
                 block_auth_token,
@@ -1236,6 +1245,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 args,
             } => {
                 let policy = gh_proxy::GatePolicy {
+                    mode: match mode.as_str() {
+                        "warn" => config::EnforcementMode::Warn,
+                        "audit" => config::EnforcementMode::Audit,
+                        _ => config::EnforcementMode::Block,
+                    },
                     scope_check: scope_check && !no_scope_check,
                     block_auth_token: block_auth_token && !no_block_auth_token,
                     unknown_command: if unknown_command == "allow" {
@@ -1246,7 +1260,18 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 };
                 run_gh_gate(&real_gh, &args, &policy)
             }
-            Command::GitGate { real_git, args } => run_git_gate(&real_git, &args),
+            Command::GitGate {
+                real_git,
+                args,
+                mode,
+            } => {
+                let mode = match mode.as_str() {
+                    "warn" => config::EnforcementMode::Warn,
+                    "audit" => config::EnforcementMode::Audit,
+                    _ => config::EnforcementMode::Block,
+                };
+                run_git_gate(&real_git, &args, mode)
+            }
         });
     }
 
@@ -1481,7 +1506,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         &disabled_categories,
         &resolved.deny_env,
         &resolved.gh_proxy,
-        resolved.git_push_prevention,
+        &resolved.git_guard,
     );
 
     // Cleanup
@@ -1582,15 +1607,32 @@ fn run_gh_gate(real_gh: &Path, args: &[String], policy: &gh_proxy::GatePolicy) -
             ui::error(&format!("Failed to exec gh: {err}"));
             ExitCode::FAILURE
         }
-        Err(msg) => {
-            eprintln!("{msg}");
-            ExitCode::FAILURE
-        }
+        Err(msg) => match policy.mode {
+            config::EnforcementMode::Block => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+            config::EnforcementMode::Warn => {
+                eprintln!("⚠️  WARNING (would block): {msg}");
+                // Allow through in warn mode
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new(real_gh).args(args).exec();
+                ui::error(&format!("Failed to exec gh: {err}"));
+                ExitCode::FAILURE
+            }
+            config::EnforcementMode::Audit => {
+                // Silent — just pass through
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new(real_gh).args(args).exec();
+                ui::error(&format!("Failed to exec gh: {err}"));
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
 /// Handle `cplt git-gate` — evaluate a git command and exec the real binary if allowed.
-fn run_git_gate(real_git: &Path, args: &[String]) -> ExitCode {
+fn run_git_gate(real_git: &Path, args: &[String], mode: config::EnforcementMode) -> ExitCode {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     match gh_proxy::gate_git(&arg_refs) {
@@ -1600,10 +1642,25 @@ fn run_git_gate(real_git: &Path, args: &[String]) -> ExitCode {
             ui::error(&format!("Failed to exec git: {err}"));
             ExitCode::FAILURE
         }
-        Err(msg) => {
-            eprintln!("{msg}");
-            ExitCode::FAILURE
-        }
+        Err(msg) => match mode {
+            config::EnforcementMode::Block => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+            config::EnforcementMode::Warn => {
+                eprintln!("⚠️  WARNING (would block): {msg}");
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new(real_git).args(args).exec();
+                ui::error(&format!("Failed to exec git: {err}"));
+                ExitCode::FAILURE
+            }
+            config::EnforcementMode::Audit => {
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new(real_git).args(args).exec();
+                ui::error(&format!("Failed to exec git: {err}"));
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 

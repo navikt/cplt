@@ -1167,6 +1167,11 @@ pub fn generate_wrapper_script(
 ) -> String {
     let cplt_escaped = shell_escape(cplt_bin);
     let gh_escaped = shell_escape(real_gh);
+    let mode_flag = match policy.mode {
+        crate::config::EnforcementMode::Block => "--mode=block",
+        crate::config::EnforcementMode::Warn => "--mode=warn",
+        crate::config::EnforcementMode::Audit => "--mode=audit",
+    };
     let scope_flag = if policy.scope_check {
         "--scope-check"
     } else {
@@ -1186,7 +1191,7 @@ pub fn generate_wrapper_script(
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {scope_flag} {auth_flag} {unknown_flag} -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} -- "$@"
 "#
     )
 }
@@ -1195,6 +1200,8 @@ exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {scope_flag} {auth_flag} {unk
 /// Baked into the wrapper script as CLI flags — never re-read from config.
 #[derive(Debug, Clone, Copy)]
 pub struct GatePolicy {
+    /// Enforcement mode for violations.
+    pub mode: crate::config::EnforcementMode,
     /// Enforce same-repo check for ScopeCheck commands.
     pub scope_check: bool,
     /// Block `gh auth token` (token exfiltration prevention).
@@ -1213,6 +1220,7 @@ pub enum UnknownCommandDecision {
 impl Default for GatePolicy {
     fn default() -> Self {
         Self {
+            mode: crate::config::EnforcementMode::Block,
             scope_check: true,
             block_auth_token: true,
             unknown_command: UnknownCommandDecision::Block,
@@ -1476,15 +1484,24 @@ pub fn gate_git(args: &[&str]) -> Result<(), String> {
 /// Generate the git wrapper script content.
 ///
 /// Like the gh wrapper, this intercepts git invocations and blocks push operations.
-pub fn generate_git_wrapper_script(real_git: &str, cplt_bin: &str) -> String {
+pub fn generate_git_wrapper_script(
+    real_git: &str,
+    cplt_bin: &str,
+    policy: &crate::config::GitGuardPolicy,
+) -> String {
     let cplt_escaped = shell_escape(cplt_bin);
     let git_escaped = shell_escape(real_git);
+    let mode_flag = match policy.mode {
+        crate::config::EnforcementMode::Block => "--mode=block",
+        crate::config::EnforcementMode::Warn => "--mode=warn",
+        crate::config::EnforcementMode::Audit => "--mode=audit",
+    };
     format!(
         r#"#!/bin/sh
 # cplt git proxy — blocks git push in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} git-gate --real-git {git_escaped} -- "$@"
+exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} -- "$@"
 "#
     )
 }
@@ -1831,6 +1848,7 @@ mod tests {
         assert!(script.contains("/usr/bin/gh"));
         assert!(script.contains("/usr/local/bin/cplt"));
         assert!(script.starts_with("#!/bin/sh"));
+        assert!(script.contains("--mode=block"));
         assert!(script.contains("--scope-check"));
         assert!(script.contains("--block-auth-token"));
         assert!(script.contains("--unknown-command=block"));
@@ -1909,10 +1927,12 @@ mod tests {
 
     #[test]
     fn git_wrapper_script_contains_paths() {
-        let script = generate_git_wrapper_script("/usr/bin/git", "/usr/local/bin/cplt");
+        let policy = crate::config::GitGuardPolicy::default();
+        let script = generate_git_wrapper_script("/usr/bin/git", "/usr/local/bin/cplt", &policy);
         assert!(script.contains("/usr/bin/git"));
         assert!(script.contains("/usr/local/bin/cplt"));
         assert!(script.contains("git-gate"));
+        assert!(script.contains("--mode=block"));
     }
 
     #[test]
