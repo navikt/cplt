@@ -4,6 +4,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use cplt::{agent, config, discover, proxy, repo_config, sandbox, scratch, trust, update};
 use std::collections::BTreeSet;
+use std::io::IsTerminal;
 #[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -581,11 +582,10 @@ enum TrustAction {
     /// Example: cplt trust accept allow_jvm_attach allow_docker
     Accept {
         /// Permission keys to approve (e.g. allow_jvm_attach, allow_docker).
-        /// Use --all to approve everything.
-        #[arg(required_unless_present = "all")]
+        /// Without arguments, shows pending permissions and prompts for confirmation.
         keys: Vec<String>,
 
-        /// Approve all permissions.
+        /// Approve all permissions without prompting.
         #[arg(long)]
         all: bool,
     },
@@ -2476,6 +2476,64 @@ fn trust_accept(
             .iter()
             .map(std::string::ToString::to_string)
             .collect()
+    } else if keys.is_empty() {
+        // Interactive mode: show pending permissions and prompt
+        let trust_entry = trust::load_trust(project_dir);
+        let pending: Vec<&str> = proposed
+            .iter()
+            .filter(|&&key| {
+                !trust_entry
+                    .as_ref()
+                    .is_some_and(|t| trust::is_key_approved(t, key))
+            })
+            .copied()
+            .collect();
+
+        if pending.is_empty() {
+            ui::info("All permissions are already approved.");
+            return ExitCode::SUCCESS;
+        }
+
+        let blue = ui::stdout_color(ui::BLUE);
+        let nc = ui::stdout_color(ui::RESET);
+        let yellow = ui::stdout_color(ui::YELLOW);
+
+        println!(
+            "{blue}[cplt]{nc} Pending permissions in .cplt.toml ({} unapproved):",
+            pending.len()
+        );
+        println!();
+        for &key in &pending {
+            let detail = propose_key_detail(&loaded.config.propose, key);
+            if let Some(d) = detail {
+                println!("  {yellow}•{nc} {key}: {d}");
+            } else {
+                println!("  {yellow}•{nc} {key}");
+            }
+        }
+        println!();
+
+        // Check if we can prompt interactively
+        if !std::io::stdin().is_terminal() {
+            ui::error(
+                "Cannot prompt for confirmation (stdin is not a terminal).\n  \
+                 Use: cplt trust accept --all",
+            );
+            return ExitCode::FAILURE;
+        }
+
+        eprint!("Accept all? [y/N]: ");
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            return ExitCode::FAILURE;
+        }
+        let answer = input.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            ui::info("Cancelled — no permissions approved.");
+            return ExitCode::SUCCESS;
+        }
+
+        pending.iter().map(|s| (*s).to_string()).collect()
     } else {
         // Validate that requested keys are actually proposed
         for key in keys {
@@ -2537,6 +2595,26 @@ fn trust_accept(
         println!("  • {key}");
     }
     ExitCode::SUCCESS
+}
+
+/// Format the proposed values for a key for display.
+fn propose_key_detail(propose: &repo_config::ProposeSection, key: &str) -> Option<String> {
+    match key {
+        "allow.read" if !propose.allow.read.is_empty() => Some(format!("{:?}", propose.allow.read)),
+        "allow.write" if !propose.allow.write.is_empty() => {
+            Some(format!("{:?}", propose.allow.write))
+        }
+        "allow.ports" if !propose.allow.ports.is_empty() => {
+            Some(format!("{:?}", propose.allow.ports))
+        }
+        "allow.localhost" if !propose.allow.localhost.is_empty() => {
+            Some(format!("{:?}", propose.allow.localhost))
+        }
+        "proxy.allow_private_domains" if !propose.proxy.allow_private_domains.is_empty() => {
+            Some(format!("{:?}", propose.proxy.allow_private_domains))
+        }
+        _ => None,
+    }
 }
 
 fn trust_revoke(

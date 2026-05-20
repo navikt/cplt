@@ -1,6 +1,7 @@
 //! Per-repository config overrides (`.cplt.toml`).
 
 use super::error::ConfigError;
+use super::path::collapse_tilde;
 use super::registry::{ConfigKeyInfo, ConfigValueType};
 
 // ── Repo config set support ──────────────────────────────────────────
@@ -131,8 +132,12 @@ pub fn set_repo_value_in_doc(
                     // --unset without value: remove the entire array
                     allow.remove(array_key);
                 } else if let Some(arr) = allow.get_mut(array_key).and_then(|v| v.as_array_mut()) {
+                    // Match both raw value and collapsed form for removal
+                    let collapsed = collapse_tilde(value);
                     arr.retain(|v| {
-                        v.as_str() != Some(value)
+                        let s = v.as_str().unwrap_or_default();
+                        s != value
+                            && s != collapsed
                             && v.as_integer().map(|i| i.to_string()).as_deref() != Some(value)
                     });
                     if arr.is_empty() {
@@ -158,8 +163,16 @@ pub fn set_repo_value_in_doc(
                     if !arr.iter().any(|v| v.as_integer() == Some(i64::from(port))) {
                         arr.push(i64::from(port));
                     }
-                } else if !arr.iter().any(|v| v.as_str() == Some(value)) {
-                    arr.push(value);
+                } else {
+                    // For path-type arrays (read, write), store with ~ for portability
+                    let stored = if array_key == "read" || array_key == "write" {
+                        collapse_tilde(value)
+                    } else {
+                        value.to_string()
+                    };
+                    if !arr.iter().any(|v| v.as_str() == Some(stored.as_str())) {
+                        arr.push(stored.as_str());
+                    }
                 }
             }
         }
@@ -213,7 +226,12 @@ pub fn set_repo_value_in_doc(
                     section.remove(array_key);
                 } else if let Some(arr) = section.get_mut(array_key).and_then(|v| v.as_array_mut())
                 {
-                    arr.retain(|v| v.as_str() != Some(value));
+                    // Match both raw value and collapsed form for removal
+                    let collapsed = collapse_tilde(value);
+                    arr.retain(|v| {
+                        let s = v.as_str().unwrap_or_default();
+                        s != value && s != collapsed
+                    });
                     if arr.is_empty() {
                         section.remove(array_key);
                     }
@@ -226,8 +244,14 @@ pub fn set_repo_value_in_doc(
                     .or_insert(Item::Value(Value::Array(Array::new())))
                     .as_array_mut()
                     .ok_or_else(|| ConfigError::Validation("expected array".to_string()))?;
-                if !arr.iter().any(|v| v.as_str() == Some(value)) {
-                    arr.push(value);
+                // For path arrays, store with ~ for portability
+                let stored = if array_key == "paths" {
+                    collapse_tilde(value)
+                } else {
+                    value.to_string()
+                };
+                if !arr.iter().any(|v| v.as_str() == Some(stored.as_str())) {
+                    arr.push(stored.as_str());
                 }
             }
         }
@@ -340,5 +364,87 @@ mod tests {
         set_repo_value_in_doc(&mut doc, info, target, "8080", false).unwrap();
         let result = doc.to_string();
         assert!(result.contains("8080"));
+    }
+
+    #[test]
+    fn set_repo_value_collapses_home_paths_for_read() {
+        let home = std::env::var("HOME").unwrap();
+        let abs_path = format!("{home}/.config/gcloud/application_default_credentials.json");
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        let target = repo_key_target(info).unwrap();
+        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+        let result = doc.to_string();
+        assert!(
+            result.contains("~/.config/gcloud/application_default_credentials.json"),
+            "absolute home path should be collapsed to ~/ form, got: {result}"
+        );
+        assert!(
+            !result.contains(&home),
+            "absolute home prefix should not remain in output"
+        );
+    }
+
+    #[test]
+    fn set_repo_value_collapses_home_paths_for_write() {
+        let home = std::env::var("HOME").unwrap();
+        let abs_path = format!("{home}/some/dir");
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("allow.write").unwrap();
+        let target = repo_key_target(info).unwrap();
+        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+        let result = doc.to_string();
+        assert!(
+            result.contains("~/some/dir"),
+            "should collapse to ~/some/dir, got: {result}"
+        );
+    }
+
+    #[test]
+    fn set_repo_value_does_not_collapse_non_home_paths() {
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        let target = repo_key_target(info).unwrap();
+        set_repo_value_in_doc(&mut doc, info, target, "/tmp/something", false).unwrap();
+        let result = doc.to_string();
+        assert!(
+            result.contains("/tmp/something"),
+            "non-home path should be stored as-is"
+        );
+    }
+
+    #[test]
+    fn set_repo_value_unset_matches_collapsed_form() {
+        let home = std::env::var("HOME").unwrap();
+        let abs_path = format!("{home}/.config/gcloud/creds.json");
+        // First set a collapsed value
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("allow.read").unwrap();
+        let target = repo_key_target(info).unwrap();
+        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+        assert!(doc.to_string().contains("~/.config/gcloud/creds.json"));
+
+        // Now unset using the absolute path (as shell would expand it)
+        set_repo_value_in_doc(&mut doc, info, target, &abs_path, true).unwrap();
+        let result = doc.to_string();
+        assert!(
+            !result.contains("creds.json"),
+            "unset with absolute path should remove collapsed entry, got: {result}"
+        );
+    }
+
+    #[test]
+    fn set_repo_value_deny_collapses_home_paths() {
+        let home = std::env::var("HOME").unwrap();
+        let abs_path = format!("{home}/.ssh");
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let info = lookup_key("deny.paths").unwrap();
+        let target = repo_key_target(info).unwrap();
+        set_repo_value_in_doc(&mut doc, info, target, &abs_path, false).unwrap();
+        let result = doc.to_string();
+        assert!(
+            result.contains("~/.ssh"),
+            "deny paths should collapse home prefix, got: {result}"
+        );
     }
 }

@@ -195,6 +195,26 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Replace the user's home directory prefix with `~` for portable storage.
+/// Only collapses exact `$HOME` or `$HOME/...` boundaries (component-aware).
+/// Returns the original string unchanged if it doesn't start with `$HOME`.
+pub fn collapse_tilde(path: &str) -> String {
+    let Ok(home) = std::env::var("HOME") else {
+        return path.to_string();
+    };
+    let home_path = std::path::Path::new(&home);
+    let input_path = std::path::Path::new(path);
+    if let Ok(rest) = input_path.strip_prefix(home_path) {
+        if rest.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rest.display())
+        }
+    } else {
+        path.to_string()
+    }
+}
+
 /// Expand tilde, resolve relative paths against config dir, and canonicalize.
 pub(super) fn resolve_config_path(
     path: &str,
@@ -258,5 +278,46 @@ mod tests {
         let contents = default_config_contents();
         let config: Config = toml::from_str(&contents).unwrap();
         assert!(config.proxy.enabled.is_none());
+    }
+
+    #[test]
+    fn collapse_tilde_home_subpath() {
+        let home = std::env::var("HOME").unwrap();
+        let input = format!("{home}/.config/gcloud/creds.json");
+        assert_eq!(collapse_tilde(&input), "~/.config/gcloud/creds.json");
+    }
+
+    #[test]
+    fn collapse_tilde_exact_home() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(collapse_tilde(&home), "~");
+    }
+
+    #[test]
+    fn collapse_tilde_non_home_path() {
+        assert_eq!(collapse_tilde("/tmp/foo"), "/tmp/foo");
+    }
+
+    #[test]
+    fn collapse_tilde_similar_prefix_not_collapsed() {
+        // e.g. HOME=/Users/hans but path is /Users/hans2/foo — must NOT collapse
+        let home = std::env::var("HOME").unwrap();
+        let similar = format!("{home}2/foo");
+        assert_eq!(collapse_tilde(&similar), similar);
+    }
+
+    #[test]
+    fn collapse_tilde_already_tilde() {
+        assert_eq!(collapse_tilde("~/.ssh/config"), "~/.ssh/config");
+    }
+
+    #[test]
+    fn collapse_tilde_roundtrip_with_expand() {
+        let home = std::env::var("HOME").unwrap();
+        let original = "~/.config/test";
+        let expanded = expand_tilde(original);
+        assert_eq!(expanded, PathBuf::from(format!("{home}/.config/test")));
+        let collapsed = collapse_tilde(expanded.to_str().unwrap());
+        assert_eq!(collapsed, original);
     }
 }
