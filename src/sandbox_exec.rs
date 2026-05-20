@@ -61,7 +61,7 @@ fn configure_command(
     scratch_dir: Option<&Path>,
     proxy_port: Option<u16>,
     agent: Agent,
-    gh_proxy: &crate::config::GhProxyPolicy,
+    gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) {
     for arg in copilot_args {
@@ -134,13 +134,13 @@ fn configure_command(
     // - gh proxy: intercepts gh commands and blocks destructive operations
     // - git push prevention: blocks git push while allowing all other git operations
     if let Some(scratch) = scratch_dir {
-        if gh_proxy.enabled {
+        if gh_guard.enabled {
             // Pre-extract GH token before installing wrappers that block `gh auth token`.
-            if gh_proxy.inject_token {
+            if gh_guard.inject_token {
                 inject_gh_token_if_needed(cmd, agent);
             }
         }
-        install_command_wrappers(cmd, scratch, gh_proxy, git_guard);
+        install_command_wrappers(cmd, scratch, gh_guard, git_guard);
     }
 }
 
@@ -191,7 +191,7 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
 fn install_command_wrappers(
     cmd: &mut Command,
     scratch_dir: &Path,
-    gh_proxy: &crate::config::GhProxyPolicy,
+    gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) {
     use std::os::unix::fs::PermissionsExt;
@@ -210,13 +210,13 @@ fn install_command_wrappers(
     let mut installed_any = false;
 
     // Install gh wrapper (only if gh_proxy enabled)
-    if gh_proxy.enabled
+    if gh_guard.enabled
         && let Some(real_gh) = which_binary("gh")
     {
         let script = crate::gh_proxy::generate_wrapper_script(
             &real_gh.to_string_lossy(),
             &cplt_str,
-            gh_proxy,
+            gh_guard,
         );
         let wrapper_path = bin_dir.join("gh");
         if std::fs::write(&wrapper_path, script).is_ok() {
@@ -384,7 +384,7 @@ pub fn exec(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
-    gh_proxy: &crate::config::GhProxyPolicy,
+    gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
     let profile_path = match write_temp_profile(&sandbox.profile_text) {
@@ -409,7 +409,7 @@ pub fn exec(
         sandbox.scratch_dir.as_deref(),
         sandbox.proxy_port,
         sandbox.agent,
-        gh_proxy,
+        gh_guard,
         git_guard,
     );
 
@@ -482,7 +482,7 @@ pub fn exec(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
-    gh_proxy: &crate::config::GhProxyPolicy,
+    gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;
@@ -500,7 +500,7 @@ pub fn exec(
         sandbox.scratch_dir.as_deref(),
         sandbox.proxy_port,
         sandbox.agent,
-        gh_proxy,
+        gh_guard,
         git_guard,
     );
 

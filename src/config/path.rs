@@ -180,7 +180,7 @@ pub fn default_config_contents() -> String {
 
 # ── gh CLI proxy ────────────────────────────────────────────────────────────
 # Intercepts `gh` commands and enforces a command-level policy.
-# [gh_proxy]
+# [gh_guard]
 # enabled = false             # enable the proxy (blocks destructive GitHub operations)
 # mode = "block"              # "block" | "warn" | "audit"
 # scope_check = true          # enforce same-repo check on write commands

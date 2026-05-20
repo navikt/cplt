@@ -33,11 +33,11 @@ const VALID_SANDBOX_KEYS: &[&str] = &[
     "allow_cache_exec",
     "allow_cache_exec_any",
     "allow_browser",
-    // Deprecated — use [gh_proxy] and [git_guard] sections instead.
+    // Deprecated — use [gh_guard] and [git_guard] sections instead.
     "gh_proxy",
     "git_push_prevention",
 ];
-const VALID_GH_PROXY_KEYS: &[&str] = &[
+const VALID_GH_GUARD_KEYS: &[&str] = &[
     "enabled",
     "mode",
     "scope_check",
@@ -58,7 +58,7 @@ const VALID_SECTIONS: &[&str] = &[
     "allow",
     "deny",
     "sandbox",
-    "gh_proxy",
+    "gh_guard",
     "git_guard",
     "audit",
     "config_version",
@@ -127,7 +127,7 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
     check_section_keys(&table, "allow", VALID_ALLOW_KEYS, &mut diagnostics);
     check_section_keys(&table, "deny", VALID_DENY_KEYS, &mut diagnostics);
     check_section_keys(&table, "sandbox", VALID_SANDBOX_KEYS, &mut diagnostics);
-    check_section_keys(&table, "gh_proxy", VALID_GH_PROXY_KEYS, &mut diagnostics);
+    check_section_keys(&table, "gh_guard", VALID_GH_GUARD_KEYS, &mut diagnostics);
     check_section_keys(&table, "git_guard", VALID_GIT_GUARD_KEYS, &mut diagnostics);
     check_section_keys(&table, "audit", VALID_AUDIT_KEYS, &mut diagnostics);
 

@@ -1,8 +1,8 @@
-# gh CLI Proxy & Git Push Prevention
+# gh Guard & Git Guard
 
 ## Overview
 
-The gh proxy prevents sandboxed agents from executing destructive GitHub
+The gh guard prevents sandboxed agents from executing destructive GitHub
 operations through the `gh` CLI. It intercepts all `gh` invocations inside
 the sandbox and enforces a command-level policy before passing through to
 the real binary.
@@ -17,7 +17,7 @@ Both features are **opt-in** (disabled by default) for a safe rollout:
 ```toml
 # ~/.config/cplt/config.toml
 
-[gh_proxy]
+[gh_guard]
 enabled = true              # blocks destructive gh operations
 scope_check = true          # enforce repo-scoping on write commands
 block_auth_token = true     # deny "gh auth token" exfiltration
@@ -32,8 +32,8 @@ prevent_push = true         # block git push/request-pull
 CLI flags (override config for a single run):
 
 ```bash
-cplt --gh-proxy          # enable gh proxy
-cplt --no-gh-proxy       # disable gh proxy
+cplt --gh-guard          # enable gh guard
+cplt --no-gh-guard       # disable gh guard
 cplt --git-guard         # enable git push prevention
 cplt --no-git-guard      # disable git push prevention
 ```
@@ -50,7 +50,7 @@ git_push_prevention = true
 The old flat config still works:
 ```toml
 [sandbox]
-gh_proxy = true              # maps to [gh_proxy] enabled=true with defaults
+gh_proxy = true              # maps to [gh_guard] enabled=true with defaults
 git_push_prevention = true   # maps to [git_guard] enabled=true with defaults
 ```
 
@@ -245,14 +245,14 @@ and AGENTS.md as the UX layer (agent doesn't even attempt push → clean experie
 
 ## Maintenance
 
-The policy table lives in `src/gh_proxy.rs`. When GitHub adds new commands
+The policy table lives in `src/gh_guard.rs`. When GitHub adds new commands
 to the `gh` CLI, they are **automatically blocked** (default-deny) until
 explicitly classified. This is the safe default but requires periodic updates.
 
 ### Adding new commands
 
 1. Check `gh help <new-command>` to understand what it does
-2. Add entries to the `POLICY` table in `src/gh_proxy.rs`
+2. Add entries to the `POLICY` table in `src/gh_guard.rs`
 3. Add tests to the `#[cfg(test)]` module
 4. Run `cargo test --lib gh_proxy`
 
@@ -286,14 +286,14 @@ Compare against the commands in `POLICY`.
 ### Phase 1: Current (this PR)
 - Core policy engine with 35 unit tests
 - Opt-in via config: `sandbox.gh_proxy = true` / `sandbox.git_push_prevention = true`
-- CLI flags: `--gh-proxy` / `--no-gh-proxy`, `--git-guard` / `--no-git-guard`
+- CLI flags: `--gh-guard` / `--no-gh-guard`, `--git-guard` / `--no-git-guard`
 - Default-deny for all unknown gh commands
 - GH_TOKEN pre-injection (blocks `gh auth token` exfiltration)
 - **Default: off** — users opt-in to test
 
 ### Phase 2: Flip default to on
 - Once stable, change default from `false` to `true`
-- Users can still opt-out via `--no-gh-proxy` / config
+- Users can still opt-out via `--no-gh-guard` / config
 - Audit logging (append to proxy log file)
 - `cplt doctor` check for gh proxy status
 

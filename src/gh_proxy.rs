@@ -1163,7 +1163,7 @@ fn shell_escape(s: &str) -> String {
 pub fn generate_wrapper_script(
     real_gh: &str,
     cplt_bin: &str,
-    policy: &crate::config::GhProxyPolicy,
+    policy: &crate::config::GhGuardPolicy,
 ) -> String {
     let cplt_escaped = shell_escape(cplt_bin);
     let gh_escaped = shell_escape(real_gh);
@@ -1843,7 +1843,7 @@ mod tests {
 
     #[test]
     fn wrapper_script_contains_paths() {
-        let policy = crate::config::GhProxyPolicy::default();
+        let policy = crate::config::GhGuardPolicy::default();
         let script = generate_wrapper_script("/usr/bin/gh", "/usr/local/bin/cplt", &policy);
         assert!(script.contains("/usr/bin/gh"));
         assert!(script.contains("/usr/local/bin/cplt"));
@@ -1937,7 +1937,7 @@ mod tests {
 
     #[test]
     fn shell_escape_handles_quotes() {
-        let policy = crate::config::GhProxyPolicy::default();
+        let policy = crate::config::GhGuardPolicy::default();
         let script = generate_wrapper_script("/path/with'quote/gh", "/path/with\"dq/cplt", &policy);
         assert!(script.contains("gh-gate"));
         // Should use single-quote escaping, no unescaped double quotes in paths

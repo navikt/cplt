@@ -56,7 +56,7 @@ pub struct Config {
     pub allow: AllowConfig,
     pub deny: DenyConfig,
     pub sandbox: SandboxConfig,
-    pub gh_proxy: GhProxyConfig,
+    pub gh_guard: GhGuardConfig,
     pub git_guard: GitGuardConfig,
     pub audit: AuditConfig,
 }
@@ -118,10 +118,10 @@ impl<'de> Deserialize<'de> for UnknownCommandPolicy {
     }
 }
 
-/// `[gh_proxy]` — gh CLI command filtering for sandboxed agents.
+/// `[gh_guard]` — gh CLI command filtering for sandboxed agents.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct GhProxyConfig {
+pub struct GhGuardConfig {
     /// Enable the gh CLI proxy (default: false for soft rollout).
     pub enabled: Option<bool>,
     /// Enforcement mode: "block" (default), "warn", or "audit".
@@ -299,7 +299,7 @@ pub struct SandboxConfig {
 /// Resolved gh proxy policy — immutable once computed at sandbox launch.
 /// Passed to the `gate()` function and baked into wrapper script flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GhProxyPolicy {
+pub struct GhGuardPolicy {
     pub enabled: bool,
     pub mode: EnforcementMode,
     pub scope_check: bool,
@@ -308,7 +308,7 @@ pub struct GhProxyPolicy {
     pub unknown_command: UnknownCommandPolicy,
 }
 
-impl Default for GhProxyPolicy {
+impl Default for GhGuardPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -382,7 +382,7 @@ pub struct Resolved {
     pub allow_browser: bool,
     pub scratch_dir: bool,
     pub quiet: bool,
-    pub gh_proxy: GhProxyPolicy,
+    pub gh_guard: GhGuardPolicy,
     pub git_guard: GitGuardPolicy,
     /// Preferred agent from config (None = auto-detect).
     pub agent: Option<String>,
@@ -423,7 +423,7 @@ pub struct CliFlags {
     pub allow_browser: bool,
     pub scratch: FeatureToggle,
     pub quiet: FeatureToggle,
-    pub gh_proxy: FeatureToggle,
+    pub gh_guard: FeatureToggle,
     pub git_push_prevention: FeatureToggle,
 }
 

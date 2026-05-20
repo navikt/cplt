@@ -321,10 +321,10 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         quiet,
         src(c.sandbox.quiet.is_some())
     );
-    let gh_proxy = c.sandbox.gh_proxy.unwrap_or(false);
+    let gh_proxy_deprecated = c.sandbox.gh_proxy.unwrap_or(false);
     println!(
-        "{blue}[cplt]{nc}    gh_proxy              = {}{} {dim}(deprecated, use [gh_proxy]){nc}",
-        gh_proxy,
+        "{blue}[cplt]{nc}    gh_proxy              = {}{} {dim}(deprecated, use [gh_guard]){nc}",
+        gh_proxy_deprecated,
         src(c.sandbox.gh_proxy.is_some())
     );
     let git_push_prevention = c.sandbox.git_push_prevention.unwrap_or(false);
@@ -334,38 +334,38 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         src(c.sandbox.git_push_prevention.is_some())
     );
 
-    // [gh_proxy] section
+    // [gh_guard] section
     println!("{blue}[cplt]{nc}");
-    println!("{blue}[cplt]{nc}  [gh_proxy]");
+    println!("{blue}[cplt]{nc}  [gh_guard]");
     println!(
         "{blue}[cplt]{nc}    enabled               = {}{}",
-        c.gh_proxy.enabled.unwrap_or(false),
-        src(c.gh_proxy.enabled.is_some())
+        c.gh_guard.enabled.unwrap_or(false),
+        src(c.gh_guard.enabled.is_some())
     );
     println!(
         "{blue}[cplt]{nc}    mode                  = {:?}{}",
-        c.gh_proxy.mode.unwrap_or_default(),
-        src(c.gh_proxy.mode.is_some())
+        c.gh_guard.mode.unwrap_or_default(),
+        src(c.gh_guard.mode.is_some())
     );
     println!(
         "{blue}[cplt]{nc}    scope_check           = {}{}",
-        c.gh_proxy.scope_check.unwrap_or(true),
-        src(c.gh_proxy.scope_check.is_some())
+        c.gh_guard.scope_check.unwrap_or(true),
+        src(c.gh_guard.scope_check.is_some())
     );
     println!(
         "{blue}[cplt]{nc}    block_auth_token      = {}{}",
-        c.gh_proxy.block_auth_token.unwrap_or(true),
-        src(c.gh_proxy.block_auth_token.is_some())
+        c.gh_guard.block_auth_token.unwrap_or(true),
+        src(c.gh_guard.block_auth_token.is_some())
     );
     println!(
         "{blue}[cplt]{nc}    inject_token          = {}{}",
-        c.gh_proxy.inject_token.unwrap_or(false),
-        src(c.gh_proxy.inject_token.is_some())
+        c.gh_guard.inject_token.unwrap_or(false),
+        src(c.gh_guard.inject_token.is_some())
     );
     println!(
         "{blue}[cplt]{nc}    unknown_command       = {:?}{}",
-        c.gh_proxy.unknown_command.unwrap_or_default(),
-        src(c.gh_proxy.unknown_command.is_some())
+        c.gh_guard.unknown_command.unwrap_or_default(),
+        src(c.gh_guard.unknown_command.is_some())
     );
 
     // [git_guard] section

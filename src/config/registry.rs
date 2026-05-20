@@ -279,7 +279,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "DEPRECATED: use [gh_proxy] section instead. Enables gh CLI proxy.",
+        description: "DEPRECATED: use [gh_guard] section instead. Enables gh CLI proxy.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -289,9 +289,9 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         default_display: "false",
         description: "DEPRECATED: use [git_guard] section instead. Enables git push prevention.",
     },
-    // [gh_proxy]
+    // [gh_guard]
     ConfigKeyInfo {
-        section: "gh_proxy",
+        section: "gh_guard",
         key: "enabled",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -299,7 +299,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Enable gh CLI proxy that blocks destructive GitHub operations (delete repo, merge PR, etc.).",
     },
     ConfigKeyInfo {
-        section: "gh_proxy",
+        section: "gh_guard",
         key: "mode",
         value_type: ConfigValueType::Str,
         dangerous: false,
@@ -307,7 +307,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Enforcement mode: \"block\" (deny and exit), \"warn\" (print warning, allow), or \"audit\" (silent log).",
     },
     ConfigKeyInfo {
-        section: "gh_proxy",
+        section: "gh_guard",
         key: "scope_check",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -315,7 +315,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Enforce same-repo check — blocks operations targeting other repositories via -R flag.",
     },
     ConfigKeyInfo {
-        section: "gh_proxy",
+        section: "gh_guard",
         key: "block_auth_token",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -323,7 +323,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Block 'gh auth token' command to prevent credential exfiltration.",
     },
     ConfigKeyInfo {
-        section: "gh_proxy",
+        section: "gh_guard",
         key: "inject_token",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -331,7 +331,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         description: "Pre-extract GH_TOKEN before sandbox launch (only for Copilot agent).",
     },
     ConfigKeyInfo {
-        section: "gh_proxy",
+        section: "gh_guard",
         key: "unknown_command",
         value_type: ConfigValueType::Str,
         dangerous: false,

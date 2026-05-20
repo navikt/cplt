@@ -28,7 +28,7 @@ pub use registry::{ConfigKeyInfo, ConfigValueType, lookup_key};
 pub use repo::{RepoKeyTarget, repo_key_rejection_reason, repo_key_target, set_repo_value_in_doc};
 pub use types::{
     AllowConfig, AuditConfig, CliFlags, Config, DenyConfig, EnforcementMode, FeatureToggle,
-    GhProxyConfig, GhProxyPolicy, GitGuardConfig, GitGuardPolicy, GitPushRule, LoadedConfig,
+    GhGuardConfig, GhGuardPolicy, GitGuardConfig, GitGuardPolicy, GitPushRule, LoadedConfig,
     ProxyConfig, Resolved, ResolvedPushRule, SandboxConfig, UnknownCommandPolicy,
 };
 pub use validation::{ConfigDiagnostic, DiagnosticLevel, validate_config};

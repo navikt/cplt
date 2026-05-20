@@ -27,7 +27,7 @@ Sandbox wrapper for AI coding agents. Runs GitHub Copilot CLI, OpenCode, Google 
 - [References](#references)
 
 **Detailed docs:**
-[Configuration](docs/configuration.md) · [Proxy & domain filtering](docs/proxy.md) · [gh & git command filtering](docs/gh-proxy.md) · [Known impacts](docs/known-impacts.md) · [Security details](docs/security.md)
+[Configuration](docs/configuration.md) · [Proxy & domain filtering](docs/proxy.md) · [gh & git command filtering](docs/gh-guard.md) · [Known impacts](docs/known-impacts.md) · [Security details](docs/security.md)
 
 ## Quick start
 

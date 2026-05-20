@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use super::error::ConfigError;
 use super::path::{config_path, expand_tilde, resolve_config_path};
 use super::types::{
-    CliFlags, Config, EnforcementMode, GhProxyPolicy, GitGuardPolicy, LoadedConfig, Resolved,
+    CliFlags, Config, EnforcementMode, GhGuardPolicy, GitGuardPolicy, LoadedConfig, Resolved,
     ResolvedPushRule, UnknownCommandPolicy,
 };
 use crate::sandbox::{HardeningCategory, validate_sbpl_path};
@@ -256,22 +256,22 @@ impl Config {
         // Quiet: FeatureToggle resolves --quiet/--no-quiet (default: off)
         let quiet = cli.quiet.resolve(self.sandbox.quiet.unwrap_or(false));
 
-        // gh-proxy: CLI flag overrides enabled; sub-options come from [gh_proxy] config.
-        // Backward compat: old `sandbox.gh_proxy = true` is treated as `gh_proxy.enabled = true`.
-        let gh_proxy_enabled_default = self
-            .gh_proxy
+        // gh-guard: CLI flag overrides enabled; sub-options come from [gh_proxy] config.
+        // Backward compat: old `sandbox.gh_proxy = true` is treated as `gh_guard.enabled = true`.
+        let gh_guard_enabled_default = self
+            .gh_guard
             .enabled
             .or(self.sandbox.gh_proxy)
             .unwrap_or(false);
-        let gh_proxy_enabled = cli.gh_proxy.resolve(gh_proxy_enabled_default);
-        let gh_proxy = GhProxyPolicy {
-            enabled: gh_proxy_enabled,
-            mode: self.gh_proxy.mode.unwrap_or(EnforcementMode::Block),
-            scope_check: self.gh_proxy.scope_check.unwrap_or(true),
-            block_auth_token: self.gh_proxy.block_auth_token.unwrap_or(true),
-            inject_token: self.gh_proxy.inject_token.unwrap_or(false),
+        let gh_guard_enabled = cli.gh_guard.resolve(gh_guard_enabled_default);
+        let gh_guard = GhGuardPolicy {
+            enabled: gh_guard_enabled,
+            mode: self.gh_guard.mode.unwrap_or(EnforcementMode::Block),
+            scope_check: self.gh_guard.scope_check.unwrap_or(true),
+            block_auth_token: self.gh_guard.block_auth_token.unwrap_or(true),
+            inject_token: self.gh_guard.inject_token.unwrap_or(false),
             unknown_command: self
-                .gh_proxy
+                .gh_guard
                 .unknown_command
                 .unwrap_or(UnknownCommandPolicy::Block),
         };
@@ -362,7 +362,7 @@ impl Config {
             allow_browser,
             scratch_dir,
             quiet,
-            gh_proxy,
+            gh_guard,
             git_guard,
             agent: self.sandbox.agent.clone(),
             deny_env: Vec::new(),
@@ -629,22 +629,22 @@ impl Resolved {
         eprintln!();
 
         // Command guards
-        if self.gh_proxy.enabled || self.git_guard.enabled {
+        if self.gh_guard.enabled || self.git_guard.enabled {
             eprintln!("{blue}[cplt]{nc}  {dim}Command guards:{nc}");
-            if self.gh_proxy.enabled {
+            if self.gh_guard.enabled {
                 if self.scratch_dir {
-                    let policy_note = match self.gh_proxy.unknown_command {
+                    let policy_note = match self.gh_guard.unknown_command {
                         UnknownCommandPolicy::Block => "default-deny",
                         UnknownCommandPolicy::Allow => "permissive",
                     };
-                    let mode_note = match self.gh_proxy.mode {
+                    let mode_note = match self.gh_guard.mode {
                         EnforcementMode::Block => "",
                         EnforcementMode::Warn => " [WARN MODE]",
                         EnforcementMode::Audit => " [AUDIT MODE]",
                     };
                     eprintln!(
-                        "{blue}[cplt]{nc}    gh proxy:      {green}on{nc}          {dim}{policy_note}, scope_check={}{mode_note}{nc}",
-                        if self.gh_proxy.scope_check {
+                        "{blue}[cplt]{nc}    gh guard:      {green}on{nc}          {dim}{policy_note}, scope_check={}{mode_note}{nc}",
+                        if self.gh_guard.scope_check {
                             "on"
                         } else {
                             "off"
@@ -653,7 +653,7 @@ impl Resolved {
                 } else {
                     let yellow = ui::color(ui::YELLOW);
                     eprintln!(
-                        "{blue}[cplt]{nc}    gh proxy:      {yellow}inactive{nc}    {dim}requires scratch_dir{nc}"
+                        "{blue}[cplt]{nc}    gh guard:      {yellow}inactive{nc}    {dim}requires scratch_dir{nc}"
                     );
                 }
             }
@@ -755,8 +755,8 @@ impl Resolved {
         if repo_config.propose.allow_env_files == Some(true) && is_approved("allow_env_files") {
             self.allow_env_files = true;
         }
-        if repo_config.propose.gh_proxy == Some(true) && is_approved("gh_proxy") {
-            self.gh_proxy.enabled = true;
+        if repo_config.propose.gh_guard == Some(true) && is_approved("gh_guard") {
+            self.gh_guard.enabled = true;
         }
         if repo_config.propose.git_push_prevention == Some(true)
             && is_approved("git_push_prevention")

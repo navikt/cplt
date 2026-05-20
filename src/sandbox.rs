@@ -203,7 +203,7 @@ pub fn exec_sandboxed(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
-    gh_proxy: &crate::config::GhProxyPolicy,
+    gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
     exec::exec(
@@ -214,7 +214,7 @@ pub fn exec_sandboxed(
         inherit_env,
         disabled_categories,
         deny_env,
-        gh_proxy,
+        gh_guard,
         git_guard,
     )
 }
