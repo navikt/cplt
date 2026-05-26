@@ -70,7 +70,7 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
                                                 └─ Block → print error, exit 1
 ```
 
-1. At sandbox launch, cplt writes a small wrapper to `{scratch}/bin/gh`
+1. At sandbox launch (when scratch directory is enabled), cplt writes a small wrapper to `{scratch}/bin/gh`
 2. `{scratch}/bin` is prepended to PATH, shadowing the real `gh`
 3. The wrapper calls `cplt gh-gate --real-gh /path/to/gh -- <args>`
 4. cplt evaluates the command against the policy table

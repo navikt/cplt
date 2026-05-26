@@ -47,6 +47,8 @@ pub struct ParsedCommand {
     pub method: Option<String>,
     /// For `gh api`: whether input flags are present (`-f`, `-F`, `--input`).
     pub has_input_flags: bool,
+    /// For `gh api`: the endpoint path (e.g., "/repos/owner/repo/pulls").
+    pub api_endpoint: Option<String>,
 }
 
 /// Static policy entry mapping (command, subcommand) to a decision.
@@ -915,6 +917,30 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         let mut method = None;
         let mut has_input_flags = false;
         let mut repo_flag = None;
+        let mut api_endpoint = None;
+
+        // Flags that consume the next argument as a value
+        const API_FLAGS_WITH_VALUE: &[&str] = &[
+            "-X",
+            "--method",
+            "-R",
+            "--repo",
+            "-f",
+            "-F",
+            "--field",
+            "--raw-field",
+            "--input",
+            "-H",
+            "--header",
+            "--hostname",
+            "-t",
+            "--template",
+            "-q",
+            "--jq",
+            "--cache",
+            "-p",
+            "--preview",
+        ];
 
         let mut i = idx;
         while i < args.len() {
@@ -929,7 +955,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 repo_flag = Some(val.to_string());
             } else if arg.starts_with("-R") && arg.len() > 2 {
                 repo_flag = Some(arg[2..].to_string());
-            } else {
+            } else if arg.starts_with('-') {
                 match arg {
                     "-X" | "--method" => {
                         if i + 1 < args.len() {
@@ -939,6 +965,8 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                     }
                     "-f" | "-F" | "--input" | "--field" | "--raw-field" => {
                         has_input_flags = true;
+                        // These take a value argument
+                        i += 1;
                     }
                     "-R" | "--repo" => {
                         if i + 1 < args.len() {
@@ -946,7 +974,15 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                             i += 1;
                         }
                     }
-                    _ => {}
+                    f if API_FLAGS_WITH_VALUE.contains(&f) => {
+                        i += 1; // skip value
+                    }
+                    _ => {} // boolean flag, skip
+                }
+            } else {
+                // Positional argument — this is the API endpoint
+                if api_endpoint.is_none() {
+                    api_endpoint = Some(arg.to_string());
                 }
             }
             i += 1;
@@ -958,6 +994,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             repo_flag: repo_flag.or(global_repo_flag),
             method,
             has_input_flags,
+            api_endpoint,
         });
     }
 
@@ -1006,6 +1043,7 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
         repo_flag: repo_flag.or(global_repo_flag),
         method: None,
         has_input_flags: false,
+        api_endpoint: None,
     })
 }
 
@@ -1074,15 +1112,45 @@ fn evaluate_api(cmd: &ParsedCommand) -> PolicyResult {
 ///
 /// `current_repo` should be in "owner/name" format.
 /// Returns true if the command targets the current repo (or has no -R flag).
+/// For `gh api` commands, also checks the endpoint URL path for /repos/{owner}/{repo}/.
 pub fn is_repo_in_scope(cmd: &ParsedCommand, current_repo: &str) -> bool {
-    match &cmd.repo_flag {
-        None => true, // No -R flag — implicitly targets current repo
-        Some(target) => {
-            // Normalize comparison: case-insensitive, strip trailing .git
-            let target_clean = target.trim_end_matches(".git").to_lowercase();
-            let current_clean = current_repo.to_lowercase();
-            target_clean == current_clean
-        }
+    // Check -R/--repo flag first
+    if let Some(target) = &cmd.repo_flag {
+        let target_clean = target.trim_end_matches(".git").to_lowercase();
+        let current_clean = current_repo.to_lowercase();
+        return target_clean == current_clean;
+    }
+
+    // For gh api: extract repo from endpoint path like /repos/{owner}/{repo}/...
+    if cmd.command == "api"
+        && let Some(ref endpoint) = cmd.api_endpoint
+        && let Some(endpoint_repo) = extract_repo_from_api_path(endpoint)
+    {
+        let current_clean = current_repo.to_lowercase();
+        return endpoint_repo.to_lowercase() == current_clean;
+    }
+
+    // No -R flag and no repo in URL path — implicitly targets current repo
+    true
+}
+
+/// Extract "owner/repo" from a GitHub API endpoint path.
+///
+/// Matches patterns like:
+/// - `/repos/owner/repo/pulls`
+/// - `repos/owner/repo/issues/1`
+/// - `/repos/owner/repo` (exact)
+///
+/// Returns None if the path doesn't match the /repos/{owner}/{repo} pattern.
+fn extract_repo_from_api_path(endpoint: &str) -> Option<String> {
+    let path = endpoint.strip_prefix('/').unwrap_or(endpoint);
+    let parts: Vec<&str> = path.split('/').collect();
+
+    // Must start with "repos" and have at least owner + repo
+    if parts.len() >= 3 && parts[0] == "repos" && !parts[1].is_empty() && !parts[2].is_empty() {
+        Some(format!("{}/{}", parts[1], parts[2]))
+    } else {
+        None
     }
 }
 
@@ -1580,6 +1648,7 @@ mod tests {
         assert_eq!(cmd.subcommand, None);
         assert_eq!(cmd.method, None);
         assert!(!cmd.has_input_flags);
+        assert_eq!(cmd.api_endpoint.as_deref(), Some("/repos/owner/repo/pulls"));
     }
 
     #[test]
@@ -1587,6 +1656,10 @@ mod tests {
         let cmd = parse_command(&["api", "-X", "POST", "/repos/owner/repo/issues"]).unwrap();
         assert_eq!(cmd.command, "api");
         assert_eq!(cmd.method.as_deref(), Some("POST"));
+        assert_eq!(
+            cmd.api_endpoint.as_deref(),
+            Some("/repos/owner/repo/issues")
+        );
     }
 
     #[test]
@@ -1594,6 +1667,7 @@ mod tests {
         let cmd = parse_command(&["api", "/repos/o/r/issues", "-f", "title=bug"]).unwrap();
         assert_eq!(cmd.command, "api");
         assert!(cmd.has_input_flags);
+        assert_eq!(cmd.api_endpoint.as_deref(), Some("/repos/o/r/issues"));
     }
 
     #[test]
@@ -1627,6 +1701,7 @@ mod tests {
                 repo_flag: None,
                 method: None,
                 has_input_flags: false,
+                api_endpoint: None,
             };
             let result = evaluate(&parsed);
             assert_eq!(
@@ -1655,6 +1730,7 @@ mod tests {
                 repo_flag: None,
                 method: None,
                 has_input_flags: false,
+                api_endpoint: None,
             };
             let result = evaluate(&parsed);
             assert_eq!(
@@ -1681,6 +1757,7 @@ mod tests {
                 repo_flag: None,
                 method: None,
                 has_input_flags: false,
+                api_endpoint: None,
             };
             let result = evaluate(&parsed);
             assert_eq!(
@@ -1699,6 +1776,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         let result = evaluate(&parsed);
         assert_eq!(result.decision, Decision::Unknown);
@@ -1713,6 +1791,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::Allow);
 
@@ -1723,6 +1802,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::Block);
     }
@@ -1735,6 +1815,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::ScopeCheck);
 
@@ -1744,6 +1825,7 @@ mod tests {
             repo_flag: None,
             method: Some("GET".to_string()),
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::ScopeCheck);
     }
@@ -1756,6 +1838,7 @@ mod tests {
             repo_flag: None,
             method: Some("POST".to_string()),
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::Block);
     }
@@ -1768,6 +1851,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: true,
+            api_endpoint: None,
         };
         assert_eq!(evaluate(&parsed).decision, Decision::Block);
     }
@@ -1782,6 +1866,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
     }
@@ -1794,6 +1879,7 @@ mod tests {
             repo_flag: Some("navikt/cplt".to_string()),
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
     }
@@ -1806,6 +1892,7 @@ mod tests {
             repo_flag: Some("other/repo".to_string()),
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
     }
@@ -1818,6 +1905,7 @@ mod tests {
             repo_flag: Some("Navikt/CPLT".to_string()),
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
     }
@@ -1830,8 +1918,80 @@ mod tests {
             repo_flag: Some("navikt/cplt.git".to_string()),
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+    }
+
+    // ── API endpoint scope tests ──
+
+    #[test]
+    fn api_endpoint_out_of_scope() {
+        let cmd = ParsedCommand {
+            command: "api".to_string(),
+            subcommand: None,
+            repo_flag: None,
+            method: None,
+            has_input_flags: false,
+            api_endpoint: Some("/repos/other/repo/pulls".to_string()),
+        };
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
+    }
+
+    #[test]
+    fn api_endpoint_in_scope() {
+        let cmd = ParsedCommand {
+            command: "api".to_string(),
+            subcommand: None,
+            repo_flag: None,
+            method: None,
+            has_input_flags: false,
+            api_endpoint: Some("/repos/navikt/cplt/pulls".to_string()),
+        };
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+    }
+
+    #[test]
+    fn api_endpoint_no_repos_prefix_in_scope() {
+        // Endpoints like /user or /orgs/foo don't have repo context — allow
+        let cmd = ParsedCommand {
+            command: "api".to_string(),
+            subcommand: None,
+            repo_flag: None,
+            method: None,
+            has_input_flags: false,
+            api_endpoint: Some("/user".to_string()),
+        };
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+    }
+
+    #[test]
+    fn api_endpoint_repo_flag_takes_precedence() {
+        // -R flag overrides endpoint path
+        let cmd = ParsedCommand {
+            command: "api".to_string(),
+            subcommand: None,
+            repo_flag: Some("other/repo".to_string()),
+            method: None,
+            has_input_flags: false,
+            api_endpoint: Some("/repos/navikt/cplt/pulls".to_string()),
+        };
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
+    }
+
+    #[test]
+    fn extract_repo_from_api_path_basic() {
+        assert_eq!(
+            extract_repo_from_api_path("/repos/navikt/cplt/pulls"),
+            Some("navikt/cplt".to_string())
+        );
+        assert_eq!(
+            extract_repo_from_api_path("repos/navikt/cplt"),
+            Some("navikt/cplt".to_string())
+        );
+        assert_eq!(extract_repo_from_api_path("/user"), None);
+        assert_eq!(extract_repo_from_api_path("/repos"), None);
+        assert_eq!(extract_repo_from_api_path("/repos/owner"), None);
     }
 
     // ── URL parsing tests ──
@@ -1901,6 +2061,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert_eq!(evaluate(&list).decision, Decision::Allow);
 
@@ -1910,6 +2071,7 @@ mod tests {
             repo_flag: None,
             method: None,
             has_input_flags: false,
+            api_endpoint: None,
         };
         assert_eq!(evaluate(&edit).decision, Decision::Block);
     }
