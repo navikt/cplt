@@ -270,61 +270,127 @@ gh help --all 2>&1 | grep "^  " | awk '{print $1}' | sort -u
 
 Compare against the commands in `POLICY`.
 
+## Security Boundaries
+
+This section is explicit about what the gh/git guard protects against and what it does NOT protect against.
+
+### What it protects against
+
+| Threat | How it's stopped |
+|--------|-----------------|
+| Agent merges a PR without human review | `gh pr merge` is in the Block tier — always denied |
+| Agent deletes a repository | `gh repo delete` is in the Block tier |
+| Agent creates releases or uploads artifacts | `gh release create/upload` blocked |
+| Agent triggers CI workflows | `gh workflow run` blocked |
+| Agent pushes directly to main/master | `git push` blocked (or only default branch blocked with `protect_default_branch_only`) |
+| Agent force-pushes and rewrites history | `--force`/`--force-with-lease` detection on push |
+| Agent exfiltrates `gh auth token` value | `gh auth token` explicitly blocked; token pre-injected as env var |
+| Agent modifies secrets/variables | `gh secret set/delete`, `gh variable set/delete` blocked |
+| Agent installs malicious gh extensions | `gh extension install/remove` blocked |
+| Agent operates on other repositories | `-R other/repo` checked via ScopeCheck |
+| Agent uses `gh api` POST to mutate state | Presence of `-f`, `-F`, `--input`, or non-GET method → blocked |
+| Agent uses `gh api graphql` for mutations | `graphql` endpoint unconditionally blocked (mutations via stdin not parseable) |
+
+### What it does NOT protect against
+
+| Gap | Explanation | Mitigation |
+|-----|-------------|------------|
+| **Data exfiltration via `gh api` GET** | The agent can `gh api /repos/owner/repo/contents/secret.yml` to read and then exfiltrate via network | Use network proxy domain filtering (`--blocked-domains`) |
+| **Direct `curl` with `GH_TOKEN`** | Agent can `curl -H "Authorization: token $GH_TOKEN" https://api.github.com/...` bypassing the gh wrapper entirely | GH_TOKEN is only injected for Copilot agent; network proxy logs all outbound connections |
+| **Wrapper bypass via real binary path** | Agent can `cat $(which gh)` to discover the real `gh` path in the wrapper script and call it directly | The wrapper uses `exec` so the real path is in the script; defense: Seatbelt blocks writes to scratch bin dir, but the path is readable |
+| **Agent edits `.github/workflows/`** | Agent can write CI configs that run on push — destructive actions happen in CI, not locally | Code review (git diff); git push is blocked so workflows can't trigger |
+| **Agent creates commits on main locally** | `git commit` on the main branch is allowed (it's a local operation) | The push guard prevents pushing those commits; human reviews before push |
+| **`git send-pack` plumbing variants** | Covered — `send-pack` is in the block list | ✅ Already handled |
+| **Agent reads project source code** | Project dir is fully readable (agent's core function) | Network domain filtering to prevent exfiltration |
+| **Heuristic parser confusion** | Extremely unusual flag combinations might confuse the parser | Fail-closed: unknown states → blocked; 87+ E2E tests cover bypass variants |
+| **New `gh` commands added upstream** | Unknown commands get `Decision::Unknown` → blocked by default (safe) | Periodic policy table updates; `unknown_command = "block"` is default |
+
+### Security model summary
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    DEFENSE IN DEPTH                              │
+├────────────────────────────────────────────────────────────────┤
+│  Layer 1: Kernel sandbox (Seatbelt/Landlock)                    │
+│    → Blocks credential file reads, exec from tmp, localhost     │
+│    → CANNOT be bypassed by any user-space code                  │
+├────────────────────────────────────────────────────────────────┤
+│  Layer 2: Environment sanitization                              │
+│    → Only safe env vars pass through                            │
+│    → Agent never sees AWS_SECRET_KEY, NPM_TOKEN, etc.           │
+├────────────────────────────────────────────────────────────────┤
+│  Layer 3: gh/git command guard (THIS FEATURE)                   │
+│    → Prevents destructive GitHub/git operations                 │
+│    → PATH-based interception (wrapper shadows real binary)      │
+│    → Soft barrier: bypassable if agent discovers real binary    │
+│    → Policy baked at launch (agent can't modify)                │
+├────────────────────────────────────────────────────────────────┤
+│  Layer 4: Network proxy (domain filtering)                      │
+│    → Blocks known exfiltration domains                          │
+│    → Logs all outbound CONNECT requests                         │
+├────────────────────────────────────────────────────────────────┤
+│  Layer 5: AGENTS.md instructions                                │
+│    → Tells agent not to push/merge/delete                       │
+│    → Compliance-based only (no enforcement)                     │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**The gh/git guard is Layer 3** — it sits between kernel enforcement (unbypassable) and instructions (unenforceable). It is a **strong deterrent** that stops compliant agents and catches accidental destructive operations. It is NOT a hard security boundary against a determined adversary with code execution.
+
+The hard security boundary is Layer 1 (kernel sandbox): credentials, SSH keys, and secret files are physically inaccessible regardless of what the agent does.
+
+### protect_default_branch_only mode
+
+When `git_guard.protect_default_branch_only = true`:
+
+- Push to `main` or `master` → **BLOCKED**
+- Push to `feature/x`, `copilot/fix-123`, any other branch → **ALLOWED**
+- `git push` with no explicit branch → **ALLOWED** (current branch, likely a feature branch)
+- Push with refspec `HEAD:refs/heads/main` → **BLOCKED** (refspec parsing detects target)
+- `git push origin` (no branch) → **ALLOWED**
+
+This mode is designed for workflows where agents should be able to push their work to feature branches for PR review, while preventing direct pushes to the default branch.
+
+**Security note:** This is intentionally permissive. The agent can push to any non-default branch. The human review gate becomes the pull request, not the push prevention. Use full `prevent_push = true` if you want no pushes at all.
+
 ## Limitations
 
-- **Not a security boundary for data exfiltration**: The proxy prevents
+- **Not a security boundary for data exfiltration**: The guard prevents
   accidental destructive actions, not deliberate data theft. An agent
   could still exfiltrate code via `gh api` GET to read repo contents.
   Use the network proxy's domain filtering for exfiltration prevention.
 
 - **Shell escape**: If an agent uses `curl` with `GH_TOKEN` directly
-  (bypassing `gh`), this proxy has no effect. The GH_TOKEN is already
-  filtered from non-Copilot agents via env sanitization, and the network
-  proxy handles domain-level control.
+  (bypassing `gh`), this guard has no effect. The GH_TOKEN is only
+  injected for Copilot agents, and the network proxy handles domain-level control.
+
+- **Wrapper discoverability**: The agent can read the wrapper script
+  (`cat $(which gh)`) to discover the real `gh` binary path. This is a
+  soft barrier, not a hard one. The kernel sandbox (Layer 1) is the hard barrier.
 
 - **Subcommand parsing is heuristic**: Complex flag combinations may
   confuse the parser. In doubt, commands are blocked (fail-closed).
 
-## Rollout plan
-
-### Phase 1: Current (this PR)
-- Core policy engine with 35 unit tests
-- Opt-in via config: `sandbox.gh_proxy = true` / `sandbox.git_push_prevention = true`
-- CLI flags: `--gh-guard` / `--no-gh-guard`, `--git-guard` / `--no-git-guard`
-- Default-deny for all unknown gh commands
-- GH_TOKEN pre-injection (blocks `gh auth token` exfiltration)
-- **Default: off** — users opt-in to test
-
-### Phase 2: Flip default to on
-- Once stable, change default from `false` to `true`
-- Users can still opt-out via `--no-gh-guard` / config
-- Audit logging (append to proxy log file)
-- `cplt doctor` check for gh proxy status
-
-### Phase 3: Refinement
-- Custom allow/block lists in config: `gh-proxy.allow = ["pr merge"]`
-- Per-repo overrides via `.cplt.toml`: `[propose] gh_proxy_allow = ["workflow run"]`
-- Warning mode (log but don't block) for gradual rollout
-- Helper script to detect new `gh` commands from upstream releases
-
 ## Testing
 
-The command wrappers have 35 unit tests covering:
+The command guards have 87+ E2E tests and 40+ unit tests covering:
 - Command parsing (simple, with flags, with `-R`, API commands)
 - Policy evaluation (all three tiers, wildcard groups, default-deny)
 - Scope checking (matching, non-matching, case-insensitive, .git suffix)
+- API endpoint path extraction (cross-repo detection)
+- Input flag bypass prevention (`--field=value`, `-fvalue`, `--input=-`)
+- GraphQL endpoint blocking
+- Force-push flag detection (including `--force-with-lease=ref` form)
 - URL parsing (HTTPS, SSH shorthand, SSH URL, non-GitHub)
 - Wrapper script generation (gh and git)
 - Git push blocking (with flags like `-c key=value`)
 - Git read/local-write operations allowed
-
-Integration testing (Phase 2):
-- E2E test: compile cplt, set up wrapper, verify blocked commands fail
-- E2E test: verify allowed commands pass through to real gh/git
-- E2E test: verify scope-check blocks cross-repo operations
+- protect_default_branch_only (branch and refspec parsing)
+- Full sandbox integration (wrapper → gate → real binary)
 
 Run tests:
 ```bash
-cargo test --lib gh_proxy    # 35 policy/parser/git tests
-mise run check               # full suite including gh_proxy
+cargo test --lib gh_proxy              # unit tests (parser, policy, helpers)
+cargo test --test e2e_guards           # 87 E2E tests (full binary pipeline)
+mise run check                         # full suite
 ```

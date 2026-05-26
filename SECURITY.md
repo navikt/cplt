@@ -51,6 +51,10 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | **Credential theft** | Read `~/.ssh/id_ed25519`, `~/.aws/credentials` | Seatbelt deny rules (macOS) / Landlock deny (Linux) |
 | **Data exfiltration** | POST secrets to `https://evil.com/collect` | Filesystem isolation (credentials unreadable) |
 | **Secret file access** | Read `~/.netrc`, `~/.npmrc`, `~/.vault-token` | Seatbelt deny rules (macOS) / Landlock deny (Linux) |
+| **Destructive GitHub ops** | `gh repo delete`, `gh pr merge`, `gh release create` | gh guard command interception (opt-in) |
+| **Unreviewed code push** | `git push origin main` | git guard command interception (opt-in) |
+| **Token exfiltration via CLI** | `gh auth token` prints raw token | gh guard blocks `auth token`; pre-injects as env var |
+| **Cross-repo operations** | `gh pr close -R other-org/other-repo` | gh guard scope checking against current repo |
 | **DNS rebinding SSRF** | Domain resolves to `127.0.0.1` after check | Post-DNS-resolution IP validation; `--allow-private-domain` opt-in bypass for explicitly trusted internal domains |
 | **Sandbox profile injection** | Path with `\n(allow file-read* (subpath "/"))` | SBPL path character validation (macOS) |
 | **Temp file symlink attack** | Symlink at predictable `/tmp/cplt.sb` | Unique filename + `O_CREAT\|O_EXCL` |
