@@ -11,7 +11,7 @@
 
 #[cfg(target_os = "macos")]
 mod e2e_tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2805,6 +2805,16 @@ mod e2e_tests {
         (repo, config_file)
     }
 
+    /// Build a Command for the cplt binary with trust-related env vars cleared.
+    /// Trust tests must not inherit __CPLT_TRUST_LOCKED from a parent sandbox.
+    fn trust_cmd(repo: &Path, config_file: &Path) -> Command {
+        let mut cmd = Command::new(binary_path());
+        cmd.current_dir(repo)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .env_remove("__CPLT_TRUST_LOCKED");
+        cmd
+    }
+
     #[test]
     fn e2e_trust_show_displays_proposals() {
         let (repo, config_file) = make_trust_repo(
@@ -2812,15 +2822,18 @@ mod e2e_tests {
             "[propose]\nallow_localhost_any = true\n\n[deny]\nenv = [\"VAULT_TOKEN\"]\n",
         );
 
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
 
-        assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "trust show failed (stderr: {}, stdout: {})",
+            String::from_utf8_lossy(&output.stderr),
+            stdout
+        );
         assert!(
             stdout.contains("allow_localhost_any"),
             "should show proposed key: {stdout}"
@@ -2843,10 +2856,8 @@ mod e2e_tests {
             make_trust_repo("accept-all", "[propose]\nallow_localhost_any = true\n");
 
         // Before accept: should show pending
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2856,10 +2867,8 @@ mod e2e_tests {
         );
 
         // Accept all
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust", "accept", "--all"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         assert!(
@@ -2869,10 +2878,8 @@ mod e2e_tests {
         );
 
         // After accept: should show approved
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2892,19 +2899,15 @@ mod e2e_tests {
         );
 
         // Accept only one key
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust", "accept", "allow_localhost_any"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         assert!(output.status.success());
 
         // Check status: one approved, one pending
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2937,26 +2940,20 @@ mod e2e_tests {
             make_trust_repo("revoke", "[propose]\nallow_localhost_any = true\n");
 
         // Accept, then revoke
-        Command::new(binary_path())
+        trust_cmd(&repo, &config_file)
             .args(["trust", "accept", "--all"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("accept should run");
 
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust", "revoke", "--all"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("revoke should run");
         assert!(output.status.success());
 
         // After revoke: should show pending
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2976,10 +2973,8 @@ mod e2e_tests {
         );
 
         // Accept all
-        Command::new(binary_path())
+        trust_cmd(&repo, &config_file)
             .args(["trust", "accept", "--all"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("accept should run");
 
@@ -3008,10 +3003,8 @@ mod e2e_tests {
             .unwrap();
 
         // After change: should show changed warning and pending status
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3035,18 +3028,14 @@ mod e2e_tests {
         let (repo_b, _) = make_trust_repo("isolation-b", "[propose]\nallow_localhost_any = true\n");
 
         // Accept in repo A (using shared config dir)
-        Command::new(binary_path())
+        trust_cmd(&repo_a, &config_file)
             .args(["trust", "accept", "--all"])
-            .current_dir(&repo_a)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("accept should run");
 
         // Repo A should show approved
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo_a, &config_file)
             .args(["trust"])
-            .current_dir(&repo_a)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout_a = String::from_utf8_lossy(&output.stdout);
@@ -3056,10 +3045,8 @@ mod e2e_tests {
         );
 
         // Repo B should still show pending (different fingerprint)
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo_b, &config_file)
             .args(["trust"])
-            .current_dir(&repo_b)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout_b = String::from_utf8_lossy(&output.stdout);
@@ -3155,10 +3142,8 @@ mod e2e_tests {
         );
 
         // After running with flag, trust should NOT be persisted
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3184,10 +3169,8 @@ mod e2e_tests {
         .unwrap();
 
         // Trust show should use HEAD version (only allow_localhost_any)
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3262,10 +3245,8 @@ mod e2e_tests {
         );
 
         // Verify trust was NOT actually modified
-        let output = Command::new(binary_path())
+        let output = trust_cmd(&repo, &config_file)
             .args(["trust"])
-            .current_dir(&repo)
-            .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
             .expect("should run");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3440,6 +3421,10 @@ mod e2e_tests {
     #[test]
     fn e2e_init_detects_env_secrets() {
         let dir = tempfile::tempdir().unwrap();
+        if std::fs::write(dir.path().join(".env.example"), "test=1").is_err() {
+            eprintln!("SKIP: .env writes blocked (running inside sandbox)");
+            return;
+        }
         std::fs::write(
             dir.path().join(".env.example"),
             "DATABASE_URL=x\nSECRET_KEY=y\nDEBUG=true\n",
