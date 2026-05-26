@@ -6,118 +6,75 @@
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-**Enterprise-grade sandbox for AI coding agents.** Gives teams kernel-enforced security boundaries around GitHub Copilot CLI, OpenCode, Gemini CLI, Pi, or any shell — so agents can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
+**Kernel-enforced sandbox for AI coding agents.** Wraps GitHub Copilot CLI, OpenCode, Gemini CLI, Pi, or any shell so agents can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
 - **Linux**: Landlock LSM + seccomp-BPF (kernel 5.13+; full network filtering on 6.7+)
 
 ![cplt banner](./assets/cplt.png)
 
-## Why teams need this
+## Why cplt?
 
-AI coding agents execute arbitrary code on developer machines. Without a sandbox, a compromised agent (via prompt injection, supply chain attack, or malicious MCP server) can:
+AI agents execute arbitrary code. A compromised agent (prompt injection, supply chain attack, malicious MCP server) can read `~/.ssh`, push to main, merge PRs, or exfiltrate code — unless the OS itself says no.
 
-- **Read SSH keys and cloud credentials** — `~/.ssh/id_ed25519`, `~/.aws/credentials`, `.env`
-- **Push directly to main** — bypassing code review entirely
-- **Merge PRs without approval** — `gh pr merge` with no human in the loop
-- **Exfiltrate code** — POST source code to attacker-controlled endpoints
-- **Install persistence** — modify git hooks, write binaries to cache dirs
-- **Trigger CI pipelines** — `gh workflow run` with arbitrary payloads
+cplt provides **kernel-level enforcement** with **team-configurable policy**:
 
-cplt prevents these at the kernel level. The agent works normally on your project, but the operating system itself blocks access to anything outside the sandbox boundary.
-
-### For security teams
-
-- **Per-repo policy** (`.cplt.toml`) — checked into version control, tamper-proof (read from git HEAD)
-- **Deny rules applied automatically** — no developer opt-in needed for `[deny]` sections
-- **Proposed permissions require approval** — `cplt trust accept` with content-pinned verification
-- **Command-level git/gh interception** — block pushes, merges, releases, secret modifications
-- **Audit trail** — proxy logs every outbound connection; gate decisions logged to stderr
-- **Works on locked-down laptops** — no Docker, no VMs, single static binary
-
-### For developers
-
-- **Zero-config start** — `brew install navikt/tap/cplt && cplt --shell-install`
-- **Same workflow** — `copilot` command just works, sandboxed transparently
-- **Fast** — instant startup, zero overhead on allowed operations (`exec()` replaces process)
-- **Auto-detected tools** — Gradle, Maven, Node.js, Rust, Go, Python discovered automatically
-- **Escape hatches** — `--allow-read`, `--pass-env`, `--allow-localhost` when you need them
+- Per-repo policy (`.cplt.toml`) committed to version control — tamper-proof, auditable
+- Deny-by-default for credentials, secrets, and sensitive files
+- Command-level git/gh interception (block pushes, merges, releases)
+- Outbound network filtering with audit logging
+- No Docker, no VMs — single static binary on locked-down laptops
+- Zero-config start for developers; escape hatches when needed
 
 ## Table of contents
 
 - [Quick start](#quick-start)
-- [Why cplt?](#why-cplt)
+- [What it blocks](#what-it-blocks)
 - [Install](#install)
-- [What it does](#what-it-does)
 - [Usage](#usage)
 - [Configuration](#configuration)
-- [Architecture](#architecture)
 - [Security](#security)
+- [Architecture](#architecture)
 - [Contributing](#contributing)
 - [References](#references)
 
 **Detailed docs:**
-[Configuration](docs/configuration.md) · [Proxy & domain filtering](docs/proxy.md) · [gh & git command guard](docs/gh-guard.md) · [Known impacts](docs/known-impacts.md) · [Security details](docs/security.md)
+[Configuration](docs/configuration.md) · [Proxy & domain filtering](docs/proxy.md) · [gh command guard](docs/gh-guard.md) · [git command guard](docs/git-guard.md) · [Known impacts](docs/known-impacts.md) · [Security details](docs/security.md)
 
 ## Quick start
 
 ```bash
-# Install
 brew install navikt/tap/cplt
+cplt --shell-install        # make 'copilot' run sandboxed (persistent)
+cplt doctor                 # check your environment
+cplt -- -p "fix the tests"  # run Copilot in sandbox
+```
 
-# Make 'copilot' run the sandboxed version (persistent)
-cplt --shell-install
-
-# Check your environment
-cplt doctor
-
-# Run Copilot in sandbox
-cplt -- -p "fix the tests"
-
-# Or run OpenCode in sandbox (with Copilot subscription — no API key needed)
-cplt --agent opencode
-
-# Or with a third-party provider
-cplt --agent opencode --pass-env ANTHROPIC_API_KEY
-
-# Or just a sandboxed shell (no AI agent, same security restrictions)
-cplt --agent shell
+Other agents:
+```bash
+cplt --agent opencode                       # OpenCode (Copilot subscription)
+cplt --agent opencode --pass-env ANTHROPIC_API_KEY  # third-party provider
+cplt --agent shell                          # sandboxed shell (no AI)
 ```
 
 ### Team rollout
 
 ```bash
-# 1. Add per-repo policy (commit to version control)
+# 1. Generate per-repo policy
 cplt init --write
 
-# 2. Developers approve repo permissions on first run
+# 2. Developers approve on first run
 cplt trust accept --all
 
-# 3. Enable command guards in global config
+# 3. Enable command guards
 cplt config set gh_guard.enabled true
 cplt config set git_guard.enabled true
 cplt config set git_guard.protect_default_branch_only true
 ```
 
-Example `.cplt.toml` for a team repository:
-```toml
-# Applied automatically — no approval needed
-[deny]
-paths = ["~/secrets", "~/.vault-token"]
-env = ["VAULT_TOKEN", "DATABASE_URL"]
+## What it blocks
 
-# Requires developer approval (cplt trust accept)
-[propose]
-gh_guard = true
-git_push_prevention = true
-allow_lifecycle_scripts = true
-
-[propose.allow]
-ports = [5432]
-localhost = [3000, 8080]
-```
-
-**Primary control: filesystem isolation + command gating.** The sandbox blocks access to credentials and secrets at the kernel level. The command guard blocks destructive operations (push, merge, delete). All restrictions apply to the agent and every process it spawns.
+The sandbox blocks access to credentials and secrets at the kernel level. Command guards block destructive operations. All restrictions apply to the agent and every process it spawns.
 
 | Resource                                                                         | Status                                   | Notes                                                                                   |
 | -------------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------- |
@@ -157,19 +114,7 @@ This table is a summary. The sandbox also allows access to system files (SSL cer
 
 For the full security model, threat analysis, and test strategy, see **[SECURITY.md](SECURITY.md)**.
 
-## Why cplt?
-
-cplt is built for organizations that want to adopt AI coding agents without compromising their security posture. It keeps the normal local CLI workflow but adds kernel-enforced restrictions and team-configurable policy.
-
-**The value proposition:**
-- Kernel enforcement (not just prompts or UI permissions)
-- Per-repo policy committed to version control (auditable, tamper-proof)
-- Zero Docker dependency (works on locked-down corporate laptops)
-- Repo-aware command gating (knows which repo the agent is working in)
-- Outbound network filtering (log and control what the agent connects to)
-- Secret-focused defaults that work immediately with no configuration
-
-### Compared with Codex CLI's sandbox
+## Compared with Codex CLI's sandbox
 
 | Area | cplt | Codex CLI sandbox |
 | --- | --- | --- |
@@ -336,8 +281,6 @@ This is the same pattern used by tools like mise, direnv, and starship.
 **Why an alias instead of a symlink?** Both cplt and Copilot CLI install into the same Homebrew bin directory (`/opt/homebrew/bin/`). A symlink would conflict — only one file named `copilot` can exist there. A shell alias avoids this entirely: the real `copilot` binary stays in PATH (so cplt can find and wrap it), and the alias transparently redirects your command.
 
 > **Note:** cplt has recursion prevention built in. If it detects it's already running inside a sandbox (via the `__CPLT_WRAPPED` environment variable), it will refuse to launch again. Read-only subcommands like `--print-profile` and `--doctor` still work inside an existing sandbox.
-
-## What it does
 
 ## Usage
 
@@ -689,16 +632,14 @@ Per-repo config (`.cplt.toml`) operates as a separate layer: `[deny]` tightens u
 
 ### Per-repo configuration (`.cplt.toml`)
 
-This is the **team governance mechanism**. Commit a `.cplt.toml` to your repository root to enforce security policy for everyone who runs agents in this project:
+Commit a `.cplt.toml` to your repository root to enforce team policy:
 
 ```toml
-# Applied automatically to all developers — no opt-in needed
-[deny]
+[deny]                    # Applied automatically — no opt-in needed
 paths = ["~/secrets", "~/.vault-token"]
 env = ["VAULT_TOKEN", "DATABASE_URL"]
 
-# Requires developer approval (cplt trust accept)
-[propose]
+[propose]                 # Requires developer approval (cplt trust accept)
 gh_guard = true
 git_push_prevention = true
 allow_jvm_attach = true
@@ -710,9 +651,8 @@ localhost = [3000]
 ```
 
 - **`[deny]`** — applied automatically (can only tighten, never weaken)
-- **`[propose]`** — requested permissions, requires approval: `cplt trust accept --all`
+- **`[propose]`** — requires approval: `cplt trust accept --all`
 - Read from `git HEAD` — tamper-proof; content-pinned approvals
-- Security teams can enforce `[deny]` rules across all repos; developers cannot override them
 
 #### Auto-generate with `cplt init`
 
@@ -844,27 +784,19 @@ cplt --allowed-domains allowed-domains.txt -- -p "x"  # allowlist mode
 
 ### gh & git command guard
 
-When enabled, cplt intercepts `gh` and `git` commands with wrapper scripts (placed in the sandbox's scratch dir, prepended to `PATH`). The guard enforces repository-scoped policy:
+When enabled, cplt intercepts `gh` and `git` commands via wrapper scripts in `$PATH`:
 
-| Command | Action | Rationale |
-|---------|--------|-----------|
-| `gh pr merge`, `gh pr close` | 🔒 Blocked | Prevent unauthorized merges |
-| `gh repo delete`, `gh release create` | 🔒 Blocked | Prevent destructive repository operations |
-| `git push --force`, `git push origin main` | 🔒 Blocked | Prevent force-pushes and direct-to-main |
-| `gh api` (write to other repos) | 🔒 Scope-checked | Agent limited to current repository |
-| `gh pr list`, `gh issue list` | ✅ Allowed | Read-only operations pass through |
-| `git push origin feature-branch` | ✅ Allowed (with `protect_default_branch_only`) | Feature branch pushes are safe |
+| Command | Action |
+|---------|--------|
+| `gh pr merge`, `gh repo delete`, `gh release create` | 🔒 Blocked |
+| `git push origin main`, `git push --force` | 🔒 Blocked |
+| `gh api` (write to other repos) | 🔒 Scope-checked |
+| `gh pr list`, `gh issue list`, `git commit` | ✅ Allowed |
+| `git push origin feature-branch` | ✅ Allowed (with `protect_default_branch_only`) |
 
-**Security level:** This is a **soft barrier** (Layer 3) — it prevents compliant agents from accidental destructive operations. A determined adversary who discovers the real binary paths could bypass it. For hard boundaries, rely on the kernel sandbox (Layer 1) and branch protection rules on the server.
+This is a **soft barrier** (Layer 3) — prevents compliant agents from accidental destructive operations. For hard boundaries, rely on kernel sandbox + server-side branch protection.
 
-```bash
-# Enable in global config
-cplt config set gh_guard.enabled true
-cplt config set git_guard.enabled true
-cplt config set git_guard.protect_default_branch_only true
-```
-
-📖 **Full details:** [docs/gh-guard.md](docs/gh-guard.md)
+📖 **Full details:** [docs/gh-guard.md](docs/gh-guard.md) · [docs/git-guard.md](docs/git-guard.md)
 
 ### Lifecycle scripts (postinstall hooks)
 
