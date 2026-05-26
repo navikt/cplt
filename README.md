@@ -315,7 +315,7 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | Core system       | `HOME`, `USER`, `PATH`, `SHELL`, `TMPDIR`, `LANG`                          | Explicit allowlist                      |
 | Terminal          | `TERM`, `COLORTERM`, `TERM_PROGRAM`                                        | Explicit allowlist                      |
 | Editor            | `EDITOR`, `VISUAL`, `PAGER`                                                | Explicit allowlist                      |
-| Auth tokens       | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`                         | Explicit allowlist (needed for Copilot) |
+| Auth tokens       | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`                         | Passed only if already set by user; gh guard uses one-time file instead |
 | Copilot config    | `COPILOT_DEBUG`, `COPILOT_*`                                               | Prefix allowlist                        |
 | Language runtimes | `NODE_*`, `GOPATH`, `CARGO_HOME`, `JAVA_HOME`, `VIRTUAL_ENV`, `PYTHONPATH` | Explicit allowlist                      |
 | Tool managers     | `NVM_*`, `PYENV_*`, `MISE_*`, `SDKMAN_*`, `COREPACK_*`, `YARN_*`           | Prefix allowlist                        |
@@ -1001,10 +1001,13 @@ Git commit and push **work out of the box** over HTTPS — no extra flags needed
    git config --global url."https://github.com/".insteadOf "git@github.com:"
    ```
    This makes git transparently use HTTPS even when remotes are configured as SSH. The rewrite is read from `~/.gitconfig` which is readable inside the sandbox.
-2. **Authenticate with `gh`** — cplt allows the agent to read `gh auth token`:
+2. **Authenticate with `gh`** — cplt serves the token to Copilot at startup:
    ```bash
    gh auth login   # one-time setup outside the sandbox
    ```
+   When gh guard is enabled, cplt caches the token at launch and serves it once
+   to Copilot via `gh auth token` — then deletes the cache. Subprocesses cannot
+   retrieve the token afterward.
 3. **Configure git credential helper** (if not already set by `gh auth setup-git`):
    ```bash
    gh auth setup-git   # sets credential.helper to use gh
@@ -1014,7 +1017,7 @@ That's it. The agent can now `git add`, `git commit`, `git push`, create branche
 
 **Optional: signed commits** — add `--allow-gpg-signing` (see [GPG signing](#gpg-commit-signing)).
 
-> **Why is SSH blocked?** The SSH agent socket gives access to *all* loaded keys, which could authenticate to any host. HTTPS with `gh auth token` is scoped to GitHub only. See [SSH agent blocking](#ssh-agent-blocking).
+> **Why is SSH blocked?** The SSH agent socket gives access to *all* loaded keys, which could authenticate to any host. HTTPS with `gh` credential helper is scoped to GitHub only. See [SSH agent blocking](#ssh-agent-blocking).
 
 > **Tip:** Protect your `main` branch with [branch protection rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-a-branch-protection-rule/about-branch-protection-rules) to prevent the agent from pushing directly to main or force-pushing. This is good practice regardless of cplt.
 
@@ -1026,7 +1029,7 @@ Certain git operations are blocked to prevent persistence attacks that survive t
 | ---------------------------------- | ----------- | ----------------------------------------------------------------- |
 | `git add/commit/status/diff/log`   | ✅ Works     | Local operations, no writes to protected paths                    |
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
-| `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth token` provides credentials            |
+| `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, credentials via `gh` credential helper          |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked   | SSH agent socket denied — use HTTPS                               |
 | `git config` (local)               | ❌ Blocked   | `.git/config` is write-protected (prevents `url.*.insteadOf` hijacking) |
 | `git config --global`              | ❌ Blocked   | `~/.gitconfig` is read-only                                      |

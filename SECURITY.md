@@ -9,13 +9,13 @@ cplt sandboxes AI coding agents — currently **GitHub Copilot CLI**, **[OpenCod
 | Property        | Copilot                             | OpenCode                                                            | Gemini                                    | Pi                                          |
 |-----------------|-------------------------------------|---------------------------------------------------------------------|-------------------------------------------|---------------------------------------------|
 | Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow → `auth.json`, or API keys                   | Google OAuth (browser) or API key         | API keys (Anthropic, OpenAI, Gemini, etc.)  |
-| Auth in sandbox | Token auto-passed via env allowlist | Copilot auth stored in data dir; third-party keys need `--pass-env` | OAuth stored in `~/.gemini/`; key needs `--pass-env` | Keys need `--pass-env`             |
+| Auth in sandbox | Token served via one-time file read (gh guard) or Keychain | Copilot auth stored in data dir; third-party keys need `--pass-env` | OAuth stored in `~/.gemini/`; key needs `--pass-env` | Keys need `--pass-env`             |
 | Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini` (read/write)                  | `~/.pi` (read/write)                       |
 | Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          | N/A (in config dir)                       | `~/.pi/agent/bin` (read + exec)             |
 | State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          | N/A                                       | N/A                                         |
 | Keychain access | Yes (required for token storage)    | No                                                                  | Yes (extension integrity)                 | No                                          |
 | SEA extraction  | Yes (pre-sandbox)                   | No                                                                  | No                                        | No                                          |
-| Env isolation   | `GH_TOKEN`, `COPILOT_*` passed      | `GH_TOKEN`, `COPILOT_*` suppressed                                  | `GH_TOKEN`, `COPILOT_*` suppressed        | `GH_TOKEN`, `COPILOT_*` suppressed          |
+| Env isolation   | `GH_TOKEN` not injected (one-time file); `COPILOT_*` passed | `GH_TOKEN`, `COPILOT_*` suppressed                                  | `GH_TOKEN`, `COPILOT_*` suppressed        | `GH_TOKEN`, `COPILOT_*` suppressed          |
 | Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                          | No (explicit only — name collision risk)    |
 
 ### OpenCode-specific security notes
@@ -53,7 +53,7 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | **Secret file access** | Read `~/.netrc`, `~/.npmrc`, `~/.vault-token` | Seatbelt deny rules (macOS) / Landlock deny (Linux) |
 | **Destructive GitHub ops** | `gh repo delete`, `gh pr merge`, `gh release create` | gh guard command interception (opt-in) |
 | **Unreviewed code push** | `git push origin main` | git guard command interception (opt-in) |
-| **Token exfiltration via CLI** | `gh auth token` prints raw token | gh guard blocks `auth token`; pre-injects as env var |
+| **Token exfiltration via CLI** | `gh auth token` prints raw token | gh guard serves cached token once at startup, deletes file — subprocesses get nothing |
 | **Cross-repo operations** | `gh pr close -R other-org/other-repo` | gh guard scope checking against current repo |
 | **DNS rebinding SSRF** | Domain resolves to `127.0.0.1` after check | Post-DNS-resolution IP validation; `--allow-private-domain` opt-in bypass for explicitly trusted internal domains |
 | **Sandbox profile injection** | Path with `\n(allow file-read* (subpath "/"))` | SBPL path character validation (macOS) |

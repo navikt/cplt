@@ -164,22 +164,42 @@ gh codespace *
 gh project * (except list/view/field-list/item-list)
 ```
 
-## `gh auth token` and token injection
+## `gh auth token` and token isolation
 
-`gh auth token` is **blocked** to prevent token exfiltration. Instead, cplt
-pre-extracts the token before the sandbox starts:
+`gh auth token` is handled with a **one-time-read** mechanism that gives
+Copilot its auth token without exposing it to subprocesses:
 
 1. Before launching the sandbox, cplt runs `gh auth token` (outside the sandbox)
-2. Injects the token as `GH_TOKEN` into the sandboxed environment
-3. Blocks `gh auth token` inside the sandbox (no way to exfiltrate the value)
+2. Writes the token to a file in the scratch dir (`{scratch}/.gh-token`, mode 0600)
+3. On Copilot's first call to `gh auth token`, the wrapper reads and returns the
+   cached token, then **immediately deletes the file**
+4. Any subsequent call by tools or MCP servers gets "no cached token available"
 
-This means the agent has API access via `GH_TOKEN` (needed for operations),
-but cannot extract the raw token string to send to external services.
+**Why not inject as `GH_TOKEN` env var?**
+
+Environment variables are inherited by all child processes. If `GH_TOKEN` is set,
+every tool, MCP server, and subprocess the agent spawns would have the token.
+The file-based approach ensures only the first reader (Copilot at startup) gets it.
+
+**Security properties:**
+- Token file exists for <1 second (deleted after Copilot's startup read)
+- Token never exposed as an environment variable
+- Copilot caches the token in memory after first read — one read is sufficient
+- After deletion, subprocesses cannot obtain the token via `gh auth token`
 
 **When this applies:**
 - Only for Copilot agent (other agents have their own auth mechanisms)
+- Only when `block_auth_token = true` (default)
 - Only when `GH_TOKEN`/`GITHUB_TOKEN` is not already set in the environment
 - Falls back gracefully if `gh` is not installed or not authenticated
+
+**Opt-in env var injection:**
+
+If you prefer the simpler approach (token in env), set `inject_token = true`:
+```toml
+[gh_guard]
+inject_token = true   # injects GH_TOKEN env var (visible to all subprocesses)
+```
 
 ## `gh api` handling
 
