@@ -14,11 +14,13 @@ pub enum ConfigValueType {
     Str,
     U16Array,
     StrArray,
+    /// Array of TOML tables (e.g. `[[git_guard.allow_push]]`).
+    ArrayOfTables,
 }
 
 impl ConfigValueType {
     pub fn is_array(self) -> bool {
-        matches!(self, Self::U16Array | Self::StrArray)
+        matches!(self, Self::U16Array | Self::StrArray | Self::ArrayOfTables)
     }
 }
 
@@ -371,6 +373,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         default_display: "true",
         description: "Block force push (only meaningful when prevent_push is false).",
     },
+    ConfigKeyInfo {
+        section: "git_guard",
+        key: "allow_push",
+        value_type: ConfigValueType::ArrayOfTables,
+        dangerous: true,
+        default_display: "[]",
+        description: "Structured push exceptions. Each entry specifies remote/branches/force conditions under which push is allowed.",
+    },
     // [audit]
     ConfigKeyInfo {
         section: "audit",
@@ -442,6 +452,7 @@ pub(super) fn type_label(vt: ConfigValueType) -> &'static str {
         ConfigValueType::Str => "string",
         ConfigValueType::U16Array => "integer array",
         ConfigValueType::StrArray => "string array",
+        ConfigValueType::ArrayOfTables => "array of tables",
     }
 }
 

@@ -75,6 +75,16 @@ pub enum EnforcementMode {
     Audit,
 }
 
+impl std::fmt::Display for EnforcementMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Block => write!(f, "block"),
+            Self::Warn => write!(f, "warn"),
+            Self::Audit => write!(f, "audit"),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for EnforcementMode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -100,6 +110,15 @@ pub enum UnknownCommandPolicy {
     Block,
     /// Allow unknown commands to pass through (permissive — use during testing/adoption).
     Allow,
+}
+
+impl std::fmt::Display for UnknownCommandPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Block => write!(f, "block"),
+            Self::Allow => write!(f, "allow"),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for UnknownCommandPolicy {

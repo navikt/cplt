@@ -50,6 +50,7 @@ pub struct ProposeSection {
     pub allow_lifecycle_scripts: Option<bool>,
     pub allow_browser: Option<bool>,
     pub allow_env_files: Option<bool>,
+    #[serde(alias = "gh_proxy")]
     pub gh_guard: Option<bool>,
     pub git_push_prevention: Option<bool>,
 

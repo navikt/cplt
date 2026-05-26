@@ -343,7 +343,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         src(c.gh_guard.enabled.is_some())
     );
     println!(
-        "{blue}[cplt]{nc}    mode                  = {:?}{}",
+        "{blue}[cplt]{nc}    mode                  = {}{}",
         c.gh_guard.mode.unwrap_or_default(),
         src(c.gh_guard.mode.is_some())
     );
@@ -363,7 +363,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         src(c.gh_guard.inject_token.is_some())
     );
     println!(
-        "{blue}[cplt]{nc}    unknown_command       = {:?}{}",
+        "{blue}[cplt]{nc}    unknown_command       = {}{}",
         c.gh_guard.unknown_command.unwrap_or_default(),
         src(c.gh_guard.unknown_command.is_some())
     );
@@ -377,7 +377,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         src(c.git_guard.enabled.is_some())
     );
     println!(
-        "{blue}[cplt]{nc}    mode                  = {:?}{}",
+        "{blue}[cplt]{nc}    mode                  = {}{}",
         c.git_guard.mode.unwrap_or_default(),
         src(c.git_guard.mode.is_some())
     );

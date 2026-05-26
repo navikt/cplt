@@ -61,6 +61,10 @@ fn parse_value_for_key(
             }
             Ok(toml_edit::Value::Array(arr))
         }
+        ConfigValueType::ArrayOfTables => Err(ConfigError::Validation(format!(
+            "{}.{} is an array of tables — edit config.toml directly to configure this key",
+            key_info.section, key_info.key
+        ))),
     }
 }
 

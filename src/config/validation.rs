@@ -108,7 +108,7 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
         }
     };
 
-    // Check top-level keys (should all be known section names)
+    // Check top-level keys (should all be known sections or scalar keys)
     for key in table.keys() {
         if !VALID_SECTIONS.contains(&key.as_str()) {
             let suggestion = suggest_key(key, VALID_SECTIONS);
@@ -117,7 +117,7 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
                 .unwrap_or_default();
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Error,
-                message: format!("unknown section [{key}]{hint}"),
+                message: format!("unknown top-level key '{key}'{hint}"),
             });
         }
     }
@@ -323,9 +323,10 @@ quiet = false
         let diagnostics = validate_config(toml);
         assert!(
             diagnostics.iter().any(|d| {
-                d.level == DiagnosticLevel::Error && d.message.contains("unknown section [proxxy]")
+                d.level == DiagnosticLevel::Error
+                    && d.message.contains("unknown top-level key 'proxxy'")
             }),
-            "should detect unknown section: {diagnostics:?}"
+            "should detect unknown top-level key: {diagnostics:?}"
         );
     }
 

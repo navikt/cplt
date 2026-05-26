@@ -1425,7 +1425,14 @@ const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
 /// Evaluate a git command. Returns Ok(()) if allowed, Err with message if blocked.
 ///
 /// Used by the `cplt git-gate` subcommand.
-pub fn gate_git(args: &[&str]) -> Result<(), String> {
+/// `prevent_push` controls whether push/request-pull/send-pack are blocked.
+/// `prevent_force_push` blocks force push even when regular push is allowed.
+pub fn gate_git(args: &[&str], prevent_push: bool, prevent_force_push: bool) -> Result<(), String> {
+    // If push prevention is entirely disabled, allow everything
+    if !prevent_push && !prevent_force_push {
+        return Ok(());
+    }
+
     // Find the subcommand by skipping global flags.
     // Git global flags that take a value (must skip the next arg too).
     const FLAGS_WITH_VALUE: &[&str] = &[
@@ -1459,13 +1466,33 @@ pub fn gate_git(args: &[&str]) -> Result<(), String> {
         return Ok(());
     };
 
-    if GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
+    if prevent_push && GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
         return Err(format!(
             "⚠️ BLOCKED by sandbox: 'git {sub}' is not allowed in this environment.\n\
              Push prevention is enabled — commit your changes locally.\n\
              This operation is restricted by the cplt sandbox to prevent unintended pushes.\n\
              Stop and report this to the human operator — they will review and push when ready."
         ));
+    }
+
+    // If only force push prevention is active (prevent_push=false, prevent_force_push=true),
+    // check for force push flags on push commands
+    if !prevent_push && prevent_force_push && sub == "push" {
+        let push_args = &args[i + 1..];
+        let has_force = push_args.iter().any(|a| {
+            *a == "--force"
+                || *a == "-f"
+                || *a == "--force-with-lease"
+                || *a == "--force-if-includes"
+        });
+        if has_force {
+            return Err(
+                "⚠️ BLOCKED by sandbox: 'git push --force' is not allowed in this environment.\n\
+                 Force push prevention is enabled — regular push is allowed but force push is blocked.\n\
+                 Stop and report this to the human operator."
+                    .to_string(),
+            );
+        }
     }
 
     // If it's in the allow list, pass through
@@ -1496,12 +1523,22 @@ pub fn generate_git_wrapper_script(
         crate::config::EnforcementMode::Warn => "--mode=warn",
         crate::config::EnforcementMode::Audit => "--mode=audit",
     };
+    let prevent_push_flag = if policy.prevent_push {
+        "--prevent-push=true"
+    } else {
+        "--prevent-push=false"
+    };
+    let prevent_force_push_flag = if policy.prevent_force_push {
+        "--prevent-force-push=true"
+    } else {
+        "--prevent-force-push=false"
+    };
     format!(
         r#"#!/bin/sh
 # cplt git proxy — blocks git push in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} -- "$@"
+exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_flag} {prevent_force_push_flag} -- "$@"
 "#
     )
 }
@@ -1881,48 +1918,63 @@ mod tests {
 
     #[test]
     fn git_push_is_blocked() {
-        assert!(gate_git(&["push"]).is_err());
-        assert!(gate_git(&["push", "origin", "main"]).is_err());
-        assert!(gate_git(&["push", "--force"]).is_err());
-        assert!(gate_git(&["-c", "user.name=x", "push"]).is_err());
+        assert!(gate_git(&["push"], true, true).is_err());
+        assert!(gate_git(&["push", "origin", "main"], true, true).is_err());
+        assert!(gate_git(&["push", "--force"], true, true).is_err());
+        assert!(gate_git(&["-c", "user.name=x", "push"], true, true).is_err());
     }
 
     #[test]
     fn git_request_pull_is_blocked() {
-        assert!(gate_git(&["request-pull", "v1.0", "origin"]).is_err());
+        assert!(gate_git(&["request-pull", "v1.0", "origin"], true, true).is_err());
     }
 
     #[test]
     fn git_read_operations_allowed() {
-        assert!(gate_git(&["status"]).is_ok());
-        assert!(gate_git(&["log", "--oneline"]).is_ok());
-        assert!(gate_git(&["diff", "HEAD~1"]).is_ok());
-        assert!(gate_git(&["fetch", "origin"]).is_ok());
-        assert!(gate_git(&["pull"]).is_ok());
-        assert!(gate_git(&["branch", "-a"]).is_ok());
+        assert!(gate_git(&["status"], true, true).is_ok());
+        assert!(gate_git(&["log", "--oneline"], true, true).is_ok());
+        assert!(gate_git(&["diff", "HEAD~1"], true, true).is_ok());
+        assert!(gate_git(&["fetch", "origin"], true, true).is_ok());
+        assert!(gate_git(&["pull"], true, true).is_ok());
+        assert!(gate_git(&["branch", "-a"], true, true).is_ok());
     }
 
     #[test]
     fn git_local_writes_allowed() {
-        assert!(gate_git(&["commit", "-m", "fix"]).is_ok());
-        assert!(gate_git(&["add", "."]).is_ok());
-        assert!(gate_git(&["checkout", "-b", "feature"]).is_ok());
-        assert!(gate_git(&["merge", "main"]).is_ok());
-        assert!(gate_git(&["rebase", "main"]).is_ok());
-        assert!(gate_git(&["stash"]).is_ok());
-        assert!(gate_git(&["tag", "v1.0"]).is_ok());
+        assert!(gate_git(&["commit", "-m", "fix"], true, true).is_ok());
+        assert!(gate_git(&["add", "."], true, true).is_ok());
+        assert!(gate_git(&["checkout", "-b", "feature"], true, true).is_ok());
+        assert!(gate_git(&["merge", "main"], true, true).is_ok());
+        assert!(gate_git(&["rebase", "main"], true, true).is_ok());
+        assert!(gate_git(&["stash"], true, true).is_ok());
+        assert!(gate_git(&["tag", "v1.0"], true, true).is_ok());
     }
 
     #[test]
     fn git_no_subcommand_allowed() {
-        assert!(gate_git(&["--version"]).is_ok());
-        assert!(gate_git(&[]).is_ok());
+        assert!(gate_git(&["--version"], true, true).is_ok());
+        assert!(gate_git(&[], true, true).is_ok());
     }
 
     #[test]
     fn git_unknown_subcommand_allowed() {
         // Unknown git commands default to allow (unlike gh which defaults to block)
-        assert!(gate_git(&["some-custom-alias"]).is_ok());
+        assert!(gate_git(&["some-custom-alias"], true, true).is_ok());
+    }
+
+    #[test]
+    fn git_push_allowed_when_prevention_disabled() {
+        assert!(gate_git(&["push"], false, false).is_ok());
+        assert!(gate_git(&["push", "--force"], false, false).is_ok());
+        assert!(gate_git(&["send-pack", "origin"], false, false).is_ok());
+    }
+
+    #[test]
+    fn git_force_push_blocked_when_only_force_prevention() {
+        // Regular push allowed, force push blocked
+        assert!(gate_git(&["push", "origin", "main"], false, true).is_ok());
+        assert!(gate_git(&["push", "--force"], false, true).is_err());
+        assert!(gate_git(&["push", "--force-with-lease"], false, true).is_err());
     }
 
     #[test]
@@ -1991,7 +2043,7 @@ mod tests {
 
     #[test]
     fn git_gate_blocks_send_pack() {
-        let result = gate_git(&["send-pack", "origin", "main"]);
+        let result = gate_git(&["send-pack", "origin", "main"], true, true);
         assert!(result.is_err());
     }
 }

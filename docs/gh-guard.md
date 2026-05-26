@@ -41,7 +41,7 @@ cplt --no-git-guard      # disable git push prevention
 Per-repo via `.cplt.toml`:
 ```toml
 [propose]
-gh_proxy = true
+gh_guard = true
 git_push_prevention = true
 ```
 
@@ -217,6 +217,7 @@ Agent calls git commit → wrapper → cplt git-gate → exec real git ✓
 |---------|--------|
 | `git push` | Remote writes — human should review and push |
 | `git request-pull` | Initiates upstream merge requests |
+| `git send-pack` | Plumbing equivalent of push — remote writes |
 
 ### Allowed git commands
 
@@ -245,14 +246,14 @@ and AGENTS.md as the UX layer (agent doesn't even attempt push → clean experie
 
 ## Maintenance
 
-The policy table lives in `src/gh_guard.rs`. When GitHub adds new commands
+The policy table lives in `src/gh_proxy.rs`. When GitHub adds new commands
 to the `gh` CLI, they are **automatically blocked** (default-deny) until
 explicitly classified. This is the safe default but requires periodic updates.
 
 ### Adding new commands
 
 1. Check `gh help <new-command>` to understand what it does
-2. Add entries to the `POLICY` table in `src/gh_guard.rs`
+2. Add entries to the `POLICY` table in `src/gh_proxy.rs`
 3. Add tests to the `#[cfg(test)]` module
 4. Run `cargo test --lib gh_proxy`
 
