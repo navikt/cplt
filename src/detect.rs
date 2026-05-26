@@ -2303,8 +2303,18 @@ services:
 
     // ── Env files detector ───────────────────────────────────────────
 
+    /// Returns true if we can write .env files (blocked inside cplt sandbox).
+    fn can_write_env_files() -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".env.example"), "test=1").is_ok()
+    }
+
     #[test]
     fn env_detects_sensitive_vars() {
+        if !can_write_env_files() {
+            eprintln!("SKIP: .env writes blocked (running inside sandbox)");
+            return;
+        }
         let dir = setup_dir();
         fs::write(
             dir.path().join(".env.example"),
@@ -2333,6 +2343,10 @@ services:
 
     #[test]
     fn env_ignores_non_sensitive_vars() {
+        if !can_write_env_files() {
+            eprintln!("SKIP: .env writes blocked (running inside sandbox)");
+            return;
+        }
         let dir = setup_dir();
         fs::write(
             dir.path().join(".env.example"),
@@ -2351,6 +2365,10 @@ services:
 
     #[test]
     fn env_skips_invalid_var_names() {
+        if !can_write_env_files() {
+            eprintln!("SKIP: .env writes blocked (running inside sandbox)");
+            return;
+        }
         let dir = setup_dir();
         fs::write(
             dir.path().join(".env.example"),
