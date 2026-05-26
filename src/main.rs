@@ -1620,6 +1620,13 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 /// is allowed, this replaces the current process with the real gh binary.
 /// If blocked, prints an error message and exits with code 1.
 fn run_gh_gate(real_gh: &Path, args: &[String], policy: &gh_proxy::GatePolicy) -> ExitCode {
+    // Intercept `gh auth token` — serve from cached file instead of blocking.
+    // This allows Copilot to authenticate without exposing the token as an env var
+    // to all child processes. The token file is written to scratch dir at startup.
+    if policy.block_auth_token && is_gh_auth_token_request(args) {
+        return serve_cached_gh_token();
+    }
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
@@ -1654,6 +1661,48 @@ fn run_gh_gate(real_gh: &Path, args: &[String], policy: &gh_proxy::GatePolicy) -
                 ExitCode::FAILURE
             }
         },
+    }
+}
+
+/// Check if args represent a `gh auth token` invocation.
+fn is_gh_auth_token_request(args: &[String]) -> bool {
+    // args are the arguments after `--` in `cplt gh-gate ... -- auth token`
+    let mut iter = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'));
+    iter.next() == Some("auth") && iter.next() == Some("token")
+}
+
+/// Serve the cached GitHub token from the scratch dir's `.gh-token` file.
+/// Deletes the file after reading so subsequent calls by subprocesses fail.
+/// Returns ExitCode::SUCCESS if token found, FAILURE otherwise.
+fn serve_cached_gh_token() -> ExitCode {
+    // TMPDIR is set to the scratch dir inside the sandbox
+    let tmpdir = std::env::var("TMPDIR")
+        .or_else(|_| std::env::var("TMP"))
+        .unwrap_or_default();
+
+    if tmpdir.is_empty() {
+        eprintln!("⚠️ BLOCKED by sandbox: 'gh auth token' — no cached token available.");
+        return ExitCode::FAILURE;
+    }
+
+    let token_path = Path::new(&tmpdir).join(".gh-token");
+
+    match std::fs::read_to_string(&token_path) {
+        Ok(token) if !token.is_empty() => {
+            // Delete the file immediately after reading — one-time use only.
+            // Copilot caches the token in memory after first read, so subsequent
+            // calls to `gh auth token` by tools/subprocesses will get "not available".
+            let _ = std::fs::remove_file(&token_path);
+            print!("{token}");
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("⚠️ BLOCKED by sandbox: 'gh auth token' — no cached token available.");
+            ExitCode::FAILURE
+        }
     }
 }
 

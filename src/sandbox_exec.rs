@@ -135,9 +135,14 @@ fn configure_command(
     // - git push prevention: blocks git push while allowing all other git operations
     if let Some(scratch) = scratch_dir {
         if gh_guard.enabled {
-            // Pre-extract GH token before installing wrappers that block `gh auth token`.
+            // Inject GH_TOKEN into env only when explicitly requested.
             if gh_guard.inject_token {
                 inject_gh_token_if_needed(cmd, agent);
+            }
+            // Cache token to file so the wrapper can serve `gh auth token` requests
+            // without exposing the token as an env var to all child processes.
+            if gh_guard.block_auth_token {
+                cache_gh_token_to_file(scratch, agent);
             }
         }
         install_command_wrappers(cmd, scratch, gh_guard, git_guard);
@@ -181,6 +186,51 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !token.is_empty() {
         cmd.env("GH_TOKEN", &token);
+    }
+}
+
+/// Cache the GitHub token to a file in the scratch dir.
+///
+/// The gh wrapper script reads this file to serve `gh auth token` requests
+/// without exposing the token as an environment variable to all child processes.
+/// The file is owner-readable only (mode 0o600).
+fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent) {
+    // Only cache for Copilot — other agents have their own auth
+    if agent != Agent::Copilot {
+        return;
+    }
+
+    // Skip if any GitHub token is already set (non-empty) in the environment —
+    // in that case Copilot will use the env var directly.
+    let has_token = |key| std::env::var(key).is_ok_and(|v| !v.is_empty());
+    if has_token("GH_TOKEN") || has_token("GITHUB_TOKEN") || has_token("COPILOT_GITHUB_TOKEN") {
+        return;
+    }
+
+    // Extract token from gh CLI config (outside sandbox)
+    let Ok(output) = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return;
+    };
+
+    if !output.status.success() {
+        return;
+    }
+
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        return;
+    }
+
+    // Write token to file with restrictive permissions
+    use std::os::unix::fs::PermissionsExt;
+    let token_path = scratch_dir.join(".gh-token");
+    if std::fs::write(&token_path, &token).is_ok() {
+        let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
     }
 }
 
