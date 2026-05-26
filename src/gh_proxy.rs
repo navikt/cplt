@@ -955,6 +955,18 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
                 repo_flag = Some(val.to_string());
             } else if arg.starts_with("-R") && arg.len() > 2 {
                 repo_flag = Some(arg[2..].to_string());
+            } else if arg.starts_with("--field=")
+                || arg.starts_with("--raw-field=")
+                || arg.starts_with("--input=")
+            {
+                // --field=key=value, --raw-field=key=value, --input=-
+                // These imply a mutating request (POST)
+                has_input_flags = true;
+            } else if (arg.starts_with("-f") && arg.len() > 2 && arg.as_bytes()[2] != b'-')
+                || (arg.starts_with("-F") && arg.len() > 2 && arg.as_bytes()[2] != b'-')
+            {
+                // -ftitle=bug, -Ftitle=bug — combined short flag with attached value
+                has_input_flags = true;
             } else if arg.starts_with('-') {
                 match arg {
                     "-X" | "--method" => {
@@ -1088,6 +1100,17 @@ pub fn evaluate(cmd: &ParsedCommand) -> PolicyResult {
 /// GET requests are scope-checked. Any other method (or presence of input
 /// flags that imply a write) is blocked.
 fn evaluate_api(cmd: &ParsedCommand) -> PolicyResult {
+    // Block GraphQL endpoint — it allows arbitrary mutations via stdin/body
+    // that cannot be statically analyzed for scope or intent.
+    if let Some(ref endpoint) = cmd.api_endpoint
+        && (endpoint == "graphql" || endpoint == "/graphql")
+    {
+        return PolicyResult {
+            decision: Decision::Block,
+            reason: "gh api graphql allows arbitrary mutations — use specific REST endpoints instead",
+        };
+    }
+
     // If input flags are present, it's implicitly a write
     if cmd.has_input_flags {
         return PolicyResult {
@@ -1550,8 +1573,8 @@ pub fn gate_git(args: &[&str], prevent_push: bool, prevent_force_push: bool) -> 
         let has_force = push_args.iter().any(|a| {
             *a == "--force"
                 || *a == "-f"
-                || *a == "--force-with-lease"
-                || *a == "--force-if-includes"
+                || a.starts_with("--force-with-lease")
+                || a.starts_with("--force-if-includes")
         });
         if has_force {
             return Err(

@@ -566,13 +566,13 @@ enum Command {
         #[arg(long, default_value = "block")]
         mode: String,
 
-        /// Whether push prevention is enabled.
+        /// Whether push prevention is enabled ("true" or "false").
         #[arg(long, default_value = "true")]
-        prevent_push: bool,
+        prevent_push: String,
 
-        /// Whether force push prevention is enabled (when push is allowed).
+        /// Whether force push prevention is enabled ("true" or "false").
         #[arg(long, default_value = "true")]
-        prevent_force_push: bool,
+        prevent_force_push: String,
 
         /// git arguments to evaluate and potentially pass through.
         #[arg(last = true)]
@@ -1280,6 +1280,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     "audit" => config::EnforcementMode::Audit,
                     _ => config::EnforcementMode::Block,
                 };
+                let prevent_push = prevent_push != "false";
+                let prevent_force_push = prevent_force_push != "false";
                 run_git_gate(&real_git, &args, mode, prevent_push, prevent_force_push)
             }
         });
