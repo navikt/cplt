@@ -22,3 +22,4 @@ tests/test_new.py
 .idea
 .cplt-fake-trust-locked-*/
 misc/coding-team/
+GH-CLI-SECURITY-TEST-REPORT.md

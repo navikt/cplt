@@ -152,7 +152,8 @@ gh secret set/delete
 gh variable set/delete
 gh workflow run/enable/disable
 gh run rerun/cancel/delete
-gh auth login/logout/refresh/setup-git/switch/token
+gh auth login/logout/refresh/setup-git/switch
+gh auth token (served from one-time cache — see below)
 gh config set
 gh extension install/remove/upgrade/exec
 gh gist create/edit/delete
@@ -207,10 +208,36 @@ The `gh api` command provides raw API access and requires special treatment:
 
 | Condition | Decision | Reason |
 |-----------|----------|--------|
-| No method flag (implicit GET) | ScopeCheck | Read operations |
-| `-X GET` | ScopeCheck | Explicit read |
+| No method flag (implicit GET) | ScopeCheck | Read operations — must target current repo |
+| `-X GET` | ScopeCheck | Explicit read — must target current repo |
 | `-X POST/PUT/PATCH/DELETE` | Block | Write operations |
 | `-f`, `-F`, or `--input` present | Block | Input implies write |
+| `graphql` endpoint | Block | Arbitrary mutations possible |
+
+### API scope enforcement
+
+GET requests are **repo-scoped** — only endpoints matching `/repos/{current-owner}/{current-repo}/...`
+are allowed. This blocks:
+
+- `/orgs/.../audit-log` — org audit logs (contains employee PII)
+- `/orgs/.../members` — org membership enumeration
+- `/orgs/.../teams` — team structure
+- `/user/repos` — private repos across all orgs
+- `/users/.../repos` — other users' repo lists
+
+Agents that need current-repo data (issues, PRs, actions, commits) work normally.
+If an agent needs org-level access, the human should run those commands outside the sandbox.
+
+### Why `gh api` is stricter than other commands
+
+Higher-level commands like `gh repo view`, `gh repo list`, `gh issue list` are **allowed
+cross-repo** because they:
+- Output curated, read-only data (not raw API responses with PII)
+- Are commonly needed by agents (checking dependencies, understanding upstream issues)
+- Don't expose sensitive org internals (audit logs, SSO identities, member emails)
+
+The raw `gh api` endpoint is restricted because it can access any REST endpoint including
+sensitive org/user data that the higher-level commands don't expose.
 
 ## Error messages
 

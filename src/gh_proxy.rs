@@ -1149,6 +1149,8 @@ fn evaluate_api(cmd: &ParsedCommand) -> PolicyResult {
 /// `current_repo` should be in "owner/name" format.
 /// Returns true if the command targets the current repo (or has no -R flag).
 /// For `gh api` commands, also checks the endpoint URL path for /repos/{owner}/{repo}/.
+/// Non-repo API endpoints (orgs, users) are NOT implicitly allowed — they require
+/// explicit -R or a matching /repos/ path.
 pub fn is_repo_in_scope(cmd: &ParsedCommand, current_repo: &str) -> bool {
     // Check -R/--repo flag first
     if let Some(target) = &cmd.repo_flag {
@@ -1158,15 +1160,21 @@ pub fn is_repo_in_scope(cmd: &ParsedCommand, current_repo: &str) -> bool {
     }
 
     // For gh api: extract repo from endpoint path like /repos/{owner}/{repo}/...
-    if cmd.command == "api"
-        && let Some(ref endpoint) = cmd.api_endpoint
-        && let Some(endpoint_repo) = extract_repo_from_api_path(endpoint)
-    {
-        let current_clean = current_repo.to_lowercase();
-        return endpoint_repo.to_lowercase() == current_clean;
+    if cmd.command == "api" {
+        if let Some(ref endpoint) = cmd.api_endpoint {
+            if let Some(endpoint_repo) = extract_repo_from_api_path(endpoint) {
+                let current_clean = current_repo.to_lowercase();
+                return endpoint_repo.to_lowercase() == current_clean;
+            }
+            // API endpoint exists but doesn't match /repos/{owner}/{repo} pattern
+            // (e.g., /orgs/..., /user/..., /users/...) — not in repo scope.
+            return false;
+        }
+        // No endpoint at all for gh api — shouldn't happen, but deny
+        return false;
     }
 
-    // No -R flag and no repo in URL path — implicitly targets current repo
+    // Non-api commands: no -R flag → implicitly targets current repo
     true
 }
 
@@ -2111,8 +2119,8 @@ mod tests {
     }
 
     #[test]
-    fn api_endpoint_no_repos_prefix_in_scope() {
-        // Endpoints like /user or /orgs/foo don't have repo context — allow
+    fn api_endpoint_no_repos_prefix_out_of_scope() {
+        // Endpoints like /user or /orgs/foo don't have repo context — blocked
         let cmd = ParsedCommand {
             command: "api".to_string(),
             subcommand: None,
@@ -2121,7 +2129,20 @@ mod tests {
             has_input_flags: false,
             api_endpoint: Some("/user".to_string()),
         };
-        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
+    }
+
+    #[test]
+    fn api_endpoint_orgs_out_of_scope() {
+        let cmd = ParsedCommand {
+            command: "api".to_string(),
+            subcommand: None,
+            repo_flag: None,
+            method: None,
+            has_input_flags: false,
+            api_endpoint: Some("/orgs/navikt/members".to_string()),
+        };
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
     }
 
     #[test]

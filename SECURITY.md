@@ -55,6 +55,7 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | **Unreviewed code push** | `git push origin main` | git guard command interception (opt-in) |
 | **Token exfiltration via CLI** | `gh auth token` prints raw token | gh guard serves cached token once at startup, deletes file — subprocesses get nothing |
 | **Cross-repo operations** | `gh pr close -R other-org/other-repo` | gh guard scope checking against current repo |
+| **Org/user data enumeration** | `gh api /orgs/.../audit-log` leaks PII | gh guard restricts API to `/repos/{current-repo}/...` endpoints only |
 | **DNS rebinding SSRF** | Domain resolves to `127.0.0.1` after check | Post-DNS-resolution IP validation; `--allow-private-domain` opt-in bypass for explicitly trusted internal domains |
 | **Sandbox profile injection** | Path with `\n(allow file-read* (subpath "/"))` | SBPL path character validation (macOS) |
 | **Temp file symlink attack** | Symlink at predictable `/tmp/cplt.sb` | Unique filename + `O_CREAT\|O_EXCL` |
@@ -185,7 +186,7 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 
 **`--allow-private-domain` weakens DNS rebinding protection for named domains.** When a domain is listed in `proxy.allow_private_domains` (or `--allow-private-domain`), the proxy skips the post-DNS private IP check for that domain. This is intentional for corporate intranet services (e.g. `intern.nav.no`) that legitimately resolve to RFC 1918 addresses. The accepted risk: if DNS for a listed domain is poisoned or hijacked, a compromised agent could reach arbitrary private hosts on your internal network — not just the intended service. All other proxy checks (port, allowlist, blocklist) still apply. Only list domains you control and whose DNS you trust.
 
-**`~/.config/gh/hosts.yml` is readable.** Copilot spawns `gh auth token` inside the sandbox. This file contains a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable (not the entire `.config/gh` directory). With outbound port 443 allowed, a compromised agent could theoretically exfiltrate this token. However, the token grants access to GitHub — which Copilot is already connected to. Users who want to mitigate this can use `--deny-path ~/.config/gh` (Copilot will fall back to Keychain auth).
+**`~/.config/gh/hosts.yml` is readable.** When gh guard is enabled, Copilot gets its token via a one-time cached file (deleted after first read). When gh guard is disabled, `gh auth token` is available inside the sandbox. This file contains a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable (not the entire `.config/gh` directory). With outbound port 443 allowed, a compromised agent could theoretically exfiltrate this token. However, the token grants access to GitHub — which Copilot is already connected to. Users who want to mitigate this can use `--deny-path ~/.config/gh` (Copilot will fall back to Keychain auth).
 
 *Possible mitigation:* A repo-scoped MCP proxy or fine-grained PAT that limits token scope to the current repository only. See issue #4 for investigation.
 
