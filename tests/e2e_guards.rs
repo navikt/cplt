@@ -325,10 +325,14 @@ fn gh_gate_allows_same_repo_api_endpoint() {
 }
 
 #[test]
-fn gh_gate_allows_non_repo_api_endpoint() {
-    // Endpoints like /user, /notifications don't target a specific repo
-    let (_, _, ok) = gh_gate(&["api", "/user"]);
-    assert!(ok, "non-repo API endpoints should be allowed");
+fn gh_gate_blocks_non_repo_api_endpoint() {
+    // Endpoints like /user, /orgs don't target the current repo — blocked for security
+    let (_, stderr, ok) = gh_gate(&["api", "/user"]);
+    assert!(!ok, "non-repo API endpoints should be blocked");
+    assert!(
+        stderr.contains("BLOCKED") || stderr.contains("blocked"),
+        "should indicate blocked: {stderr}"
+    );
 }
 
 // ============================================================
