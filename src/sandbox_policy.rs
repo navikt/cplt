@@ -578,6 +578,15 @@ pub const APP_DIRS: &[AppDir] = &[
         write: DEFAULT_WRITE_APP_DIRS,
         read: DEFAULT_READ_APP_DIRS,
     },
+    AppDir {
+        qualifier: "",
+        organization: "",
+        application: "kubebuilder-envtest",
+        process_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
+        map_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
+        write: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
+        read: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
+    },
 ];
 
 /// Return the application directory list.
