@@ -809,8 +809,8 @@ else
     echo "RESULT:auth_token:BLOCKED"
 fi
 
-# Try cross-repo (should fail)
-if {bin_dir}/gh pr list -R evil-org/other-repo 2>/dev/null; then
+# Try cross-repo (should fail — pr close is ScopeCheck, not Allow)
+if {bin_dir}/gh pr close 99 -R evil-org/other-repo 2>/dev/null; then
     echo "RESULT:cross_repo:ALLOWED"
 else
     echo "RESULT:cross_repo:BLOCKED"
