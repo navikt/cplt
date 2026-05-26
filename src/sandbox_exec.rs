@@ -158,11 +158,9 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
         return;
     }
 
-    // Skip if any GitHub token is already set in the environment
-    if std::env::var("GH_TOKEN").is_ok()
-        || std::env::var("GITHUB_TOKEN").is_ok()
-        || std::env::var("COPILOT_GITHUB_TOKEN").is_ok()
-    {
+    // Skip if any GitHub token is already set (non-empty) in the environment
+    let has_token = |key| std::env::var(key).is_ok_and(|v| !v.is_empty());
+    if has_token("GH_TOKEN") || has_token("GITHUB_TOKEN") || has_token("COPILOT_GITHUB_TOKEN") {
         return;
     }
 

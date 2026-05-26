@@ -77,6 +77,9 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 5. If allowed, `exec()` replaces the process with the real `gh` (zero overhead)
 6. If blocked, prints an error explaining why and exits non-zero
 
+> **Note:** Wrappers require the scratch directory. If you run with `--no-scratch-dir`,
+> the gh/git guards will be inactive (shown as such in `--doctor` output).
+
 ## Policy tiers
 
 | Tier | Behavior | Examples |

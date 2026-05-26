@@ -364,16 +364,29 @@ fn gh_gate_blocks_api_with_input_flags() {
 // ============================================================
 
 #[test]
-fn gh_gate_blocks_empty_args() {
-    let (_, stderr, ok) = gh_gate(&[]);
-    assert!(!ok, "empty args should be blocked (unparseable)");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+fn gh_gate_allows_empty_args() {
+    // `gh` with no args shows help — harmless, should be allowed
+    let (_, _, ok) = gh_gate(&[]);
+    assert!(ok, "empty args (shows help) should be allowed");
 }
 
 #[test]
-fn gh_gate_blocks_only_flags() {
+fn gh_gate_allows_only_flags() {
+    // `gh --help`, `gh --version` — informational, always allowed
     let (_, _, ok) = gh_gate(&["--verbose", "--help"]);
-    assert!(!ok, "only flags (no command) should be blocked");
+    assert!(ok, "only flags (e.g. --help) should be allowed");
+}
+
+#[test]
+fn gh_gate_allows_help_command() {
+    let (_, _, ok) = gh_gate(&["help"]);
+    assert!(ok, "gh help should be allowed");
+}
+
+#[test]
+fn gh_gate_allows_version_command() {
+    let (_, _, ok) = gh_gate(&["version"]);
+    assert!(ok, "gh version should be allowed");
 }
 
 // -- Input flag bypass via =value form --

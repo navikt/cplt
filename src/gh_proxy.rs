@@ -65,6 +65,19 @@ const ANY: &str = "*";
 /// The compiled policy table. Order does not matter — lookup is by exact match
 /// with wildcard fallback.
 static POLICY: &[PolicyEntry] = &[
+    // ── gh help / version (always allowed) ──
+    PolicyEntry {
+        command: "help",
+        subcommand: ANY,
+        decision: Decision::Allow,
+        reason: "read-only informational",
+    },
+    PolicyEntry {
+        command: "version",
+        subcommand: ANY,
+        decision: Decision::Allow,
+        reason: "read-only informational",
+    },
     // ── gh repo ──
     PolicyEntry {
         command: "repo",
@@ -1324,12 +1337,11 @@ impl Default for GatePolicy {
 /// This is the entry point used by the `gh-gate` subcommand.
 /// Returns `Ok(())` if the command should be allowed, or `Err(message)` if blocked.
 pub fn gate(args: &[&str], project_dir: &Path, policy: &GatePolicy) -> Result<(), String> {
-    let cmd = parse_command(args).ok_or_else(|| {
-        "⚠️ BLOCKED by sandbox: could not parse gh command.\n\
-            This operation is restricted by the cplt sandbox environment.\n\
-            Stop and report this to the human operator."
-            .to_string()
-    })?;
+    let Some(cmd) = parse_command(args) else {
+        // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.
+        // These are read-only informational invocations — always allow.
+        return Ok(());
+    };
 
     // Handle `gh auth token` block (credential exfiltration prevention)
     if policy.block_auth_token
