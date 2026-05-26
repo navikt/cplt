@@ -574,6 +574,10 @@ enum Command {
         #[arg(long, default_value = "true")]
         prevent_force_push: String,
 
+        /// Only block pushes to default branch (main/master). Allows pushes to feature branches.
+        #[arg(long, default_value = "false")]
+        protect_default_branch_only: String,
+
         /// git arguments to evaluate and potentially pass through.
         #[arg(last = true)]
         args: Vec<String>,
@@ -1274,6 +1278,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 mode,
                 prevent_push,
                 prevent_force_push,
+                protect_default_branch_only,
             } => {
                 let mode = match mode.as_str() {
                     "warn" => config::EnforcementMode::Warn,
@@ -1282,7 +1287,15 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 };
                 let prevent_push = prevent_push != "false";
                 let prevent_force_push = prevent_force_push != "false";
-                run_git_gate(&real_git, &args, mode, prevent_push, prevent_force_push)
+                let protect_default_branch_only = protect_default_branch_only != "false";
+                run_git_gate(
+                    &real_git,
+                    &args,
+                    mode,
+                    prevent_push,
+                    prevent_force_push,
+                    protect_default_branch_only,
+                )
             }
         });
     }
@@ -1651,10 +1664,16 @@ fn run_git_gate(
     mode: config::EnforcementMode,
     prevent_push: bool,
     prevent_force_push: bool,
+    protect_default_branch_only: bool,
 ) -> ExitCode {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match gh_proxy::gate_git(&arg_refs, prevent_push, prevent_force_push) {
+    match gh_proxy::gate_git(
+        &arg_refs,
+        prevent_push,
+        prevent_force_push,
+        protect_default_branch_only,
+    ) {
         Ok(()) => {
             use std::os::unix::process::CommandExt;
             let err = std::process::Command::new(real_git).args(args).exec();

@@ -288,6 +288,10 @@ impl Config {
             mode: self.git_guard.mode.unwrap_or(EnforcementMode::Block),
             prevent_push: self.git_guard.prevent_push.unwrap_or(true),
             prevent_force_push: self.git_guard.prevent_force_push.unwrap_or(true),
+            protect_default_branch_only: self
+                .git_guard
+                .protect_default_branch_only
+                .unwrap_or(false),
             allow_push: self
                 .git_guard
                 .allow_push

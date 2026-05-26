@@ -1530,7 +1530,13 @@ const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
 /// Used by the `cplt git-gate` subcommand.
 /// `prevent_push` controls whether push/request-pull/send-pack are blocked.
 /// `prevent_force_push` blocks force push even when regular push is allowed.
-pub fn gate_git(args: &[&str], prevent_push: bool, prevent_force_push: bool) -> Result<(), String> {
+/// `protect_default_branch_only` allows pushes to non-default branches (not main/master).
+pub fn gate_git(
+    args: &[&str],
+    prevent_push: bool,
+    prevent_force_push: bool,
+    protect_default_branch_only: bool,
+) -> Result<(), String> {
     // If push prevention is entirely disabled, allow everything
     if !prevent_push && !prevent_force_push {
         return Ok(());
@@ -1570,6 +1576,22 @@ pub fn gate_git(args: &[&str], prevent_push: bool, prevent_force_push: bool) -> 
     };
 
     if prevent_push && GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
+        // When protect_default_branch_only is set, only block pushes targeting
+        // the default branch (main/master). Feature branch pushes are allowed.
+        if protect_default_branch_only && sub == "push" {
+            let push_args = &args[i + 1..];
+            let target_branch = extract_push_target_branch(push_args);
+            if let Some(branch) = target_branch {
+                if !is_default_branch(branch) {
+                    return Ok(());
+                }
+            } else {
+                // No explicit branch: `git push` pushes current branch.
+                // We can't determine the current branch here (no git access),
+                // so allow it — the agent is likely on a feature branch.
+                return Ok(());
+            }
+        }
         return Err(format!(
             "⚠️ BLOCKED by sandbox: 'git {sub}' is not allowed in this environment.\n\
              Push prevention is enabled — commit your changes locally.\n\
@@ -1611,6 +1633,103 @@ pub fn gate_git(args: &[&str], prevent_push: bool, prevent_force_push: bool) -> 
     Ok(())
 }
 
+/// Default branch names that are protected when `protect_default_branch_only` is active.
+const DEFAULT_BRANCH_NAMES: &[&str] = &["main", "master"];
+
+/// Check if a branch name is a default branch (main/master).
+fn is_default_branch(branch: &str) -> bool {
+    // Strip remote prefix if present (e.g., "origin/main" → "main")
+    let short = branch.rsplit('/').next().unwrap_or(branch);
+    DEFAULT_BRANCH_NAMES.contains(&short)
+}
+
+/// Extract the target branch from `git push` arguments.
+///
+/// Parses refspecs like `origin feature-branch`, `origin HEAD:refs/heads/feature`,
+/// or just `feature-branch`. Returns None if no explicit branch target found.
+fn extract_push_target_branch<'a>(push_args: &[&'a str]) -> Option<&'a str> {
+    // Push flags that consume a value
+    const PUSH_FLAGS_WITH_VALUE: &[&str] = &[
+        "--repo",
+        "--receive-pack",
+        "--exec",
+        "-o",
+        "--push-option",
+        "--signed",
+        "--force-with-lease",
+    ];
+
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < push_args.len() {
+        let arg = push_args[i];
+        if arg == "--" {
+            // Everything after -- is positional
+            positionals.extend_from_slice(&push_args[i + 1..]);
+            break;
+        }
+        if arg.contains('=') && arg.starts_with('-') {
+            // --flag=value, skip
+            i += 1;
+            continue;
+        }
+        if PUSH_FLAGS_WITH_VALUE.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        positionals.push(arg);
+        i += 1;
+    }
+
+    // `git push [remote] [refspec...]`
+    // positionals[0] is usually the remote, positionals[1+] are refspecs
+    match positionals.len() {
+        0 => None, // `git push` — pushes current branch
+        1 => {
+            // Could be remote OR refspec. If it looks like a remote name, no branch specified.
+            // Common remotes: origin, upstream, fork, etc.
+            // If it contains a colon, it's a refspec like "HEAD:refs/heads/branch"
+            let arg = positionals[0];
+            if let Some(dst) = extract_branch_from_refspec(arg) {
+                Some(dst)
+            } else {
+                None // Just a remote name, no explicit branch
+            }
+        }
+        _ => {
+            // positionals[0] = remote, positionals[1] = first refspec
+            let refspec = positionals[1];
+            if let Some(dst) = extract_branch_from_refspec(refspec) {
+                Some(dst)
+            } else {
+                // Plain branch name like "feature-branch"
+                Some(refspec)
+            }
+        }
+    }
+}
+
+/// Parse a git refspec and extract the destination branch.
+///
+/// Refspecs: `src:dst`, `HEAD:refs/heads/branch`, or just a branch name.
+/// Returns the destination part (after `:`) or None if no colon.
+fn extract_branch_from_refspec(refspec: &str) -> Option<&str> {
+    if let Some((_src, dst)) = refspec.split_once(':') {
+        // Strip refs/heads/ prefix if present
+        let branch = dst
+            .strip_prefix("refs/heads/")
+            .or_else(|| dst.strip_prefix("refs/for/"))
+            .unwrap_or(dst);
+        Some(branch)
+    } else {
+        None
+    }
+}
+
 /// Generate the git wrapper script content.
 ///
 /// Like the gh wrapper, this intercepts git invocations and blocks push operations.
@@ -1636,12 +1755,17 @@ pub fn generate_git_wrapper_script(
     } else {
         "--prevent-force-push=false"
     };
+    let protect_default_flag = if policy.protect_default_branch_only {
+        "--protect-default-branch-only=true"
+    } else {
+        "--protect-default-branch-only=false"
+    };
     format!(
         r#"#!/bin/sh
 # cplt git proxy — blocks git push in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_flag} {prevent_force_push_flag} -- "$@"
+exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_flag} {prevent_force_push_flag} {protect_default_flag} -- "$@"
 "#
     )
 }
@@ -2115,63 +2239,63 @@ mod tests {
 
     #[test]
     fn git_push_is_blocked() {
-        assert!(gate_git(&["push"], true, true).is_err());
-        assert!(gate_git(&["push", "origin", "main"], true, true).is_err());
-        assert!(gate_git(&["push", "--force"], true, true).is_err());
-        assert!(gate_git(&["-c", "user.name=x", "push"], true, true).is_err());
+        assert!(gate_git(&["push"], true, true, false).is_err());
+        assert!(gate_git(&["push", "origin", "main"], true, true, false).is_err());
+        assert!(gate_git(&["push", "--force"], true, true, false).is_err());
+        assert!(gate_git(&["-c", "user.name=x", "push"], true, true, false).is_err());
     }
 
     #[test]
     fn git_request_pull_is_blocked() {
-        assert!(gate_git(&["request-pull", "v1.0", "origin"], true, true).is_err());
+        assert!(gate_git(&["request-pull", "v1.0", "origin"], true, true, false).is_err());
     }
 
     #[test]
     fn git_read_operations_allowed() {
-        assert!(gate_git(&["status"], true, true).is_ok());
-        assert!(gate_git(&["log", "--oneline"], true, true).is_ok());
-        assert!(gate_git(&["diff", "HEAD~1"], true, true).is_ok());
-        assert!(gate_git(&["fetch", "origin"], true, true).is_ok());
-        assert!(gate_git(&["pull"], true, true).is_ok());
-        assert!(gate_git(&["branch", "-a"], true, true).is_ok());
+        assert!(gate_git(&["status"], true, true, false).is_ok());
+        assert!(gate_git(&["log", "--oneline"], true, true, false).is_ok());
+        assert!(gate_git(&["diff", "HEAD~1"], true, true, false).is_ok());
+        assert!(gate_git(&["fetch", "origin"], true, true, false).is_ok());
+        assert!(gate_git(&["pull"], true, true, false).is_ok());
+        assert!(gate_git(&["branch", "-a"], true, true, false).is_ok());
     }
 
     #[test]
     fn git_local_writes_allowed() {
-        assert!(gate_git(&["commit", "-m", "fix"], true, true).is_ok());
-        assert!(gate_git(&["add", "."], true, true).is_ok());
-        assert!(gate_git(&["checkout", "-b", "feature"], true, true).is_ok());
-        assert!(gate_git(&["merge", "main"], true, true).is_ok());
-        assert!(gate_git(&["rebase", "main"], true, true).is_ok());
-        assert!(gate_git(&["stash"], true, true).is_ok());
-        assert!(gate_git(&["tag", "v1.0"], true, true).is_ok());
+        assert!(gate_git(&["commit", "-m", "fix"], true, true, false).is_ok());
+        assert!(gate_git(&["add", "."], true, true, false).is_ok());
+        assert!(gate_git(&["checkout", "-b", "feature"], true, true, false).is_ok());
+        assert!(gate_git(&["merge", "main"], true, true, false).is_ok());
+        assert!(gate_git(&["rebase", "main"], true, true, false).is_ok());
+        assert!(gate_git(&["stash"], true, true, false).is_ok());
+        assert!(gate_git(&["tag", "v1.0"], true, true, false).is_ok());
     }
 
     #[test]
     fn git_no_subcommand_allowed() {
-        assert!(gate_git(&["--version"], true, true).is_ok());
-        assert!(gate_git(&[], true, true).is_ok());
+        assert!(gate_git(&["--version"], true, true, false).is_ok());
+        assert!(gate_git(&[], true, true, false).is_ok());
     }
 
     #[test]
     fn git_unknown_subcommand_allowed() {
         // Unknown git commands default to allow (unlike gh which defaults to block)
-        assert!(gate_git(&["some-custom-alias"], true, true).is_ok());
+        assert!(gate_git(&["some-custom-alias"], true, true, false).is_ok());
     }
 
     #[test]
     fn git_push_allowed_when_prevention_disabled() {
-        assert!(gate_git(&["push"], false, false).is_ok());
-        assert!(gate_git(&["push", "--force"], false, false).is_ok());
-        assert!(gate_git(&["send-pack", "origin"], false, false).is_ok());
+        assert!(gate_git(&["push"], false, false, false).is_ok());
+        assert!(gate_git(&["push", "--force"], false, false, false).is_ok());
+        assert!(gate_git(&["send-pack", "origin"], false, false, false).is_ok());
     }
 
     #[test]
     fn git_force_push_blocked_when_only_force_prevention() {
         // Regular push allowed, force push blocked
-        assert!(gate_git(&["push", "origin", "main"], false, true).is_ok());
-        assert!(gate_git(&["push", "--force"], false, true).is_err());
-        assert!(gate_git(&["push", "--force-with-lease"], false, true).is_err());
+        assert!(gate_git(&["push", "origin", "main"], false, true, false).is_ok());
+        assert!(gate_git(&["push", "--force"], false, true, false).is_err());
+        assert!(gate_git(&["push", "--force-with-lease"], false, true, false).is_err());
     }
 
     #[test]
@@ -2240,7 +2364,89 @@ mod tests {
 
     #[test]
     fn git_gate_blocks_send_pack() {
-        let result = gate_git(&["send-pack", "origin", "main"], true, true);
+        let result = gate_git(&["send-pack", "origin", "main"], true, true, false);
         assert!(result.is_err());
+    }
+
+    // ── protect_default_branch_only tests ──
+
+    #[test]
+    fn protect_default_allows_feature_branch() {
+        assert!(gate_git(&["push", "origin", "feature/x"], true, true, true).is_ok());
+        assert!(gate_git(&["push", "origin", "copilot/fix"], true, true, true).is_ok());
+        assert!(gate_git(&["push", "origin", "dev"], true, true, true).is_ok());
+    }
+
+    #[test]
+    fn protect_default_blocks_main() {
+        assert!(gate_git(&["push", "origin", "main"], true, true, true).is_err());
+        assert!(gate_git(&["push", "origin", "master"], true, true, true).is_err());
+    }
+
+    #[test]
+    fn protect_default_blocks_refspec_to_main() {
+        assert!(
+            gate_git(
+                &["push", "origin", "HEAD:refs/heads/main"],
+                true,
+                true,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &["push", "origin", "abc123:refs/heads/master"],
+                true,
+                true,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn protect_default_allows_refspec_to_feature() {
+        assert!(
+            gate_git(
+                &["push", "origin", "HEAD:refs/heads/feature/x"],
+                true,
+                true,
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn protect_default_allows_bare_push() {
+        // No explicit branch = current branch (likely feature)
+        assert!(gate_git(&["push"], true, true, true).is_ok());
+        assert!(gate_git(&["push", "origin"], true, true, true).is_ok());
+    }
+
+    #[test]
+    fn is_default_branch_recognizes_main_master() {
+        assert!(is_default_branch("main"));
+        assert!(is_default_branch("master"));
+        assert!(is_default_branch("origin/main"));
+        assert!(is_default_branch("origin/master"));
+        assert!(!is_default_branch("feature/main-fix"));
+        assert!(!is_default_branch("develop"));
+        assert!(!is_default_branch("copilot/fix"));
+    }
+
+    #[test]
+    fn extract_push_target_handles_refspecs() {
+        assert_eq!(
+            extract_push_target_branch(&["origin", "feature"]),
+            Some("feature")
+        );
+        assert_eq!(
+            extract_push_target_branch(&["origin", "HEAD:refs/heads/main"]),
+            Some("main")
+        );
+        assert_eq!(extract_push_target_branch(&["origin"]), None);
+        assert_eq!(extract_push_target_branch(&[]), None);
     }
 }

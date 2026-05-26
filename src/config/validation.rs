@@ -50,6 +50,7 @@ const VALID_GIT_GUARD_KEYS: &[&str] = &[
     "mode",
     "prevent_push",
     "prevent_force_push",
+    "protect_default_branch_only",
     "allow_push",
 ];
 const VALID_AUDIT_KEYS: &[&str] = &["enabled", "destination", "level", "format"];

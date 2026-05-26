@@ -174,6 +174,9 @@ pub struct GitGuardConfig {
     /// Only meaningful when prevent_push is false — blocks destructive pushes
     /// while allowing regular pushes.
     pub prevent_force_push: Option<bool>,
+    /// Only protect default branch (main/master). Allows pushes to feature branches.
+    /// When true, `prevent_push` only blocks pushes targeting main/master.
+    pub protect_default_branch_only: Option<bool>,
     /// Structured push exceptions. Each entry specifies conditions under which
     /// push is allowed despite prevent_push being enabled.
     pub allow_push: Vec<GitPushRule>,
@@ -347,6 +350,7 @@ pub struct GitGuardPolicy {
     pub mode: EnforcementMode,
     pub prevent_push: bool,
     pub prevent_force_push: bool,
+    pub protect_default_branch_only: bool,
     pub allow_push: Vec<ResolvedPushRule>,
 }
 
@@ -357,6 +361,7 @@ impl Default for GitGuardPolicy {
             mode: EnforcementMode::Block,
             prevent_push: true,
             prevent_force_push: true,
+            protect_default_branch_only: false,
             allow_push: Vec::new(),
         }
     }

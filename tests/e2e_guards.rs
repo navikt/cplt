@@ -57,6 +57,28 @@ fn git_gate(args: &[&str], prevent_push: bool, prevent_force_push: bool) -> (Str
     git_gate_with_mode(args, prevent_push, prevent_force_push, "block")
 }
 
+/// Run `cplt git-gate` with protect-default-branch-only mode.
+fn git_gate_protect_default(args: &[&str]) -> (String, String, bool) {
+    let mut cmd = Command::new(binary_path());
+    cmd.arg("git-gate")
+        .arg("--real-git")
+        .arg("/usr/bin/true")
+        .arg("--mode=block")
+        .arg("--prevent-push=true")
+        .arg("--prevent-force-push=true")
+        .arg("--protect-default-branch-only=true")
+        .arg("--")
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+
+    let output = cmd.output().expect("cplt git-gate should run");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
 /// Run `cplt git-gate` with given policy and mode.
 fn git_gate_with_mode(
     args: &[&str],
@@ -697,6 +719,69 @@ fn git_gate_blocks_force_if_includes_equals_ref() {
         !ok,
         "--force-if-includes=<ref> must be detected as force push"
     );
+}
+
+// ============================================================
+// git-gate: protect-default-branch-only mode
+// ============================================================
+
+#[test]
+fn git_gate_protect_default_blocks_push_to_main() {
+    let (_, stderr, ok) = git_gate_protect_default(&["push", "origin", "main"]);
+    assert!(!ok, "push to main should be blocked");
+    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+}
+
+#[test]
+fn git_gate_protect_default_blocks_push_to_master() {
+    let (_, stderr, ok) = git_gate_protect_default(&["push", "origin", "master"]);
+    assert!(!ok, "push to master should be blocked");
+    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+}
+
+#[test]
+fn git_gate_protect_default_allows_push_to_feature_branch() {
+    let (_, _, ok) = git_gate_protect_default(&["push", "origin", "feature/my-work"]);
+    assert!(ok, "push to feature branch should be allowed");
+}
+
+#[test]
+fn git_gate_protect_default_allows_push_to_copilot_branch() {
+    let (_, _, ok) = git_gate_protect_default(&["push", "origin", "copilot/fix-123"]);
+    assert!(ok, "push to copilot branch should be allowed");
+}
+
+#[test]
+fn git_gate_protect_default_allows_bare_push() {
+    // `git push` with no args pushes current branch — likely a feature branch
+    let (_, _, ok) = git_gate_protect_default(&["push"]);
+    assert!(ok, "bare git push should be allowed (current branch)");
+}
+
+#[test]
+fn git_gate_protect_default_allows_push_with_remote_only() {
+    // `git push origin` — pushes current branch to remote
+    let (_, _, ok) = git_gate_protect_default(&["push", "origin"]);
+    assert!(ok, "push with only remote should be allowed");
+}
+
+#[test]
+fn git_gate_protect_default_blocks_refspec_to_main() {
+    let (_, _, ok) = git_gate_protect_default(&["push", "origin", "HEAD:refs/heads/main"]);
+    assert!(!ok, "push with refspec targeting main should be blocked");
+}
+
+#[test]
+fn git_gate_protect_default_allows_refspec_to_feature() {
+    let (_, _, ok) =
+        git_gate_protect_default(&["push", "origin", "HEAD:refs/heads/feature/branch"]);
+    assert!(ok, "push with refspec targeting feature should be allowed");
+}
+
+#[test]
+fn git_gate_protect_default_blocks_origin_slash_main() {
+    let (_, _, ok) = git_gate_protect_default(&["push", "origin", "origin/main"]);
+    assert!(!ok, "push to origin/main should be blocked");
 }
 
 // ============================================================

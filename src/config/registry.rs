@@ -375,6 +375,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "git_guard",
+        key: "protect_default_branch_only",
+        value_type: ConfigValueType::Bool,
+        dangerous: true,
+        default_display: "false",
+        description: "Only block pushes to default branch (main/master). Allows feature branch pushes.",
+    },
+    ConfigKeyInfo {
+        section: "git_guard",
         key: "allow_push",
         value_type: ConfigValueType::ArrayOfTables,
         dangerous: true,
