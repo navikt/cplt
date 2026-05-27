@@ -587,6 +587,15 @@ pub const APP_DIRS: &[AppDir] = &[
         write: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
         read: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
     },
+    AppDir {
+        qualifier: "",
+        organization: "",
+        application: "uv",
+        process_exec: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
+        map_exec: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
+        write: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
+        read: &[AppDirKind::Cache, AppDirKind::Data, AppDirKind::DataLocal],
+    },
 ];
 
 /// Return the application directory list.
