@@ -34,7 +34,6 @@ pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
         ("sandbox", "allow_browser") => Some(RepoKeyTarget::ProposeBool),
         ("sandbox", "allow_env_files") => Some(RepoKeyTarget::ProposeBool),
         ("sandbox", "gh_proxy") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "gh_guard") => Some(RepoKeyTarget::ProposeBool),
         ("sandbox", "git_push_prevention") => Some(RepoKeyTarget::ProposeBool),
         // Propose arrays
         ("allow", "read") => Some(RepoKeyTarget::ProposeAllow("read")),

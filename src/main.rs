@@ -578,6 +578,10 @@ enum Command {
         #[arg(long, default_value = "false")]
         protect_default_branch_only: String,
 
+        /// JSON-encoded allow_push rules (structured push exceptions).
+        #[arg(long, default_value = "")]
+        allow_push_rules: String,
+
         /// git arguments to evaluate and potentially pass through.
         #[arg(last = true)]
         args: Vec<String>,
@@ -1279,6 +1283,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 prevent_push,
                 prevent_force_push,
                 protect_default_branch_only,
+                allow_push_rules,
             } => {
                 let mode = match mode.as_str() {
                     "warn" => config::EnforcementMode::Warn,
@@ -1288,6 +1293,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 let prevent_push = prevent_push != "false";
                 let prevent_force_push = prevent_force_push != "false";
                 let protect_default_branch_only = protect_default_branch_only != "false";
+                let rules = parse_allow_push_rules(&allow_push_rules);
                 run_git_gate(
                     &real_git,
                     &args,
@@ -1295,6 +1301,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     prevent_push,
                     prevent_force_push,
                     protect_default_branch_only,
+                    &rules,
                 )
             }
         });
@@ -1706,6 +1713,15 @@ fn serve_cached_gh_token() -> ExitCode {
     }
 }
 
+/// Parse JSON-encoded allow_push rules from the CLI flag.
+fn parse_allow_push_rules(json: &str) -> Vec<config::ResolvedPushRule> {
+    if json.is_empty() {
+        return Vec::new();
+    }
+    // Simple JSON array format: [{"remote":"fork","branches":["agent/*"],"force":false}]
+    serde_json::from_str(json).unwrap_or_default()
+}
+
 /// Handle `cplt git-gate` — evaluate a git command and exec the real binary if allowed.
 fn run_git_gate(
     real_git: &Path,
@@ -1714,6 +1730,7 @@ fn run_git_gate(
     prevent_push: bool,
     prevent_force_push: bool,
     protect_default_branch_only: bool,
+    allow_push_rules: &[config::ResolvedPushRule],
 ) -> ExitCode {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
@@ -1722,6 +1739,8 @@ fn run_git_gate(
         prevent_push,
         prevent_force_push,
         protect_default_branch_only,
+        allow_push_rules,
+        Some(real_git),
     ) {
         Ok(()) => {
             use std::os::unix::process::CommandExt;

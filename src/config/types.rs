@@ -70,7 +70,7 @@ pub enum EnforcementMode {
     /// Warn: prints a warning to stderr but allows the command through.
     /// Use during initial adoption to discover what would break.
     Warn,
-    /// Audit: silently logs the decision without any user-visible output.
+    /// Audit: allows the command through but logs the decision to stderr.
     /// Use in CI or when collecting telemetry before enabling enforcement.
     Audit,
 }
@@ -368,7 +368,7 @@ impl Default for GitGuardPolicy {
 }
 
 /// Resolved push rule (validated at config load time).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedPushRule {
     pub remote: Option<String>,
     pub branches: Vec<String>,

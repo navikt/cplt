@@ -1565,6 +1565,8 @@ pub fn gate_git(
     prevent_push: bool,
     prevent_force_push: bool,
     protect_default_branch_only: bool,
+    allow_push_rules: &[crate::config::ResolvedPushRule],
+    real_git: Option<&Path>,
 ) -> Result<(), String> {
     // If push prevention is entirely disabled, allow everything
     if !prevent_push && !prevent_force_push {
@@ -1616,11 +1618,40 @@ pub fn gate_git(
                 }
             } else {
                 // No explicit branch: `git push` pushes current branch.
-                // We can't determine the current branch here (no git access),
-                // so allow it — the agent is likely on a feature branch.
+                // Resolve via real git to determine if we're on a protected branch.
+                let current_branch = real_git.and_then(resolve_current_branch);
+                match current_branch {
+                    Some(ref b) if !is_default_branch(b) => return Ok(()),
+                    Some(_) => {
+                        // On default branch — fall through to block
+                    }
+                    None => {
+                        // Can't determine branch — fail closed for safety
+                    }
+                }
+            }
+        }
+
+        // Check allow_push exception rules before blocking
+        if sub == "push" && !allow_push_rules.is_empty() {
+            let push_args = &args[i + 1..];
+            let has_force = push_args.iter().any(|a| {
+                *a == "--force"
+                    || *a == "-f"
+                    || a.starts_with("--force-with-lease")
+                    || a.starts_with("--force-if-includes")
+            });
+            let (remote, branch) = extract_push_remote_and_branch(push_args, real_git);
+            if matches_allow_push_rule(
+                allow_push_rules,
+                remote.as_deref(),
+                branch.as_deref(),
+                has_force,
+            ) {
                 return Ok(());
             }
         }
+
         return Err(format!(
             "⚠️ BLOCKED by sandbox: 'git {sub}' is not allowed in this environment.\n\
              Push prevention is enabled — commit your changes locally.\n\
@@ -1759,6 +1790,128 @@ fn extract_branch_from_refspec(refspec: &str) -> Option<&str> {
     }
 }
 
+/// Resolve the current git branch by calling the real git binary.
+fn resolve_current_branch(real_git: &Path) -> Option<String> {
+    let output = std::process::Command::new(real_git)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if branch.is_empty() {
+            None
+        } else {
+            Some(branch)
+        }
+    } else {
+        None
+    }
+}
+
+/// Extract the remote and branch from `git push` arguments.
+/// Returns (remote, branch) — either may be None.
+fn extract_push_remote_and_branch(
+    push_args: &[&str],
+    real_git: Option<&Path>,
+) -> (Option<String>, Option<String>) {
+    let target = extract_push_target_branch(push_args);
+    let branch = match target {
+        Some(b) => Some(b.to_string()),
+        None => real_git.and_then(resolve_current_branch),
+    };
+
+    // Extract remote (first positional that's not a refspec)
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < push_args.len() {
+        let arg = push_args[i];
+        if arg == "--" {
+            break;
+        }
+        if arg.starts_with('-') {
+            // Skip flags with values
+            if arg.contains('=')
+                || ![
+                    "--repo",
+                    "--receive-pack",
+                    "--exec",
+                    "-o",
+                    "--push-option",
+                    "--signed",
+                    "--force-with-lease",
+                ]
+                .contains(&arg)
+            {
+                i += 1;
+            } else {
+                i += 2;
+            }
+            continue;
+        }
+        positionals.push(arg);
+        i += 1;
+    }
+    let remote = positionals.first().map(ToString::to_string);
+
+    (remote, branch)
+}
+
+/// Check if a push matches any allow_push exception rule.
+/// All specified fields in a rule must match (AND logic).
+fn matches_allow_push_rule(
+    rules: &[crate::config::ResolvedPushRule],
+    remote: Option<&str>,
+    branch: Option<&str>,
+    is_force: bool,
+) -> bool {
+    for rule in rules {
+        // If force push and rule doesn't allow force, skip
+        if is_force && !rule.force {
+            continue;
+        }
+        // Check remote constraint
+        if let Some(ref rule_remote) = rule.remote {
+            match remote {
+                Some(r) if r == rule_remote => {}
+                _ => continue,
+            }
+        }
+        // Check branch constraints (glob patterns)
+        if !rule.branches.is_empty() {
+            match branch {
+                Some(b) => {
+                    let matches = rule.branches.iter().any(|pattern| glob_match(pattern, b));
+                    if !matches {
+                        continue;
+                    }
+                }
+                None => continue, // Can't verify branch — don't match
+            }
+        }
+        // All constraints matched
+        return true;
+    }
+    false
+}
+
+/// Simple glob matching for branch patterns.
+/// Supports `*` (any chars within segment) and `**` or trailing `*` for multi-segment.
+fn glob_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" || pattern == "**" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        // e.g. "agent/*" matches "agent/fix-123"
+        value.starts_with(prefix) && value.len() > prefix.len() + 1
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        // e.g. "copilot-*" matches "copilot-fix-123"
+        value.starts_with(prefix)
+    } else {
+        // Exact match
+        pattern == value
+    }
+}
+
 /// Generate the git wrapper script content.
 ///
 /// Like the gh wrapper, this intercepts git invocations and blocks push operations.
@@ -1789,12 +1942,18 @@ pub fn generate_git_wrapper_script(
     } else {
         "--protect-default-branch-only=false"
     };
+    let allow_push_flag = if policy.allow_push.is_empty() {
+        String::new()
+    } else {
+        let json = serde_json::to_string(&policy.allow_push).unwrap_or_default();
+        format!(" --allow-push-rules='{}'", json.replace('\'', "'\\''"))
+    };
     format!(
         r#"#!/bin/sh
 # cplt git proxy — blocks git push in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_flag} {prevent_force_push_flag} {protect_default_flag} -- "$@"
+exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_flag} {prevent_force_push_flag} {protect_default_flag}{allow_push_flag} -- "$@"
 "#
     )
 }
@@ -2308,63 +2467,83 @@ mod tests {
 
     #[test]
     fn git_push_is_blocked() {
-        assert!(gate_git(&["push"], true, true, false).is_err());
-        assert!(gate_git(&["push", "origin", "main"], true, true, false).is_err());
-        assert!(gate_git(&["push", "--force"], true, true, false).is_err());
-        assert!(gate_git(&["-c", "user.name=x", "push"], true, true, false).is_err());
+        assert!(gate_git(&["push"], true, true, false, &[], None).is_err());
+        assert!(gate_git(&["push", "origin", "main"], true, true, false, &[], None).is_err());
+        assert!(gate_git(&["push", "--force"], true, true, false, &[], None).is_err());
+        assert!(gate_git(&["-c", "user.name=x", "push"], true, true, false, &[], None).is_err());
     }
 
     #[test]
     fn git_request_pull_is_blocked() {
-        assert!(gate_git(&["request-pull", "v1.0", "origin"], true, true, false).is_err());
+        assert!(
+            gate_git(
+                &["request-pull", "v1.0", "origin"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn git_read_operations_allowed() {
-        assert!(gate_git(&["status"], true, true, false).is_ok());
-        assert!(gate_git(&["log", "--oneline"], true, true, false).is_ok());
-        assert!(gate_git(&["diff", "HEAD~1"], true, true, false).is_ok());
-        assert!(gate_git(&["fetch", "origin"], true, true, false).is_ok());
-        assert!(gate_git(&["pull"], true, true, false).is_ok());
-        assert!(gate_git(&["branch", "-a"], true, true, false).is_ok());
+        assert!(gate_git(&["status"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["log", "--oneline"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["diff", "HEAD~1"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["fetch", "origin"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["pull"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["branch", "-a"], true, true, false, &[], None).is_ok());
     }
 
     #[test]
     fn git_local_writes_allowed() {
-        assert!(gate_git(&["commit", "-m", "fix"], true, true, false).is_ok());
-        assert!(gate_git(&["add", "."], true, true, false).is_ok());
-        assert!(gate_git(&["checkout", "-b", "feature"], true, true, false).is_ok());
-        assert!(gate_git(&["merge", "main"], true, true, false).is_ok());
-        assert!(gate_git(&["rebase", "main"], true, true, false).is_ok());
-        assert!(gate_git(&["stash"], true, true, false).is_ok());
-        assert!(gate_git(&["tag", "v1.0"], true, true, false).is_ok());
+        assert!(gate_git(&["commit", "-m", "fix"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["add", "."], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["checkout", "-b", "feature"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["merge", "main"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["rebase", "main"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["stash"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["tag", "v1.0"], true, true, false, &[], None).is_ok());
     }
 
     #[test]
     fn git_no_subcommand_allowed() {
-        assert!(gate_git(&["--version"], true, true, false).is_ok());
-        assert!(gate_git(&[], true, true, false).is_ok());
+        assert!(gate_git(&["--version"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&[], true, true, false, &[], None).is_ok());
     }
 
     #[test]
     fn git_unknown_subcommand_allowed() {
         // Unknown git commands default to allow (unlike gh which defaults to block)
-        assert!(gate_git(&["some-custom-alias"], true, true, false).is_ok());
+        assert!(gate_git(&["some-custom-alias"], true, true, false, &[], None).is_ok());
     }
 
     #[test]
     fn git_push_allowed_when_prevention_disabled() {
-        assert!(gate_git(&["push"], false, false, false).is_ok());
-        assert!(gate_git(&["push", "--force"], false, false, false).is_ok());
-        assert!(gate_git(&["send-pack", "origin"], false, false, false).is_ok());
+        assert!(gate_git(&["push"], false, false, false, &[], None).is_ok());
+        assert!(gate_git(&["push", "--force"], false, false, false, &[], None).is_ok());
+        assert!(gate_git(&["send-pack", "origin"], false, false, false, &[], None).is_ok());
     }
 
     #[test]
     fn git_force_push_blocked_when_only_force_prevention() {
         // Regular push allowed, force push blocked
-        assert!(gate_git(&["push", "origin", "main"], false, true, false).is_ok());
-        assert!(gate_git(&["push", "--force"], false, true, false).is_err());
-        assert!(gate_git(&["push", "--force-with-lease"], false, true, false).is_err());
+        assert!(gate_git(&["push", "origin", "main"], false, true, false, &[], None).is_ok());
+        assert!(gate_git(&["push", "--force"], false, true, false, &[], None).is_err());
+        assert!(
+            gate_git(
+                &["push", "--force-with-lease"],
+                false,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2433,7 +2612,14 @@ mod tests {
 
     #[test]
     fn git_gate_blocks_send_pack() {
-        let result = gate_git(&["send-pack", "origin", "main"], true, true, false);
+        let result = gate_git(
+            &["send-pack", "origin", "main"],
+            true,
+            true,
+            false,
+            &[],
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -2441,15 +2627,35 @@ mod tests {
 
     #[test]
     fn protect_default_allows_feature_branch() {
-        assert!(gate_git(&["push", "origin", "feature/x"], true, true, true).is_ok());
-        assert!(gate_git(&["push", "origin", "copilot/fix"], true, true, true).is_ok());
-        assert!(gate_git(&["push", "origin", "dev"], true, true, true).is_ok());
+        assert!(
+            gate_git(
+                &["push", "origin", "feature/x"],
+                true,
+                true,
+                true,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["push", "origin", "copilot/fix"],
+                true,
+                true,
+                true,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        assert!(gate_git(&["push", "origin", "dev"], true, true, true, &[], None).is_ok());
     }
 
     #[test]
     fn protect_default_blocks_main() {
-        assert!(gate_git(&["push", "origin", "main"], true, true, true).is_err());
-        assert!(gate_git(&["push", "origin", "master"], true, true, true).is_err());
+        assert!(gate_git(&["push", "origin", "main"], true, true, true, &[], None).is_err());
+        assert!(gate_git(&["push", "origin", "master"], true, true, true, &[], None).is_err());
     }
 
     #[test]
@@ -2459,7 +2665,9 @@ mod tests {
                 &["push", "origin", "HEAD:refs/heads/main"],
                 true,
                 true,
-                true
+                true,
+                &[],
+                None
             )
             .is_err()
         );
@@ -2468,7 +2676,9 @@ mod tests {
                 &["push", "origin", "abc123:refs/heads/master"],
                 true,
                 true,
-                true
+                true,
+                &[],
+                None
             )
             .is_err()
         );
@@ -2481,17 +2691,19 @@ mod tests {
                 &["push", "origin", "HEAD:refs/heads/feature/x"],
                 true,
                 true,
-                true
+                true,
+                &[],
+                None
             )
             .is_ok()
         );
     }
 
     #[test]
-    fn protect_default_allows_bare_push() {
-        // No explicit branch = current branch (likely feature)
-        assert!(gate_git(&["push"], true, true, true).is_ok());
-        assert!(gate_git(&["push", "origin"], true, true, true).is_ok());
+    fn protect_default_blocks_bare_push_without_git() {
+        // When real_git is None (can't resolve branch), fail closed for safety
+        assert!(gate_git(&["push"], true, true, true, &[], None).is_err());
+        assert!(gate_git(&["push", "origin"], true, true, true, &[], None).is_err());
     }
 
     #[test]
@@ -2517,5 +2729,112 @@ mod tests {
         );
         assert_eq!(extract_push_target_branch(&["origin"]), None);
         assert_eq!(extract_push_target_branch(&[]), None);
+    }
+
+    #[test]
+    fn glob_match_patterns() {
+        assert!(glob_match("agent/*", "agent/fix-123"));
+        assert!(glob_match("copilot-*", "copilot-fix-123"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("**", "any/nested/path"));
+        assert!(glob_match("feature", "feature"));
+        assert!(!glob_match("agent/*", "other/fix"));
+        assert!(!glob_match("feature", "feature2"));
+    }
+
+    #[test]
+    fn allow_push_rule_matches() {
+        use crate::config::ResolvedPushRule;
+
+        let rules = vec![ResolvedPushRule {
+            remote: Some("fork".to_string()),
+            branches: vec!["agent/*".to_string()],
+            force: false,
+        }];
+
+        // Matches: correct remote + matching branch
+        assert!(matches_allow_push_rule(
+            &rules,
+            Some("fork"),
+            Some("agent/fix-123"),
+            false
+        ));
+        // Doesn't match: wrong remote
+        assert!(!matches_allow_push_rule(
+            &rules,
+            Some("origin"),
+            Some("agent/fix-123"),
+            false
+        ));
+        // Doesn't match: wrong branch
+        assert!(!matches_allow_push_rule(
+            &rules,
+            Some("fork"),
+            Some("main"),
+            false
+        ));
+        // Doesn't match: force push not allowed
+        assert!(!matches_allow_push_rule(
+            &rules,
+            Some("fork"),
+            Some("agent/fix"),
+            true
+        ));
+
+        // Rule with force=true
+        let rules_force = vec![ResolvedPushRule {
+            remote: None,
+            branches: vec!["agent/*".to_string()],
+            force: true,
+        }];
+        assert!(matches_allow_push_rule(
+            &rules_force,
+            Some("origin"),
+            Some("agent/x"),
+            true
+        ));
+        assert!(matches_allow_push_rule(
+            &rules_force,
+            Some("origin"),
+            Some("agent/x"),
+            false
+        ));
+    }
+
+    #[test]
+    fn allow_push_rule_in_gate_git() {
+        use crate::config::ResolvedPushRule;
+
+        let rules = vec![ResolvedPushRule {
+            remote: Some("fork".to_string()),
+            branches: vec!["agent/*".to_string()],
+            force: false,
+        }];
+
+        // Push to fork agent/fix should be allowed despite prevent_push=true
+        assert!(
+            gate_git(
+                &["push", "fork", "agent/fix-123"],
+                true,
+                true,
+                false,
+                &rules,
+                None
+            )
+            .is_ok()
+        );
+
+        // Push to origin agent/fix should still be blocked (wrong remote)
+        assert!(
+            gate_git(
+                &["push", "origin", "agent/fix-123"],
+                true,
+                true,
+                false,
+                &rules,
+                None
+            )
+            .is_err()
+        );
     }
 }
