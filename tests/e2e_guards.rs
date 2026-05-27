@@ -325,6 +325,16 @@ fn gh_gate_allows_same_repo_api_endpoint() {
 }
 
 #[test]
+fn gh_gate_allows_relative_api_endpoint() {
+    // Relative paths (no leading /repos/) are resolved by gh to current repo
+    let (_, _, ok) = gh_gate(&["api", "pulls/67/comments"]);
+    assert!(
+        ok,
+        "relative API paths should be allowed (resolved to current repo)"
+    );
+}
+
+#[test]
 fn gh_gate_blocks_non_repo_api_endpoint() {
     // Endpoints like /user, /orgs don't target the current repo — blocked for security
     let (_, stderr, ok) = gh_gate(&["api", "/user"]);

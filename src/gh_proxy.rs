@@ -1168,8 +1168,21 @@ pub fn is_repo_in_scope(cmd: &ParsedCommand, current_repo: &str) -> bool {
                 let current_clean = current_repo.to_lowercase();
                 return endpoint_repo.to_lowercase() == current_clean;
             }
-            // API endpoint exists but doesn't match /repos/{owner}/{repo} pattern
-            // (e.g., /orgs/..., /user/..., /users/...) — not in repo scope.
+            // Check if this is a relative path (no leading /) — gh resolves these
+            // to the current repo automatically (e.g., `gh api pulls/67/comments`).
+            let path = endpoint.strip_prefix('/').unwrap_or(endpoint);
+            let path = path.split('?').next().unwrap_or(path);
+            if !path.starts_with("repos/")
+                && !path.starts_with("orgs/")
+                && !path.starts_with("users/")
+                && !path.starts_with("user")
+                && !path.starts_with("notifications")
+                && !path.starts_with("graphql")
+            {
+                // Relative endpoint — gh CLI resolves to current repo. Allow.
+                return true;
+            }
+            // Absolute non-repo endpoint (e.g., /orgs/..., /user/...) — not in scope.
             return false;
         }
         // No endpoint at all for gh api — shouldn't happen, but deny
@@ -2151,6 +2164,33 @@ mod tests {
             api_endpoint: Some("/orgs/navikt/members".to_string()),
         };
         assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
+    }
+
+    #[test]
+    fn api_relative_path_in_scope() {
+        // Relative paths like `pulls/67/comments` are resolved by gh to current repo
+        let cmd = ParsedCommand {
+            command: "api".to_string(),
+            subcommand: None,
+            repo_flag: None,
+            method: None,
+            has_input_flags: false,
+            api_endpoint: Some("pulls/67/comments".to_string()),
+        };
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+    }
+
+    #[test]
+    fn api_relative_path_with_query_string_in_scope() {
+        let cmd = ParsedCommand {
+            command: "api".to_string(),
+            subcommand: None,
+            repo_flag: None,
+            method: None,
+            has_input_flags: false,
+            api_endpoint: Some("pulls?state=open".to_string()),
+        };
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
     }
 
     #[test]
