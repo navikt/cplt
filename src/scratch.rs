@@ -30,7 +30,7 @@ const SCRATCH_BASE: &str = "Library/Caches/cplt/tmp";
 const SCRATCH_BASE: &str = ".cache/cplt/tmp";
 
 /// Maximum age for stale scratch dirs before garbage collection.
-const STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+const STALE_AGE: Duration = Duration::from_hours(24);
 
 /// A per-session scratch directory with write+exec permissions.
 ///

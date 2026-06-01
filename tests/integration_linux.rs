@@ -437,8 +437,7 @@ EOF
         let has_python = Command::new("python3")
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         if !has_python {
             eprintln!("SKIPPED: python3 not available for ptrace test");
             return;

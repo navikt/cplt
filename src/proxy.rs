@@ -76,7 +76,7 @@ fn is_blocked_status(status: &str) -> bool {
 }
 
 const MAX_CONNECTIONS: usize = 64;
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_TIMEOUT: Duration = Duration::from_mins(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often file-backed domain lists are re-read from disk.

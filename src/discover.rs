@@ -834,6 +834,35 @@ pub fn copilot_pkg_dir(copilot_bin: &Path, home_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Find the Copilot CLI SEA extraction cache directory on Linux.
+///
+/// Copilot CLI ships as a SEA (Single Executable Application) binary that extracts
+/// its Node.js runtime to a platform-specific cache directory on first run.
+/// On Linux this is `~/.cache/copilot/pkg/linux-{arch}/`.
+///
+/// Returns `Some(path)` if the directory exists or can reasonably be created
+/// (parent exists). The sandbox needs read+exec access to this directory for
+/// Copilot's re-exec mechanism to work.
+pub fn copilot_sea_cache_dir(home_dir: &Path) -> Option<PathBuf> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+
+    let pkg_base = home_dir
+        .join(".cache/copilot/pkg")
+        .join(format!("linux-{arch}"));
+
+    // Return the path if it exists OR if the parent (.cache/copilot/pkg) exists
+    // so that pre-flight extraction can create it.
+    if pkg_base.exists() || pkg_base.parent().is_some_and(Path::exists) {
+        Some(pkg_base)
+    } else {
+        None
+    }
+}
+
 /// Check if a `package.json` file belongs to `@github/copilot`.
 fn is_copilot_package(pkg_json: &Path) -> bool {
     let Ok(contents) = std::fs::read_to_string(pkg_json) else {

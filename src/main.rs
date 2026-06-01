@@ -935,7 +935,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                 let source_note = match loaded.source {
                     repo_config::RepoConfigSource::GitHead => "",
                     repo_config::RepoConfigSource::WorkingTree => {
-                        ui::warn(&format!(".cplt.toml source: {SOURCE_WORKING_TREE}",));
+                        ui::warn(&format!(".cplt.toml source: {SOURCE_WORKING_TREE}"));
                         " (working tree)"
                     }
                     _ => "",
@@ -1372,6 +1372,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             .and_then(|p| {
                 // Try package.json discovery first (npm/Homebrew installs)
                 discover::copilot_pkg_dir(p, &home_dir).or_else(|| {
+                    // SEA binary on Linux: the extracted runtime lives in
+                    // ~/.cache/copilot/pkg/linux-{arch}/ and needs exec access.
+                    #[cfg(target_os = "linux")]
+                    if let Some(cache_dir) = discover::copilot_sea_cache_dir(&home_dir) {
+                        return Some(cache_dir);
+                    }
                     // Fallback: use the binary's parent directory (VS Code extension installs
                     // at ~/Library/Application Support/Code/.../copilotCli/copilot)
                     p.parent().map(std::path::Path::to_path_buf)
@@ -1484,11 +1490,16 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
     // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
-    // so extraction must happen here, outside. macOS-only: SEA extraction is a
-    // macOS Copilot packaging detail. Skipped for other agents.
+    // so extraction must happen here, outside. SEA extraction applies to both
+    // macOS (~/Library/Caches/copilot/pkg/) and Linux (~/.cache/copilot/pkg/).
     #[cfg(target_os = "macos")]
     if active_agent.needs_sea_extraction() {
         ensure_copilot_extracted(&agent_bin, &home_dir, &project_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    if active_agent.needs_sea_extraction() {
+        ensure_copilot_extracted_linux(&agent_bin, &home_dir, &project_dir)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
@@ -3244,9 +3255,7 @@ fn shell_install() -> ExitCode {
     use std::io::Write;
     // Add a newline before our line if the file doesn't end with one
     let needs_newline = rc_file.exists()
-        && std::fs::read_to_string(&rc_file)
-            .map(|c| !c.is_empty() && !c.ends_with('\n'))
-            .unwrap_or(false);
+        && std::fs::read_to_string(&rc_file).is_ok_and(|c| !c.is_empty() && !c.ends_with('\n'));
 
     let content = if needs_newline {
         format!("\n{setup_line}")
@@ -3541,8 +3550,168 @@ fn ensure_copilot_extracted(
     }
 }
 
+/// Ensure Copilot's SEA runtime is extracted on Linux before entering the sandbox.
+///
+/// Linux equivalent of `ensure_copilot_extracted`. The SEA binary at
+/// ~/.local/bin/copilot extracts its Node.js runtime to
+/// ~/.cache/copilot/pkg/linux-{arch}/<version>/ on first run. Inside the
+/// sandbox, Landlock grants execute to this directory but the extraction
+/// (write) must happen outside. If not already extracted, we run
+/// `copilot --version` here to trigger it.
+#[cfg(target_os = "linux")]
+fn ensure_copilot_extracted_linux(
+    copilot_bin: &Path,
+    home: &Path,
+    project_dir: &Path,
+) -> Result<(), String> {
+    // Security guard: don't run project-local scripts unsandboxed.
+    let bin = copilot_bin
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve copilot binary path: {e}"))?;
+    let project = project_dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve project directory path: {e}"))?;
+    if bin.starts_with(&project) {
+        return Ok(());
+    }
+
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        _ => return Ok(()),
+    };
+
+    let pkg_base = home
+        .join(".cache/copilot/pkg")
+        .join(format!("linux-{arch}"));
+
+    // Compute binary identity for the fast-path cache.
+    let binary_id = binary_identity(copilot_bin);
+
+    // Fast path: check cplt-managed marker that records both the binary
+    // identity and the actual extraction directory from the last successful run.
+    let cache_dir = home.join(".cache/cplt");
+    let cache_file = cache_dir.join("copilot-extracted");
+    if let Some(ref bid) = binary_id
+        && let Ok(cached) = std::fs::read_to_string(&cache_file)
+    {
+        let mut lines = cached.lines();
+        if let (Some(cached_id), Some(cached_dir)) = (lines.next(), lines.next())
+            && cached_id == bid.as_str()
+        {
+            let extracted_marker = pkg_base.join(cached_dir).join(".extraction-complete");
+            if extracted_marker.exists() {
+                return Ok(());
+            }
+        }
+    }
+
+    ui::info("Extracting Copilot runtime (first run after update)...");
+
+    // Ensure pkg_base exists — Copilot needs it for extraction
+    let _ = std::fs::create_dir_all(&pkg_base);
+
+    // Clean up stale .extracting-* temp dirs from previous failed attempts.
+    clean_stale_extracting_dirs(&pkg_base);
+
+    // Snapshot existing extraction dirs so we can detect the new one.
+    let dirs_before = extraction_dirs(&pkg_base);
+
+    // Run copilot briefly to trigger SEA extraction.
+    let child = std::process::Command::new(copilot_bin)
+        .args(["--no-auto-update", "--version"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(format!(
+                "Failed to spawn copilot for extraction: {e}\n  \
+                 Try running 'copilot --version' manually to trigger extraction"
+            ));
+        }
+    };
+
+    // Poll for extraction completion.
+    let mut extracted_dir_name: Option<String> = None;
+    let mut saw_extracting = false;
+    let mut child_exit_ok = false;
+    for i in 0..120 {
+        if let Some(name) = find_new_extracted_dir(&pkg_base, &dirs_before) {
+            extracted_dir_name = Some(name);
+            break;
+        }
+        if !saw_extracting && has_extracting_dir(&pkg_base) {
+            saw_extracting = true;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            child_exit_ok = status.success();
+            extracted_dir_name = find_new_extracted_dir(&pkg_base, &dirs_before);
+            if extracted_dir_name.is_some() {
+                break;
+            }
+            if saw_extracting && i < 119 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                extracted_dir_name = find_new_extracted_dir(&pkg_base, &dirs_before);
+            }
+            if extracted_dir_name.is_none() && !status.success() {
+                extracted_dir_name = try_extraction_fallback(copilot_bin, &pkg_base, &dirs_before);
+            }
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Final check after process exit
+    if extracted_dir_name.is_none() {
+        extracted_dir_name = find_new_extracted_dir(&pkg_base, &dirs_before);
+    }
+
+    // Check if copilot already has a valid extraction on disk (migration case).
+    if extracted_dir_name.is_none() {
+        extracted_dir_name = find_any_complete_dir(&pkg_base);
+    }
+
+    // If no extraction dir exists anywhere, this copilot doesn't use SEA.
+    if extracted_dir_name.is_none() && child_exit_ok && extraction_dirs(&pkg_base).is_empty() {
+        return Ok(());
+    }
+
+    // Last resort: try `-p exit` to force full startup.
+    if extracted_dir_name.is_none() {
+        extracted_dir_name = try_extraction_fallback(copilot_bin, &pkg_base, &dirs_before);
+        if extracted_dir_name.is_none() {
+            extracted_dir_name = find_any_complete_dir(&pkg_base);
+        }
+    }
+
+    if let Some(ref dir_name) = extracted_dir_name {
+        if let Some(ref bid) = binary_id {
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let _ = std::fs::write(&cache_file, format!("{bid}\n{dir_name}"));
+        }
+        if !dirs_before.contains(dir_name) {
+            ui::ok("Copilot runtime extracted");
+        }
+        Ok(())
+    } else {
+        Err(
+            "Copilot runtime extraction failed. The sandbox blocks writes to copilot cache,\n  \
+             so extraction must succeed before entering the sandbox.\n  \
+             Fix: run 'copilot --version' manually, then retry cplt."
+                .to_string(),
+        )
+    }
+}
+
 /// Try a fallback extraction method using `-p exit` (works on older Copilot versions).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn try_extraction_fallback(
     copilot_bin: &Path,
     pkg_base: &Path,
@@ -3579,7 +3748,7 @@ fn try_extraction_fallback(
 /// Compute a stable identity for a binary based on filesystem metadata.
 /// Uses canonicalized path + inode + size + full mtime (seconds + nanoseconds).
 /// Works for any file type: Mach-O binaries, shell scripts, symlinks (resolved).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn binary_identity(path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let canonical = path.canonicalize().ok()?;
@@ -3595,7 +3764,7 @@ fn binary_identity(path: &Path) -> Option<String> {
 }
 
 /// List non-hidden directory names under `pkg_base` (extraction version dirs).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn extraction_dirs(pkg_base: &Path) -> std::collections::HashSet<String> {
     std::fs::read_dir(pkg_base)
         .into_iter()
@@ -3613,7 +3782,7 @@ fn extraction_dirs(pkg_base: &Path) -> std::collections::HashSet<String> {
 }
 
 /// Check if there's an in-progress `.extracting-*` temp directory.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn has_extracting_dir(pkg_base: &Path) -> bool {
     std::fs::read_dir(pkg_base)
         .into_iter()
@@ -3627,7 +3796,7 @@ fn has_extracting_dir(pkg_base: &Path) -> bool {
 
 /// Remove stale `.extracting-*` temp dirs left over from previous failed attempts.
 /// These can prevent the SEA loader from starting a fresh extraction.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn clean_stale_extracting_dirs(pkg_base: &Path) {
     let Ok(entries) = std::fs::read_dir(pkg_base) else {
         return;
@@ -3641,7 +3810,7 @@ fn clean_stale_extracting_dirs(pkg_base: &Path) {
 }
 
 /// Find a newly created extraction dir (not in `before`) that has `.extraction-complete`.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn find_new_extracted_dir(
     pkg_base: &Path,
     before: &std::collections::HashSet<String>,
@@ -3656,7 +3825,7 @@ fn find_new_extracted_dir(
 }
 
 /// Find any extraction dir that has `.extraction-complete` (most recent first).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn find_any_complete_dir(pkg_base: &Path) -> Option<String> {
     let mut dirs: Vec<_> = std::fs::read_dir(pkg_base)
         .into_iter()
@@ -3677,7 +3846,7 @@ fn find_any_complete_dir(pkg_base: &Path) -> Option<String> {
         })
         .collect();
     // Most recently modified first
-    dirs.sort_by(|a, b| b.1.cmp(&a.1));
+    dirs.sort_by_key(|b| std::cmp::Reverse(b.1));
     dirs.into_iter().next().map(|(name, _)| name)
 }
 

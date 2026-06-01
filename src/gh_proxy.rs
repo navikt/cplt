@@ -1259,15 +1259,10 @@ fn parse_repo_from_url(url: &str) -> Option<String> {
 
     // HTTPS or SSH URL
     // Look for github.com in the path
-    let path = if let Some(rest) = url.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
-        rest
-    } else if let Some(rest) = url.strip_prefix("http://github.com/") {
-        rest
-    } else {
-        return None;
-    };
+    let path = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
 
     let repo = path.trim_end_matches(".git");
     // Should have exactly one slash: owner/repo
