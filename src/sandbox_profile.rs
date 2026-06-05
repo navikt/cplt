@@ -70,6 +70,15 @@ pub struct ProfileOptions<'a> {
     /// Allow GPG commit/tag signing. When true, grants read-only access to
     /// the public keyring and GPG agent socket. Private keys stay denied.
     pub allow_gpg_signing: bool,
+    /// Deny access to the macOS clipboard (pasteboard) Mach service.
+    ///
+    /// The clipboard is reached via the Mach service `com.apple.pasteboard.1`.
+    /// The profile emits a targeted `(deny mach-lookup …)` immediately after
+    /// `(allow mach-lookup)` so SBPL last-match-wins blocks only the pasteboard
+    /// service — Keychain, DNS (mDNSResponder), and all other Mach services
+    /// remain reachable. Useful when the sandboxed agent must not be able to
+    /// read or write clipboard contents (e.g. credential-sniffing via pbpaste).
+    pub deny_clipboard: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow Docker/Colima/OrbStack daemon socket and ~/.docker read access.
@@ -127,7 +136,13 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_home_access(&mut sb, &home, opts.agent, opts.agent_dirs);
     emit_git_hooks(&mut sb, opts.git_hooks_path);
     emit_git_worktree(&mut sb, opts.git_common_dir);
-    emit_system_access(&mut sb, &home, opts.allow_browser, allow_chromium_runtime);
+    emit_system_access(
+        &mut sb,
+        &home,
+        opts.allow_browser,
+        allow_chromium_runtime,
+        opts.deny_clipboard,
+    );
     emit_tool_dirs(
         &mut sb,
         opts.home_dir,
@@ -362,11 +377,21 @@ fn emit_system_access(
     home: &str,
     allow_browser: bool,
     allow_chromium_runtime: bool,
+    deny_clipboard: bool,
 ) {
     // Mach IPC — Node.js and macOS frameworks need service lookups
     // (Keychain, security framework, DNS, system services)
     sbpl!(sb, ";; Mach IPC (required for Node.js, Keychain, DNS)");
     sbpl!(sb, "(allow mach-lookup)");
+    if deny_clipboard {
+        // Emitted immediately after (allow mach-lookup) so SBPL last-match-wins
+        // carves out only com.apple.pasteboard.* — Keychain, DNS (mDNSResponder),
+        // Security framework, and every other Mach service remain unaffected.
+        sbpl!(
+            sb,
+            r#"(deny mach-lookup (global-name-regex #"^com\.apple\.pasteboard"))"#
+        );
+    }
     sbpl!(sb);
 
     // Chromium browser runtime support (Playwright headless testing).

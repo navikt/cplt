@@ -93,7 +93,7 @@ Legend: ✅ = kernel-enforced, ⚠️ = defense-in-depth (proxy/env), ❌ = not 
 
 - **TLS interception** — the proxy sees CONNECT targets (hostname:port) but not request bodies or responses
 - **Kernel exploits** — we rely on Apple's Seatbelt (macOS) and Landlock/seccomp (Linux) enforcement being correct
-- **Keychain isolation** (macOS) — Copilot requires Keychain access for auth; this is an accepted trade-off. `mach-lookup` is blanket because Node.js needs it for DNS, Security framework, and system services.
+- **Keychain isolation** (macOS) — Copilot requires Keychain access for auth; this is an accepted trade-off. `mach-lookup` is blanket because Node.js needs it for DNS, Security framework, and system services. The **clipboard** (`com.apple.pasteboard`) is reachable via the same blanket allow; use `--deny-clipboard` to add a targeted deny that blocks only the pasteboard service while leaving all others intact.
 - **sandbox-exec deprecation** (macOS) — Apple marks it deprecated but has not removed it; Chromium and VS Code still use it
 - **Landlock subpath limitations** (Linux) — Landlock cannot deny access to subpaths within allowed directories. If a parent directory is allowed, all children are allowed. This means certain fine-grained macOS rules (e.g., deny `.config/gh/extensions` while allowing `.config/gh/hosts.yml`) cannot be replicated on Linux.
 - **Code quality** — the sandbox cannot judge whether code written by Copilot contains backdoors; that's a code review problem

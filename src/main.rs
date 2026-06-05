@@ -237,6 +237,10 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
     #[arg(long)]
     allow_gpg_signing: bool,
 
+    /// Deny the sandboxed agent access to the macOS clipboard (pasteboard)
+    #[arg(long = "deny-clipboard")]
+    deny_clipboard: bool,
+
     /// Allow JVM Attach API unix sockets in /tmp.
     /// Needed for JVM testing frameworks that use runtime self-attach:
     /// MockK inline mocking, Mockito inline agents, ByteBuddy, JMX tools.
@@ -885,6 +889,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         inherit_env: cli.inherit_env,
         allow_lifecycle_scripts: cli.allow_lifecycle_scripts,
         allow_gpg_signing: cli.allow_gpg_signing,
+        deny_clipboard: cli.deny_clipboard,
         allow_jvm_attach: cli.allow_jvm_attach,
         allow_docker: cli.allow_docker,
         allow_tmp_exec: cli.allow_tmp_exec,
@@ -1464,6 +1469,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         git_hooks_path: git_hooks_path.as_deref(),
         git_common_dir: git_common_dir.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
+        deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_docker: resolved.allow_docker,
         electron_app_dir: electron_app_dir.as_deref(),

@@ -207,6 +207,9 @@ impl Config {
             self.sandbox.allow_gpg_signing.unwrap_or(false)
         };
 
+        // Deny-clipboard: CLI-only tightening flag (defaults to false).
+        let deny_clipboard = cli.deny_clipboard;
+
         // Allow-jvm-attach: CLI flag wins, then config, then false (blocked by default)
         let allow_jvm_attach = if cli.allow_jvm_attach {
             true
@@ -362,6 +365,7 @@ impl Config {
             inherit_env,
             allow_lifecycle_scripts,
             allow_gpg_signing,
+            deny_clipboard,
             allow_jvm_attach,
             allow_docker,
             allow_tmp_exec,

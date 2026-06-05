@@ -338,6 +338,7 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | `--allow-cache-exec <SUBDIR>` | Allow exec from a specific `~/Library/Caches/<SUBDIR>`. Can be repeated. Use for tools that cache compiled binaries there (e.g. Playwright, pnpm dlx). |
 | `--allow-cache-exec-any`    | ⚠️ **Dangerous.** Allow exec from all of `~/Library/Caches`. Prefer `--allow-cache-exec <SUBDIR>` for targeted exemptions. |
 | `--allow-browser`           | Allow the agent to open URLs in your default browser. Needed for OAuth code flows (MCP servers, Gemini CLI). Disabled by default. |
+| `--deny-clipboard`          | Block the sandboxed agent from reading or writing the macOS clipboard (`pbpaste`/`pbcopy`). Tightens the default profile by denying the `com.apple.pasteboard` Mach service; all other Mach services (Keychain, DNS, Security framework) remain unaffected. |
 
 ### Supported runtimes
 

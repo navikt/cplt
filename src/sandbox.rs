@@ -104,6 +104,7 @@ pub struct SandboxConfig<'a> {
     /// Shared .git directory for git worktrees.
     pub git_common_dir: Option<&'a Path>,
     pub allow_gpg_signing: bool,
+    pub deny_clipboard: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow Docker/Colima/OrbStack access (daemon socket + ~/.docker read).
@@ -247,6 +248,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         git_hooks_path: config.git_hooks_path,
         git_common_dir: config.git_common_dir,
         allow_gpg_signing: config.allow_gpg_signing,
+        deny_clipboard: config.deny_clipboard,
         allow_jvm_attach: config.allow_jvm_attach,
         allow_docker: config.allow_docker,
         electron_app_dir: config.electron_app_dir,

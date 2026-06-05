@@ -1216,6 +1216,7 @@ mod tests {
             git_hooks_path: None,
             git_common_dir: None,
             allow_gpg_signing: false,
+            deny_clipboard: false,
             allow_jvm_attach: false,
             allow_docker: false,
             electron_app_dir: None,
