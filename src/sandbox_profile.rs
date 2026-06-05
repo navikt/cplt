@@ -389,7 +389,7 @@ fn emit_system_access(
         // Security framework, and every other Mach service remain unaffected.
         sbpl!(
             sb,
-            r#"(deny mach-lookup (global-name-regex #"^com\.apple\.pasteboard"))"#
+            r#"(deny mach-lookup (global-name-regex #"^com\.apple\.pasteboard(\.|$)"))"#
         );
     }
     sbpl!(sb);

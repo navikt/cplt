@@ -1272,10 +1272,12 @@ finally:
         let (output, _) = run_sandboxed(&profile, cmd);
 
         fs::remove_file(&profile).ok();
+
+        // pbpaste must fail when the pasteboard service is denied. Assert a
+        // non-zero exit (the paired allow-by-default test confirms it exits 0
+        // otherwise) rather than matching a specific code or localized text.
         assert!(
-            output.contains("Operation not permitted")
-                || output.contains("EXIT:1")
-                || output.contains("not permitted"),
+            !output.contains("EXIT:0"),
             "pbpaste should be blocked when deny_clipboard is set, got: {output}"
         );
     }

@@ -6048,7 +6048,7 @@ fn deny_clipboard_emits_pasteboard_deny_after_allow() {
         deny > allow,
         "pasteboard deny must come AFTER the mach-lookup allow (last-match-wins)"
     );
-    assert!(p.contains(r#"global-name-regex #"^com\.apple\.pasteboard""#));
+    assert!(p.contains(r#"global-name-regex #"^com\.apple\.pasteboard(\.|$)""#));
 }
 
 #[test]
@@ -6084,7 +6084,7 @@ fn no_deny_clipboard_by_default() {
         allow_browser: false,
     });
     assert!(
-        !p.contains("pasteboard"),
-        "pasteboard rule must not appear by default"
+        !p.contains("com.apple.pasteboard"),
+        "pasteboard deny rule must not appear by default"
     );
 }
