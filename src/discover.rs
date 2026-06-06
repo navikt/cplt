@@ -194,21 +194,24 @@ pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
 
 // ── Agent discovery ─────────────────────────────────────────────
 
-/// Agents to probe: (display_name, binary_name, version_flag)
-const AGENTS_TO_CHECK: &[(&str, &str, &[&str])] = &[
-    ("Copilot", "copilot", &["--version"]),
-    ("OpenCode", "opencode", &["--version"]),
-    ("Gemini", "gemini", &["--version"]),
-    ("Claude", "claude", &["--version"]),
+/// Agents to probe: (display_name, binary_names, version_flag)
+const AGENTS_TO_CHECK: &[(&str, &[&str], &[&str])] = &[
+    ("Copilot", &["copilot"], &["--version"]),
+    ("OpenCode", &["opencode"], &["--version"]),
+    ("Gemini", &["gemini"], &["--version"]),
+    ("Antigravity", &["antigravity", "agy"], &["--version"]),
+    ("Claude", &["claude"], &["--version"]),
 ];
 
 /// Discover all available AI coding agents in PATH.
 pub fn discover_agents() -> Vec<AgentInfo> {
     AGENTS_TO_CHECK
         .iter()
-        .filter_map(|(name, binary, version_args)| {
-            let path = which_resolved(binary)?;
-            let version = std::process::Command::new(binary)
+        .filter_map(|(name, binaries, version_args)| {
+            let (binary_name, path) = binaries
+                .iter()
+                .find_map(|binary| which_resolved(binary).map(|path| (*binary, path)))?;
+            let version = std::process::Command::new(binary_name)
                 .args(*version_args)
                 .output()
                 .ok()
@@ -226,7 +229,7 @@ pub fn discover_agents() -> Vec<AgentInfo> {
                 });
             Some(AgentInfo {
                 name,
-                binary_name: binary,
+                binary_name,
                 path,
                 version,
             })

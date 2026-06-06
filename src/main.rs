@@ -28,8 +28,8 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 /// - macOS: Apple Seatbelt/SBPL via sandbox-exec
 /// - Linux: Landlock LSM + seccomp-BPF (kernel 5.13+, full network filtering on 6.7+)
 ///
-/// Supports GitHub Copilot CLI, OpenCode, and Google Gemini CLI. Auto-detects
-/// which agent to use, or specify explicitly with --agent.
+/// Supports GitHub Copilot CLI, OpenCode, Google Gemini CLI, Antigravity CLI,
+/// and Pi. Auto-detects which agent to use, or specify explicitly with --agent.
 ///
 /// Defaults can be saved to ~/.config/cplt/config.toml
 /// so you don't need to pass flags every time. Run `cplt config init` to
@@ -90,7 +90,7 @@ EXAMPLES:
 struct Cli {
     /// Which AI coding agent to sandbox.
     /// Resolved in order: this flag > sandbox.agent config > auto-detect from PATH.
-    /// Supported: copilot, opencode, gemini, pi, shell
+    /// Supported: copilot, opencode, gemini, antigravity, pi, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 
@@ -413,7 +413,7 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
     // --- Copilot pass-through flags ---
     // These are forwarded directly to the copilot process for convenience,
     // avoiding the need for -- when using common session-level flags.
-    // Ignored when --agent opencode is used.
+    // Ignored when --agent is anything except Copilot.
     /// Resume a previous Copilot session. Use --resume to pick interactively,
     /// or --resume=NAME to resume a specific session by name or ID.
     /// Copilot-only (ignored for other agents).
@@ -1061,8 +1061,9 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                              [cplt]   Copilot CLI: brew install --cask copilot-cli\n\
                              [cplt]   OpenCode:    npm i -g opencode-ai\n\
                              [cplt]   Gemini CLI:  npm i -g @google/gemini-cli\n\
+                             [cplt]   Antigravity: curl -fsSL https://antigravity.google/cli/install.sh | bash\n\
                              [cplt]   Pi:          npm i -g @earendil-works/pi-coding-agent\n\
-                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|gemini|pi|shell"
+                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|gemini|antigravity|pi|shell"
                         );
                     }
                 }

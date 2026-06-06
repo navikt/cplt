@@ -254,6 +254,7 @@ pub const ENV_PREFIX_ALLOWLIST: &[&str] = &[
     "SDKMAN_",         // SDKMAN (Java version manager)
     "TESTCONTAINERS_", // Testcontainers configuration
     "YARN_",           // Yarn Berry config (hardening injection overrides YARN_ENABLE_SCRIPTS)
+    "AGY_",            // Antigravity CLI runtime configuration
 ];
 
 /// Environment variables always stripped, even with --inherit-env.

@@ -1,7 +1,7 @@
 //! Agent abstraction for different AI coding tools.
 //!
 //! cplt can sandbox multiple AI coding agents — currently GitHub Copilot CLI,
-//! OpenCode, Google Gemini CLI, and Pi. Each agent has different binary names,
+//! OpenCode, Google Gemini CLI, Antigravity, and Pi. Each agent has different binary names,
 //! config directories, and runtime requirements, but shares the same core
 //! sandbox infrastructure.
 
@@ -18,6 +18,8 @@ pub enum Agent {
     OpenCode,
     /// Google Gemini CLI — AI coding agent powered by Gemini models.
     Gemini,
+    /// Antigravity CLI (`antigravity` / `agy`).
+    Antigravity,
     /// Pi coding agent (https://github.com/earendil-works/pi).
     Pi,
     /// Plain sandboxed shell — no AI agent, just a secure shell session.
@@ -31,6 +33,7 @@ impl Agent {
             Agent::Copilot => "copilot",
             Agent::OpenCode => "opencode",
             Agent::Gemini => "gemini",
+            Agent::Antigravity => "antigravity",
             Agent::Pi => "pi",
             Agent::Shell => "shell",
         }
@@ -42,6 +45,7 @@ impl Agent {
             Agent::Copilot => "Copilot",
             Agent::OpenCode => "OpenCode",
             Agent::Gemini => "Gemini",
+            Agent::Antigravity => "Antigravity",
             Agent::Pi => "Pi",
             Agent::Shell => "Shell",
         }
@@ -59,7 +63,7 @@ impl Agent {
     pub fn extra_args(&self) -> &'static [&'static str] {
         match self {
             Agent::Copilot => &["--no-auto-update"],
-            Agent::OpenCode | Agent::Gemini | Agent::Pi | Agent::Shell => &[],
+            Agent::OpenCode | Agent::Gemini | Agent::Antigravity | Agent::Pi | Agent::Shell => &[],
         }
     }
 
@@ -68,7 +72,7 @@ impl Agent {
     /// Gemini uses Keychain for extension integrity verification.
     /// OpenCode uses API keys from env vars or config files.
     pub fn needs_keychain(&self) -> bool {
-        matches!(self, Agent::Copilot | Agent::Gemini)
+        matches!(self, Agent::Copilot | Agent::Gemini | Agent::Antigravity)
     }
 
     /// Whether this agent needs access to ~/.copilot directory.
@@ -204,6 +208,26 @@ impl Agent {
                     write_files: vec![],
                 }]
             }
+            Agent::Antigravity => {
+                // Antigravity stores project config under ~/.gemini/config
+                // and runtime/session data under ~/.gemini/antigravity-cli.
+                vec![
+                    AgentDir {
+                        path: home.join(".gemini/config"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                    AgentDir {
+                        path: home.join(".gemini/antigravity-cli"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                ]
+            }
             Agent::Pi => {
                 // ~/.pi/agent stores settings, auth, sessions, themes
                 // ~/.pi/agent/bin contains managed tool binaries (fd, rg)
@@ -249,6 +273,8 @@ impl Agent {
             // Gemini uses Google OAuth by default (browser flow, stored in ~/.gemini/).
             // API key or Vertex AI project are alternatives.
             Agent::Gemini => &["GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"],
+            // Antigravity uses Google OAuth with keychain/session storage.
+            Agent::Antigravity => &[],
             // Pi supports multiple LLM providers via API keys.
             Agent::Pi => &[
                 "ANTHROPIC_API_KEY",
@@ -281,7 +307,10 @@ impl Agent {
             return Err(format!("Shell not found: {shell}"));
         }
 
-        let binary_name = self.binary_name();
+        let binary_names: &[&str] = match self {
+            Agent::Antigravity => &["antigravity", "agy"],
+            _ => &[self.binary_name()],
+        };
         let self_exe = std::env::current_exe()
             .ok()
             .and_then(|p| std::fs::canonicalize(&p).ok());
@@ -291,42 +320,45 @@ impl Agent {
         // For Copilot, track editor shims as fallback
         let mut editor_shim: Option<PathBuf> = None;
 
-        for dir in path_var.split(':') {
-            let candidate = PathBuf::from(dir).join(binary_name);
+        for binary_name in binary_names {
+            for dir in path_var.split(':') {
+                let candidate = PathBuf::from(dir).join(binary_name);
 
-            if !candidate.is_file() {
-                continue;
-            }
-
-            // Resolve mise/asdf shims to the real binary to avoid version conflicts
-            // when the project's .tool-versions specifies a different node version.
-            if let Some(real_bin) = resolve_mise_shim(&candidate, binary_name) {
-                if self_exe.as_ref() == Some(&real_bin) {
+                if !candidate.is_file() {
                     continue;
                 }
-                if matches!(self, Agent::Copilot) && is_editor_shim(&real_bin) {
+
+                // Resolve mise/asdf shims to the real binary to avoid version conflicts
+                // when the project's .tool-versions specifies a different node version.
+                if let Some(real_bin) = resolve_mise_shim(&candidate, binary_name) {
+                    if self_exe.as_ref() == Some(&real_bin) {
+                        continue;
+                    }
+                    if matches!(self, Agent::Copilot) && is_editor_shim(&real_bin) {
+                        if editor_shim.is_none() {
+                            editor_shim = Some(real_bin);
+                        }
+                        continue;
+                    }
+                    return Ok(real_bin);
+                }
+
+                let resolved =
+                    std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+                if self_exe.as_ref() == Some(&resolved) {
+                    continue; // skip cplt aliased as this binary
+                }
+
+                // Copilot-specific: prefer standalone over editor shims
+                if matches!(self, Agent::Copilot) && is_editor_shim(&resolved) {
                     if editor_shim.is_none() {
-                        editor_shim = Some(real_bin);
+                        editor_shim = Some(resolved);
                     }
                     continue;
                 }
-                return Ok(real_bin);
-            }
 
-            let resolved = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-            if self_exe.as_ref() == Some(&resolved) {
-                continue; // skip cplt aliased as this binary
+                return Ok(resolved);
             }
-
-            // Copilot-specific: prefer standalone over editor shims
-            if matches!(self, Agent::Copilot) && is_editor_shim(&resolved) {
-                if editor_shim.is_none() {
-                    editor_shim = Some(resolved);
-                }
-                continue;
-            }
-
-            return Ok(resolved);
         }
 
         if let Some(shim) = editor_shim {
@@ -344,6 +376,9 @@ impl Agent {
             Agent::Gemini => {
                 "Install Gemini CLI: npm i -g @google/gemini-cli, or brew install gemini-cli"
             }
+            Agent::Antigravity => {
+                "Install Antigravity CLI: curl -fsSL https://antigravity.google/cli/install.sh | bash"
+            }
             Agent::Pi => "Install Pi: npm i -g @earendil-works/pi-coding-agent",
             Agent::Shell => unreachable!("Shell is resolved via $SHELL above"),
         };
@@ -355,7 +390,8 @@ impl Agent {
     }
 
     /// Auto-detect which agent to use based on what's available in PATH.
-    /// Returns Copilot if found (backward compat), else OpenCode, else Gemini.
+    /// Returns Copilot if found (backward compat), else OpenCode, else Gemini,
+    /// else Antigravity.
     /// Returns None if none are found.
     pub fn auto_detect() -> Option<Agent> {
         let path_var = std::env::var("PATH").unwrap_or_default();
@@ -366,6 +402,7 @@ impl Agent {
         let mut found_copilot = false;
         let mut found_opencode = false;
         let mut found_gemini = false;
+        let mut found_antigravity = false;
 
         for dir in path_var.split(':') {
             if !found_copilot {
@@ -398,6 +435,20 @@ impl Agent {
                     }
                 }
             }
+            if !found_antigravity {
+                let antigravity_bin = PathBuf::from(dir).join("antigravity");
+                let agy_bin = PathBuf::from(dir).join("agy");
+                for candidate in [&antigravity_bin, &agy_bin] {
+                    if candidate.is_file() {
+                        let resolved =
+                            std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone());
+                        if self_exe.as_ref() != Some(&resolved) {
+                            found_antigravity = true;
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         if found_copilot {
@@ -406,6 +457,8 @@ impl Agent {
             Some(Agent::OpenCode)
         } else if found_gemini {
             Some(Agent::Gemini)
+        } else if found_antigravity {
+            Some(Agent::Antigravity)
         } else {
             None
         }
@@ -420,10 +473,11 @@ impl FromStr for Agent {
             "copilot" => Ok(Agent::Copilot),
             "opencode" => Ok(Agent::OpenCode),
             "gemini" | "gem" => Ok(Agent::Gemini),
+            "antigravity" | "agy" | "agi" => Ok(Agent::Antigravity),
             "pi" => Ok(Agent::Pi),
             "shell" | "sh" | "bash" | "zsh" => Ok(Agent::Shell),
             _ => Err(format!(
-                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, pi, shell"
+                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, shell"
             )),
         }
     }
@@ -559,6 +613,9 @@ mod tests {
         assert_eq!(Agent::from_str("gemini").unwrap(), Agent::Gemini);
         assert_eq!(Agent::from_str("Gemini").unwrap(), Agent::Gemini);
         assert_eq!(Agent::from_str("gem").unwrap(), Agent::Gemini);
+        assert_eq!(Agent::from_str("antigravity").unwrap(), Agent::Antigravity);
+        assert_eq!(Agent::from_str("agi").unwrap(), Agent::Antigravity);
+        assert_eq!(Agent::from_str("agy").unwrap(), Agent::Antigravity);
         assert!(Agent::from_str("unknown").is_err());
     }
 
@@ -578,10 +635,16 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_binary_name() {
+        assert_eq!(Agent::Antigravity.binary_name(), "antigravity");
+    }
+
+    #[test]
     fn copilot_needs_sea_extraction() {
         assert!(Agent::Copilot.needs_sea_extraction());
         assert!(!Agent::OpenCode.needs_sea_extraction());
         assert!(!Agent::Gemini.needs_sea_extraction());
+        assert!(!Agent::Antigravity.needs_sea_extraction());
     }
 
     #[test]
@@ -589,12 +652,14 @@ mod tests {
         assert_eq!(Agent::Copilot.extra_args(), &["--no-auto-update"]);
         assert!(Agent::OpenCode.extra_args().is_empty());
         assert!(Agent::Gemini.extra_args().is_empty());
+        assert!(Agent::Antigravity.extra_args().is_empty());
     }
 
     #[test]
     fn keychain_needs() {
         assert!(Agent::Copilot.needs_keychain());
         assert!(Agent::Gemini.needs_keychain());
+        assert!(Agent::Antigravity.needs_keychain());
         assert!(!Agent::OpenCode.needs_keychain());
     }
 
@@ -664,6 +729,23 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_config_dirs() {
+        let home = Path::new("/Users/test");
+        let dirs = Agent::Antigravity.config_dirs(home);
+        assert_eq!(
+            dirs.len(),
+            2,
+            "should have ~/.gemini config + antigravity-cli"
+        );
+        assert_eq!(dirs[0].path, home.join(".gemini/config"));
+        assert!(dirs[0].write);
+        assert_eq!(dirs[1].path, home.join(".gemini/antigravity-cli"));
+        assert!(dirs[1].write);
+        assert!(!dirs[0].process_exec && !dirs[0].map_exec);
+        assert!(!dirs[1].process_exec && !dirs[1].map_exec);
+    }
+
+    #[test]
     fn copilot_has_no_extra_config_dirs() {
         let home = Path::new("/Users/test");
         let dirs = Agent::Copilot.config_dirs(home);
@@ -688,10 +770,19 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_auth_env_hints() {
+        assert!(
+            Agent::Antigravity.auth_env_hint().is_empty(),
+            "antigravity uses oauth/keychain auth, no env hints"
+        );
+    }
+
+    #[test]
     fn display_names() {
         assert_eq!(format!("{}", Agent::Copilot), "Copilot");
         assert_eq!(format!("{}", Agent::OpenCode), "OpenCode");
         assert_eq!(format!("{}", Agent::Gemini), "Gemini");
+        assert_eq!(format!("{}", Agent::Antigravity), "Antigravity");
         assert_eq!(format!("{}", Agent::Pi), "Pi");
     }
 
@@ -752,8 +843,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_agent_error_lists_pi() {
+    fn unknown_agent_error_lists_antigravity_and_pi() {
         let err = Agent::from_str("nope").unwrap_err();
+        assert!(
+            err.contains("antigravity"),
+            "error should mention antigravity: {err}"
+        );
         assert!(err.contains("pi"), "error should mention pi: {err}");
     }
 

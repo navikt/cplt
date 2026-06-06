@@ -6,7 +6,7 @@
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-**Kernel-enforced sandbox for AI coding agents.** Wraps GitHub Copilot CLI, OpenCode, Gemini CLI, Pi, or any shell so agents can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
+**Kernel-enforced sandbox for AI coding agents.** Wraps GitHub Copilot CLI, OpenCode, Gemini CLI, Antigravity CLI, Pi, or any shell so agents can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
 - **Linux**: Landlock LSM + seccomp-BPF (kernel 5.13+; full network filtering on 6.7+)
@@ -122,7 +122,7 @@ For the full security model, threat analysis, and test strategy, see **[SECURITY
 | Environment handling | Allowlist + hardening env injection | More basic pass-through model |
 | Secret file protection | Deny patterns such as `.env*`, `.pem`, `.key` inside the repo | Primarily directory-scoped access |
 | Repo policy | [`.cplt.toml`](docs/configuration.md#per-repo-configuration-cplttoml) with explicit trust/approval flow | No repo-level policy file |
-| Agent support | Copilot, OpenCode, Gemini CLI, [Pi agent](#pi-agent-support), or shell | Codex only |
+| Agent support | Copilot, OpenCode, Gemini CLI, [Antigravity CLI](#antigravity-cli-support), [Pi agent](#pi-agent-support), or shell | Codex only |
 
 cplt is not stronger everywhere. Codex CLI has Linux namespace isolation today, and it already exposes explicit sandbox modes such as read-only and workspace-write. cplt does not yet have that mode matrix.
 
@@ -163,7 +163,7 @@ That matters most for CLI agents and credential exposure:
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
 | SSH git | Blocked at kernel (SSH agent socket denied) | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`) | Not blocked |
-| Agent support | Copilot, OpenCode, Gemini, Pi, Shell | Claude Code |
+| Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Shell | Claude Code |
 | Config | TOML (global + per-repo) | JSON (global only) + `--control-fd` live updates |
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |
 
@@ -288,7 +288,7 @@ This is the same pattern used by tools like mise, direnv, and starship.
 cplt [OPTIONS] [-- <AGENT_ARGS>...]
 ```
 
-Everything after `--` is passed directly to the agent process (copilot, opencode, or shell).
+Everything after `--` is passed directly to the agent process (copilot, opencode, gemini, antigravity, pi, or shell).
 
 ### File access
 
@@ -494,6 +494,24 @@ cplt --agent gemini --pass-env GEMINI_API_KEY
 - Keychain access is enabled (used for extension integrity verification)
 - OAuth browser flow requires `--allow-browser` for first-time login
 - `--resume`, `--continue`, `--remote`, `--name` flags are Copilot-specific and ignored for Gemini
+
+### Antigravity CLI support
+
+cplt can sandbox [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli). Use `antigravity` as the canonical cplt agent name (aliases `agy` and `agi` are accepted).
+
+```bash
+# Run Antigravity CLI
+cplt --agent antigravity
+
+# Set Antigravity as your default agent
+cplt config set sandbox.agent antigravity
+```
+
+**Security notes for Antigravity:**
+- Antigravity config (`~/.gemini/config/`) and runtime data (`~/.gemini/antigravity-cli/`) are writable in the sandbox
+- Keychain access is enabled (used by OAuth/keyring-based auth)
+- OAuth browser flow requires `--allow-browser` for first-time login
+- `--resume`, `--continue`, `--remote`, `--name` flags are Copilot-specific and ignored for Antigravity
 
 ### Pi agent support
 
