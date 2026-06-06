@@ -211,7 +211,7 @@ pub fn discover_agents() -> Vec<AgentInfo> {
             let (binary_name, path) = binaries
                 .iter()
                 .find_map(|binary| which_resolved(binary).map(|path| (*binary, path)))?;
-            let version = std::process::Command::new(binary_name)
+            let version = std::process::Command::new(&path)
                 .args(*version_args)
                 .output()
                 .ok()

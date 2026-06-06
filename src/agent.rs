@@ -377,7 +377,7 @@ impl Agent {
                 "Install Gemini CLI: npm i -g @google/gemini-cli, or brew install gemini-cli"
             }
             Agent::Antigravity => {
-                "Install Antigravity CLI: curl -fsSL https://antigravity.google/cli/install.sh | bash"
+                "Install Antigravity CLI: see https://antigravity.google/docs/cli-getting-started"
             }
             Agent::Pi => "Install Pi: npm i -g @earendil-works/pi-coding-agent",
             Agent::Shell => unreachable!("Shell is resolved via $SHELL above"),

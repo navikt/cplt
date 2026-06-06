@@ -1061,7 +1061,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                              [cplt]   Copilot CLI: brew install --cask copilot-cli\n\
                              [cplt]   OpenCode:    npm i -g opencode-ai\n\
                              [cplt]   Gemini CLI:  npm i -g @google/gemini-cli\n\
-                             [cplt]   Antigravity: curl -fsSL https://antigravity.google/cli/install.sh | bash\n\
+                             [cplt]   Antigravity: https://antigravity.google/docs/cli-getting-started\n\
                              [cplt]   Pi:          npm i -g @earendil-works/pi-coding-agent\n\
                              [cplt] Or specify explicitly: cplt --agent copilot|opencode|gemini|antigravity|pi|shell"
                         );

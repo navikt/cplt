@@ -4,19 +4,19 @@ This document describes the security architecture of cplt, the threat model it a
 
 ## Supported Agents
 
-cplt sandboxes AI coding agents — currently **GitHub Copilot CLI**, **[OpenCode](https://opencode.ai/)**, **Google Gemini CLI**, and **[Pi](https://github.com/earendil-works/pi)**. All share the same core sandbox infrastructure (deny-default Seatbelt/Landlock profile, env sanitization, scratch dir), with agent-specific adaptations:
+cplt sandboxes AI coding agents — currently **GitHub Copilot CLI**, **[OpenCode](https://opencode.ai/)**, **Google Gemini CLI**, **[Antigravity CLI](https://github.com/google-antigravity/antigravity-cli)**, and **[Pi](https://github.com/earendil-works/pi)**. All share the same core sandbox infrastructure (deny-default Seatbelt/Landlock profile, env sanitization, scratch dir), with agent-specific adaptations:
 
-| Property        | Copilot                             | OpenCode                                                            | Gemini                                    | Pi                                          |
-|-----------------|-------------------------------------|---------------------------------------------------------------------|-------------------------------------------|---------------------------------------------|
-| Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow → `auth.json`, or API keys                   | Google OAuth (browser) or API key         | API keys (Anthropic, OpenAI, Gemini, etc.)  |
-| Auth in sandbox | Token served via one-time file read (gh guard) or Keychain | Copilot auth stored in data dir; third-party keys need `--pass-env` | OAuth stored in `~/.gemini/`; key needs `--pass-env` | Keys need `--pass-env`             |
-| Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini` (read/write)                  | `~/.pi` (read/write)                       |
-| Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          | N/A (in config dir)                       | `~/.pi/agent/bin` (read + exec)             |
-| State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          | N/A                                       | N/A                                         |
-| Keychain access | Yes (required for token storage)    | No                                                                  | Yes (extension integrity)                 | No                                          |
-| SEA extraction  | Yes (pre-sandbox)                   | No                                                                  | No                                        | No                                          |
-| Env isolation   | `GH_TOKEN` not injected (one-time file); `COPILOT_*` passed | `GH_TOKEN`, `COPILOT_*` suppressed                                  | `GH_TOKEN`, `COPILOT_*` suppressed        | `GH_TOKEN`, `COPILOT_*` suppressed          |
-| Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                          | No (explicit only — name collision risk)    |
+| Property        | Copilot                             | OpenCode                                                            | Gemini                                    | Antigravity                                 | Pi                                          |
+|-----------------|-------------------------------------|---------------------------------------------------------------------|-------------------------------------------|----------------------------------------------|---------------------------------------------|
+| Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow → `auth.json`, or API keys                   | Google OAuth (browser) or API key         | Google OAuth (browser / keyring session)     | API keys (Anthropic, OpenAI, Gemini, etc.)  |
+| Auth in sandbox | Token served via one-time file read (gh guard) or Keychain | Copilot auth stored in data dir; third-party keys need `--pass-env` | OAuth stored in `~/.gemini/`; key needs `--pass-env` | OAuth/session data stored in `~/.gemini/*` | Keys need `--pass-env`             |
+| Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini` (read/write)                  | `~/.gemini/config` (read/write)              | `~/.pi` (read/write)                       |
+| Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          | N/A (in config dir)                       | `~/.gemini/antigravity-cli` (read/write)     | `~/.pi/agent/bin` (read + exec)             |
+| State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          | N/A                                       | N/A                                          | N/A                                         |
+| Keychain access | Yes (required for token storage)    | No                                                                  | Yes (extension integrity)                 | Yes (OAuth/keyring flow)                     | No                                          |
+| SEA extraction  | Yes (pre-sandbox)                   | No                                                                  | No                                        | No                                           | No                                          |
+| Env isolation   | `GH_TOKEN` not injected (one-time file); `COPILOT_*` passed | `GH_TOKEN`, `COPILOT_*` suppressed                                  | `GH_TOKEN`, `COPILOT_*` suppressed        | `GH_TOKEN`, `COPILOT_*` suppressed           | `GH_TOKEN`, `COPILOT_*` suppressed          |
+| Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                          | Yes (priority 4)                             | No (explicit only — name collision risk)    |
 
 ### OpenCode-specific security notes
 
@@ -33,6 +33,12 @@ cplt sandboxes AI coding agents — currently **GitHub Copilot CLI**, **[OpenCod
 - **API key alternative**: `GEMINI_API_KEY` or `GOOGLE_CLOUD_PROJECT` can be used instead of OAuth — must be passed via `--pass-env`.
 - **Keychain access enabled**: Gemini uses macOS Keychain for extension integrity verification.
 - **Config dir is read/write**: `~/.gemini/` stores auth, settings, sessions, and agents.
+
+### Antigravity-specific security notes
+
+- **OAuth browser flow**: Antigravity uses Google OAuth for login.
+- **Keychain access enabled**: Antigravity relies on macOS keyring/Keychain integration as an authentication trade-off, similar to other OAuth-based agents.
+- **Config/data dirs are read/write**: `~/.gemini/config/` and `~/.gemini/antigravity-cli/`.
 
 ### Pi-specific security notes
 
