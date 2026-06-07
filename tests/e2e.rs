@@ -767,6 +767,30 @@ mod e2e_tests {
     }
 
     #[test]
+    fn e2e_print_profile_deny_clipboard_emits_pasteboard_deny() {
+        require_copilot!();
+        let output = cplt_cmd()
+            .args(["--deny-clipboard", "--print-profile"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        let allow_idx = stdout
+            .find("(allow mach-lookup)")
+            .expect("profile should include mach-lookup allow");
+        let deny_idx = stdout
+            .find(r#"(deny mach-lookup (global-name-regex #"^com\.apple\.pasteboard(\.|$)"))"#)
+            .expect("profile should include pasteboard deny when --deny-clipboard is set");
+        assert!(
+            deny_idx > allow_idx,
+            "pasteboard deny must appear after mach allow (SBPL last-match-wins).\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
     fn e2e_print_profile_allow_write() {
         require_copilot!();
         let allow_dir =

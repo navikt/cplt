@@ -1282,6 +1282,29 @@ finally:
         );
     }
 
+    /// Verify `--deny-clipboard` also blocks clipboard writes via `pbcopy`.
+    ///
+    /// This complements the `pbpaste` read test so both read and write
+    /// operations are covered against the same pasteboard Mach deny.
+    #[test]
+    fn real_profile_deny_clipboard_blocks_pbcopy() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let mut opts = default_opts(&project, &home);
+        opts.deny_clipboard = true;
+        let profile = write_real_profile(&opts);
+
+        let cmd = "echo cplt-test | pbcopy 2>&1; echo EXIT:$?";
+        let (output, _) = run_sandboxed(&profile, cmd);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            !output.contains("EXIT:0"),
+            "pbcopy should be blocked when deny_clipboard is set, got: {output}"
+        );
+    }
+
     /// Without `--deny-clipboard`, `pbpaste` must still exit successfully.
     ///
     /// This guards against accidentally breaking the pasteboard in the default
