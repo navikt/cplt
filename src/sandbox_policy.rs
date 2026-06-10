@@ -47,6 +47,9 @@ pub const DENIED_HOME_SUBPATHS: &[&str] = &[
     ".gradle/gradle.properties",
     ".cargo/credentials",
     ".cargo/credentials.toml",
+    // NuGet.Config can contain <packageSourceCredentials> with plaintext registry passwords.
+    // Same threat model as .m2/settings.xml — override with allow.read if private registry needed.
+    ".nuget/NuGet.Config",
 ];
 
 /// Sensitive file patterns in the project directory that are denied by default.
@@ -228,7 +231,11 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "ASDF_DATA_DIR",           // asdf data directory (installs, shims)
     "PYTHONDONTWRITEBYTECODE", // Prevent .pyc writes (common in CI/sandboxed envs)
     // pnpm
-    "PNPM_HOME", // pnpm binary location
+    "PNPM_HOME",             // pnpm binary location
+    "NPM_CONFIG_USERCONFIG", // path to a custom .npmrc file (not the file itself — no auth tokens)
+    // .NET / dotnet CLI
+    "DOTNET_CLI_HOME", // override dotnet CLI state dir (default ~/.dotnet)
+    "DOTNET_ROOT",     // override SDK install location (e.g. Homebrew /usr/local/share/dotnet)
     // Locale
     "LANG",
     "LANGUAGE",
@@ -627,7 +634,19 @@ pub const APP_DIRS: &[AppDir] = &[
         application: "pnpm",
         process_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
         map_exec: &[AppDirKind::Data, AppDirKind::DataLocal],
-        write: DEFAULT_WRITE_APP_DIRS,
+        // Config/Preference dirs (~/.config/pnpm, ~/Library/Preferences/pnpm) are
+        // writable: pnpm reads and writes its settings (hoisting, virtual store state)
+        // there during normal operation. These dirs contain no credentials.
+        write: &[
+            AppDirKind::Cache,
+            AppDirKind::Config,
+            AppDirKind::ConfigLocal,
+            AppDirKind::Data,
+            AppDirKind::DataLocal,
+            AppDirKind::Preference,
+            AppDirKind::Runtime,
+            AppDirKind::State,
+        ],
         read: DEFAULT_READ_APP_DIRS,
     },
     AppDir {
@@ -825,6 +844,29 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: true,
         write: true,
     },
+    // NuGet package cache: contains .nupkg archives + extracted native libs.
+    // map_exec needed for packages that ship native shared libraries (.so/.dylib).
+    HomeToolDir {
+        path: ".nuget",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    // dotnet CLI home: stores first-run state, telemetry opt-out flags, tool manifests.
+    // write needed for CLI state files dotnet writes on every invocation.
+    // process_exec intentionally false: dotnet SDK executables live in system paths
+    // (Homebrew: /usr/local/share/dotnet, Linux packages: /usr/share/dotnet) — not here.
+    // Granting write + process_exec would let a rogue agent trojan dotnet tools that
+    // persist after the sandbox (same pattern as .cargo/bin which is also write: false).
+    // map_exec true for JIT-compiled native images the runtime memory-maps.
+    // Users who install the SDK via dotnet-install.sh into ~/.dotnet may need to add
+    // allow.read = ["~/.dotnet"] and set DOTNET_ROOT explicitly.
+    HomeToolDir {
+        path: ".dotnet",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
     HomeToolDir {
         path: "go/pkg",
         process_exec: false,
@@ -864,6 +906,8 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: true,
         write: true,
     },
+    // Note: pnpm config dirs (~/.config/pnpm on Linux, ~/Library/Preferences/pnpm on macOS)
+    // are handled by the pnpm AppDir entry with Config/Preference write access, not here.
     // Kotlin compiler daemon: client marker files and run files.
     // The Kotlin Maven/Gradle plugin uses this for daemon lifecycle management.
     // XDG path (Linux, some macOS setups)

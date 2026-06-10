@@ -1847,6 +1847,8 @@ fn home_tool_dirs_has_all_runtime_entries() {
         ".gradle",
         ".m2",
         ".konan",
+        ".nuget",
+        ".dotnet",
         "go/pkg",
         ".cargo/registry",
         ".cargo/git",
@@ -1869,6 +1871,16 @@ fn home_tool_dirs_has_all_runtime_entries() {
     assert!(
         paths.contains(&"Library/pnpm"),
         "HOME_TOOL_DIRS missing Library/pnpm"
+    );
+
+    // pnpm config dirs are handled by AppDirs, not HOME_TOOL_DIRS
+    assert!(
+        !paths.contains(&"Library/Preferences/pnpm"),
+        "Library/Preferences/pnpm should NOT be in HOME_TOOL_DIRS (handled by AppDirs)"
+    );
+    assert!(
+        !paths.contains(&".config/pnpm"),
+        ".config/pnpm should NOT be in HOME_TOOL_DIRS (handled by AppDirs)"
     );
 }
 
@@ -1949,6 +1961,11 @@ fn env_allowlist_includes_new_runtime_vars() {
 
     // pnpm
     assert!(ENV_ALLOWLIST.contains(&"PNPM_HOME"));
+    assert!(ENV_ALLOWLIST.contains(&"NPM_CONFIG_USERCONFIG"));
+
+    // .NET / dotnet CLI
+    assert!(ENV_ALLOWLIST.contains(&"DOTNET_CLI_HOME"));
+    assert!(ENV_ALLOWLIST.contains(&"DOTNET_ROOT"));
 
     // Prefixes
     assert!(ENV_PREFIX_ALLOWLIST.contains(&"PYENV_"));
