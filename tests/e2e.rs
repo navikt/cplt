@@ -3757,4 +3757,172 @@ mod e2e_tests {
             "doctor should show workspace member: {combined}"
         );
     }
+
+    // ============================================================
+    // cplt exec tests
+    // ============================================================
+
+    #[test]
+    fn e2e_exec_runs_true() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args(["exec", "--no-validate", "--", "/usr/bin/true"])
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+
+        assert!(
+            output.status.success(),
+            "cplt exec -- /usr/bin/true should exit 0.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn e2e_exec_exit_code_pass_through() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args(["exec", "--no-validate", "--", "/usr/bin/false"])
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+
+        assert!(
+            !output.status.success(),
+            "cplt exec -- /usr/bin/false should exit non-zero"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "exit code should be 1 (from /usr/bin/false)"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_shell_c_mode() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args(["exec", "--no-validate", "-c", "echo hello-from-exec"])
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec -c should run");
+
+        assert!(
+            output.status.success(),
+            "cplt exec -c 'echo ...' should exit 0.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("hello-from-exec"),
+            "stdout should contain echo output.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_no_banner_on_stdout() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args(["exec", "--no-validate", "--", "/usr/bin/true"])
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // exec must not contaminate stdout with cplt startup messages
+        assert!(
+            stdout.is_empty(),
+            "exec stdout should be clean (no banner).\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_stderr_quiet_by_default() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args(["exec", "--no-validate", "--", "/usr/bin/true"])
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // quiet is the default for exec — no cplt status lines
+        assert!(
+            stderr.is_empty(),
+            "exec stderr should be empty by default (quiet).\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_env_credentials_filtered() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args(["exec", "--no-validate", "--", "/usr/bin/env"])
+            .current_dir(project_dir())
+            .env("AWS_SECRET_ACCESS_KEY", "should-be-stripped")
+            .env("DATABASE_URL", "postgres://secret")
+            .output()
+            .expect("cplt exec should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("should-be-stripped"),
+            "AWS_SECRET_ACCESS_KEY must be stripped from sandbox env.\nstdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("postgres://secret"),
+            "DATABASE_URL must be stripped from sandbox env.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_no_command_errors() {
+        let output = cplt_cmd()
+            .args(["exec"])
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec with no cmd should run");
+
+        assert!(
+            !output.status.success(),
+            "cplt exec with no command should exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("exec")
+                || stderr.contains("Usage")
+                || stderr.contains("CMD")
+                || stderr.contains("no command"),
+            "stderr should contain usage hint.\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_no_quiet_shows_summary() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args([
+                "exec",
+                "--no-validate",
+                "--no-quiet",
+                "--yes",
+                "--",
+                "/usr/bin/true",
+            ])
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec --no-quiet should run");
+
+        assert!(
+            output.status.success(),
+            "cplt exec --no-quiet should still succeed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // --no-quiet should print sandbox configuration summary
+        assert!(
+            stderr.contains("Project") || stderr.contains("project"),
+            "exec --no-quiet should print sandbox summary.\nstderr: {stderr}"
+        );
+    }
 }

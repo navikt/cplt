@@ -83,6 +83,15 @@ EXAMPLES:
   cplt trust accept allow_jvm_attach allow_docker
     Approve specific permissions from .cplt.toml
 
+  cplt exec -- npm install
+    Run npm install in the sandbox (filesystem/network isolated)
+
+  cplt exec -c \"npm install && npm test\"
+    Run compound shell commands in the sandbox
+
+  alias npm=\"cplt exec -- npm\"
+    Sandboxed npm for every invocation
+
   eval \"$(cplt --shell-setup)\"
     Add to your shell rc so 'copilot' runs the sandboxed version
 "
@@ -522,7 +531,35 @@ enum Command {
     /// and sandbox-critical paths. Exits 0 if all critical checks pass.
     Doctor,
 
-    /// [internal] Evaluate a gh command against the proxy policy.
+    /// Run an arbitrary command inside the sandbox.
+    ///
+    /// Uses the same sandbox as `--agent shell`: filesystem isolation,
+    /// env filtering, network proxy, etc.
+    ///
+    /// stdin/stdout/stderr are passed through transparently.
+    /// Exit code is forwarded from the child process.
+    /// No startup banner or confirmation prompt — clean for piping and aliases.
+    ///
+    /// All top-level cplt flags work: --project-dir, --allow-read, --with-proxy, etc.
+    ///
+    /// EXAMPLES:
+    ///   cplt exec -- npm install
+    ///   cplt exec --allow-lifecycle-scripts -- npm install
+    ///   cplt exec --project-dir /path/to/repo -- make build
+    ///   cplt exec -c "npm install && npm test"
+    ///   alias npm="cplt exec -- npm"
+    Exec {
+        /// Run CMD via the shell interpreter ($SHELL -c CMD).
+        /// Useful for shell built-ins and compound commands.
+        /// Example: cplt exec -c "npm install && npm test"
+        #[arg(short = 'c', value_name = "CMD", conflicts_with = "cmd")]
+        shell_cmd: Option<String>,
+
+        /// The command and its arguments (everything after --).
+        #[arg(last = true, value_name = "CMD")]
+        cmd: Vec<String>,
+    },
+
     ///
     /// Called by the gh wrapper script inside the sandbox. Not intended
     /// for direct use. Evaluates the command, passes through if allowed,
@@ -1241,7 +1278,7 @@ fn start_proxy_if_enabled(
     }
 }
 
-fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // Handle --init-config
     if cli.init_config {
         return Ok(init_config());
@@ -1256,6 +1293,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // Handle --shell-install: append setup line to shell rc file
     if cli.shell_install {
         return Ok(shell_install());
+    }
+
+    // Handle `cplt exec` before consuming cli.command so resolve_context
+    // can still borrow &cli after we take the exec-specific fields out.
+    if let Some(Command::Exec { shell_cmd, cmd }) = cli.command.take() {
+        return run_exec_command(&cli, shell_cmd, cmd);
     }
 
     // Handle subcommands (these don't need macOS or sandbox)
@@ -1335,6 +1378,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     &rules,
                 )
             }
+            // Exec is handled before this match (see above) — unreachable
+            Command::Exec { .. } => unreachable!("Command::Exec handled before this match"),
         });
     }
 
@@ -1817,6 +1862,237 @@ fn run_git_gate(
             }
         },
     }
+}
+
+// ── cplt exec ──────────────────────────────────────────────────────────────
+
+/// Resolve a command name to an absolute binary path.
+///
+/// If `name` is already an absolute path, validate it exists and return it.
+/// Otherwise walk PATH entries (left-to-right) and return the first match.
+/// Unlike `Agent::resolve_binary()`, this does not skip cplt aliases — the
+/// user explicitly asked for this binary.
+fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
+    let p = PathBuf::from(name);
+    if p.is_absolute() {
+        // Canonicalize to resolve symlinks and `..` components — consistent with
+        // how other paths are handled, and avoids passing a non-canonical path
+        // to the OS after the sandbox allow-lists have been resolved.
+        let canonical = std::fs::canonicalize(&p).with_context(|| {
+            format!("exec: binary not found or not accessible: {}", p.display())
+        })?;
+        if canonical.is_file() {
+            return Ok(canonical);
+        }
+        bail!("exec: not a file: {}", canonical.display());
+    }
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    for dir in path_var.split(':') {
+        let candidate = PathBuf::from(dir).join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    bail!("exec: '{name}' not found in PATH")
+}
+
+/// Run an arbitrary command inside the sandbox (`cplt exec -- <cmd> [args]`).
+///
+/// Reuses the Agent::Shell sandbox policy. Defaults to quiet+yes so it is
+/// clean for scripting and shell aliases. Pass --no-quiet to show the summary.
+fn run_exec_command(
+    cli: &Cli,
+    shell_cmd: Option<String>,
+    cmd: Vec<String>,
+) -> anyhow::Result<ExitCode> {
+    // Platform check
+    if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+        bail!("cplt exec requires macOS or Linux");
+    }
+
+    // Recursion guard: block nested exec inside an existing sandbox.
+    if std::env::var("__CPLT_WRAPPED").is_ok() {
+        bail!(
+            "cplt exec: already inside a cplt sandbox (recursion detected). \
+             Run this command outside the sandbox."
+        );
+    }
+
+    // Resolve the binary and args to pass to the sandbox
+    let (exec_bin, exec_args): (PathBuf, Vec<String>) = if let Some(ref shell_c) = shell_cmd {
+        // -c mode: delegate to $SHELL -c "cmd"
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                "/bin/zsh".to_string()
+            } else {
+                "/bin/sh".to_string()
+            }
+        });
+        (
+            PathBuf::from(shell),
+            vec!["-c".to_string(), shell_c.clone()],
+        )
+    } else {
+        if cmd.is_empty() {
+            bail!(
+                "cplt exec: no command given.\n\
+                 Usage: cplt exec -- <cmd> [args...]\n\
+                 Or:    cplt exec -c \"cmd && cmd\""
+            );
+        }
+        let bin = resolve_exec_binary(&cmd[0])?;
+        (bin, cmd[1..].to_vec())
+    };
+
+    // Resolve config, paths, project dir — same pipeline as the main agent launch
+    let ResolvedContext {
+        mut resolved,
+        config_path,
+        home_dir,
+        project_dir,
+        unapproved_proposals: _,
+        // active_agent from resolve_context is ignored — exec always uses Shell
+        active_agent: _,
+    } = resolve_context(cli)?;
+
+    // exec defaults to quiet+yes (scripting UX). User can override with --no-quiet / --no-yes.
+    if !cli.no_quiet {
+        resolved.quiet = true;
+    }
+    if !cli.no_yes {
+        resolved.yes = true;
+    }
+
+    // Warn about dangerous flags even in quiet mode — exec defaults to quiet,
+    // so these warnings would otherwise be silently swallowed. The main agent
+    // flow only warns inside print_summary (shown when !quiet), but for exec
+    // the user never explicitly chose quiet mode, so we must warn here.
+    if resolved.inherit_env {
+        ui::warn(
+            "exec: --inherit-env is active — all env vars (including credentials) are passed to the sandbox",
+        );
+    }
+    if resolved.allow_docker {
+        ui::warn(
+            "exec: --allow-docker is active — container volume mounts bypass sandbox filesystem restrictions",
+        );
+    }
+    if resolved.allow_tmp_exec {
+        ui::warn("exec: --allow-tmp-exec is active — code execution from /tmp is allowed");
+    }
+
+    // Always use the Shell sandbox policy
+    let active_agent = agent::Agent::Shell;
+
+    let tool_discovery = discover::discover_tools(&home_dir);
+    let existing_home_tool_dirs = tool_discovery.existing_home_tool_dirs;
+    let existing_app_dirs = tool_discovery.existing_app_dirs;
+
+    let scratch_guard = if resolved.scratch_dir {
+        scratch::ScratchDir::gc_stale(&home_dir);
+        match scratch::ScratchDir::create(&home_dir) {
+            Ok(s) => Some(s),
+            Err(e) => bail!("Cannot create scratch dir: {e}"),
+        }
+    } else {
+        None
+    };
+    let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
+
+    let git_hooks_path = discover::git_hooks_path(&home_dir);
+    let git_common_dir = discover::git_common_dir(&home_dir, &project_dir);
+    let java_home_dir = std::env::var("JAVA_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .filter(|p| !crate::is_unsafe_root(p, &home_dir));
+
+    let agent_dirs = active_agent.config_dirs(&home_dir);
+    for dir in &agent_dirs {
+        if !dir.path.exists() {
+            let _ = std::fs::create_dir_all(&dir.path);
+        }
+    }
+
+    let proxy_handle = start_proxy_if_enabled(&mut resolved, cli, config_path.as_ref())?;
+    let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
+
+    let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
+        project_dir: &project_dir,
+        home_dir: &home_dir,
+        extra_read: &resolved.allow_read,
+        extra_write: &resolved.allow_write,
+        extra_deny: &resolved.deny_paths,
+        existing_home_tool_dirs: Some(&existing_home_tool_dirs),
+        existing_app_dirs: Some(&existing_app_dirs),
+        extra_ports: &resolved.allow_ports,
+        localhost_ports: &resolved.allow_localhost,
+        proxy_port: proxy_port_for_profile,
+        allow_env_files: resolved.allow_env_files,
+        allow_localhost_any: resolved.allow_localhost_any,
+        scratch_dir: scratch_path,
+        allow_tmp_exec: resolved.allow_tmp_exec,
+        // exec has no agent install dir to grant special access to
+        copilot_install_dir: None,
+        java_home: java_home_dir.as_deref(),
+        git_hooks_path: git_hooks_path.as_deref(),
+        git_common_dir: git_common_dir.as_deref(),
+        allow_gpg_signing: resolved.allow_gpg_signing,
+        deny_clipboard: resolved.deny_clipboard,
+        allow_jvm_attach: resolved.allow_jvm_attach,
+        allow_docker: resolved.allow_docker,
+        electron_app_dir: None,
+        agent: active_agent,
+        agent_dirs: &agent_dirs,
+        allow_cache_exec: &resolved.allow_cache_exec,
+        allow_cache_exec_any: resolved.allow_cache_exec_any,
+        allow_browser: resolved.allow_browser,
+    }) {
+        Ok(s) => s,
+        Err(e) => bail!("{e}"),
+    };
+
+    if cli.print_profile {
+        println!("{}", sandbox::describe(&prepared));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Preflight: verify the sandbox mechanism works on this system.
+    // Respects --no-validate (same as the main agent flow).
+    if !resolved.no_validate {
+        match sandbox::preflight(&prepared) {
+            Ok(()) => {}
+            Err(e) => bail!("Sandbox validation failed: {e}"),
+        }
+    }
+
+    // Summary (only shown with --no-quiet)
+    if !resolved.quiet {
+        resolved.print_summary(&project_dir, &home_dir, active_agent);
+    }
+    if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
+        bail!("{e}");
+    }
+
+    let disabled_categories = resolved.disabled_hardening_categories();
+
+    let exit_code = sandbox::exec_sandboxed(
+        &prepared,
+        &exec_bin,
+        &exec_args,
+        &resolved.pass_env,
+        resolved.inherit_env,
+        &disabled_categories,
+        &resolved.deny_env,
+        &resolved.gh_guard,
+        &resolved.git_guard,
+    );
+
+    if let Some(handle) = proxy_handle {
+        handle.shutdown();
+    }
+
+    Ok(ExitCode::from(exit_code))
 }
 
 fn run_doctor() -> ExitCode {
