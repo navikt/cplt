@@ -1304,6 +1304,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     #[allow(clippy::collapsible_if)]
     if matches!(&cli.command, Some(Command::Exec { .. })) {
         if let Some(Command::Exec { shell_cmd, cmd }) = cli.command.take() {
+            // exec always uses the shell sandbox policy. Default --agent shell
+            // if none is specified so resolve_context doesn't fail when no AI
+            // agent binary is installed.
+            if cli.agent.is_none() {
+                cli.agent = Some("shell".to_string());
+            }
+            // exec defaults to quiet — apply before resolve_context so that
+            // config-loading diagnostics (e.g. "[cplt] Repo config: ...") are
+            // suppressed and don't contaminate scripts/pipes using exec.
+            if !cli.no_quiet {
+                cli.quiet = true;
+            }
             return run_exec_command(&cli, shell_cmd, cmd);
         }
     }
