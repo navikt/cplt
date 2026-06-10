@@ -539,10 +539,26 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     let log_file = state.log_file.as_deref();
     let log_level = state.log_level;
 
+    // Compute localhost bypass before the port check: --allow-localhost <PORT> must
+    // also exempt that port from the general port policy (which only lists remote ports
+    // like 443/80). Without this, allow_localhost_ports would be silently ignored —
+    // the port check would fire first and return 403 before the localhost logic ran.
+    let localhost_connect_allowed = {
+        let h = host.trim_start_matches('[').trim_end_matches(']');
+        let is_loopback = h == "localhost"
+            || h.ends_with(".localhost")
+            || h.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        is_loopback && (state.allow_localhost_any || state.allow_localhost_ports.contains(&port))
+    };
+
     // Enforce port policy — only allow ports matching the sandbox network rules.
     // Without this, the proxy would let sandboxed processes tunnel to arbitrary
     // remote ports, bypassing the sandbox's port restrictions.
-    if !state.allowed_ports.contains(&port) {
+    // Exception: explicitly-opened localhost ports bypass this check; the user's
+    // intent with --allow-localhost <PORT> is to reach that port regardless of
+    // whether it appears in the general allowed_ports list.
+    if !localhost_connect_allowed && !state.allowed_ports.contains(&port) {
         log_connection("CONNECT", target, "BLOCKED-PORT", log_file, log_level);
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPort not allowed\r\n");
         return;
@@ -564,20 +580,6 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n");
         return;
     }
-
-    // Allow CONNECT to localhost when the user has explicitly opened the port
-    // via `--allow-localhost <PORT>` or `--allow-localhost-any`. Without this,
-    // the private-IP block below would deny all loopback connections regardless
-    // of the user's intent — particularly important on Linux where the proxy is
-    // the primary localhost enforcement layer.
-    let localhost_connect_allowed = {
-        let h = host.trim_start_matches('[').trim_end_matches(']');
-        let is_loopback = h == "localhost"
-            || h.ends_with(".localhost")
-            || h.parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        is_loopback && (state.allow_localhost_any || state.allow_localhost_ports.contains(&port))
-    };
     // Reject hostname patterns that are known private (fast path before DNS)
     if !localhost_connect_allowed && is_private_hostname(&host) {
         log_connection("CONNECT", target, "BLOCKED-PRIVATE", log_file, log_level);
