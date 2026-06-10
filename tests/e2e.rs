@@ -3887,6 +3887,34 @@ mod e2e_tests {
     }
 
     #[test]
+    fn e2e_exec_relative_path() {
+        require_sandbox!();
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = project_dir();
+        let script = dir.join("cplt_exec_test_script.sh");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write test script");
+        let mut perms = fs::metadata(&script).expect("stat script").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod script");
+
+        let output = cplt_cmd()
+            .args(["exec", "--no-validate", "--", "./cplt_exec_test_script.sh"])
+            .current_dir(&dir)
+            .output()
+            .expect("cplt exec with relative path should run");
+
+        let _ = fs::remove_file(&script);
+
+        assert!(
+            output.status.success(),
+            "cplt exec -- ./script.sh should exit 0.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn e2e_exec_no_quiet_shows_summary() {
         require_sandbox!();
         let output = cplt_cmd()

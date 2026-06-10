@@ -1298,8 +1298,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Handle `cplt exec` before consuming cli.command so resolve_context
     // can still borrow &cli after we take the exec-specific fields out.
-    if let Some(Command::Exec { shell_cmd, cmd }) = cli.command.take() {
-        return run_exec_command(&cli, shell_cmd, cmd);
+    // The outer matches! guard ensures we only call take() when the variant
+    // is definitely Exec — without it, take() would consume any subcommand
+    // and leave cli.command = None, silently breaking all other subcommands.
+    #[allow(clippy::collapsible_if)]
+    if matches!(&cli.command, Some(Command::Exec { .. })) {
+        if let Some(Command::Exec { shell_cmd, cmd }) = cli.command.take() {
+            return run_exec_command(&cli, shell_cmd, cmd);
+        }
     }
 
     // Handle subcommands (these don't need macOS or sandbox)
@@ -1887,6 +1893,17 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
         }
         bail!("exec: not a file: {}", canonical.display());
     }
+    // Relative path (e.g. `./vendor-script.sh`) — resolve against cwd, not PATH.
+    if name.contains('/') {
+        let cwd = std::env::current_dir().context("exec: cannot determine current directory")?;
+        let canonical = std::fs::canonicalize(cwd.join(name)).with_context(|| {
+            format!("exec: relative binary not found or not accessible: {name}")
+        })?;
+        if canonical.is_file() {
+            return Ok(canonical);
+        }
+        bail!("exec: not a file: {}", canonical.display());
+    }
     let path_var = std::env::var("PATH").unwrap_or_default();
     for dir in path_var.split(':') {
         let candidate = PathBuf::from(dir).join(name);
@@ -1921,18 +1938,13 @@ fn run_exec_command(
 
     // Resolve the binary and args to pass to the sandbox
     let (exec_bin, exec_args): (PathBuf, Vec<String>) = if let Some(ref shell_c) = shell_cmd {
-        // -c mode: delegate to $SHELL -c "cmd"
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-            if cfg!(target_os = "macos") {
-                "/bin/zsh".to_string()
-            } else {
-                "/bin/sh".to_string()
-            }
-        });
-        (
-            PathBuf::from(shell),
-            vec!["-c".to_string(), shell_c.clone()],
-        )
+        // -c mode: use the same shell as --agent shell for consistent behaviour.
+        // Agent::Shell.resolve_binary() validates $SHELL exists and falls back to
+        // /bin/zsh (macOS) or /bin/bash (Linux) — same fallbacks as the interactive shell.
+        let shell = agent::Agent::Shell
+            .resolve_binary()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        (shell, vec!["-c".to_string(), shell_c.clone()])
     } else {
         if cmd.is_empty() {
             bail!(
