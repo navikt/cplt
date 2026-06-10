@@ -127,11 +127,13 @@ fn configure_command(
         //     --allow-localhost-any. Without explicit localhost access, the proxy is
         //     the sole mechanism blocking loopback connections (Landlock is port-based
         //     only and cannot distinguish localhost from remote hosts).
-        let localhost_allowed = allow_localhost_any || !allow_localhost.is_empty();
         #[cfg(target_os = "macos")]
-        let set_no_proxy = true;
+        let set_no_proxy = {
+            let _ = (allow_localhost, allow_localhost_any); // used on Linux only
+            true
+        };
         #[cfg(not(target_os = "macos"))]
-        let set_no_proxy = localhost_allowed;
+        let set_no_proxy = allow_localhost_any || !allow_localhost.is_empty();
         if set_no_proxy {
             cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
             cmd.env("no_proxy", "localhost,127.0.0.1,::1");

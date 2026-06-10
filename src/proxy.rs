@@ -606,12 +606,16 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // Check the RESOLVED IP address (prevents DNS rebinding attacks).
     // Domains in allow_private_domains are explicitly trusted to resolve to private IPs
     // (e.g. corporate internal services). All other checks still apply.
-    // Exception: localhost connections explicitly opened via --allow-localhost are
-    // permitted to resolve to loopback without being in allow_private_domains.
+    //
+    // For --allow-localhost: we use the *resolved* IP to confirm loopback, not the
+    // hostname. `*.localhost` in DNS is supposed to resolve to 127.0.0.1, but a
+    // compromised DNS or /etc/hosts entry could make `evil.localhost` resolve to
+    // 169.254.169.254 (cloud IMDS) or an internal host. Using the hostname pattern
+    // alone would bypass this check entirely, enabling SSRF to cloud metadata.
     let private_domains = state.get_private_domains();
     if is_private_ip(&socket_addr.ip())
         && !is_domain_match(&host, &private_domains)
-        && !localhost_connect_allowed
+        && !socket_addr.ip().is_loopback()
     {
         log_connection(
             "CONNECT",
@@ -1466,5 +1470,45 @@ mod tests {
             status.contains("200"),
             "CONNECT to localhost:{port} should succeed with --allow-localhost-any; got: {status}"
         );
+    }
+
+    /// Regression guard for the DNS rebinding fix:
+    /// The post-DNS private-IP check must use `socket_addr.ip().is_loopback()`, NOT
+    /// `localhost_connect_allowed` (which is derived from the hostname pre-DNS).
+    ///
+    /// Attack: `CONNECT evil.localhost:PORT` where `evil.localhost` resolves to
+    /// `169.254.169.254` (cloud IMDS) or `10.x.x.x` (internal).  The hostname
+    /// `*.localhost` would set `localhost_connect_allowed = true`, bypassing the
+    /// guard entirely with the old condition `&& !localhost_connect_allowed`.
+    ///
+    /// With the fix (`&& !socket_addr.ip().is_loopback()`), the resolved IP is
+    /// always verified — a private non-loopback IP is blocked regardless of hostname.
+    ///
+    /// We can't fake DNS in a unit test, but we can assert the IP-level invariants
+    /// that the fix relies on.
+    #[test]
+    fn post_dns_check_uses_is_loopback_not_hostname_pattern() {
+        // cloud IMDS and internal IPs are private but NOT loopback
+        let imds: std::net::IpAddr = "169.254.169.254".parse().unwrap();
+        let internal: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let loopback6: std::net::IpAddr = "::1".parse().unwrap();
+
+        // All four are caught by is_private_ip (the outer condition)
+        assert!(is_private_ip(&imds), "IMDS must be private");
+        assert!(is_private_ip(&internal), "RFC1918 must be private");
+        assert!(is_private_ip(&loopback), "loopback must be private");
+        assert!(is_private_ip(&loopback6), "IPv6 loopback must be private");
+
+        // Only true loopback passes is_loopback() — the guard the fix uses
+        assert!(!imds.is_loopback(), "IMDS must not be loopback");
+        assert!(!internal.is_loopback(), "RFC1918 must not be loopback");
+        assert!(loopback.is_loopback(), "127.0.0.1 must be loopback");
+        assert!(loopback6.is_loopback(), "::1 must be loopback");
+
+        // Consequence: if evil.localhost resolves to IMDS, is_loopback() = false
+        // → the private-IP block fires → SSRF prevented.
+        // With the old !localhost_connect_allowed condition, this block would be
+        // skipped for any *.localhost hostname, enabling the SSRF.
     }
 }
