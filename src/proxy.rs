@@ -123,6 +123,11 @@ pub struct ProxyState {
     // Ports: frozen at startup (kernel Seatbelt profile is immutable)
     allowed_ports: Vec<u16>,
 
+    // Localhost: ports (or all) explicitly opened via --allow-localhost[/-any].
+    // The proxy bypasses its private-IP block for CONNECT to these.
+    allow_localhost_ports: Vec<u16>,
+    allow_localhost_any: bool,
+
     // Audit log
     log_file: Option<PathBuf>,
     // Verbosity level for stderr output
@@ -300,6 +305,11 @@ pub struct ProxyOptions {
     pub port: u16,
     pub blocked_file: PathBuf,
     pub allowed_ports: Vec<u16>,
+    /// Specific localhost ports explicitly opened by `--allow-localhost`.
+    /// The proxy bypasses its private-IP block for CONNECT to these ports.
+    pub allow_localhost_ports: Vec<u16>,
+    /// Whether all localhost ports are open (`--allow-localhost-any`).
+    pub allow_localhost_any: bool,
     /// Path to an allowlist file (one domain per line). When set, only
     /// matching domains pass. The file is re-read every RELOAD_TTL seconds.
     pub allowed_domains_file: Option<PathBuf>,
@@ -382,6 +392,8 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         config_file: opts.config_file,
         private_domains_cache: Mutex::new(DomainCache::new(opts.config_private_domains)),
         allowed_ports: ports,
+        allow_localhost_ports: opts.allow_localhost_ports,
+        allow_localhost_any: opts.allow_localhost_any,
         log_file: opts.log_file,
         log_level: opts.log_level,
     });
@@ -553,8 +565,16 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         return;
     }
 
+    // Allow CONNECT to localhost when the user has explicitly opened the port
+    // via `--allow-localhost <PORT>` or `--allow-localhost-any`. Without this,
+    // the private-IP block below would deny all loopback connections regardless
+    // of the user's intent — particularly important on Linux where the proxy is
+    // the primary localhost enforcement layer.
+    let localhost_connect_allowed = is_private_hostname(&host)
+        && (state.allow_localhost_any || state.allow_localhost_ports.contains(&port));
+
     // Reject hostname patterns that are known private (fast path before DNS)
-    if is_private_hostname(&host) {
+    if !localhost_connect_allowed && is_private_hostname(&host) {
         log_connection("CONNECT", target, "BLOCKED-PRIVATE", log_file, log_level);
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked\r\n");
         return;
@@ -579,8 +599,13 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // Check the RESOLVED IP address (prevents DNS rebinding attacks).
     // Domains in allow_private_domains are explicitly trusted to resolve to private IPs
     // (e.g. corporate internal services). All other checks still apply.
+    // Exception: localhost connections explicitly opened via --allow-localhost are
+    // permitted to resolve to loopback without being in allow_private_domains.
     let private_domains = state.get_private_domains();
-    if is_private_ip(&socket_addr.ip()) && !is_domain_match(&host, &private_domains) {
+    if is_private_ip(&socket_addr.ip())
+        && !is_domain_match(&host, &private_domains)
+        && !localhost_connect_allowed
+    {
         log_connection(
             "CONNECT",
             target,
@@ -1059,6 +1084,8 @@ mod tests {
                 "config.example.com".to_string(),
             ])),
             allowed_ports: vec![443],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
         };
@@ -1079,6 +1106,8 @@ mod tests {
             config_file: None,
             private_domains_cache: Mutex::new(DomainCache::new(vec!["shared.com".to_string()])),
             allowed_ports: vec![443],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
         };
@@ -1104,6 +1133,8 @@ mod tests {
             config_file: None,
             private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
             allowed_ports: vec![443],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
         };
@@ -1132,6 +1163,8 @@ mod tests {
             config_file: None,
             private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
             allowed_ports: vec![443],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
         };
@@ -1166,6 +1199,8 @@ mod tests {
                     .unwrap(),
             }),
             allowed_ports: vec![443],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
         };
@@ -1217,6 +1252,8 @@ mod tests {
             port: 0,
             blocked_file: blocked,
             allowed_ports: vec![],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
             cli_private_domains: Vec::new(),
@@ -1245,6 +1282,8 @@ mod tests {
             port: 0,
             blocked_file: blocked,
             allowed_ports: vec![],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
             allowed_domains_file: Some(allowlist_path),
             allowed_domains_initial: Vec::new(),
             cli_private_domains: Vec::new(),
@@ -1278,6 +1317,8 @@ mod tests {
             config_file: None,
             private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
             allowed_ports: vec![443],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
         };

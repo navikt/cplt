@@ -1250,6 +1250,8 @@ fn start_proxy_if_enabled(
         port: resolved.proxy_port,
         blocked_file,
         allowed_ports: resolved.allow_ports.clone(),
+        allow_localhost_ports: resolved.allow_localhost.clone(),
+        allow_localhost_any: resolved.allow_localhost_any,
         allowed_domains_file,
         allowed_domains_initial: Vec::new(),
         cli_private_domains: cli.allow_private_domains.clone(),

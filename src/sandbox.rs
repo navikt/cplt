@@ -140,6 +140,10 @@ pub struct PreparedSandbox {
     scratch_dir: Option<PathBuf>,
     proxy_port: Option<u16>,
     agent: Agent,
+    /// Specific localhost ports the user has explicitly opened.
+    allow_localhost: Vec<u16>,
+    /// Whether all localhost ports are open (`--allow-localhost-any`).
+    allow_localhost_any: bool,
     /// Landlock + seccomp pre-computed sandbox data (Linux only).
     /// Built in the parent process; applied in pre_exec.
     #[cfg(target_os = "linux")]
@@ -266,6 +270,8 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         scratch_dir: config.scratch_dir.map(Path::to_path_buf),
         proxy_port: config.proxy_port,
         agent: config.agent,
+        allow_localhost: config.localhost_ports.to_vec(),
+        allow_localhost_any: config.allow_localhost_any,
     })
 }
 
@@ -325,6 +331,8 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         scratch_dir: config.scratch_dir.map(Path::to_path_buf),
         proxy_port: config.proxy_port,
         agent: config.agent,
+        allow_localhost: config.localhost_ports.to_vec(),
+        allow_localhost_any: config.allow_localhost_any,
         precomputed,
     })
 }

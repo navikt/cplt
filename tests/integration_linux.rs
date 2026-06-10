@@ -503,6 +503,70 @@ else:
         );
     }
 
+    #[test]
+    fn allow_localhost_port_permits_tcp_connect() {
+        require_landlock!(4);
+        let project = create_test_project();
+
+        // Start a listener that will accept a connection
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn a thread to accept the one connection so the sandbox connect() doesn't hang
+        let handle = std::thread::spawn(move || {
+            listener.accept().ok();
+        });
+
+        let script = format!(
+            "bash -c 'echo > /dev/tcp/127.0.0.1/{port}' 2>&1 && echo CONNECT_OK || echo CONNECT_FAILED"
+        );
+        let (_, stdout, _) = run_sandboxed_with_flags(
+            project.path(),
+            &["--allow-localhost", &port.to_string()],
+            &script,
+        );
+        handle.join().ok();
+
+        assert!(
+            stdout.contains("CONNECT_OK"),
+            "--allow-localhost {port} should permit TCP connect to localhost:{port} — stdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn allow_localhost_port_does_not_open_other_ports() {
+        require_landlock!(4);
+        let project = create_test_project();
+
+        let listener1 =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener 1");
+        let port1 = listener1.local_addr().unwrap().port();
+        let listener2 =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener 2");
+        let port2 = listener2.local_addr().unwrap().port();
+
+        // Accept on port1 so it doesn't hang
+        let handle = std::thread::spawn(move || {
+            listener1.accept().ok();
+        });
+
+        // Allow only port1; port2 should still be blocked
+        let script = format!("bash -c 'echo > /dev/tcp/127.0.0.1/{port2}' 2>&1 || echo BLOCKED");
+        let (_, stdout, _) = run_sandboxed_with_flags(
+            project.path(),
+            &["--allow-localhost", &port1.to_string()],
+            &script,
+        );
+        drop(listener2);
+        handle.join().ok();
+
+        assert!(
+            stdout.contains("BLOCKED"),
+            "--allow-localhost {port1} should not open port {port2} — stdout: {stdout}"
+        );
+    }
+
     // ── E2E binary tests ──────────────────────────────────────────
 
     #[test]

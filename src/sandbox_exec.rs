@@ -60,6 +60,8 @@ fn configure_command(
     disabled_categories: &[HardeningCategory],
     scratch_dir: Option<&Path>,
     proxy_port: Option<u16>,
+    allow_localhost: &[u16],
+    allow_localhost_any: bool,
     agent: Agent,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
@@ -119,12 +121,18 @@ fn configure_command(
         cmd.env("HTTPS_PROXY", &proxy_url);
         cmd.env("http_proxy", &proxy_url);
         cmd.env("https_proxy", &proxy_url);
-        // On macOS, exclude loopback from proxying — Seatbelt enforces localhost
-        // isolation at the kernel level, and MCP servers/dev servers need direct access.
-        // On Linux, do NOT exclude localhost — the proxy is the only mechanism to
-        // mediate/deny loopback connections (Landlock cannot filter by IP).
+        // Exclude loopback from proxying when localhost access is explicitly enabled:
+        //   - macOS: always excluded — Seatbelt enforces localhost at the kernel level.
+        //   - Linux: excluded only when the user opened specific localhost ports or
+        //     --allow-localhost-any. Without explicit localhost access, the proxy is
+        //     the sole mechanism blocking loopback connections (Landlock is port-based
+        //     only and cannot distinguish localhost from remote hosts).
+        let localhost_allowed = allow_localhost_any || !allow_localhost.is_empty();
         #[cfg(target_os = "macos")]
-        {
+        let set_no_proxy = true;
+        #[cfg(not(target_os = "macos"))]
+        let set_no_proxy = localhost_allowed;
+        if set_no_proxy {
             cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
             cmd.env("no_proxy", "localhost,127.0.0.1,::1");
         }
@@ -467,6 +475,8 @@ pub fn exec(
         disabled_categories,
         sandbox.scratch_dir.as_deref(),
         sandbox.proxy_port,
+        &sandbox.allow_localhost,
+        sandbox.allow_localhost_any,
         sandbox.agent,
         gh_guard,
         git_guard,
@@ -558,6 +568,8 @@ pub fn exec(
         disabled_categories,
         sandbox.scratch_dir.as_deref(),
         sandbox.proxy_port,
+        &sandbox.allow_localhost,
+        sandbox.allow_localhost_any,
         sandbox.agent,
         gh_guard,
         git_guard,
