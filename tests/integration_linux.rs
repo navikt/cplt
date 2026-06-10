@@ -526,8 +526,10 @@ else:
             &["--allow-localhost", &port.to_string()],
             &script,
         );
-        handle.join().ok();
 
+        // Ensure the accept thread unblocks even if the sandboxed connect failed.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        handle.join().ok();
         assert!(
             stdout.contains("CONNECT_OK"),
             "--allow-localhost {port} should permit TCP connect to localhost:{port} — stdout: {stdout}"

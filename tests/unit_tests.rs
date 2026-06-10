@@ -413,56 +413,6 @@ fn allow_private_domains_suffix_match() {
     assert!(!is_domain_match("notintern.nav.no", &list));
 }
 
-#[test]
-fn proxy_allow_localhost_port_bypasses_private_block() {
-    use cplt::proxy::is_private_hostname;
-    // Simulate the bypass condition in handle_connect when --allow-localhost is set:
-    //   localhost_connect_allowed = is_private_hostname(host)
-    //     && (allow_localhost_any || allow_localhost_ports.contains(&port))
-    let host = "localhost";
-    let port: u16 = 5173;
-
-    // Without allow_localhost: private hostname → should be blocked
-    let allow_localhost_ports: Vec<u16> = vec![];
-    let allow_localhost_any = false;
-    let localhost_connect_allowed =
-        is_private_hostname(host) && (allow_localhost_any || allow_localhost_ports.contains(&port));
-    assert!(
-        !localhost_connect_allowed,
-        "localhost:5173 should be blocked when --allow-localhost is not set"
-    );
-
-    // With --allow-localhost 5173: should be allowed
-    let allow_localhost_ports: Vec<u16> = vec![5173];
-    let localhost_connect_allowed =
-        is_private_hostname(host) && (allow_localhost_any || allow_localhost_ports.contains(&port));
-    assert!(
-        localhost_connect_allowed,
-        "localhost:5173 should be allowed when --allow-localhost 5173 is set"
-    );
-
-    // With --allow-localhost-any: all ports allowed
-    let allow_localhost_ports: Vec<u16> = vec![];
-    let allow_localhost_any = true;
-    let localhost_connect_allowed =
-        is_private_hostname(host) && (allow_localhost_any || allow_localhost_ports.contains(&port));
-    assert!(
-        localhost_connect_allowed,
-        "localhost:5173 should be allowed when --allow-localhost-any is set"
-    );
-
-    // Different port not in allow list → still blocked
-    let other_port: u16 = 9000;
-    let allow_localhost_ports: Vec<u16> = vec![5173];
-    let allow_localhost_any = false;
-    let localhost_connect_allowed = is_private_hostname(host)
-        && (allow_localhost_any || allow_localhost_ports.contains(&other_port));
-    assert!(
-        !localhost_connect_allowed,
-        "localhost:9000 should remain blocked when only port 5173 is allowed"
-    );
-}
-
 // ============================================================
 // SBPL path validation
 // ============================================================

@@ -570,9 +570,14 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // the private-IP block below would deny all loopback connections regardless
     // of the user's intent — particularly important on Linux where the proxy is
     // the primary localhost enforcement layer.
-    let localhost_connect_allowed = is_private_hostname(&host)
-        && (state.allow_localhost_any || state.allow_localhost_ports.contains(&port));
-
+    let localhost_connect_allowed = {
+        let h = host.trim_start_matches('[').trim_end_matches(']');
+        let is_loopback = h == "localhost"
+            || h.ends_with(".localhost")
+            || h.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        is_loopback && (state.allow_localhost_any || state.allow_localhost_ports.contains(&port))
+    };
     // Reject hostname patterns that are known private (fast path before DNS)
     if !localhost_connect_allowed && is_private_hostname(&host) {
         log_connection("CONNECT", target, "BLOCKED-PRIVATE", log_file, log_level);
@@ -1337,5 +1342,127 @@ mod tests {
         assert!(domains.contains(&"npm.pkg.github.com".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Skip guard for tests that make real TCP connections.
+    /// These tests require localhost TCP access, which is blocked inside the cplt sandbox.
+    macro_rules! require_localhost_tcp {
+        () => {
+            if std::env::var("__CPLT_WRAPPED").is_ok() {
+                eprintln!("SKIPPED: proxy CONNECT tests require localhost TCP (blocked inside cplt sandbox)");
+                return;
+            }
+        };
+    }
+
+    /// Helper: make a raw CONNECT request through the proxy and return the status line.
+    fn proxy_connect(proxy_port: u16, target: &str) -> String {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let mut conn = std::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).unwrap();
+        write!(conn, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").unwrap();
+        let mut reader = BufReader::new(conn);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        line.trim().to_string()
+    }
+
+    fn make_proxy(allow_localhost_ports: Vec<u16>, allow_localhost_any: bool) -> ProxyHandle {
+        let blocked = PathBuf::from("/dev/null");
+        start(ProxyOptions {
+            port: 0,
+            blocked_file: blocked,
+            allowed_ports: vec![443, 80],
+            allow_localhost_ports,
+            allow_localhost_any,
+            allowed_domains_file: None,
+            allowed_domains_initial: Vec::new(),
+            cli_private_domains: Vec::new(),
+            config_private_domains: Vec::new(),
+            config_file: None,
+            log_file: None,
+            log_level: ProxyLogLevel::None,
+        })
+        .expect("proxy start failed")
+    }
+
+    #[test]
+    fn proxy_connect_localhost_blocked_without_allow() {
+        require_localhost_tcp!();
+        // Start a real listener so the proxy can actually resolve the target.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let proxy = make_proxy(vec![], false);
+        let status = proxy_connect(proxy.port, &format!("localhost:{port}"));
+        proxy.shutdown();
+        drop(listener);
+
+        assert!(
+            status.contains("403"),
+            "CONNECT to localhost should be blocked without --allow-localhost; got: {status}"
+        );
+    }
+
+    #[test]
+    fn proxy_connect_localhost_allowed_with_specific_port() {
+        require_localhost_tcp!();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept the one connection so CONNECT doesn't hang waiting for TCP handshake.
+        let handle = std::thread::spawn(move || {
+            listener.accept().ok();
+        });
+
+        let proxy = make_proxy(vec![port], false);
+        let status = proxy_connect(proxy.port, &format!("localhost:{port}"));
+        proxy.shutdown();
+        handle.join().ok();
+
+        assert!(
+            status.contains("200"),
+            "CONNECT to localhost:{port} should succeed with --allow-localhost {port}; got: {status}"
+        );
+    }
+
+    #[test]
+    fn proxy_connect_localhost_other_port_still_blocked() {
+        require_localhost_tcp!();
+        let listener1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let allowed_port = listener1.local_addr().unwrap().port();
+        let listener2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let blocked_port = listener2.local_addr().unwrap().port();
+
+        let proxy = make_proxy(vec![allowed_port], false);
+        let status = proxy_connect(proxy.port, &format!("localhost:{blocked_port}"));
+        proxy.shutdown();
+        drop(listener1);
+        drop(listener2);
+
+        assert!(
+            status.contains("403"),
+            "CONNECT to localhost:{blocked_port} should be blocked when only {allowed_port} is allowed; got: {status}"
+        );
+    }
+
+    #[test]
+    fn proxy_connect_localhost_any_opens_all_ports() {
+        require_localhost_tcp!();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            listener.accept().ok();
+        });
+
+        let proxy = make_proxy(vec![], true);
+        let status = proxy_connect(proxy.port, &format!("localhost:{port}"));
+        proxy.shutdown();
+        handle.join().ok();
+
+        assert!(
+            status.contains("200"),
+            "CONNECT to localhost:{port} should succeed with --allow-localhost-any; got: {status}"
+        );
     }
 }
