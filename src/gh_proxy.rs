@@ -1303,6 +1303,16 @@ fn parse_repo_from_url(url: &str) -> Option<String> {
     // Look for github.com in the path
     let path = url
         .strip_prefix("https://github.com/")
+        .or_else(|| {
+            // HTTPS with embedded credentials: https://x-access-token:TOKEN@github.com/owner/repo.git
+            // Used by GitHub Actions and other CI systems.
+            if url.starts_with("https://") {
+                url.find("@github.com/")
+                    .map(|pos| &url[pos + "@github.com/".len()..])
+            } else {
+                None
+            }
+        })
         .or_else(|| url.strip_prefix("ssh://git@github.com/"))
         .or_else(|| url.strip_prefix("http://github.com/"))?;
 
@@ -2520,6 +2530,15 @@ mod tests {
     fn parse_ssh_url() {
         assert_eq!(
             parse_repo_from_url("ssh://git@github.com/navikt/cplt.git"),
+            Some("navikt/cplt".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_https_url_with_embedded_token() {
+        // GitHub Actions clones with https://x-access-token:TOKEN@github.com/owner/repo.git
+        assert_eq!(
+            parse_repo_from_url("https://x-access-token:ghs_abc123@github.com/navikt/cplt.git"),
             Some("navikt/cplt".to_string())
         );
     }
