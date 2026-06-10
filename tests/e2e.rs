@@ -3766,7 +3766,7 @@ mod e2e_tests {
     fn e2e_exec_runs_true() {
         require_sandbox!();
         let output = cplt_cmd()
-            .args(["exec", "--no-validate", "--", "/usr/bin/true"])
+            .args(["--no-validate", "exec", "--", "/usr/bin/true"])
             .current_dir(project_dir())
             .output()
             .expect("cplt exec should run");
@@ -3782,7 +3782,7 @@ mod e2e_tests {
     fn e2e_exec_exit_code_pass_through() {
         require_sandbox!();
         let output = cplt_cmd()
-            .args(["exec", "--no-validate", "--", "/usr/bin/false"])
+            .args(["--no-validate", "exec", "--", "/usr/bin/false"])
             .current_dir(project_dir())
             .output()
             .expect("cplt exec should run");
@@ -3802,7 +3802,7 @@ mod e2e_tests {
     fn e2e_exec_shell_c_mode() {
         require_sandbox!();
         let output = cplt_cmd()
-            .args(["exec", "--no-validate", "-c", "echo hello-from-exec"])
+            .args(["--no-validate", "exec", "-c", "echo hello-from-exec"])
             .current_dir(project_dir())
             .output()
             .expect("cplt exec -c should run");
@@ -3825,7 +3825,7 @@ mod e2e_tests {
         // both must be clean so it is safe to use in pipes and shell aliases.
         require_sandbox!();
         let output = cplt_cmd()
-            .args(["exec", "--no-validate", "--", "/usr/bin/true"])
+            .args(["--no-validate", "exec", "--", "/usr/bin/true"])
             .current_dir(project_dir())
             .output()
             .expect("cplt exec should run");
@@ -3846,7 +3846,7 @@ mod e2e_tests {
     fn e2e_exec_env_credentials_filtered() {
         require_sandbox!();
         let output = cplt_cmd()
-            .args(["exec", "--no-validate", "--", "/usr/bin/env"])
+            .args(["--no-validate", "exec", "--", "/usr/bin/env"])
             .current_dir(project_dir())
             .env("AWS_SECRET_ACCESS_KEY", "should-be-stripped")
             .env("DATABASE_URL", "postgres://secret")
@@ -3900,7 +3900,7 @@ mod e2e_tests {
         fs::set_permissions(&script, perms).expect("chmod script");
 
         let output = cplt_cmd()
-            .args(["exec", "--no-validate", "--", "./cplt_exec_test_script.sh"])
+            .args(["--no-validate", "exec", "--", "./cplt_exec_test_script.sh"])
             .current_dir(&dir)
             .output()
             .expect("cplt exec with relative path should run");
@@ -3919,10 +3919,10 @@ mod e2e_tests {
         require_sandbox!();
         let output = cplt_cmd()
             .args([
-                "exec",
                 "--no-validate",
                 "--no-quiet",
                 "--yes",
+                "exec",
                 "--",
                 "/usr/bin/true",
             ])
