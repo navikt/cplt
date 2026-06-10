@@ -1474,9 +1474,17 @@ mod tests {
             listener.accept().ok();
         });
 
-        let proxy = make_proxy(vec![port], false);
+        // Force IPv4 resolution: on macOS, `localhost` may resolve to ::1 first,
+        // which fails to connect to our IPv4-only listener. The injected resolver
+        // pins localhost → 127.0.0.1 so we test proxy allow-logic, not DNS order.
+        let loopback_v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let resolver: ResolverFn =
+            Arc::new(move |_host: &str, p: u16| Some(std::net::SocketAddr::new(loopback_v4, p)));
+        let proxy = make_proxy_with_resolver(vec![port], false, Some(resolver));
         let status = proxy_connect(proxy.port, &format!("localhost:{port}"));
         proxy.shutdown();
+        // Fallback connect so the accept thread unblocks if proxy didn't reach it.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         handle.join().ok();
 
         assert!(
@@ -1515,9 +1523,14 @@ mod tests {
             listener.accept().ok();
         });
 
-        let proxy = make_proxy(vec![], true);
+        // Force IPv4 resolution (same macOS ::1-first issue as the test above).
+        let loopback_v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let resolver: ResolverFn =
+            Arc::new(move |_host: &str, p: u16| Some(std::net::SocketAddr::new(loopback_v4, p)));
+        let proxy = make_proxy_with_resolver(vec![], true, Some(resolver));
         let status = proxy_connect(proxy.port, &format!("localhost:{port}"));
         proxy.shutdown();
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         handle.join().ok();
 
         assert!(
@@ -1609,6 +1622,9 @@ mod tests {
     /// Verify that legitimate localhost still works when --allow-localhost is set.
     /// This is the positive counterpart to proxy_blocks_dns_rebinding_evil_localhost_to_imds:
     /// real localhost resolves to 127.0.0.1, which is_loopback() = true → allowed.
+    ///
+    /// Uses an injected resolver to pin localhost → 127.0.0.1 so the test is stable
+    /// on macOS where getaddrinfo("localhost") returns ::1 first.
     #[test]
     fn proxy_allows_real_localhost_with_allow_localhost() {
         require_localhost_tcp!();
@@ -1620,10 +1636,13 @@ mod tests {
             listener.accept().ok();
         });
 
-        // No injected resolver — real DNS resolution: localhost → 127.0.0.1 (loopback)
-        let proxy = make_proxy(vec![port], false);
+        let loopback_v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let resolver: ResolverFn =
+            Arc::new(move |_host: &str, p: u16| Some(std::net::SocketAddr::new(loopback_v4, p)));
+        let proxy = make_proxy_with_resolver(vec![port], false, Some(resolver));
         let status = proxy_connect(proxy.port, &format!("localhost:{port}"));
         proxy.shutdown();
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         handle.join().ok();
 
         assert!(
