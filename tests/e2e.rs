@@ -3820,7 +3820,9 @@ mod e2e_tests {
     }
 
     #[test]
-    fn e2e_exec_no_banner_on_stdout() {
+    fn e2e_exec_no_output_contamination() {
+        // exec must not contaminate stdout or stderr with cplt startup messages —
+        // both must be clean so it is safe to use in pipes and shell aliases.
         require_sandbox!();
         let output = cplt_cmd()
             .args(["exec", "--no-validate", "--", "/usr/bin/true"])
@@ -3829,24 +3831,11 @@ mod e2e_tests {
             .expect("cplt exec should run");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // exec must not contaminate stdout with cplt startup messages
         assert!(
             stdout.is_empty(),
             "exec stdout should be clean (no banner).\nstdout: {stdout}"
         );
-    }
-
-    #[test]
-    fn e2e_exec_stderr_quiet_by_default() {
-        require_sandbox!();
-        let output = cplt_cmd()
-            .args(["exec", "--no-validate", "--", "/usr/bin/true"])
-            .current_dir(project_dir())
-            .output()
-            .expect("cplt exec should run");
-
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // quiet is the default for exec — no cplt status lines
         assert!(
             stderr.is_empty(),
             "exec stderr should be empty by default (quiet).\nstderr: {stderr}"

@@ -50,11 +50,14 @@ cplt doctor                 # check your environment
 cplt -- -p "fix the tests"  # run Copilot in sandbox
 ```
 
-Other agents:
+Other agents and sandbox commands:
 ```bash
 cplt --agent opencode                       # OpenCode (Copilot subscription)
 cplt --agent opencode --pass-env ANTHROPIC_API_KEY  # third-party provider
-cplt --agent shell                          # sandboxed shell (no AI)
+cplt --agent shell                          # interactive sandboxed shell (no AI)
+cplt exec -- npm install                    # sandbox any command directly
+cplt exec -c "npm install && npm test"      # compound commands in sandbox
+alias npm="cplt exec -- npm"               # sandboxed npm for every invocation
 ```
 
 ### Team rollout
@@ -556,14 +559,43 @@ Run a plain sandboxed shell — no AI agent, same security restrictions. Useful 
 # Interactive sandboxed shell (uses $SHELL — fish, zsh, bash)
 cplt --agent shell
 
-# Run a single command inside the sandbox
-cplt --agent shell -- -c 'go test ./...'
-
 # Inspect what's allowed without entering the shell
 cplt --agent shell --print-profile
 ```
 
 The sandbox applies the same deny-by-default rules — filesystem isolation, network restrictions, env sanitization. Shell config directories (fish variables/history, zsh history) are writable.
+
+> **Tip:** To run a single command non-interactively, use [`cplt exec`](#exec-mode) — it is cleaner for scripting and shell aliases than `cplt --agent shell -- -c 'cmd'`.
+
+### Exec mode
+
+<a id="exec-mode"></a>
+
+Run any command inside the sandbox without starting an AI agent. Clean for scripting, piping, and shell aliases — no startup banner, no confirmation prompt.
+
+```bash
+# Sandbox a single command
+cplt exec -- npm install
+cplt exec -- make build
+cplt exec -- go test ./...
+
+# Compound commands via $SHELL -c
+cplt exec -c "npm install && npm test"
+
+# Pass sandbox flags as usual
+cplt exec --allow-lifecycle-scripts -- npm install
+cplt exec --project-dir /path/to/repo -- make build
+cplt exec --with-proxy -- curl https://example.com
+
+# Shell aliases for sandboxed tools
+alias npm="cplt exec -- npm"
+alias node="cplt exec -- node"
+alias python="cplt exec -- python"
+```
+
+All top-level `cplt` flags apply: `--project-dir`, `--allow-read`, `--deny-path`, `--with-proxy`, `--pass-env`, etc.
+
+Use `--no-quiet` to see the full sandbox configuration summary before the command runs.
 
 ### Examples
 
@@ -638,7 +670,8 @@ cplt --pass-env ANTHROPIC_API_KEY
 cplt --agent shell
 
 # Run a one-off command in the sandbox
-cplt --agent shell -- -c 'npm test'
+cplt exec -- npm test
+cplt exec -c "npm install && npm test"
 ```
 
 ## Configuration

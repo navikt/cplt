@@ -560,6 +560,7 @@ enum Command {
         cmd: Vec<String>,
     },
 
+    /// [internal] Evaluate a gh command against the proxy policy.
     ///
     /// Called by the gh wrapper script inside the sandbox. Not intended
     /// for direct use. Evaluates the command, passes through if allowed,
