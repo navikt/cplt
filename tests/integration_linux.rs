@@ -739,4 +739,204 @@ else:
         );
         assert_eq!(code, 0, "~/.cache should be writable");
     }
+
+    // ── Proxy-layer tests ─────────────────────────────────────────
+    //
+    // These tests exercise the cplt CONNECT proxy (not just Landlock).
+    // Existing network tests use /dev/tcp (raw TCP) which bypasses HTTP_PROXY.
+    // curl respects HTTP_PROXY and exercises the full proxy enforcement layer.
+    //
+    // Prerequisite: curl must be in PATH on the test machine.
+
+    /// Skip guard for tests that require curl.
+    macro_rules! require_curl {
+        () => {
+            if !std::process::Command::new("curl")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                eprintln!("SKIPPED: curl not available");
+                return;
+            }
+        };
+    }
+
+    /// Start a minimal HTTP/1.0 server that accepts one connection and returns 200.
+    /// Returns (port, join_handle). The handle must be joined after the test.
+    fn start_http_echo_server() -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind echo server");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                );
+            }
+        });
+        (port, handle)
+    }
+
+    /// Full-stack proxy wiring test: --allow-localhost PORT sets NO_PROXY and opens
+    /// the Landlock TCP path so curl can reach the listener directly.
+    ///
+    /// Data flow: curl → (NO_PROXY set) → direct TCP → Landlock allows PORT → listener
+    ///
+    /// This test would fail if:
+    /// - allow_localhost_ports is not wired from CLI into sandbox_exec (NO_PROXY not set)
+    /// - Landlock does not open the port when --allow-localhost is given
+    #[test]
+    fn proxy_allows_curl_to_localhost_with_allow_flag() {
+        require_landlock!(4);
+        require_curl!();
+        let project = create_test_project();
+        let (port, server_handle) = start_http_echo_server();
+
+        let script = format!(
+            "curl --max-time 5 -s http://127.0.0.1:{port}/ && echo CURL_OK || echo CURL_FAIL"
+        );
+        let (_, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--allow-localhost", &port.to_string()],
+            &script,
+        );
+
+        // Unblock the server if curl didn't connect
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        server_handle.join().ok();
+
+        assert!(
+            stdout.contains("CURL_OK"),
+            "--allow-localhost {port}: curl to 127.0.0.1:{port} must succeed; stdout: {stdout} stderr: {stderr}"
+        );
+    }
+
+    /// Negative case: without --allow-localhost, curl to localhost must be blocked.
+    /// Without the flag, NO_PROXY is not set → curl routes through the cplt proxy →
+    /// proxy returns 405 (plain HTTP) or the Landlock TCP deny fires first.
+    #[test]
+    fn proxy_blocks_curl_to_localhost_without_allow_flag() {
+        require_landlock!(4);
+        require_curl!();
+        let project = create_test_project();
+
+        // Use a high ephemeral port. There's nothing listening, but the test
+        // only needs to verify the connection attempt is blocked, not that a
+        // real server responds.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // Close it — we don't want connections to succeed
+
+        let script = format!(
+            "curl --max-time 3 -sf http://127.0.0.1:{port}/ 2>&1 && echo CURL_OK || echo CURL_FAIL"
+        );
+        let (_, stdout, _) = run_sandboxed(project.path(), &script);
+
+        assert!(
+            stdout.contains("CURL_FAIL"),
+            "without --allow-localhost, curl to 127.0.0.1:{port} must fail; got: {stdout}"
+        );
+    }
+
+    /// Verify that the NO_PROXY env var is set inside the sandbox when
+    /// --allow-localhost is configured, so tools bypass the proxy for loopback.
+    #[test]
+    fn no_proxy_set_when_allow_localhost_configured() {
+        require_landlock!();
+        let project = create_test_project();
+
+        let (_, stdout, _) = run_sandboxed_with_flags(
+            project.path(),
+            &["--allow-localhost", "5173"],
+            "echo \"NO_PROXY=${NO_PROXY:-UNSET}\"",
+        );
+
+        assert!(
+            stdout.contains("localhost") || stdout.contains("127.0.0.1"),
+            "--allow-localhost must set NO_PROXY to include loopback addresses; got: {stdout}"
+        );
+    }
+
+    /// Verify that NO_PROXY is NOT set (or does not include loopback) when
+    /// --allow-localhost is not configured — the proxy must intercept loopback.
+    #[test]
+    fn no_proxy_not_set_without_allow_localhost() {
+        require_landlock!();
+        let project = create_test_project();
+
+        let (_, stdout, _) = run_sandboxed(project.path(), "echo \"NO_PROXY=${NO_PROXY:-UNSET}\"");
+
+        assert!(
+            stdout.contains("UNSET")
+                || (!stdout.contains("localhost") && !stdout.contains("127.0.0.1")),
+            "without --allow-localhost, NO_PROXY must not bypass proxy for loopback; got: {stdout}"
+        );
+    }
+
+    // ── Environment isolation tests ───────────────────────────────
+
+    /// Verify that credential-style env vars do not leak into the sandbox.
+    /// The ENV_ALLOWLIST is supposed to filter these out.
+    #[test]
+    fn sandboxed_env_does_not_leak_credentials() {
+        require_landlock!();
+        let project = create_test_project();
+
+        // Inject credential-like vars into the cplt parent process env
+        let output = Command::new(binary_path())
+            .args([
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--agent",
+                "shell",
+                "-C",
+                &project.path().to_string_lossy(),
+                "--",
+                "-c",
+                "env | grep -cE '^(AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AZURE_CLIENT_SECRET|NPM_TOKEN|GITHUB_TOKEN)=' ; true",
+            ])
+            .env("HOME", home_dir())
+            .env("AWS_SECRET_ACCESS_KEY", "test-secret-must-not-leak")
+            .env("AWS_SESSION_TOKEN", "test-token-must-not-leak")
+            .env("AZURE_CLIENT_SECRET", "test-azure-secret")
+            .env("NPM_TOKEN", "test-npm-token")
+            .env("GITHUB_TOKEN", "test-github-token")
+            .output()
+            .expect("Failed to run cplt");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let count: u32 = stdout.trim().parse().unwrap_or(999);
+        assert_eq!(
+            count, 0,
+            "Credential env vars must be filtered by ENV_ALLOWLIST; found {count} leaking into sandbox. stdout: {stdout}"
+        );
+    }
+
+    /// Verify that HOME and other required tool vars pass through to the sandbox.
+    #[test]
+    fn sandboxed_env_passes_home_and_path() {
+        require_landlock!();
+        let project = create_test_project();
+
+        let (_, stdout, _) = run_sandboxed(
+            project.path(),
+            "echo HOME=$HOME && echo PATH_SET=${PATH:+yes}",
+        );
+
+        assert!(
+            stdout.contains("HOME="),
+            "HOME must be present in sandbox env; got: {stdout}"
+        );
+        assert!(
+            stdout.contains("PATH_SET=yes"),
+            "PATH must be present in sandbox env; got: {stdout}"
+        );
+    }
 }

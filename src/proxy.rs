@@ -104,6 +104,12 @@ impl DomainCache {
     }
 }
 
+/// DNS resolver override used in tests to inject fake DNS responses.
+/// Receives (hostname, port) and returns a resolved `SocketAddr`, or `None`
+/// to simulate a DNS failure. Never used in production builds.
+#[cfg(test)]
+pub type ResolverFn = Arc<dyn Fn(&str, u16) -> Option<std::net::SocketAddr> + Send + Sync>;
+
 /// Shared proxy state holding cached domain lists and config paths.
 /// Wrapped in `Arc` and shared across connection threads.
 pub struct ProxyState {
@@ -132,6 +138,10 @@ pub struct ProxyState {
     log_file: Option<PathBuf>,
     // Verbosity level for stderr output
     log_level: ProxyLogLevel,
+
+    // Test-only: injectable DNS resolver to simulate fake DNS responses.
+    #[cfg(test)]
+    resolver: Option<ResolverFn>,
 }
 
 impl ProxyState {
@@ -326,6 +336,11 @@ pub struct ProxyOptions {
     pub log_file: Option<PathBuf>,
     /// Verbosity level for proxy stderr output.
     pub log_level: ProxyLogLevel,
+
+    /// Test-only: injectable DNS resolver. Pass a closure to override DNS
+    /// resolution in proxy tests (e.g. to simulate DNS rebinding).
+    #[cfg(test)]
+    pub resolver: Option<ResolverFn>,
 }
 
 /// Start the proxy on a background thread. Returns a handle for shutdown.
@@ -396,6 +411,8 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         allow_localhost_any: opts.allow_localhost_any,
         log_file: opts.log_file,
         log_level: opts.log_level,
+        #[cfg(test)]
+        resolver: opts.resolver,
     });
 
     listener
@@ -588,19 +605,36 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     }
 
     // Resolve DNS FIRST, then check the resolved IP
-    let addr = format!("{host}:{port}");
-    let socket_addr = if let Ok(mut addrs) = addr.to_socket_addrs() {
-        if let Some(a) = addrs.next() {
+    let addr_str = format!("{host}:{port}");
+    #[cfg(test)]
+    let socket_addr = {
+        // In tests, an injected resolver can fake DNS responses (e.g. to simulate
+        // DNS rebinding where evil.localhost → 169.254.169.254).
+        if let Some(ref resolver) = state.resolver {
+            if let Some(a) = resolver(&host, port) {
+                a
+            } else {
+                log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
+                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+                return;
+            }
+        } else if let Some(a) = addr_str.to_socket_addrs().ok().and_then(|mut a| a.next()) {
             a
         } else {
             log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
-    } else {
-        log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
-        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-        return;
+    };
+    #[cfg(not(test))]
+    let socket_addr = {
+        if let Some(a) = addr_str.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            a
+        } else {
+            log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
+            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            return;
+        }
     };
 
     // Check the RESOLVED IP address (prevents DNS rebinding attacks).
@@ -1099,6 +1133,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
+            resolver: None,
         };
 
         let domains = state.get_private_domains();
@@ -1121,6 +1156,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
+            resolver: None,
         };
 
         let domains = state.get_private_domains();
@@ -1148,6 +1184,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
+            resolver: None,
         };
 
         let domains = state.get_allowed_domains();
@@ -1178,6 +1215,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
+            resolver: None,
         };
 
         let blocked = state.get_blocked_domains();
@@ -1214,6 +1252,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
+            resolver: None,
         };
 
         // First read: picks up "old.nav.no" from cache reload + "cli.nav.no"
@@ -1272,6 +1311,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
+            resolver: None,
         });
         assert!(result.is_ok());
         result.unwrap().shutdown();
@@ -1302,6 +1342,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
+            resolver: None,
         });
         assert!(result.is_err(), "should fail when allowlist is unreadable");
 
@@ -1332,6 +1373,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
+            resolver: None,
         };
 
         // Initial read picks up github.com from stale cache (triggers reload)
@@ -1373,6 +1415,17 @@ mod tests {
     }
 
     fn make_proxy(allow_localhost_ports: Vec<u16>, allow_localhost_any: bool) -> ProxyHandle {
+        make_proxy_with_resolver(allow_localhost_ports, allow_localhost_any, None)
+    }
+
+    /// Start a proxy with an optional injected DNS resolver.
+    /// Pass `Some(f)` to override DNS resolution in tests (e.g. to simulate
+    /// DNS rebinding where `evil.localhost` resolves to `169.254.169.254`).
+    fn make_proxy_with_resolver(
+        allow_localhost_ports: Vec<u16>,
+        allow_localhost_any: bool,
+        resolver: Option<ResolverFn>,
+    ) -> ProxyHandle {
         let blocked = PathBuf::from("/dev/null");
         start(ProxyOptions {
             port: 0,
@@ -1387,6 +1440,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
+            resolver,
         })
         .expect("proxy start failed")
     }
@@ -1486,6 +1540,10 @@ mod tests {
     ///
     /// We can't fake DNS in a unit test, but we can assert the IP-level invariants
     /// that the fix relies on.
+    ///
+    /// With the injectable resolver (`make_proxy_with_resolver`), we CAN now simulate
+    /// the full DNS rebinding path: the proxy receives `CONNECT evil.localhost:8080`,
+    /// the injected resolver returns `169.254.169.254`, and we verify the proxy blocks it.
     #[test]
     fn post_dns_check_uses_is_loopback_not_hostname_pattern() {
         // cloud IMDS and internal IPs are private but NOT loopback
@@ -1505,10 +1563,72 @@ mod tests {
         assert!(!internal.is_loopback(), "RFC1918 must not be loopback");
         assert!(loopback.is_loopback(), "127.0.0.1 must be loopback");
         assert!(loopback6.is_loopback(), "::1 must be loopback");
+    }
 
-        // Consequence: if evil.localhost resolves to IMDS, is_loopback() = false
-        // → the private-IP block fires → SSRF prevented.
-        // With the old !localhost_connect_allowed condition, this block would be
-        // skipped for any *.localhost hostname, enabling the SSRF.
+    /// Full proxy-level DNS rebinding test using the injectable resolver.
+    ///
+    /// This test WOULD HAVE FAILED with the old `&& !localhost_connect_allowed`
+    /// condition and PASSES with the fixed `&& !socket_addr.ip().is_loopback()`.
+    ///
+    /// Scenario: agent sends `CONNECT evil.localhost:8080` to the proxy.
+    /// The hostname matches `*.localhost`, so `localhost_connect_allowed = true`.
+    /// The injected resolver returns `169.254.169.254` (cloud IMDS).
+    /// The proxy must block this despite `localhost_connect_allowed` being set,
+    /// because the resolved IP is not loopback.
+    #[test]
+    fn proxy_blocks_dns_rebinding_evil_localhost_to_imds() {
+        require_localhost_tcp!();
+
+        let imds_addr: std::net::IpAddr = "169.254.169.254".parse().unwrap();
+
+        // Inject a resolver that maps evil.localhost → 169.254.169.254 (cloud IMDS)
+        let resolver: ResolverFn = Arc::new(move |host: &str, port: u16| {
+            if host == "evil.localhost" {
+                Some(std::net::SocketAddr::new(imds_addr, port))
+            } else {
+                // Fall back to real resolution for other hosts
+                format!("{host}:{port}")
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut a| a.next())
+            }
+        });
+
+        // Port 8080 is explicitly "opened" via allow_localhost_ports.
+        // With the old code, this would cause the proxy to forward CONNECT to IMDS.
+        let proxy = make_proxy_with_resolver(vec![8080], false, Some(resolver));
+        let status = proxy_connect(proxy.port, "evil.localhost:8080");
+        proxy.shutdown();
+
+        assert!(
+            status.contains("403"),
+            "DNS rebinding: evil.localhost:8080 resolves to 169.254.169.254 — must block even though port 8080 is in allow_localhost_ports; got: {status}"
+        );
+    }
+
+    /// Verify that legitimate localhost still works when --allow-localhost is set.
+    /// This is the positive counterpart to proxy_blocks_dns_rebinding_evil_localhost_to_imds:
+    /// real localhost resolves to 127.0.0.1, which is_loopback() = true → allowed.
+    #[test]
+    fn proxy_allows_real_localhost_with_allow_localhost() {
+        require_localhost_tcp!();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            listener.accept().ok();
+        });
+
+        // No injected resolver — real DNS resolution: localhost → 127.0.0.1 (loopback)
+        let proxy = make_proxy(vec![port], false);
+        let status = proxy_connect(proxy.port, &format!("localhost:{port}"));
+        proxy.shutdown();
+        handle.join().ok();
+
+        assert!(
+            status.contains("200"),
+            "localhost:{port} with allow_localhost must succeed (resolves to 127.0.0.1); got: {status}"
+        );
     }
 }
