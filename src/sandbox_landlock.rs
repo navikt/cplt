@@ -243,6 +243,27 @@ const DEVICE_FILES: &[&str] = &[
 ///
 /// Returns a `LandlockPolicy` that can be applied with `apply_policy()`
 /// on Linux, or described with `describe_policy()` on any platform.
+/// True if `subdir` is a safe relative cache subdirectory: non-empty and every
+/// path component is a normal name (rejects `..`, `.`, an absolute root, or a
+/// Windows-style prefix).
+///
+/// Load-bearing for the Linux cache-exec carve-out: the joined path is opened
+/// with `O_PATH`, and the kernel resolves `..` at open() time. Without this
+/// filter a crafted value like `../../bin` would grant execute *outside*
+/// `~/.cache`. (macOS SBPL is immune because `subpath` does literal prefix
+/// matching on already-canonicalized paths, where `..` never appears.)
+fn is_safe_cache_subdir(subdir: &str) -> bool {
+    use std::path::Component;
+    let mut saw_component = false;
+    for component in std::path::Path::new(subdir).components() {
+        match component {
+            Component::Normal(_) => saw_component = true,
+            _ => return false,
+        }
+    }
+    saw_component
+}
+
 pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let mut fs_rules = Vec::new();
     let home = config.home_dir;
@@ -329,6 +350,48 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     ioctl: false,
                 },
             });
+        }
+    }
+
+    // ── Cache exec carve-out (opt-in; Linux equivalent of macOS allow_cache_exec) ──
+    // `~/.cache` is granted read+write by HOME_TOOL_DIRS but deliberately NOT
+    // execute, to block binary-drop staging (a rogue agent writing a binary into
+    // a cache dir and running it). `--allow-cache-exec <SUBDIR>` opts a specific
+    // subdir back into exec for tools that legitimately run binaries from there
+    // (e.g. Playwright's `ms-playwright/chromium-*`); `--allow-cache-exec-any`
+    // opens exec across the entire `~/.cache` tree (dangerous — separate flag).
+    //
+    // Landlock grants are additive (union over a path's ancestors), so adding an
+    // execute rule on `~/.cache/<subdir>` grants exec there while the rest of
+    // `~/.cache` stays non-executable.
+    //
+    // SECURITY: subdir entries are filtered to traversal-free relative paths via
+    // is_safe_cache_subdir() — see that function for why this is load-bearing on
+    // Linux but not macOS.
+    let cache_base = home.join(".cache");
+    if config.allow_cache_exec_any {
+        fs_rules.push(FsRule {
+            path: cache_base,
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: true,
+                ioctl: false,
+            },
+        });
+    } else {
+        for subdir in config.allow_cache_exec {
+            if is_safe_cache_subdir(subdir) {
+                fs_rules.push(FsRule {
+                    path: cache_base.join(subdir),
+                    access: FsAccess {
+                        read: true,
+                        write: true,
+                        execute: true,
+                        ioctl: false,
+                    },
+                });
+            }
         }
     }
 
@@ -1296,6 +1359,122 @@ mod tests {
                 "DENIED_HOME_SUBPATHS file {file} should NOT have a direct Landlock rule"
             );
         }
+    }
+
+    #[test]
+    fn cache_exec_subdir_grants_execute_on_that_subdir() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let subdirs = vec!["ms-playwright".to_string()];
+        let mut config = test_config(&project, &home);
+        config.allow_cache_exec = &subdirs;
+        let policy = generate_policy(&config);
+
+        let target = home.join(".cache/ms-playwright");
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == target)
+            .expect("~/.cache/ms-playwright should be in the ruleset");
+        assert!(rule.access.execute, "cache-exec subdir must grant execute");
+        assert!(rule.access.read);
+        assert!(rule.access.write);
+
+        // The rest of ~/.cache stays non-executable: the plain .cache HOME_TOOL_DIR
+        // rule grants read+write only.
+        let cache_rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == home.join(".cache"))
+            .expect(".cache should still be in ruleset");
+        assert!(
+            !cache_rule.access.execute,
+            "the broad ~/.cache rule must NOT grant execute"
+        );
+    }
+
+    #[test]
+    fn cache_exec_supports_nested_subdir() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let subdirs = vec!["ms-playwright/chromium-1217".to_string()];
+        let mut config = test_config(&project, &home);
+        config.allow_cache_exec = &subdirs;
+        let policy = generate_policy(&config);
+
+        let target = home.join(".cache/ms-playwright/chromium-1217");
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == target && r.access.execute),
+            "nested cache-exec subdir should grant execute"
+        );
+    }
+
+    #[test]
+    fn cache_exec_any_grants_execute_on_whole_cache() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.allow_cache_exec_any = true;
+        let policy = generate_policy(&config);
+
+        let target = home.join(".cache");
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == target && r.access.execute),
+            "allow_cache_exec_any should grant execute on the whole ~/.cache tree"
+        );
+    }
+
+    #[test]
+    fn cache_exec_rejects_path_traversal() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        // A crafted subdir must not grant execute outside ~/.cache. On Linux the
+        // kernel resolves `..` at open() time, so an unfiltered value like
+        // "../../bin" would otherwise escape the cache dir.
+        let subdirs = vec![
+            "../../bin".to_string(),
+            "..".to_string(),
+            "/etc".to_string(),
+            "foo/../../bar".to_string(),
+        ];
+        let mut config = test_config(&project, &home);
+        config.allow_cache_exec = &subdirs;
+        let policy = generate_policy(&config);
+
+        for rule in &policy.fs_rules {
+            // No executable rule may resolve outside ~/.cache because of these entries.
+            if rule.access.execute {
+                assert!(
+                    !rule.path.to_string_lossy().contains(".."),
+                    "traversal subdir must not produce an executable rule: {:?}",
+                    rule.path
+                );
+                assert_ne!(
+                    rule.path,
+                    PathBuf::from("/etc"),
+                    "absolute subdir must not produce an executable rule on /etc"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_safe_cache_subdir_accepts_and_rejects() {
+        assert!(is_safe_cache_subdir("ms-playwright"));
+        assert!(is_safe_cache_subdir("ms-playwright/chromium-1217"));
+        assert!(is_safe_cache_subdir("pnpm/dlx"));
+        assert!(!is_safe_cache_subdir(""));
+        assert!(!is_safe_cache_subdir(".."));
+        assert!(!is_safe_cache_subdir("../etc"));
+        assert!(!is_safe_cache_subdir("foo/../../bar"));
+        assert!(!is_safe_cache_subdir("/etc"));
+        assert!(!is_safe_cache_subdir("."));
     }
 
     #[test]

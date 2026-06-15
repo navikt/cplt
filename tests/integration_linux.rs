@@ -147,6 +147,39 @@ mod linux_tests {
         )
     }
 
+    /// Run a shell command inside the sandbox with a custom HOME and extra flags.
+    fn run_sandboxed_home_with_flags(
+        project_dir: &Path,
+        home: &Path,
+        extra_flags: &[&str],
+        script: &str,
+    ) -> (i32, String, String) {
+        let dir_str = project_dir.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec![
+            "--yes",
+            "--no-validate",
+            "--quiet",
+            "--agent",
+            "shell",
+            "-C",
+            &dir_str,
+        ];
+        args.extend_from_slice(extra_flags);
+        args.extend_from_slice(&["--", "-c", script]);
+
+        let output = Command::new(binary_path())
+            .args(&args)
+            .env("HOME", home)
+            .output()
+            .expect("Failed to execute cplt");
+
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
     /// Create a fake HOME with populated sensitive directories for hermetic testing.
     fn create_fake_home_with_secrets() -> tempfile::TempDir {
         let fake_home = tempfile::tempdir().expect("Failed to create temp home");
@@ -424,6 +457,54 @@ EOF
             run_sandboxed_with_flags(project.path(), &["--scratch-dir"], script);
         assert_eq!(code, 0, "Should be able to execute from scratch dir");
         assert!(stdout.contains("hello from scratch"));
+    }
+
+    #[test]
+    fn landlock_allows_cache_exec_with_flag() {
+        require_landlock!();
+        let project = create_test_project();
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        fs::create_dir_all(fake_home.path().join(".cache/ms-playwright")).unwrap();
+        let script = r#"
+            cat > ~/.cache/ms-playwright/run.sh << 'EOF'
+#!/bin/sh
+echo "hello from cache"
+EOF
+            chmod +x ~/.cache/ms-playwright/run.sh
+            ~/.cache/ms-playwright/run.sh
+        "#;
+        let (code, stdout, _) = run_sandboxed_home_with_flags(
+            project.path(),
+            fake_home.path(),
+            &["--allow-cache-exec", "ms-playwright"],
+            script,
+        );
+        assert_eq!(
+            code, 0,
+            "exec from ~/.cache/ms-playwright should be allowed with --allow-cache-exec — stdout: {stdout}"
+        );
+        assert!(stdout.contains("hello from cache"));
+    }
+
+    #[test]
+    fn landlock_blocks_cache_exec_without_flag() {
+        require_landlock!();
+        let project = create_test_project();
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        fs::create_dir_all(fake_home.path().join(".cache/ms-playwright")).unwrap();
+        let script = r#"
+            cat > ~/.cache/ms-playwright/run.sh << 'EOF'
+#!/bin/sh
+echo "should not run"
+EOF
+            chmod +x ~/.cache/ms-playwright/run.sh 2>/dev/null
+            ~/.cache/ms-playwright/run.sh 2>&1
+        "#;
+        let (code, stdout, _) = run_sandboxed_home(project.path(), fake_home.path(), script);
+        assert!(
+            code != 0 || !stdout.contains("should not run"),
+            "exec from ~/.cache without --allow-cache-exec must be blocked — code: {code}, stdout: {stdout}"
+        );
     }
 
     // ── seccomp enforcement tests ─────────────────────────────────

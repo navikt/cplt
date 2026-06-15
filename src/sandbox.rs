@@ -309,12 +309,6 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
              Docker socket access is not yet implemented in the Landlock backend.",
         );
     }
-    if !config.allow_cache_exec.is_empty() || config.allow_cache_exec_any {
-        ui::warn(
-            "--allow-cache-exec has no effect on Linux: \
-             ~/Library/Caches is a macOS-specific path.",
-        );
-    }
 
     let policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);

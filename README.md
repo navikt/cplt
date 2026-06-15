@@ -954,12 +954,12 @@ cplt config explain sandbox.scratch_dir
 
 ### Cache exec (Playwright, pnpm dlx, etc.)
 
-Some tools unpack and execute binaries directly from `~/Library/Caches`, which is exec-blocked by default:
+Some tools unpack and execute binaries directly from `~/Library/Caches` (macOS) / `~/.cache` (Linux), which is exec-blocked by default:
 
 | Tool | Cache path | Fix |
 |---|---|---|
-| Playwright (browsers) | `~/Library/Caches/ms-playwright/` | `cplt config set sandbox.allow_cache_exec ms-playwright` |
-| pnpm dlx | `~/Library/Caches/pnpm/dlx/` | `cplt config set sandbox.allow_cache_exec pnpm/dlx` |
+| Playwright (browsers) | `~/Library/Caches/ms-playwright/` · `~/.cache/ms-playwright/` | `cplt config set sandbox.allow_cache_exec ms-playwright` |
+| pnpm dlx | `~/Library/Caches/pnpm/dlx/` · `~/.cache/pnpm/dlx/` | `cplt config set sandbox.allow_cache_exec pnpm/dlx` |
 
 **Fix:**
 
@@ -969,6 +969,12 @@ cplt config set sandbox.allow_cache_exec pnpm/dlx
 ```
 
 Or for a single run: `cplt --allow-cache-exec ms-playwright --allow-cache-exec pnpm/dlx`
+
+> **Playwright on Linux:** run Chromium with its own sandbox disabled
+> (`chromiumSandbox: false` in `playwright.config`, or launch with `--no-sandbox`).
+> cplt's Landlock + seccomp is the enforcing boundary, and the seccomp filter
+> blocks the `unshare`/`setns` syscalls that Chromium's nested namespace sandbox
+> needs. This is the standard way to run Chromium inside another sandbox.
 
 `--allow-cache-exec-any` opens exec for all of `~/Library/Caches` — use only as a last resort.
 
