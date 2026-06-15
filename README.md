@@ -976,7 +976,7 @@ Or for a single run: `cplt --allow-cache-exec ms-playwright --allow-cache-exec p
 > blocks the `unshare`/`setns` syscalls that Chromium's nested namespace sandbox
 > needs. This is the standard way to run Chromium inside another sandbox.
 
-`--allow-cache-exec-any` opens exec for all of `~/Library/Caches` — use only as a last resort.
+`--allow-cache-exec-any` opens exec for the entire cache tree (`~/Library/Caches` on macOS, `~/.cache` on Linux) — use only as a last resort.
 
 ### Localhost blocking
 
