@@ -637,6 +637,27 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         }
     };
 
+    // Hard requirement for the localhost carve-out: a target that was only
+    // permitted because of --allow-localhost(-any) MUST resolve to a loopback
+    // address. `*.localhost` is supposed to map to 127.0.0.1/::1, but a hostile
+    // resolver or /etc/hosts entry could point `evil.localhost` at a public or
+    // private non-loopback IP. Without this check the carve-out (which already
+    // bypassed the port policy and private-hostname block) would tunnel to an
+    // arbitrary port on an arbitrary host — an SSRF / egress-widening vector.
+    // The earlier is_private_ip guard below only catches *private* IPs; this also
+    // closes the *public* non-loopback case.
+    if localhost_connect_allowed && !socket_addr.ip().is_loopback() {
+        log_connection(
+            "CONNECT",
+            target,
+            "BLOCKED-PRIVATE-RESOLVED",
+            log_file,
+            log_level,
+        );
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to non-loopback IP\r\n");
+        return;
+    }
+
     // Check the RESOLVED IP address (prevents DNS rebinding attacks).
     // Domains in allow_private_domains are explicitly trusted to resolve to private IPs
     // (e.g. corporate internal services). All other checks still apply.
@@ -1648,6 +1669,37 @@ mod tests {
         assert!(
             status.contains("200"),
             "localhost:{port} with allow_localhost must succeed (resolves to 127.0.0.1); got: {status}"
+        );
+    }
+
+    /// Regression test for the *public-IP* DNS-rebinding variant of the localhost
+    /// carve-out. The private-IP path is covered by the IMDS test above; this one
+    /// pins `evil.localhost` to a public address (which `is_private_ip` does NOT
+    /// catch) and asserts the loopback requirement still blocks it.
+    #[test]
+    fn proxy_blocks_localhost_carveout_to_public_ip() {
+        require_localhost_tcp!();
+
+        // 93.184.216.34 (example.com) — a routable public IP, not private/loopback.
+        let public_addr: std::net::IpAddr = "93.184.216.34".parse().unwrap();
+        let resolver: ResolverFn = Arc::new(move |host: &str, port: u16| {
+            if host == "evil.localhost" {
+                Some(std::net::SocketAddr::new(public_addr, port))
+            } else {
+                format!("{host}:{port}")
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut a| a.next())
+            }
+        });
+
+        let proxy = make_proxy_with_resolver(vec![8080], false, Some(resolver));
+        let status = proxy_connect(proxy.port, "evil.localhost:8080");
+        proxy.shutdown();
+
+        assert!(
+            status.contains("403"),
+            "carve-out: evil.localhost:8080 resolving to a public IP must be blocked (resolved IP is not loopback); got: {status}"
         );
     }
 }
