@@ -561,6 +561,9 @@ else:
             &script,
         );
         drop(listener2);
+        // Unblock the port1 accept thread (the sandboxed script only touches
+        // port2, so nothing else ever connects to port1) to avoid a hang on join.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port1));
         handle.join().ok();
 
         assert!(
