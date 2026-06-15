@@ -462,8 +462,31 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
 enum Command {
     /// Manage cplt configuration.
     ///
-    /// Validate, inspect, or initialize your config file.
-    /// Config is stored at ~/.config/cplt/config.toml (override with CPLT_CONFIG).
+    /// cplt reads config from `~/.config/cplt/config.toml` by default
+    /// (override with `CPLT_CONFIG`).
+    ///
+    /// Use `cplt config explain` to learn what each key does, `show` to see the
+    /// merged result, `set` to save values, and `validate` to catch typos early.
+    ///
+    /// Use `--repo` with `config set` for project-specific permissions that
+    /// should live in `.cplt.toml`, then approve them with `cplt trust`.
+    #[command(after_help = "\
+QUICK START:
+  cplt config explain
+    List all keys with their descriptions, current values, and set commands.
+
+  cplt config explain sandbox.allow_docker
+    Learn what a specific key does before enabling it.
+
+  cplt config show
+    Show the merged config file + defaults.
+
+  cplt config set sandbox.quiet true
+    Save a value without editing TOML.
+
+  cplt config validate
+    Catch typos and type errors before launch.
+")]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -717,9 +740,23 @@ enum ConfigAction {
 
     /// Explain what config keys do.
     ///
-    /// Without arguments, lists all keys with descriptions.
-    /// With a key, shows detailed info for that key.
-    /// Example: cplt config explain sandbox.quiet
+    /// Without a key, lists all keys grouped by section.
+    /// With a key, shows the description, current value, default, and the
+    /// matching `cplt config set ...` command.
+    #[command(after_help = "\
+EXAMPLES:
+  cplt config explain
+    Browse all config keys by section.
+
+  cplt config explain sandbox.allow_jvm_attach
+    See why Gradle/MockK/Mockito inline mocking may need JVM attach.
+
+  cplt config explain sandbox.allow_docker
+    See why Docker access is treated as dangerous.
+
+  cplt config explain allow.read
+    Learn how repeated values are merged.
+")]
     Explain {
         /// Config key to explain (omit to list all)
         key: Option<String>,

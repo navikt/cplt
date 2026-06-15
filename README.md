@@ -702,6 +702,17 @@ cplt config explain   # list all keys with descriptions
 
 Per-repo config (`.cplt.toml`) operates as a separate layer: `[deny]` tightens unconditionally, and approved permissions are **additive only** — they can enable features but cannot disable anything set by CLI or global config.
 
+#### Global-only settings
+
+These keys stay in `~/.config/cplt/config.toml` and are rejected from
+`.cplt.toml` because they are machine-specific or local preferences:
+
+`sandbox.agent`, `sandbox.quiet`, `sandbox.yes`, `sandbox.validate`,
+`sandbox.scratch_dir`, `sandbox.pass_env`, `sandbox.inherit_env`,
+`sandbox.allow_cache_exec`, `sandbox.allow_cache_exec_any`, `proxy.enabled`,
+`proxy.port`, `proxy.log_file`, `proxy.log_level`, `proxy.blocked_domains`,
+`proxy.allowed_domains`, and all `[gh_guard]`, `[git_guard]`, and `[audit]` keys
+
 ### Per-repo configuration (`.cplt.toml`)
 
 Commit a `.cplt.toml` to your repository root to enforce team policy:

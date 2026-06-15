@@ -1,5 +1,16 @@
 # Configuration
 
+## How cplt config works
+
+cplt reads config in this order:
+
+1. CLI flags for the current run
+2. `~/.config/cplt/config.toml` (or `CPLT_CONFIG`)
+3. built-in defaults
+
+List values are merged, so repeated `cplt config set` commands accumulate for
+`allow.read`, `allow.write`, `allow.ports`, `allow.localhost`, and `deny.paths`.
+
 ## Quick setup
 
 Use `cplt config set` to configure cplt without editing files:
@@ -12,6 +23,68 @@ cplt config set allow.ports 8080
 cplt config set gh_guard.enabled true
 cplt config set git_guard.enabled true
 ```
+
+If your startup command is getting long, move repeated flags into config.
+For your personal machine setup, use global config (no `--repo`):
+
+```bash
+cplt config set sandbox.allow_localhost_any true
+cplt config set sandbox.allow_docker true
+cplt config set sandbox.allow_jvm_attach true
+cplt config set allow.read ~/.gitconfig
+cplt config set allow.read ~/code/work/.gitconfig-nav
+```
+
+That translates a one-off command like:
+
+```bash
+cplt --allow-localhost-any --allow-docker --allow-jvm-attach \
+  --allow-read ~/.gitconfig --allow-read ~/code/work/.gitconfig-nav
+```
+
+into saved config:
+
+- `sandbox.allow_localhost_any` for tools that spin up random localhost ports
+- `sandbox.allow_docker` for Gradle/Testcontainers/Docker access
+- `sandbox.allow_jvm_attach` for Gradle daemon, MockK, and Mockito inline mocking
+- `allow.read` for host files the agent should always be able to inspect
+
+Use `cplt config explain` to see what a key does and how to set it.
+
+Use **repo config + trust** for project-specific sandbox permissions that
+belong to the repository, and **global config** for machine-specific paths:
+
+- `.cplt.toml` + `cplt trust` for `sandbox.allow_jvm_attach`,
+  `sandbox.allow_docker`, `sandbox.allow_localhost_any`, `allow.ports`
+- `~/.config/cplt/config.toml` for `allow.read ~/.gitconfig` and other
+  host-specific file paths
+
+### Global-only settings
+
+These settings are **not supported in `.cplt.toml`** because they are machine-
+specific or local CLI preferences. `cplt config set --repo <key>` rejects them
+with an explanation — set them in `~/.config/cplt/config.toml` instead:
+
+| Key | Why |
+|---|---|
+| `sandbox.agent` | preferred agent depends on what's installed locally |
+| `sandbox.quiet` | local output preference |
+| `sandbox.yes` | local prompt-skip preference |
+| `sandbox.validate` | local launch behavior |
+| `sandbox.scratch_dir` | local temp handling |
+| `sandbox.pass_env` | machine-specific env passthrough |
+| `sandbox.inherit_env` | local debug-only behavior |
+| `sandbox.allow_cache_exec` | cache paths differ per machine |
+| `sandbox.allow_cache_exec_any` | too broad for repo policy |
+| `proxy.enabled` | local proxy preference |
+| `proxy.port` | port conflicts are machine-specific |
+| `proxy.log_file` | local log path |
+| `proxy.log_level` | local verbosity preference |
+| `proxy.blocked_domains` | local path to a blocklist file |
+| `proxy.allowed_domains` | local path to an allowlist file |
+| all `[gh_guard]` keys | guard policy is configured globally, not per-repo |
+| all `[git_guard]` keys | guard policy is configured globally, not per-repo |
+| all `[audit]` keys | audit destination/level is a local concern |
 
 For project-specific settings (committed to `.cplt.toml`):
 
@@ -44,7 +117,7 @@ cplt config validate                      # check for syntax errors and unknown 
 The config file lives at `~/.config/cplt/config.toml`. You can create a starter template with:
 
 ```bash
-cplt --init-config
+cplt config init
 ```
 
 This creates a commented template at `~/.config/cplt/config.toml`:
