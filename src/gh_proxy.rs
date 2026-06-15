@@ -1304,14 +1304,26 @@ fn parse_repo_from_url(url: &str) -> Option<String> {
     let path = url
         .strip_prefix("https://github.com/")
         .or_else(|| {
-            // HTTPS with embedded credentials: https://x-access-token:TOKEN@github.com/owner/repo.git
-            // Used by GitHub Actions and other CI systems.
-            if url.starts_with("https://") {
-                url.find("@github.com/")
-                    .map(|pos| &url[pos + "@github.com/".len()..])
-            } else {
-                None
-            }
+            // HTTPS with embedded credentials:
+            //   https://x-access-token:TOKEN@github.com/owner/repo.git
+            // Anchor the host check to the URL *authority* (the segment before the
+            // first '/'), so a crafted path such as
+            //   https://evil.example/@github.com/owner/repo.git
+            // is NOT mis-parsed as a GitHub URL.
+            let after_scheme = url.strip_prefix("https://")?;
+            let (authority, rest) = match after_scheme.split_once('/') {
+                Some((a, r)) => (a, r),
+                None => (after_scheme, ""),
+            };
+            // Strip any userinfo (user:token@) and an optional :port.
+            let host = authority
+                .rsplit('@')
+                .next()
+                .unwrap_or(authority)
+                .split(':')
+                .next()
+                .unwrap_or(authority);
+            (host == "github.com").then_some(rest)
         })
         .or_else(|| url.strip_prefix("ssh://git@github.com/"))
         .or_else(|| url.strip_prefix("http://github.com/"))?;
@@ -2547,6 +2559,22 @@ mod tests {
     fn parse_non_github_url() {
         assert_eq!(
             parse_repo_from_url("https://gitlab.com/owner/repo.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_https_url_spoofed_github_in_path_rejected() {
+        // The host is evil.example, not github.com — the `@github.com/` substring
+        // sits in the path and must NOT be treated as a GitHub URL.
+        assert_eq!(
+            parse_repo_from_url("https://evil.example/@github.com/navikt/cplt.git"),
+            None
+        );
+        assert_eq!(
+            parse_repo_from_url(
+                "https://x-access-token:TOKEN@evil.example/@github.com/navikt/cplt.git"
+            ),
             None
         );
     }
