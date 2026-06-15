@@ -879,6 +879,25 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
         }
     }
 
+    // Pre-create cache-exec subdirs (e.g. ~/.cache/ms-playwright) that may not
+    // exist on first run. Landlock skips O_PATH on non-existent paths, so without
+    // this the execute rule would be silently dropped and the tool's binary would
+    // stay non-executable until cplt is restarted after the dir is populated.
+    //
+    // Scope: only writable+executable rules under ~/.cache — i.e. exactly the
+    // cache-exec carve-outs from generate_policy(). User --allow-write paths live
+    // elsewhere and are deliberately not pre-created (see comment above).
+    let cache_base = policy.home_dir.join(".cache");
+    for rule in &policy.fs_rules {
+        if rule.access.write
+            && rule.access.execute
+            && rule.path.starts_with(&cache_base)
+            && !rule.path.exists()
+        {
+            let _ = std::fs::create_dir_all(&rule.path);
+        }
+    }
+
     // Pre-open all filesystem paths in the parent process.
     // This avoids CString allocation and open() calls in pre_exec.
     // Paths under /proc/self are magic symlinks that resolve to /proc/<pid> —
@@ -1443,9 +1462,26 @@ mod tests {
             "/etc".to_string(),
             "foo/../../bar".to_string(),
         ];
+        // Baseline: identical config with no cache-exec entries.
+        let baseline = generate_policy(&test_config(&project, &home));
+        let baseline_exec = baseline
+            .fs_rules
+            .iter()
+            .filter(|r| r.access.execute)
+            .count();
+
         let mut config = test_config(&project, &home);
         config.allow_cache_exec = &subdirs;
         let policy = generate_policy(&config);
+
+        // Every traversal entry must be rejected, so no *new* executable rule is
+        // added beyond the baseline. This proves the guard actually drops the
+        // crafted subdirs rather than the assertions passing vacuously.
+        let exec_count = policy.fs_rules.iter().filter(|r| r.access.execute).count();
+        assert_eq!(
+            exec_count, baseline_exec,
+            "traversal subdirs must not add any executable rule"
+        );
 
         for rule in &policy.fs_rules {
             // No executable rule may resolve outside ~/.cache because of these entries.
