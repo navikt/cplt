@@ -1,9 +1,9 @@
 //! Agent abstraction for different AI coding tools.
 //!
 //! cplt can sandbox multiple AI coding agents — currently GitHub Copilot CLI,
-//! OpenCode, Google Gemini CLI, Antigravity, and Pi. Each agent has different binary names,
-//! config directories, and runtime requirements, but shares the same core
-//! sandbox infrastructure.
+//! OpenCode, Google Gemini CLI, Antigravity, Pi, and Claude Code. Each agent has
+//! different binary names, config directories, and runtime requirements, but
+//! shares the same core sandbox infrastructure.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -22,6 +22,8 @@ pub enum Agent {
     Antigravity,
     /// Pi coding agent (https://github.com/earendil-works/pi).
     Pi,
+    /// Claude Code (Anthropic's `claude` CLI).
+    Claude,
     /// Plain sandboxed shell — no AI agent, just a secure shell session.
     Shell,
 }
@@ -35,6 +37,7 @@ impl Agent {
             Agent::Gemini => "gemini",
             Agent::Antigravity => "antigravity",
             Agent::Pi => "pi",
+            Agent::Claude => "claude",
             Agent::Shell => "shell",
         }
     }
@@ -47,6 +50,7 @@ impl Agent {
             Agent::Gemini => "Gemini",
             Agent::Antigravity => "Antigravity",
             Agent::Pi => "Pi",
+            Agent::Claude => "Claude Code",
             Agent::Shell => "Shell",
         }
     }
@@ -63,7 +67,12 @@ impl Agent {
     pub fn extra_args(&self) -> &'static [&'static str] {
         match self {
             Agent::Copilot => &["--no-auto-update"],
-            Agent::OpenCode | Agent::Gemini | Agent::Antigravity | Agent::Pi | Agent::Shell => &[],
+            Agent::OpenCode
+            | Agent::Gemini
+            | Agent::Antigravity
+            | Agent::Pi
+            | Agent::Claude
+            | Agent::Shell => &[],
         }
     }
 
@@ -150,9 +159,14 @@ impl Agent {
     /// Whether this agent needs macOS Keychain access for auth tokens.
     /// Copilot stores GitHub auth tokens in the Keychain.
     /// Gemini uses Keychain for extension integrity verification.
+    /// Claude Code stores its OAuth token in the login Keychain on macOS
+    /// ("Claude Code-credentials"); on Linux it uses ~/.claude/.credentials.json.
     /// OpenCode uses API keys from env vars or config files.
     pub fn needs_keychain(&self) -> bool {
-        matches!(self, Agent::Copilot | Agent::Gemini | Agent::Antigravity)
+        matches!(
+            self,
+            Agent::Copilot | Agent::Gemini | Agent::Antigravity | Agent::Claude
+        )
     }
 
     /// Whether this agent needs access to ~/.copilot directory.
@@ -330,6 +344,45 @@ impl Agent {
                     },
                 ]
             }
+            Agent::Claude => {
+                // CLAUDE_CONFIG_DIR relocates BOTH the data dir and .claude.json
+                // under a single root, so granting that subtree covers everything.
+                // Must stay in sync with ENV_ALLOWLIST (the var has to reach the
+                // child for it to use the same dir we grant). Mirrors OpenCode XDG.
+                let custom_dir = std::env::var("CLAUDE_CONFIG_DIR")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                if let Some(dir) = custom_dir {
+                    return vec![AgentDir {
+                        path: PathBuf::from(dir),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    }];
+                }
+                // Default layout: ~/.claude holds sessions, projects, history,
+                // settings, and the OAuth token (.credentials.json on Linux).
+                // ~/.claude.json is the top-level config (projects, MCP servers,
+                // account) — a single file at home root, granted via a file path
+                // (Seatbelt subpath / Landlock PathBeneath both match a file).
+                vec![
+                    AgentDir {
+                        path: home.join(".claude"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                    AgentDir {
+                        path: home.join(".claude.json"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                ]
+            }
         }
     }
 
@@ -399,6 +452,24 @@ impl Agent {
                 "HF_TOKEN",
                 "CLOUDFLARE_API_KEY",
                 "OPENCODE_API_KEY",
+            ],
+            // Claude Code authenticates via the OAuth token in ~/.claude
+            // (or macOS Keychain) by default — no env var needed for the
+            // subscription flow. These are for API-key / enterprise routing.
+            Agent::Claude => &[
+                // Anthropic API direct
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_BASE_URL",
+                // Long-lived OAuth token from `claude setup-token`
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                // Amazon Bedrock routing
+                "CLAUDE_CODE_USE_BEDROCK",
+                "AWS_BEARER_TOKEN_BEDROCK",
+                // Google Vertex AI routing
+                "CLAUDE_CODE_USE_VERTEX",
+                "ANTHROPIC_VERTEX_PROJECT_ID",
+                "GOOGLE_CLOUD_PROJECT",
             ],
             Agent::Shell => &[],
         }
@@ -498,6 +569,10 @@ impl Agent {
                 "Install Antigravity CLI: see https://antigravity.google/docs/cli-getting-started"
             }
             Agent::Pi => "Install Pi: npm i -g @earendil-works/pi-coding-agent",
+            Agent::Claude => {
+                "Install Claude Code: npm i -g @anthropic-ai/claude-code, \
+                 or see https://docs.anthropic.com/en/docs/claude-code"
+            }
             Agent::Shell => unreachable!("Shell is resolved via $SHELL above"),
         };
 
@@ -510,6 +585,8 @@ impl Agent {
     /// Auto-detect which agent to use based on what's available in PATH.
     /// Returns Copilot if found (backward compat), else OpenCode, else Gemini,
     /// else Antigravity.
+    /// Pi and Claude are explicit-only (`--agent pi` / `--agent claude`) and are
+    /// never auto-detected, to avoid silently changing the default for existing users.
     /// Returns None if none are found.
     pub fn auto_detect() -> Option<Agent> {
         let path_var = std::env::var("PATH").unwrap_or_default();
@@ -593,9 +670,10 @@ impl FromStr for Agent {
             "gemini" | "gem" => Ok(Agent::Gemini),
             "antigravity" | "agy" | "agi" => Ok(Agent::Antigravity),
             "pi" => Ok(Agent::Pi),
+            "claude" | "cc" | "claude-code" => Ok(Agent::Claude),
             "shell" | "sh" | "bash" | "zsh" => Ok(Agent::Shell),
             _ => Err(format!(
-                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, shell"
+                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, shell"
             )),
         }
     }
@@ -1064,6 +1142,104 @@ mod tests {
             "error should mention antigravity: {err}"
         );
         assert!(err.contains("pi"), "error should mention pi: {err}");
+        assert!(err.contains("claude"), "error should mention claude: {err}");
+    }
+
+    #[test]
+    fn parse_claude_agent() {
+        assert_eq!(Agent::from_str("claude").unwrap(), Agent::Claude);
+        assert_eq!(Agent::from_str("Claude").unwrap(), Agent::Claude);
+        assert_eq!(Agent::from_str("cc").unwrap(), Agent::Claude);
+        assert_eq!(Agent::from_str("claude-code").unwrap(), Agent::Claude);
+    }
+
+    #[test]
+    fn claude_binary_name() {
+        assert_eq!(Agent::Claude.binary_name(), "claude");
+    }
+
+    #[test]
+    fn claude_display_name() {
+        assert_eq!(format!("{}", Agent::Claude), "Claude Code");
+    }
+
+    #[test]
+    fn claude_no_sea_extraction() {
+        assert!(!Agent::Claude.needs_sea_extraction());
+    }
+
+    #[test]
+    fn claude_no_extra_args() {
+        assert!(Agent::Claude.extra_args().is_empty());
+    }
+
+    #[test]
+    fn claude_needs_keychain() {
+        // macOS stores the Claude Code OAuth token in the login Keychain
+        assert!(Agent::Claude.needs_keychain());
+    }
+
+    #[test]
+    fn claude_no_copilot_dir() {
+        assert!(!Agent::Claude.needs_copilot_dir());
+    }
+
+    #[test]
+    fn claude_config_dirs() {
+        temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Claude.config_dirs(home);
+            assert_eq!(dirs.len(), 2, "should have ~/.claude and ~/.claude.json");
+            assert_eq!(dirs[0].path, home.join(".claude"));
+            assert!(dirs[0].write, "~/.claude should be writable");
+            assert!(!dirs[0].process_exec && !dirs[0].map_exec);
+            assert_eq!(dirs[1].path, home.join(".claude.json"));
+            assert!(dirs[1].write, "~/.claude.json should be writable");
+        });
+    }
+
+    #[test]
+    fn claude_config_dir_override() {
+        temp_env::with_var("CLAUDE_CONFIG_DIR", Some("/custom/claude"), || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Claude.config_dirs(home);
+            assert_eq!(
+                dirs.len(),
+                1,
+                "override collapses to the single custom root"
+            );
+            assert_eq!(dirs[0].path, PathBuf::from("/custom/claude"));
+            assert!(dirs[0].write, "custom config dir should be writable");
+            assert!(!dirs[0].process_exec && !dirs[0].map_exec);
+        });
+    }
+
+    #[test]
+    fn claude_config_dir_empty_falls_back_to_default() {
+        temp_env::with_var("CLAUDE_CONFIG_DIR", Some(""), || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Claude.config_dirs(home);
+            assert_eq!(dirs.len(), 2, "empty override is ignored");
+            assert_eq!(dirs[0].path, home.join(".claude"));
+        });
+    }
+
+    #[test]
+    fn claude_auth_env_hints() {
+        let hints = Agent::Claude.auth_env_hint();
+        assert!(hints.contains(&"ANTHROPIC_API_KEY"));
+        assert!(hints.contains(&"ANTHROPIC_AUTH_TOKEN"));
+        assert!(hints.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(hints.contains(&"CLAUDE_CODE_USE_BEDROCK"));
+        assert!(hints.contains(&"CLAUDE_CODE_USE_VERTEX"));
+    }
+
+    #[test]
+    fn claude_not_auto_detected() {
+        // Claude is explicit-only; auto_detect must never return it.
+        // (We can't easily fake PATH here, but the detection loop has no
+        // claude branch — this guards against a regression in intent.)
+        assert_ne!(Agent::auto_detect(), Some(Agent::Claude));
     }
 
     #[test]

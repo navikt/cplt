@@ -245,6 +245,9 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "PAGER",
     // GPG — terminal device path for pinentry (not sensitive, e.g. "/dev/ttys001")
     "GPG_TTY",
+    // Claude Code — config root override (path, not a secret). Must reach the
+    // child so it uses the same dir Agent::Claude.config_dirs() grants.
+    "CLAUDE_CONFIG_DIR",
 ];
 
 /// Environment variable prefixes safe to pass through.
@@ -384,6 +387,16 @@ pub const HARDENING_ENV_VARS: &[HardeningEnvVar] = &[
         value: "1",
         category: HardeningCategory::SandboxMarker,
         description: "Block cplt trust commands inside sandbox",
+    },
+    // Self-update lock — agents that auto-update would write to (and execute
+    // from) their install dir inside the sandbox, which is a persistence vector
+    // and fails against read-only install paths. Copilot uses --no-auto-update;
+    // Claude Code has no such flag and honours DISABLE_AUTOUPDATER instead.
+    HardeningEnvVar {
+        name: "DISABLE_AUTOUPDATER",
+        value: "1",
+        category: HardeningCategory::SandboxMarker,
+        description: "Disable Claude Code auto-updater inside sandbox",
     },
     // Telemetry opt-out — many build tools and CLIs send default-on usage analytics.
     // These env vars instruct tools to disable telemetry collection. They have no

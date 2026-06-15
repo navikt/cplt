@@ -23,3 +23,6 @@ tests/test_new.py
 .cplt-fake-trust-locked-*/
 misc/coding-team/
 GH-CLI-SECURITY-TEST-REPORT.md
+
+# Local agent worktrees/metadata — never track
+.claude/

@@ -668,6 +668,54 @@ fn profile_grants_copilot_config_access() {
 }
 
 #[test]
+fn profile_grants_claude_config_access() {
+    temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
+        let home = std::path::Path::new("/Users/test");
+        let agent_dirs = cplt::agent::Agent::Claude.config_dirs(home);
+        let p = generate_profile(&ProfileOptions {
+            project_dir: std::path::Path::new("/projects/app"),
+            home_dir: home,
+            extra_read: &[],
+            extra_write: &[],
+            extra_deny: &[],
+            existing_home_tool_dirs: None,
+            existing_app_dirs: None,
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            allow_tmp_exec: false,
+            copilot_install_dir: None,
+            java_home: None,
+            git_hooks_path: None,
+            git_common_dir: None,
+            allow_gpg_signing: false,
+            deny_clipboard: false,
+            allow_jvm_attach: false,
+            allow_docker: false,
+            electron_app_dir: None,
+            agent: cplt::agent::Agent::Claude,
+            agent_dirs: &agent_dirs,
+            allow_cache_exec: &[],
+            allow_cache_exec_any: false,
+            allow_browser: false,
+        });
+        // Config dir + top-level config file are readable and writable.
+        assert!(p.contains("(allow file-read* (subpath \"/Users/test/.claude\"))"));
+        assert!(p.contains("(allow file-write* (subpath \"/Users/test/.claude\"))"));
+        assert!(p.contains("(allow file-write* (subpath \"/Users/test/.claude.json\"))"));
+        // Writable config dir must not be executable (persistence guard).
+        assert!(p.contains("(deny process-exec (subpath \"/Users/test/.claude\"))"));
+        // Auto-executing artifacts are write-denied (host-persistence guard);
+        // the deny is more specific than the dir-wide allow, so it wins.
+        assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/statusline.sh\"))"));
+        assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/plugins\"))"));
+    });
+}
+
+#[test]
 fn profile_denies_sensitive_dirs() {
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
@@ -2844,6 +2892,41 @@ fn env_sanitized_injects_hardening_vars() {
         "should inject __CPLT_TRUST_LOCKED to block cplt trust inside sandbox"
     );
     assert_eq!(trust_lock.unwrap().1, "1");
+
+    let autoupdate = env.vars.iter().find(|(k, _)| k == "DISABLE_AUTOUPDATER");
+    assert!(
+        autoupdate.is_some(),
+        "should inject DISABLE_AUTOUPDATER to block agent self-update inside sandbox"
+    );
+    assert_eq!(autoupdate.unwrap().1, "1");
+}
+
+#[test]
+fn env_claude_injects_autoupdater_and_suppresses_copilot_vars() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        ("GH_TOKEN", "gh-secret"),
+        ("COPILOT_GITHUB_TOKEN", "copilot-secret"),
+        ("COPILOT_FOO", "x"),
+    ]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Claude);
+
+    // Auto-update disabled (no --no-auto-update flag exists for Claude Code)
+    let autoupdate = env.vars.iter().find(|(k, _)| k == "DISABLE_AUTOUPDATER");
+    assert_eq!(
+        autoupdate.map(|(_, v)| v.as_str()),
+        Some("1"),
+        "DISABLE_AUTOUPDATER should be injected for Claude"
+    );
+
+    // Copilot-only auth vars must not leak to a non-Copilot agent
+    for leaked in &["GH_TOKEN", "COPILOT_GITHUB_TOKEN", "COPILOT_FOO"] {
+        assert!(
+            !env.vars.iter().any(|(k, _)| k == leaked),
+            "{leaked} should be suppressed for Claude"
+        );
+    }
 }
 
 #[test]

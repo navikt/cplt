@@ -29,7 +29,7 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 /// - Linux: Landlock LSM + seccomp-BPF (kernel 5.13+, full network filtering on 6.7+)
 ///
 /// Supports GitHub Copilot CLI, OpenCode, Google Gemini CLI, Antigravity CLI,
-/// and Pi. Auto-detects which agent to use, or specify explicitly with --agent.
+/// Pi, and Claude Code. Auto-detects which agent to use, or specify explicitly with --agent.
 ///
 /// Defaults can be saved to ~/.config/cplt/config.toml
 /// so you don't need to pass flags every time. Run `cplt config init` to
@@ -99,7 +99,7 @@ EXAMPLES:
 struct Cli {
     /// Which AI coding agent to sandbox.
     /// Resolved in order: this flag > sandbox.agent config > auto-detect from PATH.
-    /// Supported: copilot, opencode, gemini, antigravity, pi, shell
+    /// Supported: copilot, opencode, gemini, antigravity, pi, claude, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 
@@ -1145,7 +1145,8 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                              [cplt]   Gemini CLI:  npm i -g @google/gemini-cli\n\
                              [cplt]   Antigravity: https://antigravity.google/docs/cli-getting-started\n\
                              [cplt]   Pi:          npm i -g @earendil-works/pi-coding-agent\n\
-                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|gemini|antigravity|pi|shell"
+                             [cplt]   Claude Code: npm i -g @anthropic-ai/claude-code\n\
+                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|gemini|antigravity|pi|claude|shell"
                         );
                     }
                 }
@@ -1164,7 +1165,13 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         let has_api_key = hints.iter().any(|key| {
             parent_env.iter().any(|(k, _)| k == *key) && resolved.pass_env.iter().any(|v| v == *key)
         });
-        if !has_api_key && !resolved.inherit_env && !hints.is_empty() {
+        // Claude Code is OAuth-first: its subscription token lives in the granted
+        // config dir (or macOS Keychain), so it authenticates with no env var —
+        // same as Copilot. Don't nag about API keys; Claude prompts for login
+        // itself when unauthenticated. The hints stay for users who deliberately
+        // route via API/Bedrock/Vertex (documented in the README).
+        let oauth_first = active_agent == agent::Agent::Claude;
+        if !has_api_key && !resolved.inherit_env && !hints.is_empty() && !oauth_first {
             ui::warn(&format!(
                 "No API keys passed. {} needs auth — either:",
                 active_agent.display_name()

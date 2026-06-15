@@ -335,6 +335,22 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
         sbpl!(sb);
     }
 
+    // Claude Code: the config dir is writable (sessions, history, credentials),
+    // but a few artifacts auto-execute on the HOST the next time `claude` runs
+    // outside the sandbox — a persistence vector the agent never needs to write
+    // mid-session. Deny those specifically (most-specific match wins over the
+    // dir-wide allow above). settings.json, commands/, agents/, skills/ stay
+    // writable: Claude legitimately authors them and they require user invocation.
+    // macOS only — Landlock cannot deny a subpath within an allowed dir (see SECURITY.md).
+    if matches!(agent, Agent::Claude)
+        && let Some(cfg) = agent_dirs.iter().find(|d| d.write)
+    {
+        for sub in ["statusline.sh", "plugins"] {
+            let p = cfg.path.join(sub).display().to_string();
+            sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+        }
+    }
+
     // GitHub CLI auth — Copilot spawns `gh auth token` which reads these specific files.
     // OpenCode may also use `gh` for auth. Allow for all agents.
     sbpl!(sb, ";; GitHub CLI auth (specific files only)");

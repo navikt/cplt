@@ -153,7 +153,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Str,
         dangerous: false,
         default_display: "",
-        description: "Preferred AI coding agent (copilot, opencode, gemini, antigravity, pi, shell). Auto-detected from PATH if not set.",
+        description: "Preferred AI coding agent (copilot, opencode, gemini, antigravity, pi, claude, shell). Auto-detected from PATH if not set.",
     },
     ConfigKeyInfo {
         section: "sandbox",

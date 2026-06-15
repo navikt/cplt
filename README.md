@@ -125,7 +125,7 @@ For the full security model, threat analysis, and test strategy, see **[SECURITY
 | Environment handling | Allowlist + hardening env injection | More basic pass-through model |
 | Secret file protection | Deny patterns such as `.env*`, `.pem`, `.key` inside the repo | Primarily directory-scoped access |
 | Repo policy | [`.cplt.toml`](docs/configuration.md#per-repo-configuration-cplttoml) with explicit trust/approval flow | No repo-level policy file |
-| Agent support | Copilot, OpenCode, Gemini CLI, [Antigravity CLI](#antigravity-cli-support), [Pi agent](#pi-agent-support), or shell | Codex only |
+| Agent support | Copilot, OpenCode, Gemini CLI, [Antigravity CLI](#antigravity-cli-support), [Pi agent](#pi-agent-support), [Claude Code](#claude-code-support), or shell | Codex only |
 
 cplt is not stronger everywhere. Codex CLI has Linux namespace isolation today, and it already exposes explicit sandbox modes such as read-only and workspace-write. cplt does not yet have that mode matrix.
 
@@ -166,7 +166,7 @@ That matters most for CLI agents and credential exposure:
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
 | SSH git | Blocked at kernel (SSH agent socket denied) | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`) | Not blocked |
-| Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Shell | Claude Code |
+| Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, Shell | Claude Code |
 | Config | TOML (global + per-repo) | JSON (global only) + `--control-fd` live updates |
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |
 
@@ -303,7 +303,7 @@ This is the same pattern used by tools like mise, direnv, and starship.
 cplt [OPTIONS] [-- <AGENT_ARGS>...]
 ```
 
-Everything after `--` is passed directly to the agent process (copilot, opencode, gemini, antigravity, pi, or shell).
+Everything after `--` is passed directly to the agent process (copilot, opencode, gemini, antigravity, pi, claude, or shell).
 
 ### File access
 
@@ -563,6 +563,29 @@ cplt config set sandbox.agent pi
 - Pi config/auth (`~/.pi/`) is writable in the sandbox
 - Pi managed binaries (`~/.pi/agent/bin/`) have process-exec permission (for bundled `fd`, `rg`)
 - Keychain access is disabled
+
+### Claude Code support
+
+cplt can sandbox [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`@anthropic-ai/claude-code`, binary `claude`).
+
+```bash
+# Run Claude Code (must be explicit — not auto-detected)
+cplt --agent claude
+
+# API-key / enterprise routing instead of the subscription OAuth flow
+cplt --agent claude --pass-env ANTHROPIC_API_KEY
+
+# Set Claude Code as your default agent
+cplt config set sandbox.agent claude
+```
+
+**Security notes for Claude Code:**
+- **Not auto-detected**: select explicitly with `--agent claude` (aliases `cc`, `claude-code`) or set `sandbox.agent = "claude"` in config
+- **Subscription auth works out of the box**: the OAuth token lives in `~/.claude` (`.credentials.json` on Linux) or the macOS Keychain — both are exposed in the sandbox, so no env var is needed and cplt does not nag about API keys
+- **API keys are opt-in**: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), and Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`) must be passed via `--pass-env`
+- Claude Code config (`~/.claude/`) and top-level config (`~/.claude.json`) are writable in the sandbox
+- **`CLAUDE_CONFIG_DIR` is honored**: if set, cplt grants that directory instead of `~/.claude` and passes the variable through, so a relocated config root keeps working
+- **Auto-update is disabled** (`DISABLE_AUTOUPDATER=1`) — Claude Code has no `--no-auto-update` flag, and self-updating inside the sandbox is both a persistence vector and would fail against read-only install paths
 
 ### Shell mode
 
