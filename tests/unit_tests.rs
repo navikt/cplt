@@ -705,6 +705,7 @@ fn profile_grants_claude_config_access() {
         // Config dir + top-level config file are readable and writable.
         assert!(p.contains("(allow file-read* (subpath \"/Users/test/.claude\"))"));
         assert!(p.contains("(allow file-write* (subpath \"/Users/test/.claude\"))"));
+        assert!(p.contains("(allow file-read* (subpath \"/Users/test/.claude.json\"))"));
         assert!(p.contains("(allow file-write* (subpath \"/Users/test/.claude.json\"))"));
         // Writable config dir must not be executable (persistence guard).
         assert!(p.contains("(deny process-exec (subpath \"/Users/test/.claude\"))"));

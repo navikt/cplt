@@ -391,12 +391,14 @@ pub const HARDENING_ENV_VARS: &[HardeningEnvVar] = &[
     // Self-update lock — agents that auto-update would write to (and execute
     // from) their install dir inside the sandbox, which is a persistence vector
     // and fails against read-only install paths. Copilot uses --no-auto-update;
-    // Claude Code has no such flag and honours DISABLE_AUTOUPDATER instead.
+    // tools without such a flag (e.g. Claude Code) honour DISABLE_AUTOUPDATER.
+    // Injected for all agents like the rest of this list — a no-op for tools
+    // that don't recognise it.
     HardeningEnvVar {
         name: "DISABLE_AUTOUPDATER",
         value: "1",
         category: HardeningCategory::SandboxMarker,
-        description: "Disable Claude Code auto-updater inside sandbox",
+        description: "Disable agent auto-updaters inside sandbox (e.g. Claude Code)",
     },
     // Telemetry opt-out — many build tools and CLIs send default-on usage analytics.
     // These env vars instruct tools to disable telemetry collection. They have no
