@@ -121,7 +121,7 @@ struct Cli {
     #[arg(long)]
     no_proxy: bool,
 
-    /// Port for the local proxy to listen on [default: 18080].
+    /// Port for the local proxy to listen on [default: ephemeral port].
     /// Only relevant when --with-proxy is enabled.
     #[arg(long, value_name = "PORT")]
     proxy_port: Option<u16>,
