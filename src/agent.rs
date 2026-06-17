@@ -149,6 +149,21 @@ impl Agent {
                 }
                 // --remote and --name have no agy equivalent; dropped.
             }
+            Agent::Claude => {
+                // claude: -c/--continue continues the most recent session;
+                // -r/--resume [id] resumes a session. Bare --resume opens an
+                // interactive picker, so it maps directly (unlike opencode/agy).
+                if continue_session {
+                    args.push("--continue".to_string());
+                }
+                if let Some(session) = resume {
+                    args.push("--resume".to_string());
+                    if !session.is_empty() {
+                        args.push(session.to_string());
+                    }
+                }
+                // --remote and --name have no claude equivalent; dropped.
+            }
             // Gemini still receives auto-resume handling in main.rs; Pi and Shell
             // have no recognized session flags. None get explicit translation here.
             Agent::Gemini | Agent::Pi | Agent::Shell => {}
@@ -916,6 +931,31 @@ mod tests {
         // --remote and --name are dropped (no agy equivalent).
         assert!(
             Agent::Antigravity
+                .session_args(None, false, Some("x"), true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn session_args_claude() {
+        // --continue maps to claude's --continue.
+        assert_eq!(
+            Agent::Claude.session_args(None, true, None, false),
+            vec!["--continue"]
+        );
+        // --resume=ID maps to claude's --resume ID.
+        assert_eq!(
+            Agent::Claude.session_args(Some("sess99"), false, None, false),
+            vec!["--resume", "sess99"]
+        );
+        // Bare --resume maps to --resume (interactive picker).
+        assert_eq!(
+            Agent::Claude.session_args(Some(""), false, None, false),
+            vec!["--resume"]
+        );
+        // --remote and --name are dropped (no claude equivalent).
+        assert!(
+            Agent::Claude
                 .session_args(None, false, Some("x"), true)
                 .is_empty()
         );
