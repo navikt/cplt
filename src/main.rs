@@ -29,7 +29,9 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 /// - Linux: Landlock LSM + seccomp-BPF (kernel 5.13+, full network filtering on 6.7+)
 ///
 /// Supports GitHub Copilot CLI, OpenCode, Google Gemini CLI, Antigravity CLI,
-/// Pi, and Claude Code. Auto-detects which agent to use, or specify explicitly with --agent.
+/// Pi, and Claude Code. Copilot, OpenCode, Gemini, and Antigravity are
+/// auto-detected from PATH; Pi and Claude Code are explicit-only — select them
+/// with --agent. Use --agent to override the detected agent at any time.
 ///
 /// Defaults can be saved to ~/.config/cplt/config.toml
 /// so you don't need to pass flags every time. Run `cplt config init` to

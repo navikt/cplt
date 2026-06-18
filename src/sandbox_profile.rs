@@ -327,7 +327,8 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
                 sbpl!(sb, "(deny file-map-executable (subpath \"{path}\"))");
             }
             // Explicitly deny writes on exec-only dirs (prevents write+exec persistence
-            // even when a parent dir is writable — SBPL uses most-specific match)
+            // even when a parent dir is writable — this deny is emitted after the
+            // parent allow, so SBPL last-match-wins lets it override)
             if !dir.write && dir.process_exec {
                 sbpl!(sb, "(deny file-write* (subpath \"{path}\"))");
             }
@@ -338,8 +339,9 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
     // Claude Code: the config dir is writable (sessions, history, credentials),
     // but a few artifacts auto-execute on the HOST the next time `claude` runs
     // outside the sandbox — a persistence vector the agent never needs to write
-    // mid-session. Deny those specifically (most-specific match wins over the
-    // dir-wide allow above). settings.json, commands/, agents/, skills/ stay
+    // mid-session. Deny those specifically (emitted after the dir-wide allow
+    // above, so SBPL last-match-wins lets the deny override). settings.json,
+    // commands/, agents/, skills/ stay
     // writable: Claude legitimately authors them and they require user invocation.
     // macOS only — Landlock cannot deny a subpath within an allowed dir (see SECURITY.md).
     //

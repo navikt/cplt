@@ -710,7 +710,8 @@ fn profile_grants_claude_config_access() {
         // Writable config dir must not be executable (persistence guard).
         assert!(p.contains("(deny process-exec (subpath \"/Users/test/.claude\"))"));
         // Auto-executing artifacts are write-denied (host-persistence guard);
-        // the deny is more specific than the dir-wide allow, so it wins.
+        // the deny is emitted after the dir-wide allow, so SBPL last-match-wins
+        // lets it override.
         assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/statusline.sh\"))"));
         assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/plugins\"))"));
     });
