@@ -5,7 +5,7 @@
 //! unknown commands and a three-tier classification:
 //!
 //! - **Allow**: always permitted (read operations)
-//! - **ScopeCheck**: permitted only for the current repository
+//! - **`ScopeCheck`**: permitted only for the current repository
 //! - **Block**: never permitted (destructive/out-of-scope)
 //!
 //! The proxy is implemented as a shell wrapper placed ahead of the real
@@ -24,7 +24,7 @@ pub enum Decision {
     ScopeCheck,
     /// Always blocked — destructive or out-of-scope.
     Block,
-    /// Command not in policy table — decision deferred to GatePolicy.unknown_command.
+    /// Command not in policy table — decision deferred to `GatePolicy.unknown_command`.
     Unknown,
 }
 
@@ -883,6 +883,7 @@ static POLICY: &[PolicyEntry] = &[
 ///
 /// Expects `args` to be the arguments *after* the `gh` binary name,
 /// i.e. `["pr", "create", "--title", "fix: bug"]`.
+#[must_use]
 pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
     if args.is_empty() {
         return None;
@@ -1077,11 +1078,13 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
 }
 
 /// Look up the policy decision for a parsed command.
+#[must_use]
 pub fn evaluate(cmd: &ParsedCommand) -> PolicyResult {
     evaluate_with_policy(cmd, false)
 }
 
 /// Look up the policy decision for a parsed command, respecting policy flags.
+#[must_use]
 pub fn evaluate_with_policy(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
     // Special handling for `gh api`
     if cmd.command == "api" {
@@ -1194,6 +1197,7 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
 /// relative-path fallback — they require an explicit /repos/{owner}/{repo}/... match.
 /// This prevents scope-check bypass via top-level endpoints (e.g. `gists`, `app/...`)
 /// that don't start with a deny-listed prefix.
+#[must_use]
 pub fn is_repo_in_scope(cmd: &ParsedCommand, current_repo: &str) -> bool {
     // Check -R/--repo flag first
     if let Some(target) = &cmd.repo_flag {
@@ -1270,6 +1274,7 @@ fn extract_repo_from_api_path(endpoint: &str) -> Option<String> {
 ///
 /// Tries `git remote get-url origin` and parses the owner/repo from it.
 /// Returns None if not in a git repo or remote URL can't be parsed.
+#[must_use]
 pub fn detect_current_repo(project_dir: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
@@ -1288,11 +1293,11 @@ pub fn detect_current_repo(project_dir: &Path) -> Option<String> {
 ///
 /// Handles all URIs - assumes `github` though, so does not support other git forges for now
 fn parse_repo_from_url(url: &str) -> Option<String> {
-    let uri = if (url.starts_with("git@") && url.matches(":").count() == 1)
-        || (url.starts_with("ssh://git@") && url.matches(":").count() > 1)
+    let uri = if (url.starts_with("git@") && url.matches(':').count() == 1)
+        || (url.starts_with("ssh://git@") && url.matches(':').count() > 1)
     {
         let uri_without_scheme = url.trim_start_matches("ssh://").trim_start_matches("git@");
-        let auth_and_parts: Vec<&str> = uri_without_scheme.splitn(2, ":").collect();
+        let auth_and_parts: Vec<&str> = uri_without_scheme.splitn(2, ':').collect();
         let authority = auth_and_parts[0];
         let path: &str = auth_and_parts.get(1).map_or("", |v| v);
         URIBuilder::new()
@@ -1309,7 +1314,7 @@ fn parse_repo_from_url(url: &str) -> Option<String> {
         match URI::try_from(url) {
             Ok(uri) => uri,
             Err(e) => {
-                eprintln!("Unable to parse `git remote get-url origin`: {}", e);
+                eprintln!("Unable to parse `git remote get-url origin`: {e}");
                 return None;
             }
         }
@@ -1323,7 +1328,7 @@ fn parse_repo_from_url(url: &str) -> Option<String> {
     }
 
     let path = uri.path().to_string();
-    let repo = path.trim_end_matches(".git").trim_start_matches("/");
+    let repo = path.trim_end_matches(".git").trim_start_matches('/');
     // Should have exactly one slash: owner/repo
     if repo.matches('/').count() == 1 && !repo.starts_with('/') && !repo.ends_with('/') {
         Some(repo.to_string())
@@ -1350,6 +1355,7 @@ fn shell_escape(s: &str) -> String {
 /// `cplt_bin` is the path to the cplt binary (for calling `gh-gate`).
 /// Policy flags are baked into the wrapper invocation so the gate doesn't
 /// re-read config at runtime (security: agent could edit config files).
+#[must_use]
 pub fn generate_wrapper_script(
     real_gh: &str,
     cplt_bin: &str,
@@ -1397,7 +1403,7 @@ exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {mode_flag} {scope_flag} {aut
 pub struct GatePolicy {
     /// Enforcement mode for violations.
     pub mode: crate::config::EnforcementMode,
-    /// Enforce same-repo check for ScopeCheck commands.
+    /// Enforce same-repo check for `ScopeCheck` commands.
     pub scope_check: bool,
     /// Block `gh auth token` (token exfiltration prevention).
     pub block_auth_token: bool,
@@ -1982,7 +1988,7 @@ fn extract_push_remote_and_branch(
     (remote, branch)
 }
 
-/// Check if a push matches any allow_push exception rule.
+/// Check if a push matches any `allow_push` exception rule.
 /// All specified fields in a rule must match (AND logic).
 fn matches_allow_push_rule(
     rules: &[crate::config::ResolvedPushRule],
@@ -2041,6 +2047,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 /// Generate the git wrapper script content.
 ///
 /// Like the gh wrapper, this intercepts git invocations and blocks push operations.
+#[must_use]
 pub fn generate_git_wrapper_script(
     real_git: &str,
     cplt_bin: &str,

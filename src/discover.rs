@@ -69,9 +69,9 @@ pub struct ToolDiscovery {
     pub tools: Vec<ToolInfo>,
     /// Homebrew prefix (e.g. `/opt/homebrew` or `/usr/local`).
     pub homebrew_prefix: Option<PathBuf>,
-    /// Which HOME_TOOL_DIRS actually exist on disk.
+    /// Which `HOME_TOOL_DIRS` actually exist on disk.
     pub existing_home_tool_dirs: Vec<String>,
-    /// Writable APP_DIRS considered during discovery, including paths that may not yet exist.
+    /// Writable `APP_DIRS` considered during discovery, including paths that may not yet exist.
     pub existing_app_dirs: Vec<String>,
 }
 
@@ -133,7 +133,8 @@ pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
 
 impl AuthDiscovery {
     /// Returns true if at least one auth mechanism is available.
-    pub fn any_auth_available(&self) -> bool {
+    #[must_use]
+    pub const fn any_auth_available(&self) -> bool {
         !self.env_tokens.is_empty()
             || self.gh_cli_auth
             || self.security_cli_exists
@@ -143,6 +144,7 @@ impl AuthDiscovery {
 
 // ── Copilot CLI discovery ───────────────────────────────────────
 
+#[must_use]
 pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
     let binary_path = which_resolved("copilot");
 
@@ -194,7 +196,7 @@ pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
 
 // ── Agent discovery ─────────────────────────────────────────────
 
-/// Agents to probe: (display_name, binary_names, version_flag)
+/// Agents to probe: (`display_name`, `binary_names`, `version_flag`)
 const AGENTS_TO_CHECK: &[(&str, &[&str], &[&str])] = &[
     ("Copilot", &["copilot"], &["--version"]),
     ("OpenCode", &["opencode"], &["--version"]),
@@ -204,6 +206,7 @@ const AGENTS_TO_CHECK: &[(&str, &[&str], &[&str])] = &[
 ];
 
 /// Discover all available AI coding agents in PATH.
+#[must_use]
 pub fn discover_agents() -> Vec<AgentInfo> {
     AGENTS_TO_CHECK
         .iter()
@@ -341,6 +344,7 @@ pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
 // ── Full discovery ──────────────────────────────────────────────
 
 /// Run all discovery probes and return a complete report.
+#[must_use]
 pub fn discover_all(home_dir: &Path, project_dir: &Path) -> Discovery {
     Discovery {
         auth: discover_auth(home_dir),
@@ -649,7 +653,7 @@ impl Discovery {
 // Named functions keep cfg blocks out of the discovery logic above.
 
 /// Check if macOS Keychain CLI exists. Always false on other platforms.
-fn probe_security_cli() -> bool {
+const fn probe_security_cli() -> bool {
     #[cfg(target_os = "macos")]
     {
         Path::new("/usr/bin/security").exists()
@@ -661,7 +665,7 @@ fn probe_security_cli() -> bool {
 }
 
 /// Check if macOS Keychain directory exists. Always false on other platforms.
-fn probe_keychains_dir(home_dir: &Path) -> bool {
+const fn probe_keychains_dir(home_dir: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
         home_dir.join("Library/Keychains").exists()
@@ -674,7 +678,7 @@ fn probe_keychains_dir(home_dir: &Path) -> bool {
 }
 
 /// Check if macOS Security framework database exists. Always false on other platforms.
-fn probe_security_db() -> bool {
+const fn probe_security_db() -> bool {
     #[cfg(target_os = "macos")]
     {
         Path::new("/private/var/db/mds").exists()
@@ -686,7 +690,7 @@ fn probe_security_db() -> bool {
 }
 
 /// Print Keychain CLI status in doctor output (macOS only, no-op on Linux).
-fn print_keychain_status(security_cli_exists: bool) {
+const fn print_keychain_status(security_cli_exists: bool) {
     #[cfg(target_os = "macos")]
     if security_cli_exists {
         println!(
@@ -708,7 +712,7 @@ fn print_keychain_status(security_cli_exists: bool) {
 }
 
 /// Print macOS-specific path status (keychains, security db). No-op on Linux.
-fn print_macos_path_status(keychains_dir_exists: bool, security_db_exists: bool) {
+const fn print_macos_path_status(keychains_dir_exists: bool, security_db_exists: bool) {
     #[cfg(target_os = "macos")]
     {
         if keychains_dir_exists {
@@ -821,6 +825,7 @@ fn print_sandbox_mechanism_status() -> bool {
 /// - the binary is standalone (no `package.json` ancestor) — e.g. Homebrew cask
 /// - the nearest `package.json` belongs to a different package
 /// - the path would resolve to an unsafe root (`/`, `$HOME`, `/tmp`)
+#[must_use]
 pub fn copilot_pkg_dir(copilot_bin: &Path, home_dir: &Path) -> Option<PathBuf> {
     let mut dir = copilot_bin.parent()?;
     for _ in 0..4 {
@@ -890,6 +895,7 @@ fn is_copilot_package(pkg_json: &Path) -> bool {
 /// - the path is not under `$HOME` (prevents arbitrary filesystem reads)
 /// - the path is too shallow under `$HOME` (must be ≥3 components deep,
 ///   e.g. `~/.config/git/hooks` OK, `~/hooks` rejected as too broad)
+#[must_use]
 pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
     let output = std::process::Command::new("git")
         .args(["config", "--global", "core.hooksPath"])
@@ -940,6 +946,7 @@ pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
 /// - Not a worktree (regular repo with `.git` dir in project root)
 /// - The common dir resolves to an unsafe root
 /// - The common dir is not under `$HOME`
+#[must_use]
 pub fn git_common_dir(home_dir: &Path, project_dir: &Path) -> Option<PathBuf> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
@@ -990,6 +997,7 @@ pub fn git_common_dir(home_dir: &Path, project_dir: &Path) -> Option<PathBuf> {
 ///
 /// Returns `<bundle>.app/Contents` (not the whole bundle) to limit scope.
 /// Also works for VS Code Insiders, Cursor, Windsurf, and other Electron editors.
+#[must_use]
 pub fn discover_electron_app(copilot_bin: &Path) -> Option<PathBuf> {
     // Only process shell scripts (text files), not compiled binaries
     let content = std::fs::read_to_string(copilot_bin).ok()?;

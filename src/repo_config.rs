@@ -27,7 +27,7 @@ pub struct RepoConfig {
 
 /// Restrictive keys — can only tighten the sandbox.
 /// Applied unconditionally (the agent has no incentive to restrict itself).
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DenySection {
     /// Additional paths to deny access to (beyond the default deny list).
@@ -39,7 +39,7 @@ pub struct DenySection {
 }
 
 /// Expansive keys — relax the sandbox. Require user trust approval.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProposeSection {
     pub allow_localhost_any: Option<bool>,
@@ -64,7 +64,7 @@ pub struct ProposeSection {
 }
 
 /// Proposed allow expansions (paths, ports).
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProposeAllowSection {
     #[serde(default)]
@@ -78,7 +78,7 @@ pub struct ProposeAllowSection {
 }
 
 /// Proposed proxy settings.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProposeProxySection {
     #[serde(default)]
@@ -168,7 +168,7 @@ pub fn parse_and_validate(content: &str) -> Result<RepoConfig, String> {
     Ok(config)
 }
 
-/// Parse TOML content into a RepoConfig.
+/// Parse TOML content into a `RepoConfig`.
 fn parse_repo_config(content: &str) -> Result<RepoConfig, String> {
     toml::from_str(content).map_err(|e| format!("Invalid .cplt.toml: {e}"))
 }
@@ -234,11 +234,12 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Collect all proposed key names from a ProposeSection.
+/// Collect all proposed key names from a `ProposeSection`.
 ///
 /// Returns the list of keys that would relax the sandbox if approved.
 /// Used to show the user what a repo is requesting and to intersect
 /// with the trust store's accepted list.
+#[must_use]
 pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     let mut keys = Vec::new();
 

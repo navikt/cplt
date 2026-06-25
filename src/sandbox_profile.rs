@@ -54,10 +54,10 @@ pub struct ProfileOptions<'a> {
     pub allow_tmp_exec: bool,
     /// Copilot CLI package directory (resolved from the binary location).
     /// Needed when Copilot is installed in a non-standard location (e.g. ~/n/
-    /// via the `n` Node version manager) that isn't covered by TOOL_READ_DIRS.
+    /// via the `n` Node version manager) that isn't covered by `TOOL_READ_DIRS`.
     pub copilot_install_dir: Option<&'a Path>,
-    /// JAVA_HOME directory for JDK read + dylib loading.
-    /// Needed when Java is installed outside TOOL_READ_DIRS (e.g. ~/hostedtoolcache,
+    /// `JAVA_HOME` directory for JDK read + dylib loading.
+    /// Needed when Java is installed outside `TOOL_READ_DIRS` (e.g. ~/hostedtoolcache,
     /// sdkman, or other version managers).
     pub java_home: Option<&'a Path>,
     /// Global git hooks directory from `core.hooksPath`.
@@ -79,7 +79,7 @@ pub struct ProfileOptions<'a> {
     /// remain reachable. Useful when the sandboxed agent must not be able to
     /// read or write clipboard contents (e.g. credential-sniffing via pbpaste).
     pub deny_clipboard: bool,
-    /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
+    /// Allow JVM Attach API unix sockets in /tmp (.`java_pid`* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow Docker/Colima/OrbStack daemon socket and ~/.docker read access.
     pub allow_docker: bool,
@@ -105,6 +105,7 @@ pub struct ProfileOptions<'a> {
 /// Sections are emitted in a fixed order — SBPL uses last-match-wins semantics,
 /// so deny rules must come after their corresponding allows. Each `emit_*` helper
 /// writes a contiguous block; their call order must not be changed.
+#[must_use]
 pub fn generate_profile(opts: &ProfileOptions) -> String {
     let mut sb = String::with_capacity(4096);
     let home = opts.home_dir.to_string_lossy();
@@ -753,7 +754,7 @@ fn emit_tool_dirs(
 
 /// Allow reading and dlopen from the Copilot CLI package directory.
 /// Needed when Copilot is installed via a non-standard Node version manager
-/// (e.g. `n` at ~/n/) whose path isn't covered by TOOL_READ_DIRS.
+/// (e.g. `n` at ~/n/) whose path isn't covered by `TOOL_READ_DIRS`.
 fn emit_copilot_install(sb: &mut String, install_dir: Option<&Path>) {
     if let Some(dir) = install_dir {
         let p = dir.to_string_lossy();
@@ -764,8 +765,8 @@ fn emit_copilot_install(sb: &mut String, install_dir: Option<&Path>) {
     }
 }
 
-/// Allow reading and loading JDK libraries from JAVA_HOME.
-/// Needed when Java is installed outside TOOL_READ_DIRS — e.g. version managers
+/// Allow reading and loading JDK libraries from `JAVA_HOME`.
+/// Needed when Java is installed outside `TOOL_READ_DIRS` — e.g. version managers
 /// (sdkman, actions/setup-java hostedtoolcache) that place the JDK under HOME.
 fn emit_java_home(sb: &mut String, java_home: Option<&Path>) {
     if let Some(dir) = java_home {
@@ -969,7 +970,7 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
 ///
 /// Emitted AFTER `emit_deny_rules` so SBPL last-match-wins re-allows the file.
 /// Only matches exact paths from `DENIED_HOME_SUBPATHS` — hard denies
-/// (DENIED_FILES, DENIED_DOTFILES) cannot be overridden this way.
+/// (`DENIED_FILES`, `DENIED_DOTFILES`) cannot be overridden this way.
 fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[PathBuf]) {
     let home_path = Path::new(home);
     let mut overrides: Vec<&str> = Vec::new();
@@ -993,10 +994,10 @@ fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[Pat
     }
 }
 
-/// Re-allow specific files inside DENIED_DOTFILES directories when the user
+/// Re-allow specific files inside `DENIED_DOTFILES` directories when the user
 /// has explicitly approved them via `allow.read`.
 ///
-/// DENIED_DOTFILES uses `(deny file-read* (subpath ...))` which blocks entire
+/// `DENIED_DOTFILES` uses `(deny file-read* (subpath ...))` which blocks entire
 /// directories. When a user explicitly approves a file inside one of these dirs,
 /// we emit a targeted `(allow file-read* (literal ...))` AFTER the deny so
 /// SBPL last-match-wins grants access to that specific file only.

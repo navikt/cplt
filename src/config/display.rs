@@ -101,6 +101,7 @@ pub fn explain_all(loaded: Option<&LoadedConfig>) {
 /// Get the effective value of a config key.
 /// Returns `(value_string, is_from_file)`.
 #[allow(clippy::collapsible_if)]
+#[must_use]
 pub fn get_config_value(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) -> (String, bool) {
     if let Some(loaded) = loaded {
         if let Ok(root) = loaded.raw.parse::<toml::Table>() {

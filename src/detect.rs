@@ -31,7 +31,8 @@ pub enum SandboxFlag {
 
 impl SandboxFlag {
     /// The config key name as it appears in .cplt.toml `[propose]` section.
-    pub fn key_name(self) -> &'static str {
+    #[must_use]
+    pub const fn key_name(self) -> &'static str {
         match self {
             Self::AllowJvmAttach => "allow_jvm_attach",
             Self::AllowDocker => "allow_docker",
@@ -45,7 +46,8 @@ impl SandboxFlag {
     }
 
     /// Risk warning for dangerous permissions. None means safe to suggest.
-    pub fn risk_warning(self) -> Option<&'static str> {
+    #[must_use]
+    pub const fn risk_warning(self) -> Option<&'static str> {
         match self {
             Self::AllowLifecycleScripts => {
                 Some("runs arbitrary scripts on install — only enable if builds fail without it")
@@ -114,8 +116,8 @@ pub enum Signal {
 impl std::fmt::Display for Signal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Signal::FileExists { path } | Signal::DirExists { path } => write!(f, "{path}"),
-            Signal::FileContains { path, reason } => write!(f, "{path} ({reason})"),
+            Self::FileExists { path } | Self::DirExists { path } => write!(f, "{path}"),
+            Self::FileContains { path, reason } => write!(f, "{path} ({reason})"),
         }
     }
 }
@@ -145,14 +147,14 @@ pub struct DetectorOutput {
 }
 
 impl DetectorOutput {
-    fn none() -> Self {
+    const fn none() -> Self {
         Self {
             detection: None,
             diagnostics: Vec::new(),
         }
     }
 
-    fn detected(detection: Detection) -> Self {
+    const fn detected(detection: Detection) -> Self {
         Self {
             detection: Some(detection),
             diagnostics: Vec::new(),
@@ -179,7 +181,8 @@ pub struct DetectionReport {
 impl DetectionReport {
     /// Create a report from detections, suggestions, and diagnostics.
     /// Initializes workspace fields to empty (for non-monorepo use).
-    pub fn new(
+    #[must_use]
+    pub const fn new(
         detections: Vec<Detection>,
         suggestions: BTreeSet<Suggestion>,
         diagnostics: Vec<Diagnostic>,
@@ -209,6 +212,7 @@ pub struct DetectContext {
 const MAX_READ_SIZE: u64 = 256 * 1024;
 
 impl DetectContext {
+    #[must_use]
     pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
@@ -217,6 +221,7 @@ impl DetectContext {
 
     /// Check if a relative path exists as a file.
     /// Rejects symlinks pointing outside the project root.
+    #[must_use]
     pub fn exists(&self, relative: &str) -> bool {
         if Self::is_traversal(relative) {
             return false;
@@ -230,6 +235,7 @@ impl DetectContext {
 
     /// Check if a relative path exists as a directory.
     /// Rejects symlinks pointing outside the project root.
+    #[must_use]
     pub fn dir_exists(&self, relative: &str) -> bool {
         if Self::is_traversal(relative) {
             return false;
@@ -244,6 +250,7 @@ impl DetectContext {
     /// Read file contents (limited size, best-effort).
     /// Returns None if file doesn't exist, is too large, can't be read,
     /// or resolves (via symlink) to a location outside the project root.
+    #[must_use]
     pub fn read_text(&self, relative: &str) -> Option<String> {
         if Self::is_traversal(relative) {
             return None;
@@ -260,6 +267,7 @@ impl DetectContext {
     }
 
     /// Project root path.
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -363,6 +371,7 @@ pub const DETECTORS: &[DetectorSpec] = &[
 ];
 
 /// Run all detectors against a project directory.
+#[must_use]
 pub fn detect_project(dir: &Path) -> DetectionReport {
     let ctx = DetectContext::new(dir);
     let mut detections = Vec::new();
@@ -1234,7 +1243,7 @@ const SCAN_MAX_DEPTH: usize = 4;
 /// Max directory entries to visit during fallback scan.
 const SCAN_MAX_ENTRIES: usize = 10_000;
 
-/// Max file size for workspace config files (512 KiB — same as DetectContext).
+/// Max file size for workspace config files (512 KiB — same as `DetectContext`).
 const WORKSPACE_MAX_FILE_SIZE: usize = 512 * 1024;
 
 /// Discover workspace members from explicit workspace configuration files.
@@ -1248,6 +1257,7 @@ const WORKSPACE_MAX_FILE_SIZE: usize = 512 * 1024;
 ///
 /// Returns discovered members and any diagnostics. Members use canonical relative
 /// paths and are deduplicated. Paths outside the repo root are rejected with a diagnostic.
+#[must_use]
 pub fn discover_workspace_members(root: &Path) -> (Vec<WorkspaceMember>, Vec<Diagnostic>) {
     let mut members = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1659,8 +1669,10 @@ fn parse_go_work(
 // ── Heuristic fallback scan ──────────────────────────────────────────
 
 /// Bounded directory scan for subprojects when no workspace config is found.
+///
 /// Walks up to [`SCAN_MAX_DEPTH`] levels, skipping known non-project directories,
 /// and looks for manifest files that indicate a project root.
+#[must_use]
 pub fn scan_for_subprojects(root: &Path) -> (Vec<WorkspaceMember>, Vec<Diagnostic>) {
     let mut members = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1777,6 +1789,7 @@ fn scan_dir_recursive(
 /// 2. Discovers workspace members (explicit configs, or heuristic fallback)
 /// 3. Runs all detectors on each member subdirectory
 /// 4. Merges suggestions with provenance tracking
+#[must_use]
 pub fn detect_project_recursive(root: &Path) -> DetectionReport {
     // Step 1: root-level detection
     let mut report = detect_project(root);
@@ -1859,6 +1872,7 @@ pub struct GlobalDetectionReport {
 /// Scan the user's home directory and environment for tool configurations
 /// that need personal config settings. Only detects tools commonly used
 /// by Nav developers.
+#[must_use]
 pub fn detect_global(home: &Path) -> GlobalDetectionReport {
     let mut detections = Vec::new();
 

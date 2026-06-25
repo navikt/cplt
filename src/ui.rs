@@ -31,7 +31,7 @@ fn force_color_set() -> bool {
 }
 
 /// Whether color should be suppressed by environment variables.
-/// True when NO_COLOR is set (any value) or TERM=dumb.
+/// True when `NO_COLOR` is set (any value) or TERM=dumb.
 fn env_suppresses_color() -> bool {
     static SUPPRESSED: OnceLock<bool> = OnceLock::new();
     *SUPPRESSED.get_or_init(|| {
@@ -44,7 +44,7 @@ fn env_suppresses_color() -> bool {
 
 /// Whether color is enabled for **stderr**. Cached on first call.
 ///
-/// Priority: FORCE_COLOR > NO_COLOR/TERM=dumb > TTY detection.
+/// Priority: `FORCE_COLOR` > `NO_COLOR/TERM=dumb` > TTY detection.
 pub fn use_color() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -60,7 +60,7 @@ pub fn use_color() -> bool {
 
 /// Whether color is enabled for **stdout**. Cached on first call.
 ///
-/// Priority: FORCE_COLOR > NO_COLOR/TERM=dumb > TTY detection.
+/// Priority: `FORCE_COLOR` > `NO_COLOR/TERM=dumb` > TTY detection.
 pub fn use_stdout_color() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -76,12 +76,14 @@ pub fn use_stdout_color() -> bool {
 
 /// Return the escape code for **stderr** if color is enabled, empty string otherwise.
 #[inline]
+#[must_use]
 pub fn color(code: &str) -> &str {
     if use_color() { code } else { "" }
 }
 
 /// Return the escape code for **stdout** if color is enabled, empty string otherwise.
 #[inline]
+#[must_use]
 pub fn stdout_color(code: &str) -> &str {
     if use_stdout_color() { code } else { "" }
 }

@@ -270,7 +270,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
     matrix[a.len()][b.len()]
 }
 
-fn value_type_name(v: &toml::Value) -> &'static str {
+const fn value_type_name(v: &toml::Value) -> &'static str {
     match v {
         toml::Value::String(_) => "string",
         toml::Value::Integer(_) => "integer",

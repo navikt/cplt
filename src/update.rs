@@ -167,6 +167,7 @@ pub fn fetch_latest_release(current_version: &str) -> Result<Release, UpdateErro
 }
 
 /// Compare current version against the latest release.
+#[must_use]
 pub fn check_version(current: &str, latest: &Release) -> VersionStatus {
     if current == "0.0.0" {
         return VersionStatus::DevBuild {
@@ -291,6 +292,7 @@ pub fn perform_update(
 }
 
 /// Check if the current binary is managed by Homebrew.
+#[must_use]
 pub fn is_homebrew_managed() -> bool {
     let exe = std::env::current_exe()
         .ok()
@@ -305,6 +307,7 @@ pub fn is_homebrew_managed() -> bool {
 }
 
 /// Construct the asset filename for the current platform and architecture.
+#[must_use]
 pub fn asset_name(arch: &str) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -325,6 +328,7 @@ pub fn asset_name(arch: &str) -> String {
 ///   - YYYY.MM.DD-SHA (legacy)
 ///   - YYYY.MM.DD.HH.MM.SS-SHA (intermediate)
 ///   - YYYY.MM.DD-HHMMSS-SHA (current)
+#[must_use]
 pub fn looks_like_version(s: &str) -> bool {
     // SHA is always the last dash-separated segment
     let Some((prefix, sha)) = s.rsplit_once('-') else {
@@ -363,9 +367,11 @@ pub fn looks_like_version(s: &str) -> bool {
 }
 
 /// Extract the sortable date+time portion of a version string.
+///
 /// Returns everything before the last `-` (the git SHA).
 /// Lexicographic comparison works correctly across all formats:
 ///   "2026.04.13" < "2026.04.13-173045" < "2026.04.13.17.30.45"
+#[must_use]
 pub fn version_date(version: &str) -> &str {
     version
         .rsplit_once('-')
@@ -643,7 +649,7 @@ fn verify_binary_version(
 ///
 /// On macOS, removes quarantine attributes and ad-hoc code signs the binary
 /// (required by Gatekeeper). On Linux, this is a no-op.
-fn postprocess_binary(path: &Path) {
+const fn postprocess_binary(path: &Path) {
     #[cfg(target_os = "macos")]
     {
         let _ = run_xattr(path);

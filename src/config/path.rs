@@ -7,6 +7,7 @@ use super::types::{CONFIG_DIR, CONFIG_FILE};
 
 /// Return the config file path.
 /// Checks `CPLT_CONFIG` env var first, then `~/.config/cplt/config.toml`.
+#[must_use]
 pub fn config_path() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("CPLT_CONFIG") {
         return Some(expand_tilde(&custom));
@@ -30,6 +31,7 @@ pub fn config_dir() -> Option<PathBuf> {
 }
 
 /// Generate a default config file with comments explaining each option.
+#[must_use]
 pub fn default_config_contents() -> String {
     r#"# cplt configuration
 #
@@ -213,6 +215,7 @@ pub fn default_config_contents() -> String {
 }
 
 /// Expand leading `~/` to `$HOME/`. Only this form is supported.
+#[must_use]
 pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
@@ -227,8 +230,10 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 }
 
 /// Replace the user's home directory prefix with `~` for portable storage.
+///
 /// Only collapses exact `$HOME` or `$HOME/...` boundaries (component-aware).
 /// Returns the original string unchanged if it doesn't start with `$HOME`.
+#[must_use]
 pub fn collapse_tilde(path: &str) -> String {
     let Ok(home) = std::env::var("HOME") else {
         return path.to_string();

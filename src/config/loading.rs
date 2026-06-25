@@ -35,7 +35,7 @@ impl Config {
             }
         };
 
-        let config: Config = toml::from_str(&raw).map_err(|e| ConfigError::TomlParse {
+        let config: Self = toml::from_str(&raw).map_err(|e| ConfigError::TomlParse {
             path: path.display().to_string(),
             source: e,
         })?;
@@ -390,6 +390,7 @@ impl Config {
 
 impl Resolved {
     /// Returns the hardening categories that are disabled by user configuration.
+    #[must_use]
     pub fn disabled_hardening_categories(&self) -> Vec<HardeningCategory> {
         let mut disabled = Vec::new();
         if self.allow_lifecycle_scripts {

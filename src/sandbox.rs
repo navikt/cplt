@@ -97,7 +97,7 @@ pub struct SandboxConfig<'a> {
     pub allow_tmp_exec: bool,
     /// Copilot CLI package directory (resolved from the binary location).
     pub copilot_install_dir: Option<&'a Path>,
-    /// JAVA_HOME directory — grants JDK read + dylib loading.
+    /// `JAVA_HOME` directory — grants JDK read + dylib loading.
     pub java_home: Option<&'a Path>,
     /// Global git hooks directory from `core.hooksPath`.
     pub git_hooks_path: Option<&'a Path>,
@@ -105,7 +105,7 @@ pub struct SandboxConfig<'a> {
     pub git_common_dir: Option<&'a Path>,
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
-    /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
+    /// Allow JVM Attach API unix sockets in /tmp (.`java_pid`* pattern only).
     pub allow_jvm_attach: bool,
     /// Allow Docker/Colima/OrbStack access (daemon socket + ~/.docker read).
     pub allow_docker: bool,
@@ -145,18 +145,20 @@ pub struct PreparedSandbox {
     /// Whether all localhost ports are open (`--allow-localhost-any`).
     allow_localhost_any: bool,
     /// Landlock + seccomp pre-computed sandbox data (Linux only).
-    /// Built in the parent process; applied in pre_exec.
+    /// Built in the parent process; applied in `pre_exec`.
     #[cfg(target_os = "linux")]
     precomputed: landlock_mod::PrecomputedSandbox,
 }
 
 impl PreparedSandbox {
     /// The project directory this sandbox is configured for.
+    #[must_use]
     pub fn project_dir(&self) -> &Path {
         &self.project_dir
     }
 
     /// The home directory this sandbox is configured for.
+    #[must_use]
     pub fn home_dir(&self) -> &Path {
         &self.home_dir
     }
@@ -178,6 +180,7 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 ///
 /// On macOS, returns the SBPL profile text (useful for `--print-profile`).
 /// On Linux, returns a formatted Landlock rule summary.
+#[must_use]
 pub fn describe(sandbox: &PreparedSandbox) -> &str {
     &sandbox.profile_text
 }
@@ -188,7 +191,7 @@ pub fn describe(sandbox: &PreparedSandbox) -> &str {
 /// inside `sandbox-exec` to confirm enforcement is active.
 ///
 /// On Linux, this is a no-op (ABI checks happen during prepare).
-pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
+pub const fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
     exec::preflight(sandbox)
 }
 
@@ -202,6 +205,7 @@ pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
 /// and `disabled_categories` — see [`build_sandbox_env()`] for details.
 /// `deny_env` contains additional env vars to strip (from repo config [deny] section).
 #[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn exec_sandboxed(
     sandbox: &PreparedSandbox,
     copilot_bin: &Path,

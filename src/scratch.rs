@@ -93,10 +93,11 @@ impl ScratchDir {
             return Err(format!("Scratch dir path unsafe: {e}"));
         }
 
-        Ok(ScratchDir { path: session_dir })
+        Ok(Self { path: session_dir })
     }
 
     /// Path to the scratch directory.
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -19,7 +19,8 @@ pub enum ConfigValueType {
 }
 
 impl ConfigValueType {
-    pub fn is_array(self) -> bool {
+    #[must_use]
+    pub const fn is_array(self) -> bool {
         matches!(self, Self::U16Array | Self::StrArray | Self::ArrayOfTables)
     }
 }
@@ -469,7 +470,7 @@ pub fn lookup_key(dotted: &str) -> Result<&'static ConfigKeyInfo, ConfigError> {
         })
 }
 
-pub(super) fn type_label(vt: ConfigValueType) -> &'static str {
+pub(super) const fn type_label(vt: ConfigValueType) -> &'static str {
     match vt {
         ConfigValueType::Bool => "bool",
         ConfigValueType::U16 => "integer (1-65535)",

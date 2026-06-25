@@ -33,10 +33,11 @@ pub const DENIED_FILES: &[&str] = &[
     ".vault-token",
 ];
 
-/// Credential files inside otherwise-allowed HOME_TOOL_DIRS.
+/// Credential files inside otherwise-allowed `HOME_TOOL_DIRS`.
+///
 /// These are denied by default because they typically contain registry
 /// credentials (Nexus/Artifactory passwords, API tokens, master passwords).
-/// Unlike DENIED_FILES, these can be overridden with `--allow-read` or
+/// Unlike `DENIED_FILES`, these can be overridden with `--allow-read` or
 /// `allow.read` in config.toml for developers using private registries.
 ///
 /// On Linux (Landlock), this deny is NOT enforceable — Landlock cannot deny
@@ -304,7 +305,7 @@ pub enum HardeningCategory {
     LifecycleScripts,
     /// Prevent git from prompting or leaking credentials interactively.
     GitHardening,
-    /// Disable commit/tag signing inside the sandbox. Separated from GitHardening
+    /// Disable commit/tag signing inside the sandbox. Separated from `GitHardening`
     /// so `--allow-gpg-signing` can re-enable signing without removing
     /// `GIT_TERMINAL_PROMPT=0`.
     GitSigning,
@@ -456,7 +457,7 @@ pub const GPG_SIGNING_ALLOW_FILES: &[&str] = &[
 ];
 
 /// Application directory kinds according to relevant platform specifications.
-/// See https://docs.rs/directories for more details
+/// See <https://docs.rs/directories> for more details
 pub enum AppDirKind {
     /// macOS: `~/Library/Caches/<app>` · Linux/macOS when using XDG: `~/.cache/<app>`
     Cache,
@@ -492,28 +493,28 @@ impl AppDirKind {
             fn(project_dir: ProjectDirs) -> Option<PathBuf>,
         );
         let lookup: Lookup = match self {
-            AppDirKind::Cache => ("XDG_CACHE_HOME", ".cache", |project_dir| {
+            Self::Cache => ("XDG_CACHE_HOME", ".cache", |project_dir| {
                 Some(project_dir.cache_dir().to_owned())
             }),
-            AppDirKind::Config => ("XDG_CONFIG_HOME", ".config", |project_dir| {
+            Self::Config => ("XDG_CONFIG_HOME", ".config", |project_dir| {
                 Some(project_dir.config_dir().to_owned())
             }),
-            AppDirKind::ConfigLocal => ("XDG_CONFIG_HOME", ".config", |project_dir| {
+            Self::ConfigLocal => ("XDG_CONFIG_HOME", ".config", |project_dir| {
                 Some(project_dir.config_local_dir().to_owned())
             }),
-            AppDirKind::Data => ("XDG_DATA_HOME", ".local/share", |project_dir| {
+            Self::Data => ("XDG_DATA_HOME", ".local/share", |project_dir| {
                 Some(project_dir.data_dir().to_owned())
             }),
-            AppDirKind::DataLocal => ("XDG_DATA_HOME", ".local/share", |project_dir| {
+            Self::DataLocal => ("XDG_DATA_HOME", ".local/share", |project_dir| {
                 Some(project_dir.data_local_dir().to_owned())
             }),
-            AppDirKind::Preference => ("XDG_CONFIG_HOME", ".config", |project_dir| {
+            Self::Preference => ("XDG_CONFIG_HOME", ".config", |project_dir| {
                 Some(project_dir.preference_dir().to_owned())
             }),
-            AppDirKind::Runtime => ("XDG_RUNTIME_DIR", "", |project_dir| {
+            Self::Runtime => ("XDG_RUNTIME_DIR", "", |project_dir| {
                 project_dir.runtime_dir().map(ToOwned::to_owned)
             }),
-            AppDirKind::State => ("XDG_STATE_HOME", ".local/state", |project_dir| {
+            Self::State => ("XDG_STATE_HOME", ".local/state", |project_dir| {
                 project_dir.state_dir().map(ToOwned::to_owned)
             }),
         };
@@ -586,23 +587,28 @@ impl AppDir {
             .collect()
     }
 
+    #[must_use]
     pub fn process_exec_paths(&self, home_dir: &Path) -> Vec<PathBuf> {
         self.resolve_dedup(self.process_exec, home_dir)
     }
 
+    #[must_use]
     pub fn map_exec_paths(&self, home_dir: &Path) -> Vec<PathBuf> {
         self.resolve_dedup(self.map_exec, home_dir)
     }
 
+    #[must_use]
     pub fn write_paths(&self, home_dir: &Path) -> Vec<PathBuf> {
         self.resolve_dedup(self.write, home_dir)
     }
 
+    #[must_use]
     pub fn read_paths(&self, home_dir: &Path) -> Vec<PathBuf> {
         self.resolve_dedup(self.read, home_dir)
     }
 
     /// Union of all category paths, deduplicated.
+    #[must_use]
     pub fn all_paths(&self, home_dir: &std::path::Path) -> Vec<PathBuf> {
         let mut seen = std::collections::HashSet::new();
         let mut paths = Vec::new();
@@ -724,7 +730,8 @@ pub const APP_DIRS: &[AppDir] = &[
 /// A single unified list covers both macOS and Linux paths. Some entries may
 /// not exist on a given platform or system, but they remain in the shared list
 /// and are handled by the platform-specific sandbox implementations at runtime.
-pub fn app_dirs() -> &'static [AppDir] {
+#[must_use]
+pub const fn app_dirs() -> &'static [AppDir] {
     APP_DIRS
 }
 
@@ -975,7 +982,8 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
 /// paths that don't exist on a given platform are harmlessly skipped because
 /// `discover.rs` filters them via `existing_home_tool_dirs` before they reach
 /// the profile generator.
-pub fn home_tool_dirs() -> &'static [HomeToolDir] {
+#[must_use]
+pub const fn home_tool_dirs() -> &'static [HomeToolDir] {
     HOME_TOOL_DIRS
 }
 

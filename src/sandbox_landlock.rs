@@ -13,7 +13,7 @@
 //! allowed directory. On macOS, SBPL can deny `.env` reads and `.git/hooks`
 //! writes inside the project dir at the kernel level. On Linux, these
 //! protections come from the proxy layer (exfiltration blocking) and
-//! environment hardening (GIT_CONFIG overrides), not from filesystem rules.
+//! environment hardening (`GIT_CONFIG` overrides), not from filesystem rules.
 //!
 //! Landlock network rules (ABI v4+) are port-based, not address-based.
 //! This means port 443 allows connecting to ANY host on that port, including
@@ -70,7 +70,7 @@ pub struct NetRule {
     pub port: u16,
 }
 
-/// Complete Landlock policy compiled from SandboxConfig.
+/// Complete Landlock policy compiled from `SandboxConfig`.
 ///
 /// This is a platform-agnostic description of what the Landlock ruleset
 /// will enforce. It's built by [`generate_policy()`] and applied by
@@ -86,7 +86,7 @@ pub struct LandlockPolicy {
     /// from remote hosts. The proxy still provides domain-level filtering.
     pub restrict_net_connect: bool,
     /// Home directory — used to pre-create writable cache directories that
-    /// Landlock needs to open(O_PATH) before the sandbox is applied.
+    /// Landlock needs to `open(O_PATH)` before the sandbox is applied.
     pub home_dir: PathBuf,
 }
 
@@ -145,7 +145,7 @@ pub struct BpfInstruction {
 // to keep each platform's paths independent and auditable.
 
 /// System paths that need read access.
-/// Linux equivalent of macOS `SYSTEM_READ_FILES` in sandbox_policy.rs.
+/// Linux equivalent of macOS `SYSTEM_READ_FILES` in `sandbox_policy.rs`.
 const LINUX_SYSTEM_READ_PATHS: &[&str] = &[
     "/etc/ssl",
     "/etc/pki",             // RHEL/Fedora CA certificates
@@ -174,7 +174,7 @@ const LINUX_SYSTEM_READ_PATHS: &[&str] = &[
 ];
 
 /// Tool directories with read + execute access.
-/// Linux equivalent of macOS `TOOL_READ_DIRS` in sandbox_policy.rs.
+/// Linux equivalent of macOS `TOOL_READ_DIRS` in `sandbox_policy.rs`.
 const LINUX_TOOL_DIRS: &[&str] = &[
     "/bin",
     "/sbin",
@@ -248,7 +248,7 @@ const DEVICE_FILES: &[&str] = &[
 /// Windows-style prefix).
 ///
 /// Load-bearing for the Linux cache-exec carve-out: the joined path is opened
-/// with `O_PATH`, and the kernel resolves `..` at open() time. Without this
+/// with `O_PATH`, and the kernel resolves `..` at `open()` time. Without this
 /// filter a crafted value like `../../bin` would grant execute *outside*
 /// `~/.cache`. (macOS SBPL is immune because `subpath` does literal prefix
 /// matching on already-canonicalized paths, where `..` never appears.)
@@ -264,6 +264,7 @@ fn is_safe_cache_subdir(subdir: &str) -> bool {
     saw_component
 }
 
+#[must_use]
 pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let mut fs_rules = Vec::new();
     let home = config.home_dir;
@@ -666,6 +667,7 @@ fn should_include_tool_dir(dir: &HomeToolDir, config: &super::SandboxConfig) -> 
 }
 
 /// Human-readable summary of the Landlock policy for `--print-profile`.
+#[must_use]
 pub fn describe_policy(policy: &LandlockPolicy) -> String {
     let mut out = String::new();
     out.push_str("# Landlock filesystem policy (deny-by-default)\n");
@@ -815,7 +817,7 @@ fn probe_abi_candidate(abi: ABI) -> Result<(), String> {
 
 /// Pre-compute all sandbox data in the parent process.
 ///
-/// This does all I/O and allocation before fork(), so the `pre_exec`
+/// This does all I/O and allocation before `fork()`, so the `pre_exec`
 /// hook only needs to make raw syscalls. This avoids async-signal-safety
 /// issues when forking a multi-threaded process (the proxy thread may
 /// be running).
@@ -933,11 +935,11 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
 
 /// Build the seccomp BPF filter program in the parent process.
 ///
-/// Returns a Vec of BPF instructions ready to be passed to prctl()
-/// in the child. No allocation needed in pre_exec.
+/// Returns a Vec of BPF instructions ready to be passed to `prctl()`
+/// in the child. No allocation needed in `pre_exec`.
 ///
 /// Security: The filter validates `seccomp_data.arch` first to prevent
-/// bypass via 32-bit compat syscall ABI (e.g. `int 0x80` on x86_64).
+/// bypass via 32-bit compat syscall ABI (e.g. `int 0x80` on `x86_64`).
 #[cfg(target_os = "linux")]
 fn build_seccomp_filter() -> Vec<BpfInstruction> {
     // BPF constants
@@ -1047,15 +1049,15 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
 ///
 /// # Safety (async-signal-safety)
 ///
-/// The Landlock crate API does heap-allocate internally (Ruleset, add_rule,
-/// etc.). This runs after fork() in a multi-threaded process (the proxy
-/// thread is running). Strictly, heap allocation in pre_exec is not
+/// The Landlock crate API does heap-allocate internally (Ruleset, `add_rule`,
+/// etc.). This runs after `fork()` in a multi-threaded process (the proxy
+/// thread is running). Strictly, heap allocation in `pre_exec` is not
 /// async-signal-safe. In practice this is safe because:
 /// 1. The proxy thread spends nearly all time blocked in I/O syscalls
-///    (epoll_wait/recv/send), not holding the allocator lock.
+///    (`epoll_wait/recv/send`), not holding the allocator lock.
 /// 2. The Landlock allocations are small and fast (~microseconds).
 /// 3. This is the same risk profile as any Rust program using
-///    Command::spawn() with pre_exec in a multi-threaded context.
+///    `Command::spawn()` with `pre_exec` in a multi-threaded context.
 ///
 /// Deferred paths (magic symlinks like `/proc/self`) also require one
 /// `open()` call per path in the child.
@@ -1256,6 +1258,7 @@ const BLOCKED_SYSCALL_NAMES_COMMON: &[&str] = &[
 ];
 
 /// Return the full list of blocked syscall names for the current architecture.
+#[must_use]
 pub fn blocked_syscall_names() -> Vec<&'static str> {
     #[allow(unused_mut)]
     let mut names = BLOCKED_SYSCALL_NAMES_COMMON.to_vec();

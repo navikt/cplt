@@ -22,6 +22,7 @@ pub enum RepoKeyTarget {
 
 /// Map a global config key to its repo config location.
 /// Returns None if the key is not valid in repo config.
+#[must_use]
 pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
     match (key_info.section, key_info.key) {
         // Propose booleans
@@ -53,6 +54,7 @@ pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
 }
 
 /// Keys that are valid in repo config but rejected — provides clear error messages.
+#[must_use]
 pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
     match (key_info.section, key_info.key) {
         ("sandbox", "quiet") => "controls local CLI output, not project sandbox policy",

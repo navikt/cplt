@@ -28,7 +28,8 @@ pub enum ProxyLogLevel {
 }
 
 impl ProxyLogLevel {
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Error => "error",
@@ -322,7 +323,7 @@ pub struct ProxyOptions {
     /// Whether all localhost ports are open (`--allow-localhost-any`).
     pub allow_localhost_any: bool,
     /// Path to an allowlist file (one domain per line). When set, only
-    /// matching domains pass. The file is re-read every RELOAD_TTL seconds.
+    /// matching domains pass. The file is re-read every `RELOAD_TTL` seconds.
     pub allowed_domains_file: Option<PathBuf>,
     /// Initial allowed domains from CLI/config (used for startup validation).
     /// After startup, the file is the source of truth for dynamic reload.
@@ -331,7 +332,7 @@ pub struct ProxyOptions {
     pub cli_private_domains: Vec<String>,
     /// Domains allowed to resolve to private IPs — config portion (initial).
     pub config_private_domains: Vec<String>,
-    /// Path to TOML config file for dynamic reload of private_domains.
+    /// Path to TOML config file for dynamic reload of `private_domains`.
     pub config_file: Option<PathBuf>,
     /// Path to append audit log lines. None = no file logging.
     pub log_file: Option<PathBuf>,
@@ -787,6 +788,7 @@ fn is_blocked_in_list(hostname: &str, blocked_domains: &[String]) -> bool {
     false
 }
 
+#[must_use]
 pub fn is_blocked(hostname: &str, blocked_file: &PathBuf) -> bool {
     if !blocked_file.exists() {
         return false;
@@ -806,6 +808,7 @@ pub fn is_blocked(hostname: &str, blocked_file: &PathBuf) -> bool {
     is_blocked_in_content(hostname, &contents)
 }
 
+#[must_use]
 pub fn is_blocked_in_content(hostname: &str, contents: &str) -> bool {
     let host = normalize_hostname(hostname);
     for line in contents.lines() {
@@ -829,6 +832,7 @@ fn normalize_hostname(host: &str) -> String {
 /// Check if a hostname matches any entry in a domain list.
 /// Matching is exact or subdomain: `example.com` matches `example.com`
 /// and `sub.example.com`. Case-insensitive, trailing dots stripped.
+#[must_use]
 pub fn is_domain_match(hostname: &str, domains: &[String]) -> bool {
     let host = normalize_hostname(hostname);
     for pattern in domains {
@@ -873,6 +877,7 @@ pub fn parse_domain_file(path: &std::path::Path) -> Result<Vec<String>, String> 
 
 /// Check if a resolved IP address is private/reserved (post-DNS resolution).
 /// This is the primary defense against DNS rebinding attacks.
+#[must_use]
 pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
@@ -897,6 +902,7 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
 }
 
 /// Check hostname patterns that are known to be private (pre-DNS fast path).
+#[must_use]
 pub fn is_private_hostname(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
     // Check if it's an IP literal first
@@ -907,40 +913,40 @@ pub fn is_private_hostname(host: &str) -> bool {
 }
 
 // CGNAT range (RFC 6598) — used by Tailscale, WireGuard, carrier NAT
-fn is_cgnat(ip: &std::net::Ipv4Addr) -> bool {
+const fn is_cgnat(ip: &std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 100 && (o[1] & 0xC0) == 64 // 100.64.0.0/10
 }
 
 // Benchmarking range (RFC 2544)
-fn is_benchmarking(ip: &std::net::Ipv4Addr) -> bool {
+const fn is_benchmarking(ip: &std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 198 && (o[1] & 0xFE) == 18 // 198.18.0.0/15
 }
 
 // Reserved/future use (RFC 1112)
-fn is_reserved_v4(ip: &std::net::Ipv4Addr) -> bool {
+const fn is_reserved_v4(ip: &std::net::Ipv4Addr) -> bool {
     ip.octets()[0] >= 240 // 240.0.0.0/4
 }
 
 // IETF protocol assignments (RFC 6890)
-fn is_protocol_assign(ip: &std::net::Ipv4Addr) -> bool {
+const fn is_protocol_assign(ip: &std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 192 && o[1] == 0 && o[2] == 0 // 192.0.0.0/24
 }
 
 // IPv6 Unique Local Address (RFC 4193)
-fn is_ula(ip: &std::net::Ipv6Addr) -> bool {
+const fn is_ula(ip: &std::net::Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xFE00) == 0xFC00 // fc00::/7
 }
 
 // IPv6 link-local (RFC 4291)
-fn is_link_local_v6(ip: &std::net::Ipv6Addr) -> bool {
+const fn is_link_local_v6(ip: &std::net::Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xFFC0) == 0xFE80 // fe80::/10
 }
 
 // IPv4-mapped IPv6 addresses with private IPv4
-fn is_v4_mapped_private(ip: &std::net::Ipv6Addr) -> bool {
+const fn is_v4_mapped_private(ip: &std::net::Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         v4.is_loopback()
             || v4.is_private()
@@ -1014,7 +1020,7 @@ fn iso_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+const fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     // Civil calendar from day count (algorithm from Howard Hinnant)
     let z = days as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -1182,7 +1188,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_min(1),
             resolver: None,
         };
 
@@ -1206,7 +1212,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_min(1),
             resolver: None,
         };
 
@@ -1235,7 +1241,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_min(1),
             resolver: None,
         };
 
@@ -1267,7 +1273,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_min(1),
             resolver: None,
         };
 
@@ -1305,7 +1311,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_min(1),
             resolver: None,
         };
 
@@ -1365,7 +1371,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_min(1),
             resolver: None,
         });
         assert!(result.is_ok());
@@ -1397,7 +1403,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_min(1),
             resolver: None,
         });
         assert!(result.is_err(), "should fail when allowlist is unreadable");
@@ -1429,7 +1435,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_min(1),
             resolver: None,
         };
 
@@ -1497,7 +1503,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_min(1),
             resolver,
         })
         .expect("proxy start failed")

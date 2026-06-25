@@ -39,6 +39,7 @@ pub enum InitResult {
 
 /// Run the init command from a pre-computed detection report.
 /// Avoids redundant filesystem scans when the caller already has the report.
+#[must_use]
 pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions) -> InitResult {
     if report.detections.is_empty() && report.workspace_members.is_empty() {
         return InitResult::NothingDetected;
@@ -81,6 +82,7 @@ pub fn run_init(project_dir: &Path, report: &DetectionReport, opts: &InitOptions
 }
 
 /// Format the detection report for human-readable stdout display.
+#[must_use]
 pub fn format_report(report: &DetectionReport) -> String {
     let mut out = String::new();
 
@@ -153,7 +155,7 @@ fn format_suggestion(s: &Suggestion) -> String {
 /// Generate a valid .cplt.toml from a detection report.
 ///
 /// Only includes suggestions appropriate for repo-level config.
-/// Machine-specific suggestions (cache_exec, home-relative paths) are emitted
+/// Machine-specific suggestions (`cache_exec`, home-relative paths) are emitted
 /// as comments with guidance to add them to personal config.
 ///
 /// When provenance is available (from monorepo detection), adds comments
@@ -621,6 +623,7 @@ fn write_port_array(out: &mut String, key: &str, values: &BTreeSet<u16>) {
 use crate::detect::{GlobalDetectionReport, GlobalSuggestion};
 
 /// Format a human-readable report of global detections.
+#[must_use]
 pub fn format_global_report(report: &GlobalDetectionReport) -> String {
     let mut out = String::new();
     if report.detections.is_empty() {
@@ -654,6 +657,7 @@ fn format_global_suggestion(s: &GlobalSuggestion) -> String {
 }
 
 /// Generate a valid personal config TOML from global detection.
+#[must_use]
 pub fn generate_global_toml(report: &GlobalDetectionReport) -> String {
     let mut out = String::new();
 
@@ -737,6 +741,7 @@ pub enum GlobalInitResult {
 }
 
 /// Run the global init workflow.
+#[must_use]
 pub fn run_init_global(
     config_path: &Path,
     report: &GlobalDetectionReport,

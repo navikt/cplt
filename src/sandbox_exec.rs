@@ -159,10 +159,10 @@ fn configure_command(
     }
 }
 
-/// Inject GH_TOKEN into the command env if not already present.
+/// Inject `GH_TOKEN` into the command env if not already present.
 ///
 /// Runs `gh auth token` outside the sandbox to extract the token from
-/// `~/.config/gh/hosts.yml`, then injects it as GH_TOKEN. This allows
+/// `~/.config/gh/hosts.yml`, then injects it as `GH_TOKEN`. This allows
 /// the gh proxy to safely block `gh auth token` inside the sandbox
 /// while still giving the agent API access.
 ///
@@ -534,14 +534,14 @@ fn write_temp_profile(profile_text: &str) -> Result<std::path::PathBuf, String> 
 /// Returns `Result` to match the macOS preflight signature (which can fail).
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_wraps)]
-pub fn preflight(_sandbox: &super::PreparedSandbox) -> Result<(), String> {
+pub const fn preflight(_sandbox: &super::PreparedSandbox) -> Result<(), String> {
     Ok(())
 }
 
 /// Execute copilot inside a Landlock + seccomp sandbox.
 ///
 /// The sandbox is applied via a `pre_exec` hook that runs in the child
-/// process between fork() and exec(). All allocation and I/O was done
+/// process between `fork()` and `exec()`. All allocation and I/O was done
 /// in the parent via `precompute()` — the hook only makes raw syscalls.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]

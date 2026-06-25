@@ -24,7 +24,8 @@ impl FeatureToggle {
     ///
     /// Clap's `conflicts_with` should prevent both being true, but we
     /// handle it defensively: `off` wins if both are set.
-    pub fn from_pair(on: bool, off: bool) -> Self {
+    #[must_use]
+    pub const fn from_pair(on: bool, off: bool) -> Self {
         match (on, off) {
             (_, true) => Self::ForceOff,
             (true, false) => Self::ForceOn,
@@ -33,7 +34,8 @@ impl FeatureToggle {
     }
 
     /// Resolve to a concrete bool given the config/default value.
-    pub fn resolve(self, config_default: bool) -> bool {
+    #[must_use]
+    pub const fn resolve(self, config_default: bool) -> bool {
         match self {
             Self::ForceOn => true,
             Self::ForceOff => false,
@@ -151,8 +153,8 @@ pub struct GhGuardConfig {
     pub scope_check: Option<bool>,
     /// Block `gh auth token` to prevent token exfiltration (default: true).
     pub block_auth_token: Option<bool>,
-    /// Pre-extract GH_TOKEN before sandbox launch for Copilot agent (default: false).
-    /// Only meaningful when block_auth_token is true — provides the token via env var
+    /// Pre-extract `GH_TOKEN` before sandbox launch for Copilot agent (default: false).
+    /// Only meaningful when `block_auth_token` is true — provides the token via env var
     /// while blocking the command that would expose it to arbitrary tools.
     pub inject_token: Option<bool>,
     /// Policy for commands not in the classification table (default: "block").
@@ -175,14 +177,14 @@ pub struct GitGuardConfig {
     /// Block git push, request-pull, and send-pack (default: true).
     pub prevent_push: Option<bool>,
     /// Block git push --force/--force-with-lease (default: true).
-    /// Only meaningful when prevent_push is false — blocks destructive pushes
+    /// Only meaningful when `prevent_push` is false — blocks destructive pushes
     /// while allowing regular pushes.
     pub prevent_force_push: Option<bool>,
     /// Only protect default branch (main/master). Allows pushes to feature branches.
     /// When true, `prevent_push` only blocks pushes targeting main/master.
     pub protect_default_branch_only: Option<bool>,
     /// Structured push exceptions. Each entry specifies conditions under which
-    /// push is allowed despite prevent_push being enabled.
+    /// push is allowed despite `prevent_push` being enabled.
     pub allow_push: Vec<GitPushRule>,
 }
 
@@ -285,8 +287,8 @@ pub struct SandboxConfig {
     pub allow_gpg_signing: Option<bool>,
     /// Allow JVM Attach API unix sockets in /tmp (default: false).
     /// Needed for JVM testing frameworks that use runtime self-attach
-    /// (MockK inline mocking, Mockito inline, ByteBuddy agent loading).
-    /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
+    /// (`MockK` inline mocking, Mockito inline, `ByteBuddy` agent loading).
+    /// Only allows sockets matching /`tmp/.java_pid`<PID> — SSH agent and
     /// all other unix sockets remain blocked.
     pub allow_jvm_attach: Option<bool>,
     /// Allow Docker/Colima/OrbStack access inside the sandbox (default: false).
@@ -302,7 +304,7 @@ pub struct SandboxConfig {
     /// No exec is allowed from ~/Library/Caches by default (binary-drop staging risk).
     pub allow_cache_exec: Vec<String>,
     /// Allow process execution from ALL ~/Library/Caches subdirectories (default: false).
-    /// DANGEROUS: much broader than allow_cache_exec — prefer specific subdirs.
+    /// DANGEROUS: much broader than `allow_cache_exec` — prefer specific subdirs.
     pub allow_cache_exec_any: Option<bool>,
     /// Allow Launch Services (`open` command) for OAuth browser flows (default: false).
     /// Lets the sandboxed agent open URLs in your default browser.

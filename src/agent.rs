@@ -1,7 +1,7 @@
 //! Agent abstraction for different AI coding tools.
 //!
 //! cplt can sandbox multiple AI coding agents — currently GitHub Copilot CLI,
-//! OpenCode, Google Gemini CLI, Antigravity, Pi, and Claude Code. Each agent has
+//! `OpenCode`, Google Gemini CLI, Antigravity, Pi, and Claude Code. Each agent has
 //! different binary names, config directories, and runtime requirements, but
 //! shares the same core sandbox infrastructure.
 
@@ -14,13 +14,13 @@ use std::str::FromStr;
 pub enum Agent {
     /// GitHub Copilot CLI (default).
     Copilot,
-    /// OpenCode (anomalyco/opencode) — open source AI coding agent.
+    /// `OpenCode` (anomalyco/opencode) — open source AI coding agent.
     OpenCode,
     /// Google Gemini CLI — AI coding agent powered by Gemini models.
     Gemini,
     /// Antigravity CLI (`antigravity` / `agy`).
     Antigravity,
-    /// Pi coding agent (https://github.com/earendil-works/pi).
+    /// Pi coding agent (<https://github.com/earendil-works/pi>).
     Pi,
     /// Claude Code (Anthropic's `claude` CLI).
     Claude,
@@ -30,49 +30,53 @@ pub enum Agent {
 
 impl Agent {
     /// The binary name to search for in PATH.
-    pub fn binary_name(&self) -> &'static str {
+    #[must_use]
+    pub const fn binary_name(&self) -> &'static str {
         match self {
-            Agent::Copilot => "copilot",
-            Agent::OpenCode => "opencode",
-            Agent::Gemini => "gemini",
-            Agent::Antigravity => "antigravity",
-            Agent::Pi => "pi",
-            Agent::Claude => "claude",
-            Agent::Shell => "shell",
+            Self::Copilot => "copilot",
+            Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
+            Self::Pi => "pi",
+            Self::Claude => "claude",
+            Self::Shell => "shell",
         }
     }
 
     /// Human-readable display name.
-    pub fn display_name(&self) -> &'static str {
+    #[must_use]
+    pub const fn display_name(&self) -> &'static str {
         match self {
-            Agent::Copilot => "Copilot",
-            Agent::OpenCode => "OpenCode",
-            Agent::Gemini => "Gemini",
-            Agent::Antigravity => "Antigravity",
-            Agent::Pi => "Pi",
-            Agent::Claude => "Claude Code",
-            Agent::Shell => "Shell",
+            Self::Copilot => "Copilot",
+            Self::OpenCode => "OpenCode",
+            Self::Gemini => "Gemini",
+            Self::Antigravity => "Antigravity",
+            Self::Pi => "Pi",
+            Self::Claude => "Claude Code",
+            Self::Shell => "Shell",
         }
     }
 
     /// Whether this agent uses Node.js SEA extraction that needs pre-sandbox setup.
     /// Copilot uses SEA packaging which extracts to ~/Library/Caches/copilot/pkg/.
-    /// OpenCode is distributed via npm or standalone binary — no SEA extraction needed.
-    pub fn needs_sea_extraction(&self) -> bool {
-        matches!(self, Agent::Copilot)
+    /// `OpenCode` is distributed via npm or standalone binary — no SEA extraction needed.
+    #[must_use]
+    pub const fn needs_sea_extraction(&self) -> bool {
+        matches!(self, Self::Copilot)
     }
 
     /// Extra arguments injected before the user's args.
     /// Copilot needs --no-auto-update to prevent writes to ~/.copilot/pkg inside sandbox.
-    pub fn extra_args(&self) -> &'static [&'static str] {
+    #[must_use]
+    pub const fn extra_args(&self) -> &'static [&'static str] {
         match self {
-            Agent::Copilot => &["--no-auto-update"],
-            Agent::OpenCode
-            | Agent::Gemini
-            | Agent::Antigravity
-            | Agent::Pi
-            | Agent::Claude
-            | Agent::Shell => &[],
+            Self::Copilot => &["--no-auto-update"],
+            Self::OpenCode
+            | Self::Gemini
+            | Self::Antigravity
+            | Self::Pi
+            | Self::Claude
+            | Self::Shell => &[],
         }
     }
 
@@ -82,13 +86,14 @@ impl Agent {
     /// cplt exposes `--resume`, `--continue`, `--remote`, and `--name` for
     /// convenience. Each agent spells these differently (or not at all):
     /// - Copilot: `--resume[=ID]`, `--continue`, `--remote`, `--name NAME`
-    /// - OpenCode: `--continue`, `--session ID` (no remote/name)
+    /// - `OpenCode`: `--continue`, `--session ID` (no remote/name)
     /// - Antigravity (`agy`): `--continue`, `--conversation ID` (no remote/name)
     ///
     /// Flags an agent doesn't support are silently dropped (documented in the
     /// CLI help as "ignored for other agents"). A bare `--resume` (interactive
     /// session picker) maps to "continue last session" for agents that lack an
     /// interactive picker, which is the closest equivalent.
+    #[must_use]
     pub fn session_args(
         &self,
         resume: Option<&str>,
@@ -98,7 +103,7 @@ impl Agent {
     ) -> Vec<String> {
         let mut args = Vec::new();
         match self {
-            Agent::Copilot => {
+            Self::Copilot => {
                 if remote {
                     args.push("--remote".to_string());
                 }
@@ -117,7 +122,7 @@ impl Agent {
                     args.push(name.to_string());
                 }
             }
-            Agent::OpenCode => {
+            Self::OpenCode => {
                 // opencode: -c/--continue continues the last session;
                 // -s/--session <id> resumes a specific session by id.
                 if continue_session {
@@ -133,7 +138,7 @@ impl Agent {
                 }
                 // --remote and --name have no opencode equivalent; dropped.
             }
-            Agent::Antigravity => {
+            Self::Antigravity => {
                 // agy: --continue continues the most recent conversation;
                 // --conversation <id> resumes a specific conversation by id.
                 if continue_session {
@@ -149,7 +154,7 @@ impl Agent {
                 }
                 // --remote and --name have no agy equivalent; dropped.
             }
-            Agent::Claude => {
+            Self::Claude => {
                 // claude: -c/--continue continues the most recent session;
                 // -r/--resume [id] resumes a session. Bare --resume opens an
                 // interactive picker, so it maps directly (unlike opencode/agy).
@@ -166,7 +171,7 @@ impl Agent {
             }
             // Gemini still receives auto-resume handling in main.rs; Pi and Shell
             // have no recognized session flags. None get explicit translation here.
-            Agent::Gemini | Agent::Pi | Agent::Shell => {}
+            Self::Gemini | Self::Pi | Self::Shell => {}
         }
         args
     }
@@ -176,30 +181,32 @@ impl Agent {
     /// Gemini uses Keychain for extension integrity verification.
     /// Claude Code stores its OAuth token in the login Keychain on macOS
     /// ("Claude Code-credentials"); on Linux it uses ~/.claude/.credentials.json.
-    /// OpenCode uses API keys from env vars or config files.
-    pub fn needs_keychain(&self) -> bool {
+    /// `OpenCode` uses API keys from env vars or config files.
+    #[must_use]
+    pub const fn needs_keychain(&self) -> bool {
         matches!(
             self,
-            Agent::Copilot | Agent::Gemini | Agent::Antigravity | Agent::Claude
+            Self::Copilot | Self::Gemini | Self::Antigravity | Self::Claude
         )
     }
 
     /// Whether this agent needs access to ~/.copilot directory.
-    pub fn needs_copilot_dir(&self) -> bool {
-        matches!(self, Agent::Copilot)
+    #[must_use]
+    pub const fn needs_copilot_dir(&self) -> bool {
+        matches!(self, Self::Copilot)
     }
 
     /// Config directories under $HOME that need read/write access.
-    /// Returns (relative_path, needs_write).
+    /// Returns (`relative_path`, `needs_write`).
     pub fn config_dirs(&self, home: &Path) -> Vec<AgentDir> {
         match self {
-            Agent::Copilot => {
+            Self::Copilot => {
                 vec![
                     // ~/.copilot is handled separately in emit_home_access
                     // (needs map-executable for native modules)
                 ]
             }
-            Agent::Shell => {
+            Self::Shell => {
                 // Shell needs write access to its config/data dirs for history,
                 // variables, and sourcing config files.
                 let shell_path = std::env::var("SHELL").unwrap_or_default();
@@ -242,7 +249,7 @@ impl Agent {
                     _ => vec![],
                 }
             }
-            Agent::OpenCode => {
+            Self::OpenCode => {
                 // Respect XDG_CONFIG_HOME for config dir
                 let config_base = std::env::var("XDG_CONFIG_HOME")
                     .ok()
@@ -307,7 +314,7 @@ impl Agent {
                     },
                 ]
             }
-            Agent::Gemini => {
+            Self::Gemini => {
                 // ~/.gemini stores auth, settings, sessions, and agents
                 vec![AgentDir {
                     path: home.join(".gemini"),
@@ -317,7 +324,7 @@ impl Agent {
                     write_files: vec![],
                 }]
             }
-            Agent::Antigravity => {
+            Self::Antigravity => {
                 // Antigravity stores project config under ~/.gemini/config
                 // and runtime/session data under ~/.gemini/antigravity-cli.
                 vec![
@@ -337,7 +344,7 @@ impl Agent {
                     },
                 ]
             }
-            Agent::Pi => {
+            Self::Pi => {
                 // ~/.pi/agent/ stores all global data: settings.json, trust.json,
                 // sessions/, npm/ packages. Per https://pi.dev/docs/latest/settings
                 // ~/.pi/agent/bin contains managed tool binaries (fd, rg)
@@ -359,7 +366,7 @@ impl Agent {
                     },
                 ]
             }
-            Agent::Claude => {
+            Self::Claude => {
                 // CLAUDE_CONFIG_DIR relocates BOTH the data dir and .claude.json
                 // under a single root, so granting that subtree covers everything.
                 // Must stay in sync with ENV_ALLOWLIST (the var has to reach the
@@ -404,16 +411,17 @@ impl Agent {
     /// Environment variable names this agent may need for authentication.
     /// These are NOT added to the default allowlist — they must be
     /// explicitly passed via --pass-env or agent config.
-    /// Note: OpenCode also supports GitHub Copilot as a provider via
+    /// Note: `OpenCode` also supports GitHub Copilot as a provider via
     /// `/connect` — no env key needed for that flow (auth stored in auth.json).
-    pub fn auth_env_hint(&self) -> &'static [&'static str] {
+    #[must_use]
+    pub const fn auth_env_hint(&self) -> &'static [&'static str] {
         match self {
             // Copilot tokens are in the default allowlist (accepted trade-off)
-            Agent::Copilot => &[],
+            Self::Copilot => &[],
             // OpenCode third-party provider API keys — user must opt in.
             // Copilot provider uses device flow + auth.json, no env var needed.
             // Source of truth: https://opencode.ai/docs/providers/
-            Agent::OpenCode => &[
+            Self::OpenCode => &[
                 // Anthropic
                 "ANTHROPIC_API_KEY",
                 // OpenAI + Azure OpenAI
@@ -438,12 +446,12 @@ impl Agent {
             ],
             // Gemini uses Google OAuth by default (browser flow, stored in ~/.gemini/).
             // API key or Vertex AI project are alternatives.
-            Agent::Gemini => &["GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"],
+            Self::Gemini => &["GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"],
             // Antigravity uses Google OAuth with keychain/session storage.
-            Agent::Antigravity => &[],
+            Self::Antigravity => &[],
             // Pi supports many LLM providers via API keys.
             // Source of truth: https://github.com/earendil-works/pi/blob/main/packages/ai/src/env-api-keys.ts
-            Agent::Pi => &[
+            Self::Pi => &[
                 // Anthropic (classic key + OAuth token)
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_OAUTH_TOKEN",
@@ -471,7 +479,7 @@ impl Agent {
             // Claude Code authenticates via the OAuth token in ~/.claude
             // (or macOS Keychain) by default — no env var needed for the
             // subscription flow. These are for API-key / enterprise routing.
-            Agent::Claude => &[
+            Self::Claude => &[
                 // Anthropic API direct
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_AUTH_TOKEN",
@@ -486,17 +494,17 @@ impl Agent {
                 "ANTHROPIC_VERTEX_PROJECT_ID",
                 "GOOGLE_CLOUD_PROJECT",
             ],
-            Agent::Shell => &[],
+            Self::Shell => &[],
         }
     }
 
     /// Resolve the agent binary, walking PATH and skipping cplt aliases.
     ///
     /// For Copilot: prefers standalone binaries over VS Code editor shims.
-    /// For OpenCode: straightforward PATH search.
+    /// For `OpenCode`: straightforward PATH search.
     /// For Shell: uses $SHELL or falls back to /bin/zsh (macOS) or /bin/bash.
     pub fn resolve_binary(&self) -> Result<PathBuf, String> {
-        if matches!(self, Agent::Shell) {
+        if matches!(self, Self::Shell) {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| {
                 if cfg!(target_os = "macos") {
                     "/bin/zsh".to_string()
@@ -512,7 +520,7 @@ impl Agent {
         }
 
         let binary_names: &[&str] = match self {
-            Agent::Antigravity => &["antigravity", "agy"],
+            Self::Antigravity => &["antigravity", "agy"],
             _ => &[self.binary_name()],
         };
         let self_exe = std::env::current_exe()
@@ -538,7 +546,7 @@ impl Agent {
                     if self_exe.as_ref() == Some(&real_bin) {
                         continue;
                     }
-                    if matches!(self, Agent::Copilot) && is_editor_shim(&real_bin) {
+                    if matches!(self, Self::Copilot) && is_editor_shim(&real_bin) {
                         if editor_shim.is_none() {
                             editor_shim = Some(real_bin);
                         }
@@ -554,7 +562,7 @@ impl Agent {
                 }
 
                 // Copilot-specific: prefer standalone over editor shims
-                if matches!(self, Agent::Copilot) && is_editor_shim(&resolved) {
+                if matches!(self, Self::Copilot) && is_editor_shim(&resolved) {
                     if editor_shim.is_none() {
                         editor_shim = Some(resolved);
                     }
@@ -570,25 +578,25 @@ impl Agent {
         }
 
         let install_hint = match self {
-            Agent::Copilot => {
+            Self::Copilot => {
                 "If you installed cplt as a 'copilot' alias, the real Copilot CLI \
                  must also be in PATH (e.g. brew install --cask copilot-cli)."
             }
-            Agent::OpenCode => {
+            Self::OpenCode => {
                 "Install OpenCode: npm i -g opencode-ai, or brew install anomalyco/tap/opencode"
             }
-            Agent::Gemini => {
+            Self::Gemini => {
                 "Install Gemini CLI: npm i -g @google/gemini-cli, or brew install gemini-cli"
             }
-            Agent::Antigravity => {
+            Self::Antigravity => {
                 "Install Antigravity CLI: see https://antigravity.google/docs/cli-getting-started"
             }
-            Agent::Pi => "Install Pi: npm i -g @earendil-works/pi-coding-agent",
-            Agent::Claude => {
+            Self::Pi => "Install Pi: npm i -g @earendil-works/pi-coding-agent",
+            Self::Claude => {
                 "Install Claude Code: npm i -g @anthropic-ai/claude-code, \
                  or see https://docs.anthropic.com/en/docs/claude-code"
             }
-            Agent::Shell => unreachable!("Shell is resolved via $SHELL above"),
+            Self::Shell => unreachable!("Shell is resolved via $SHELL above"),
         };
 
         Err(format!(
@@ -598,12 +606,13 @@ impl Agent {
     }
 
     /// Auto-detect which agent to use based on what's available in PATH.
-    /// Returns Copilot if found (backward compat), else OpenCode, else Gemini,
+    /// Returns Copilot if found (backward compat), else `OpenCode`, else Gemini,
     /// else Antigravity.
     /// Pi and Claude are explicit-only (`--agent pi` / `--agent claude`) and are
     /// never auto-detected, to avoid silently changing the default for existing users.
     /// Returns None if none are found.
-    pub fn auto_detect() -> Option<Agent> {
+    #[must_use]
+    pub fn auto_detect() -> Option<Self> {
         let path_var = std::env::var("PATH").unwrap_or_default();
         let self_exe = std::env::current_exe()
             .ok()
@@ -662,13 +671,13 @@ impl Agent {
         }
 
         if found_copilot {
-            Some(Agent::Copilot)
+            Some(Self::Copilot)
         } else if found_opencode {
-            Some(Agent::OpenCode)
+            Some(Self::OpenCode)
         } else if found_gemini {
-            Some(Agent::Gemini)
+            Some(Self::Gemini)
         } else if found_antigravity {
-            Some(Agent::Antigravity)
+            Some(Self::Antigravity)
         } else {
             None
         }
@@ -678,15 +687,15 @@ impl Agent {
 impl FromStr for Agent {
     type Err = String;
 
-    fn from_str(s: &str) -> Result<Agent, String> {
+    fn from_str(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
-            "copilot" => Ok(Agent::Copilot),
-            "opencode" => Ok(Agent::OpenCode),
-            "gemini" | "gem" => Ok(Agent::Gemini),
-            "antigravity" | "agy" | "agi" => Ok(Agent::Antigravity),
-            "pi" => Ok(Agent::Pi),
-            "claude" | "cc" | "claude-code" => Ok(Agent::Claude),
-            "shell" | "sh" | "bash" | "zsh" => Ok(Agent::Shell),
+            "copilot" => Ok(Self::Copilot),
+            "opencode" => Ok(Self::OpenCode),
+            "gemini" | "gem" => Ok(Self::Gemini),
+            "antigravity" | "agy" | "agi" => Ok(Self::Antigravity),
+            "pi" => Ok(Self::Pi),
+            "claude" | "cc" | "claude-code" => Ok(Self::Claude),
+            "shell" | "sh" | "bash" | "zsh" => Ok(Self::Shell),
             _ => Err(format!(
                 "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, shell"
             )),

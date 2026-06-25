@@ -11,7 +11,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// Build info: if CPLT_LONG_VERSION is set at compile time (via mise tasks),
+/// Build info: if `CPLT_LONG_VERSION` is set at compile time (via mise tasks),
 /// use that; otherwise fall back to the Cargo package version.
 const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
     Some(v) => v,
@@ -28,8 +28,8 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 /// - macOS: Apple Seatbelt/SBPL via sandbox-exec
 /// - Linux: Landlock LSM + seccomp-BPF (kernel 5.13+, full network filtering on 6.7+)
 ///
-/// Supports GitHub Copilot CLI, OpenCode, Google Gemini CLI, Antigravity CLI,
-/// Pi, and Claude Code. Copilot, OpenCode, Gemini, and Antigravity are
+/// Supports GitHub Copilot CLI, `OpenCode`, Google Gemini CLI, Antigravity CLI,
+/// Pi, and Claude Code. Copilot, `OpenCode`, Gemini, and Antigravity are
 /// auto-detected from PATH; Pi and Claude Code are explicit-only — select them
 /// with --agent. Use --agent to override the detected agent at any time.
 ///
@@ -113,7 +113,7 @@ struct Cli {
 
     /// Enable a local CONNECT proxy that logs and filters outbound connections.
     /// All agent traffic is routed through the proxy via
-    /// HTTP_PROXY/HTTPS_PROXY env vars. Can block known-bad domains with
+    /// `HTTP_PROXY/HTTPS_PROXY` env vars. Can block known-bad domains with
     /// --blocked-domains. The proxy enforces the same port restrictions as
     /// the sandbox (443 + --allow-port values).
     #[arg(long)]
@@ -160,7 +160,7 @@ struct Cli {
     /// Allow connections to this domain even if it resolves to a private/internal IP.
     /// Use for corporate intranet services such as internal MCP servers.
     /// Suffix matching: "intern.nav.no" covers all its subdomains.
-    /// Can be specified multiple times. Merged with proxy.allow_private_domains in config.
+    /// Can be specified multiple times. Merged with `proxy.allow_private_domains` in config.
     #[arg(long = "allow-private-domain", value_name = "DOMAIN")]
     allow_private_domains: Vec<String>,
 
@@ -215,8 +215,8 @@ struct Cli {
     /// Pass an additional environment variable through to the sandbox.
     /// By default, only a safe allowlist of env vars is passed (PATH, HOME,
     /// TERM, Go/Java/Rust/Node paths, etc.). Cloud credentials (AWS_*,
-    /// DATABASE_URL, NPM_TOKEN) are stripped. For OpenCode, use this to pass
-    /// API keys: --pass-env ANTHROPIC_API_KEY
+    /// `DATABASE_URL`, `NPM_TOKEN`) are stripped. For `OpenCode`, use this to pass
+    /// API keys: --pass-env `ANTHROPIC_API_KEY`
     /// Can be specified multiple times.
     #[arg(long = "pass-env", value_name = "VAR")]
     pass_env: Vec<String>,
@@ -259,8 +259,8 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
 
     /// Allow JVM Attach API unix sockets in /tmp.
     /// Needed for JVM testing frameworks that use runtime self-attach:
-    /// MockK inline mocking, Mockito inline agents, ByteBuddy, JMX tools.
-    /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
+    /// `MockK` inline mocking, Mockito inline agents, `ByteBuddy`, JMX tools.
+    /// Only allows sockets matching /`tmp/.java_pid`<PID> — SSH agent and
     /// all other unix sockets remain blocked.
     #[arg(long)]
     allow_jvm_attach: bool,
@@ -436,13 +436,13 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
     // Ignored when --agent is anything except Copilot.
     /// Resume a previous session. Use --resume to pick interactively,
     /// or --resume=NAME to resume a specific session by name or ID.
-    /// Supported for Copilot (--resume), OpenCode (maps to --session),
+    /// Supported for Copilot (--resume), `OpenCode` (maps to --session),
     /// and Antigravity (maps to --conversation). Ignored for other agents.
     #[arg(long, value_name = "SESSION", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     resume: Option<String>,
 
     /// Resume the most recent session in this directory.
-    /// Supported for Copilot, OpenCode, and Antigravity (--continue).
+    /// Supported for Copilot, `OpenCode`, and Antigravity (--continue).
     /// Ignored for other agents.
     #[arg(long = "continue", conflicts_with = "resume")]
     continue_session: bool,
@@ -666,7 +666,7 @@ QUICK START:
         #[arg(long, default_value = "false")]
         protect_default_branch_only: String,
 
-        /// JSON-encoded allow_push rules (structured push exceptions).
+        /// JSON-encoded `allow_push` rules (structured push exceptions).
         #[arg(long, default_value = "")]
         allow_push_rules: String,
 
@@ -732,7 +732,7 @@ enum ConfigAction {
         unset: bool,
 
         /// Required when setting dangerous keys to true
-        /// (sandbox.inherit_env, sandbox.allow_tmp_exec)
+        /// (`sandbox.inherit_env`, `sandbox.allow_tmp_exec`)
         #[arg(long)]
         force: bool,
 
@@ -781,9 +781,9 @@ enum TrustAction {
 
     /// Approve specific permissions from .cplt.toml.
     ///
-    /// Example: cplt trust accept allow_jvm_attach allow_docker
+    /// Example: cplt trust accept `allow_jvm_attach` `allow_docker`
     Accept {
-        /// Permission keys to approve (e.g. allow_jvm_attach, allow_docker).
+        /// Permission keys to approve (e.g. `allow_jvm_attach`, `allow_docker`).
         /// Without arguments, shows pending permissions and prompts for confirmation.
         keys: Vec<String>,
 
@@ -794,9 +794,9 @@ enum TrustAction {
 
     /// Revoke trust for specific permissions.
     ///
-    /// Example: cplt trust revoke allow_docker
+    /// Example: cplt trust revoke `allow_docker`
     Revoke {
-        /// Keys to revoke (e.g. allow_docker).
+        /// Keys to revoke (e.g. `allow_docker`).
         /// Use --all to revoke all trust for this repo.
         #[arg(required_unless_present = "all")]
         keys: Vec<String>,
@@ -816,7 +816,7 @@ const LABEL_ALLOW_PENDING: &str = "(pending approval)";
 const STATUS_APPROVED: &str = "✓ approved";
 const STATUS_PENDING: &str = "○ pending";
 
-fn source_label(source: repo_config::RepoConfigSource) -> &'static str {
+const fn source_label(source: repo_config::RepoConfigSource) -> &'static str {
     match source {
         repo_config::RepoConfigSource::GitHead => SOURCE_GIT_HEAD,
         repo_config::RepoConfigSource::WorkingTree => SOURCE_WORKING_TREE,
@@ -1840,7 +1840,7 @@ fn is_gh_auth_token_request(args: &[String]) -> bool {
 
 /// Serve the cached GitHub token from the scratch dir's `.gh-token` file.
 /// Deletes the file after reading so subsequent calls by subprocesses fail.
-/// Returns ExitCode::SUCCESS if token found, FAILURE otherwise.
+/// Returns `ExitCode::SUCCESS` if token found, FAILURE otherwise.
 fn serve_cached_gh_token() -> ExitCode {
     // TMPDIR is set to the scratch dir inside the sandbox
     let tmpdir = std::env::var("TMPDIR")
@@ -1870,7 +1870,7 @@ fn serve_cached_gh_token() -> ExitCode {
     }
 }
 
-/// Parse JSON-encoded allow_push rules from the CLI flag.
+/// Parse JSON-encoded `allow_push` rules from the CLI flag.
 fn parse_allow_push_rules(json: &str) -> Vec<config::ResolvedPushRule> {
     if json.is_empty() {
         return Vec::new();
@@ -1974,7 +1974,7 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
 
 /// Run an arbitrary command inside the sandbox (`cplt exec -- <cmd> [args]`).
 ///
-/// Reuses the Agent::Shell sandbox policy. Defaults to quiet+yes so it is
+/// Reuses the `Agent::Shell` sandbox policy. Defaults to quiet+yes so it is
 /// clean for scripting and shell aliases. Pass --no-quiet to show the summary.
 fn run_exec_command(
     cli: &Cli,
@@ -3663,7 +3663,7 @@ fn shell_install() -> ExitCode {
 ///
 /// On Linux, Copilot doesn't use Electron app bundles, so this always returns `None`.
 /// Skipped for non-Copilot agents.
-fn discover_electron_app_dir(
+const fn discover_electron_app_dir(
     agent_bin_result: &Result<PathBuf, String>,
     agent: agent::Agent,
 ) -> Option<std::path::PathBuf> {

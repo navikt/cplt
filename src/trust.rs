@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 const TRUST_DIR: &str = "trust";
 
 /// A trust entry recording which proposals have been approved for a repo.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustEntry {
     /// Repository identification.
     pub repo: RepoIdentity,
@@ -23,7 +23,7 @@ pub struct TrustEntry {
 }
 
 /// Identifies the repository this trust entry applies to.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RepoIdentity {
     /// Canonical remote URL (e.g. "github.com/navikt/spleis").
     #[serde(default)]
@@ -34,7 +34,7 @@ pub struct RepoIdentity {
 }
 
 /// Which proposal keys have been approved.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AcceptedProposals {
     /// List of approved key names (e.g. `["allow_localhost_any", "allow_jvm_attach"]`).
     #[serde(default)]
@@ -55,6 +55,7 @@ pub struct AcceptedProposals {
 /// project path as fallback. Returns a hex-encoded SHA-256 (full 64 chars)
 /// for use as a filename. This ensures collision resistance and stability
 /// across Rust versions/platforms.
+#[must_use]
 pub fn repo_fingerprint(project_dir: &Path) -> String {
     let identity = canonical_remote(project_dir).unwrap_or_else(|| {
         // Canonicalize to handle symlinks/relative paths consistently
@@ -93,6 +94,7 @@ fn canonical_remote(project_dir: &Path) -> Option<String> {
 /// - `git@github.com:org/repo.git` → `github.com/org/repo`
 /// - `https://github.com/org/repo.git` → `github.com/org/repo`
 /// - Lowercases the host portion.
+#[must_use]
 pub fn normalize_remote_url(url: &str) -> String {
     let url = url.trim();
 
@@ -150,6 +152,7 @@ pub fn normalize_remote_url(url: &str) -> String {
 ///
 /// Returns `~/.config/cplt/trust/` by default, or `<parent of $CPLT_CONFIG>/trust/`
 /// if the `CPLT_CONFIG` env var overrides the config file location.
+#[must_use]
 pub fn trust_dir() -> Option<PathBuf> {
     let config_dir = crate::config::config_dir()?;
     Some(config_dir.join(TRUST_DIR))
@@ -158,6 +161,7 @@ pub fn trust_dir() -> Option<PathBuf> {
 /// Load the trust entry for a repository.
 ///
 /// Returns `None` if no trust file exists (repo has never been approved).
+#[must_use]
 pub fn load_trust(project_dir: &Path) -> Option<TrustEntry> {
     let fingerprint = repo_fingerprint(project_dir);
     let trust_file = trust_dir()?.join(format!("{fingerprint}.toml"));
@@ -205,11 +209,13 @@ pub fn revoke_trust(project_dir: &Path) -> Result<(), String> {
 }
 
 /// Check if a specific key is approved for a repository.
+#[must_use]
 pub fn is_key_approved(trust: &TrustEntry, key: &str) -> bool {
     trust.accepted.keys.iter().any(|k| k == key)
 }
 
 /// Filter a list of proposed keys to only those that are approved.
+#[must_use]
 pub fn filter_approved<'a>(proposed: &[&'a str], trust: &TrustEntry) -> Vec<&'a str> {
     proposed
         .iter()
@@ -219,6 +225,7 @@ pub fn filter_approved<'a>(proposed: &[&'a str], trust: &TrustEntry) -> Vec<&'a 
 }
 
 /// Filter a list of proposed keys to only those NOT yet approved.
+#[must_use]
 pub fn filter_unapproved<'a>(proposed: &[&'a str], trust: &TrustEntry) -> Vec<&'a str> {
     proposed
         .iter()
@@ -230,6 +237,7 @@ pub fn filter_unapproved<'a>(proposed: &[&'a str], trust: &TrustEntry) -> Vec<&'
 /// Get the current timestamp in ISO 8601 format (UTC).
 ///
 /// Uses `std::time::SystemTime` — no external dependencies or shell-outs.
+#[must_use]
 pub fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 

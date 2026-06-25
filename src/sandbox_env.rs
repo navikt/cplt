@@ -23,7 +23,7 @@ pub struct SandboxEnv {
 }
 
 /// Environment variables that are Copilot-specific and should not be exposed
-/// to other agents. These contain GitHub auth tokens that OpenCode doesn't need.
+/// to other agents. These contain GitHub auth tokens that `OpenCode` doesn't need.
 const COPILOT_ONLY_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
 
 /// Environment variable prefix that is Copilot-specific.
@@ -49,13 +49,14 @@ fn is_agent_suppressed(key: &str, agent: Agent) -> bool {
 /// Build the environment variable map for the sandboxed process.
 ///
 /// Pure function (takes parent env as input) for testability.
-/// Returns (vars_to_set, vars_to_remove, should_clear).
+/// Returns (`vars_to_set`, `vars_to_remove`, `should_clear`).
 ///
 /// - `should_clear`: if true, caller must `env_clear()` first, then set all vars from `vars_to_set`.
 /// - `vars_to_remove`: only relevant when `should_clear` is false (inherit mode).
 /// - `scratch_dir`: if Some, TMPDIR/TMP/TEMP/GOTMPDIR are redirected to this path
 ///   (unless explicitly overridden by user via `extra_pass_env`).
 /// - `agent`: which agent is being sandboxed — Copilot-specific env vars are suppressed for other agents.
+#[must_use]
 pub fn build_sandbox_env(
     parent_env: &[(String, String)],
     extra_pass_env: &[String],
@@ -206,7 +207,7 @@ pub fn build_sandbox_env(
     env
 }
 
-/// Dangerous NODE_OPTIONS flags that allow code preloading or module interception.
+/// Dangerous `NODE_OPTIONS` flags that allow code preloading or module interception.
 const NODE_OPTIONS_DANGEROUS: &[&str] = &[
     "--require",
     "-r",
@@ -218,7 +219,7 @@ const NODE_OPTIONS_DANGEROUS: &[&str] = &[
     "--conditions",
 ];
 
-/// Strip dangerous directives from NODE_OPTIONS while preserving safe ones.
+/// Strip dangerous directives from `NODE_OPTIONS` while preserving safe ones.
 ///
 /// Dangerous flags (--require, --loader, --import, etc.) allow preload injection
 /// across all Node.js child processes inside the sandbox. Safe flags like
@@ -236,7 +237,7 @@ fn sanitize_node_options(vars: &mut Vec<(String, String)>) {
     }
 }
 
-/// Parse NODE_OPTIONS and remove dangerous flags (and their arguments).
+/// Parse `NODE_OPTIONS` and remove dangerous flags (and their arguments).
 fn strip_dangerous_node_flags(value: &str) -> String {
     let parts: Vec<&str> = value.split_whitespace().collect();
     let mut result = Vec::new();

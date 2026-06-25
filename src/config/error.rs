@@ -54,6 +54,6 @@ pub enum ConfigError {
 
 impl From<String> for ConfigError {
     fn from(s: String) -> Self {
-        ConfigError::Validation(s)
+        Self::Validation(s)
     }
 }

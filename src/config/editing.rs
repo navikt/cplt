@@ -232,8 +232,9 @@ pub fn unset_value_in_doc(doc: &mut toml_edit::DocumentMut, key_info: &ConfigKey
     }
 }
 
-/// Read the current display value for a key from a toml_edit document.
+/// Read the current display value for a key from a `toml_edit` document.
 /// Returns `None` if the key is not set.
+#[must_use]
 pub fn get_value_from_doc(
     doc: &toml_edit::DocumentMut,
     key_info: &ConfigKeyInfo,

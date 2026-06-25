@@ -1,6 +1,6 @@
 //! cplt — sandbox wrapper for AI coding agents.
 //!
-//! Runs AI agents (GitHub Copilot, OpenCode, Gemini CLI) inside a
+//! Runs AI agents (GitHub Copilot, `OpenCode`, Gemini CLI) inside a
 //! deny-by-default OS sandbox (macOS Seatbelt, Linux Landlock+seccomp),
 //! with a filtering CONNECT proxy for network control.
 
@@ -23,6 +23,7 @@ pub mod update;
 /// Prevents accidental sandbox misconfiguration by blocking roots that
 /// would grant access to the entire system, user home, or sensitive
 /// system directories. Platform-specific entries are gated with `cfg`.
+#[must_use]
 pub fn is_unsafe_root(path: &std::path::Path, home: &std::path::Path) -> bool {
     let p = path.to_string_lossy();
 
