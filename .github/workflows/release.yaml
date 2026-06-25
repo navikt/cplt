@@ -69,7 +69,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.96"
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build
