@@ -16,6 +16,7 @@ sha2 = { version = "0.11.0", default-features = false }
 thiserror = "2.0.18"
 toml = "1.1"
 toml_edit = "0.25"
+uriparse = "0.6.4"
 
 # Linux-only: Landlock LSM crate (only compiled and linked on Linux).
 # Run `cargo update` with network access to populate the lockfile.

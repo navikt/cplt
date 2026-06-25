@@ -1,5 +1,8 @@
 /target/
 
+# .env* files
+.env*
+
 # Temp dirs created by e2e tests (cleaned on drop, but may survive panics/kills)
 .cplt-e2e-*
 .cplt-smoke-*
@@ -26,3 +29,7 @@ GH-CLI-SECURITY-TEST-REPORT.md
 
 # Local agent worktrees/metadata — never track
 .claude/
+
+# Nix
+.direnv/
+result*

@@ -13,6 +13,8 @@
 
 use std::path::Path;
 
+use uriparse::{URI, URIBuilder};
+
 /// Policy decision for a `gh` command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -1274,7 +1276,6 @@ pub fn detect_current_repo(project_dir: &Path) -> Option<String> {
         .current_dir(project_dir)
         .output()
         .ok()?;
-
     if !output.status.success() {
         return None;
     }
@@ -1285,50 +1286,31 @@ pub fn detect_current_repo(project_dir: &Path) -> Option<String> {
 
 /// Parse owner/repo from a git remote URL.
 ///
-/// Handles:
-/// - `https://github.com/owner/repo.git`
-/// - `https://github.com/owner/repo`
-/// - `git@github.com:owner/repo.git`
-/// - `ssh://git@github.com/owner/repo.git`
+/// Handles all URIs - assumes `github` though, so does not support other git forges for now
 fn parse_repo_from_url(url: &str) -> Option<String> {
-    // SSH shorthand: git@github.com:owner/repo.git
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
-        let repo = rest.trim_end_matches(".git");
-        if repo.contains('/') {
-            return Some(repo.to_string());
+    let uri = if (url.starts_with("git@") && url.matches(":").count() == 1) || (url.starts_with("ssh://git@") && url.matches(":").count() > 1) {
+        let uri_without_scheme = url.trim_start_matches("ssh://").trim_start_matches("git@");
+        let auth_and_parts: Vec<&str> = uri_without_scheme.splitn(2, ":").collect();
+        let authority = auth_and_parts[0];
+        let path: &str = auth_and_parts.get(1).map_or("", |v| v);
+        URIBuilder::new().try_scheme("ssh").unwrap().try_authority(Some(authority)).unwrap().try_path(path).unwrap().clone().build().unwrap()
+    } else {
+        match URI::try_from(url) {
+            Ok(uri) => uri,
+            Err(e) => {
+                eprintln!("Unable to parse `git remote get-url origin`: {}", e);
+                return None;
+            },
         }
+    };
+
+    // We only accept github for now
+    if let Some(auth) = uri.authority() && auth.host().to_string().as_str() != "github.com"{
+        return None;
     }
 
-    // HTTPS or SSH URL
-    // Look for github.com in the path
-    let path = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| {
-            // HTTPS with embedded credentials:
-            //   https://x-access-token:TOKEN@github.com/owner/repo.git
-            // Anchor the host check to the URL *authority* (the segment before the
-            // first '/'), so a crafted path such as
-            //   https://evil.example/@github.com/owner/repo.git
-            // is NOT mis-parsed as a GitHub URL.
-            let after_scheme = url.strip_prefix("https://")?;
-            let (authority, rest) = match after_scheme.split_once('/') {
-                Some((a, r)) => (a, r),
-                None => (after_scheme, ""),
-            };
-            // Strip any userinfo (user:token@) and an optional :port.
-            let host = authority
-                .rsplit('@')
-                .next()
-                .unwrap_or(authority)
-                .split(':')
-                .next()
-                .unwrap_or(authority);
-            (host == "github.com").then_some(rest)
-        })
-        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| url.strip_prefix("http://github.com/"))?;
-
-    let repo = path.trim_end_matches(".git");
+    let path = uri.path().to_string();
+    let repo = path.trim_end_matches(".git").trim_start_matches("/");
     // Should have exactly one slash: owner/repo
     if repo.matches('/').count() == 1 && !repo.starts_with('/') && !repo.ends_with('/') {
         Some(repo.to_string())
@@ -2534,6 +2516,14 @@ mod tests {
     fn parse_ssh_shorthand() {
         assert_eq!(
             parse_repo_from_url("git@github.com:navikt/cplt.git"),
+            Some("navikt/cplt".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_ssh_alias() {
+        assert_eq!(
+            parse_repo_from_url("github-nav:navikt/cplt.git"),
             Some("navikt/cplt".to_string())
         );
     }
