@@ -1288,24 +1288,37 @@ pub fn detect_current_repo(project_dir: &Path) -> Option<String> {
 ///
 /// Handles all URIs - assumes `github` though, so does not support other git forges for now
 fn parse_repo_from_url(url: &str) -> Option<String> {
-    let uri = if (url.starts_with("git@") && url.matches(":").count() == 1) || (url.starts_with("ssh://git@") && url.matches(":").count() > 1) {
+    let uri = if (url.starts_with("git@") && url.matches(":").count() == 1)
+        || (url.starts_with("ssh://git@") && url.matches(":").count() > 1)
+    {
         let uri_without_scheme = url.trim_start_matches("ssh://").trim_start_matches("git@");
         let auth_and_parts: Vec<&str> = uri_without_scheme.splitn(2, ":").collect();
         let authority = auth_and_parts[0];
         let path: &str = auth_and_parts.get(1).map_or("", |v| v);
-        URIBuilder::new().try_scheme("ssh").unwrap().try_authority(Some(authority)).unwrap().try_path(path).unwrap().clone().build().unwrap()
+        URIBuilder::new()
+            .try_scheme("ssh")
+            .unwrap()
+            .try_authority(Some(authority))
+            .unwrap()
+            .try_path(path)
+            .unwrap()
+            .clone()
+            .build()
+            .unwrap()
     } else {
         match URI::try_from(url) {
             Ok(uri) => uri,
             Err(e) => {
                 eprintln!("Unable to parse `git remote get-url origin`: {}", e);
                 return None;
-            },
+            }
         }
     };
 
     // We only accept github for now
-    if let Some(auth) = uri.authority() && auth.host().to_string().as_str() != "github.com"{
+    if let Some(auth) = uri.authority()
+        && auth.host().to_string().as_str() != "github.com"
+    {
         return None;
     }
 

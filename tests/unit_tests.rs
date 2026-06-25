@@ -2745,6 +2745,7 @@ fn profile_nvm_has_exec() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn profile_fnm_has_exec() {
     // fnm (Fast Node Manager) stores Node.js at ~/.local/share/fnm/node-versions/.
     // Node binaries and bundled JS modules (corepack/yarn/npm) must be executable
