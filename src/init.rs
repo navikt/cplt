@@ -135,17 +135,17 @@ fn write_detection(out: &mut String, d: &Detection) {
 fn format_suggestion(s: &Suggestion) -> String {
     match s {
         Suggestion::Propose(flag) => format!("{} = true", flag.key_name()),
-        Suggestion::AllowRead(p) => format!("allow.read += [\"{p}\"]"),
-        Suggestion::AllowWrite(p) => format!("allow.write += [\"{p}\"]"),
-        Suggestion::AllowPort(p) => format!("allow.ports += [{p}]"),
-        Suggestion::AllowLocalhost(p) => format!("allow.localhost += [{p}]"),
+        Suggestion::AllowRead(p) => format!("allow.read = [\"{p}\"]"),
+        Suggestion::AllowWrite(p) => format!("allow.write = [\"{p}\"]"),
+        Suggestion::AllowPort(p) => format!("allow.ports = [{p}]"),
+        Suggestion::AllowLocalhost(p) => format!("allow.localhost = [{p}]"),
         Suggestion::AllowCacheExec(p) => {
-            format!("sandbox.allow_cache_exec += [\"{p}\"]  (personal config)")
+            format!("sandbox.allow_cache_exec = [\"{p}\"]  (personal config)")
         }
-        Suggestion::DenyEnv(v) => format!("deny.env += [\"{v}\"]"),
-        Suggestion::DenyPath(p) => format!("deny.paths += [\"{p}\"]"),
+        Suggestion::DenyEnv(v) => format!("deny.env = [\"{v}\"]"),
+        Suggestion::DenyPath(p) => format!("deny.paths = [\"{p}\"]"),
         Suggestion::AllowPrivateDomain(d) => {
-            format!("proxy.allow_private_domains += [\"{d}\"]")
+            format!("proxy.allow_private_domains = [\"{d}\"]")
         }
     }
 }
@@ -216,14 +216,14 @@ pub fn generate_toml(report: &DetectionReport) -> String {
             }
             Suggestion::AllowRead(p) => {
                 if is_home_relative(p) {
-                    personal_hints.push(format!("allow.read += [\"{p}\"]  # in personal config"));
+                    personal_hints.push(format!("allow.read = [\"{p}\"]  # in personal config"));
                 } else {
                     allow_read.insert(p.as_str());
                 }
             }
             Suggestion::AllowWrite(p) => {
                 if is_home_relative(p) {
-                    personal_hints.push(format!("allow.write += [\"{p}\"]  # in personal config"));
+                    personal_hints.push(format!("allow.write = [\"{p}\"]  # in personal config"));
                 } else {
                     allow_write.insert(p.as_str());
                 }
@@ -236,7 +236,7 @@ pub fn generate_toml(report: &DetectionReport) -> String {
             }
             Suggestion::AllowCacheExec(p) => {
                 personal_hints.push(format!(
-                    "sandbox.allow_cache_exec += [\"{p}\"]  # in personal config"
+                    "sandbox.allow_cache_exec = [\"{p}\"]  # in personal config"
                 ));
             }
             Suggestion::DenyEnv(v) => {
@@ -645,10 +645,10 @@ pub fn format_global_report(report: &GlobalDetectionReport) -> String {
 fn format_global_suggestion(s: &GlobalSuggestion) -> String {
     match s {
         GlobalSuggestion::CacheExec(name) => {
-            format!("sandbox.allow_cache_exec += [\"{name}\"]")
+            format!("sandbox.allow_cache_exec = [\"{name}\"]")
         }
         GlobalSuggestion::GpgSigning => "sandbox.allow_gpg_signing = true".to_string(),
-        GlobalSuggestion::AllowRead(path) => format!("allow.read += [\"{path}\"]"),
+        GlobalSuggestion::AllowRead(path) => format!("allow.read = [\"{path}\"]"),
         GlobalSuggestion::SetAgent(name) => format!("sandbox.agent = \"{name}\""),
     }
 }
