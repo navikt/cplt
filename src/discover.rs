@@ -1112,6 +1112,20 @@ fn find_native_modules(home_dir: &Path, module_name: &str) -> Vec<PathBuf> {
     results
 }
 
+/// Detect the project root directory by running `git rev-parse --show-toplevel`.
+pub fn detect_project_root() -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let path = String::from_utf8(output.stdout).ok()?;
+        Some(PathBuf::from(path.trim()))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
