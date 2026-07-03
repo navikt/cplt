@@ -817,13 +817,7 @@ fn profile_denies_sensitive_files() {
         allow_cache_exec_any: false,
         allow_browser: false,
     });
-    for file in &[
-        ".netrc",
-        ".npmrc",
-        ".pypirc",
-        ".gem/credentials",
-        ".vault-token",
-    ] {
+    for file in &[".netrc", ".pypirc", ".gem/credentials", ".vault-token"] {
         assert!(
             p.contains(&format!(
                 "(deny file-read* (literal \"/Users/test/{file}\"))"
@@ -874,6 +868,7 @@ fn profile_denies_credential_files_in_tool_dirs() {
         ".gradle/gradle.properties",
         ".cargo/credentials",
         ".cargo/credentials.toml",
+        ".npmrc",
     ] {
         assert!(
             p.contains(&format!(

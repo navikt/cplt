@@ -25,13 +25,7 @@ pub const DENIED_DOTFILES: &[&str] = &[
 ];
 
 /// Sensitive files under $HOME that are always denied.
-pub const DENIED_FILES: &[&str] = &[
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".gem/credentials",
-    ".vault-token",
-];
+pub const DENIED_FILES: &[&str] = &[".netrc", ".pypirc", ".gem/credentials", ".vault-token"];
 
 /// Credential files inside otherwise-allowed HOME_TOOL_DIRS.
 /// These are denied by default because they typically contain registry
@@ -50,6 +44,7 @@ pub const DENIED_HOME_SUBPATHS: &[&str] = &[
     // NuGet.Config can contain <packageSourceCredentials> with plaintext registry passwords.
     // Same threat model as .m2/settings.xml — override with allow.read if private registry needed.
     ".nuget/NuGet.Config",
+    ".npmrc",
 ];
 
 /// Sensitive file patterns in the project directory that are denied by default.
@@ -913,6 +908,13 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
     // Yarn Berry global cache: packages only, no executables
     HomeToolDir {
         path: ".yarn",
+        process_exec: false,
+        map_exec: false,
+        write: true,
+    },
+    // npm global cache: packages only, no executables
+    HomeToolDir {
+        path: ".npm",
         process_exec: false,
         map_exec: false,
         write: true,

@@ -422,10 +422,15 @@ fn detect_jvm(ctx: &DetectContext) -> DetectorOutput {
 
     let mut suggestions = vec![Suggestion::Propose(SandboxFlag::AllowJvmAttach)];
 
-    // Check for ~/.gradle/gradle.properties (common for credentials/proxy config)
-    suggestions.push(Suggestion::AllowRead(
-        "~/.gradle/gradle.properties".to_string(),
-    ));
+    // Check for credentials/proxy config files
+    if is_gradle {
+        suggestions.push(Suggestion::AllowRead(
+            "~/.gradle/gradle.properties".to_string(),
+        ));
+    }
+    if is_maven {
+        suggestions.push(Suggestion::AllowRead("~/.m2/settings.xml".to_string()));
+    }
 
     // Content scan: check for mocking frameworks that need JVM attach
     if is_gradle {
@@ -500,6 +505,14 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
             || content.contains("\"turbo\"")
         {
             suggestions.push(Suggestion::Propose(SandboxFlag::AllowLocalhostAny));
+        }
+
+        // If local .npmrc exists or package.json specifies a registry, suggest ~/.npmrc
+        if ctx.exists(".npmrc")
+            || content.contains("\"registry\"")
+            || content.contains("publishConfig")
+        {
+            suggestions.push(Suggestion::AllowRead("~/.npmrc".to_string()));
         }
     }
 
@@ -1882,6 +1895,16 @@ pub fn detect_global(home: &Path) -> GlobalDetectionReport {
         detections.push(d);
     }
 
+    // npm credentials (private registry access)
+    if let Some(d) = detect_global_npmrc(home) {
+        detections.push(d);
+    }
+
+    // Maven credentials (private registry access)
+    if let Some(d) = detect_global_m2_settings(home) {
+        detections.push(d);
+    }
+
     // Preferred agent from PATH
     if let Some(d) = detect_global_agent() {
         detections.push(d);
@@ -1963,6 +1986,52 @@ fn detect_global_gradle_credentials(home: &Path) -> Option<GlobalDetection> {
         reason: "~/.gradle/gradle.properties contains repository configuration".to_string(),
         suggestions: vec![GlobalSuggestion::AllowRead(
             "~/.gradle/gradle.properties".to_string(),
+        )],
+    })
+}
+
+fn detect_global_npmrc(home: &Path) -> Option<GlobalDetection> {
+    // ~/.npmrc is denied by default (may contain authentication tokens).
+    // If it exists and contains registry configurations/tokens, suggest allowing read access.
+    let npmrc_path = home.join(".npmrc");
+    if !npmrc_path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&npmrc_path).ok()?;
+    let has_registry = content.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#')
+            && (trimmed.contains("registry") || trimmed.contains("_authToken"))
+    });
+    if !has_registry {
+        return None;
+    }
+    Some(GlobalDetection {
+        name: "npm registry credentials",
+        reason: "~/.npmrc contains registry or token configuration".to_string(),
+        suggestions: vec![GlobalSuggestion::AllowRead("~/.npmrc".to_string())],
+    })
+}
+
+fn detect_global_m2_settings(home: &Path) -> Option<GlobalDetection> {
+    // ~/.m2/settings.xml is denied by default (may contain repository server credentials).
+    // If it exists and contains custom servers/profiles, suggest allowing read access.
+    let settings_path = home.join(".m2/settings.xml");
+    if !settings_path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&settings_path).ok()?;
+    let has_registry = content.contains("<server>")
+        || content.contains("<mirror>")
+        || content.contains("<repository>");
+    if !has_registry {
+        return None;
+    }
+    Some(GlobalDetection {
+        name: "Maven repository settings",
+        reason: "~/.m2/settings.xml contains repository server configurations".to_string(),
+        suggestions: vec![GlobalSuggestion::AllowRead(
+            "~/.m2/settings.xml".to_string(),
         )],
     })
 }
@@ -2907,6 +2976,74 @@ services:
                 .detections
                 .iter()
                 .any(|d| d.name == "Gradle registry credentials")
+        );
+    }
+
+    #[test]
+    fn global_detect_npmrc_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let npmrc = home.path().join(".npmrc");
+        std::fs::write(
+            &npmrc,
+            "registry=https://npm.pkg.github.com\n_authToken=secret",
+        )
+        .unwrap();
+
+        let report = detect_global(home.path());
+        assert!(
+            report
+                .detections
+                .iter()
+                .any(|d| d.name == "npm registry credentials")
+        );
+        assert!(
+            report
+                .detections
+                .iter()
+                .flat_map(|d| &d.suggestions)
+                .any(|s| matches!(s, GlobalSuggestion::AllowRead(p) if p.contains(".npmrc")))
+        );
+    }
+
+    #[test]
+    fn global_detect_npmrc_no_match() {
+        let home = tempfile::tempdir().unwrap();
+        let npmrc = home.path().join(".npmrc");
+        std::fs::write(&npmrc, "# just a comment").unwrap();
+
+        let report = detect_global(home.path());
+        assert!(
+            !report
+                .detections
+                .iter()
+                .any(|d| d.name == "npm registry credentials")
+        );
+    }
+
+    #[test]
+    fn global_detect_m2_settings_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let settings = home.path().join(".m2/settings.xml");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            "<settings><servers><server><id>nexus</id></server></servers></settings>",
+        )
+        .unwrap();
+
+        let report = detect_global(home.path());
+        assert!(
+            report
+                .detections
+                .iter()
+                .any(|d| d.name == "Maven repository settings")
+        );
+        assert!(
+            report
+                .detections
+                .iter()
+                .flat_map(|d| &d.suggestions)
+                .any(|s| matches!(s, GlobalSuggestion::AllowRead(p) if p.contains("settings.xml")))
         );
     }
 
