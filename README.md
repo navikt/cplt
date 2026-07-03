@@ -314,6 +314,7 @@ The project directory is the primary writable workspace, plus a narrow allowlist
 | `-d, --project-dir <DIR>`  | Which directory Copilot can work in. Defaults to the current git repo root.                                                                       |
 | `--allow-read <PATH>`      | Let Copilot read (read-only) files outside the project (e.g. shared libraries, docs). Can be repeated.                                            |
 | `--allow-write <PATH>`     | Let Copilot read AND write outside the project. Use carefully. Can be repeated.                                                                   |
+| `--allow-socket <PATH>`    | Allow the agent to access a Unix domain socket path (e.g. custom LSP daemon, database socket). Can be repeated.                                   |
 | `--deny-path <PATH>`       | Block a path that would otherwise be allowed. Deny always wins. Can be repeated.                                                                  |
 | `--allow-port <PORT>`      | Allow outbound TCP on an extra port (default: only 443). Can be repeated.                                                                         |
 | `--allow-localhost <PORT>` | Allow outbound to `localhost` on a specific port (localhost is blocked by default). Use for MCP servers or dev servers. Can be repeated.          |
@@ -768,6 +769,7 @@ allow_docker = true
 [propose.allow]
 ports = [5432]
 localhost = [3000]
+socket = ["/var/run/docker.sock"]
 ```
 
 - **`[deny]`** — applied automatically (can only tighten, never weaken)

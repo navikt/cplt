@@ -33,6 +33,7 @@ pub struct ProfileOptions<'a> {
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
+    pub allow_socket: &'a [PathBuf],
     pub extra_deny: &'a [PathBuf],
     /// If `Some`, only include these home tool dirs (tighter profile via discovery).
     /// If `None`, all known home tool dirs are included.
@@ -169,6 +170,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_denied_dotfile_overrides(&mut sb, &home, opts.extra_read);
     emit_gpg_signing_rules(&mut sb, &home, opts.allow_gpg_signing, opts.extra_deny);
     emit_docker_rules(&mut sb, &home, opts.allow_docker, opts.extra_deny);
+    emit_socket_rules(&mut sb, opts.allow_socket, opts.extra_deny);
     emit_network_rules(
         &mut sb,
         &home,
@@ -1106,6 +1108,53 @@ const DOCKER_SOCKET_PATHS: &[&str] = &[
     ".finch/docker.sock",          // AWS Finch
     "Library/Application Support/rancher-desktop/lima/docker.sock", // Rancher Desktop
 ];
+
+fn emit_socket_rules(sb: &mut String, allow_socket: &[PathBuf], extra_deny: &[PathBuf]) {
+    if allow_socket.is_empty() {
+        return;
+    }
+
+    sbpl!(sb, ";; Unix domain sockets (--allow-socket)");
+    for path in allow_socket {
+        let path_str = path.to_string_lossy();
+
+        // SECURITY: check if the user explicitly denied the socket path
+        let mut denied = false;
+        for d in extra_deny {
+            if path == d || path.starts_with(d) {
+                denied = true;
+                break;
+            }
+        }
+        if denied {
+            sbpl!(
+                sb,
+                ";; Socket access skipped: --deny-path overlaps with {}",
+                path_str
+            );
+            continue;
+        }
+
+        sbpl!(sb, "(allow file-read* (subpath \"{}\"))", path_str);
+        sbpl!(sb, "(allow file-write* (subpath \"{}\"))", path_str);
+        sbpl!(
+            sb,
+            "(allow network-outbound (remote unix-socket (subpath \"{}\")))",
+            path_str
+        );
+        sbpl!(
+            sb,
+            "(allow network-bind (local unix-socket (subpath \"{}\")))",
+            path_str
+        );
+        sbpl!(
+            sb,
+            "(allow network-inbound (local unix-socket (subpath \"{}\")))",
+            path_str
+        );
+    }
+    sbpl!(sb);
+}
 
 /// Allow Docker access when `--allow-docker` is set.
 ///

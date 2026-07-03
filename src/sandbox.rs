@@ -81,6 +81,7 @@ pub struct SandboxConfig<'a> {
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
+    pub extra_socket: &'a [PathBuf],
     pub extra_deny: &'a [PathBuf],
     /// If `Some`, only include these home tool dirs (tighter profile via discovery).
     /// If `None`, all known home tool dirs are included.
@@ -237,6 +238,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         home_dir: config.home_dir,
         extra_read: config.extra_read,
         extra_write: config.extra_write,
+        allow_socket: config.extra_socket,
         extra_deny: config.extra_deny,
         existing_home_tool_dirs: config.existing_home_tool_dirs,
         existing_app_dirs: config.existing_app_dirs,
@@ -371,6 +373,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     }
     for p in config.extra_write {
         policy::validate_sbpl_path(p).map_err(|e| format!("--allow-write path: {e}"))?;
+    }
+    for p in config.extra_socket {
+        policy::validate_sbpl_path(p).map_err(|e| format!("--allow-socket path: {e}"))?;
     }
     for p in config.extra_deny {
         policy::validate_sbpl_path(p).map_err(|e| format!("--deny-path path: {e}"))?;

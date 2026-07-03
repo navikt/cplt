@@ -372,6 +372,7 @@ mod macos_tests {
             home_dir: home,
             extra_read: &[],
             extra_write: &[],
+            allow_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
             existing_app_dirs: None,

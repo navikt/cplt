@@ -134,6 +134,18 @@ impl Config {
         }
         allow_write.extend(cli.allow_write);
 
+        // Allow-socket: merge config + CLI
+        let mut allow_socket: Vec<PathBuf> = Vec::new();
+        for s in &self.allow.socket {
+            match resolve_config_path(s, config_dir.as_ref()) {
+                Ok(p) => allow_socket.push(p),
+                Err(e) => {
+                    ui::warn(&format!("Warning: allow.socket path {s:?}: {e}"));
+                }
+            }
+        }
+        allow_socket.extend(cli.allow_socket);
+
         // Deny-paths: merge config + CLI
         // SECURITY: config deny paths MUST resolve — a silently dropped deny is dangerous
         let mut deny_paths: Vec<PathBuf> = Vec::new();
@@ -319,6 +331,7 @@ impl Config {
         for p in allow_read
             .iter()
             .chain(allow_write.iter())
+            .chain(allow_socket.iter())
             .chain(deny_paths.iter())
         {
             validate_sbpl_path(p)?;
@@ -360,6 +373,7 @@ impl Config {
             allow_private_domains,
             allow_read,
             allow_write,
+            allow_socket,
             deny_paths,
             allow_ports,
             allow_localhost,
@@ -440,6 +454,14 @@ impl Resolved {
             for p in &self.allow_write {
                 eprintln!(
                     "{blue}[cplt]{nc}    Extra write:   {yellow}allowed{nc}     {}",
+                    p.display()
+                );
+            }
+        }
+        if !self.allow_socket.is_empty() {
+            for p in &self.allow_socket {
+                eprintln!(
+                    "{blue}[cplt]{nc}    Socket:        {yellow}allowed{nc}     {}",
                     p.display()
                 );
             }
@@ -796,6 +818,14 @@ impl Resolved {
                 let path = expand_tilde(path_str);
                 if !self.allow_write.contains(&path) {
                     self.allow_write.push(path);
+                }
+            }
+        }
+        if is_approved("allow.socket") {
+            for path_str in &repo_config.propose.allow.socket {
+                let path = expand_tilde(path_str);
+                if !self.allow_socket.contains(&path) {
+                    self.allow_socket.push(path);
                 }
             }
         }

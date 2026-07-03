@@ -534,6 +534,19 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
+    // ── Extra socket paths from config ──
+    for p in config.extra_socket {
+        fs_rules.push(FsRule {
+            path: p.clone(),
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: false,
+                ioctl: false,
+            },
+        });
+    }
+
     // ── GPG signing files (read-only subset of ~/.gnupg) ──
     if config.allow_gpg_signing {
         for &file in policy::GPG_SIGNING_ALLOW_FILES {
@@ -1283,6 +1296,7 @@ mod tests {
             home_dir,
             extra_read: &[],
             extra_write: &[],
+            extra_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
             existing_app_dirs: None,

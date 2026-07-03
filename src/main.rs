@@ -177,6 +177,11 @@ struct Cli {
     #[arg(long = "allow-write", value_name = "PATH")]
     allow_write: Vec<PathBuf>,
 
+    /// Allow the agent to access a Unix domain socket path (e.g. for LSP server or Docker).
+    /// Can be specified multiple times.
+    #[arg(long = "allow-socket", value_name = "PATH")]
+    allow_socket: Vec<PathBuf>,
+
     /// Block access to a specific path, even if it would normally be allowed.
     /// Deny rules always win over allow rules. Use this to protect sensitive
     /// files inside otherwise-allowed directories.
@@ -940,6 +945,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
     // Canonicalize CLI paths for consistency with config path handling
     let cli_allow_read = canonicalize_paths(&cli.allow_read, "--allow-read");
     let cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
+    let cli_allow_socket = canonicalize_paths(&cli.allow_socket, "--allow-socket");
     let cli_deny_paths = canonicalize_deny_paths(&cli.deny_paths)?;
 
     let (cfg, config_path) = match config::Config::load_file() {
@@ -964,6 +970,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         allow_private_domains: cli.allow_private_domains.clone(),
         allow_read: cli_allow_read,
         allow_write: cli_allow_write,
+        allow_socket: cli_allow_socket,
         deny_paths: cli_deny_paths,
         allow_ports: cli.allow_ports.clone(),
         allow_localhost: cli.allow_localhost.clone(),
@@ -1583,6 +1590,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         home_dir: &home_dir,
         extra_read: &resolved.allow_read,
         extra_write: &resolved.allow_write,
+        extra_socket: &resolved.allow_socket,
         extra_deny: &resolved.deny_paths,
         existing_home_tool_dirs: Some(&existing_home_tool_dirs),
         existing_app_dirs: Some(&existing_app_dirs),
@@ -2093,6 +2101,7 @@ fn run_exec_command(
         home_dir: &home_dir,
         extra_read: &resolved.allow_read,
         extra_write: &resolved.allow_write,
+        extra_socket: &resolved.allow_socket,
         extra_deny: &resolved.deny_paths,
         existing_home_tool_dirs: Some(&existing_home_tool_dirs),
         existing_app_dirs: Some(&existing_app_dirs),

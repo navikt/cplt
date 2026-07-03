@@ -245,6 +245,8 @@ pub struct AllowConfig {
     pub read: Vec<String>,
     /// Additional paths to allow writing.
     pub write: Vec<String>,
+    /// Unix socket paths to allow access to.
+    pub socket: Vec<String>,
     /// Additional outbound TCP ports beyond 443.
     pub ports: Vec<u16>,
     /// Localhost ports to allow (localhost is blocked by default).
@@ -402,6 +404,7 @@ pub struct Resolved {
     pub allow_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
+    pub allow_socket: Vec<PathBuf>,
     pub deny_paths: Vec<PathBuf>,
     pub allow_ports: Vec<u16>,
     pub allow_localhost: Vec<u16>,
@@ -446,6 +449,7 @@ pub struct CliFlags {
     pub allow_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
+    pub allow_socket: Vec<PathBuf>,
     pub deny_paths: Vec<PathBuf>,
     pub allow_ports: Vec<u16>,
     pub allow_localhost: Vec<u16>,

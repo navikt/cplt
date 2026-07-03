@@ -14,7 +14,7 @@ const VALID_PROXY_KEYS: &[&str] = &[
     "log_level",
     "allow_private_domains",
 ];
-const VALID_ALLOW_KEYS: &[&str] = &["read", "write", "ports", "localhost"];
+const VALID_ALLOW_KEYS: &[&str] = &["read", "write", "socket", "ports", "localhost"];
 const VALID_DENY_KEYS: &[&str] = &["paths"];
 const VALID_SANDBOX_KEYS: &[&str] = &[
     "agent",

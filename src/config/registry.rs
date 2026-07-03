@@ -124,6 +124,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "allow",
+        key: "socket",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[]",
+        description: "Unix socket paths to allow access to.",
+    },
+    ConfigKeyInfo {
+        section: "allow",
         key: "ports",
         value_type: ConfigValueType::U16Array,
         dangerous: false,

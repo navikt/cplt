@@ -76,6 +76,12 @@ pub fn default_config_contents() -> String {
 # Localhost ports to allow (localhost is blocked by default).
 # Use for MCP servers, dev servers, or local APIs.
 # localhost = [3000, 8080]
+#
+# Unix socket paths to allow access to.
+# socket = [
+#     "/var/run/docker.sock",
+#     "~/.codex/codex-lsp/daemon/daemon.sock",
+# ]
 
 # ─── Denied paths ───────────────────────────────────────────
 # Additional paths to explicitly block (overrides allows).
