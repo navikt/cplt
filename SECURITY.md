@@ -360,6 +360,9 @@ Files always denied:
 - `~/.gem/credentials` — RubyGems credentials
 - `~/.vault-token` — HashiCorp Vault
 
+#### Symlink attack protection
+SBPL (macOS Seatbelt) resolves symlink targets at the kernel VFS layer before matching paths against deny rules. To verify this, cplt includes integration tests that attempt to read sensitive files (such as `.env`) through symlinks with non-matching names. The kernel correctly resolves the symlink target and blocks the operation.
+
 #### Tool directory permissions
 
 Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permission model (`HomeToolDir`) with granular `process_exec`, `map_exec`, and `write` flags:

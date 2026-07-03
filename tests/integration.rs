@@ -663,6 +663,35 @@ mod macos_tests {
     }
 
     #[test]
+    fn real_profile_blocks_env_file_symlink_read() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".cplt-envsymtest-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join(".env"), "SECRET=hunter2\n").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        // Create symlink innocuous-name -> .env
+        let env_path = tmp.join(".env");
+        let link_path = tmp.join("innocuous-name");
+        std::os::unix::fs::symlink(&env_path, &link_path).unwrap();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let cmd = format!("cat '{}' 2>&1; echo EXIT:$?", link_path.display());
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "symlink to .env should be blocked by default, got: {output}"
+        );
+    }
+
+    #[test]
     fn real_profile_blocks_env_file_delete() {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
