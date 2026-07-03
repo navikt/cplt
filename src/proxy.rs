@@ -1464,11 +1464,17 @@ mod tests {
     fn proxy_connect(proxy_port: u16, target: &str) -> String {
         use std::io::{BufRead as _, BufReader, Write as _};
         let mut conn = std::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).unwrap();
-        write!(conn, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").unwrap();
+        let _ = write!(conn, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
         let mut reader = BufReader::new(conn);
         let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        line.trim().to_string()
+        match reader.read_line(&mut line) {
+            Ok(0) => "403 EOF".to_string(),
+            Ok(_) => line.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                "403 ECONNRESET".to_string()
+            }
+            Err(e) => format!("ERROR: {e}"),
+        }
     }
 
     fn make_proxy(allow_localhost_ports: Vec<u16>, allow_localhost_any: bool) -> ProxyHandle {
