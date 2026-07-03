@@ -352,16 +352,19 @@ Directories explicitly allowed (read-only):
 
 - `~/.config/gh` — GitHub CLI credentials (Copilot spawns `gh auth token`; see [Honest gaps](#honest-gaps))
 
-Files always denied:
+Files always denied (hard blocks):
 
 - `~/.netrc` — HTTP credentials
-- `~/.npmrc` — npm registry tokens
 - `~/.pypirc` — PyPI credentials
 - `~/.gem/credentials` — RubyGems credentials
 - `~/.vault-token` — HashiCorp Vault
 
+Files denied by default (overridable via `--allow-read` for private registries):
+
+- `~/.npmrc` — npm registry configuration
+
 #### Symlink attack protection
-SBPL (macOS Seatbelt) resolves symlink targets at the kernel VFS layer before matching paths against deny rules. To verify this, cplt includes integration tests that attempt to read sensitive files (such as `.env`) through symlinks with non-matching names. The kernel correctly resolves the symlink target and blocks the operation.
+SBPL (macOS Seatbelt) resolves symlink targets at the kernel VFS layer during path evaluation. To verify this behavior, cplt includes integration tests demonstrating that attempts to read a denied file (such as `.env`) via a symlink with an innocuous name are successfully blocked by the kernel.
 
 #### Tool directory permissions
 

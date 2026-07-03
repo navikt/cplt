@@ -44,6 +44,8 @@ pub const DENIED_HOME_SUBPATHS: &[&str] = &[
     // NuGet.Config can contain <packageSourceCredentials> with plaintext registry passwords.
     // Same threat model as .m2/settings.xml — override with allow.read if private registry needed.
     ".nuget/NuGet.Config",
+    // .npmrc is a top-level file, but belongs here so it can be overridden via --allow-read
+    // if the user needs to access a private npm registry (unlike hard-denied dotfiles).
     ".npmrc",
 ];
 
