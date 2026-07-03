@@ -1637,6 +1637,26 @@ mod tests {
     }
 
     #[test]
+    fn extra_socket_paths_added() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let extra = vec![PathBuf::from("/var/run/custom.sock")];
+        let mut config = test_config(&project, &home);
+        config.extra_socket = &extra;
+        let policy = generate_policy(&config);
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == Path::new("/var/run/custom.sock"))
+            .expect("extra socket path should be in rules");
+        assert!(rule.access.read);
+        assert!(rule.access.write);
+        assert!(!rule.access.execute);
+        assert!(!rule.access.ioctl);
+    }
+
+    #[test]
     fn extra_write_paths_added() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");

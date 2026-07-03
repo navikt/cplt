@@ -1135,21 +1135,21 @@ fn emit_socket_rules(sb: &mut String, allow_socket: &[PathBuf], extra_deny: &[Pa
             continue;
         }
 
-        sbpl!(sb, "(allow file-read* (subpath \"{}\"))", path_str);
-        sbpl!(sb, "(allow file-write* (subpath \"{}\"))", path_str);
+        sbpl!(sb, "(allow file-read* (literal \"{}\"))", path_str);
+        sbpl!(sb, "(allow file-write* (literal \"{}\"))", path_str);
         sbpl!(
             sb,
-            "(allow network-outbound (remote unix-socket (subpath \"{}\")))",
+            "(allow network-outbound (remote unix-socket (literal \"{}\")))",
             path_str
         );
         sbpl!(
             sb,
-            "(allow network-bind (local unix-socket (subpath \"{}\")))",
+            "(allow network-bind (local unix-socket (literal \"{}\")))",
             path_str
         );
         sbpl!(
             sb,
-            "(allow network-inbound (local unix-socket (subpath \"{}\")))",
+            "(allow network-inbound (local unix-socket (literal \"{}\")))",
             path_str
         );
     }

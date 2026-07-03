@@ -5108,26 +5108,26 @@ fn profile_socket_allows_rules() {
 
     assert!(
         p.contains(
-            r#"(allow file-read* (subpath "/Users/test/.codex/codex-lsp/daemon/daemon.sock"))"#
+            r#"(allow file-read* (literal "/Users/test/.codex/codex-lsp/daemon/daemon.sock"))"#
         ),
         "Profile must allow read access to the socket path"
     );
     assert!(
         p.contains(
-            r#"(allow file-write* (subpath "/Users/test/.codex/codex-lsp/daemon/daemon.sock"))"#
+            r#"(allow file-write* (literal "/Users/test/.codex/codex-lsp/daemon/daemon.sock"))"#
         ),
         "Profile must allow write access to the socket path"
     );
     assert!(
-        p.contains(r#"(allow network-outbound (remote unix-socket (subpath "/Users/test/.codex/codex-lsp/daemon/daemon.sock")))"#),
+        p.contains(r#"(allow network-outbound (remote unix-socket (literal "/Users/test/.codex/codex-lsp/daemon/daemon.sock")))"#),
         "Profile must allow network-outbound to the socket path"
     );
     assert!(
-        p.contains(r#"(allow network-bind (local unix-socket (subpath "/Users/test/.codex/codex-lsp/daemon/daemon.sock")))"#),
+        p.contains(r#"(allow network-bind (local unix-socket (literal "/Users/test/.codex/codex-lsp/daemon/daemon.sock")))"#),
         "Profile must allow network-bind to the socket path"
     );
     assert!(
-        p.contains(r#"(allow network-inbound (local unix-socket (subpath "/Users/test/.codex/codex-lsp/daemon/daemon.sock")))"#),
+        p.contains(r#"(allow network-inbound (local unix-socket (literal "/Users/test/.codex/codex-lsp/daemon/daemon.sock")))"#),
         "Profile must allow network-inbound to the socket path"
     );
 }
