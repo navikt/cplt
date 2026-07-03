@@ -1524,12 +1524,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             .and_then(|p| {
                 // Try package.json discovery first (npm/Homebrew installs)
                 discover::copilot_pkg_dir(p, &home_dir).or_else(|| {
-                    // SEA binary on Linux: the extracted runtime lives in
-                    // ~/.cache/copilot/pkg/linux-{arch}/ and needs exec access.
-                    #[cfg(target_os = "linux")]
-                    if let Some(cache_dir) = discover::copilot_sea_cache_dir(&home_dir) {
-                        return Some(cache_dir);
-                    }
                     // Fallback: use the binary's parent directory (VS Code extension installs
                     // at ~/Library/Application Support/Code/.../copilotCli/copilot)
                     p.parent().map(std::path::Path::to_path_buf)

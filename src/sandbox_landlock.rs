@@ -603,6 +603,19 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 ioctl: false,
             },
         });
+
+        // Copilot SEA cache — auto-updaters download newer versions here.
+        // Execute is required for Node to spawn the newer ripgrep / helpers.
+        // (Write access is already inherited from the broader ~/.cache allow).
+        fs_rules.push(FsRule {
+            path: home.join(".cache/copilot/pkg"),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: true,
+                ioctl: false,
+            },
+        });
     }
     for dir in config.agent_dirs {
         fs_rules.push(FsRule {
