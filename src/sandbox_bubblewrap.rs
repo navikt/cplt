@@ -1,83 +1,134 @@
-#![allow(dead_code, unused_imports)]
 //! Bubblewrap namespace isolation for Linux.
 //!
-//! # Purpose
+//! # What this actually guarantees
 //!
-//! Adds defense-in-depth namespace isolation on top of Landlock + seccomp-BPF:
-//! - **PID namespace**: Agent cannot see or signal host processes
-//! - **Mount namespace**: Only necessary paths visible, everything else invisible
-//! - **Network namespace**: Only loopback + proxy port visible (enforces proxy routing)
-//! - **User namespace**: Unprivileged operation (no root needed)
+//! Bubblewrap (`bwrap`) layers kernel **namespace** isolation on top of the
+//! Landlock + seccomp-BPF sandbox. The honest guarantees are:
 //!
-//! # Design
+//! - **PID namespace**: the agent cannot see or signal host processes (`ps`
+//!   shows only the agent's own tree).
+//! - **IPC / UTS / cgroup namespaces**: no shared SysV IPC, isolated hostname,
+//!   isolated cgroup view.
+//! - **User namespace**: unprivileged operation — the agent maps to the
+//!   invoking UID and holds no real capabilities on the host.
+//! - **Mount namespace**: the entire host filesystem is bind-mounted
+//!   **read-only** (`--ro-bind / /`); writable paths are re-bound writable at
+//!   their real locations. Actual *access control* is still Landlock's job
+//!   (deny-by-default): the mount namespace only changes the mount topology,
+//!   it does not hide arbitrary files.
+//! - **Network**: the network namespace is **deliberately shared with the
+//!   host** (no `--unshare-net`) so the agent can reach the host-bound cplt
+//!   CONNECT proxy on `127.0.0.1`. Outbound control stays with Landlock TCP
+//!   port rules (ABI v4+) and the proxy — bwrap adds nothing here.
 //!
-//! Bubblewrap (`bwrap`) is invoked as a wrapper around the sandboxed process.
-//! The execution flow becomes:
+//! # Layering (how Landlock + seccomp stay enforced under bwrap)
+//!
+//! `bwrap` itself needs `unshare(2)`, `mount(2)` and `pivot_root(2)` to build
+//! the namespaces. Our seccomp filter `EPERM`s exactly those syscalls and a
+//! restrictive Landlock domain (deny-by-default, no rule for `/`) blocks the
+//! bind-mount sources — so we must **not** apply either to the `bwrap` process.
+//! Instead they are applied to the **agent**, after bwrap finishes its setup:
 //!
 //! ```text
-//! cplt → bwrap → copilot (with Landlock+seccomp applied via pre_exec)
+//! cplt ──exec──▶ bwrap (namespaces only, unrestricted)
+//!                  └─exec──▶ cplt re-entry helper (this module, in-namespace)
+//!                              │  applies Landlock + seccomp bound to the
+//!                              │  inodes visible *inside* the namespaces
+//!                              └─execve──▶ agent (Landlock + seccomp enforced)
 //! ```
 //!
-//! Bwrap sets up namespaces and filesystem mounts, then execs the copilot binary.
-//! The Landlock+seccomp layer is still applied in the pre_exec hook (after bwrap's
-//! setup but before the final exec), providing multiple layers of defense.
+//! The re-entry helper is dispatched by an `.init_array` constructor
+//! ([`bwrap_inner_entry`]) that runs before `main()`. On a normal cplt run the
+//! constructor is a single `getenv` and returns immediately; it only does work
+//! when this process is the bwrap-spawned helper (identified by the
+//! [`ENV_INNER_POLICY`] environment variable). This lets the whole feature
+//! live in the sandbox layer without any change to `main.rs`.
+//!
+//! Because the helper opens its Landlock `O_PATH` fds *inside* the namespaces,
+//! Landlock binds to the exact inodes present there (the fresh `--proc`,
+//! `--dev` and `--tmpfs /tmp` mounts and the mirrored writable binds) — making
+//! the effective policy identical to the non-bwrap path. See
+//! [`crate::sandbox::landlock_mod::apply_landlock_and_seccomp_now`].
 //!
 //! # Graceful degradation
 //!
-//! If `bwrap` is not available or namespace creation fails, the sandbox falls back
-//! to Landlock+seccomp only. This ensures cplt works on systems without Bubblewrap.
+//! If `bwrap` is missing or namespace creation fails during
+//! [`check_availability`]/[`test_functionality`], auto-detect falls back to
+//! Landlock + seccomp only. If the wrapped process fails to signal that the
+//! inner sandbox was applied (see the confirm pipe in `sandbox_exec.rs`),
+//! auto-detect likewise falls back at spawn time rather than bricking the run.
 //!
 //! # Configuration
 //!
-//! Controlled by the `use_bubblewrap` option in `SandboxConfig`:
-//! - `Some(true)`: Always use bwrap (fail if unavailable)
-//! - `Some(false)`: Never use bwrap
-//! - `None` (default): Auto-detect and use if available
+//! Controlled by `use_bubblewrap` in `SandboxConfig`:
+//! - `Some(true)`: always use bwrap (fail if unavailable)
+//! - `Some(false)`: never use bwrap
+//! - `None` (default): auto-detect and use if available
 
-use crate::sandbox::landlock_mod::FsRule;
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
+use crate::sandbox::landlock_mod::{FsAccess, FsRule, NetRule};
+
+/// Environment variable carrying the read end of the policy pipe (a decimal fd
+/// number) from which the bwrap re-entry helper reads the serialized Landlock
+/// policy + agent argv. Its mere presence tells the `.init_array` constructor
+/// that this process is the helper.
+///
+/// A pipe is used instead of a file deliberately: the namespaces mount a fresh
+/// `--tmpfs /tmp`, so a policy file in the host temp dir could be invisible
+/// inside; an inherited fd is immune to mount topology and leaves no policy
+/// data on disk.
+pub(crate) const ENV_INNER_POLICY: &str = "__CPLT_BWRAP_POLICY_FD";
+
+/// Environment variable carrying the write end of the confirm pipe (a decimal
+/// fd number). The helper writes one byte to it just before `execve`-ing the
+/// agent so the parent knows the inner sandbox was applied.
+pub(crate) const ENV_CONFIRM_FD: &str = "__CPLT_BWRAP_CONFIRM_FD";
+
+/// A validated Bubblewrap execution wrapper, built during `prepare()`.
+#[derive(Clone)]
+pub(crate) struct BubblewrapWrapper {
+    /// Path to the `bwrap` binary.
+    pub bwrap_path: PathBuf,
+    /// Pre-built namespace/mount arguments for `bwrap` (before `-- <helper>`).
+    pub bwrap_args: Vec<String>,
+    /// Landlock filesystem rules, re-applied in-namespace by the helper.
+    pub fs_rules: Vec<FsRule>,
+    /// Landlock TCP-connect rules, re-applied in-namespace by the helper.
+    pub net_rules: Vec<NetRule>,
+    /// Whether to restrict TCP connect at the kernel level.
+    pub restrict_net_connect: bool,
+    /// `true` when bwrap was explicitly requested (`--use-bubblewrap` /
+    /// `use_bubblewrap = true`). A spawn-time failure is then a hard error;
+    /// on auto-detect it degrades gracefully to Landlock-only.
+    pub strict: bool,
+}
+
 /// Check if bubblewrap is available on this system.
 ///
-/// Returns the path to the `bwrap` binary if found in PATH.
-#[cfg(target_os = "linux")]
-pub fn check_availability() -> Option<PathBuf> {
-    which::which("bwrap").ok()
+/// Returns the path to the `bwrap` binary if found in PATH. Reuses the
+/// project's own PATH resolver so no extra crate is needed.
+pub(crate) fn check_availability() -> Option<PathBuf> {
+    super::exec::which_binary("bwrap")
 }
 
-/// Non-Linux platforms don't support bubblewrap.
-#[cfg(not(target_os = "linux"))]
-pub fn check_availability() -> Option<PathBuf> {
-    None
-}
-
-/// Test if bubblewrap actually works by running a minimal sandbox.
+/// Test that bubblewrap can actually create the namespaces we use.
 ///
-/// Returns `Ok(())` if bwrap can create namespaces, `Err(msg)` otherwise.
-/// This catches systems where bwrap exists but namespaces are disabled.
-#[cfg(target_os = "linux")]
-pub fn test_functionality(bwrap_path: &Path) -> Result<(), String> {
-    // Test the same namespace configuration we actually use in production:
-    // - --unshare-user: unprivileged user namespace (often disabled on hardened systems)
-    // - --ro-bind / /: base read-only root mount (our VFS strategy)
-    // - --proc / --dev / --tmpfs: required namespace mounts
-    // If this fails, the fallback to Landlock-only mode is triggered.
+/// Runs `bwrap <production args> /bin/true`. The args come straight from
+/// [`build_bwrap_args`] (plus `/bin/true`) so the probe can never drift from
+/// the real invocation. Catches hardened hosts where `bwrap` exists but user
+/// namespaces are disabled.
+pub(crate) fn test_functionality(bwrap_path: &Path, fs_rules: &[FsRule]) -> Result<(), String> {
+    let mut args = build_bwrap_args(fs_rules);
+    args.push("--".to_string());
+    args.push("/bin/true".to_string());
+
     let output = Command::new(bwrap_path)
-        .args([
-            "--unshare-user",
-            "--unshare-pid",
-            "--ro-bind",
-            "/",
-            "/",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "/bin/true",
-        ])
+        .args(&args)
         .output()
         .map_err(|e| format!("Failed to spawn bwrap test: {e}"))?;
 
@@ -86,178 +137,394 @@ pub fn test_functionality(bwrap_path: &Path) -> Result<(), String> {
     } else {
         Err(format!(
             "bwrap test failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn test_functionality(_bwrap_path: &Path) -> Result<(), String> {
-    Err("Bubblewrap not supported on this platform".to_string())
-}
-
-/// Build the bwrap command arguments for namespace isolation.
+/// Build the `bwrap` namespace/mount arguments (everything before `-- <cmd>`).
 ///
-/// # Arguments
+/// # Mount strategy
 ///
-/// - `project_dir`: Project directory to mount read-write (primarily for verification/logging)
-/// - `home_dir`: User's home directory (primarily for verification/logging)
-/// - `scratch_dir`: Scratch directory for temp files (if enabled)
-/// - `fs_rules`: The Landlock filesystem rules to map into the VFS
+/// The goal is for the mount topology inside the namespaces to expose the same
+/// inode at each path that the Landlock rule for that path was written for, so
+/// the in-namespace Landlock application (the re-entry helper) is faithful:
 ///
-/// # Returns
+/// 1. `--ro-bind / /` — the whole host filesystem, read-only. This covers
+///    every read-only Landlock rule with zero extra arguments.
+/// 2. `--proc /proc`, `--dev /dev` — fresh mounts required by the PID / user
+///    namespaces. These are managed by bwrap; the helper re-opens the device
+///    and `/proc/self` fds *inside* the namespace so Landlock binds to the
+///    namespace's nodes, not the host's.
+/// 3. `--tmpfs /tmp` — a private, empty `/tmp`. Crucially it is a plain tmpfs,
+///    **not** the scratch dir. The scratch dir carries a write+exec Landlock
+///    rule; overlaying it on `/tmp` would make all of `/tmp` executable and
+///    break the "exec from /tmp is denied" guarantee. Keeping `/tmp` a bare
+///    tmpfs preserves that guarantee (its Landlock rule grants no execute).
+/// 4. For every **writable** Landlock rule, `--bind <path> <path>` at its real
+///    location so writes actually reach the backing store (the read-only base
+///    from step 1 would otherwise deny them). Writable paths that live under
+///    `/tmp` (e.g. the scratch dir, or a `--project-dir` inside `/tmp`) are
+///    bound *after* the `--tmpfs /tmp` so they shadow it and stay visible —
+///    fixing the case where a project under `/tmp` vanished inside the sandbox.
 ///
-/// Vector of command-line arguments for `bwrap`.
-#[cfg(target_os = "linux")]
-pub fn build_bwrap_args(
-    _project_dir: &Path,
-    _home_dir: &Path,
-    scratch_dir: Option<&Path>,
-    fs_rules: &[FsRule],
-) -> Vec<String> {
+/// Paths managed by bwrap (`/proc`, `/dev`, `/sys`) and the `/tmp` mount point
+/// itself are skipped in step 4 — binding host `/tmp` back over the tmpfs would
+/// re-expose host temp files and re-break the exec guarantee.
+pub(crate) fn build_bwrap_args(fs_rules: &[FsRule]) -> Vec<String> {
     let mut args = Vec::new();
 
-    // ── Namespace isolation ────────────────────────────────────
-
-    // Unshare namespaces except network (so the sandboxed process can connect
-    // to the host-bound cplt CONNECT proxy on 127.0.0.1)
+    // ── Namespace isolation (network intentionally shared — see module docs) ──
     args.extend([
-        "--unshare-pid".to_string(), // PID namespace (agent can't see host processes)
-        "--unshare-ipc".to_string(), // IPC namespace (no shared memory with host)
-        "--unshare-uts".to_string(), // UTS namespace (hostname isolation)
-        "--unshare-cgroup".to_string(), // Cgroup namespace (process tree isolation)
-        "--die-with-parent".to_string(), // Automatically terminate sandbox if cplt parent exits
+        "--unshare-pid".to_string(),
+        "--unshare-ipc".to_string(),
+        "--unshare-uts".to_string(),
+        "--unshare-cgroup".to_string(),
+        "--unshare-user".to_string(),
+        "--die-with-parent".to_string(),
     ]);
 
-    // User namespace for unprivileged operation
-    args.push("--unshare-user".to_string());
-
-    // ── Filesystem setup ───────────────────────────────────────
-
-    // Mount the host root read-only as our base template
+    // ── Base filesystem: whole host root, read-only ──
     args.extend(["--ro-bind".to_string(), "/".to_string(), "/".to_string()]);
-
-    // Mount /proc (required for PID namespace)
     args.extend(["--proc".to_string(), "/proc".to_string()]);
-
-    // Mount /dev (device files)
     args.extend(["--dev".to_string(), "/dev".to_string()]);
+    // Private empty /tmp — deliberately a bare tmpfs (no exec-bearing rule).
+    args.extend(["--tmpfs".to_string(), "/tmp".to_string()]);
 
-    // ── Scratch directory ──────────────────────────────────────
+    // ── Writable overlays, shallowest first so parents are bound before
+    //    children (bwrap applies operations in order). ──
+    let mut writable: Vec<&FsRule> = fs_rules.iter().filter(|r| r.access.write).collect();
+    writable.sort_by_key(|r| r.path.components().count());
 
-    if let Some(scratch) = scratch_dir {
-        args.extend([
-            "--bind".to_string(),
-            scratch.to_string_lossy().to_string(),
-            "/tmp".to_string(),
-        ]);
-    } else {
-        // Mount a tmpfs for /tmp if no scratch dir
-        args.extend(["--tmpfs".to_string(), "/tmp".to_string()]);
-    }
-
-    // ── Policy-driven overlay mounts ──────────────────────────
-    // Sort rules by path length (number of components) so that parent directories
-    // are mounted before child subpaths (e.g. ~/.cache before ~/.cache/copilot/pkg)
-    let mut sorted_rules = fs_rules.to_vec();
-    sorted_rules.sort_by_key(|r| r.path.components().count());
-
-    for rule in &sorted_rules {
-        // Skip paths managed directly by Bubblewrap core setup to prevent host leakage or namespace breakage
-        if rule.path.starts_with("/tmp")
-            || rule.path.starts_with("/proc")
-            || rule.path.starts_with("/dev")
-            || rule.path.starts_with("/sys")
+    for rule in writable {
+        let path = &rule.path;
+        // Skip bwrap-managed subtrees and the /tmp mount point itself.
+        if path.starts_with("/proc")
+            || path.starts_with("/dev")
+            || path.starts_with("/sys")
+            || path == Path::new("/tmp")
         {
             continue;
         }
-
-        if !rule.path.exists() {
+        // Landlock silently drops rules for non-existent paths; mirror that so
+        // we don't hand bwrap a bind source that does not exist.
+        if !path.exists() {
             continue;
         }
-
-        let path_str = rule.path.to_string_lossy().to_string();
-
-        if rule.access.write {
-            // Writable paths: override the read-only base mount with a writable bind.
-            args.extend(["--bind".to_string(), path_str.clone(), path_str]);
-        }
-        // Read-only paths are already visible via the base `--ro-bind / /` mount.
-        // Emitting redundant `--ro-bind` mounts inflates the argument list with no
-        // security benefit — skipping them keeps the invocation lean.
+        let path_str = path.to_string_lossy().into_owned();
+        args.extend(["--bind".to_string(), path_str.clone(), path_str]);
     }
 
     args
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn build_bwrap_args(
-    _project_dir: &Path,
-    _home_dir: &Path,
-    _scratch_dir: Option<&Path>,
-    _fs_rules: &[FsRule],
-) -> Vec<String> {
-    Vec::new()
+/// Resolve whether bubblewrap should wrap this run, and build the wrapper.
+///
+/// Single strictness-parameterised path so the `Some(true)` and `None` arms no
+/// longer duplicate the availability → probe → build sequence:
+/// - `Some(false)` → never wrap.
+/// - `Some(true)`  → wrap, or return `Err` (caller bails).
+/// - `None`        → wrap if available, else warn and fall back (`Ok(None)`).
+///
+/// The `fs_rules`/`net_rules` clones happen only on the arms that actually
+/// build a wrapper — never on the disabled or fallback paths.
+pub(crate) fn resolve(
+    use_bubblewrap: Option<bool>,
+    fs_rules: &[FsRule],
+    net_rules: &[NetRule],
+    restrict_net_connect: bool,
+) -> Result<Option<BubblewrapWrapper>, String> {
+    match use_bubblewrap {
+        Some(false) => Ok(None),
+        Some(true) => build_wrapper(fs_rules, net_rules, restrict_net_connect, true)
+            .map(Some)
+            .map_err(|e| {
+                format!(
+                    "Bubblewrap explicitly requested but unavailable: {e}. \
+                     Install bubblewrap or remove --use-bubblewrap."
+                )
+            }),
+        None => match build_wrapper(fs_rules, net_rules, restrict_net_connect, false) {
+            Ok(wrapper) => Ok(Some(wrapper)),
+            Err(e) => {
+                crate::ui::warn(&format!(
+                    "Bubblewrap unavailable ({e}). Using Landlock + seccomp only."
+                ));
+                Ok(None)
+            }
+        },
+    }
+}
+
+fn build_wrapper(
+    fs_rules: &[FsRule],
+    net_rules: &[NetRule],
+    restrict_net_connect: bool,
+    strict: bool,
+) -> Result<BubblewrapWrapper, String> {
+    let bwrap_path = check_availability().ok_or_else(|| "bwrap not found in PATH".to_string())?;
+    test_functionality(&bwrap_path, fs_rules)?;
+    let bwrap_args = build_bwrap_args(fs_rules);
+    Ok(BubblewrapWrapper {
+        bwrap_path,
+        bwrap_args,
+        fs_rules: fs_rules.to_vec(),
+        net_rules: net_rules.to_vec(),
+        restrict_net_connect,
+        strict,
+    })
+}
+
+// ── Re-entry helper: policy transfer ───────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct InnerRule {
+    path: String,
+    r: bool,
+    w: bool,
+    x: bool,
+    i: bool,
+}
+
+impl InnerRule {
+    fn from_fs_rule(rule: &FsRule) -> Self {
+        Self {
+            path: rule.path.to_string_lossy().into_owned(),
+            r: rule.access.read,
+            w: rule.access.write,
+            x: rule.access.execute,
+            i: rule.access.ioctl,
+        }
+    }
+
+    fn to_fs_rule(&self) -> FsRule {
+        FsRule {
+            path: PathBuf::from(&self.path),
+            access: FsAccess {
+                read: self.r,
+                write: self.w,
+                execute: self.x,
+                ioctl: self.i,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct InnerPolicy {
+    fs_rules: Vec<InnerRule>,
+    net_ports: Vec<u16>,
+    restrict_net_connect: bool,
+    /// `[agent_binary, args...]` — `execve`-ed verbatim by the helper.
+    agent_argv: Vec<String>,
+}
+
+/// Serialize the Landlock policy + agent argv for transfer to the re-entry
+/// helper over the policy pipe.
+pub(crate) fn serialize_policy(
+    wrapper: &BubblewrapWrapper,
+    agent_bin: &Path,
+    agent_args: &[String],
+) -> std::io::Result<Vec<u8>> {
+    let mut agent_argv = Vec::with_capacity(agent_args.len() + 1);
+    agent_argv.push(agent_bin.to_string_lossy().into_owned());
+    agent_argv.extend(agent_args.iter().cloned());
+
+    let policy = InnerPolicy {
+        fs_rules: wrapper
+            .fs_rules
+            .iter()
+            .map(InnerRule::from_fs_rule)
+            .collect(),
+        net_ports: wrapper.net_rules.iter().map(|r| r.port).collect(),
+        restrict_net_connect: wrapper.restrict_net_connect,
+        agent_argv,
+    };
+    serde_json::to_vec(&policy).map_err(std::io::Error::other)
+}
+
+// ── Re-entry helper: the .init_array constructor ───────────────
+
+/// Constructor that runs before `main()`. Fast no-op on a normal run; only
+/// does work when this process is the bwrap-spawned re-entry helper.
+///
+/// Registered in `.init_array` so no `main.rs` dispatch is needed. Glibc calls
+/// entries with `(argc, argv, envp)`; the extra C arguments are harmless to an
+/// `extern "C" fn()`.
+#[used]
+#[unsafe(link_section = ".init_array")]
+static BWRAP_INNER_CTOR: extern "C" fn() = bwrap_inner_entry;
+
+extern "C" fn bwrap_inner_entry() {
+    if std::env::var_os(ENV_INNER_POLICY).is_none() {
+        // Overwhelmingly common case: we are a normal cplt process.
+        return;
+    }
+    run_inner();
+    // `run_inner` only returns on failure; on success it `execve`-s the agent.
+    // We must NOT fall through to `main()` (it would run partially sandboxed).
+    // Exiting without writing the confirm byte tells the parent to fall back
+    // (auto-detect) or report a hard error (explicit --use-bubblewrap).
+    unsafe { libc::_exit(126) };
+}
+
+/// Apply the inner sandbox from the serialized policy, then `execve` the agent.
+///
+/// Returns only on failure (so the caller can `_exit`). Security-critical:
+/// this is the process that becomes the agent, so Landlock + seccomp MUST be
+/// enforced here before `execve`.
+fn run_inner() {
+    let Some(fd) = std::env::var_os(ENV_INNER_POLICY)
+        .and_then(|v| v.to_str().and_then(|s| s.parse::<i32>().ok()))
+    else {
+        return;
+    };
+    let Some(data) = read_all_fd(fd) else {
+        return;
+    };
+    let Ok(policy) = serde_json::from_slice::<InnerPolicy>(&data) else {
+        return;
+    };
+
+    let fs_rules: Vec<FsRule> = policy.fs_rules.iter().map(InnerRule::to_fs_rule).collect();
+    let net_rules: Vec<NetRule> = policy
+        .net_ports
+        .iter()
+        .map(|&port| NetRule { port })
+        .collect();
+
+    // Bind Landlock to in-namespace inodes and install seccomp. If this fails
+    // we return without signalling success — never run the agent unsandboxed.
+    if crate::sandbox::landlock_mod::apply_landlock_and_seccomp_now(
+        &fs_rules,
+        &net_rules,
+        policy.restrict_net_connect,
+    )
+    .is_err()
+    {
+        return;
+    }
+
+    // Signal the parent that the sandbox is in force, then close the pipe so it
+    // does not leak into the agent.
+    if let Some(fd) = std::env::var_os(ENV_CONFIRM_FD)
+        .and_then(|v| v.to_str().and_then(|s| s.parse::<i32>().ok()))
+    {
+        let byte = [1u8];
+        unsafe {
+            libc::write(fd, byte.as_ptr().cast(), 1);
+            libc::close(fd);
+        }
+    }
+
+    // Scrub our private env before handing off to the agent.
+    scrub_env(ENV_INNER_POLICY);
+    scrub_env(ENV_CONFIRM_FD);
+
+    exec_agent(&policy.agent_argv);
+    // `exec_agent` only returns if `execve` failed.
+}
+
+/// Read the whole policy pipe until EOF, then close the fd.
+///
+/// Runs pre-`main()` in the freshly exec'd helper — single-threaded, so plain
+/// blocking reads and allocation are fine. Returns `None` on any read error.
+fn read_all_fd(fd: i32) -> Option<Vec<u8>> {
+    let mut data = Vec::with_capacity(16 * 1024);
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        if n == 0 {
+            break;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        data.extend_from_slice(&buf[..n as usize]);
+    }
+    unsafe { libc::close(fd) };
+    Some(data)
+}
+
+fn scrub_env(name: &str) {
+    if let Ok(cname) = CString::new(name) {
+        unsafe {
+            libc::unsetenv(cname.as_ptr());
+        }
+    }
+}
+
+/// `execve` the agent, inheriting the current (namespace) environment.
+fn exec_agent(argv: &[String]) {
+    let Some(bin) = argv.first() else {
+        return;
+    };
+    let Ok(path) = CString::new(bin.as_bytes()) else {
+        return;
+    };
+    let mut cargs: Vec<CString> = Vec::with_capacity(argv.len());
+    for arg in argv {
+        let Ok(c) = CString::new(arg.as_bytes()) else {
+            return;
+        };
+        cargs.push(c);
+    }
+    let mut ptrs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    unsafe {
+        libc::execv(path.as_ptr(), ptrs.as_ptr());
+    }
+    // Only reached if execv failed.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn builds_basic_bwrap_args() {
-        let args = build_bwrap_args(
-            Path::new("/home/user/project"),
-            Path::new("/home/user"),
-            Some(Path::new("/tmp/cplt-scratch")),
-            &[], // no fs_rules — base mounts only
-        );
+    fn writable_rule(path: &str) -> FsRule {
+        FsRule {
+            path: PathBuf::from(path),
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: true,
+                ioctl: false,
+            },
+        }
+    }
 
-        // Must isolate these namespaces
+    #[test]
+    fn args_isolate_expected_namespaces() {
+        let args = build_bwrap_args(&[]);
         assert!(args.contains(&"--unshare-pid".to_string()));
+        assert!(args.contains(&"--unshare-ipc".to_string()));
+        assert!(args.contains(&"--unshare-uts".to_string()));
+        assert!(args.contains(&"--unshare-cgroup".to_string()));
         assert!(args.contains(&"--unshare-user".to_string()));
         assert!(args.contains(&"--die-with-parent".to_string()));
-        // Network namespace is intentionally NOT isolated (proxy runs on host)
+        // Network namespace is intentionally shared (proxy runs on the host).
         assert!(!args.contains(&"--unshare-net".to_string()));
-
-        // Base root mount
-        assert!(args.contains(&"--ro-bind".to_string()));
-        assert!(args.contains(&"/".to_string()));
-
-        // Scratch dir should be bind-mounted as /tmp
-        assert!(args.contains(&"/tmp/cplt-scratch".to_string()));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn includes_system_mounts() {
-        let args = build_bwrap_args(
-            Path::new("/home/user/project"),
-            Path::new("/home/user"),
-            None,
-            &[], // no fs_rules
-        );
-
-        // Should set up /proc for PID namespace
-        assert!(args.contains(&"--proc".to_string()));
-        assert!(args.contains(&"/proc".to_string()));
-
-        // Should set up /dev with safe device nodes
-        assert!(args.contains(&"--dev".to_string()));
-        assert!(args.contains(&"/dev".to_string()));
-
-        // No scratch dir → tmpfs for /tmp
-        assert!(args.contains(&"--tmpfs".to_string()));
+    fn args_set_up_base_mounts() {
+        let args = build_bwrap_args(&[]);
+        assert!(args.windows(3).any(|w| w == ["--ro-bind", "/", "/"]));
+        assert!(args.windows(2).any(|w| w == ["--proc", "/proc"]));
+        assert!(args.windows(2).any(|w| w == ["--dev", "/dev"]));
+        // /tmp is a bare tmpfs, never the scratch dir (exec-from-/tmp guarantee).
+        assert!(args.windows(2).any(|w| w == ["--tmpfs", "/tmp"]));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn writable_fs_rules_add_bind_mounts() {
-        use crate::sandbox::landlock_mod::{FsAccess, FsRule};
-        use std::path::PathBuf;
-
-        // Use /tmp as a path that exists and is writable in the test environment
+    fn tmp_is_never_bind_mounted_from_host() {
+        // A writable /tmp rule must NOT re-bind host /tmp over the tmpfs, which
+        // would re-expose host temp files and grant exec through /tmp.
         let rules = vec![FsRule {
             path: PathBuf::from("/tmp"),
             access: FsAccess {
@@ -267,24 +534,93 @@ mod tests {
                 ioctl: false,
             },
         }];
-        let args = build_bwrap_args(
-            Path::new("/home/user/project"),
-            Path::new("/home/user"),
-            None,
-            &rules,
-        );
-        // /tmp is in the system-managed skip list, so it should NOT generate a --bind
-        // (bwrap manages /tmp itself via --tmpfs)
-        let tmp_bind_count = args
+        let args = build_bwrap_args(&rules);
+        let tmp_bind = args
             .windows(3)
-            .filter(|w| w[0] == "--bind" && w[2] == "/tmp")
-            .count();
-        assert_eq!(tmp_bind_count, 0, "/tmp should be skipped (system-managed)");
+            .any(|w| w[0] == "--bind" && w[1] == "/tmp" && w[2] == "/tmp");
+        assert!(!tmp_bind, "/tmp must stay a private tmpfs, not a host bind");
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
-    fn check_availability_returns_none_on_non_linux() {
-        assert_eq!(check_availability(), None);
+    fn writable_paths_under_tmp_survive_the_tmp_shadow() {
+        // Regression: a scratch dir or --project-dir under /tmp must survive
+        // the --tmpfs /tmp shadow via an explicit writable bind emitted AFTER
+        // the tmpfs (bwrap applies mount operations in argument order).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        assert!(
+            dir.path().starts_with(std::env::temp_dir()),
+            "test premise: tempdir lives under the system temp dir"
+        );
+        let rules = vec![writable_rule(&dir_str)];
+        let args = build_bwrap_args(&rules);
+
+        let tmpfs_idx = args.iter().position(|a| a == "--tmpfs").expect("tmpfs");
+        let bind_idx = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == dir_str && w[2] == dir_str)
+            .expect("writable path under /tmp must be bound (project-under-/tmp regression)");
+        assert!(
+            bind_idx > tmpfs_idx,
+            "writable bind under /tmp must come after --tmpfs /tmp to shadow it"
+        );
+    }
+
+    #[test]
+    fn nothing_shadows_tmp_mount_point() {
+        // SECURITY (exec-from-/tmp guarantee): /tmp inside the namespace must
+        // be the bare tmpfs — in particular the scratch dir (whose Landlock
+        // rule always grants write+exec) must never be mounted AT /tmp. If it
+        // were, files created via /tmp would carry the scratch rule's exec
+        // right and `cp payload /tmp/x && /tmp/x` would run, which every
+        // non-bwrap configuration kernel-denies by default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scratch_like = writable_rule(&dir.path().to_string_lossy());
+        let args = build_bwrap_args(&[scratch_like]);
+
+        // No mount operation may target /tmp as its destination other than the
+        // tmpfs itself.
+        let tmp_dest = args
+            .windows(3)
+            .any(|w| (w[0] == "--bind" || w[0] == "--ro-bind") && w[2] == "/tmp");
+        assert!(!tmp_dest, "no bind may target the /tmp mount point");
+        assert!(args.windows(2).any(|w| w == ["--tmpfs", "/tmp"]));
+    }
+
+    #[test]
+    fn nonexistent_writable_paths_are_skipped() {
+        let rules = vec![writable_rule("/definitely/not/a/real/path/xyzzy")];
+        let args = build_bwrap_args(&rules);
+        assert!(!args.iter().any(|a| a.contains("xyzzy")));
+    }
+
+    #[test]
+    fn bwrap_managed_subtrees_are_not_rebound() {
+        let rules = vec![
+            writable_rule("/dev/tty"),
+            writable_rule("/proc/self"),
+            writable_rule("/sys/fs/cgroup"),
+        ];
+        let args = build_bwrap_args(&rules);
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/dev/tty")
+        );
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/proc/self")
+        );
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/sys/fs/cgroup")
+        );
+    }
+
+    #[test]
+    fn resolve_disabled_returns_none() {
+        assert!(resolve(Some(false), &[], &[], true).unwrap().is_none());
     }
 }

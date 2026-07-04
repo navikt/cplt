@@ -272,8 +272,13 @@ impl Config {
             .scratch
             .resolve(self.sandbox.scratch_dir.unwrap_or(true));
 
-        // Use-bubblewrap: CLI flag wins (if set), then config, then None (auto-detect)
-        let use_bubblewrap = cli.use_bubblewrap.or(self.sandbox.use_bubblewrap);
+        // Use-bubblewrap: tri-state. --use-bubblewrap/--no-bubblewrap resolve via
+        // FeatureToggle (off wins if both set); otherwise fall through to config,
+        // then None (auto-detect).
+        let use_bubblewrap = cli
+            .use_bubblewrap
+            .to_option()
+            .or(self.sandbox.use_bubblewrap);
 
         // Quiet: FeatureToggle resolves --quiet/--no-quiet (default: off)
         let quiet = cli.quiet.resolve(self.sandbox.quiet.unwrap_or(false));
@@ -1140,6 +1145,68 @@ validate = false
             })
             .unwrap();
         assert!(!resolved.quiet, "--no-quiet should always win over --quiet");
+    }
+
+    #[test]
+    fn cli_use_bubblewrap_overrides_config_disabled() {
+        let config: Config = toml::from_str("[sandbox]\nuse_bubblewrap = false\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                use_bubblewrap: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(resolved.use_bubblewrap, Some(true));
+    }
+
+    #[test]
+    fn cli_no_bubblewrap_overrides_config_enabled() {
+        let config: Config = toml::from_str("[sandbox]\nuse_bubblewrap = true\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                use_bubblewrap: FeatureToggle::ForceOff,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(resolved.use_bubblewrap, Some(false));
+    }
+
+    #[test]
+    fn config_use_bubblewrap_used_when_no_cli_flag() {
+        let config: Config = toml::from_str("[sandbox]\nuse_bubblewrap = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert_eq!(
+            resolved.use_bubblewrap,
+            Some(true),
+            "config value should be deserialized and used when no CLI flag is set"
+        );
+    }
+
+    #[test]
+    fn use_bubblewrap_none_when_neither_flag_nor_config() {
+        let config = Config::default();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert_eq!(
+            resolved.use_bubblewrap, None,
+            "no flag and no config → None (auto-detect)"
+        );
+    }
+
+    #[test]
+    fn no_bubblewrap_wins_over_use_bubblewrap_flag() {
+        let config = Config::default();
+        // FeatureToggle::from_pair(true, true) → ForceOff (off wins)
+        let resolved = config
+            .merge(CliFlags {
+                use_bubblewrap: FeatureToggle::from_pair(true, true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            resolved.use_bubblewrap,
+            Some(false),
+            "--no-bubblewrap should always win over --use-bubblewrap"
+        );
     }
 
     #[test]

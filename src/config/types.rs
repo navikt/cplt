@@ -40,6 +40,23 @@ impl FeatureToggle {
             Self::UseDefault => config_default,
         }
     }
+
+    /// Project onto a tri-state `Option<bool>` for options whose config layer
+    /// is itself tri-state (`Some(true)`/`Some(false)`/`None`) rather than a
+    /// plain bool with a hardcoded default.
+    ///
+    /// `ForceOn`/`ForceOff` are explicit CLI overrides; `UseDefault` yields
+    /// `None` so the caller can fall through to the config value (e.g. via
+    /// `.or(config_value)`). Preserves the "off wins if both flags are set"
+    /// convention of `from_pair`, since a contradictory pair resolves to
+    /// `ForceOff` → `Some(false)`.
+    pub fn to_option(self) -> Option<bool> {
+        match self {
+            Self::ForceOn => Some(true),
+            Self::ForceOff => Some(false),
+            Self::UseDefault => None,
+        }
+    }
 }
 
 /// Default config directory relative to $HOME.
@@ -474,7 +491,7 @@ pub struct CliFlags {
     pub allow_cache_exec_any: bool,
     pub allow_browser: bool,
     pub scratch: FeatureToggle,
-    pub use_bubblewrap: Option<bool>,
+    pub use_bubblewrap: FeatureToggle,
     pub quiet: FeatureToggle,
     pub yes: FeatureToggle,
     pub gh_guard: FeatureToggle,

@@ -4,7 +4,8 @@
 //!
 //! The sandbox uses different kernel enforcement mechanisms per platform:
 //! - **macOS**: Seatbelt/SBPL via `sandbox-exec`
-//! - **Linux**: Landlock LSM + seccomp-BPF
+//! - **Linux**: Landlock LSM + seccomp-BPF, optionally wrapped in Bubblewrap
+//!   namespace isolation (see `bubblewrap` module for the layering)
 //!
 //! The public API is platform-agnostic:
 //! - [`prepare()`] validates configuration and compiles it into a [`PreparedSandbox`]
@@ -16,6 +17,7 @@
 //! - `profile`: SBPL profile generation (macOS — also compiled cross-platform for testing)
 //! - `exec`: sandbox-exec (macOS) / Landlock+seccomp (Linux) invocation
 //! - `landlock_mod`: Landlock rule generation (cross-platform) and application (Linux)
+//! - `bubblewrap`: optional namespace isolation layer (Linux only)
 //!
 //! # Submodule layout
 //!
@@ -29,6 +31,7 @@ use crate::agent::{Agent, AgentDir};
 #[cfg(target_os = "linux")]
 use crate::ui;
 
+#[cfg(target_os = "linux")]
 #[path = "sandbox_bubblewrap.rs"]
 mod bubblewrap;
 #[path = "sandbox_env.rs"]
@@ -159,17 +162,7 @@ pub struct PreparedSandbox {
     /// Bubblewrap execution wrapper (Linux only).
     /// If Some, bwrap is used to wrap the execution.
     #[cfg(target_os = "linux")]
-    bwrap_wrapper: Option<BubblewrapWrapper>,
-}
-
-/// Bubblewrap execution wrapper configuration (Linux only).
-#[cfg(target_os = "linux")]
-#[derive(Clone)]
-struct BubblewrapWrapper {
-    /// Path to the bwrap binary.
-    bwrap_path: PathBuf,
-    /// Pre-built command arguments for bwrap.
-    bwrap_args: Vec<String>,
+    bwrap_wrapper: Option<bubblewrap::BubblewrapWrapper>,
 }
 
 impl PreparedSandbox {
@@ -336,74 +329,21 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     let policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);
 
-    // Save the fs_rules before moving policy into precompute(). precompute()
-    // takes ownership (it needs to open O_PATH fds for every rule), so we
-    // clone here. The clone is cheap relative to the syscalls that follow and
-    // is only performed when bubblewrap is active.
-    let fs_rules_for_bwrap = policy.fs_rules.clone();
+    // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
+    // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
+    // build a wrapper (explicit-on, or auto-detect with bwrap available) — the
+    // disabled and fallback arms borrow and clone nothing.
+    let bwrap_wrapper = bubblewrap::resolve(
+        config.use_bubblewrap,
+        &policy.fs_rules,
+        &policy.net_rules,
+        policy.restrict_net_connect,
+    )?;
 
     // Pre-compute everything in the parent process.
     // ABI check, BPF construction, and all allocation happens here.
     // The pre_exec hook only makes raw syscalls.
     let precomputed = landlock_mod::precompute(policy)?;
-
-    // Check if bubblewrap should be used
-    let bwrap_wrapper = match config.use_bubblewrap {
-        Some(true) => {
-            // User explicitly requested bwrap — fail if unavailable
-            let bwrap_path = bubblewrap::check_availability().ok_or_else(|| {
-                "Bubblewrap (bwrap) explicitly requested but not found in PATH. \
-                     Install bubblewrap or remove --use-bubblewrap flag."
-                    .to_string()
-            })?;
-            bubblewrap::test_functionality(&bwrap_path)?;
-
-            let bwrap_args = bubblewrap::build_bwrap_args(
-                config.project_dir,
-                config.home_dir,
-                config.scratch_dir,
-                &fs_rules_for_bwrap,
-            );
-
-            Some(BubblewrapWrapper {
-                bwrap_path,
-                bwrap_args,
-            })
-        }
-        Some(false) => {
-            // User explicitly disabled bwrap
-            None
-        }
-        None => {
-            // Auto-detect: use bwrap if available, fall back if not
-            if let Some(bwrap_path) = bubblewrap::check_availability() {
-                match bubblewrap::test_functionality(&bwrap_path) {
-                    Ok(()) => {
-                        let bwrap_args = bubblewrap::build_bwrap_args(
-                            config.project_dir,
-                            config.home_dir,
-                            config.scratch_dir,
-                            &fs_rules_for_bwrap,
-                        );
-
-                        Some(BubblewrapWrapper {
-                            bwrap_path,
-                            bwrap_args,
-                        })
-                    }
-                    Err(e) => {
-                        ui::warn(&format!(
-                            "Bubblewrap detected but not functional ({e}). \
-                             Falling back to Landlock+seccomp only."
-                        ));
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        }
-    };
 
     Ok(PreparedSandbox {
         project_dir: config.project_dir.to_path_buf(),

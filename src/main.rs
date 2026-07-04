@@ -1002,13 +1002,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         allow_cache_exec_any: cli.allow_cache_exec_any,
         allow_browser: cli.allow_browser,
         scratch: config::FeatureToggle::from_pair(cli.scratch_dir, cli.no_scratch_dir),
-        use_bubblewrap: if cli.use_bubblewrap {
-            Some(true)
-        } else if cli.no_bubblewrap {
-            Some(false)
-        } else {
-            None
-        },
+        use_bubblewrap: config::FeatureToggle::from_pair(cli.use_bubblewrap, cli.no_bubblewrap),
         quiet: config::FeatureToggle::from_pair(cli.quiet, cli.no_quiet),
         yes: config::FeatureToggle::from_pair(cli.yes, cli.no_yes),
         gh_guard: config::FeatureToggle::from_pair(cli.gh_guard, cli.no_gh_guard),

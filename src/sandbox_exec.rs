@@ -323,7 +323,7 @@ fn install_command_wrappers(
 }
 
 /// Find a binary in PATH by name.
-fn which_binary(name: &str) -> Option<PathBuf> {
+pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
@@ -334,34 +334,30 @@ fn which_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Spawn a sandboxed command, forward signals, and wait for exit.
-///
-/// Handles SIGTTOU/SIGTTIN suppression (Node.js terminal raw mode),
-/// SIGTERM/SIGHUP forwarding to the child, and cleanup on exit.
-fn spawn_and_wait(cmd: &mut Command) -> u8 {
-    // Ignore SIGTTOU/SIGTTIN — copilot (Node.js) may manipulate terminal
-    // settings (raw mode), and when the child exits the terminal state can
-    // cause these signals to be sent to us.
+/// Ignore SIGTTOU/SIGTTIN — copilot (Node.js) may manipulate terminal
+/// settings (raw mode), and when the child exits the terminal state can
+/// cause these signals to be sent to us.
+fn ignore_terminal_stop_signals() {
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
     }
+}
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            ui::error(&format!("Failed to start sandboxed process: {e}"));
-            return 1;
-        }
-    };
+fn restore_terminal_stop_signals() {
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+    }
+}
 
+/// Forward SIGTERM/SIGHUP to an already-spawned child and wait for it,
+/// translating the exit status to a u8 exit code (128 + signal if killed).
+fn forward_and_wait(mut child: std::process::Child) -> u8 {
     let child_pid = child.id() as i32;
-
-    // Forward SIGTERM/SIGHUP to the child (these aren't sent by the terminal)
     install_signal_forwarding(child_pid);
 
-    // POSIX: if killed by signal, exit with 128 + signal number
-    let status = match child.wait() {
+    match child.wait() {
         Ok(status) => status
             .code()
             .unwrap_or_else(|| status.signal().map_or(1, |s| 128 + s)) as u8,
@@ -372,13 +368,27 @@ fn spawn_and_wait(cmd: &mut Command) -> u8 {
             }
             1
         }
+    }
+}
+
+/// Spawn a sandboxed command, forward signals, and wait for exit.
+///
+/// Handles SIGTTOU/SIGTTIN suppression (Node.js terminal raw mode),
+/// SIGTERM/SIGHUP forwarding to the child, and cleanup on exit.
+fn spawn_and_wait(cmd: &mut Command) -> u8 {
+    ignore_terminal_stop_signals();
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            ui::error(&format!("Failed to start sandboxed process: {e}"));
+            restore_terminal_stop_signals();
+            return 1;
+        }
     };
 
-    unsafe {
-        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
-        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
-    }
-
+    let status = forward_and_wait(child);
+    restore_terminal_stop_signals();
     status
 }
 
@@ -538,14 +548,24 @@ pub fn preflight(_sandbox: &super::PreparedSandbox) -> Result<(), String> {
     Ok(())
 }
 
-/// Execute copilot inside a Landlock + seccomp sandbox, optionally wrapped with Bubblewrap.
+/// Execute the agent inside a Landlock + seccomp sandbox, optionally wrapped
+/// with Bubblewrap namespaces.
 ///
-/// If bubblewrap is configured in the PreparedSandbox, the execution flow becomes:
-///   cplt → bwrap (namespaces) → copilot (Landlock+seccomp via pre_exec)
+/// # Layering
 ///
-/// Otherwise, Landlock+seccomp are applied via a `pre_exec` hook that runs in the child
-/// process between fork() and exec(). All allocation and I/O was done
-/// in the parent via `precompute()` — the hook only makes raw syscalls.
+/// - **Without bwrap**: Landlock + seccomp are applied via a `pre_exec` hook
+///   that runs in the child between `fork()` and `execve()`.
+/// - **With bwrap**: the pre_exec hook is deliberately **not** installed on the
+///   `bwrap` process — our seccomp filter `EPERM`s `unshare`/`mount` and the
+///   Landlock domain blocks the bind-mount sources, either of which would
+///   prevent bwrap from building its namespaces. Instead bwrap runs
+///   unrestricted and re-execs this binary as an in-namespace helper (see
+///   [`super::bubblewrap`]) which applies Landlock + seccomp to itself and then
+///   `execve`s the agent. Landlock + seccomp therefore end up enforced on the
+///   agent, never on bwrap and never dropped.
+///
+/// If the bwrap path cannot start (auto-detect only), it degrades gracefully to
+/// the direct Landlock + seccomp path below.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub fn exec(
@@ -561,27 +581,34 @@ pub fn exec(
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;
 
-    // Determine if we're using bubblewrap
-    let (cmd_bin, cmd_args): (PathBuf, Vec<String>) = if let Some(ref bwrap) = sandbox.bwrap_wrapper
-    {
-        // Build bwrap command: bwrap [bwrap_args] -- copilot_bin [copilot_args]
-        let mut full_args = bwrap.bwrap_args.clone();
-        full_args.push("--".to_string());
-        full_args.push(copilot_bin.to_string_lossy().to_string());
-        full_args.extend(copilot_args.iter().cloned());
+    // Bubblewrap-wrapped path (namespaces + in-namespace Landlock/seccomp).
+    if let Some(wrapper) = sandbox.bwrap_wrapper.as_ref() {
+        match exec_bwrap(
+            sandbox,
+            wrapper,
+            copilot_bin,
+            copilot_args,
+            extra_pass_env,
+            inherit_env,
+            disabled_categories,
+            deny_env,
+            gh_guard,
+            git_guard,
+        ) {
+            BwrapOutcome::Ran(code) => return code,
+            BwrapOutcome::Fallback => {
+                ui::warn("Bubblewrap could not start; using Landlock + seccomp only.");
+                // fall through to the direct path
+            }
+        }
+    }
 
-        (bwrap.bwrap_path.clone(), full_args)
-    } else {
-        // Direct execution without bwrap
-        (copilot_bin.to_path_buf(), copilot_args.to_vec())
-    };
-
-    let mut cmd = Command::new(&cmd_bin);
-    cmd.args(&cmd_args);
+    // Direct Landlock + seccomp path (also the auto-detect fallback).
+    let mut cmd = Command::new(copilot_bin);
 
     configure_command(
         &mut cmd,
-        &[], // Args already included in cmd_args
+        copilot_args,
         &sandbox.project_dir,
         &sandbox.home_dir,
         extra_pass_env,
@@ -613,4 +640,235 @@ pub fn exec(
     }
 
     spawn_and_wait(&mut cmd)
+}
+
+/// Outcome of attempting the bubblewrap-wrapped execution.
+#[cfg(target_os = "linux")]
+enum BwrapOutcome {
+    /// The wrapped process ran (or bwrap failed under explicit `--use-bubblewrap`,
+    /// which is a hard error rather than a fallback); carries the exit code.
+    Ran(u8),
+    /// bwrap could not start on the auto-detect path — caller should fall back.
+    Fallback,
+}
+
+/// Run the agent under bwrap: `bwrap [ns args] -- <cplt re-entry helper>`.
+///
+/// bwrap builds the namespaces, then re-execs this binary as the in-namespace
+/// helper (dispatched by the `.init_array` constructor in [`super::bubblewrap`]
+/// via the [`super::bubblewrap::ENV_INNER_POLICY`] env var). The helper applies
+/// Landlock + seccomp bound to the in-namespace inodes and `execve`s the agent.
+///
+/// A confirm pipe carries one byte from the helper (written just before it
+/// `execve`s the agent). If the parent sees EOF instead — i.e. the helper never
+/// applied the sandbox and the agent never ran — auto-detect falls back cleanly
+/// with no risk of running the agent twice.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn exec_bwrap(
+    sandbox: &super::PreparedSandbox,
+    wrapper: &super::bubblewrap::BubblewrapWrapper,
+    copilot_bin: &Path,
+    copilot_args: &[String],
+    extra_pass_env: &[String],
+    inherit_env: bool,
+    disabled_categories: &[HardeningCategory],
+    deny_env: &[String],
+    gh_guard: &crate::config::GhGuardPolicy,
+    git_guard: &crate::config::GitGuardPolicy,
+) -> BwrapOutcome {
+    // The re-entry helper is this very binary; bwrap execs it by absolute path
+    // (visible inside the namespace via `--ro-bind / /`).
+    let cplt_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return bwrap_setup_failed(wrapper, &format!("cannot locate cplt binary: {e}")),
+    };
+
+    // Serialize the Landlock policy + agent argv for the helper to re-apply.
+    let policy_bytes = match super::bubblewrap::serialize_policy(wrapper, copilot_bin, copilot_args)
+    {
+        Ok(b) => b,
+        Err(e) => return bwrap_setup_failed(wrapper, &format!("policy setup failed: {e}")),
+    };
+
+    // Policy pipe: parent pre-loads the serialized policy; the helper inherits
+    // the read end through bwrap (our pipe fds are not CLOEXEC and bwrap passes
+    // inherited fds through). A pipe rather than a file because the namespace's
+    // fresh `--tmpfs /tmp` would shadow a policy file in the host temp dir, and
+    // no policy data touches the disk. Writing before spawn is deadlock-free
+    // only while the payload fits the pipe buffer (64 KiB on Linux) — enforced.
+    if policy_bytes.len() > 60_000 {
+        return bwrap_setup_failed(wrapper, "policy too large for the transfer pipe");
+    }
+    let mut policy_fds = [0i32; 2];
+    if unsafe { libc::pipe(policy_fds.as_mut_ptr()) } != 0 {
+        return bwrap_setup_failed(wrapper, "cannot create policy pipe");
+    }
+    let (policy_read_fd, policy_write_fd) = (policy_fds[0], policy_fds[1]);
+    let written = unsafe {
+        libc::write(
+            policy_write_fd,
+            policy_bytes.as_ptr().cast(),
+            policy_bytes.len(),
+        )
+    };
+    // Close the write end now so the helper sees EOF after the payload.
+    unsafe {
+        libc::close(policy_write_fd);
+    }
+    if written != policy_bytes.len() as isize {
+        unsafe {
+            libc::close(policy_read_fd);
+        }
+        return bwrap_setup_failed(wrapper, "short write to policy pipe");
+    }
+
+    // Confirm pipe: read end stays in the parent (CLOEXEC), write end is
+    // inherited through bwrap into the helper.
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        unsafe {
+            libc::close(policy_read_fd);
+        }
+        return bwrap_setup_failed(wrapper, "cannot create confirm pipe");
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    unsafe {
+        libc::fcntl(read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+
+    let mut bwrap_argv = wrapper.bwrap_args.clone();
+    bwrap_argv.push("--".to_string());
+    bwrap_argv.push(cplt_exe.to_string_lossy().into_owned());
+
+    let mut cmd = Command::new(&wrapper.bwrap_path);
+    cmd.args(&bwrap_argv);
+    configure_command(
+        &mut cmd,
+        &[],
+        &sandbox.project_dir,
+        &sandbox.home_dir,
+        extra_pass_env,
+        inherit_env,
+        disabled_categories,
+        sandbox.scratch_dir.as_deref(),
+        sandbox.proxy_port,
+        &sandbox.allow_localhost,
+        sandbox.allow_localhost_any,
+        sandbox.agent,
+        gh_guard,
+        git_guard,
+    );
+    for var in deny_env {
+        cmd.env_remove(var);
+    }
+    // Set the re-entry env AFTER configure_command so a `clear_first` env build
+    // cannot wipe them.
+    cmd.env(
+        super::bubblewrap::ENV_INNER_POLICY,
+        policy_read_fd.to_string(),
+    );
+    cmd.env(super::bubblewrap::ENV_CONFIRM_FD, write_fd.to_string());
+
+    ignore_terminal_stop_signals();
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            restore_terminal_stop_signals();
+            unsafe {
+                libc::close(policy_read_fd);
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return bwrap_setup_failed(wrapper, &format!("failed to spawn bwrap: {e}"));
+        }
+    };
+
+    // Close the parent's copies: the helper has its own inherited descriptors,
+    // and dropping the confirm write end makes EOF observable if the helper
+    // never writes the confirm byte.
+    unsafe {
+        libc::close(policy_read_fd);
+        libc::close(write_fd);
+    }
+    let confirm = read_confirm_byte(read_fd);
+    unsafe {
+        libc::close(read_fd);
+    }
+
+    if matches!(confirm, ConfirmResult::Eof) {
+        // Helper never applied the sandbox and never execed the agent — reap
+        // the child and fall back (agent has not run, so no double execution).
+        let _ = forward_and_wait(child);
+        restore_terminal_stop_signals();
+        return bwrap_setup_failed(wrapper, "namespace helper did not apply the sandbox");
+    }
+
+    let code = forward_and_wait(child);
+    restore_terminal_stop_signals();
+    BwrapOutcome::Ran(code)
+}
+
+/// Map a bwrap start-up failure to an outcome: hard error when bwrap was
+/// explicitly requested, graceful fallback on auto-detect.
+#[cfg(target_os = "linux")]
+fn bwrap_setup_failed(
+    wrapper: &super::bubblewrap::BubblewrapWrapper,
+    detail: &str,
+) -> BwrapOutcome {
+    if wrapper.strict {
+        ui::error(&format!("Bubblewrap requested but {detail}."));
+        BwrapOutcome::Ran(1)
+    } else {
+        BwrapOutcome::Fallback
+    }
+}
+
+/// Result of waiting for the confirm byte from the bwrap re-entry helper.
+#[cfg(target_os = "linux")]
+enum ConfirmResult {
+    /// The helper applied the sandbox and is about to run the agent.
+    Confirmed,
+    /// All write ends closed with no byte — the helper did not apply the sandbox.
+    Eof,
+    /// Timed out or errored; treat as "probably running" to avoid a double run.
+    Unknown,
+}
+
+/// Wait (bounded) for the helper's confirm byte.
+///
+/// The helper writes the byte within milliseconds of startup; the generous
+/// timeout only guards against a stuck descriptor and is treated as `Unknown`
+/// (proceed to wait) rather than a fallback, so the agent is never run twice.
+#[cfg(target_os = "linux")]
+fn read_confirm_byte(fd: i32) -> ConfirmResult {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let r = unsafe { libc::poll(&raw mut pfd, 1, 15_000) };
+        if r < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return ConfirmResult::Unknown;
+        }
+        if r == 0 {
+            return ConfirmResult::Unknown; // timeout
+        }
+        let mut buf = [0u8; 1];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), 1) };
+        if n < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return ConfirmResult::Unknown;
+        }
+        if n == 0 {
+            return ConfirmResult::Eof;
+        }
+        return ConfirmResult::Confirmed;
+    }
 }

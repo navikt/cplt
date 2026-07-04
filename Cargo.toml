@@ -21,7 +21,6 @@ toml_edit = "0.25"
 # Run `cargo update` with network access to populate the lockfile.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
-which = "7.0"
 
 [profile.release]
 strip = true

@@ -1161,6 +1161,100 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Apply Landlock + seccomp to the current process from a plain rule list,
+/// opening every `O_PATH` fd **in the caller's own mount namespace**.
+///
+/// # Why this exists (Bubblewrap re-entry)
+///
+/// The normal path splits work between `precompute()` (parent: opens fds,
+/// builds BPF) and `apply_precomputed()` (child pre_exec: raw syscalls only).
+/// Those fds are opened in the **host** mount namespace before `fork()`.
+///
+/// Under Bubblewrap that is wrong: `bwrap` replaces `/proc`, `/dev` and
+/// `/tmp` with fresh mounts and mirrors writable paths via bind mounts, so
+/// the inodes visible at those paths *inside* the namespaces differ from the
+/// host inodes a pre-`fork()` fd would reference. Landlock rules bind to the
+/// inode behind the fd, so host fds would grant rights on the wrong objects
+/// (e.g. the host `/tmp`, invisible inside) and miss the real ones (the
+/// namespace's fresh `/tmp` tmpfs, its `--dev` device nodes, its devpts).
+///
+/// This function is called by the re-entry helper **inside** the bwrap
+/// namespaces (a freshly exec'd, single-threaded process). Opening the fds
+/// here binds each rule to exactly the inode present at that path inside the
+/// namespaces, making Landlock semantics under bwrap identical to the
+/// non-bwrap path. Because the process is single-threaded and pre-`main`,
+/// ordinary allocation and `open()` are safe — none of the async-signal
+/// constraints of `apply_precomputed()` apply.
+///
+/// The process must `execve()` the agent immediately afterwards; the leaked
+/// `O_PATH | O_CLOEXEC` fds are closed by that `execve`.
+#[cfg(target_os = "linux")]
+pub(crate) fn apply_landlock_and_seccomp_now(
+    fs_rules: &[FsRule],
+    net_rules: &[NetRule],
+    restrict_net_connect: bool,
+) -> std::io::Result<()> {
+    use landlock::{
+        ABI, Access, AccessFs, AccessNet, NetPort, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus,
+    };
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let abi_version = check_availability().map_err(std::io::Error::other)?;
+
+    let ruleset = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi_version))
+        .map_err(std::io::Error::other)?;
+    let ruleset = if abi_version >= ABI::V4 && restrict_net_connect {
+        ruleset
+            .handle_access(AccessNet::ConnectTcp)
+            .map_err(std::io::Error::other)?
+    } else {
+        ruleset
+    };
+    let mut created = ruleset.create().map_err(std::io::Error::other)?;
+
+    // Open each rule's path in *this* namespace. `/proc/self` resolves to this
+    // process's pid, which is preserved across the upcoming `execve()`, so no
+    // deferral is needed here (unlike the fork-based path).
+    for rule in fs_rules {
+        let c_path = CString::new(rule.path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::other("path contains null byte"))?;
+        let raw_fd: RawFd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if raw_fd < 0 {
+            // Path not present inside the namespace — skip, mirroring precompute().
+            continue;
+        }
+        let path_beneath_rule = create_path_beneath_rule(abi_version, &raw_fd, &rule.access);
+        created = created
+            .add_rule(path_beneath_rule)
+            .map_err(std::io::Error::other)?;
+    }
+
+    if abi_version >= ABI::V4 && restrict_net_connect {
+        for rule in net_rules {
+            created = created
+                .add_rule(NetPort::new(rule.port, AccessNet::ConnectTcp))
+                .map_err(std::io::Error::other)?;
+        }
+    }
+
+    let status = created.restrict_self().map_err(std::io::Error::other)?;
+    if status.ruleset == RulesetStatus::NotEnforced {
+        return Err(std::io::Error::other(
+            "Landlock rules were not enforced by the kernel",
+        ));
+    }
+
+    // Seccomp is rebuilt here rather than serialized across the re-entry — the
+    // BPF program is architecture-specific but otherwise constant, so building
+    // it in-process is simpler and cannot drift from the fork-based path.
+    apply_seccomp_filter(&build_seccomp_filter())?;
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn create_path_beneath_rule<'fd>(
     abi_version: ABI,

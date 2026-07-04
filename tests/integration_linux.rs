@@ -1086,4 +1086,231 @@ else:
             "sandbox should allow execution of binaries in copilot pkg dir. stdout: {stdout}"
         );
     }
+
+    // ── Bubblewrap namespace isolation ─────────────────────────────
+    //
+    // These tests verify the optional Bubblewrap layer on top of Landlock +
+    // seccomp. What bwrap actually provides (and what these tests assert):
+    // - pid/ipc/uts/cgroup/user namespaces (host process tree invisible,
+    //   unprivileged operation)
+    // - full host filesystem visible READ-ONLY inside the mount namespace,
+    //   with Landlock still providing the access control (deny-by-default)
+    // - the host network is deliberately SHARED (no --unshare-net) so the
+    //   agent can reach the host-bound CONNECT proxy on 127.0.0.1
+    // - Landlock + seccomp are re-applied inside the namespaces by the cplt
+    //   re-entry helper, so kernel access control is never weakened by bwrap
+
+    /// Check if `bwrap` is available. Tests that require it should call this
+    /// and return early if false.
+    fn bwrap_available() -> bool {
+        Command::new("which")
+            .arg("bwrap")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Skip guard for tests that need a working bubblewrap.
+    macro_rules! require_bwrap {
+        () => {
+            require_landlock!();
+            if !bwrap_available() {
+                eprintln!("SKIPPED: bwrap not available");
+                return;
+            }
+        };
+    }
+
+    /// Run inside the sandbox with bubblewrap explicitly enabled.
+    fn run_sandboxed_bwrap(project_dir: &Path, script: &str) -> (i32, String, String) {
+        run_sandboxed_with_flags(project_dir, &["--use-bubblewrap"], script)
+    }
+
+    #[test]
+    fn bwrap_auto_detect_default_runs() {
+        require_landlock!();
+        let project = create_test_project();
+
+        // No bubblewrap flag at all — the true auto-detect default. Must work
+        // both when bwrap is available (namespaces active) and when it is not
+        // (graceful fallback to Landlock+seccomp only).
+        let (exit, stdout, stderr) = run_sandboxed(project.path(), "echo auto-ok");
+
+        assert_eq!(
+            exit, 0,
+            "auto-detect default must not brick the run: {stderr}"
+        );
+        assert!(stdout.contains("auto-ok"));
+    }
+
+    #[test]
+    fn bwrap_explicit_disable_works() {
+        require_landlock!();
+        let project = create_test_project();
+
+        let (exit, stdout, _) =
+            run_sandboxed_with_flags(project.path(), &["--no-bubblewrap"], "echo 'without bwrap'");
+
+        assert_eq!(exit, 0, "Command should succeed without bwrap");
+        assert!(stdout.contains("without bwrap"));
+    }
+
+    #[test]
+    fn bwrap_pid_namespace_isolates_process_list() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        let (exit, stdout, stderr) = run_sandboxed_bwrap(project.path(), "ps aux | wc -l");
+        assert_eq!(exit, 0, "ps should succeed: {stderr}");
+
+        // In a PID namespace only the agent's own tree is visible.
+        let proc_count: usize = stdout.trim().parse().unwrap_or(9999);
+        assert!(
+            proc_count < 20,
+            "Should see < 20 processes in PID namespace, got {proc_count}"
+        );
+    }
+
+    #[test]
+    fn bwrap_cannot_see_host_init() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        let (exit, stdout, _) =
+            run_sandboxed_bwrap(project.path(), "cat /proc/1/comm 2>&1 || echo 'blocked'");
+        assert_eq!(exit, 0);
+        // PID 1 inside the namespace is bwrap/the helper, never the host init.
+        assert!(
+            !stdout.contains("systemd") || stdout.contains("blocked"),
+            "Should not see host init in PID namespace: {stdout}"
+        );
+    }
+
+    #[test]
+    fn bwrap_project_dir_readable_and_writable() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        let (exit, stdout, stderr) = run_sandboxed_bwrap(
+            project.path(),
+            "cat test.txt && echo 'new content' > new_file.txt",
+        );
+        assert_eq!(exit, 0, "project read+write should work: {stderr}");
+        assert_eq!(stdout.trim(), "hello from project");
+
+        let content = fs::read_to_string(project.path().join("new_file.txt"))
+            .expect("Should create file in project");
+        assert_eq!(content.trim(), "new content");
+    }
+
+    #[test]
+    fn bwrap_project_dir_under_tmp_is_visible() {
+        require_bwrap!();
+
+        // Regression (PR #64 review): the namespace shadows /tmp with a fresh
+        // tmpfs, so a project dir under /tmp must be explicitly bind-mounted
+        // back or it vanishes (cwd falls back to /, all project IO fails).
+        let base = tempfile::Builder::new()
+            .prefix("cplt-bwrap-tmp-proj")
+            .tempdir_in("/tmp")
+            .expect("Failed to create project under /tmp");
+        fs::write(base.path().join("test.txt"), "hello from tmp project").unwrap();
+
+        let (exit, stdout, stderr) = run_sandboxed_bwrap(
+            base.path(),
+            "cat test.txt && echo ok > written.txt && cat written.txt",
+        );
+        assert_eq!(exit, 0, "project under /tmp must stay usable: {stderr}");
+        assert!(stdout.contains("hello from tmp project"));
+        assert!(stdout.contains("ok"));
+        assert!(base.path().join("written.txt").exists());
+    }
+
+    #[test]
+    fn bwrap_exec_from_tmp_still_denied() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        // SECURITY: the "exec from /tmp is denied" guarantee must hold with
+        // bwrap active. /tmp inside the namespace is a bare tmpfs whose
+        // Landlock rule grants no execute — the scratch dir (write+exec) is
+        // never overlaid on /tmp.
+        let (exit, stdout, _) = run_sandboxed_bwrap(
+            project.path(),
+            "cp /bin/true /tmp/evil && chmod +x /tmp/evil && /tmp/evil 2>&1 || echo 'exec blocked'",
+        );
+        assert_eq!(exit, 0);
+        assert!(
+            stdout.contains("exec blocked") || stdout.contains("Permission denied"),
+            "exec from /tmp must be denied under bwrap: {stdout}"
+        );
+    }
+
+    #[test]
+    fn bwrap_landlock_still_blocks_sensitive_paths() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        // Landlock (applied in-namespace by the re-entry helper) must still
+        // deny credential paths even though --ro-bind / / makes them visible
+        // in the mount table.
+        let (exit, stdout, _) = run_sandboxed_bwrap(
+            project.path(),
+            "ls ~/.ssh 2>&1 || cat ~/.aws/credentials 2>&1 || echo 'landlock blocked'",
+        );
+        assert_eq!(exit, 0);
+        assert!(
+            stdout.contains("landlock blocked") || stdout.contains("Permission denied"),
+            "Landlock must still deny sensitive paths with bwrap: {stdout}"
+        );
+    }
+
+    #[test]
+    fn bwrap_user_namespace_maps_host_uid() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        let (exit, stdout, _) = run_sandboxed_bwrap(project.path(), "id -u");
+        assert_eq!(exit, 0);
+        let host_uid = unsafe { libc::getuid() };
+        assert_eq!(
+            stdout.trim(),
+            host_uid.to_string(),
+            "Should see the host UID inside the user namespace"
+        );
+    }
+
+    #[test]
+    fn bwrap_preserves_environment_variables() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        let (exit, stdout, _) = run_sandboxed_bwrap(
+            project.path(),
+            "echo HOME=$HOME; echo PATH=$PATH | grep -q '/bin' && echo 'path ok'",
+        );
+        assert_eq!(exit, 0);
+        assert!(stdout.contains("HOME="), "HOME should be set");
+        assert!(stdout.contains("path ok"), "PATH should contain /bin");
+    }
+
+    #[test]
+    fn bwrap_seccomp_still_blocks_unshare() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        // seccomp is applied by the re-entry helper inside the namespaces —
+        // the agent must not be able to build nested namespaces.
+        let (exit, stdout, _) = run_sandboxed_bwrap(
+            project.path(),
+            "unshare --user true 2>&1 || echo 'unshare blocked'",
+        );
+        assert_eq!(exit, 0);
+        assert!(
+            stdout.contains("unshare blocked")
+                || stdout.contains("Operation not permitted")
+                || stdout.contains("not permitted"),
+            "unshare must stay seccomp-blocked inside bwrap: {stdout}"
+        );
+    }
 }

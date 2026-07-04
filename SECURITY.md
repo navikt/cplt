@@ -94,12 +94,12 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 
 | Protection | macOS (Seatbelt) | Linux (Landlock + seccomp) | Linux (+ Bubblewrap) |
 |---|---|---|---|
-| Credential files (~/.ssh, ~/.aws) | ✅ Kernel deny | ✅ Not in ruleset (deny-by-default) | ✅ Namespace + Landlock |
+| Credential files (~/.ssh, ~/.aws) | ✅ Kernel deny | ✅ Not in ruleset (deny-by-default) | ✅ Landlock (deny-by-default) |
 | Project .env file read/write/delete | ✅ Kernel deny | ⚠️ Proxy blocks exfiltration | ⚠️ Proxy blocks exfiltration |
 | .git/hooks write in project | ✅ Kernel deny | ⚠️ Env hardening (GIT_CONFIG_NOSYSTEM) | ⚠️ Env hardening |
 | .git/config write in project | ✅ Kernel deny | ⚠️ Env hardening + proxy | ⚠️ Env hardening + proxy |
-| Network: outbound port filtering | ✅ Kernel (all versions) | ✅ Kernel (6.7+) / ⚠️ Proxy only (<6.7) | ✅ Network namespace |
-| Network: localhost isolation | ✅ Kernel deny | ⚠️ Proxy domain filtering | ✅ Network namespace |
+| Network: outbound port filtering | ✅ Kernel (all versions) | ✅ Kernel (6.7+) / ⚠️ Proxy only (<6.7) | ✅ Same as Landlock (no net namespace) |
+| Network: localhost isolation | ✅ Kernel deny | ⚠️ Proxy domain filtering | ⚠️ Proxy domain filtering (no net namespace) |
 | Exec from /tmp | ✅ Kernel deny | ✅ Landlock deny | ✅ Landlock deny |
 | Dangerous syscalls | N/A (Seatbelt covers) | ✅ seccomp-BPF | ✅ seccomp-BPF |
 | PID namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
@@ -111,28 +111,51 @@ Legend: ✅ = kernel-enforced, ⚠️ = defense-in-depth (proxy/env), ❌ = not 
 
 ### Linux namespace isolation (Bubblewrap)
 
-On Linux, cplt can optionally layer **Bubblewrap** (`bwrap`) on top of Landlock + seccomp-BPF for defense-in-depth namespace isolation. Bubblewrap is used by Flatpak and provides battle-tested container functionality.
+On Linux, cplt can optionally layer **Bubblewrap** (`bwrap`) on top of Landlock + seccomp-BPF. Bubblewrap is used by Flatpak and provides battle-tested, unprivileged namespace setup. It is **defense-in-depth for the Landlock/seccomp layer, not a replacement for it** — Landlock (filesystem/network access control) and seccomp (syscall filtering) remain the enforcing boundary; bwrap adds process, IPC, and hostname isolation plus a private `/tmp` around them.
 
-**Namespace layers:**
+**What bwrap adds:**
 
-1. **PID namespace** — agent cannot see or signal host processes. `ps` shows only the agent's own process tree, preventing process enumeration attacks.
-2. **Mount namespace** — only necessary paths are mounted; everything else is invisible. Provides additional filesystem isolation beyond Landlock's deny-by-default model.
-3. **Network namespace** — only loopback interface is available. All external network access is blocked at the kernel level; the proxy is accessible via `127.0.0.1`. This provides localhost SSRF protection comparable to macOS Seatbelt.
-4. **User namespace** — runs unprivileged (no root needed). The agent appears as UID 0 inside the namespace but has no real root capabilities outside.
+1. **PID namespace** — the agent cannot see or signal host processes. `ps` shows only the agent's own process tree, preventing process enumeration attacks.
+2. **IPC / UTS / cgroup namespaces** — no shared SysV IPC, an isolated hostname, and an isolated cgroup view.
+3. **Mount namespace** — the whole host filesystem is bind-mounted **read-only** (`--ro-bind / /`); write access is granted only at the specific paths carrying a writable Landlock rule (re-bound writable at their real locations). The host root is therefore *enumerable* inside the namespace — the mount namespace only changes the mount topology, it does **not** hide arbitrary files. Confidentiality is Landlock's job (deny-by-default): a path with no read rule is denied by Landlock even though it appears in the mount table.
+4. **Private `/tmp`** — `/tmp` is a fresh, empty `tmpfs` that carries no exec-bearing Landlock rule, so the "no exec from `/tmp`" guarantee holds. The scratch dir (write+exec) is kept at its real path and is never overlaid on `/tmp`; a writable path that legitimately lives under `/tmp` (e.g. a `--project-dir` in `/tmp`) is re-bound *after* the tmpfs so it stays usable.
+5. **User namespace** — unprivileged operation, no root required. The agent maps to the **invoking host UID** (there is no UID-0 mapping) and holds no real capabilities on the host.
+
+Bubblewrap **deliberately does not** create a network namespace (see limitations below), so it is **not a network or confidentiality boundary**.
+
+**Layering — how Landlock + seccomp stay enforced (fail-closed):**
+
+`bwrap` needs `unshare`/`mount`/`pivot_root` to build the namespaces — exactly the syscalls our seccomp filter `EPERM`s, and the bind-mount sources are what a restrictive Landlock domain would block. So Landlock and seccomp are **not** applied to the `bwrap` process; they are applied to the **agent**, inside the namespaces, after bwrap finishes setup:
+
+```text
+cplt ──exec──▶ bwrap (creates namespaces, unrestricted)
+                 └─exec──▶ cplt re-entry helper (in-namespace)
+                             │  applies Landlock + seccomp bound to the
+                             │  inodes visible *inside* the namespaces
+                             └─execve──▶ agent (Landlock + seccomp enforced)
+```
+
+The re-entry helper is this same cplt binary, dispatched by an `.init_array` constructor keyed on the `__CPLT_BWRAP_POLICY_FD` environment variable; the Landlock policy and agent argv arrive over an **inherited pipe** (nothing is written to disk, so the fresh `--tmpfs /tmp` cannot hide it). Because the helper opens its Landlock rule paths *inside* the namespaces, the effective policy is identical to the non-bwrap path. If any step of the helper fails it `_exit(126)`s **before** the agent runs — the agent is never executed unsandboxed. A one-byte confirm pipe lets the parent detect that the inner sandbox was applied; on auto-detect a missing confirmation degrades gracefully to the direct Landlock+seccomp path, while explicit `--use-bubblewrap` treats it as a hard error.
 
 **Activation:**
 
-- **Auto-detect (default):** If `bwrap` is in PATH and functional, it's used automatically. Falls back to Landlock+seccomp if unavailable.
-- **Explicit enable:** `--use-bubblewrap` or `sandbox.use_bubblewrap = true` in config — fails if bwrap unavailable.
-- **Explicit disable:** `--no-bubblewrap` or `sandbox.use_bubblewrap = false` — uses Landlock+seccomp only.
+- **Auto-detect (default):** if `bwrap` is in PATH and can actually create the namespaces (probed by running the real `build_bwrap_args` output against `/bin/true`), it is used automatically. Falls back to Landlock+seccomp otherwise.
+- **Explicit enable:** `--use-bubblewrap` or `sandbox.use_bubblewrap = true` — hard-fails if bwrap is unavailable rather than silently falling back.
+- **Explicit disable:** `--no-bubblewrap` or `sandbox.use_bubblewrap = false` — uses Landlock+seccomp only. If both are given, off wins.
 
-**Graceful degradation:** Bubblewrap requires kernel 3.8+ with user namespaces enabled. On systems without bwrap or namespace support, cplt falls back to Landlock + seccomp-BPF (still providing strong filesystem and syscall isolation).
+**Graceful degradation:** Bubblewrap requires a kernel with unprivileged user namespaces enabled. On systems without bwrap or namespace support, cplt falls back to Landlock + seccomp-BPF (still providing the full filesystem and syscall isolation — bwrap changes the process/mount topology, not the access-control policy).
 
-**Security model:** Bubblewrap provides namespace isolation; Landlock + seccomp-BPF are still applied inside the namespace via `pre_exec` hook. This creates multiple defense layers:
-- Filesystem: Landlock (deny-by-default) + mount namespace (path visibility)
-- Network: Network namespace (kernel-level isolation) + Landlock port filtering (6.7+) + proxy (domain filtering)
-- Syscalls: seccomp-BPF (ptrace, mount, kexec_load blocked)
-- Processes: PID namespace (host process tree invisible)
+**What bwrap does NOT provide:**
+
+- **No network isolation.** There is no network namespace: the host network is shared **by design** so the sandboxed agent can reach cplt's CONNECT proxy on `127.0.0.1`. Outbound control stays with Landlock TCP port rules (ABI v4+) and the proxy — exactly as on the non-bwrap path. Kernel-level network isolation (a private netns with the proxy bridged in) is future work tracked in [issue #114](https://github.com/navikt/cplt/issues/114).
+- **No filesystem confidentiality from the mount namespace.** The full host filesystem is enumerable read-only; Landlock, not the mount namespace, is what denies reads.
+- **No UID remapping.** The host UID is visible inside the user namespace (asserted by an integration test); there is no root/UID-0 illusion.
+
+**Security model summary:** the layers, honestly attributed —
+- Filesystem: **Landlock** (deny-by-default) is the access control; the mount namespace only makes the host root read-only and provides a private `/tmp`.
+- Network: **proxy** (domain filtering) + **Landlock** port filtering (6.7+). Bubblewrap adds nothing here.
+- Syscalls: **seccomp-BPF** (ptrace, mount, kexec_load, unshare, … blocked), applied to the agent inside the namespaces.
+- Processes: **PID namespace** (host process tree invisible), plus IPC/UTS/cgroup isolation.
 
 **Installation:**
 ```bash
