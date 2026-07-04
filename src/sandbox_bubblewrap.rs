@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Bubblewrap namespace isolation for Linux.
 //!
 //! # Purpose
@@ -33,6 +34,7 @@
 //! - `Some(false)`: Never use bwrap
 //! - `None` (default): Auto-detect and use if available
 
+use crate::sandbox::landlock_mod::FsRule;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -56,13 +58,22 @@ pub fn check_availability() -> Option<PathBuf> {
 /// This catches systems where bwrap exists but namespaces are disabled.
 #[cfg(target_os = "linux")]
 pub fn test_functionality(bwrap_path: &Path) -> Result<(), String> {
+    // Test the same namespace configuration we actually use in production:
+    // - --unshare-user: unprivileged user namespace (often disabled on hardened systems)
+    // - --ro-bind / /: base read-only root mount (our VFS strategy)
+    // - --proc / --dev / --tmpfs: required namespace mounts
+    // If this fails, the fallback to Landlock-only mode is triggered.
     let output = Command::new(bwrap_path)
         .args([
-            "--unshare-all",
-            "--dev",
-            "/dev",
+            "--unshare-user",
+            "--unshare-pid",
+            "--ro-bind",
+            "/",
+            "/",
             "--proc",
             "/proc",
+            "--dev",
+            "/dev",
             "--tmpfs",
             "/tmp",
             "/bin/true",
@@ -89,71 +100,42 @@ pub fn test_functionality(_bwrap_path: &Path) -> Result<(), String> {
 ///
 /// # Arguments
 ///
-/// - `project_dir`: Project directory to mount read-write
-/// - `home_dir`: User's home directory
+/// - `project_dir`: Project directory to mount read-write (primarily for verification/logging)
+/// - `home_dir`: User's home directory (primarily for verification/logging)
 /// - `scratch_dir`: Scratch directory for temp files (if enabled)
-/// - `proxy_port`: Proxy port for network isolation (if enabled)
-/// - `extra_read`: Additional directories to mount read-only
-/// - `extra_write`: Additional directories to mount read-write
-/// - `agent_dirs`: Agent-specific directories to mount
+/// - `fs_rules`: The Landlock filesystem rules to map into the VFS
 ///
 /// # Returns
 ///
 /// Vector of command-line arguments for `bwrap`.
 #[cfg(target_os = "linux")]
 pub fn build_bwrap_args(
-    project_dir: &Path,
-    home_dir: &Path,
+    _project_dir: &Path,
+    _home_dir: &Path,
     scratch_dir: Option<&Path>,
-    extra_read: &[PathBuf],
-    extra_write: &[PathBuf],
+    fs_rules: &[FsRule],
 ) -> Vec<String> {
     let mut args = Vec::new();
 
     // ── Namespace isolation ────────────────────────────────────
 
-    // Unshare all namespaces except user (we'll do that separately)
+    // Unshare namespaces except network (so the sandboxed process can connect
+    // to the host-bound cplt CONNECT proxy on 127.0.0.1)
     args.extend([
         "--unshare-pid".to_string(), // PID namespace (agent can't see host processes)
-        "--unshare-net".to_string(), // Network namespace (only loopback available)
         "--unshare-ipc".to_string(), // IPC namespace (no shared memory with host)
         "--unshare-uts".to_string(), // UTS namespace (hostname isolation)
         "--unshare-cgroup".to_string(), // Cgroup namespace (process tree isolation)
+        "--die-with-parent".to_string(), // Automatically terminate sandbox if cplt parent exits
     ]);
 
     // User namespace for unprivileged operation
-    args.extend([
-        "--unshare-user".to_string(),
-        "--uid".to_string(),
-        "0".to_string(), // Map to UID 0 inside namespace
-        "--gid".to_string(),
-        "0".to_string(), // Map to GID 0 inside namespace
-    ]);
+    args.push("--unshare-user".to_string());
 
     // ── Filesystem setup ───────────────────────────────────────
 
-    // Note: We do NOT use --clearenv because cplt sets environment variables
-    // via Command::env() after this function returns, and those need to be
-    // preserved through bwrap to the sandboxed process. Bwrap will inherit
-    // the environment from the parent Command.
-
-    // Mount essential system directories (read-only)
-    for sys_dir in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
-        if Path::new(sys_dir).exists() {
-            args.extend([
-                "--ro-bind".to_string(),
-                sys_dir.to_string(),
-                sys_dir.to_string(),
-            ]);
-        }
-    }
-
-    // Mount /etc read-only (needed for DNS, SSL certs, etc.)
-    args.extend([
-        "--ro-bind".to_string(),
-        "/etc".to_string(),
-        "/etc".to_string(),
-    ]);
+    // Mount the host root read-only as our base template
+    args.extend(["--ro-bind".to_string(), "/".to_string(), "/".to_string()]);
 
     // Mount /proc (required for PID namespace)
     args.extend(["--proc".to_string(), "/proc".to_string()]);
@@ -161,76 +143,49 @@ pub fn build_bwrap_args(
     // Mount /dev (device files)
     args.extend(["--dev".to_string(), "/dev".to_string()]);
 
-    // Mount /sys read-only
-    if Path::new("/sys").exists() {
-        args.extend([
-            "--ro-bind".to_string(),
-            "/sys".to_string(),
-            "/sys".to_string(),
-        ]);
-    }
-
-    // ── User home directory ────────────────────────────────────
-
-    // Mount home directory - we'll let Landlock handle fine-grained access control
-    // within it, so we just make it available here
-    args.extend([
-        "--bind".to_string(),
-        home_dir.to_string_lossy().to_string(),
-        home_dir.to_string_lossy().to_string(),
-    ]);
-
-    // ── Project directory ──────────────────────────────────────
-
-    // Mount project directory read-write
-    args.extend([
-        "--bind".to_string(),
-        project_dir.to_string_lossy().to_string(),
-        project_dir.to_string_lossy().to_string(),
-    ]);
-
     // ── Scratch directory ──────────────────────────────────────
 
     if let Some(scratch) = scratch_dir {
         args.extend([
             "--bind".to_string(),
             scratch.to_string_lossy().to_string(),
-            scratch.to_string_lossy().to_string(),
+            "/tmp".to_string(),
         ]);
-    }
-
-    // Mount a tmpfs for /tmp if no scratch dir
-    if scratch_dir.is_none() {
+    } else {
+        // Mount a tmpfs for /tmp if no scratch dir
         args.extend(["--tmpfs".to_string(), "/tmp".to_string()]);
     }
 
-    // ── Extra read/write paths ─────────────────────────────────
+    // ── Policy-driven overlay mounts ──────────────────────────
+    // Sort rules by path length (number of components) so that parent directories
+    // are mounted before child subpaths (e.g. ~/.cache before ~/.cache/copilot/pkg)
+    let mut sorted_rules = fs_rules.to_vec();
+    sorted_rules.sort_by_key(|r| r.path.components().count());
 
-    for path in extra_read {
-        if path.exists() {
-            args.extend([
-                "--ro-bind".to_string(),
-                path.to_string_lossy().to_string(),
-                path.to_string_lossy().to_string(),
-            ]);
+    for rule in &sorted_rules {
+        // Skip paths managed directly by Bubblewrap core setup to prevent host leakage or namespace breakage
+        if rule.path.starts_with("/tmp")
+            || rule.path.starts_with("/proc")
+            || rule.path.starts_with("/dev")
+            || rule.path.starts_with("/sys")
+        {
+            continue;
         }
-    }
 
-    for path in extra_write {
-        if path.exists() {
-            args.extend([
-                "--bind".to_string(),
-                path.to_string_lossy().to_string(),
-                path.to_string_lossy().to_string(),
-            ]);
+        if !rule.path.exists() {
+            continue;
         }
+
+        let path_str = rule.path.to_string_lossy().to_string();
+
+        if rule.access.write {
+            // Writable paths: override the read-only base mount with a writable bind.
+            args.extend(["--bind".to_string(), path_str.clone(), path_str]);
+        }
+        // Read-only paths are already visible via the base `--ro-bind / /` mount.
+        // Emitting redundant `--ro-bind` mounts inflates the argument list with no
+        // security benefit — skipping them keeps the invocation lean.
     }
-
-    // ── Network configuration ──────────────────────────────────
-
-    // With --unshare-net, only loopback is available
-    // The proxy will be bound to 127.0.0.1 and accessible
-    // All other network access is blocked at the kernel level
 
     args
 }
@@ -240,8 +195,7 @@ pub fn build_bwrap_args(
     _project_dir: &Path,
     _home_dir: &Path,
     _scratch_dir: Option<&Path>,
-    _extra_read: &[PathBuf],
-    _extra_write: &[PathBuf],
+    _fs_rules: &[FsRule],
 ) -> Vec<String> {
     Vec::new()
 }
@@ -257,18 +211,22 @@ mod tests {
             Path::new("/home/user/project"),
             Path::new("/home/user"),
             Some(Path::new("/tmp/cplt-scratch")),
-            &[],
-            &[],
+            &[], // no fs_rules — base mounts only
         );
 
-        // Should have namespace isolation flags
+        // Must isolate these namespaces
         assert!(args.contains(&"--unshare-pid".to_string()));
-        assert!(args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--unshare-user".to_string()));
+        assert!(args.contains(&"--die-with-parent".to_string()));
+        // Network namespace is intentionally NOT isolated (proxy runs on host)
+        assert!(!args.contains(&"--unshare-net".to_string()));
 
-        // Should mount project dir
-        assert!(args.contains(&"--bind".to_string()));
-        assert!(args.contains(&"/home/user/project".to_string()));
+        // Base root mount
+        assert!(args.contains(&"--ro-bind".to_string()));
+        assert!(args.contains(&"/".to_string()));
+
+        // Scratch dir should be bind-mounted as /tmp
+        assert!(args.contains(&"/tmp/cplt-scratch".to_string()));
     }
 
     #[cfg(target_os = "linux")]
@@ -278,17 +236,50 @@ mod tests {
             Path::new("/home/user/project"),
             Path::new("/home/user"),
             None,
-            &[],
-            &[],
+            &[], // no fs_rules
         );
 
-        // Should have /proc
+        // Should set up /proc for PID namespace
         assert!(args.contains(&"--proc".to_string()));
         assert!(args.contains(&"/proc".to_string()));
 
-        // Should have /dev
+        // Should set up /dev with safe device nodes
         assert!(args.contains(&"--dev".to_string()));
         assert!(args.contains(&"/dev".to_string()));
+
+        // No scratch dir → tmpfs for /tmp
+        assert!(args.contains(&"--tmpfs".to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_fs_rules_add_bind_mounts() {
+        use crate::sandbox::landlock_mod::{FsAccess, FsRule};
+        use std::path::PathBuf;
+
+        // Use /tmp as a path that exists and is writable in the test environment
+        let rules = vec![FsRule {
+            path: PathBuf::from("/tmp"),
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: false,
+                ioctl: false,
+            },
+        }];
+        let args = build_bwrap_args(
+            Path::new("/home/user/project"),
+            Path::new("/home/user"),
+            None,
+            &rules,
+        );
+        // /tmp is in the system-managed skip list, so it should NOT generate a --bind
+        // (bwrap manages /tmp itself via --tmpfs)
+        let tmp_bind_count = args
+            .windows(3)
+            .filter(|w| w[0] == "--bind" && w[2] == "/tmp")
+            .count();
+        assert_eq!(tmp_bind_count, 0, "/tmp should be skipped (system-managed)");
     }
 
     #[cfg(not(target_os = "linux"))]

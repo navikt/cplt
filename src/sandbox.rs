@@ -336,6 +336,12 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     let policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);
 
+    // Save the fs_rules before moving policy into precompute(). precompute()
+    // takes ownership (it needs to open O_PATH fds for every rule), so we
+    // clone here. The clone is cheap relative to the syscalls that follow and
+    // is only performed when bubblewrap is active.
+    let fs_rules_for_bwrap = policy.fs_rules.clone();
+
     // Pre-compute everything in the parent process.
     // ABI check, BPF construction, and all allocation happens here.
     // The pre_exec hook only makes raw syscalls.
@@ -356,8 +362,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
                 config.project_dir,
                 config.home_dir,
                 config.scratch_dir,
-                config.extra_read,
-                config.extra_write,
+                &fs_rules_for_bwrap,
             );
 
             Some(BubblewrapWrapper {
@@ -378,8 +383,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
                             config.project_dir,
                             config.home_dir,
                             config.scratch_dir,
-                            config.extra_read,
-                            config.extra_write,
+                            &fs_rules_for_bwrap,
                         );
 
                         Some(BubblewrapWrapper {

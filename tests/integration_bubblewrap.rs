@@ -232,10 +232,10 @@ mod bwrap_tests {
         );
     }
 
-    // ── Network namespace tests ────────────────────────────────────
+    // ── Network tests ─────────────────────────────────────────────
 
     #[test]
-    fn bwrap_network_namespace_blocks_external() {
+    fn sandbox_blocks_external_network() {
         if !bwrap_available() {
             eprintln!("SKIPPED: bwrap not available");
             return;
@@ -243,8 +243,9 @@ mod bwrap_tests {
 
         let project = create_test_project();
 
-        // Network namespace should block external connections
-        // Only loopback should be available
+        // The sandbox blocks external connections (via Landlock/seccomp + proxy).
+        // Network namespace is intentionally disabled so the process can reach the
+        // host-bound cplt CONNECT proxy on 127.0.0.1.
         let (exit, stdout, _) = run_sandboxed_with_bwrap(
             project.path(),
             "ping -c 1 -W 1 8.8.8.8 2>&1 || echo 'network blocked'",
@@ -252,31 +253,11 @@ mod bwrap_tests {
 
         assert_eq!(exit, 0);
         assert!(
-            stdout.contains("network blocked") || stdout.contains("Network is unreachable"),
-            "Should block external network access in network namespace"
-        );
-    }
-
-    #[test]
-    fn bwrap_localhost_accessible() {
-        if !bwrap_available() {
-            eprintln!("SKIPPED: bwrap not available");
-            return;
-        }
-
-        let project = create_test_project();
-
-        // Localhost should still work (loopback interface in network namespace)
-        let (exit, stdout, _) = run_sandboxed_with_bwrap(
-            project.path(),
-            "ping -c 1 -W 1 127.0.0.1 || echo 'localhost blocked'",
-        );
-
-        assert_eq!(exit, 0);
-        // Localhost ping should work (might fail but shouldn't be "unreachable")
-        assert!(
-            !stdout.contains("Network is unreachable"),
-            "Localhost should be reachable in network namespace"
+            stdout.contains("network blocked")
+                || stdout.contains("unreachable")
+                || stdout.contains("Permission denied")
+                || stdout.contains("not permitted"),
+            "Should block external network access"
         );
     }
 
@@ -291,34 +272,15 @@ mod bwrap_tests {
 
         let project = create_test_project();
 
-        // In user namespace, should run as mapped user (appears as UID 0 inside)
+        // In user namespace, should run as mapped user (should match our host UID)
         let (exit, stdout, _) = run_sandboxed_with_bwrap(project.path(), "id -u");
 
         assert_eq!(exit, 0);
-        // Should see UID 0 inside the namespace (mapped from real UID)
-        assert_eq!(stdout.trim(), "0", "Should see UID 0 in user namespace");
-    }
-
-    #[test]
-    fn bwrap_user_namespace_no_real_root() {
-        if !bwrap_available() {
-            eprintln!("SKIPPED: bwrap not available");
-            return;
-        }
-
-        let project = create_test_project();
-
-        // Despite appearing as UID 0, should not have real root powers
-        // Cannot chown files to arbitrary UIDs (would need real root)
-        let (exit, stdout, _) = run_sandboxed_with_bwrap(
-            project.path(),
-            "touch test_chown.txt && chown 1234:1234 test_chown.txt 2>&1 || echo 'chown failed'",
-        );
-
-        assert_eq!(exit, 0);
-        assert!(
-            stdout.contains("chown failed") || stdout.contains("Invalid argument"),
-            "Should not have real root capabilities"
+        let host_uid = unsafe { libc::getuid() };
+        assert_eq!(
+            stdout.trim(),
+            host_uid.to_string(),
+            "Should see the host UID inside the user namespace"
         );
     }
 
