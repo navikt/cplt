@@ -95,7 +95,7 @@ mod linux_tests {
                 "--quiet",
                 "--agent",
                 "shell",
-                "-C",
+                "--project-dir",
                 &project_dir.to_string_lossy(),
                 "--",
                 "-c",
@@ -125,7 +125,7 @@ mod linux_tests {
             "--quiet",
             "--agent",
             "shell",
-            "-C",
+            "--project-dir",
             &dir_str,
         ];
         args.extend_from_slice(extra_flags);
@@ -155,7 +155,7 @@ mod linux_tests {
                 "--quiet",
                 "--agent",
                 "shell",
-                "-C",
+                "--project-dir",
                 &project_dir.to_string_lossy(),
                 "--",
                 "-c",
@@ -186,7 +186,7 @@ mod linux_tests {
             "--quiet",
             "--agent",
             "shell",
-            "-C",
+            "--project-dir",
             &dir_str,
         ];
         args.extend_from_slice(extra_flags);
@@ -272,7 +272,7 @@ mod linux_tests {
                 "--quiet",
                 "--agent",
                 "shell",
-                "-C",
+                "--project-dir",
                 &project.path().to_string_lossy(),
                 "--",
                 "-c",
@@ -401,7 +401,7 @@ mod linux_tests {
                 "--quiet",
                 "--agent",
                 "shell",
-                "-C",
+                "--project-dir",
                 &project.path().to_string_lossy(),
                 "--",
                 "-c",
@@ -436,7 +436,7 @@ mod linux_tests {
                 "--quiet",
                 "--agent",
                 "shell",
-                "-C",
+                "--project-dir",
                 &project.path().to_string_lossy(),
                 "--",
                 "-c",
@@ -780,7 +780,11 @@ else:
         require_landlock!();
         let project = create_test_project();
         let output = Command::new(binary_path())
-            .args(["--print-profile", "-C", &project.path().to_string_lossy()])
+            .args([
+                "--print-profile",
+                "--project-dir",
+                &project.path().to_string_lossy(),
+            ])
             .env("HOME", home_dir())
             .output()
             .expect("Failed to run cplt --print-profile");
@@ -823,7 +827,7 @@ else:
                 "--quiet",
                 "--agent",
                 "shell",
-                "-C",
+                "--project-dir",
                 &project.path().to_string_lossy(),
                 "--",
                 "-c",
@@ -872,7 +876,7 @@ else:
                 "--quiet",
                 "--agent",
                 "shell",
-                "-C",
+                "--project-dir",
                 &project.path().to_string_lossy(),
                 "--",
                 "-c",
@@ -1089,7 +1093,7 @@ else:
                 "--quiet",
                 "--agent",
                 "shell",
-                "-C",
+                "--project-dir",
                 &project.path().to_string_lossy(),
                 "--",
                 "-c",
@@ -1173,7 +1177,7 @@ else:
                 "--quiet",
                 "--agent",
                 "copilot",
-                "-C",
+                "--project-dir",
                 &project.path().to_string_lossy(),
                 "--",
                 "--version",
