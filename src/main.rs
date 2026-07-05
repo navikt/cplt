@@ -975,6 +975,21 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) {
         let Ok(path) = std::fs::canonicalize(&ovr.path) else {
             continue;
         };
+        // Security guard: an ambient tool-path env var (exported long ago for
+        // unrelated reasons, or injected via a repo config / --pass-env) must
+        // never widen the sandbox to an unsafe root or to HOME/its ancestors —
+        // e.g. GOPATH=$HOME would make the whole home dir writable, GOPATH=/ the
+        // whole filesystem. canonicalize() above has already resolved any `..`,
+        // so this is the single choke point where the effective grant is vetted.
+        // Applies to read grants too (read access to `/` or `$HOME` over-grants).
+        if !cplt::sandbox::tool_override_path_is_safe(&path, home) {
+            ui::warn(&format!(
+                "Ignoring {} = {}: resolves to an unsafe root or HOME and would defeat the sandbox",
+                ovr.name,
+                path.display()
+            ));
+            continue;
+        }
         let target = if ovr.write {
             &mut resolved.allow_write
         } else {

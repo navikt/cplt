@@ -1104,6 +1104,9 @@ pub const TOOL_PATH_ENV_VARS: &[ToolPathEnvVar] = &[
 /// A single resolved tool-path override to add to the sandbox allow set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPathOverride {
+    /// Name of the env var this override came from (e.g. `GOPATH`). Used for
+    /// diagnostics when the override is dropped by the safety guard.
+    pub name: &'static str,
     /// Resolved path (leading `~/` expanded, relative paths joined onto `$HOME`).
     /// Not yet canonicalized or existence-checked — the caller does that so the
     /// backend only receives paths that actually exist (Landlock requires it).
@@ -1117,8 +1120,11 @@ pub struct ToolPathOverride {
 /// - Leading `~/` (or a bare `~`) expands to `home`.
 /// - Absolute paths are kept as-is.
 /// - Relative paths are joined onto `home` (env-var paths are almost always
-///   absolute; this keeps a stray relative value inside HOME rather than
-///   resolving it against an unknown cwd and widening access outside HOME).
+///   absolute) rather than resolved against an unknown cwd. This is *not* a
+///   containment guarantee: a value like `../../etc` still escapes HOME once the
+///   caller's `canonicalize()` collapses the `..` components. Final safety is
+///   enforced downstream by [`tool_override_path_is_safe`] at the merge site,
+///   which drops any override that resolves to an unsafe root or to HOME/above.
 ///
 /// Does not canonicalize or check existence — kept pure for cross-platform tests.
 fn resolve_tool_path(raw: &str, home: &Path) -> PathBuf {
@@ -1168,12 +1174,46 @@ pub fn tool_path_env_overrides(env: &[(String, String)], home: &Path) -> Vec<Too
             existing.write = existing.write || tv.write;
         } else {
             out.push(ToolPathOverride {
+                name: tv.name,
                 path: resolved,
                 write: tv.write,
             });
         }
     }
     out
+}
+
+/// Whether a canonicalized tool-path override is safe to add to the sandbox
+/// allow set.
+///
+/// A tool-path env var (`GOPATH`, `CARGO_HOME`, …) is attacker-influenceable: it
+/// may have been exported long ago for unrelated reasons, or injected via a repo
+/// config or `--pass-env`. Legitimate tool directories are always
+/// *subdirectories* of `$HOME` (e.g. `~/go`, `~/.cargo`) or of a custom project
+/// root, so an override that resolves to an unsafe root ([`crate::is_unsafe_root`]:
+/// `/`, `$HOME`, `/tmp`, platform system dirs) or to `$HOME` itself or any
+/// ancestor of it can only *widen* the sandbox and defeat its purpose. Such
+/// overrides must be dropped.
+///
+/// This is the single choke point where a canonicalized override becomes an
+/// allow rule; `canonicalize()` has already collapsed any `..`, so the path
+/// passed here is the effective grant. Applies to read grants too — read access
+/// to `/` or `$HOME` is also an over-grant.
+///
+/// `path` must already be canonicalized; `home` is the (canonical) home dir.
+pub fn tool_override_path_is_safe(path: &Path, home: &Path) -> bool {
+    // `/`, `$HOME`, `/tmp`, and platform system roots — mirrors every other
+    // path-widening guard in the codebase (project_dir, tool-dir discovery).
+    if crate::is_unsafe_root(path, home) {
+        return false;
+    }
+    // Any ancestor of HOME (e.g. `/Users` on macOS, `/home` on Linux, or a
+    // deeper parent). `starts_with` also matches HOME itself, which
+    // `is_unsafe_root` already covers — kept as defense in depth.
+    if home.starts_with(path) {
+        return false;
+    }
+    true
 }
 
 /// Validate that a path is safe for interpolation into SBPL profile strings.

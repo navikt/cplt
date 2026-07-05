@@ -8,7 +8,7 @@ use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
     HardeningCategory, ProfileOptions, SandboxConfig, build_sandbox_env, generate_policy,
-    generate_profile, tool_path_env_overrides, validate_sbpl_path,
+    generate_profile, tool_override_path_is_safe, tool_path_env_overrides, validate_sbpl_path,
 };
 
 // ============================================================
@@ -6780,4 +6780,77 @@ fn tool_path_same_path_write_wins_over_read() {
     assert_eq!(overrides.len(), 1, "same path must be deduplicated");
     assert_eq!(overrides[0].path, std::path::PathBuf::from("/shared/dir"));
     assert!(overrides[0].write, "write grant wins over read");
+}
+
+// --- Safety guard: reject over-broad tool-path overrides -------------------
+// tool_override_path_is_safe() is the choke point that stops an ambient env var
+// (e.g. GOPATH=$HOME or GOPATH=/) from silently widening the sandbox. It runs on
+// the already-canonicalized path, so `..` has been collapsed by then.
+
+#[test]
+fn tool_override_home_dir_is_dropped() {
+    // GOPATH=$HOME → granting write to the entire home dir defeats the sandbox.
+    let home = std::path::Path::new("/home/tester");
+    assert!(
+        !tool_override_path_is_safe(home, home),
+        "an override resolving to HOME itself must be dropped"
+    );
+}
+
+#[test]
+fn tool_override_filesystem_root_is_dropped() {
+    // GOPATH=/ → granting the whole filesystem must be dropped.
+    let home = std::path::Path::new("/home/tester");
+    assert!(
+        !tool_override_path_is_safe(std::path::Path::new("/"), home),
+        "an override resolving to / must be dropped"
+    );
+}
+
+#[test]
+fn tool_override_home_ancestor_is_dropped() {
+    // A relative value like GOPATH=../../.. canonicalizes to an ancestor of HOME
+    // (e.g. /home or /). Any ancestor of HOME is an over-grant and must be
+    // dropped — this holds cross-platform (is_unsafe_root does not list /home on
+    // macOS, so the HOME-ancestor check is what catches it there).
+    let home = std::path::Path::new("/home/tester");
+    for ancestor in ["/home", "/"] {
+        assert!(
+            !tool_override_path_is_safe(std::path::Path::new(ancestor), home),
+            "ancestor of HOME ({ancestor}) must be dropped"
+        );
+    }
+}
+
+#[test]
+fn tool_override_escaped_path_to_unsafe_root_is_dropped() {
+    // GOPATH=../../../../etc canonicalizes to /etc — resolve_tool_path's
+    // join-to-HOME does NOT contain it once `..` collapses. The guard catches the
+    // effective (canonicalized) grant. /tmp is an unsafe root everywhere; /etc is
+    // one on Linux.
+    let home = std::path::Path::new("/home/tester");
+    assert!(
+        !tool_override_path_is_safe(std::path::Path::new("/tmp"), home),
+        "an override resolving to /tmp must be dropped"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        !tool_override_path_is_safe(std::path::Path::new("/etc"), home),
+        "an override escaping HOME to a system root must be dropped"
+    );
+}
+
+#[test]
+fn tool_override_normal_custom_dir_is_kept() {
+    // The feature must still work: a real custom tool dir that is neither a root
+    // nor HOME/an ancestor stays granted — both outside and inside HOME.
+    let home = std::path::Path::new("/home/tester");
+    assert!(
+        tool_override_path_is_safe(std::path::Path::new("/opt/custom-gopath"), home),
+        "a normal custom dir outside HOME must be granted"
+    );
+    assert!(
+        tool_override_path_is_safe(std::path::Path::new("/home/tester/go-alt"), home),
+        "a normal custom SUBdir of HOME must be granted"
+    );
 }
