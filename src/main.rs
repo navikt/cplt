@@ -1086,10 +1086,12 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                 // Check trust store — validate content hash
                 if let Some(t) = trust::load_trust(&project_dir) {
                     let current_hash = trust::proposal_content_hash(&loaded.config.propose);
-                    if !t.accepted.content_hash.is_empty()
-                        && t.accepted.content_hash != current_hash
-                    {
-                        // Proposals changed since approval — invalidate
+                    // Treat a legacy empty stored hash as STALE (see approval_is_stale):
+                    // it pins nothing, so applying its keys against arbitrary proposal
+                    // *values* with no re-prompt would be unsafe.
+                    if trust::approval_is_stale(&t.accepted.content_hash, &current_hash) {
+                        // Proposals changed since approval (or a legacy unpinned
+                        // entry) — invalidate and require re-approval.
                         if !resolved.quiet {
                             ui::warn(
                                 ".cplt.toml permissions changed since last approval — re-approve with `cplt trust accept`",

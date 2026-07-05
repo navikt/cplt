@@ -314,6 +314,21 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
         hasher.update(format!("allow.write={p}\n").as_bytes());
     }
 
+    // Unix-socket proposals are proposable AND applied (apply_repo_config), and a
+    // socket like /var/run/docker.sock is a host-escape vector. They MUST be part
+    // of the pinned content so a trusted repo cannot later add or change
+    // `[propose.allow] socket=[…]` without re-approval.
+    let mut socket: Vec<&str> = propose
+        .allow
+        .socket
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    socket.sort_unstable();
+    for p in &socket {
+        hasher.update(format!("allow.socket={p}\n").as_bytes());
+    }
+
     let mut ports: Vec<u16> = propose.allow.ports.clone();
     ports.sort_unstable();
     for port in &ports {
@@ -340,6 +355,19 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
     let hash = hasher.finalize();
     // Full SHA-256 hex (64 chars) — collision-resistant content pinning
     hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decide whether a stored approval is stale relative to the current proposal
+/// content hash and must be re-approved before its keys can be applied.
+///
+/// Security: an EMPTY `stored_hash` is a legacy trust file written before content
+/// pinning existed. It pins nothing, so it MUST be treated as stale — never as a
+/// match. If it were treated as "matches", the previously-approved keys would be
+/// applied against arbitrary (possibly malicious) proposal *values* with no
+/// re-prompt. Any mismatch — including empty-vs-current — invalidates, forcing a
+/// one-time re-approval that writes a real hash.
+pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
+    stored_hash != current_hash
 }
 
 #[cfg(test)]
@@ -537,6 +565,26 @@ approved_at = "2026-05-01T12:00:00Z"
     }
 
     #[test]
+    fn empty_stored_hash_is_stale() {
+        // Legacy trust files have an empty content_hash. It must NOT be treated
+        // as "matches" — it should invalidate and force re-approval. A non-empty
+        // matching hash stays fresh; a non-empty differing hash is stale.
+        let current = "a".repeat(64);
+        assert!(
+            approval_is_stale("", &current),
+            "empty (legacy) stored hash must be treated as stale"
+        );
+        assert!(
+            approval_is_stale("deadbeef", &current),
+            "differing stored hash must be stale"
+        );
+        assert!(
+            !approval_is_stale(&current, &current),
+            "matching non-empty stored hash must stay fresh (no false re-prompt)"
+        );
+    }
+
+    #[test]
     fn proposal_content_hash_is_stable() {
         use crate::repo_config::{ProposeAllowSection, ProposeSection};
 
@@ -578,6 +626,52 @@ approved_at = "2026-05-01T12:00:00Z"
         assert_ne!(
             proposal_content_hash(&propose1),
             proposal_content_hash(&propose2)
+        );
+    }
+
+    #[test]
+    fn proposal_content_hash_changes_on_socket_change() {
+        // Security: `propose.allow.socket` is applied by apply_repo_config and a
+        // socket like /var/run/docker.sock is a host-escape vector. Changing it
+        // must invalidate an existing approval, so it must alter the content hash.
+        use crate::repo_config::{ProposeAllowSection, ProposeSection};
+
+        let base = ProposeSection {
+            allow: ProposeAllowSection {
+                read: vec!["~/.gradle/gradle.properties".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let with_socket = ProposeSection {
+            allow: ProposeAllowSection {
+                read: vec!["~/.gradle/gradle.properties".to_string()],
+                socket: vec!["/var/run/docker.sock".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_ne!(
+            proposal_content_hash(&base),
+            proposal_content_hash(&with_socket),
+            "adding a proposed socket must change the content hash"
+        );
+
+        // Changing the socket path must also change the hash.
+        let with_other_socket = ProposeSection {
+            allow: ProposeAllowSection {
+                read: vec!["~/.gradle/gradle.properties".to_string()],
+                socket: vec!["/tmp/other.sock".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_ne!(
+            proposal_content_hash(&with_socket),
+            proposal_content_hash(&with_other_socket),
+            "changing a proposed socket path must change the content hash"
         );
     }
 

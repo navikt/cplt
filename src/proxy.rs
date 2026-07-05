@@ -674,11 +674,15 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // compromised DNS or /etc/hosts entry could make `evil.localhost` resolve to
     // 169.254.169.254 (cloud IMDS) or an internal host. Using the hostname pattern
     // alone would bypass this check entirely, enabling SSRF to cloud metadata.
+    //
+    // Crucially, a loopback-resolving target is only exempted when localhost
+    // access was explicitly allowed. See `resolved_ip_is_blocked` for the why.
     let private_domains = state.get_private_domains();
-    if is_private_ip(&socket_addr.ip())
-        && !is_domain_match(&host, &private_domains)
-        && !socket_addr.ip().is_loopback()
-    {
+    if resolved_ip_is_blocked(
+        &socket_addr.ip(),
+        is_domain_match(&host, &private_domains),
+        localhost_connect_allowed,
+    ) {
         log_connection(
             "CONNECT",
             target,
@@ -896,6 +900,37 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// Decide whether a target's *resolved* IP must be blocked as a private-network
+/// SSRF risk, given whether the host is an approved private domain and whether
+/// localhost access was explicitly allowed.
+///
+/// Security: a hostname that resolves to loopback (`lvh.me`, `127.0.0.1.nip.io`,
+/// or alternate encodings such as `2130706433`, `0x7f000001`, `127.1`) must NOT
+/// be silently exempted just because the final IP is loopback. Reaching loopback
+/// services is only permitted when localhost access was explicitly requested
+/// (`localhost_allowed` — the same flag that gated the port and private-hostname
+/// carve-outs above) or the host is an approved private domain. Otherwise a
+/// crafted DNS name defeats the no-localhost default — and under `--proxy-forced`,
+/// where this proxy is the sole egress gate, it would tunnel to arbitrary
+/// loopback services. `is_private_hostname` only catches the literal `localhost`
+/// pre-DNS, so this resolved-IP check is the real gate for the rest.
+pub fn resolved_ip_is_blocked(
+    ip: &std::net::IpAddr,
+    host_is_private_domain: bool,
+    localhost_allowed: bool,
+) -> bool {
+    if !is_private_ip(ip) {
+        return false;
+    }
+    // Explicitly-approved corporate/internal domains may resolve to private IPs.
+    if host_is_private_domain {
+        return false;
+    }
+    // Loopback is reachable only when localhost access was explicitly allowed;
+    // every other private/reserved IP is always blocked here.
+    !(ip.is_loopback() && localhost_allowed)
+}
+
 /// Check hostname patterns that are known to be private (pre-DNS fast path).
 pub fn is_private_hostname(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
@@ -1042,6 +1077,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn resolved_loopback_blocked_unless_localhost_allowed() {
+        // A target that resolves to loopback (e.g. lvh.me, 127.0.0.1.nip.io,
+        // 2130706433, 0x7f000001, 127.1) must be BLOCKED when localhost access
+        // was not explicitly allowed, and ALLOWED when it was. No real DNS is
+        // needed — the decision is a pure function of the resolved IP.
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Not allowed, not a private domain → blocked.
+        assert!(
+            resolved_ip_is_blocked(&loopback, false, false),
+            "loopback-resolving target must be blocked when localhost not allowed"
+        );
+
+        // Localhost explicitly allowed → permitted.
+        assert!(
+            !resolved_ip_is_blocked(&loopback, false, true),
+            "loopback must be reachable when localhost access is allowed"
+        );
+
+        // Approved private domain → permitted even without localhost flag.
+        assert!(
+            !resolved_ip_is_blocked(&loopback, true, false),
+            "approved private domain resolving to loopback is permitted"
+        );
+
+        // IPv6 loopback behaves the same.
+        let loopback_v6: std::net::IpAddr = "::1".parse().unwrap();
+        assert!(resolved_ip_is_blocked(&loopback_v6, false, false));
+        assert!(!resolved_ip_is_blocked(&loopback_v6, false, true));
+    }
+
+    #[test]
+    fn resolved_non_loopback_private_always_blocked() {
+        // Non-loopback private/reserved IPs are blocked regardless of the
+        // localhost flag — the carve-out is loopback-only.
+        let imds: std::net::IpAddr = "169.254.169.254".parse().unwrap(); // cloud IMDS
+        let rfc1918: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        for allowed in [false, true] {
+            assert!(
+                resolved_ip_is_blocked(&imds, false, allowed),
+                "link-local IMDS must be blocked even with localhost allowed"
+            );
+            assert!(
+                resolved_ip_is_blocked(&rfc1918, false, allowed),
+                "RFC1918 private IP must be blocked even with localhost allowed"
+            );
+        }
+        // But an approved private domain may reach a private (non-loopback) IP.
+        assert!(!resolved_ip_is_blocked(&rfc1918, true, false));
+
+        // Public IPs are never blocked by this gate.
+        let public: std::net::IpAddr = "93.184.216.34".parse().unwrap();
+        assert!(!resolved_ip_is_blocked(&public, false, false));
     }
 
     #[test]

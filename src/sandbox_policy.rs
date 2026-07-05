@@ -122,6 +122,11 @@ pub(super) const TOOL_READ_DIRS: &[&str] = &[
 /// Vars matching a prefix allowlist entry BUT also matching one of these
 /// suffixes are stripped — deny wins. Prevents `YARN_NPM_AUTH_TOKEN`,
 /// `COPILOT_SECRET_KEY`, etc. from leaking through broad prefix rules.
+///
+/// `_IDENT` is included because Yarn Berry's `YARN_NPM_AUTH_IDENT` holds a
+/// base64-encoded `user:password` registry credential; without this suffix it
+/// would pass through the `YARN_` prefix allowlist and leak to the sandboxed
+/// agent in default sanitized mode.
 const ENV_PREFIX_DENY_SUFFIXES: &[&str] = &[
     "_TOKEN",
     "_AUTH",
@@ -130,6 +135,7 @@ const ENV_PREFIX_DENY_SUFFIXES: &[&str] = &[
     "_KEY",
     "_PASSWORD",
     "_CREDENTIALS",
+    "_IDENT",
 ];
 
 /// Check if a var name looks like a secret based on its suffix.

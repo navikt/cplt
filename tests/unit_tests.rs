@@ -3345,6 +3345,29 @@ fn env_prefix_denies_secret_suffixes() {
 }
 
 #[test]
+fn env_yarn_npm_auth_ident_is_stripped() {
+    // Yarn Berry's YARN_NPM_AUTH_IDENT is a base64 `user:password` registry
+    // credential. It must be stripped by the _IDENT deny-suffix even though the
+    // YARN_ prefix is allowlisted, while benign YARN_ config vars still pass.
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("PATH", "/usr/bin"),
+        ("YARN_NPM_AUTH_IDENT", "dXNlcjpwYXNzd29yZA=="),
+        ("YARN_CACHE_FOLDER", "/some/cache"),
+    ]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+
+    assert!(
+        !env.vars.iter().any(|(k, _)| k == "YARN_NPM_AUTH_IDENT"),
+        "YARN_NPM_AUTH_IDENT (base64 user:pass) must not leak through YARN_ prefix"
+    );
+    assert!(
+        env.vars.iter().any(|(k, _)| k == "YARN_CACHE_FOLDER"),
+        "benign YARN_ config var should still pass through"
+    );
+}
+
+#[test]
 fn env_explicit_allowlist_bypasses_suffix_deny() {
     // GH_TOKEN and GITHUB_TOKEN are in the explicit ENV_ALLOWLIST and must pass
     // through even though they end in _TOKEN.
