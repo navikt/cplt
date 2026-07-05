@@ -178,14 +178,20 @@ pub(crate) fn test_functionality(
 ///
 /// 5. Finally, for every path in `ro_protect` that exists, `--ro-bind <p> <p>`
 ///    is emitted *after* the writable binds so it shadows them read-only. This
-///    is the Finding 1 persistence mitigation: the project's `.git/hooks` (and
-///    the other git-persistence files macOS denies) live inside the writable
-///    project tree, which Landlock cannot carve a sub-deny out of. A read-only
-///    bwrap mount restores parity — an agent can no longer plant a hook that
-///    runs unsandboxed on the next `git` invocation. Only paths that already
-///    exist are bound (bwrap errors on a missing bind source, and a read-only
-///    bind cannot protect a path the attacker would have to *create* — that
-///    residual is documented in SECURITY.md).
+///    is the Finding 1 persistence mitigation: the project's `.git/hooks` lives
+///    inside the writable project tree, which Landlock cannot carve a sub-deny
+///    out of. A read-only bwrap mount restores parity — an agent can no longer
+///    plant a hook file that runs unsandboxed on the next `git` invocation. The
+///    protected set is deliberately narrow (`.git/hooks`, `.cplt.toml`) — see
+///    [`git_persistence_paths`] for why `.git/config`/`.gitmodules` are left
+///    writable and for the `core.hooksPath` residual.
+///
+///    Two documented residuals: a read-only bind only protects paths that
+///    already **exist** at launch — bwrap errors on a missing bind source and
+///    cannot bind a nonexistent path, so a not-yet-created `.cplt.toml` can
+///    still be created by the agent; and submodule hooks
+///    (`.git/modules/<name>/hooks`) are not covered. Both are documented in
+///    SECURITY.md.
 pub(crate) fn build_bwrap_args(fs_rules: &[FsRule], ro_protect: &[PathBuf]) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -246,20 +252,39 @@ pub(crate) fn build_bwrap_args(fs_rules: &[FsRule], ro_protect: &[PathBuf]) -> V
     args
 }
 
-/// Project-internal paths that macOS write-denies for persistence prevention
-/// but Landlock cannot (they live inside the writable project tree). When
-/// Bubblewrap is active these are re-bound read-only. Only the ones that exist
-/// on disk are ultimately bound (see [`build_bwrap_args`]).
+/// Project-internal paths re-bound **read-only** when Bubblewrap is active, to
+/// restore the macOS write-deny parity that Landlock cannot express (they live
+/// inside the writable project tree, which Landlock cannot carve a sub-deny out
+/// of). Only paths that exist on disk are ultimately bound (see
+/// [`build_bwrap_args`]).
 ///
-/// Mirrors `sandbox_profile::emit_sensitive_project_denies` /
-/// `emit_git_hooks`: `.git/hooks` (persistence via planted hooks), `.git/config`
-/// (`core.hooksPath` / `insteadOf` hijack), `.gitmodules` (submodule supply
-/// chain), and `.cplt.toml` (the agent tampering with its own sandbox config).
+/// The set is deliberately **narrow** — only paths an agent has no legitimate
+/// reason to write *and* that are real persistence vectors:
+///
+/// - `.git/hooks` — the primary persistence escape. A planted hook runs
+///   *unsandboxed* on the next `git` invocation; agents do not normally write
+///   here.
+/// - `.cplt.toml` — relaxes the next session's sandbox; agents do not normally
+///   write it, and any `[propose]` block needs explicit trust approval anyway.
+///
+/// `.git/config` and `.gitmodules` are **deliberately left writable**: read-only
+/// binding them would break common, legitimate in-sandbox git operations
+/// (`git config user.email/user.name` identity setup — without it the next
+/// `git commit` fails "Please tell me who you are" — plus `git remote add`,
+/// `git push -u` upstream tracking, and `git submodule add`, which writes
+/// `.gitmodules`). Worse, git rewrites config via a `.git/config.lock` +
+/// rename-over-file; a denied write can leave a STALE `.git/config.lock` that
+/// blocks the user's *next* out-of-sandbox git. This also matches the git
+/// command guard, which explicitly allows `git config user.name`.
+///
+/// RESIDUAL: because `.git/config` stays writable, an agent can still set
+/// `core.hooksPath` to redirect hooks to a writable directory. The read-only
+/// `.git/hooks` bind therefore only mitigates the *direct* persistence vector
+/// (planting a hook file); it is not a complete closure of git-hook
+/// persistence. See SECURITY.md for the full residual discussion.
 pub(crate) fn git_persistence_paths(project_dir: &Path) -> Vec<PathBuf> {
     vec![
         project_dir.join(".git/hooks"),
-        project_dir.join(".git/config"),
-        project_dir.join(".gitmodules"),
         project_dir.join(".cplt.toml"),
     ]
 }
@@ -702,17 +727,60 @@ mod tests {
     }
 
     #[test]
+    fn ro_protect_set_is_narrow_and_leaves_git_config_writable() {
+        // The protected set is deliberately narrow: only .git/hooks and
+        // .cplt.toml. .git/config / .gitmodules must stay writable so legit
+        // in-sandbox git config/remote/submodule ops (and their lock files)
+        // are not broken — even when those files exist on disk.
+        let proj = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(proj.path().join(".git/hooks")).expect("create .git/hooks");
+        std::fs::write(proj.path().join(".git/config"), "").expect("create .git/config");
+        std::fs::write(proj.path().join(".gitmodules"), "").expect("create .gitmodules");
+        std::fs::write(proj.path().join(".cplt.toml"), "").expect("create .cplt.toml");
+
+        let proj_str = proj.path().to_string_lossy().into_owned();
+        let rules = vec![writable_rule(&proj_str)];
+        let ro = git_persistence_paths(proj.path());
+        let args = build_bwrap_args(&rules, &ro);
+
+        // .git/hooks and .cplt.toml are re-bound read-only.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--ro-bind"
+                    && w[1] == proj.path().join(".git/hooks").to_string_lossy()),
+            ".git/hooks must be re-bound read-only"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--ro-bind"
+                    && w[1] == proj.path().join(".cplt.toml").to_string_lossy()),
+            ".cplt.toml must be re-bound read-only"
+        );
+        // .git/config and .gitmodules are NOT re-bound (stay writable), even
+        // though both exist on disk — the narrowing, not the exists-check, is
+        // what leaves them out.
+        assert!(
+            !args.iter().any(|a| a.ends_with("/.git/config")),
+            ".git/config must NOT be re-bound read-only (would break git config/remote ops)"
+        );
+        assert!(
+            !args.iter().any(|a| a.ends_with("/.gitmodules")),
+            ".gitmodules must NOT be re-bound read-only (would break git submodule add)"
+        );
+    }
+
+    #[test]
     fn nonexistent_git_persistence_paths_are_skipped() {
         // A read-only bind of a missing path would make bwrap error (failing the
         // probe) and cannot protect a not-yet-created file anyway — skip it.
         let proj = tempfile::tempdir().expect("tempdir");
-        // No .git/hooks, .gitmodules, or .cplt.toml created.
+        // No .git/hooks or .cplt.toml created.
         let ro = git_persistence_paths(proj.path());
         let args = build_bwrap_args(&[], &ro);
         assert!(
             !args
                 .iter()
-                .any(|a| a.contains(".git/hooks") || a.contains(".gitmodules")),
+                .any(|a| a.contains(".git/hooks") || a.contains(".cplt.toml")),
             "missing git-persistence paths must not be bound"
         );
     }
