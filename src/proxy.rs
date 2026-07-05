@@ -812,13 +812,6 @@ fn resolve_locally(state: &ProxyState, host: &str, port: u16) -> Option<std::net
 /// `allow_private_domains` entry. This is the exact policy the direct-connect
 /// path enforces inline; the upstream-forward path reuses it so both modes
 /// treat a resolvable host identically.
-fn resolved_ip_blocked(state: &ProxyState, host: &str, socket_addr: &std::net::SocketAddr) -> bool {
-    let private_domains = state.get_private_domains();
-    is_private_ip(&socket_addr.ip())
-        && !is_domain_match(host, &private_domains)
-        && !socket_addr.ip().is_loopback()
-}
-
 fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // Parse host:port
     let (host, port) = match target.rsplit_once(':') {
@@ -922,7 +915,11 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         // Reaching such names is the intended purpose of upstream mode; the
         // hostname allow/block/port gates above still constrain it.
         if let Some(socket_addr) = resolve_locally(state, &host, port)
-            && resolved_ip_blocked(state, &host, &socket_addr)
+            && resolved_ip_is_blocked(
+                &socket_addr.ip(),
+                is_domain_match(&host, &state.get_private_domains()),
+                localhost_opt_in,
+            )
         {
             log_connection(
                 "CONNECT",
@@ -2611,6 +2608,8 @@ mod tests {
             "corp.internal → 10.0.0.5 (RFC1918, not allow-listed) must stay BLOCKED even with \
              --allow-localhost-any; localhost opt-in must not open private networks; got: {status}"
         );
+    }
+
     // ── Upstream proxy chaining ──────────────────────────────────────────
 
     #[test]
