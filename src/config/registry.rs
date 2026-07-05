@@ -107,6 +107,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "proxy",
+        key: "upstream",
+        value_type: ConfigValueType::Str,
+        dangerous: false,
+        default_display: "",
+        description: "Upstream (corporate) proxy URL to forward CONNECT tunnels through, e.g. \"http://corporate-proxy.example.com:8080\". cplt still enforces all domain filtering, logging, and port checks before forwarding. Optional basic-auth userinfo is supported; only the http scheme is supported.",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
         key: "allow_private_domains",
         value_type: ConfigValueType::StrArray,
         dangerous: false,

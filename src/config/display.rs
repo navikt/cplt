@@ -192,6 +192,9 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     if let Some(ref lf) = c.proxy.log_file {
         println!("{blue}[cplt]{nc}    log_file         = \"{lf}\"");
     }
+    if let Some(ref up) = c.proxy.upstream {
+        println!("{blue}[cplt]{nc}    upstream         = \"{up}\"");
+    }
     println!(
         "{blue}[cplt]{nc}    log_level        = \"{}\"{}",
         c.proxy.log_level.as_deref().unwrap_or("none"),

@@ -168,6 +168,13 @@ struct Cli {
     #[arg(long, value_name = "SECONDS")]
     proxy_timeout: Option<u64>,
 
+    /// Upstream (corporate) proxy to forward CONNECT tunnels through, e.g.
+    /// http://corporate-proxy.example.com:8080. cplt still enforces all domain
+    /// filtering, logging, and port checks BEFORE forwarding. Optional basic
+    /// auth: http://user:pass@host:8080. Only the http scheme is supported.
+    #[arg(long, value_name = "URL")]
+    proxy_upstream: Option<String>,
+
     /// Allow connections to this domain even if it resolves to a private/internal IP.
     /// Use for corporate intranet services such as internal MCP servers.
     /// Suffix matching: "intern.nav.no" covers all its subdomains.
@@ -1050,6 +1057,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
             None => None,
         },
         proxy_timeout: cli.proxy_timeout,
+        proxy_upstream: cli.proxy_upstream.clone(),
         allow_private_domains: cli.allow_private_domains.clone(),
         allow_read: cli_allow_read,
         allow_write: cli_allow_write,
@@ -1444,6 +1452,7 @@ fn start_proxy_if_enabled(
         log_file: resolved.proxy_log_file.clone(),
         log_level: resolved.proxy_log_level,
         timeout: resolved.proxy_timeout,
+        upstream: resolved.proxy_upstream.clone(),
     }) {
         Ok(handle) => {
             resolved.proxy_port = handle.port;

@@ -258,6 +258,13 @@ pub struct ProxyConfig {
     pub allow_private_domains: Option<Vec<String>>,
     /// Proxy read/write timeout in seconds (default: 60).
     pub timeout: Option<u64>,
+    /// Upstream (corporate) proxy URL to forward CONNECT tunnels through,
+    /// e.g. "http://corporate-proxy.example.com:8080". When set, cplt still
+    /// enforces ALL of its domain filtering, logging, and port checks first,
+    /// then forwards approved tunnels to this proxy instead of connecting
+    /// directly. Optional basic-auth userinfo is supported
+    /// ("http://user:pass@host:8080"); only the http scheme is supported.
+    pub upstream: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -431,6 +438,9 @@ pub struct Resolved {
     pub proxy_log_file: Option<PathBuf>,
     pub proxy_log_level: crate::proxy::ProxyLogLevel,
     pub proxy_timeout: std::time::Duration,
+    /// Parsed upstream (corporate) proxy to forward CONNECT tunnels through.
+    /// `None` = direct connections (unchanged behavior).
+    pub proxy_upstream: Option<crate::proxy::UpstreamProxy>,
     pub allow_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
@@ -478,6 +488,8 @@ pub struct CliFlags {
     pub proxy_log_file: Option<PathBuf>,
     pub proxy_log_level: Option<crate::proxy::ProxyLogLevel>,
     pub proxy_timeout: Option<u64>,
+    /// Upstream proxy URL from `--proxy-upstream` (unparsed; validated in merge).
+    pub proxy_upstream: Option<String>,
     pub allow_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,

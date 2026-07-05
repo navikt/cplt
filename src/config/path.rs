@@ -61,6 +61,11 @@ pub fn default_config_contents() -> String {
 # Use for corporate internal services, e.g. MCP servers on your company's intranet.
 # Suffix matching: "intern.nav.no" covers all its subdomains.
 # allow_private_domains = ["intern.nav.no"]
+# Upstream (corporate) proxy to forward CONNECT tunnels through. When set, cplt
+# keeps enforcing ALL of its domain filtering, logging, and port checks first,
+# then forwards approved tunnels to this proxy instead of connecting directly.
+# Optional basic auth: "http://user:pass@host:8080". Only the http scheme is supported.
+# upstream = "http://corporate-proxy.example.com:8080"
 
 # ─── Allowed paths ──────────────────────────────────────────
 # Additional paths the sandboxed process may access.

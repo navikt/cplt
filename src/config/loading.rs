@@ -114,6 +114,17 @@ impl Config {
         let proxy_timeout =
             std::time::Duration::from_secs(cli.proxy_timeout.or(self.proxy.timeout).unwrap_or(60));
 
+        // Upstream (corporate) proxy: CLI > config. Parse+validate the URL here so
+        // a malformed value fails config loading (fail-closed) rather than being
+        // silently ignored at connection time.
+        let proxy_upstream = match cli.proxy_upstream.or_else(|| self.proxy.upstream.clone()) {
+            Some(url) => Some(
+                crate::proxy::UpstreamProxy::parse(&url)
+                    .map_err(|e| ConfigError::Validation(format!("proxy.upstream: {e}")))?,
+            ),
+            None => None,
+        };
+
         // Allow private domains: merge CLI + config list, sort+dedup.
         // Validates that entries are non-empty (empty string would bypass private IP
         // check for all domains that match is_domain_match("", _), which is none — but
@@ -401,6 +412,7 @@ impl Config {
             proxy_log_file,
             proxy_log_level,
             proxy_timeout,
+            proxy_upstream,
             allow_private_domains,
             allow_read,
             allow_write,
@@ -676,6 +688,12 @@ impl Resolved {
                     "{blue}[cplt]{nc}    Private:       {yellow}allowed{nc}     {dim}{}{}",
                     self.allow_private_domains.join(", "),
                     nc
+                );
+            }
+            if let Some(ref up) = self.proxy_upstream {
+                eprintln!(
+                    "{blue}[cplt]{nc}    Upstream:      {green}on{nc}          {dim}{}:{}{nc}",
+                    up.host, up.port
                 );
             }
             if let Some(ref lf) = self.proxy_log_file {

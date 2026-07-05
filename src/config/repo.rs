@@ -80,6 +80,9 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
         ("proxy", "allowed_domains") => {
             "domain lists are machine-specific paths, not project policy"
         }
+        ("proxy", "upstream") => {
+            "the corporate proxy is machine/network-specific, not project policy"
+        }
         _ => "not supported in repo config",
     }
 }
