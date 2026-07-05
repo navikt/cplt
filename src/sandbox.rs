@@ -68,6 +68,10 @@ pub use landlock_mod::{
     FsAccess, FsRule, LandlockPolicy, NetRule, blocked_syscall_names, describe_policy,
     generate_policy,
 };
+// Kernel capability probe — used by integration tests (securityfs is
+// root-only on some hosts, so tests cannot read abi_version from there).
+#[cfg(target_os = "linux")]
+pub use landlock_mod::available_abi_version;
 
 // ── Platform-agnostic sandbox API ──────────────────────────────
 

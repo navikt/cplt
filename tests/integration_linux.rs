@@ -18,9 +18,11 @@ mod linux_tests {
     // ── Landlock ABI detection ─────────────────────────────────────
 
     fn landlock_abi_version() -> Option<u32> {
-        fs::read_to_string("/sys/kernel/security/landlock/abi_version")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
+        // Probe via the landlock_create_ruleset syscall (through the lib's
+        // check_availability), NOT /sys/kernel/security/landlock/abi_version:
+        // securityfs is root-only on GitHub Actions runners, so the file read
+        // reports "unavailable" on kernels where Landlock works fine.
+        cplt::sandbox::available_abi_version()
     }
 
     /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox

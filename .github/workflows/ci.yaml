@@ -142,7 +142,10 @@ jobs:
           if [ -r /sys/kernel/security/landlock/abi_version ]; then
             echo "Landlock ABI: $(cat /sys/kernel/security/landlock/abi_version)"
           else
-            echo "::warning::Landlock abi_version not readable"
+            # securityfs is root-only on GitHub runners; the tests probe the
+            # ABI via the landlock_create_ruleset syscall instead, so this is
+            # informational only.
+            echo "Landlock abi_version not readable via securityfs (expected on GitHub runners)"
           fi
 
           echo "bwrap: $(bwrap --version)"

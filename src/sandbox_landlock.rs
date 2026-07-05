@@ -773,6 +773,24 @@ pub fn describe_policy(policy: &LandlockPolicy) -> String {
 
 // ── Linux-only: Landlock kernel application ────────────────────
 
+/// Highest kernel-supported Landlock ABI as a plain version number.
+///
+/// Probes via ruleset creation (same as [`check_availability`]), not
+/// securityfs: `/sys/kernel/security/landlock/abi_version` is root-only on
+/// some hosts (e.g. GitHub Actions runners), so file-based probing
+/// under-reports availability.
+#[cfg(target_os = "linux")]
+pub fn available_abi_version() -> Option<u32> {
+    Some(match check_availability().ok()? {
+        ABI::V6 => 6,
+        ABI::V5 => 5,
+        ABI::V4 => 4,
+        ABI::V3 => 3,
+        ABI::V2 => 2,
+        _ => 1,
+    })
+}
+
 /// Check Landlock availability and return the highest supported ABI version.
 ///
 /// Probes the kernel by attempting to create a Ruleset for each ABI level
