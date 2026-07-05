@@ -1748,11 +1748,15 @@ mod tests {
         require_localhost_tcp!();
 
         // 0.0.0.0 is the unspecified address → is_private_ip() == true
-        // (is_unspecified), non-loopback, and connect() to it on a stream socket
-        // fails immediately (EADDRNOTAVAIL on macOS; on Linux it is treated as
-        // 127.0.0.1 and yields a prompt ECONNREFUSED since nothing is listening
-        // on this privileged port). The former 255.255.255.255 broadcast address
-        // had OS-dependent connect behavior that could hang for CONNECT_TIMEOUT.
+        // (is_unspecified). We assert only that the block was LIFTED (no 403);
+        // we deliberately do NOT assert the downstream connect outcome, because
+        // it is environment-dependent: connect(0.0.0.0) is refused on macOS but
+        // on Linux is treated as 127.0.0.1, which may connect successfully if a
+        // loopback listener happens to be running (the linux CI job runs a
+        // :443 listener for the proxy-forced enforcement test). The security
+        // property under test — allow_private_domains flips the decision — is
+        // proven by "not 403" here paired with the sibling test that returns 403
+        // for the same IP without the allow-list.
         let private_addr: std::net::IpAddr = "0.0.0.0".parse().unwrap();
         let resolver: ResolverFn = Arc::new(move |host: &str, port: u16| {
             if host == "corp.internal" {
@@ -1783,15 +1787,14 @@ mod tests {
         let status = proxy_connect(proxy.port, "corp.internal:443");
         proxy.shutdown();
 
-        // The guard was bypassed: the proxy proceeded to connect (and failed with
-        // 502) instead of returning the private-IP 403.
+        // The guard was bypassed: the proxy did NOT return the private-IP 403 and
+        // proceeded past the block. (Sibling test proxy_blocks_private_ip_...
+        // returns 403 for the same IP without the allow-list, so "not 403" is the
+        // differential that proves the allow-list, and only the allow-list,
+        // flipped the decision.)
         assert!(
             !status.contains("403"),
             "allow_private_domains must lift the private-IP block for corp.internal; got: {status}"
-        );
-        assert!(
-            status.contains("502"),
-            "with the block lifted, the unroutable upstream connect should fail with 502; got: {status}"
         );
     }
 
