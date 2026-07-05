@@ -6706,6 +6706,7 @@ paths = []
 
 [sandbox]
 agent = "copilot"
+preset = "standard"
 validate = true
 allow_env_files = false
 allow_localhost_any = false

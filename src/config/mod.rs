@@ -29,6 +29,6 @@ pub use repo::{RepoKeyTarget, repo_key_rejection_reason, repo_key_target, set_re
 pub use types::{
     AllowConfig, AuditConfig, CliFlags, Config, DenyConfig, EnforcementMode, FeatureToggle,
     GhGuardConfig, GhGuardPolicy, GitGuardConfig, GitGuardPolicy, GitPushRule, LoadedConfig,
-    ProxyConfig, Resolved, ResolvedPushRule, SandboxConfig, UnknownCommandPolicy,
+    Preset, ProxyConfig, Resolved, ResolvedPushRule, SandboxConfig, UnknownCommandPolicy,
 };
 pub use validation::{ConfigDiagnostic, DiagnosticLevel, validate_config};

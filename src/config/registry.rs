@@ -190,6 +190,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "preset",
+        value_type: ConfigValueType::Str,
+        dangerous: false,
+        default_display: "standard",
+        description: "Policy preset baseline for the five sandbox toggles: \"strict\", \"standard\" (default, no-op), \"permissive\", or \"full-trust\". Individual keys/flags override it.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "validate",
         value_type: ConfigValueType::Bool,
         dangerous: false,

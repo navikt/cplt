@@ -39,6 +39,12 @@ pub struct DenySection {
 }
 
 /// Expansive keys — relax the sandbox. Require user trust approval.
+///
+/// Note: policy presets (`sandbox.preset`) are intentionally NOT proposable
+/// here. A preset composes several dangerous permissions at once (docker, tmp
+/// exec, ...) into a single opaque baseline, which would defeat the per-key
+/// trust review. Repos must request individual keys so each is reviewed and
+/// trusted on its own. `deny_unknown_fields` rejects a stray `preset` key.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProposeSection {

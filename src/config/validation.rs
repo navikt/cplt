@@ -184,6 +184,13 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
 
     // Warn about dangerous settings
     if let Some(sandbox) = table.get("sandbox").and_then(|v| v.as_table()) {
+        if sandbox.get("preset").and_then(toml::Value::as_str) == Some("full-trust") {
+            diagnostics.push(ConfigDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "sandbox.preset = \"full-trust\": enables docker, env files, tmp exec, localhost, and lifecycle scripts (DANGEROUS)"
+                    .to_string(),
+            });
+        }
         if sandbox.get("inherit_env").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,

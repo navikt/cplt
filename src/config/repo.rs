@@ -55,6 +55,10 @@ pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
 /// Keys that are valid in repo config but rejected — provides clear error messages.
 pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
     match (key_info.section, key_info.key) {
+        ("sandbox", "preset") => {
+            "composes multiple dangerous permissions (docker, tmp exec, ...) — \
+             a repo must request individual keys so each can be reviewed and trusted"
+        }
         ("sandbox", "quiet") => "controls local CLI output, not project sandbox policy",
         ("sandbox", "validate") => "controls local validation behavior, not project policy",
         ("sandbox", "scratch_dir") => "controls local temp handling, not project policy",
