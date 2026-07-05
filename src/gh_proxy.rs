@@ -1469,6 +1469,33 @@ impl Default for GatePolicy {
     }
 }
 
+/// True if a `gh auth status` argument requests that the token be printed.
+///
+/// A naive exact match on `--show-token`/`-t` misses the equivalent spellings
+/// that gh (cobra/pflag) accepts, every one of which leaks the OAuth token:
+///   • `--show-token`       — canonical long form
+///   • `--show-token=true`  — long form with an attached boolean value
+///   • `-t`                 — short form
+///   • `-at` / `-ta`        — bundled single-dash boolean cluster (auth status
+///                            also accepts `-a`/`--active`, so shorthands combine)
+///
+/// A single-dash cluster containing `t` reveals the token; a `--`-prefixed long
+/// flag (e.g. `--tags`) is NOT a cluster and must never be treated as one, or the
+/// guard would misfire on unrelated flags. This check must stay conservative
+/// (fail closed): any credible spelling of the token flag has to be caught here
+/// because the POLICY table classifies `auth status` as a read-only Allow.
+fn arg_reveals_token(arg: &str) -> bool {
+    if arg == "--show-token" || arg.starts_with("--show-token=") {
+        return true;
+    }
+    // Single-dash short cluster (`-t`, `-at`, `-ta`, …) — explicitly NOT a
+    // `--long` flag, so `--tags` and friends are excluded.
+    if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
+        return arg[1..].contains('t');
+    }
+    false
+}
+
 /// Evaluate a full command and return a human-friendly verdict.
 ///
 /// This is the entry point used by the `gh-gate` subcommand.
@@ -1485,12 +1512,14 @@ pub fn gate(args: &[&str], project_dir: &Path, policy: &GatePolicy) -> Result<()
     // Two paths print the raw OAuth token:
     //   • `gh auth token`             — dedicated token printer
     //   • `gh auth status --show-token` / `-t` — prints the token alongside status
-    // The POLICY table classifies `auth status` as a read-only Allow, so the
-    // `--show-token`/`-t` variant must be caught here or it leaks the token with
-    // the default config. Plain `gh auth status` (no token flag) stays allowed.
+    // The POLICY table classifies `auth status` as a read-only Allow, so every
+    // spelling of the token flag (`--show-token`, `--show-token=true`, `-t`, and
+    // bundled `-at`/`-ta` clusters — see `arg_reveals_token`) must be caught here
+    // or it leaks the token with the default config. Plain `gh auth status` (no
+    // token flag) stays allowed.
     let reveals_token_via_status = cmd.command == "auth"
         && cmd.subcommand.as_deref() == Some("status")
-        && args.iter().any(|a| *a == "--show-token" || *a == "-t");
+        && args.iter().any(|a| arg_reveals_token(a));
     if policy.block_auth_token
         && cmd.command == "auth"
         && (cmd.subcommand.as_deref() == Some("token") || reveals_token_via_status)
@@ -1762,31 +1791,101 @@ fn refspec_target_branch(refspec: &str) -> &str {
     }
 }
 
-/// Detect `git` invocations that would change which repository a remote points at.
+/// The remote whose URL defines the enforced repository scope.
+///
+/// The gh-guard reads `git remote get-url origin` at gate time, so only mutations
+/// that create or retarget `origin` can bypass scope — management of other remotes
+/// (upstream, fork, …) is harmless and must stay allowed.
+const SCOPE_REMOTE: &str = "origin";
+
+/// `git remote add` flags that consume a following value (so the value is not
+/// mistaken for the remote name when locating the positional arguments).
+const REMOTE_ADD_VALUE_FLAGS: &[&str] = &["-t", "-m"];
+
+/// True if a `git remote <verb> …` invocation creates or retargets `origin`'s URL.
+///
+/// Only the verbs that can point `origin` at a new URL threaten scope integrity:
+///   • `set-url origin …` — rewrites origin's URL in place.
+///   • `add origin …`     — (re)creates origin pointing at the given URL.
+///   • `rename <x> origin` — promotes another remote to become `origin`.
+/// Non-origin forms (`add upstream`, `rename a b`, `set-url upstream`), plus
+/// `remove`/`rm` and read-only verbs, are left alone.
+fn remote_verb_retargets_origin(verb: &str, verb_args: &[&str]) -> bool {
+    let value_flags: &[&str] = if verb == "add" {
+        REMOTE_ADD_VALUE_FLAGS
+    } else {
+        &[]
+    };
+    // Positional (non-flag) tokens, skipping flags and any values they consume.
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < verb_args.len() {
+        let a = verb_args[i];
+        if a.starts_with('-') {
+            if value_flags.contains(&a) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        positionals.push(a);
+        i += 1;
+    }
+    match verb {
+        // `add`/`set-url`: the first positional is the remote name.
+        "add" | "set-url" => positionals.first().copied() == Some(SCOPE_REMOTE),
+        // `rename <old> <new>`: only promoting a remote *to* `origin` retargets scope.
+        "rename" => positionals.get(1).copied() == Some(SCOPE_REMOTE),
+        _ => false,
+    }
+}
+
+/// Detect `git` invocations that would change which repository the `origin` remote
+/// points at.
 ///
 /// The gh-guard derives the enforced repository scope by reading
-/// `git remote get-url origin` at gate time. If an agent can rewrite `origin`'s
-/// URL (or otherwise re-map remotes), it can retarget every "in-scope" operation
-/// to an arbitrary repository. So while the git guard is active, mutating a
-/// remote's URL is blocked. Read-only inspection (`git remote -v`,
-/// `git remote get-url origin`, `git config --get remote.origin.url`) is unaffected.
+/// `git remote get-url origin` at gate time. If an agent can create or rewrite
+/// `origin`'s URL (directly, or via git's URL-rewrite config), it can retarget
+/// every "in-scope" operation to an arbitrary repository. So while the git guard
+/// is active, mutating `origin`'s URL is blocked. Managing other remotes
+/// (`git remote add upstream …`, `rename`, `remove`) and read-only inspection
+/// (`git remote -v`, `git remote get-url origin`, `git config --get …`) are
+/// unaffected — those cannot redirect the scope source.
 fn is_remote_scope_mutation(sub: &str, sub_args: &[&str]) -> bool {
     match sub {
         "remote" => {
             // First non-flag token is the verb. No verb → list (read-only).
-            let verb = sub_args.iter().find(|a| !a.starts_with('-')).copied();
-            matches!(verb, Some("add" | "set-url" | "rename" | "remove" | "rm"))
+            let Some(verb_idx) = sub_args.iter().position(|a| !a.starts_with('-')) else {
+                return false;
+            };
+            let verb = sub_args[verb_idx];
+            if matches!(verb, "add" | "set-url" | "rename") {
+                remote_verb_retargets_origin(verb, &sub_args[verb_idx + 1..])
+            } else {
+                false
+            }
         }
         "config" => config_sets_remote_url(sub_args),
         _ => false,
     }
 }
 
-/// True if `git config` args write to a `remote.<name>.url` / `.pushurl` key.
+/// True if `git config` args write to a key that can redirect the enforced scope.
+///
+/// Two key families qualify, both of which persistently change where a github.com
+/// URL resolves:
+///   • `remote.origin.url` / `remote.origin.pushurl` — the scope is read from
+///     `origin`, so retargeting its URL is a direct bypass. Non-origin remote
+///     URLs (`remote.upstream.url`) are harmless and stay allowed.
+///   • `url.<base>.insteadOf` / `url.<base>.pushInsteadOf` — git's URL-rewrite
+///     rules silently redirect `fetch`/`pull`/`clone`/`push` transport for any
+///     matching URL, an equivalent transport-remap (code-injection) vector.
 ///
 /// Reads (`--get`, `--get-all`, `--get-regexp`, `--list`, and the bare
-/// `git config remote.origin.url` form that just prints the value) are allowed;
-/// only a key with a following value (a set) is treated as a scope mutation.
+/// `git config <key>` form that just prints the value) are allowed; only a key
+/// with a following value (a set) is treated as a scope mutation. Keys are matched
+/// case-insensitively, as git config key names are case-insensitive.
 fn config_sets_remote_url(sub_args: &[&str]) -> bool {
     const READ_FLAGS: &[&str] = &[
         "--get",
@@ -1804,7 +1903,11 @@ fn config_sets_remote_url(sub_args: &[&str]) -> bool {
     }
     for (idx, arg) in sub_args.iter().enumerate() {
         let key = arg.to_lowercase();
-        if key.starts_with("remote.") && (key.ends_with(".url") || key.ends_with(".pushurl")) {
+        let redirects_scope = key == "remote.origin.url"
+            || key == "remote.origin.pushurl"
+            || (key.starts_with("url.")
+                && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof")));
+        if redirects_scope {
             // A non-flag token after the key is the value → this is a write.
             return sub_args.get(idx + 1).is_some_and(|v| !v.starts_with('-'));
         }
@@ -3403,10 +3506,17 @@ mod tests {
         let policy = GatePolicy::default(); // block_auth_token = true
         assert!(gate(&["auth", "status", "--show-token"], dir, &policy).is_err());
         assert!(gate(&["auth", "status", "-t"], dir, &policy).is_err());
+        // pflag flag variants that bypass an exact-string match must be caught too.
+        assert!(gate(&["auth", "status", "--show-token=true"], dir, &policy).is_err());
+        assert!(gate(&["auth", "status", "-at"], dir, &policy).is_err()); // bundled -a -t
+        assert!(gate(&["auth", "status", "-ta"], dir, &policy).is_err()); // bundle, other order
         // `gh auth token` remains blocked.
         assert!(gate(&["auth", "token"], dir, &policy).is_err());
         // Plain `gh auth status` (no token flag) is still allowed.
         assert!(gate(&["auth", "status"], dir, &policy).is_ok());
+        // `-a`/`--active` alone (no token) and unrelated `--`-long flags must not misfire.
+        assert!(gate(&["auth", "status", "-a"], dir, &policy).is_ok());
+        assert!(gate(&["auth", "status", "--tags"], dir, &policy).is_ok());
 
         // When block_auth_token is disabled, --show-token is allowed.
         let unlocked = GatePolicy {
@@ -3454,9 +3564,10 @@ mod tests {
             )
             .is_err()
         );
+        // Re-creating `origin` pointing elsewhere is the same bypass.
         assert!(
             gate_git(
-                &["remote", "add", "evil", "https://github.com/evil/repo"],
+                &["remote", "add", "origin", "https://github.com/evil/repo"],
                 true,
                 true,
                 false,
@@ -3465,20 +3576,10 @@ mod tests {
             )
             .is_err()
         );
+        // Promoting another remote *to* `origin` retargets the scope source.
         assert!(
             gate_git(
-                &["remote", "rename", "origin", "up"],
-                true,
-                true,
-                false,
-                &[],
-                None
-            )
-            .is_err()
-        );
-        assert!(
-            gate_git(
-                &["remote", "remove", "origin"],
+                &["remote", "rename", "upstream", "origin"],
                 true,
                 true,
                 false,
@@ -3544,6 +3645,151 @@ mod tests {
         );
         // Unrelated config writes are unaffected.
         assert!(gate_git(&["config", "user.name", "x"], true, true, false, &[], None).is_ok());
+    }
+
+    // Finding 2: git's URL-rewrite keys (`url.<base>.insteadOf` /
+    // `pushInsteadOf`) persistently redirect where github.com URLs resolve, an
+    // equivalent transport-remap vector — they must be blocked like remote URL sets.
+    #[test]
+    fn git_config_insteadof_rewrite_blocked() {
+        // Setting an insteadOf / pushInsteadOf rewrite is blocked.
+        assert!(
+            gate_git(
+                &[
+                    "config",
+                    "url.https://evil/.insteadOf",
+                    "https://github.com/"
+                ],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &[
+                    "config",
+                    "url.https://evil/.pushInsteadOf",
+                    "https://github.com/"
+                ],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        // Reads of the same key stay allowed.
+        assert!(
+            gate_git(
+                &["config", "--get", "url.https://evil/.insteadOf"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        // Bare read form (prints the value) stays allowed.
+        assert!(
+            gate_git(
+                &["config", "url.https://evil/.insteadOf"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    // Finding 3: managing NON-origin remotes doesn't touch the scope source and
+    // must stay allowed; only mutations that create/retarget `origin` are blocked.
+    #[test]
+    fn git_nonorigin_remote_management_allowed() {
+        // Non-origin management: allowed (was previously over-blocked).
+        for args in [
+            &["remote", "add", "upstream", "https://github.com/other/repo"][..],
+            &["remote", "rename", "oldfork", "newfork"][..],
+            &["remote", "remove", "upstream"][..],
+            &["remote", "rm", "upstream"][..],
+            &[
+                "remote",
+                "set-url",
+                "upstream",
+                "https://github.com/other/repo",
+            ][..],
+            // Renaming origin away / removing origin can't redirect (re-adding
+            // origin is itself blocked), so it is allowed.
+            &["remote", "rename", "origin", "backup"][..],
+            &["remote", "remove", "origin"][..],
+            // Non-origin config URL sets are unrelated to scope.
+            &[
+                "config",
+                "remote.upstream.url",
+                "https://github.com/other/repo",
+            ][..],
+        ] {
+            assert!(
+                gate_git(args, true, true, false, &[], None).is_ok(),
+                "expected allowed: git {}",
+                args.join(" ")
+            );
+        }
+
+        // Origin-retargeting mutations: still blocked (scope-bypass prevention).
+        for args in [
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/evil/repo",
+            ][..],
+            &["remote", "add", "origin", "https://github.com/evil/repo"][..],
+            &["remote", "rename", "upstream", "origin"][..],
+        ] {
+            assert!(
+                gate_git(args, true, true, false, &[], None).is_err(),
+                "expected blocked: git {}",
+                args.join(" ")
+            );
+        }
+
+        // The origin-retarget block also holds under force-push-only policy,
+        // and still does not over-block non-origin management there.
+        assert!(
+            gate_git(
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://github.com/evil/repo"
+                ],
+                false,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &["remote", "add", "upstream", "https://github.com/other/repo"],
+                false,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
     }
 
     // Bug 3: a leading `+` on a refspec forces the update and must be recognized
