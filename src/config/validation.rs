@@ -1,71 +1,88 @@
 //! Unknown-key detection and typo suggestions.
+//!
+//! Valid key names are **derived from the serde structs** (via [`serde_ignored`])
+//! rather than hand-maintained string arrays: any key that does not map to a
+//! `Config` struct field is reported as unknown. Adding a new config option
+//! therefore only requires touching the struct definition — typos of it are
+//! flagged automatically, with no parallel list to keep in sync.
+//!
+//! Runtime loading stays forward-compatible: unknown keys are ignored (not a
+//! hard error) so configs can be shared across cplt versions, but they are
+//! surfaced as a warning at load time and as diagnostics in `cplt config validate`.
 
+use super::registry::CONFIG_KEYS;
 use super::types::Config;
 
 // ── Config validation (unknown key detection) ────────────────────────
 
-/// Valid keys for each TOML section. Used by `validate_config` to detect typos.
-const VALID_PROXY_KEYS: &[&str] = &[
-    "enabled",
-    "port",
-    "blocked_domains",
-    "allowed_domains",
-    "log_file",
-    "log_level",
-    "allow_private_domains",
-];
-const VALID_ALLOW_KEYS: &[&str] = &["read", "write", "socket", "ports", "localhost"];
-const VALID_DENY_KEYS: &[&str] = &["paths"];
-const VALID_SANDBOX_KEYS: &[&str] = &[
-    "agent",
-    "validate",
-    "allow_env_files",
-    "allow_localhost_any",
-    "pass_env",
-    "inherit_env",
-    "allow_lifecycle_scripts",
-    "allow_gpg_signing",
-    "allow_jvm_attach",
-    "allow_docker",
-    "allow_tmp_exec",
-    "scratch_dir",
-    "use_bubblewrap",
-    "quiet",
-    "allow_cache_exec",
-    "allow_cache_exec_any",
-    "allow_browser",
-    // Deprecated — use [gh_guard] and [git_guard] sections instead.
-    "gh_proxy",
-    "git_push_prevention",
-];
-const VALID_GH_GUARD_KEYS: &[&str] = &[
-    "enabled",
-    "mode",
-    "scope_check",
-    "block_auth_token",
-    "inject_token",
-    "unknown_command",
-    "allow_api_write",
-];
-const VALID_GIT_GUARD_KEYS: &[&str] = &[
-    "enabled",
-    "mode",
-    "prevent_push",
-    "prevent_force_push",
-    "protect_default_branch_only",
-    "allow_push",
-];
-const VALID_AUDIT_KEYS: &[&str] = &["enabled", "destination", "level", "format"];
-const VALID_SECTIONS: &[&str] = &[
-    "proxy",
-    "allow",
-    "deny",
-    "sandbox",
-    "gh_guard",
-    "git_guard",
-    "audit",
-    "config_version",
-];
+/// Top-level scalar keys that are valid but not TOML sections.
+const TOP_LEVEL_SCALARS: &[&str] = &["config_version"];
+
+/// Deserialize a user `Config` from TOML while collecting the dotted paths of
+/// any keys that do not correspond to a struct field (unknown/misspelled keys).
+///
+/// This is the single source of truth for "is this key known?": validity is
+/// derived from the `#[derive(Deserialize)]` structs, so there is no key list
+/// to keep in sync. Unknown keys are collected, **not** rejected — callers
+/// decide whether to warn (forward-compatible load) or error (`config validate`).
+pub(super) fn deserialize_collecting_unknowns(
+    toml_text: &str,
+) -> Result<(Config, Vec<String>), toml::de::Error> {
+    let de = toml::Deserializer::parse(toml_text)?;
+    let mut ignored = Vec::new();
+    let config = serde_ignored::deserialize(de, |path| {
+        ignored.push(path.to_string());
+    })?;
+    Ok((config, ignored))
+}
+
+/// The distinct `[section]` names known to the config, derived from the registry.
+fn known_sections() -> Vec<&'static str> {
+    let mut sections = Vec::new();
+    for info in CONFIG_KEYS {
+        if !sections.contains(&info.section) {
+            sections.push(info.section);
+        }
+    }
+    sections
+}
+
+/// Valid keys within a given section, derived from the registry.
+fn section_keys(section: &str) -> Vec<&'static str> {
+    CONFIG_KEYS
+        .iter()
+        .filter(|info| info.section == section)
+        .map(|info| info.key)
+        .collect()
+}
+
+/// Valid top-level keys (section names plus top-level scalars like `config_version`).
+fn top_level_keys() -> Vec<&'static str> {
+    let mut keys = known_sections();
+    keys.extend_from_slice(TOP_LEVEL_SCALARS);
+    keys
+}
+
+/// Build a human-readable message for an unknown key path (e.g. `sandbox.inherit_evn`),
+/// including a "did you mean 'x'?" suggestion derived from the registry.
+///
+/// Candidate keys for the suggestion come from `CONFIG_KEYS`, so suggestions
+/// automatically cover any option present in the registry.
+pub(super) fn describe_unknown_key(path: &str) -> String {
+    if let Some((section, key)) = path.split_once('.') {
+        let candidates = section_keys(section);
+        let hint = suggest_key(key, &candidates)
+            .map(|s| format!(" (did you mean '{s}'?)"))
+            .unwrap_or_default();
+        format!("unknown key '{key}' in [{section}]{hint}")
+    } else {
+        let candidates = top_level_keys();
+        let hint = suggest_key(path, &candidates)
+            .map(|s| format!(" (did you mean '{s}'?)"))
+            .unwrap_or_default();
+        format!("unknown top-level key '{path}'{hint}")
+    }
+}
 
 /// A single validation diagnostic.
 #[derive(Debug)]
@@ -111,39 +128,47 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
         }
     };
 
-    // Check top-level keys (should all be known sections or scalar keys)
-    for key in table.keys() {
-        if !VALID_SECTIONS.contains(&key.as_str()) {
-            let suggestion = suggest_key(key, VALID_SECTIONS);
-            let hint = suggestion
-                .map(|s| format!(" (did you mean '{s}'?)"))
-                .unwrap_or_default();
+    // Structural check: a known section must be a table, not a scalar.
+    // This gives a clearer message than the raw serde type error below.
+    for section in known_sections() {
+        if let Some(value) = table.get(section)
+            && !value.is_table()
+        {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Error,
-                message: format!("unknown top-level key '{key}'{hint}"),
+                message: format!(
+                    "[{section}] must be a table, not a {}",
+                    value_type_name(value)
+                ),
             });
         }
     }
 
-    // Check keys within each known section
-    check_section_keys(&table, "proxy", VALID_PROXY_KEYS, &mut diagnostics);
-    check_section_keys(&table, "allow", VALID_ALLOW_KEYS, &mut diagnostics);
-    check_section_keys(&table, "deny", VALID_DENY_KEYS, &mut diagnostics);
-    check_section_keys(&table, "sandbox", VALID_SANDBOX_KEYS, &mut diagnostics);
-    check_section_keys(&table, "gh_guard", VALID_GH_GUARD_KEYS, &mut diagnostics);
-    check_section_keys(&table, "git_guard", VALID_GIT_GUARD_KEYS, &mut diagnostics);
-    check_section_keys(&table, "audit", VALID_AUDIT_KEYS, &mut diagnostics);
-
-    // Also verify it deserializes correctly (catches type errors)
-    if diagnostics
-        .iter()
-        .all(|d| d.level != DiagnosticLevel::Error)
-        && let Err(e) = toml::from_str::<Config>(toml_text)
-    {
-        diagnostics.push(ConfigDiagnostic {
-            level: DiagnosticLevel::Error,
-            message: format!("type error: {e}"),
-        });
+    // Unknown/misspelled keys and type errors: derive validity from the structs
+    // via serde_ignored. Unknown keys are collected (not fatal); a type error
+    // aborts deserialization and is reported as such.
+    match deserialize_collecting_unknowns(toml_text) {
+        Ok((_config, unknown_keys)) => {
+            for path in unknown_keys {
+                diagnostics.push(ConfigDiagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: describe_unknown_key(&path),
+                });
+            }
+        }
+        Err(e) => {
+            // A section-as-scalar error is already reported above with a nicer
+            // message — don't double-report it as a generic type error.
+            if diagnostics
+                .iter()
+                .all(|d| d.level != DiagnosticLevel::Error)
+            {
+                diagnostics.push(ConfigDiagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("type error: {e}"),
+                });
+            }
+        }
     }
 
     // Warn about dangerous settings
@@ -194,40 +219,6 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
     }
 
     diagnostics
-}
-
-fn check_section_keys(
-    table: &toml::Table,
-    section: &str,
-    valid_keys: &[&str],
-    diagnostics: &mut Vec<ConfigDiagnostic>,
-) {
-    let Some(section_value) = table.get(section) else {
-        return;
-    };
-    let Some(section_table) = section_value.as_table() else {
-        diagnostics.push(ConfigDiagnostic {
-            level: DiagnosticLevel::Error,
-            message: format!(
-                "[{section}] must be a table, not a {}",
-                value_type_name(section_value)
-            ),
-        });
-        return;
-    };
-
-    for key in section_table.keys() {
-        if !valid_keys.contains(&key.as_str()) {
-            let suggestion = suggest_key(key, valid_keys);
-            let hint = suggestion
-                .map(|s| format!(" (did you mean '{s}'?)"))
-                .unwrap_or_default();
-            diagnostics.push(ConfigDiagnostic {
-                level: DiagnosticLevel::Error,
-                message: format!("unknown key '{key}' in [{section}]{hint}"),
-            });
-        }
-    }
 }
 
 /// Suggest the closest valid key using simple edit distance.
@@ -287,7 +278,6 @@ fn value_type_name(v: &toml::Value) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::path::default_config_contents;
-    use crate::config::registry::CONFIG_KEYS;
 
     #[test]
     fn validate_valid_config_no_diagnostics() {
@@ -451,47 +441,55 @@ quiet = false
         );
     }
 
-    /// Ensures every valid sandbox/allow key has a CONFIG_KEYS entry and is
-    /// mentioned in the default config template. Catches forgotten docs when
-    /// adding new config options.
+    /// Forward compatibility: a config using a section/key that this cplt
+    /// version does not know about must still LOAD successfully (unknown keys
+    /// are ignored, not fatal) — users share configs across cplt versions.
     #[test]
-    fn config_keys_cover_all_valid_keys() {
-        let template = default_config_contents();
+    fn future_unknown_section_still_loads() {
+        let toml = "
+[sandbox]
+quiet = true
 
-        // Every sandbox key must have a CONFIG_KEYS entry
-        for &key in VALID_SANDBOX_KEYS {
-            let has_entry = CONFIG_KEYS
-                .iter()
-                .any(|k| k.section == "sandbox" && k.key == key);
-            assert!(
-                has_entry,
-                "VALID_SANDBOX_KEYS contains '{key}' but CONFIG_KEYS has no sandbox.{key} entry"
-            );
-        }
+[future_feature]
+some_new_option = true
+";
+        // Deserialization must succeed and yield the known values...
+        let (config, unknown) = deserialize_collecting_unknowns(toml).unwrap();
+        assert_eq!(config.sandbox.quiet, Some(true));
+        // ...while still surfacing the unknown top-level section.
+        assert!(
+            unknown.iter().any(|p| p == "future_feature"),
+            "unknown section should be collected: {unknown:?}"
+        );
+    }
 
-        // Every sandbox key must appear in the default config template
-        // (except deprecated keys that are documented in their own sections)
-        const DEPRECATED_SANDBOX_KEYS: &[&str] = &["gh_proxy", "git_push_prevention"];
-        for &key in VALID_SANDBOX_KEYS {
-            if DEPRECATED_SANDBOX_KEYS.contains(&key) {
-                continue;
-            }
-            assert!(
-                template.contains(key),
-                "VALID_SANDBOX_KEYS contains '{key}' but default_config_contents() does not mention it"
-            );
-        }
+    /// A brand-new struct field is auto-covered: because validity is derived
+    /// from the structs, a real field (`sandbox.yes`) is never flagged even
+    /// though no hand-maintained key list mentions it. This is the regression
+    /// the old VALID_*_KEYS arrays were prone to (they omitted `yes`).
+    #[test]
+    fn valid_struct_field_not_flagged_as_unknown() {
+        let toml = "[sandbox]\nyes = true\n";
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics.is_empty(),
+            "a real struct field must not be flagged: {diagnostics:?}"
+        );
+    }
 
-        // Every allow key must have a CONFIG_KEYS entry
-        for &key in VALID_ALLOW_KEYS {
-            let has_entry = CONFIG_KEYS
-                .iter()
-                .any(|k| k.section == "allow" && k.key == key);
-            assert!(
-                has_entry,
-                "VALID_ALLOW_KEYS contains '{key}' but CONFIG_KEYS has no allow.{key} entry"
-            );
-        }
+    /// Unknown nested key is reported with its `section.key` context.
+    #[test]
+    fn validate_detects_unknown_nested_key() {
+        let toml = "[gh_guard]\nenabled = true\nbogus_option = true\n";
+        let diagnostics = validate_config(toml);
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.level == DiagnosticLevel::Error
+                    && d.message.contains("unknown key 'bogus_option'")
+                    && d.message.contains("[gh_guard]")
+            }),
+            "should detect unknown nested key with section context: {diagnostics:?}"
+        );
     }
 
     #[test]

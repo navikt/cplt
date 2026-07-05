@@ -4852,11 +4852,12 @@ fn validate_catches_typo_in_sandbox_key() {
 #[test]
 fn validate_catches_unknown_proxy_key() {
     use cplt::config::{DiagnosticLevel, validate_config};
-    let diagnostics = validate_config("[proxy]\nenabled = true\ntimeout = 30\n");
+    // `tiemout` is a typo of the real `timeout` field — it must be flagged.
+    let diagnostics = validate_config("[proxy]\nenabled = true\ntiemout = 30\n");
     assert!(
         diagnostics
             .iter()
-            .any(|d| { d.level == DiagnosticLevel::Error && d.message.contains("timeout") })
+            .any(|d| { d.level == DiagnosticLevel::Error && d.message.contains("tiemout") })
     );
 }
 

@@ -35,10 +35,23 @@ impl Config {
             }
         };
 
-        let config: Config = toml::from_str(&raw).map_err(|e| ConfigError::TomlParse {
-            path: path.display().to_string(),
-            source: e,
-        })?;
+        // Forward-compatible load: unknown keys (e.g. options from a newer cplt
+        // version, or typos) are collected and warned about but do NOT fail the
+        // load. Validity is derived from the struct definitions via serde_ignored,
+        // so there is no key list to keep in sync with the config schema.
+        let (config, unknown_keys) = super::validation::deserialize_collecting_unknowns(&raw)
+            .map_err(|e| ConfigError::TomlParse {
+                path: path.display().to_string(),
+                source: e,
+            })?;
+
+        for key_path in &unknown_keys {
+            ui::warn(&format!(
+                "{} in {} (ignored)",
+                super::validation::describe_unknown_key(key_path),
+                path.display()
+            ));
+        }
 
         Ok(Some(LoadedConfig { config, path, raw }))
     }
