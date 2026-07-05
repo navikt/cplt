@@ -1648,6 +1648,62 @@ else:
         );
     }
 
+    /// The distinguishing guarantee of `--proxy-forced` on Linux, observed
+    /// end-to-end: port 443 is allowed by the DEFAULT policy but DROPPED under
+    /// forced mode, so a direct connect to `:443` (bypassing the proxy) is
+    /// kernel-blocked only when forced. Unlike the smoke test above (which uses a
+    /// fresh ephemeral port that is blocked in both modes and so proves nothing
+    /// about the 443 drop), this exercises the actual behavioral delta.
+    ///
+    /// Observing it needs a listener on the privileged port 443, which CI sets up
+    /// (`CPLT_TEST_PRIV_443=1`, backed by a real 127.0.0.1:443 listener). Locally
+    /// it self-skips; under `CPLT_TEST_REQUIRE_SANDBOX=1` a missing listener FAILS
+    /// so a CI-setup regression can't silently drop this coverage.
+    #[test]
+    fn proxy_forced_kernel_blocks_direct_443() {
+        require_landlock!(4); // TCP-connect rules require Landlock ABI v4 (kernel 6.7+)
+
+        if std::env::var("CPLT_TEST_PRIV_443").as_deref() != Ok("1") {
+            assert!(
+                !require_sandbox_enforced(),
+                "CPLT_TEST_PRIV_443 required by CPLT_TEST_REQUIRE_SANDBOX but the \
+                 privileged 127.0.0.1:443 listener was not set up"
+            );
+            eprintln!("SKIPPED: no privileged 127.0.0.1:443 listener (CPLT_TEST_PRIV_443 unset)");
+            return;
+        }
+
+        // The listener must be reachable from OUTSIDE the sandbox, else the
+        // differential below is meaningless — fail loudly rather than skip.
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &"127.0.0.1:443".parse().unwrap(),
+                std::time::Duration::from_secs(2),
+            )
+            .is_ok(),
+            "CPLT_TEST_PRIV_443=1 but 127.0.0.1:443 is not reachable — CI listener setup is broken"
+        );
+
+        let project = create_test_project();
+        // Raw connect to :443, bypassing any proxy env var. Reports CONNECTED or BLOCKED.
+        let probe = "if echo > /dev/tcp/127.0.0.1/443 2>/dev/null; then echo CONNECTED; else echo BLOCKED; fi";
+
+        // Default policy allows port 443 → the direct connect SUCCEEDS.
+        let (_, out_default, err_default) = run_sandboxed(project.path(), probe);
+        assert!(
+            out_default.contains("CONNECTED"),
+            "default policy allows :443 — expected CONNECTED (control), stdout: {out_default}, stderr: {err_default}"
+        );
+
+        // --proxy-forced drops the 443 allow → the direct connect is Landlock-BLOCKED.
+        let (_, out_forced, err_forced) =
+            run_sandboxed_with_flags(project.path(), &["--proxy-forced"], probe);
+        assert!(
+            out_forced.contains("BLOCKED") && !out_forced.contains("CONNECTED"),
+            "--proxy-forced must kernel-block a direct :443 connect — stdout: {out_forced}, stderr: {err_forced}"
+        );
+    }
+
     /// Sanity: `--proxy-forced` must not be accidentally over-restrictive. In-
     /// sandbox filesystem work (write then read a project-local file) must still
     /// succeed — the mode only tightens network egress, not the filesystem rules.

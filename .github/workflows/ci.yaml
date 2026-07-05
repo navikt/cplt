@@ -171,14 +171,54 @@ jobs:
             /bin/true
           echo "bwrap functional probe: OK"
 
+      - name: Start privileged 127.0.0.1:443 listener (proxy-forced enforcement e2e)
+        # --proxy-forced drops the Landlock :443 allow. A listener on the
+        # privileged port 443 lets proxy_forced_kernel_blocks_direct_443 OBSERVE
+        # that a direct :443 connect is kernel-blocked under forced mode but
+        # allowed by default — a fully local, hermetic differential (no external
+        # network). Runs as a transient systemd unit so it survives to the test
+        # step; binding :443 needs root (runners have passwordless sudo).
+        run: |
+          cat > /tmp/listen443.py <<'PY'
+          import socket
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(("127.0.0.1", 443))
+          s.listen(128)
+          while True:
+              c, _ = s.accept()
+              try:
+                  c.sendall(b"HELLO443\n")
+              finally:
+                  c.close()
+          PY
+          sudo systemd-run --unit=cplt-e2e-443 --collect python3 -u /tmp/listen443.py
+          # Wait until reachable; fail the step (not the test) if it never binds.
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/443) 2>/dev/null; then
+              echo "127.0.0.1:443 listener up"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "::error::127.0.0.1:443 listener did not come up"
+          sudo journalctl -u cplt-e2e-443 --no-pager | tail -20 || true
+          exit 1
+
       - name: Run all Linux tests (skips fail the job)
         # CPLT_TEST_REQUIRE_SANDBOX=1 makes require_landlock!/require_bwrap!/
         # require_curl! panic instead of skip, so a missing capability (e.g.
         # bubblewrap uninstalled — issue #113) turns this job red rather than
-        # silently passing.
+        # silently passing. CPLT_TEST_PRIV_443=1 tells the proxy-forced
+        # enforcement test that the privileged :443 listener above is available,
+        # so it runs (and, under require-mode, fails if the listener is missing).
         env:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
+          CPLT_TEST_PRIV_443: "1"
         run: cargo test --verbose
+
+      - name: Stop 127.0.0.1:443 listener
+        if: always()
+        run: sudo systemctl stop cplt-e2e-443 2>/dev/null || true
 
       - name: Assert working tree is clean (no leaked test artifacts)
         run: |
