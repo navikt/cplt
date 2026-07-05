@@ -157,6 +157,13 @@ pub fn default_config_contents() -> String {
 # Cleaned up automatically on exit.
 # scratch_dir = true
 #
+# Linux only: wrap the sandbox in Bubblewrap namespaces for defense-in-depth
+# (PID/IPC/UTS/cgroup/user namespaces plus a private /tmp). The host network
+# is shared so the filtering proxy keeps working. Unset = auto-detect: uses
+# bwrap when installed, falls back to Landlock + seccomp-BPF otherwise.
+# Set false to never use bwrap, true to require it (error if missing).
+# use_bubblewrap = true
+#
 # DANGEROUS: Allow process execution from system temp directories.
 # Re-enables exec from /tmp (Linux) or /private/tmp, /private/var/folders (macOS).
 # Prefer scratch_dir which creates a controlled executable temp dir.

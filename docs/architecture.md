@@ -56,6 +56,7 @@ src/
   sandbox_env.rs       Sandbox environment variable construction.
   sandbox_exec.rs      Process execution, signal forwarding.
   sandbox_landlock.rs  Landlock LSM + seccomp-BPF (Linux).
+  sandbox_bubblewrap.rs Optional Bubblewrap namespace layer + in-namespace re-entry helper (Linux).
   discover.rs          Runtime probing (--doctor), tool/auth discovery.
   proxy.rs + proxy/    CONNECT proxy, domain blocking, audit log.
   scratch.rs           Per-session scratch directory, TMPDIR redirect.

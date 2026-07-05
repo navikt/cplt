@@ -29,6 +29,7 @@ const VALID_SANDBOX_KEYS: &[&str] = &[
     "allow_docker",
     "allow_tmp_exec",
     "scratch_dir",
+    "use_bubblewrap",
     "quiet",
     "allow_cache_exec",
     "allow_cache_exec_any",

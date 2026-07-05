@@ -53,6 +53,7 @@ See [SECURITY.md](../SECURITY.md) for the full threat model and honest gaps.
 - **Some macOS flags are not applicable** — `--allow-docker`, `--allow-jvm-attach`, `--allow-cache-exec` emit warnings and are ignored on Linux
 - **No audit logs** — `--show-denials` is macOS-only; use `strace -f -e trace=file,network` for debugging
 - **Auth scoped to env + gh CLI** — no D-Bus/Secret Service integration for v1
+- **Bubblewrap layer is optional defense-in-depth** — when `bwrap` is installed (or `--use-bubblewrap`/`sandbox.use_bubblewrap` is set), the sandbox additionally gets PID/IPC/UTS/cgroup/user namespaces and a private `/tmp`; Landlock + seccomp are applied inside the namespaces by a fail-closed re-entry helper (the agent can never run unsandboxed). It does **not** add a network namespace (host network is shared so the filtering proxy keeps working — kernel-level network isolation is tracked in [#114](https://github.com/navikt/cplt/issues/114)) and does not hide the host filesystem (visible read-only; Landlock controls access). Auto-detect falls back to Landlock-only with a warning if bwrap is missing or non-functional
 
 ### Both platforms
 

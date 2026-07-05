@@ -365,9 +365,10 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
     no_git_guard: bool,
 
     /// Use Bubblewrap for namespace isolation on Linux (auto-detect if not specified).
-    /// Provides defense-in-depth: PID, mount, network, and user namespaces on top
-    /// of Landlock + seccomp-BPF. Falls back to Landlock+seccomp if bwrap unavailable.
-    /// Only effective on Linux — ignored on macOS.
+    /// Provides defense-in-depth: PID, mount, IPC, UTS, cgroup, and user namespaces
+    /// plus a private /tmp, on top of Landlock + seccomp-BPF. The host network is
+    /// shared so proxy-based filtering keeps working. Falls back to Landlock+seccomp
+    /// if bwrap is unavailable. Only effective on Linux — ignored on macOS.
     #[arg(long)]
     use_bubblewrap: bool,
 

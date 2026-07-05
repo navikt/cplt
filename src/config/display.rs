@@ -320,6 +320,13 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         scratch,
         src(c.sandbox.scratch_dir.is_some())
     );
+    match c.sandbox.use_bubblewrap {
+        Some(v) => println!(
+            "{blue}[cplt]{nc}    use_bubblewrap        = {v}{}",
+            src(true)
+        ),
+        None => println!("{blue}[cplt]{nc}    use_bubblewrap        = auto-detect"),
+    }
     let quiet = c.sandbox.quiet.unwrap_or(false);
     println!(
         "{blue}[cplt]{nc}    quiet                 = {}{}",

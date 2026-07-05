@@ -72,6 +72,7 @@ with an explanation — set them in `~/.config/cplt/config.toml` instead:
 | `sandbox.yes` | local prompt-skip preference |
 | `sandbox.validate` | local launch behavior |
 | `sandbox.scratch_dir` | local temp handling |
+| `sandbox.use_bubblewrap` | depends on bwrap being installed on the machine |
 | `sandbox.pass_env` | machine-specific env passthrough |
 | `sandbox.inherit_env` | local debug-only behavior |
 | `sandbox.allow_cache_exec` | cache paths differ per machine |

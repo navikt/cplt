@@ -246,6 +246,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "use_bubblewrap",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "auto-detect",
+        description: "Linux only: wrap the sandbox in Bubblewrap namespaces (PID/IPC/UTS/cgroup/user + private /tmp) for defense-in-depth. Unset = auto-detect with fallback to Landlock-only.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "quiet",
         value_type: ConfigValueType::Bool,
         dangerous: false,
