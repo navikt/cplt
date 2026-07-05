@@ -447,6 +447,33 @@ impl Resolved {
         disabled
     }
 
+    /// Reject option combinations that would silently defeat proxy-forced mode.
+    ///
+    /// Security-critical (#53): `proxy_forced` locks kernel egress to the proxy
+    /// port (Linux drops the default `*:443` Landlock allow; macOS SBPL pins
+    /// `localhost:<proxy_port>`). `allow_localhost_any`, by contrast, disables
+    /// kernel-level TCP-connect restriction *entirely* — Landlock net rules are
+    /// port-based and cannot pin localhost, so the only way to honor
+    /// "any localhost port" is to stop restricting connect altogether. The two
+    /// are mutually exclusive: enforcing both would leave direct egress to any
+    /// `host:443` wide open under the exact flag whose purpose is to close it,
+    /// with no warning. Fail closed with a clear error instead of silently
+    /// downgrading — this must fire for the RESOLVED value regardless of whether
+    /// `allow_localhost_any` came from CLI, user config, or an approved repo
+    /// proposal (so call this AFTER `apply_repo_config`).
+    pub fn check_proxy_forced_conflicts(&self) -> Result<(), String> {
+        if self.proxy_forced && self.allow_localhost_any {
+            return Err(
+                "conflicting options: proxy.forced / --proxy-forced restricts egress to the \
+                 proxy port, which is incompatible with allow_localhost_any / \
+                 --allow-localhost-any that disables kernel network restriction; \
+                 enable one or the other."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Print comprehensive sandbox configuration summary to stderr.
     ///
     /// Shows ALL effective settings including defaults so the user can make
@@ -1017,6 +1044,65 @@ validate = false
         let config: Config = toml::from_str("[proxy]\nforced = true\n").unwrap();
         let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(resolved.proxy_forced);
+    }
+
+    #[test]
+    fn proxy_forced_conflicts_with_allow_localhost_any() {
+        // #53: proxy.forced (lock egress to proxy port) and allow_localhost_any
+        // (disable kernel net restriction) are mutually exclusive. Combining them
+        // must be a hard error — never a silent open-network downgrade.
+        let config: Config =
+            toml::from_str("[proxy]\nforced = true\n[sandbox]\nallow_localhost_any = true\n")
+                .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.proxy_forced);
+        assert!(resolved.allow_localhost_any);
+        let err = resolved
+            .check_proxy_forced_conflicts()
+            .expect_err("proxy_forced + allow_localhost_any must conflict");
+        assert!(
+            err.contains("allow_localhost_any"),
+            "error must name the offending option: {err}"
+        );
+    }
+
+    #[test]
+    fn proxy_forced_conflict_detects_repo_proposed_allow_localhost_any() {
+        // The conflict must fire regardless of WHERE allow_localhost_any came
+        // from: here it is enabled via an approved repo proposal, applied after
+        // merge — exactly the silent-downgrade path the check must catch.
+        let config: Config = toml::from_str("[proxy]\nforced = true\n").unwrap();
+        let mut resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.check_proxy_forced_conflicts().is_ok());
+        let repo_config = crate::repo_config::RepoConfig {
+            propose: crate::repo_config::ProposeSection {
+                allow_localhost_any: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        resolved.apply_repo_config(&repo_config, &["allow_localhost_any"]);
+        assert!(resolved.allow_localhost_any);
+        assert!(
+            resolved.check_proxy_forced_conflicts().is_err(),
+            "repo-proposed allow_localhost_any must still conflict with proxy.forced"
+        );
+    }
+
+    #[test]
+    fn proxy_forced_alone_has_no_conflict() {
+        let config: Config = toml::from_str("[proxy]\nforced = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.check_proxy_forced_conflicts().is_ok());
+    }
+
+    #[test]
+    fn allow_localhost_any_alone_has_no_conflict() {
+        let config: Config = toml::from_str("[sandbox]\nallow_localhost_any = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.allow_localhost_any);
+        assert!(!resolved.proxy_forced);
+        assert!(resolved.check_proxy_forced_conflicts().is_ok());
     }
 
     #[test]

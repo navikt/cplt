@@ -1609,14 +1609,26 @@ else:
     // below plus Agent B's unit tests on `generate_policy`, which assert the
     // exact net-rule set (proxy port present, 443 absent) with a known port.
 
-    /// Negative probe: under `--proxy-forced`, a direct TCP connect to an
-    /// arbitrary non-proxy port Q must be kernel-blocked. A live listener on Q
-    /// distinguishes "blocked by Landlock" (EPERM) from "nothing listening"
-    /// (ECONNREFUSED) — same mechanism as `landlock_blocks_outbound_tcp`. Q is a
-    /// fresh ephemeral port, so it can never collide with the proxy's own port;
-    /// with the 443 seed dropped, Q is denied.
+    /// Smoke check (NOT a proof of the 443 drop): under `--proxy-forced`, a
+    /// direct TCP connect to an arbitrary non-proxy port Q stays kernel-blocked.
+    /// A live listener on Q distinguishes "blocked by Landlock" (EPERM) from
+    /// "nothing listening" (ECONNREFUSED) — same mechanism as
+    /// `landlock_blocks_outbound_tcp`.
+    ///
+    /// HONESTY NOTE: this does NOT prove the behavioral delta of proxy-forced
+    /// mode. A fresh ephemeral port Q is denied in DEFAULT mode too (the default
+    /// policy allows only 443 + the proxy port), so this exact assertion passes
+    /// with the feature OFF. The genuine differentiator — dropping the default
+    /// `*:443` allow so direct HTTPS becomes kernel-denied — cannot be exercised
+    /// end-to-end in CI: distinguishing EPERM from ECONNREFUSED on :443 requires
+    /// a listener bound to :443, which needs root, and we do not rely on external
+    /// network. The 443 drop is instead proven by the `generate_policy` unit
+    /// tests in `src/sandbox_landlock.rs`
+    /// (`proxy_forced_drops_443_and_allows_only_proxy_port`), which assert the
+    /// exact net-rule set (proxy port present, 443 absent) against a known port.
+    /// This test remains as a basic egress-denial smoke check under forced mode.
     #[test]
-    fn proxy_forced_blocks_direct_tcp_to_nonproxy_port() {
+    fn proxy_forced_smoke_denies_direct_tcp_to_arbitrary_port() {
         require_landlock!(4);
         let project = create_test_project();
 

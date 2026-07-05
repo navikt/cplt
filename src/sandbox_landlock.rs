@@ -85,6 +85,12 @@ pub struct LandlockPolicy {
     /// network rules are port-based only — they cannot distinguish localhost
     /// from remote hosts. The proxy still provides domain-level filtering.
     pub restrict_net_connect: bool,
+    /// Proxy-forced mode (#53): kernel egress is locked to the proxy port and
+    /// the default `*:443` allow is dropped. Recorded here so `precompute()` can
+    /// FAIL CLOSED when the kernel cannot enforce TCP-connect restriction
+    /// (Landlock ABI < v4): warn-and-continue would launch the agent with open
+    /// direct networking behind the very flag meant to prevent it.
+    pub proxy_forced: bool,
     /// Home directory — used to pre-create writable cache directories that
     /// Landlock needs to open(O_PATH) before the sandbox is applied.
     pub home_dir: PathBuf,
@@ -704,6 +710,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         fs_rules,
         net_rules,
         restrict_net_connect,
+        proxy_forced: config.proxy_forced,
         home_dir: home.to_path_buf(),
     }
 }
@@ -965,6 +972,30 @@ fn build_best_effort_ruleset(
 ///
 /// Called once in `prepare()`. The returned `PrecomputedSandbox` is
 /// cloned into the `pre_exec` closure.
+/// Fail-closed gate for proxy-forced mode (#53).
+///
+/// `proxy_forced` locks kernel egress to the proxy port, which is only
+/// enforceable via Landlock's `ConnectTcp` access right (ABI v4+, kernel 6.7+).
+/// On older kernels that right is unavailable, so no net rule is ever applied —
+/// returning an error here makes the caller refuse to launch rather than run the
+/// agent with unrestricted direct networking behind a misleading warning.
+///
+/// Returns `Ok(())` when not in proxy-forced mode (the caller's existing
+/// warn-and-continue behavior is unaffected) or when the ABI can enforce the
+/// restriction.
+#[cfg(target_os = "linux")]
+fn check_proxy_forced_enforceable(proxy_forced: bool, abi_version: ABI) -> Result<(), String> {
+    if proxy_forced && abi_version < ABI::V4 {
+        return Err(format!(
+            "proxy.forced requires kernel-level network restriction \
+             (Landlock ABI v4+, kernel 6.7+), which this kernel does not support \
+             (probed ABI v{abi_version}); cannot honor forced egress. \
+             Upgrade the kernel or disable proxy.forced."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> {
     use std::ffi::CString;
@@ -972,6 +1003,16 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
 
     let abi_version = check_availability()?;
     let seccomp_filter = build_seccomp_filter();
+
+    // Fail closed (#53): proxy-forced mode locks kernel egress to the proxy port
+    // (the default `*:443` allow is dropped). Enforcing that requires Landlock
+    // TCP-connect restriction (ConnectTcp, ABI v4+ / kernel 6.7+). If the kernel
+    // cannot enforce it, warn-and-continue would launch the agent with open
+    // direct networking — the exact bypass proxy-forced exists to close. Refuse
+    // to launch instead. The non-forced path keeps its warn-and-continue
+    // behavior below. macOS SBPL is unaffected (it enforces regardless).
+    check_proxy_forced_enforceable(policy.proxy_forced, abi_version)?;
+
     if abi_version < ABI::V4 && policy.restrict_net_connect {
         // Check if proxy is configured (proxy_port would have been added to net_rules)
         let has_proxy = policy.net_rules.iter().any(|r| r.port != 443);
@@ -1934,6 +1975,41 @@ mod tests {
     }
 
     #[test]
+    fn generate_policy_records_proxy_forced_flag() {
+        // The proxy_forced flag must reach the policy so precompute() can
+        // fail closed on kernels that can't enforce net restriction (#53).
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.proxy_forced = true;
+        config.proxy_port = Some(8080);
+        assert!(generate_policy(&config).proxy_forced);
+
+        let mut config2 = test_config(&project, &home);
+        config2.proxy_forced = false;
+        assert!(!generate_policy(&config2).proxy_forced);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_forced_fails_closed_below_abi_v4() {
+        // #53: on kernels < 6.7 (ABI < v4) ConnectTcp is unavailable, so kernel
+        // egress cannot be locked to the proxy port. proxy_forced must then
+        // refuse to launch rather than warn-and-continue with open networking.
+        for abi in [ABI::V1, ABI::V2, ABI::V3] {
+            assert!(
+                check_proxy_forced_enforceable(true, abi).is_err(),
+                "proxy_forced must fail closed on ABI {abi} (< v4)"
+            );
+        }
+        // ABI v4+ can enforce, so proxy_forced is allowed.
+        assert!(check_proxy_forced_enforceable(true, ABI::V4).is_ok());
+        assert!(check_proxy_forced_enforceable(true, ABI::V5).is_ok());
+        // Non-forced mode is never gated — old kernels keep warn-and-continue.
+        assert!(check_proxy_forced_enforceable(false, ABI::V1).is_ok());
+    }
+
+    #[test]
     fn extra_ports_added_to_net_rules() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
@@ -2598,6 +2674,7 @@ mod tests {
             ],
             net_rules: vec![],
             restrict_net_connect: false,
+            proxy_forced: false,
             home_dir: PathBuf::from("/tmp/test-home"),
         };
 

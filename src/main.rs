@@ -1283,6 +1283,14 @@ fn start_proxy_if_enabled(
     // rather than silently picking a side, then force the proxy on so the
     // fail-closed start path below applies.
     if resolved.proxy_forced {
+        // Hard conflict (#53): proxy-forced locks egress to the proxy port, which
+        // is fundamentally incompatible with allow_localhost_any disabling kernel
+        // net restriction. Checked here so it sees the fully RESOLVED value —
+        // including allow_localhost_any enabled via an approved repo proposal
+        // (apply_repo_config runs before this in resolve_context).
+        resolved
+            .check_proxy_forced_conflicts()
+            .map_err(|e| anyhow::anyhow!(e))?;
         if !resolved.with_proxy {
             bail!(
                 "conflicting options: --proxy-forced requires the proxy, but it was \
