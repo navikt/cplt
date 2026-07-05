@@ -240,6 +240,46 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Redact the userinfo credentials from an upstream-proxy URL so it is safe to
+/// print in `cplt config show`/`explain` or any log line.
+///
+/// - `http://user:pass@host:8080` → `http://user:***@host:8080` (username kept,
+///   password hidden)
+/// - `http://token@host:8080` → `http://***@host:8080` (a lone userinfo could
+///   itself be a bearer-style secret, so it is hidden whole)
+/// - `http://host:8080` and bare `host:8080` → returned unchanged (no secret)
+///
+/// SECURITY: this is display-only. The real `Proxy-Authorization: Basic` header
+/// sent to the upstream is derived from the untouched URL in
+/// [`UpstreamProxy::parse`] and is never affected by this function — only what
+/// humans see is redacted, so credentials cannot leak into terminals, logs, or
+/// CI artifacts while the tunnel still authenticates correctly.
+pub fn redact_upstream_url(url: &str) -> String {
+    // Only the authority is touched; preserve any `scheme://` prefix verbatim.
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (Some(s), r),
+        None => (None, url),
+    };
+
+    // Userinfo is everything before the last '@' in the authority, matching the
+    // split UpstreamProxy::parse performs. No '@' means there is nothing secret.
+    let redacted_rest = match rest.rsplit_once('@') {
+        Some((userinfo, hostport)) => {
+            let masked = match userinfo.split_once(':') {
+                Some((user, _pass)) => format!("{user}:***"),
+                None => "***".to_string(),
+            };
+            format!("{masked}@{hostport}")
+        }
+        None => rest.to_string(),
+    };
+
+    match scheme {
+        Some(s) => format!("{s}://{redacted_rest}"),
+        None => redacted_rest,
+    }
+}
+
 /// Shared proxy state holding cached domain lists and config paths.
 /// Wrapped in `Arc` and shared across connection threads.
 pub struct ProxyState {
@@ -2585,6 +2625,43 @@ mod tests {
             req,
             "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\
              Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn redact_upstream_url_masks_password_keeps_username_and_host() {
+        let shown = redact_upstream_url("http://alice:s3cret@corp.example.com:8080");
+        assert_eq!(shown, "http://alice:***@corp.example.com:8080");
+        // The secret must never survive redaction; the host:port must.
+        assert!(!shown.contains("s3cret"));
+        assert!(shown.contains("corp.example.com:8080"));
+    }
+
+    #[test]
+    fn redact_upstream_url_without_userinfo_is_unchanged() {
+        assert_eq!(
+            redact_upstream_url("http://corp.example.com:8080"),
+            "http://corp.example.com:8080"
+        );
+        // Bare host:port (no scheme, no userinfo) is likewise untouched.
+        assert_eq!(
+            redact_upstream_url("corp.example.com:3128"),
+            "corp.example.com:3128"
+        );
+    }
+
+    #[test]
+    fn redact_upstream_url_hides_lone_userinfo_token() {
+        // A userinfo with no ':' could itself be a bearer-style token, so the
+        // whole thing is hidden rather than shown as a bare "username".
+        assert_eq!(
+            redact_upstream_url("http://tok3n@corp.example.com:8080"),
+            "http://***@corp.example.com:8080"
+        );
+        // Also handled without a scheme.
+        assert_eq!(
+            redact_upstream_url("tok3n@corp.example.com:8080"),
+            "***@corp.example.com:8080"
         );
     }
 

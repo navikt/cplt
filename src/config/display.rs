@@ -20,6 +20,7 @@ pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
     };
 
     let (current_value, from_file) = get_config_value(key_info, loaded);
+    let current_value = redact_sensitive_value(key_info, current_value);
     let type_str = type_label(key_info.value_type);
 
     println!("{bold}{}.{}{nc}", key_info.section, key_info.key);
@@ -75,6 +76,7 @@ pub fn explain_all(loaded: Option<&LoadedConfig>) {
             String::new()
         };
         let (current_value, from_file) = get_config_value(key, loaded);
+        let current_value = redact_sensitive_value(key, current_value);
         // Dim for default value, bold for override; yellow if dangerous key is enabled.
         let value_color = if !from_file {
             dim
@@ -125,6 +127,19 @@ fn format_toml_value(val: &toml::Value) -> String {
             format!("[{}]", items.join(", "))
         }
         other => other.to_string(),
+    }
+}
+
+/// Redact credential-bearing values before they are printed in a summary
+/// (`config show` / `config explain`). Currently only `proxy.upstream` can
+/// carry a `user:pass@` secret. `config get <key>` deliberately does NOT go
+/// through this — asking for a single key by name returns the raw value the
+/// user themselves stored.
+fn redact_sensitive_value(key_info: &ConfigKeyInfo, value: String) -> String {
+    if key_info.section == "proxy" && key_info.key == "upstream" {
+        crate::proxy::redact_upstream_url(&value)
+    } else {
+        value
     }
 }
 
@@ -193,7 +208,13 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         println!("{blue}[cplt]{nc}    log_file         = \"{lf}\"");
     }
     if let Some(ref up) = c.proxy.upstream {
-        println!("{blue}[cplt]{nc}    upstream         = \"{up}\"");
+        // Redact `user:pass@` userinfo — this summary is routinely pasted into
+        // issues/CI logs. The real Proxy-Authorization sent upstream is derived
+        // from the untouched URL at parse time and is unaffected.
+        println!(
+            "{blue}[cplt]{nc}    upstream         = \"{}\"",
+            crate::proxy::redact_upstream_url(up)
+        );
     }
     println!(
         "{blue}[cplt]{nc}    log_level        = \"{}\"{}",

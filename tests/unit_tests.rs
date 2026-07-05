@@ -446,6 +446,33 @@ fn proxy_upstream_invalid_url_rejected() {
 }
 
 #[test]
+fn config_show_redacts_upstream_credentials() {
+    // `cplt config show`/`explain` print proxy.upstream through
+    // redact_upstream_url. A URL carrying `user:pass@` must never leak the
+    // password to the terminal (these summaries get pasted into issues/CI),
+    // but the host:port must stay visible so the summary is still useful.
+    let shown = cplt::proxy::redact_upstream_url("http://alice:s3cret@corp.example.com:8080");
+    assert!(
+        !shown.contains("s3cret"),
+        "password leaked in config show: {shown}"
+    );
+    assert!(
+        shown.contains("corp.example.com:8080"),
+        "host should remain visible: {shown}"
+    );
+    assert_eq!(shown, "http://alice:***@corp.example.com:8080");
+}
+
+#[test]
+fn config_show_upstream_without_credentials_unchanged() {
+    // A no-userinfo upstream has no secret, so config show displays it verbatim.
+    assert_eq!(
+        cplt::proxy::redact_upstream_url("http://corp.example.com:8080"),
+        "http://corp.example.com:8080"
+    );
+}
+
+#[test]
 fn allow_private_domains_suffix_match() {
     use cplt::proxy::is_domain_match;
     let list = vec!["intern.nav.no".to_string()];
