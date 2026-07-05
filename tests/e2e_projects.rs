@@ -2425,7 +2425,10 @@ import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
-    s.bind(('0.0.0.0', 18999))
+    # Bind an ephemeral port (0) rather than a fixed one: a fixed port can flake
+    # with 'Address already in use' under parallel CI. The kernel assigns a free
+    # port, which is all this wildcard-bind check needs.
+    s.bind(('0.0.0.0', 0))
     s.listen(1)
     s.close()
     print('ALLOWED')

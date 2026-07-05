@@ -6641,6 +6641,14 @@ level = "blocked"
 format = "text"
 "#;
 
+    // Parse the fixture so coverage is checked per-section, not by a bare
+    // substring. A plain `"{key} ="` grep matches ANYWHERE in the fixture, so
+    // keys that recur across sections (e.g. `enabled`, `mode`, `port`) let a
+    // key missing from ITS OWN section pass because a same-named key exists
+    // under a different section. Parsing forces each registry `section.key` to
+    // actually appear under `[section]`.
+    let parsed: toml::Value = toml::from_str(toml).expect("fixture TOML must parse");
+
     for key_info in all_config_keys() {
         if matches!(key_info.value_type, ConfigValueType::ArrayOfTables) {
             continue;
@@ -6649,14 +6657,19 @@ format = "text"
         if excluded.contains(&dotted.as_str()) {
             continue;
         }
-        // #126 Tier 2: dropped the always-true `|| toml.contains("[{section}]")`
-        // disjunct — with it, adding a new key to an EXISTING section passed
-        // silently because the section header was already present. Each key must
-        // now actually appear as `key =` in the fixture.
+        // #126 Tier 2 / #129: require `key` under its OWN `[section]` table, not
+        // merely somewhere in the fixture. This makes the guard force the
+        // fixture to cover every distinct section.key pair.
+        let covered = parsed
+            .get(key_info.section)
+            .and_then(|section| section.get(key_info.key))
+            .is_some();
         assert!(
-            toml.contains(&format!("{} =", key_info.key)),
-            "registry key '{dotted}' is not covered by the fixture TOML in \
-             `registry_keys_match_validate_all_valid_keys_fixture` — add it"
+            covered,
+            "registry key '{dotted}' is not covered under its own [{}] section in \
+             the fixture TOML in \
+             `registry_keys_match_validate_all_valid_keys_fixture` — add it",
+            key_info.section
         );
     }
 }

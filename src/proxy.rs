@@ -1747,10 +1747,13 @@ mod tests {
     fn proxy_allowlist_bypasses_private_ip_block() {
         require_localhost_tcp!();
 
-        // 255.255.255.255 is the limited broadcast address → is_private_ip() == true
-        // (is_broadcast), non-loopback, and connect() on a stream socket fails
-        // immediately (EACCES/EHOSTUNREACH) rather than hanging for CONNECT_TIMEOUT.
-        let private_addr: std::net::IpAddr = "255.255.255.255".parse().unwrap();
+        // 0.0.0.0 is the unspecified address → is_private_ip() == true
+        // (is_unspecified), non-loopback, and connect() to it on a stream socket
+        // fails immediately (EADDRNOTAVAIL on macOS; on Linux it is treated as
+        // 127.0.0.1 and yields a prompt ECONNREFUSED since nothing is listening
+        // on this privileged port). The former 255.255.255.255 broadcast address
+        // had OS-dependent connect behavior that could hang for CONNECT_TIMEOUT.
+        let private_addr: std::net::IpAddr = "0.0.0.0".parse().unwrap();
         let resolver: ResolverFn = Arc::new(move |host: &str, port: u16| {
             if host == "corp.internal" {
                 Some(std::net::SocketAddr::new(private_addr, port))
