@@ -984,7 +984,11 @@ fn build_best_effort_ruleset(
 /// warn-and-continue behavior is unaffected) or when the ABI can enforce the
 /// restriction.
 #[cfg(target_os = "linux")]
-fn check_proxy_forced_enforceable(proxy_forced: bool, abi_version: ABI) -> Result<(), String> {
+fn check_proxy_forced_enforceable(
+    proxy_forced: bool,
+    abi_version: ABI,
+    restrict_net_connect: bool,
+) -> Result<(), String> {
     if proxy_forced && abi_version < ABI::V4 {
         return Err(format!(
             "proxy.forced requires kernel-level network restriction \
@@ -992,6 +996,19 @@ fn check_proxy_forced_enforceable(proxy_forced: bool, abi_version: ABI) -> Resul
              (probed ABI v{abi_version}); cannot honor forced egress. \
              Upgrade the kernel or disable proxy.forced."
         ));
+    }
+    // Defense in depth: proxy.forced also requires net-connect restriction to be
+    // ON. `restrict_net_connect` is false only when `allow_localhost_any` is set,
+    // a combination main.rs already rejects before launch — but guard it here at
+    // the enforcement layer too, so a future launch path that forgets the
+    // orchestration conflict check can never silently launch with open
+    // networking. This never fires on a valid current path.
+    if proxy_forced && !restrict_net_connect {
+        return Err(
+            "proxy.forced requires kernel network restriction, but it is disabled by \
+             allow_localhost_any; refusing to launch (fail-closed, no open networking)."
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -1011,7 +1028,11 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     // direct networking — the exact bypass proxy-forced exists to close. Refuse
     // to launch instead. The non-forced path keeps its warn-and-continue
     // behavior below. macOS SBPL is unaffected (it enforces regardless).
-    check_proxy_forced_enforceable(policy.proxy_forced, abi_version)?;
+    check_proxy_forced_enforceable(
+        policy.proxy_forced,
+        abi_version,
+        policy.restrict_net_connect,
+    )?;
 
     if abi_version < ABI::V4 && policy.restrict_net_connect {
         // Check if proxy is configured (proxy_port would have been added to net_rules)
@@ -1998,15 +2019,23 @@ mod tests {
         // refuse to launch rather than warn-and-continue with open networking.
         for abi in [ABI::V1, ABI::V2, ABI::V3] {
             assert!(
-                check_proxy_forced_enforceable(true, abi).is_err(),
+                check_proxy_forced_enforceable(true, abi, true).is_err(),
                 "proxy_forced must fail closed on ABI {abi} (< v4)"
             );
         }
         // ABI v4+ can enforce, so proxy_forced is allowed.
-        assert!(check_proxy_forced_enforceable(true, ABI::V4).is_ok());
-        assert!(check_proxy_forced_enforceable(true, ABI::V5).is_ok());
+        assert!(check_proxy_forced_enforceable(true, ABI::V4, true).is_ok());
+        assert!(check_proxy_forced_enforceable(true, ABI::V5, true).is_ok());
         // Non-forced mode is never gated — old kernels keep warn-and-continue.
-        assert!(check_proxy_forced_enforceable(false, ABI::V1).is_ok());
+        assert!(check_proxy_forced_enforceable(false, ABI::V1, true).is_ok());
+        // Defense in depth: proxy_forced with net restriction disabled
+        // (allow_localhost_any) fails closed even on a capable kernel.
+        assert!(
+            check_proxy_forced_enforceable(true, ABI::V5, false).is_err(),
+            "proxy_forced must fail closed when net restriction is disabled"
+        );
+        // Non-forced with restriction disabled is fine.
+        assert!(check_proxy_forced_enforceable(false, ABI::V5, false).is_ok());
     }
 
     #[test]
