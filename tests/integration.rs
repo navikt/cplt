@@ -22,10 +22,29 @@ mod macos_tests {
             .unwrap_or(false)
     }
 
+    /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox
+    /// capability must FAIL the test rather than silently skip. Mirrors the Linux
+    /// `require_sandbox_enforced()` in `integration_linux.rs`: a `sandbox-exec`
+    /// regression on the macOS runner turns the job red instead of leaving CI
+    /// green while nothing is enforced. Default (unset) behaviour is unchanged for
+    /// local dev / nested-sandbox runs.
+    fn require_sandbox_enforced() -> bool {
+        std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() == Ok("1")
+    }
+
     /// Skip guard — call at the top of tests that invoke sandbox-exec.
+    ///
+    /// Under `CPLT_TEST_REQUIRE_SANDBOX=1` the skip branch panics instead, so a
+    /// missing/broken `sandbox-exec` on the CI runner turns the job red.
     macro_rules! require_sandbox {
         () => {
             if !sandbox_exec_available() {
+                if require_sandbox_enforced() {
+                    panic!(
+                        "sandbox-exec required by CPLT_TEST_REQUIRE_SANDBOX but unavailable \
+                         (a trivial profile failed to apply — Seatbelt/sandbox-exec regression?)"
+                    );
+                }
                 eprintln!("SKIPPED: sandbox-exec not available (likely already sandboxed)");
                 return;
             }

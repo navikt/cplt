@@ -955,9 +955,23 @@ mod sandbox_integration {
             .unwrap_or(false)
     }
 
+    /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox
+    /// capability must FAIL the test rather than silently skip (mirrors the Linux
+    /// `require_sandbox_enforced()` in `integration_linux.rs`). Default (unset)
+    /// behaviour is unchanged for local dev / nested-sandbox runs.
+    fn require_sandbox_enforced() -> bool {
+        std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() == Ok("1")
+    }
+
     macro_rules! require_sandbox {
         () => {
             if !sandbox_exec_available() {
+                if require_sandbox_enforced() {
+                    panic!(
+                        "sandbox-exec required by CPLT_TEST_REQUIRE_SANDBOX but unavailable \
+                         (a trivial profile failed to apply — Seatbelt/sandbox-exec regression?)"
+                    );
+                }
                 eprintln!("SKIPPED: sandbox-exec not available");
                 return;
             }

@@ -46,22 +46,50 @@ mod e2e_tests {
             .unwrap_or(false)
     }
 
-    /// Skip guard — call at the top of tests that need Copilot CLI.
-    /// Returns true if the test should be skipped.
+    /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox
+    /// capability must FAIL the test rather than silently skip. This mirrors the
+    /// Linux `require_sandbox_enforced()` in `integration_linux.rs` and closes the
+    /// gap where a `sandbox-exec`/Seatbelt regression on the macOS runner would
+    /// leave CI green because every enforcement test self-skipped. Default (unset)
+    /// behaviour is unchanged for local dev / nested-sandbox runs.
+    fn require_sandbox_enforced() -> bool {
+        std::env::var("CPLT_TEST_REQUIRE_SANDBOX").as_deref() == Ok("1")
+    }
+
+    /// Skip guard — call at the top of tests that need the REAL Copilot CLI.
+    ///
+    /// Copilot cannot be installed/authenticated in CI, so this always self-skips
+    /// (never a require-mode). Only tests whose intent genuinely depends on the
+    /// real Copilot binary/output keep this guard; sandbox/proxy/profile behaviour
+    /// is exercised via `--print-profile`, the default Copilot agent (no binary
+    /// needed), or the fake-copilot fixtures instead. The `SKIPPED (copilot):`
+    /// marker is grepped by the CI summary step so the residual skip count is
+    /// surfaced as a `::warning::`.
     macro_rules! require_copilot {
         () => {
             if !copilot_cli_available() {
-                eprintln!("SKIPPED: copilot CLI not found in PATH");
+                eprintln!(
+                    "SKIPPED (copilot): copilot CLI not found in PATH — test genuinely requires the real Copilot binary"
+                );
                 return;
             }
         };
     }
 
     /// Skip guard — call at the top of tests that invoke sandbox-exec.
-    /// Skips when already inside a sandbox (nested sandbox-exec is denied by macOS).
+    ///
+    /// Skips when already inside a sandbox (nested sandbox-exec is denied by
+    /// macOS). Under `CPLT_TEST_REQUIRE_SANDBOX=1` the skip branch panics instead,
+    /// so a missing/broken `sandbox-exec` on the CI runner turns the job red.
     macro_rules! require_sandbox {
         () => {
             if !sandbox_exec_available() {
+                if require_sandbox_enforced() {
+                    panic!(
+                        "sandbox-exec required by CPLT_TEST_REQUIRE_SANDBOX but unavailable \
+                         (a trivial profile failed to apply — Seatbelt/sandbox-exec regression?)"
+                    );
+                }
                 eprintln!("SKIPPED: sandbox-exec not available (likely already sandboxed)");
                 return;
             }
@@ -112,11 +140,12 @@ mod e2e_tests {
 
     #[test]
     fn e2e_sandbox_validation_passes() {
-        require_copilot!();
         require_sandbox!();
-        let output = Command::new(binary_path())
+        // Fake copilot on PATH (not the real binary): sandbox validation passing
+        // and the agent launching is agent-agnostic, so this runs in CI.
+        let (mut cmd, _fake) = cplt_cmd_with_fake_copilot();
+        let output = cmd
             .args(["--yes", "--", "--version"])
-            .current_dir(project_dir())
             .output()
             .expect("binary should run");
 
@@ -134,12 +163,13 @@ mod e2e_tests {
 
     #[test]
     fn e2e_proxy_starts_with_version() {
-        require_copilot!();
         require_sandbox!();
+        // Fake copilot on PATH: proxy startup is agent-agnostic, so this runs in CI.
         // Use a high unique port to avoid collisions
         let port = 19200 + (std::process::id() % 800) as u16;
 
-        let output = Command::new(binary_path())
+        let (mut cmd, _fake) = cplt_cmd_with_fake_copilot();
+        let output = cmd
             .args([
                 "--yes",
                 "--with-proxy",
@@ -149,7 +179,6 @@ mod e2e_tests {
                 "--",
                 "--version",
             ])
-            .current_dir(project_dir())
             .output()
             .expect("binary should run");
 
@@ -168,9 +197,10 @@ mod e2e_tests {
 
     #[test]
     fn e2e_show_denials_doesnt_crash() {
-        require_copilot!();
         require_sandbox!();
-        let output = Command::new(binary_path())
+        // Fake copilot on PATH: denial-log streaming is agent-agnostic, runs in CI.
+        let (mut cmd, _fake) = cplt_cmd_with_fake_copilot();
+        let output = cmd
             .args([
                 "--yes",
                 "--show-denials",
@@ -178,7 +208,6 @@ mod e2e_tests {
                 "--",
                 "--version",
             ])
-            .current_dir(project_dir())
             .output()
             .expect("binary should run");
 
@@ -201,7 +230,8 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_contains_deny_default() {
-        require_copilot!();
+        // No require_copilot!: --print-profile defaults to the Copilot agent and
+        // needs no Copilot binary (see main.rs), so this runs in CI.
         let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
@@ -219,7 +249,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_blocks_sensitive_dirs() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
@@ -239,7 +268,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_allows_project_dir() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
@@ -272,7 +300,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_restricts_network() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
@@ -305,7 +332,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_allows_gh_config_readonly() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
@@ -337,7 +363,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_deny_path_overrides_project() {
-        require_copilot!();
         // Create a temp project with a subdir to deny. TempDir auto-cleans on
         // drop (including panic); the project path is passed explicitly so no
         // fixture is written into the repo checkout.
@@ -373,7 +398,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_allow_read_appears_in_profile() {
-        require_copilot!();
         // Create a temp dir outside the project to allow-read
         let allow_dir = std::env::temp_dir().join(format!("cplt-e2e-allow-{}", std::process::id()));
         std::fs::create_dir_all(&allow_dir).unwrap();
@@ -410,7 +434,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_custom_project_dir() {
-        require_copilot!();
         let custom_dir =
             std::env::temp_dir().join(format!("cplt-e2e-project-{}", std::process::id()));
         std::fs::create_dir_all(&custom_dir).unwrap();
@@ -459,7 +482,8 @@ mod e2e_tests {
 
     #[test]
     fn e2e_doctor_reports_auth_section() {
-        require_copilot!();
+        // No require_copilot!: doctor always prints the Auth section header
+        // regardless of whether Copilot is installed, so this runs in CI.
         let output = Command::new(binary_path())
             .args(["--doctor"])
             .current_dir(project_dir())
@@ -493,7 +517,8 @@ mod e2e_tests {
 
     #[test]
     fn e2e_doctor_reports_tools_section() {
-        require_copilot!();
+        // No require_copilot!: doctor always prints the Tools section (git is
+        // present on the runner) regardless of Copilot, so this runs in CI.
         let output = Command::new(binary_path())
             .args(["--doctor"])
             .current_dir(project_dir())
@@ -683,7 +708,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_allow_tmp_exec_removes_denies() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--allow-tmp-exec", "--print-profile"])
             .current_dir(project_dir())
@@ -705,7 +729,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_allow_localhost_any() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--allow-localhost-any", "--print-profile"])
             .current_dir(project_dir())
@@ -727,7 +750,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_allow_localhost_port() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--allow-localhost", "3000", "--print-profile"])
             .current_dir(project_dir())
@@ -750,7 +772,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_allow_port() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--allow-port", "8080", "--print-profile"])
             .current_dir(project_dir())
@@ -768,7 +789,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_deny_clipboard_emits_pasteboard_deny() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--deny-clipboard", "--print-profile"])
             .current_dir(project_dir())
@@ -792,7 +812,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_allow_write() {
-        require_copilot!();
         let allow_dir =
             std::env::temp_dir().join(format!("cplt-e2e-allow-write-{}", std::process::id()));
         std::fs::create_dir_all(&allow_dir).unwrap();
@@ -826,7 +845,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_allow_env_files() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--allow-env-files", "--print-profile"])
             .current_dir(project_dir())
@@ -845,7 +863,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_scratch_dir_appears() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--scratch-dir", "--print-profile"])
             .current_dir(project_dir())
@@ -867,7 +884,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_copilot_pkg_write_denied() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
@@ -885,7 +901,6 @@ mod e2e_tests {
 
     #[test]
     fn e2e_print_profile_git_persistence_blocked() {
-        require_copilot!();
         let output = cplt_cmd()
             .args(["--print-profile"])
             .current_dir(project_dir())
@@ -961,6 +976,20 @@ mod e2e_tests {
             String::from_utf8_lossy(&output.stdout).to_string(),
             String::from_utf8_lossy(&output.stderr).to_string(),
         )
+    }
+
+    /// Build a `cplt` Command with a fake `copilot` prepended to PATH, for
+    /// pipeline tests that exercise sandbox/proxy/denial *wiring* (agent-agnostic)
+    /// rather than real Copilot behaviour — so they run in CI without the real
+    /// binary. The returned `TempDir` holds the fake script and must stay alive
+    /// for the duration of the run (its Drop removes it), so bind it (`let (_, _f)`).
+    fn cplt_cmd_with_fake_copilot() -> (Command, tempfile::TempDir) {
+        let fake_dir = create_fake_copilot();
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
+        let mut cmd = Command::new(binary_path());
+        cmd.current_dir(project_dir()).env("PATH", &new_path);
+        (cmd, fake_dir)
     }
 
     #[test]

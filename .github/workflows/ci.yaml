@@ -86,8 +86,41 @@ jobs:
       - name: Install Gradle (for Gradle sandbox tests)
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # ratchet:gradle/actions/setup-gradle@v6.2.0
 
-      - name: Run all tests
-        run: cargo test --verbose
+      - name: Run all tests (skips fail the job)
+        # CPLT_TEST_REQUIRE_SANDBOX=1 makes require_sandbox! panic instead of skip,
+        # so a missing/broken sandbox-exec (a Seatbelt regression on the runner)
+        # turns this job red rather than silently passing while nothing is
+        # enforced — the macOS analogue of the Linux job's execute-or-fail guard
+        # (issue #115). sandbox-exec is always present on macos-latest, so this is
+        # safe to require. Output is teed (with pipefail) to a log outside the
+        # workspace so the skip-summary step below can count residual skips without
+        # dirtying the working tree; a real test failure still fails the pipeline.
+        env:
+          CPLT_TEST_REQUIRE_SANDBOX: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --verbose -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+
+      - name: Surface tests skipped for missing tooling
+        if: always()
+        shell: bash
+        run: |
+          # Copilot cannot be installed/authed in CI, so tests that genuinely need
+          # the real Copilot binary self-skip with a `SKIPPED (copilot):` marker.
+          # cargo hides passing-test stderr, so we run with --nocapture above and
+          # count the markers here, surfacing the residual (unrunnable-in-CI) count
+          # as a ::warning:: so a silent-skip regression stays observable (#115).
+          LOG="$RUNNER_TEMP/test-output.log"
+          if [ ! -f "$LOG" ]; then
+            echo "No test output captured — skipping summary"
+            exit 0
+          fi
+          copilot_skips=$(grep -c "SKIPPED (copilot)" "$LOG" || true)
+          echo "Copilot-gated tests skipped (Copilot not installed in CI): $copilot_skips"
+          if [ "$copilot_skips" -gt 0 ]; then
+            echo "::warning::${copilot_skips} E2E test(s) skipped because the real Copilot CLI is not installed in CI. These genuinely require the Copilot binary/auth (see require_copilot! in tests/e2e.rs); all sandbox/proxy/profile behaviour is covered without it."
+          fi
 
       - name: Assert working tree is clean (no leaked test artifacts)
         run: |
