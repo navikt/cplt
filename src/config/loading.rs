@@ -46,8 +46,10 @@ impl Config {
             })?;
 
         for key_path in &unknown_keys {
+            // describe_unknown_key already includes "in [section]"; append the
+            // file and the ignored note without repeating "in".
             ui::warn(&format!(
-                "{} in {} (ignored)",
+                "{} — ignored ({})",
                 super::validation::describe_unknown_key(key_path),
                 path.display()
             ));

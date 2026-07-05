@@ -70,13 +70,24 @@ fn top_level_keys() -> Vec<&'static str> {
 /// automatically cover any option present in the registry.
 pub(super) fn describe_unknown_key(path: &str) -> String {
     if let Some((section, key)) = path.split_once('.') {
-        let candidates = section_keys(section);
+        // Exclude the reported key itself from the suggestion candidates. The
+        // candidates come from CONFIG_KEYS (a superset that includes repo-only
+        // keys like `deny.env`), so a key that is valid in the registry but not
+        // on the user-config struct would otherwise suggest itself
+        // ("did you mean 'env'?"), which is nonsense.
+        let candidates: Vec<&str> = section_keys(section)
+            .into_iter()
+            .filter(|c| *c != key)
+            .collect();
         let hint = suggest_key(key, &candidates)
             .map(|s| format!(" (did you mean '{s}'?)"))
             .unwrap_or_default();
         format!("unknown key '{key}' in [{section}]{hint}")
     } else {
-        let candidates = top_level_keys();
+        let candidates: Vec<&str> = top_level_keys()
+            .into_iter()
+            .filter(|c| *c != path)
+            .collect();
         let hint = suggest_key(path, &candidates)
             .map(|s| format!(" (did you mean '{s}'?)"))
             .unwrap_or_default();
@@ -521,5 +532,25 @@ some_new_option = true
     fn edit_distance_empty_strings() {
         assert_eq!(edit_distance("", "abc"), 3);
         assert_eq!(edit_distance("abc", ""), 3);
+    }
+
+    #[test]
+    fn unknown_key_valid_in_registry_but_not_struct_does_not_self_suggest() {
+        // `deny.env` is a repo-only registry key with no field on the user
+        // DenyConfig struct, so serde_ignored flags it as unknown. The
+        // suggestion must NOT be the same key ("did you mean 'env'?").
+        let msg = describe_unknown_key("deny.env");
+        assert!(msg.contains("unknown key 'env' in [deny]"), "got: {msg}");
+        assert!(
+            !msg.contains("did you mean 'env'"),
+            "self-suggestion leaked: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_still_suggests_a_genuine_typo() {
+        // A real typo of a user-struct key still gets a suggestion.
+        let msg = describe_unknown_key("sandbox.inherit_evn");
+        assert!(msg.contains("did you mean 'inherit_env'"), "got: {msg}");
     }
 }
