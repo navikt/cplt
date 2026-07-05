@@ -107,7 +107,11 @@ pub struct LandlockPolicy {
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub struct PrecomputedSandbox {
-    pub abi_version: ABI,
+    // NOTE: the kernel ABI version is deliberately *not* stored here. Ruleset
+    // construction uses `CompatLevel::BestEffort` (see `build_best_effort_ruleset`)
+    // which downgrades unsupported features per-kernel, so `apply_precomputed()`
+    // never branches on the ABI version. Availability is still probed once in
+    // `precompute()` for the diagnostic network warning.
     /// Pre-opened `O_PATH` file descriptors for Landlock filesystem rules.
     /// Opened in `precompute()` (parent), used in `apply_precomputed()` (child).
     /// Raw fds (i32) so the struct remains Clone-able. Closed on exec via
@@ -775,10 +779,10 @@ pub fn describe_policy(policy: &LandlockPolicy) -> String {
 
 /// Highest kernel-supported Landlock ABI as a plain version number.
 ///
-/// Probes via ruleset creation (same as [`check_availability`]), not
-/// securityfs: `/sys/kernel/security/landlock/abi_version` is root-only on
-/// some hosts (e.g. GitHub Actions runners), so file-based probing
-/// under-reports availability.
+/// Delegates to [`check_availability`], which performs the single-syscall
+/// version probe (never securityfs: `/sys/kernel/security/landlock/abi_version`
+/// is root-only on some hosts such as GitHub Actions runners, so file-based
+/// probing under-reports availability).
 #[cfg(target_os = "linux")]
 pub fn available_abi_version() -> Option<u32> {
     Some(match check_availability().ok()? {
@@ -793,68 +797,128 @@ pub fn available_abi_version() -> Option<u32> {
 
 /// Check Landlock availability and return the highest supported ABI version.
 ///
-/// Probes the kernel by attempting to create a Ruleset for each ABI level
-/// (V6 down to V1) with `HardRequirement` compatibility. Returns the highest
-/// ABI that the kernel successfully supports.
+/// # Single-probe, best-effort strategy
+///
+/// This performs the officially recommended availability probe: one
+/// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` syscall,
+/// which returns the highest ABI version the running kernel supports (or a
+/// negative errno if Landlock is unavailable). It replaces the historical
+/// V6→V1 hard-requirement probe loop.
+///
+/// Enforcement logic deliberately does **not** branch on the returned version:
+/// the actual ruleset is built with [`CompatLevel::BestEffort`], so the
+/// `landlock` crate transparently drops the access rights the kernel lacks
+/// (see [`build_best_effort_ruleset`]). This keeps cplt portable across kernels
+/// 5.13 → 6.12+ without per-ABI feature branching, which the crate authors
+/// explicitly discourage ("it is difficult to track detailed ABI differences").
+/// The returned version is used only for diagnostics (`--doctor`) and the
+/// "network filtering unavailable on this kernel" warning.
+///
+/// The version query is a direct syscall, not a securityfs read, so it works
+/// even where `/sys/kernel/security/landlock/abi_version` is root-only
+/// (e.g. GitHub Actions runners).
 ///
 /// Called in the parent process during `prepare()` — never in `pre_exec`.
 #[cfg(target_os = "linux")]
 pub fn check_availability() -> Result<ABI, String> {
-    const ABI_PROBE_ORDER: [ABI; 6] = [ABI::V6, ABI::V5, ABI::V4, ABI::V3, ABI::V2, ABI::V1];
+    // LANDLOCK_CREATE_RULESET_VERSION flag (== 1): asks the kernel for the
+    // supported ABI version instead of creating a real ruleset.
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_ulong = 1;
 
-    let mut last_error = None;
-    for &abi in &ABI_PROBE_ORDER {
-        match probe_abi_candidate(abi) {
-            Ok(()) => return Ok(abi),
-            Err(err) => {
-                last_error = Some(format!("ABI {abi:?}: {err}"));
-            }
-        }
-    }
-
-    match last_error {
-        None => {
-            unreachable!("ABI_PROBE_ORDER is non-empty")
-        }
-        Some(e) => Err(format!(
-            "Landlock is not available on this system: {e}\n\
-             Requires Linux 5.13+ with Landlock enabled in the kernel.\n\
-             Check: cat /sys/kernel/security/lsm (should include 'landlock')"
-        )),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn probe_abi_candidate(abi: ABI) -> Result<(), String> {
-    use landlock::{
-        Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr, Scope,
+    // SAFETY: a NULL attr with size 0 plus the VERSION flag is the documented
+    // version-query form of landlock_create_ruleset(2). It allocates no file
+    // descriptor and has no side effects; it only returns the ABI version.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
     };
 
-    let mut ruleset = Ruleset::default().set_compatibility(CompatLevel::HardRequirement);
-
-    ruleset = ruleset
-        .handle_access(AccessFs::from_all(abi))
-        .map_err(|e| format!("filesystem access probe failed: {e}"))?;
-
-    let handled_net = AccessNet::from_all(abi);
-    if !handled_net.is_empty() {
-        ruleset = ruleset
-            .handle_access(handled_net)
-            .map_err(|e| format!("network access probe failed: {e}"))?;
+    if ret < 1 {
+        return Err("Landlock is not available on this system.\n\
+             Requires Linux 5.13+ with Landlock enabled in the kernel.\n\
+             Check: cat /sys/kernel/security/lsm (should include 'landlock')"
+            .to_string());
     }
 
-    let scopes = Scope::from_all(abi);
-    if !scopes.is_empty() {
-        ruleset = ruleset
-            .scope(scopes)
-            .map_err(|e| format!("scope probe failed: {e}"))?;
-    }
+    // Clamp to the highest ABI this build understands. A newer kernel reporting
+    // a version above V6 is treated as V6 — best-effort construction still
+    // opportunistically enables every feature the kernel supports.
+    let abi = match ret {
+        1 => ABI::V1,
+        2 => ABI::V2,
+        3 => ABI::V3,
+        4 => ABI::V4,
+        5 => ABI::V5,
+        _ => ABI::V6,
+    };
+    Ok(abi)
+}
 
-    ruleset
-        .create()
-        .map_err(|e| format!("ruleset creation probe failed: {e}"))?;
+/// Build a created Landlock ruleset using the official best-effort pattern.
+///
+/// # Why best-effort (kernel-version portability)
+///
+/// Rather than probing each ABI level and hard-requiring a specific one, we
+/// declare the **maximum** feature set once and let the `landlock` crate strip
+/// whatever the running kernel cannot enforce:
+///
+/// * The ABI v1 filesystem baseline is a **hard requirement**. If the kernel
+///   cannot enforce even v1 filesystem access control, ruleset construction
+///   fails here and the sandbox refuses to run (fail closed — see below).
+/// * Everything above v1 (Refer, Truncate, IoctlDev, TCP-connect scoping, …)
+///   is declared at the v6 level under [`CompatLevel::BestEffort`], so on older
+///   kernels those rights are silently dropped instead of causing a hard error.
+///
+/// This lets one binary degrade gracefully across kernels 5.13 → 6.12+ without
+/// branching on the ABI version in application code.
+///
+/// # Fail-closed contract
+///
+/// Best-effort applies to *feature downgrade across ABI versions only*, never
+/// to skipping enforcement. The hard-required v1 baseline plus the
+/// `RulesetStatus::NotEnforced` check at each `restrict_self()` call site
+/// guarantee the sandbox never silently runs the agent unsandboxed.
+///
+/// `restrict_net_connect` controls whether TCP connect is handled at all: when
+/// false (e.g. `--allow-localhost-any`) we do not handle `AccessNet::ConnectTcp`,
+/// leaving connect unrestricted by Landlock (the proxy provides filtering).
+#[cfg(target_os = "linux")]
+fn build_best_effort_ruleset(
+    restrict_net_connect: bool,
+) -> std::io::Result<landlock::RulesetCreated> {
+    use landlock::{
+        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr,
+    };
 
-    Ok(())
+    let ruleset = Ruleset::default()
+        // SECURITY: hard-require the v1 filesystem baseline — fail closed if the
+        // kernel cannot provide even that.
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(ABI::V1))
+        .map_err(std::io::Error::other)?
+        // Opportunistically request everything up to v6; the crate drops the
+        // unsupported rights on older kernels.
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::from_all(ABI::V6))
+        .map_err(std::io::Error::other)?;
+
+    // Handle TCP connect (ABI v4+) only when network restriction is enabled.
+    // Under BestEffort this is silently dropped on kernels < 6.7; the proxy is
+    // then the sole network control. We intentionally do NOT handle BindTcp —
+    // outbound connect is the only network access cplt scopes.
+    let ruleset = if restrict_net_connect {
+        ruleset
+            .handle_access(AccessNet::ConnectTcp)
+            .map_err(std::io::Error::other)?
+    } else {
+        ruleset
+    };
+
+    ruleset.create().map_err(std::io::Error::other)
 }
 
 /// Pre-compute all sandbox data in the parent process.
@@ -966,7 +1030,6 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     let restrict_net_connect = policy.restrict_net_connect;
 
     Ok(PrecomputedSandbox {
-        abi_version,
         pre_opened_fds,
         deferred_paths,
         net_rules,
@@ -1108,27 +1171,13 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
 /// The seccomp filter application is allocation-free (raw prctl syscall).
 #[cfg(target_os = "linux")]
 pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
-    use landlock::{
-        ABI, Access, AccessFs, AccessNet, NetPort, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus,
-    };
+    use landlock::{AccessNet, NetPort, RulesetCreatedAttr, RulesetStatus};
 
-    let ruleset = Ruleset::default()
-        .handle_access(AccessFs::from_all(sandbox.abi_version))
-        .map_err(std::io::Error::other)?;
-
-    // Handle ConnectTcp on ABI v4+ only when network restriction is enabled.
-    // When allow_localhost_any is set, we skip this — Landlock cannot
-    // distinguish localhost from remote, so we rely on the proxy instead.
-    let ruleset = if sandbox.abi_version >= ABI::V4 && sandbox.restrict_net_connect {
-        ruleset
-            .handle_access(AccessNet::ConnectTcp)
-            .map_err(std::io::Error::other)?
-    } else {
-        ruleset
-    };
-
-    let mut created = ruleset.create().map_err(std::io::Error::other)?;
+    // Best-effort ruleset: full v6 feature set declared, unsupported rights
+    // dropped by the crate on older kernels. The hard-required v1 baseline plus
+    // the NotEnforced check below keep this fail-closed. See
+    // [`build_best_effort_ruleset`].
+    let mut created = build_best_effort_ruleset(sandbox.restrict_net_connect)?;
 
     // Add filesystem rules for deferred paths (e.g. /proc/self).
     // These are magic symlinks that resolve per-process — opened here in the
@@ -1140,7 +1189,7 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
         if raw_fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let path_beneath_rule = create_path_beneath_rule(sandbox.abi_version, &raw_fd, access);
+        let path_beneath_rule = create_path_beneath_rule(&raw_fd, access);
         created = created
             .add_rule(path_beneath_rule)
             .map_err(std::io::Error::other)?;
@@ -1149,14 +1198,16 @@ pub fn apply_precomputed(sandbox: &PrecomputedSandbox) -> std::io::Result<()> {
     // Add filesystem rules using pre-opened file descriptors.
     // No open() or CString allocation — just borrow the raw fd.
     for &(raw_fd, access) in &sandbox.pre_opened_fds {
-        let path_beneath_rule = create_path_beneath_rule(sandbox.abi_version, &raw_fd, &access);
+        let path_beneath_rule = create_path_beneath_rule(&raw_fd, &access);
         created = created
             .add_rule(path_beneath_rule)
             .map_err(std::io::Error::other)?;
     }
 
-    // Add network rules (ABI v4+, only when network restriction is active).
-    if sandbox.abi_version >= ABI::V4 && sandbox.restrict_net_connect {
+    // Add network rules only when network restriction is active. On kernels
+    // < 6.7 the ConnectTcp handling was best-effort-dropped above, so these
+    // NetPort rules are silently dropped too (no per-ABI branch needed here).
+    if sandbox.restrict_net_connect {
         for rule in &sandbox.net_rules {
             created = created
                 .add_rule(NetPort::new(rule.port, AccessNet::ConnectTcp))
@@ -1212,26 +1263,13 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     net_rules: &[NetRule],
     restrict_net_connect: bool,
 ) -> std::io::Result<()> {
-    use landlock::{
-        ABI, Access, AccessFs, AccessNet, NetPort, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus,
-    };
+    use landlock::{AccessNet, NetPort, RulesetCreatedAttr, RulesetStatus};
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let abi_version = check_availability().map_err(std::io::Error::other)?;
-
-    let ruleset = Ruleset::default()
-        .handle_access(AccessFs::from_all(abi_version))
-        .map_err(std::io::Error::other)?;
-    let ruleset = if abi_version >= ABI::V4 && restrict_net_connect {
-        ruleset
-            .handle_access(AccessNet::ConnectTcp)
-            .map_err(std::io::Error::other)?
-    } else {
-        ruleset
-    };
-    let mut created = ruleset.create().map_err(std::io::Error::other)?;
+    // Same best-effort construction as the fork-based path — the hard-required
+    // v1 baseline fails closed if Landlock is unavailable inside the namespace.
+    let mut created = build_best_effort_ruleset(restrict_net_connect)?;
 
     // Open each rule's path in *this* namespace. `/proc/self` resolves to this
     // process's pid, which is preserved across the upcoming `execve()`, so no
@@ -1244,13 +1282,13 @@ pub(crate) fn apply_landlock_and_seccomp_now(
             // Path not present inside the namespace — skip, mirroring precompute().
             continue;
         }
-        let path_beneath_rule = create_path_beneath_rule(abi_version, &raw_fd, &rule.access);
+        let path_beneath_rule = create_path_beneath_rule(&raw_fd, &rule.access);
         created = created
             .add_rule(path_beneath_rule)
             .map_err(std::io::Error::other)?;
     }
 
-    if abi_version >= ABI::V4 && restrict_net_connect {
+    if restrict_net_connect {
         for rule in net_rules {
             created = created
                 .add_rule(NetPort::new(rule.port, AccessNet::ConnectTcp))
@@ -1273,9 +1311,24 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     Ok(())
 }
 
+/// Build a `PathBeneath` rule carrying the **full** access-rights set implied
+/// by `access`, independent of the running kernel's ABI.
+///
+/// # Why no ABI branching here
+///
+/// The rule is always added to a ruleset built by [`build_best_effort_ruleset`]
+/// under [`CompatLevel::BestEffort`](landlock::CompatLevel::BestEffort). The
+/// `landlock` crate performs a per-rule compatibility pass at `add_rule()`
+/// time: rights the kernel does not support (Refer on < v2, Truncate on < v3,
+/// IoctlDev on < v5) are silently stripped from *this* rule. Declaring the
+/// maximum set and letting the crate downgrade is exactly the best-effort
+/// pattern, and keeps this function free of `abi_version` comparisons.
+///
+/// The consistency check the crate runs uses the ruleset's *requested* handled
+/// access (`AccessFs::from_all(ABI::V6)`), which is a superset of everything
+/// set below, so no rule is ever rejected here.
 #[cfg(target_os = "linux")]
 fn create_path_beneath_rule<'fd>(
-    abi_version: ABI,
     raw_fd: &'fd RawFd,
     access: &FsAccess,
 ) -> PathBeneath<BorrowedFd<'fd>> {
@@ -1290,35 +1343,32 @@ fn create_path_beneath_rule<'fd>(
     };
 
     if access.write {
-        let mut write_flags = AccessFs::WriteFile
+        access_flags |= AccessFs::WriteFile
             | AccessFs::RemoveDir
             | AccessFs::RemoveFile
             | AccessFs::MakeDir
             | AccessFs::MakeReg
             | AccessFs::MakeSym
             | AccessFs::MakeFifo
-            | AccessFs::MakeSock;
-        if abi_version >= ABI::V2 {
-            // Refer controls rename()/link() across different Landlock
-            // domains. Without it, build tools (cargo, git) that move
-            // files between directories would fail.
-            write_flags |= AccessFs::Refer;
-        }
-        if abi_version >= ABI::V3 {
-            write_flags |= AccessFs::Truncate;
-        }
-        access_flags |= write_flags;
+            | AccessFs::MakeSock
+            // Refer (v2): rename()/link() across Landlock domains — build tools
+            // (cargo, git) moving files between directories need it.
+            // Truncate (v3): truncate()/ftruncate() and O_TRUNC opens.
+            // Both are best-effort-stripped on kernels that predate them.
+            | AccessFs::Refer
+            | AccessFs::Truncate;
     }
 
     if access.execute {
         access_flags |= AccessFs::Execute;
     }
 
-    if access.ioctl && abi_version >= ABI::V5 {
-        // Landlock ABI v5 (kernel ≥ 6.8) enforces IOCTL_DEV for character
-        // and block devices. Grant it for device paths so tcsetattr() on
-        // /dev/tty and /dev/pts/* succeeds — without this, raw mode fails,
-        // the terminal stays in cooked/echo mode and Copilot's TUI hangs.
+    if access.ioctl {
+        // IoctlDev (v5, kernel ≥ 6.8) enforces ioctl() on character/block
+        // devices. Grant it for device paths so tcsetattr() on /dev/tty and
+        // /dev/pts/* succeeds — without it raw mode fails, the terminal stays
+        // in cooked/echo mode and Copilot's TUI hangs. Best-effort-stripped on
+        // kernels < 6.8 where the right does not exist.
         access_flags |= AccessFs::IoctlDev;
     }
 
@@ -2498,5 +2548,47 @@ mod tests {
             1,
             "/tmp should be pre-opened; /proc/self must not be"
         );
+    }
+
+    /// The best-effort ruleset must build successfully on any kernel that
+    /// reports Landlock support: it hard-requires only the v1 filesystem
+    /// baseline and downgrades every higher-ABI right. If this ever fails on a
+    /// Landlock-capable kernel, the sandbox would refuse to run — proving the
+    /// hard-required v1 baseline is the *only* gate, not a specific ABI.
+    ///
+    /// Kernel-dependent, so gated behind availability: environments without
+    /// Landlock (older kernels, some CI sandboxes) skip rather than fail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn best_effort_ruleset_builds_when_landlock_available() {
+        if available_abi_version().is_none() {
+            return; // Landlock unavailable here — nothing to assert.
+        }
+        // Both the network-restricted and the localhost-any (no ConnectTcp)
+        // shapes must construct without a hard error.
+        build_best_effort_ruleset(true).expect("net-restricted ruleset should build");
+        build_best_effort_ruleset(false).expect("fs-only ruleset should build");
+    }
+
+    /// `available_abi_version()` and `check_availability()` must agree: the
+    /// single-syscall probe backs both, and the reported version stays within
+    /// the range this build understands (v1..=v6).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn available_abi_version_agrees_with_check_availability() {
+        match check_availability() {
+            Ok(_) => {
+                let v = available_abi_version()
+                    .expect("available_abi_version must be Some when check_availability is Ok");
+                assert!(
+                    (1..=6).contains(&v),
+                    "reported ABI version {v} must be within the supported range"
+                );
+            }
+            Err(_) => assert!(
+                available_abi_version().is_none(),
+                "available_abi_version must be None when Landlock is unavailable"
+            ),
+        }
     }
 }
