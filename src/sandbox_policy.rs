@@ -344,6 +344,18 @@ pub const HARDENING_ENV_VARS: &[HardeningEnvVar] = &[
         category: HardeningCategory::GitHardening,
         description: "Prevent git from prompting for credentials",
     },
+    // The system git config (/etc/gitconfig) is not in the Landlock read
+    // allowlist. When it exists — as on Debian/Ubuntu and every GitHub Actions
+    // runner — git hits EACCES (not ENOENT) and aborts every command with
+    // "fatal: unknown error occurred while reading the configuration files".
+    // Skipping system config keeps git working and prevents system-level
+    // settings (url rewrites, hooks) from reaching the sandboxed agent.
+    HardeningEnvVar {
+        name: "GIT_CONFIG_NOSYSTEM",
+        value: "1",
+        category: HardeningCategory::GitHardening,
+        description: "Skip /etc/gitconfig (denied by Landlock; would abort git)",
+    },
     // Git signing — ~/.ssh and ~/.gnupg are denied by the sandbox, so commit/tag
     // signing would fail with EPERM. Disable it via config override rather than
     // opening private key directories. Re-enabled by --allow-gpg-signing.
