@@ -1135,6 +1135,19 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         }
     }
 
+    // Reconcile proxy.forced vs allow_localhost_any (#53). Done here, after all
+    // sources (CLI, user config, repo proposal) are merged, so every downstream
+    // consumer — the startup summary and the sandbox policy — sees the resolved
+    // value. proxy.forced supersedes allow_localhost_any (forces it off) rather
+    // than erroring, so the feature stays usable where allow_localhost_any is set.
+    if resolved.reconcile_proxy_forced() {
+        ui::warn(
+            "proxy.forced is active: ignoring allow_localhost_any — all outbound traffic \
+             must go through the proxy. Allowing any localhost port would disable kernel \
+             network restriction and defeat forced egress.",
+        );
+    }
+
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         ui::warn(&format!(
@@ -1283,14 +1296,9 @@ fn start_proxy_if_enabled(
     // rather than silently picking a side, then force the proxy on so the
     // fail-closed start path below applies.
     if resolved.proxy_forced {
-        // Hard conflict (#53): proxy-forced locks egress to the proxy port, which
-        // is fundamentally incompatible with allow_localhost_any disabling kernel
-        // net restriction. Checked here so it sees the fully RESOLVED value —
-        // including allow_localhost_any enabled via an approved repo proposal
-        // (apply_repo_config runs before this in resolve_context).
-        resolved
-            .check_proxy_forced_conflicts()
-            .map_err(|e| anyhow::anyhow!(e))?;
+        // proxy.forced vs allow_localhost_any is reconciled earlier in
+        // resolve_context (proxy.forced wins, allow_localhost_any forced off).
+        // The remaining incompatibility is an explicitly disabled proxy.
         if !resolved.with_proxy {
             bail!(
                 "conflicting options: --proxy-forced requires the proxy, but it was \
