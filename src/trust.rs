@@ -401,12 +401,27 @@ pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
 /// same path stays trusted. A legacy entry with an empty `path` (written before
 /// path binding existed) matches nothing, forcing a one-time re-approval that
 /// records the real path.
+///
+/// # Fail-closed
+///
+/// This is a security gate, so canonicalization failure MUST be treated as a
+/// mismatch, never as a match. If *either* the stored approved path or the
+/// current project path cannot be canonicalized (missing, unreadable, symlink
+/// loop, …) the comparison of raw strings could be spoofed or could silently
+/// pass on non-normalized input, so we return `false` (not trusted → re-approval
+/// required) rather than falling back to a lexical comparison.
 pub fn approved_path_matches(entry: &TrustEntry, project_dir: &Path) -> bool {
     if entry.repo.path.is_empty() {
         return false;
     }
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canon(Path::new(&entry.repo.path)) == canon(project_dir)
+    // Fail closed: a canonicalize error on either side means "not trusted".
+    let (Ok(stored), Ok(current)) = (
+        std::fs::canonicalize(Path::new(&entry.repo.path)),
+        std::fs::canonicalize(project_dir),
+    ) else {
+        return false;
+    };
+    stored == current
 }
 
 #[cfg(test)]
@@ -670,6 +685,25 @@ approved_at = "2026-05-01T12:00:00Z"
             &entry,
             Path::new("/home/user/spleis")
         ));
+    }
+
+    #[test]
+    fn approved_path_noncanonicalizable_is_not_trusted() {
+        // Fail-closed: if the stored approved path cannot be canonicalized (here,
+        // a nonexistent path that is byte-for-byte identical to the current one),
+        // the gate must NOT trust it. A lexical fallback would return `true` for
+        // two identical raw strings even though neither resolves on disk, which
+        // would let a spoofed/non-normalized path inherit an approval — so the
+        // gate returns `false` and forces a re-approval instead.
+        let missing = "/nonexistent-cplt-test-path/attacker/spleis";
+        let entry = TrustEntry {
+            repo: RepoIdentity {
+                remote: "github.com/navikt/spleis".to_string(),
+                path: missing.to_string(),
+            },
+            ..Default::default()
+        };
+        assert!(!approved_path_matches(&entry, Path::new(missing)));
     }
 
     #[test]

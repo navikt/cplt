@@ -357,8 +357,10 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     // Finding 1: Landlock cannot deny subpaths inside the writable project tree,
     // so the project's .git/hooks (and other git-persistence files) stay
     // writable — a persistence-escape vector. When Bubblewrap is active we
-    // re-bind those pre-existing paths read-only to restore macOS parity.
-    let ro_protect = bubblewrap::git_persistence_paths(config.project_dir);
+    // re-bind those pre-existing paths read-only to restore macOS parity. In a
+    // git worktree the real hooks live under the shared git_common_dir (which
+    // the sandbox grants write access to), so pass it through to cover them too.
+    let ro_protect = bubblewrap::git_persistence_paths(config.project_dir, config.git_common_dir);
 
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually

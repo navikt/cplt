@@ -282,11 +282,34 @@ pub(crate) fn build_bwrap_args(fs_rules: &[FsRule], ro_protect: &[PathBuf]) -> V
 /// `.git/hooks` bind therefore only mitigates the *direct* persistence vector
 /// (planting a hook file); it is not a complete closure of git-hook
 /// persistence. See SECURITY.md for the full residual discussion.
-pub(crate) fn git_persistence_paths(project_dir: &Path) -> Vec<PathBuf> {
-    vec![
+///
+/// # Worktrees
+///
+/// In a git **worktree**, `<project>/.git` is a *file* (a gitdir pointer), so
+/// `<project>/.git/hooks` does not exist and the real hooks live under the
+/// shared common dir (`<git_common_dir>/hooks`) — which the sandbox grants
+/// write access to. Protecting only the project's `.git/hooks` would therefore
+/// miss the actual persistence vector for worktrees. When `git_common_dir` is
+/// known (worktree case) and differs from `<project>/.git`, we ALSO protect
+/// `<git_common_dir>/hooks`. Non-existent paths are skipped downstream (see
+/// [`build_bwrap_args`]).
+pub(crate) fn git_persistence_paths(
+    project_dir: &Path,
+    git_common_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![
         project_dir.join(".git/hooks"),
         project_dir.join(".cplt.toml"),
-    ]
+    ];
+    // Worktree: the shared common dir holds the real hooks. `git_common_dir` is
+    // only `Some` for a worktree (see `discover::git_common_dir`), but guard on
+    // it differing from `<project>/.git` so a regular repo never double-binds.
+    if let Some(common) = git_common_dir
+        && common != project_dir.join(".git")
+    {
+        paths.push(common.join("hooks"));
+    }
+    paths
 }
 
 /// Resolve whether bubblewrap should wrap this run, and build the wrapper.
@@ -709,7 +732,7 @@ mod tests {
         let hooks_str = hooks.to_string_lossy().into_owned();
 
         let rules = vec![writable_rule(&proj_str)];
-        let ro = git_persistence_paths(proj.path());
+        let ro = git_persistence_paths(proj.path(), None);
         let args = build_bwrap_args(&rules, &ro);
 
         let proj_bind_idx = args
@@ -740,7 +763,7 @@ mod tests {
 
         let proj_str = proj.path().to_string_lossy().into_owned();
         let rules = vec![writable_rule(&proj_str)];
-        let ro = git_persistence_paths(proj.path());
+        let ro = git_persistence_paths(proj.path(), None);
         let args = build_bwrap_args(&rules, &ro);
 
         // .git/hooks and .cplt.toml are re-bound read-only.
@@ -775,13 +798,58 @@ mod tests {
         // probe) and cannot protect a not-yet-created file anyway — skip it.
         let proj = tempfile::tempdir().expect("tempdir");
         // No .git/hooks or .cplt.toml created.
-        let ro = git_persistence_paths(proj.path());
+        let ro = git_persistence_paths(proj.path(), None);
         let args = build_bwrap_args(&[], &ro);
         assert!(
             !args
                 .iter()
                 .any(|a| a.contains(".git/hooks") || a.contains(".cplt.toml")),
             "missing git-persistence paths must not be bound"
+        );
+    }
+
+    #[test]
+    fn worktree_common_dir_hooks_are_protected() {
+        // In a git worktree, <project>/.git is a FILE pointing at the shared
+        // gitdir, so <project>/.git/hooks does not exist and the real hooks live
+        // under git_common_dir/hooks (which the sandbox grants write access to).
+        // The ro_protect set MUST include the common-dir hooks so the
+        // persistence-escape mitigation does not miss them.
+        let common = tempfile::tempdir().expect("tempdir"); // shared .git dir
+        let common_hooks = common.path().join("hooks");
+        std::fs::create_dir_all(&common_hooks).expect("create common hooks");
+
+        let proj = tempfile::tempdir().expect("tempdir"); // worktree checkout
+        let ro = git_persistence_paths(proj.path(), Some(common.path()));
+
+        assert!(
+            ro.contains(&common_hooks),
+            "worktree common-dir hooks must be in the ro_protect set"
+        );
+
+        // And once bound they are re-bound read-only (they exist on disk).
+        let args = build_bwrap_args(&[], &ro);
+        let common_hooks_str = common_hooks.to_string_lossy().into_owned();
+        assert!(
+            args.windows(3).any(|w| w[0] == "--ro-bind"
+                && w[1] == common_hooks_str
+                && w[2] == common_hooks_str),
+            "worktree common-dir hooks must be re-bound read-only"
+        );
+    }
+
+    #[test]
+    fn regular_repo_does_not_double_bind_git_dir() {
+        // Defensive guard: if git_common_dir were ever `Some(<project>/.git)`
+        // (a non-worktree), it must NOT be added a second time — the standard
+        // <project>/.git/hooks entry already covers it.
+        let proj = tempfile::tempdir().expect("tempdir");
+        let ro = git_persistence_paths(proj.path(), Some(&proj.path().join(".git")));
+        let hooks = proj.path().join(".git/hooks");
+        assert_eq!(
+            ro.iter().filter(|p| **p == hooks).count(),
+            1,
+            "the project's .git/hooks must appear exactly once"
         );
     }
 }
