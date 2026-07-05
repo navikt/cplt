@@ -2348,6 +2348,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             resolver: Some(resolver),
+            upstream: None,
         })
         .expect("proxy start failed");
 
@@ -2404,6 +2405,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             resolver: Some(resolver),
+            upstream: None,
         })
         .expect("proxy start failed");
 

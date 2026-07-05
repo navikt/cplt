@@ -6686,6 +6686,7 @@ fn registry_keys_match_validate_all_valid_keys_fixture() {
 enabled = false
 forced = false
 port = 18080
+upstream = "http://corp-proxy.example.com:8080"
 blocked_domains = "file.txt"
 allowed_domains = "file.txt"
 log_file = "log.txt"
