@@ -564,13 +564,20 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // also exempt that port from the general port policy (which only lists remote ports
     // like 443/80). Without this, allow_localhost_ports would be silently ignored —
     // the port check would fire first and return 403 before the localhost logic ran.
+    // Config-level localhost opt-in for this connection, independent of how the
+    // hostname is spelled: the user either allowed all localhost ports
+    // (`--allow-localhost-any`) or explicitly allow-listed this port
+    // (`--allow-localhost <PORT>`). This is the sole gate for a target that
+    // *resolves* to loopback — see the `resolved_ip_is_blocked` call below.
+    let localhost_opt_in = state.allow_localhost_any || state.allow_localhost_ports.contains(&port);
+
     let localhost_connect_allowed = {
         let h = host.trim_start_matches('[').trim_end_matches(']');
         let is_loopback = h == "localhost"
             || h.ends_with(".localhost")
             || h.parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback());
-        is_loopback && (state.allow_localhost_any || state.allow_localhost_ports.contains(&port))
+        is_loopback && localhost_opt_in
     };
 
     // Enforce port policy — only allow ports matching the sandbox network rules.
@@ -675,13 +682,19 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // 169.254.169.254 (cloud IMDS) or an internal host. Using the hostname pattern
     // alone would bypass this check entirely, enabling SSRF to cloud metadata.
     //
-    // Crucially, a loopback-resolving target is only exempted when localhost
-    // access was explicitly allowed. See `resolved_ip_is_blocked` for the why.
+    // Crucially, a loopback-resolving target is exempted only when the user opted
+    // into localhost access for this connection (`localhost_opt_in`) — NOT based on
+    // whether the hostname literally spells "localhost". Once the target has
+    // resolved to a loopback IP, the spelling of the name is irrelevant: a user who
+    // opted in with `--allow-localhost-any` (or `--allow-localhost <PORT>`) may
+    // legitimately reach loopback via a loopback-aliasing name (`lvh.me`,
+    // `127.0.0.1.nip.io`). With no opt-in, loopback stays blocked regardless of the
+    // name, preserving the no-localhost default. See `resolved_ip_is_blocked`.
     let private_domains = state.get_private_domains();
     if resolved_ip_is_blocked(
         &socket_addr.ip(),
         is_domain_match(&host, &private_domains),
-        localhost_connect_allowed,
+        localhost_opt_in,
     ) {
         log_connection(
             "CONNECT",
@@ -902,18 +915,29 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
 
 /// Decide whether a target's *resolved* IP must be blocked as a private-network
 /// SSRF risk, given whether the host is an approved private domain and whether
-/// localhost access was explicitly allowed.
+/// the user opted into localhost access for this connection.
+///
+/// Semantics:
+/// - A non-loopback private/reserved IP (RFC1918, CGNAT, link-local, cloud IMDS,
+///   ULA, ...) is ALWAYS blocked here unless the host is an approved private
+///   domain (`allow_private_domains`). The localhost opt-in never opens these.
+/// - A loopback IP is blocked UNLESS the user opted into localhost access for this
+///   connection (`localhost_allowed`, i.e. `--allow-localhost-any` OR the target
+///   port is in the allow-listed localhost ports). This is the *config-level*
+///   opt-in — it does not depend on whether the hostname literally spells
+///   "localhost".
 ///
 /// Security: a hostname that resolves to loopback (`lvh.me`, `127.0.0.1.nip.io`,
 /// or alternate encodings such as `2130706433`, `0x7f000001`, `127.1`) must NOT
 /// be silently exempted just because the final IP is loopback. Reaching loopback
-/// services is only permitted when localhost access was explicitly requested
-/// (`localhost_allowed` — the same flag that gated the port and private-hostname
-/// carve-outs above) or the host is an approved private domain. Otherwise a
-/// crafted DNS name defeats the no-localhost default — and under `--proxy-forced`,
-/// where this proxy is the sole egress gate, it would tunnel to arbitrary
-/// loopback services. `is_private_hostname` only catches the literal `localhost`
-/// pre-DNS, so this resolved-IP check is the real gate for the rest.
+/// services is only permitted when localhost access was explicitly requested;
+/// otherwise a crafted DNS name defeats the no-localhost default — and under
+/// `--proxy-forced`, where this proxy is the sole egress gate, it would tunnel to
+/// arbitrary loopback services. Conversely, keying the loopback waiver on the
+/// config opt-in (rather than the literal hostname) honors an explicit opt-in
+/// consistently for loopback-aliasing names, without ever loosening the block on
+/// non-loopback private IPs. `is_private_hostname` only catches the literal
+/// `localhost` pre-DNS, so this resolved-IP check is the real gate for the rest.
 pub fn resolved_ip_is_blocked(
     ip: &std::net::IpAddr,
     host_is_private_domain: bool,
@@ -1834,6 +1858,133 @@ mod tests {
         assert!(
             status.contains("403"),
             "carve-out: evil.localhost:8080 resolving to a public IP must be blocked (resolved IP is not loopback); got: {status}"
+        );
+    }
+
+    /// Direct unit test of the `resolved_ip_is_blocked` contract after the
+    /// localhost-opt-in change: the `localhost_allowed` argument is the
+    /// config-level opt-in, and it waives ONLY loopback — never non-loopback
+    /// private IPs like RFC1918.
+    #[test]
+    fn resolved_ip_is_blocked_waives_only_loopback_on_optin() {
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let loopback6: std::net::IpAddr = "::1".parse().unwrap();
+        let rfc1918: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        let public: std::net::IpAddr = "93.184.216.34".parse().unwrap();
+
+        // No opt-in: loopback stays blocked (the SSRF-fix default).
+        assert!(resolved_ip_is_blocked(&loopback, false, false));
+        assert!(resolved_ip_is_blocked(&loopback6, false, false));
+
+        // Opt-in: loopback is waived (v4 and v6).
+        assert!(!resolved_ip_is_blocked(&loopback, false, true));
+        assert!(!resolved_ip_is_blocked(&loopback6, false, true));
+
+        // Opt-in must NOT open non-loopback private IPs (RFC1918).
+        assert!(resolved_ip_is_blocked(&rfc1918, false, true));
+        assert!(resolved_ip_is_blocked(&rfc1918, false, false));
+
+        // Approved private domain lifts the block for the non-loopback private IP.
+        assert!(!resolved_ip_is_blocked(&rfc1918, true, false));
+
+        // Public IPs are never private → never blocked here regardless of flags.
+        assert!(!resolved_ip_is_blocked(&public, false, false));
+    }
+
+    /// The localhost opt-in must be honored for a loopback-ALIASING DNS name
+    /// (e.g. `lvh.me`) that does NOT literally spell "localhost". Before the fix,
+    /// `resolved_ip_is_blocked` was gated on the hostname-literal flag, so such a
+    /// name resolving to 127.0.0.1 was over-blocked even with `--allow-localhost-any`.
+    ///
+    /// CONNECT `lvh.me:443` (443 is in the general allowed_ports, so it clears the
+    /// port policy), resolver pins `lvh.me` → the loopback listener. With the fix
+    /// (`localhost_opt_in` passed to `resolved_ip_is_blocked`) this is ALLOWED.
+    #[test]
+    fn proxy_allows_loopback_aliasing_name_with_localhost_optin() {
+        require_localhost_tcp!();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            listener.accept().ok();
+        });
+
+        let loopback_addr = std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), listen_port);
+        let resolver: ResolverFn = Arc::new(move |host: &str, _port: u16| {
+            if host == "lvh.me" {
+                Some(loopback_addr)
+            } else {
+                None
+            }
+        });
+
+        // allow_localhost_any = true (config-level opt-in), no hostname literal.
+        let proxy = make_proxy_with_resolver(vec![], true, Some(resolver));
+        let status = proxy_connect(proxy.port, "lvh.me:443");
+        proxy.shutdown();
+        let _ = std::net::TcpStream::connect(("127.0.0.1", listen_port));
+        handle.join().ok();
+
+        assert!(
+            status.contains("200"),
+            "lvh.me:443 resolving to loopback must be ALLOWED with --allow-localhost-any \
+             even though the name isn't literally 'localhost'; got: {status}"
+        );
+    }
+
+    /// The no-opt-in default stays fail-closed regardless of the hostname: a
+    /// loopback-aliasing name resolving to 127.0.0.1 is BLOCKED when the user did
+    /// not opt into localhost. Preserves the loopback SSRF fix.
+    #[test]
+    fn proxy_blocks_loopback_aliasing_name_without_optin() {
+        require_localhost_tcp!();
+
+        let loopback_addr = std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), 443);
+        let resolver: ResolverFn = Arc::new(move |host: &str, _port: u16| {
+            if host == "lvh.me" {
+                Some(loopback_addr)
+            } else {
+                None
+            }
+        });
+
+        // No localhost opt-in at all.
+        let proxy = make_proxy_with_resolver(vec![], false, Some(resolver));
+        let status = proxy_connect(proxy.port, "lvh.me:443");
+        proxy.shutdown();
+
+        assert!(
+            status.contains("403"),
+            "lvh.me:443 resolving to loopback must be BLOCKED without any localhost opt-in; got: {status}"
+        );
+    }
+
+    /// The localhost opt-in must NOT open non-loopback private IPs (RFC1918):
+    /// `--allow-localhost-any` waives loopback only, never 10.0.0.0/8 etc.
+    /// `corp.internal` (not allow-listed) resolving to 10.0.0.5 must stay BLOCKED
+    /// even with `allow_localhost_any = true`.
+    #[test]
+    fn proxy_localhost_optin_does_not_open_rfc1918() {
+        require_localhost_tcp!();
+
+        let private_addr = std::net::SocketAddr::new("10.0.0.5".parse().unwrap(), 443);
+        let resolver: ResolverFn = Arc::new(move |host: &str, _port: u16| {
+            if host == "corp.internal" {
+                Some(private_addr)
+            } else {
+                None
+            }
+        });
+
+        // Opt into localhost broadly — must not affect the RFC1918 block.
+        let proxy = make_proxy_with_resolver(vec![], true, Some(resolver));
+        let status = proxy_connect(proxy.port, "corp.internal:443");
+        proxy.shutdown();
+
+        assert!(
+            status.contains("403"),
+            "corp.internal → 10.0.0.5 (RFC1918, not allow-listed) must stay BLOCKED even with \
+             --allow-localhost-any; localhost opt-in must not open private networks; got: {status}"
         );
     }
 }
