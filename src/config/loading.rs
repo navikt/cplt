@@ -1650,6 +1650,38 @@ validate = false
     }
 
     #[test]
+    fn preset_from_name_roundtrips_canonical_names() {
+        assert_eq!(Preset::from_name("strict"), Some(Preset::Strict));
+        assert_eq!(Preset::from_name("standard"), Some(Preset::Standard));
+        assert_eq!(Preset::from_name("permissive"), Some(Preset::Permissive));
+        assert_eq!(Preset::from_name("full-trust"), Some(Preset::FullTrust));
+        assert_eq!(Preset::from_name("bogus"), None);
+    }
+
+    #[test]
+    fn preset_enabled_dangerous_names_matches_toggles() {
+        // Safe presets enable nothing dangerous.
+        assert!(Preset::Strict.enabled_dangerous_names().is_empty());
+        assert!(Preset::Standard.enabled_dangerous_names().is_empty());
+        // Permissive names exactly its three toggles, in display order.
+        assert_eq!(
+            Preset::Permissive.enabled_dangerous_names(),
+            vec!["tmp-exec", "localhost-any", "lifecycle-scripts"]
+        );
+        // Full-trust adds docker + env-files.
+        assert_eq!(
+            Preset::FullTrust.enabled_dangerous_names(),
+            vec![
+                "tmp-exec",
+                "localhost-any",
+                "lifecycle-scripts",
+                "docker",
+                "env-files"
+            ]
+        );
+    }
+
+    #[test]
     fn no_preset_equals_standard_defaults() {
         // No preset must be byte-for-byte the same five toggles as `standard`
         // (and as today's hardcoded defaults) — no behavior change.

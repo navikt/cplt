@@ -240,6 +240,14 @@ struct Cli {
     #[arg(long)]
     allow_localhost_any: bool,
 
+    // The paired --allow-*/--no-allow-* preset toggles below (localhost-any,
+    // env-files, lifecycle-scripts, docker, tmp-exec) deliberately do NOT use
+    // clap `conflicts_with`. This matches the convention for every paired
+    // toggle in this tool (--with-proxy/--no-proxy, --quiet/--no-quiet, …):
+    // contradictions are resolved by `FeatureToggle::from_pair`, where OFF
+    // wins if both are passed. Off-wins is the safe default for a security
+    // tool — a stray `--allow-*` can never silently re-enable a toggle the
+    // user also disabled — so we accept the pair rather than erroring on it.
     /// Force localhost-any off, overriding a permissive/full-trust preset or a
     /// config value. Use with --preset to opt out of just this toggle.
     #[arg(long)]
@@ -2836,18 +2844,41 @@ fn run_config_set(
         }
     };
 
-    // Dangerous key safeguard
-    if op.key_info.dangerous
-        && !unset
-        && let Some(val) = value
-        && val == "true"
+    // Dangerous-setting safeguard. Two cases weaken the sandbox and require
+    // --force:
+    //   1. A key flagged `dangerous` in the registry set to `true`
+    //      (allow_docker, allow_tmp_exec, …) — danger is in the KEY.
+    //   2. `sandbox.preset` set to a value that enables guarded toggles
+    //      (permissive/full-trust) — danger is in the VALUE, so this must be
+    //      value-aware. strict/standard are no-op baselines and are allowed.
+    if !unset
         && !force
+        && let Some(val) = value
     {
-        ui::error(&format!(
-            "{key} is a dangerous setting — it weakens sandbox security.\n  \
-             Add --force to confirm: cplt config set {key} true --force"
-        ));
-        return ExitCode::FAILURE;
+        // Value-aware preset check: warn and name what the preset enables.
+        if op.key_info.section == "sandbox"
+            && op.key_info.key == "preset"
+            && let Some(preset) = config::Preset::from_name(val)
+        {
+            let enabled = preset.enabled_dangerous_names();
+            if !enabled.is_empty() {
+                ui::error(&format!(
+                    "{key} = {val} enables dangerous settings ({}) — it weakens sandbox security.\n  \
+                     Add --force to confirm: cplt config set {key} {val} --force",
+                    enabled.join(", ")
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
+
+        // Key-level dangerous-bool check.
+        if op.key_info.dangerous && val == "true" {
+            ui::error(&format!(
+                "{key} is a dangerous setting — it weakens sandbox security.\n  \
+                 Add --force to confirm: cplt config set {key} true --force"
+            ));
+            return ExitCode::FAILURE;
+        }
     }
 
     // Load or create document

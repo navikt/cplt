@@ -183,7 +183,61 @@ pub struct PresetToggles {
     pub allow_lifecycle_scripts: bool,
 }
 
+impl PresetToggles {
+    /// Human-readable names of the toggles this baseline turns **on**, in a
+    /// stable display order. Every one of these five toggles is treated as
+    /// dangerous when set explicitly (each has `dangerous: true` in the
+    /// registry and its own `config validate` warning), so this doubles as
+    /// "the dangerous settings this preset enables" — used to warn about and
+    /// name exactly what a dangerous preset turns on.
+    ///
+    /// Deriving the list from the actual toggle values means a preset warning
+    /// can never drift out of sync with what [`Preset::toggles`] enables.
+    pub fn enabled_dangerous_names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.allow_tmp_exec {
+            names.push("tmp-exec");
+        }
+        if self.allow_localhost_any {
+            names.push("localhost-any");
+        }
+        if self.allow_lifecycle_scripts {
+            names.push("lifecycle-scripts");
+        }
+        if self.allow_docker {
+            names.push("docker");
+        }
+        if self.allow_env_files {
+            names.push("env-files");
+        }
+        names
+    }
+}
+
 impl Preset {
+    /// Parse a preset from its canonical string name (as used in the config
+    /// file and on the CLI). Shared by `Deserialize` and by
+    /// validation/`config set` so the accepted names cannot drift between
+    /// parsing paths.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "strict" => Some(Self::Strict),
+            "standard" => Some(Self::Standard),
+            "permissive" => Some(Self::Permissive),
+            "full-trust" => Some(Self::FullTrust),
+            _ => None,
+        }
+    }
+
+    /// The dangerous sandbox toggles this preset enables, by name. Empty for
+    /// `strict`/`standard` (no-op baselines); non-empty for `permissive` and
+    /// `full-trust`. A non-empty result means the preset weakens the sandbox
+    /// and should trigger the same dangerous-setting safeguards as the
+    /// individual toggles it turns on.
+    pub fn enabled_dangerous_names(self) -> Vec<&'static str> {
+        self.toggles().enabled_dangerous_names()
+    }
+
     /// Map the preset to its baseline toggle values.
     ///
     /// Note `Strict` and `Standard` produce the same five values — the only
@@ -234,15 +288,11 @@ impl<'de> Deserialize<'de> for Preset {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "strict" => Ok(Self::Strict),
-            "standard" => Ok(Self::Standard),
-            "permissive" => Ok(Self::Permissive),
-            "full-trust" => Ok(Self::FullTrust),
-            other => Err(serde::de::Error::custom(format!(
-                "invalid preset '{other}': expected \"strict\", \"standard\", \"permissive\", or \"full-trust\""
-            ))),
-        }
+        Self::from_name(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "invalid preset '{s}': expected \"strict\", \"standard\", \"permissive\", or \"full-trust\""
+            ))
+        })
     }
 }
 

@@ -2084,6 +2084,70 @@ mod e2e_tests {
     }
 
     #[test]
+    fn e2e_config_set_dangerous_preset_requires_force() {
+        // sandbox.preset is not a `dangerous` KEY, but permissive/full-trust
+        // are dangerous VALUES (they enable guarded toggles), so setting them
+        // must trip the same --force safeguard as a dangerous bool.
+        for preset in ["permissive", "full-trust"] {
+            let fake_home = make_config_home(&format!("set-preset-{preset}"));
+
+            // Without --force should fail and name what it enables.
+            let output = Command::new(binary_path())
+                .args(["config", "set", "sandbox.preset", preset])
+                .env("HOME", fake_home.to_str().unwrap())
+                .env_remove("CPLT_CONFIG")
+                .output()
+                .expect("should run");
+            assert!(
+                !output.status.success(),
+                "preset={preset} should fail without --force"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("--force"),
+                "preset={preset} should mention --force: {stderr}"
+            );
+
+            // With --force should succeed.
+            let output2 = Command::new(binary_path())
+                .args(["config", "set", "sandbox.preset", preset, "--force"])
+                .env("HOME", fake_home.to_str().unwrap())
+                .env_remove("CPLT_CONFIG")
+                .output()
+                .expect("should run");
+            assert!(
+                output2.status.success(),
+                "preset={preset} should succeed with --force: {}",
+                String::from_utf8_lossy(&output2.stderr)
+            );
+
+            let _ = std::fs::remove_dir_all(&fake_home);
+        }
+    }
+
+    #[test]
+    fn e2e_config_set_safe_preset_no_force_needed() {
+        // strict/standard are no-op-or-safer baselines — no --force required.
+        for preset in ["strict", "standard"] {
+            let fake_home = make_config_home(&format!("set-safe-preset-{preset}"));
+
+            let output = Command::new(binary_path())
+                .args(["config", "set", "sandbox.preset", preset])
+                .env("HOME", fake_home.to_str().unwrap())
+                .env_remove("CPLT_CONFIG")
+                .output()
+                .expect("should run");
+            assert!(
+                output.status.success(),
+                "preset={preset} should not require --force: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let _ = std::fs::remove_dir_all(&fake_home);
+        }
+    }
+
+    #[test]
     fn e2e_config_set_invalid_key_fails() {
         let fake_home = make_config_home("set-badkey");
 
