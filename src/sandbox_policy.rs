@@ -196,6 +196,8 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "NODE_ENV",
     "NODE_EXTRA_CA_CERTS",
     "NPM_CONFIG_CACHE",
+    "npm_config_cache",  // npm's canonical lowercase spelling of the cache path
+    "YARN_CACHE_FOLDER", // Yarn global cache location (also matches YARN_ prefix)
     "NPM_CONFIG_PREFIX",
     // Go
     "GOPATH",
@@ -227,6 +229,7 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "ASDF_DIR",                // asdf install directory
     "ASDF_DATA_DIR",           // asdf data directory (installs, shims)
     "PYTHONDONTWRITEBYTECODE", // Prevent .pyc writes (common in CI/sandboxed envs)
+    "PIP_CACHE_DIR",           // pip download/wheel cache location
     // pnpm
     "PNPM_HOME",             // pnpm binary location
     "NPM_CONFIG_USERCONFIG", // path to a custom .npmrc file (not the file itself — no auth tokens)
@@ -993,6 +996,184 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
 /// the profile generator.
 pub fn home_tool_dirs() -> &'static [HomeToolDir] {
     HOME_TOOL_DIRS
+}
+
+// ── Tool-path environment variable overrides ───────────────────────────────
+
+/// A development tool environment variable that relocates where the tool reads
+/// or writes files (e.g. `GOPATH`, `CARGO_HOME`, `NODE_PATH`).
+///
+/// [`HOME_TOOL_DIRS`] allowlists each tool's *default* location under `$HOME`.
+/// When a user points one of these env vars at a **non-default** path and that
+/// value is passed into the sandbox, builds fail because the custom path is not
+/// in the allow set (e.g. `GOPATH=/custom` → `go build` cannot write there).
+/// [`tool_path_env_overrides`] closes that gap by granting the resolved path.
+///
+/// Security note: an env var value is user-controlled configuration, so honoring
+/// it is consistent with how cplt already trusts `pass-env` — the same user who
+/// launches cplt set the variable. We only ever *add* access (never remove), and
+/// grant write only for the tools that genuinely write to the path.
+pub struct ToolPathEnvVar {
+    /// Environment variable name (looked up in the parent process env).
+    pub name: &'static str,
+    /// `true` → grant read+write (build caches / dependency stores the tool
+    /// writes to). `false` → grant read-only (lookup paths the tool only reads).
+    pub write: bool,
+    /// Home-relative default locations already covered by [`HOME_TOOL_DIRS`] (or
+    /// redirected elsewhere, e.g. `GOCACHE` → scratch dir). If the env var
+    /// resolves to one of these, no extra rule is added — the base policy already
+    /// grants it, so adding it again would only widen or duplicate the grant.
+    /// Multiple entries cover per-platform defaults (macOS `Library/...` vs XDG).
+    pub default_subpaths: &'static [&'static str],
+}
+
+/// Recognized tool-path env vars and how their target path is granted.
+///
+/// Covers the common Go, Node/npm/yarn/pnpm, Rust/cargo and Python/pip knobs.
+/// Write is granted for caches and dependency stores the tool populates; read
+/// for pure lookup paths (`NODE_PATH`). All of these vars reach the sandbox via
+/// [`ENV_ALLOWLIST`] (or a prefix in [`ENV_PREFIX_ALLOWLIST`]), so the granted
+/// path is actually nameable by the sandboxed process.
+pub const TOOL_PATH_ENV_VARS: &[ToolPathEnvVar] = &[
+    // ── Go ──────────────────────────────────────────────────────────────────
+    // GOPATH holds go/bin, go/pkg (module cache) and go/src; builds write here.
+    ToolPathEnvVar {
+        name: "GOPATH",
+        write: true,
+        default_subpaths: &["go"],
+    },
+    // Module cache — `go build`/`go test`/`go get` download & extract modules.
+    ToolPathEnvVar {
+        name: "GOMODCACHE",
+        write: true,
+        default_subpaths: &["go/pkg/mod"],
+    },
+    // Build cache. Default is redirected to the scratch dir (SCRATCH_DIR_ENV_VARS),
+    // so honor only an explicit non-default override.
+    ToolPathEnvVar {
+        name: "GOCACHE",
+        write: true,
+        default_subpaths: &["Library/Caches/go-build", ".cache/go-build"],
+    },
+    // ── Rust / cargo ─────────────────────────────────────────────────────────
+    // CARGO_HOME holds bin/, registry/ and git/ — cargo writes to registry & git.
+    ToolPathEnvVar {
+        name: "CARGO_HOME",
+        write: true,
+        default_subpaths: &[".cargo"],
+    },
+    // ── Node / npm / yarn / pnpm ─────────────────────────────────────────────
+    // npm cache (uppercase and npm's canonical lowercase spelling).
+    ToolPathEnvVar {
+        name: "NPM_CONFIG_CACHE",
+        write: true,
+        default_subpaths: &[".npm"],
+    },
+    ToolPathEnvVar {
+        name: "npm_config_cache",
+        write: true,
+        default_subpaths: &[".npm"],
+    },
+    // Yarn (Classic & Berry) global cache folder.
+    ToolPathEnvVar {
+        name: "YARN_CACHE_FOLDER",
+        write: true,
+        default_subpaths: &[".cache/yarn", "Library/Caches/Yarn"],
+    },
+    // pnpm home (global store + shims).
+    ToolPathEnvVar {
+        name: "PNPM_HOME",
+        write: true,
+        default_subpaths: &["Library/pnpm", ".local/share/pnpm"],
+    },
+    // NODE_PATH is a module *lookup* path — read-only is sufficient.
+    ToolPathEnvVar {
+        name: "NODE_PATH",
+        write: false,
+        default_subpaths: &[],
+    },
+    // ── Python / pip ─────────────────────────────────────────────────────────
+    // pip download/wheel cache.
+    ToolPathEnvVar {
+        name: "PIP_CACHE_DIR",
+        write: true,
+        default_subpaths: &[".cache/pip", "Library/Caches/pip"],
+    },
+];
+
+/// A single resolved tool-path override to add to the sandbox allow set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPathOverride {
+    /// Resolved path (leading `~/` expanded, relative paths joined onto `$HOME`).
+    /// Not yet canonicalized or existence-checked — the caller does that so the
+    /// backend only receives paths that actually exist (Landlock requires it).
+    pub path: PathBuf,
+    /// `true` → read+write, `false` → read-only.
+    pub write: bool,
+}
+
+/// Expand a raw env var path value into an absolute path.
+///
+/// - Leading `~/` (or a bare `~`) expands to `home`.
+/// - Absolute paths are kept as-is.
+/// - Relative paths are joined onto `home` (env-var paths are almost always
+///   absolute; this keeps a stray relative value inside HOME rather than
+///   resolving it against an unknown cwd and widening access outside HOME).
+///
+/// Does not canonicalize or check existence — kept pure for cross-platform tests.
+fn resolve_tool_path(raw: &str, home: &Path) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else if raw == "~" {
+        home.to_path_buf()
+    } else {
+        let p = Path::new(raw);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            home.join(p)
+        }
+    }
+}
+
+/// Compute the extra read/write paths implied by tool-path env vars.
+///
+/// For each variable in [`TOOL_PATH_ENV_VARS`] present in `env`, resolve its
+/// value (see [`resolve_tool_path`]) and, if it points at a **non-default**
+/// location, emit a [`ToolPathOverride`]. Default locations are skipped because
+/// [`HOME_TOOL_DIRS`] already grants them. Unset/empty vars contribute nothing.
+///
+/// `env` is the *parent* process environment as `(name, value)` pairs. Duplicate
+/// resolved paths are collapsed; if the same path is requested read-only and
+/// read+write, the write grant wins.
+///
+/// Pure function (env passed in, no `std::env` / filesystem access) so rule
+/// generation is testable on any platform.
+pub fn tool_path_env_overrides(env: &[(String, String)], home: &Path) -> Vec<ToolPathOverride> {
+    let mut out: Vec<ToolPathOverride> = Vec::new();
+    for tv in TOOL_PATH_ENV_VARS {
+        let Some((_, raw)) = env.iter().find(|(k, _)| k == tv.name) else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let resolved = resolve_tool_path(raw, home);
+        // Skip values that resolve to a default location already in the base policy.
+        if tv.default_subpaths.iter().any(|d| resolved == home.join(d)) {
+            continue;
+        }
+        // Deduplicate; upgrade an existing read-only grant to write if needed.
+        if let Some(existing) = out.iter_mut().find(|o| o.path == resolved) {
+            existing.write = existing.write || tv.write;
+        } else {
+            out.push(ToolPathOverride {
+                path: resolved,
+                write: tv.write,
+            });
+        }
+    }
+    out
 }
 
 /// Validate that a path is safe for interpolation into SBPL profile strings.

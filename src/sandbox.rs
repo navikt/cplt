@@ -52,7 +52,8 @@ mod profile;
 pub use policy::{
     AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
     ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
-    HomeToolDir, app_dirs, home_tool_dirs, validate_sbpl_path,
+    HomeToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs, home_tool_dirs,
+    tool_path_env_overrides, validate_sbpl_path,
 };
 
 // SBPL profile generation — kept public for unit tests.

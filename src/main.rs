@@ -954,6 +954,38 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
         .collect()
 }
 
+/// Grant sandbox access to tool paths relocated via env vars (e.g. `GOPATH`,
+/// `CARGO_HOME`, `NODE_PATH`).
+///
+/// cplt allowlists each tool's *default* directory (e.g. `~/go`, `~/.cargo`),
+/// but when a user overrides one of these env vars to a custom path and that
+/// value is passed into the sandbox, the custom path is not in the allow set,
+/// so builds fail (e.g. `GOPATH=/custom` → `go build` cannot write there).
+///
+/// We read the *parent* process env (the well-known tool vars all reach the
+/// sandbox via the env allowlist), compute the implied read/write paths, then
+/// canonicalize and drop any that don't exist — Landlock requires an existing
+/// path to open, and macOS SBPL rules for missing paths are inert. Paths are
+/// merged into `allow_read`/`allow_write`, which the backends already handle;
+/// this only ever *adds* access.
+fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    for ovr in cplt::sandbox::tool_path_env_overrides(&env, home) {
+        // canonicalize() also serves as the existence check: a missing path errors.
+        let Ok(path) = std::fs::canonicalize(&ovr.path) else {
+            continue;
+        };
+        let target = if ovr.write {
+            &mut resolved.allow_write
+        } else {
+            &mut resolved.allow_read
+        };
+        if !target.contains(&path) {
+            target.push(path);
+        }
+    }
+}
+
 /// Resolved configuration, paths, and agent info needed by the sandbox.
 #[allow(dead_code)] // unapproved_proposals is consumed by the warning block in resolve_context
 struct ResolvedContext {
@@ -1644,6 +1676,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // Start proxy (handle returned for RAII ownership)
     let proxy_handle = start_proxy_if_enabled(&mut resolved, &cli, config_path.as_ref())?;
 
+    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
+    merge_tool_path_env_overrides(&mut resolved, &home_dir);
+
     // Prepare the sandbox — validates paths, generates platform-specific profile.
     // Path validation (SBPL injection checks on macOS) is handled internally
     // by prepare(), so callers don't need to know about backend-specific risks.
@@ -2161,6 +2196,9 @@ fn run_exec_command(
 
     let proxy_handle = start_proxy_if_enabled(&mut resolved, cli, config_path.as_ref())?;
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
+
+    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
+    merge_tool_path_env_overrides(&mut resolved, &home_dir);
 
     let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
         project_dir: &project_dir,
