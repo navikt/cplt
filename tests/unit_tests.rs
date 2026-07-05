@@ -6782,6 +6782,105 @@ fn tool_path_same_path_write_wins_over_read() {
     assert!(overrides[0].write, "write grant wins over read");
 }
 
+// --- List-valued tool-path env vars (colon-separated on Unix) ---------------
+// GOPATH and NODE_PATH are OS path lists (`GOPATH=/a:/b`); each segment must
+// become its own override. Single-path vars are never split.
+
+#[test]
+fn tool_path_gopath_list_yields_one_override_per_segment() {
+    // GOPATH=/a:/b → two writable overrides, one per directory in the list.
+    let home = std::path::Path::new("/home/tester");
+    let env = env_pairs(&[("GOPATH", "/a:/b")]);
+    let overrides = tool_path_env_overrides(&env, home);
+    let paths: Vec<&std::path::Path> = overrides.iter().map(|o| o.path.as_path()).collect();
+    assert_eq!(overrides.len(), 2, "each GOPATH segment → its own override");
+    assert!(paths.contains(&std::path::Path::new("/a")));
+    assert!(paths.contains(&std::path::Path::new("/b")));
+    assert!(
+        overrides.iter().all(|o| o.write),
+        "GOPATH segments are build roots → read+write"
+    );
+}
+
+#[test]
+fn tool_path_node_path_list_yields_read_only_per_segment() {
+    // NODE_PATH=/x:/y → two read-only overrides, one per lookup directory.
+    let home = std::path::Path::new("/home/tester");
+    let env = env_pairs(&[("NODE_PATH", "/x:/y")]);
+    let overrides = tool_path_env_overrides(&env, home);
+    let paths: Vec<&std::path::Path> = overrides.iter().map(|o| o.path.as_path()).collect();
+    assert_eq!(
+        overrides.len(),
+        2,
+        "each NODE_PATH segment → its own override"
+    );
+    assert!(paths.contains(&std::path::Path::new("/x")));
+    assert!(paths.contains(&std::path::Path::new("/y")));
+    assert!(
+        overrides.iter().all(|o| !o.write),
+        "NODE_PATH segments are lookup paths → read-only"
+    );
+}
+
+#[test]
+fn tool_path_list_empty_segments_are_ignored() {
+    // Doubled (`/a::/b`) and trailing (`/b:`) separators produce empty segments
+    // that must be skipped rather than resolving to HOME (join of an empty path).
+    let home = std::path::Path::new("/home/tester");
+    let env = env_pairs(&[("GOPATH", "/a::/b:")]);
+    let overrides = tool_path_env_overrides(&env, home);
+    let paths: Vec<&std::path::Path> = overrides.iter().map(|o| o.path.as_path()).collect();
+    assert_eq!(
+        overrides.len(),
+        2,
+        "empty segments must be skipped, got: {overrides:?}"
+    );
+    assert!(paths.contains(&std::path::Path::new("/a")));
+    assert!(paths.contains(&std::path::Path::new("/b")));
+    assert!(
+        !paths.contains(&home),
+        "an empty segment must NOT resolve to HOME"
+    );
+}
+
+#[test]
+fn tool_path_single_path_var_with_colon_is_not_split() {
+    // A single-path var (CARGO_HOME) is never split, so a `:` in a weird-but-real
+    // directory name is preserved verbatim as one path.
+    let home = std::path::Path::new("/home/tester");
+    let env = env_pairs(&[("CARGO_HOME", "/weird:dir/cargo")]);
+    let overrides = tool_path_env_overrides(&env, home);
+    assert_eq!(overrides.len(), 1, "single-path var must not be split");
+    assert_eq!(
+        overrides[0].path,
+        std::path::PathBuf::from("/weird:dir/cargo")
+    );
+    assert!(overrides[0].write);
+}
+
+#[test]
+fn tool_path_list_per_segment_safety_guard_drops_unsafe_segment() {
+    // GOPATH=/custom:/ → the list splits into /custom and /. tool_path_env_overrides
+    // emits both; the per-segment safety guard keeps /custom and drops the root.
+    let home = std::path::Path::new("/home/tester");
+    let env = env_pairs(&[("GOPATH", "/custom:/")]);
+    let overrides = tool_path_env_overrides(&env, home);
+    let kept: Vec<&std::path::Path> = overrides
+        .iter()
+        .map(|o| o.path.as_path())
+        .filter(|p| tool_override_path_is_safe(p, home))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![std::path::Path::new("/custom")],
+        "only the safe segment survives the per-segment guard"
+    );
+    assert!(
+        !tool_override_path_is_safe(std::path::Path::new("/"), home),
+        "the `/` segment must be dropped by the guard"
+    );
+}
+
 // --- Safety guard: reject over-broad tool-path overrides -------------------
 // tool_override_path_is_safe() is the choke point that stops an ambient env var
 // (e.g. GOPATH=$HOME or GOPATH=/) from silently widening the sandbox. It runs on

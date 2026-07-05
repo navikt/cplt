@@ -1025,6 +1025,12 @@ pub struct ToolPathEnvVar {
     /// grants it, so adding it again would only widen or duplicate the grant.
     /// Multiple entries cover per-platform defaults (macOS `Library/...` vs XDG).
     pub default_subpaths: &'static [&'static str],
+    /// `true` → the value is an OS path list (colon-separated on Unix, e.g.
+    /// `GOPATH=/a:/b` or `NODE_PATH=/x:/y`), so each segment is a separate path
+    /// and must be resolved and granted independently. `false` → the whole value
+    /// is a single path, even if it happens to contain a `:`, so it is never
+    /// split.
+    pub list: bool,
 }
 
 /// Recognized tool-path env vars and how their target path is granted.
@@ -1034,6 +1040,11 @@ pub struct ToolPathEnvVar {
 /// for pure lookup paths (`NODE_PATH`). All of these vars reach the sandbox via
 /// [`ENV_ALLOWLIST`] (or a prefix in [`ENV_PREFIX_ALLOWLIST`]), so the granted
 /// path is actually nameable by the sandboxed process.
+/// Separator between entries in a list-valued tool-path env var. cplt targets
+/// Unix (macOS/Linux) where the OS path-list separator is `:` (as used by
+/// `PATH`, `GOPATH`, `NODE_PATH`, …).
+const TOOL_PATH_LIST_SEPARATOR: char = ':';
+
 pub const TOOL_PATH_ENV_VARS: &[ToolPathEnvVar] = &[
     // ── Go ──────────────────────────────────────────────────────────────────
     // GOPATH holds go/bin, go/pkg (module cache) and go/src; builds write here.
@@ -1041,12 +1052,15 @@ pub const TOOL_PATH_ENV_VARS: &[ToolPathEnvVar] = &[
         name: "GOPATH",
         write: true,
         default_subpaths: &["go"],
+        // GOPATH is a colon-separated list on Unix; each entry is its own root.
+        list: true,
     },
     // Module cache — `go build`/`go test`/`go get` download & extract modules.
     ToolPathEnvVar {
         name: "GOMODCACHE",
         write: true,
         default_subpaths: &["go/pkg/mod"],
+        list: false,
     },
     // Build cache. Default is redirected to the scratch dir (SCRATCH_DIR_ENV_VARS),
     // so honor only an explicit non-default override.
@@ -1054,6 +1068,7 @@ pub const TOOL_PATH_ENV_VARS: &[ToolPathEnvVar] = &[
         name: "GOCACHE",
         write: true,
         default_subpaths: &["Library/Caches/go-build", ".cache/go-build"],
+        list: false,
     },
     // ── Rust / cargo ─────────────────────────────────────────────────────────
     // CARGO_HOME holds bin/, registry/ and git/ — cargo writes to registry & git.
@@ -1061,6 +1076,7 @@ pub const TOOL_PATH_ENV_VARS: &[ToolPathEnvVar] = &[
         name: "CARGO_HOME",
         write: true,
         default_subpaths: &[".cargo"],
+        list: false,
     },
     // ── Node / npm / yarn / pnpm ─────────────────────────────────────────────
     // npm cache (uppercase and npm's canonical lowercase spelling).
@@ -1068,29 +1084,35 @@ pub const TOOL_PATH_ENV_VARS: &[ToolPathEnvVar] = &[
         name: "NPM_CONFIG_CACHE",
         write: true,
         default_subpaths: &[".npm"],
+        list: false,
     },
     ToolPathEnvVar {
         name: "npm_config_cache",
         write: true,
         default_subpaths: &[".npm"],
+        list: false,
     },
     // Yarn (Classic & Berry) global cache folder.
     ToolPathEnvVar {
         name: "YARN_CACHE_FOLDER",
         write: true,
         default_subpaths: &[".cache/yarn", "Library/Caches/Yarn"],
+        list: false,
     },
     // pnpm home (global store + shims).
     ToolPathEnvVar {
         name: "PNPM_HOME",
         write: true,
         default_subpaths: &["Library/pnpm", ".local/share/pnpm"],
+        list: false,
     },
-    // NODE_PATH is a module *lookup* path — read-only is sufficient.
+    // NODE_PATH is a module *lookup* path — read-only is sufficient. Like the
+    // shell PATH, it is a colon-separated list of directories on Unix.
     ToolPathEnvVar {
         name: "NODE_PATH",
         write: false,
         default_subpaths: &[],
+        list: true,
     },
     // ── Python / pip ─────────────────────────────────────────────────────────
     // pip download/wheel cache.
@@ -1098,6 +1120,7 @@ pub const TOOL_PATH_ENV_VARS: &[ToolPathEnvVar] = &[
         name: "PIP_CACHE_DIR",
         write: true,
         default_subpaths: &[".cache/pip", "Library/Caches/pip"],
+        list: false,
     },
 ];
 
@@ -1149,9 +1172,18 @@ fn resolve_tool_path(raw: &str, home: &Path) -> PathBuf {
 /// location, emit a [`ToolPathOverride`]. Default locations are skipped because
 /// [`HOME_TOOL_DIRS`] already grants them. Unset/empty vars contribute nothing.
 ///
+/// List-valued vars ([`ToolPathEnvVar::list`], e.g. `GOPATH`, `NODE_PATH`) hold a
+/// colon-separated list of directories on Unix (`GOPATH=/a:/b`); each segment is
+/// resolved and granted independently, and empty segments (from `/a::/b` or a
+/// trailing `:`) are skipped. Single-path vars are never split, so a `:` inside a
+/// genuine directory name is preserved verbatim.
+///
 /// `env` is the *parent* process environment as `(name, value)` pairs. Duplicate
 /// resolved paths are collapsed; if the same path is requested read-only and
 /// read+write, the write grant wins.
+///
+/// The downstream safety guard ([`tool_override_path_is_safe`]) runs per emitted
+/// override at the merge site, so it is applied per segment for list vars.
 ///
 /// Pure function (env passed in, no `std::env` / filesystem access) so rule
 /// generation is testable on any platform.
@@ -1164,20 +1196,31 @@ pub fn tool_path_env_overrides(env: &[(String, String)], home: &Path) -> Vec<Too
         if raw.is_empty() {
             continue;
         }
-        let resolved = resolve_tool_path(raw, home);
-        // Skip values that resolve to a default location already in the base policy.
-        if tv.default_subpaths.iter().any(|d| resolved == home.join(d)) {
-            continue;
-        }
-        // Deduplicate; upgrade an existing read-only grant to write if needed.
-        if let Some(existing) = out.iter_mut().find(|o| o.path == resolved) {
-            existing.write = existing.write || tv.write;
+        // List vars are colon-separated path lists on Unix; single-path vars are
+        // treated as one value even if they contain a `:`.
+        let segments: Vec<&str> = if tv.list {
+            raw.split(TOOL_PATH_LIST_SEPARATOR)
+                .filter(|s| !s.is_empty())
+                .collect()
         } else {
-            out.push(ToolPathOverride {
-                name: tv.name,
-                path: resolved,
-                write: tv.write,
-            });
+            vec![raw.as_str()]
+        };
+        for seg in segments {
+            let resolved = resolve_tool_path(seg, home);
+            // Skip values that resolve to a default location already in the base policy.
+            if tv.default_subpaths.iter().any(|d| resolved == home.join(d)) {
+                continue;
+            }
+            // Deduplicate; upgrade an existing read-only grant to write if needed.
+            if let Some(existing) = out.iter_mut().find(|o| o.path == resolved) {
+                existing.write = existing.write || tv.write;
+            } else {
+                out.push(ToolPathOverride {
+                    name: tv.name,
+                    path: resolved,
+                    write: tv.write,
+                });
+            }
         }
     }
     out
