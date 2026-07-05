@@ -85,9 +85,9 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | **Process-group escape** | Kill parent, children continue unsandboxed | Signal forwarding (SIGTERM, SIGHUP) |
 | **Env var credential theft** | Read `AWS_SECRET_ACCESS_KEY` from env | `env_clear()` + safe allowlist |
 | **Persistence via native modules** | Replace `keytar.node` with malware | Deny writes to `~/.copilot/pkg` |
-| **Git hook injection** | Write post-checkout hook that runs outside sandbox | Seatbelt deny rules (macOS); env hardening `GIT_CONFIG_NOSYSTEM` + proxy exfiltration blocking (Linux — project-internal `.git/hooks` is writable) |
-| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Seatbelt deny rules (macOS); env hardening (Linux — `.git/config` writable within project, but proxy blocks redirected fetches) |
-| **Submodule supply chain** | Modify `.gitmodules` to point to malicious repo | Seatbelt deny rules (macOS); proxy domain filtering (Linux — `.gitmodules` writable within project) |
+| **Git hook injection** | Write post-checkout hook that runs outside sandbox | Seatbelt write-deny (macOS); **Landlock leaves project `.git/hooks` writable** — env hardening does NOT stop a planted hook running unsandboxed on the next `git` run; closed only when Bubblewrap re-binds `.git/hooks` read-only (Linux) |
+| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Seatbelt write-deny (macOS); Landlock leaves `.git/config` writable within project (Bubblewrap re-binds it read-only); the injected `GIT_CONFIG_*` overrides constrain config resolution for in-sandbox git runs, and the proxy blocks redirected fetches (Linux) |
+| **Submodule supply chain** | Modify `.gitmodules` to point to malicious repo | Seatbelt write-deny (macOS); Landlock leaves `.gitmodules` writable within project (Bubblewrap re-binds it read-only if present); proxy domain filtering limits reachable clone targets (Linux) |
 | **Syscall abuse** | `ptrace`, `mount`, `kexec_load` | seccomp-BPF filter (Linux) |
 
 ### Platform enforcement comparison
@@ -96,8 +96,9 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 |---|---|---|---|
 | Credential files (~/.ssh, ~/.aws) | ✅ Kernel deny | ✅ Not in ruleset (deny-by-default) | ✅ Landlock (deny-by-default) |
 | Project .env file read/write/delete | ✅ Kernel deny | ⚠️ Proxy blocks exfiltration | ⚠️ Proxy blocks exfiltration |
-| .git/hooks write in project | ✅ Kernel deny | ⚠️ Env hardening (GIT_CONFIG_NOSYSTEM) | ⚠️ Env hardening |
-| .git/config write in project | ✅ Kernel deny | ⚠️ Env hardening + proxy | ⚠️ Env hardening + proxy |
+| .git/hooks write in project | ✅ Kernel deny | ❌ Writable (Landlock can't sub-deny; env hardening does NOT block hook planting) | ✅ Re-bound read-only |
+| .git/config write in project | ✅ Kernel deny | ❌ Writable (env hardening constrains in-sandbox config resolution only) | ✅ Re-bound read-only |
+| .gitmodules / .cplt.toml write in project | ✅ Kernel deny | ❌ Writable (Landlock can't sub-deny) | ✅ Re-bound read-only if present |
 | Network: outbound port filtering | ✅ Kernel (all versions) | ✅ Kernel (6.7+) / ⚠️ Proxy only (<6.7) | ✅ Same as Landlock (no net namespace) |
 | Network: localhost isolation | ✅ Kernel deny | ⚠️ Proxy domain filtering | ⚠️ Proxy domain filtering (no net namespace) |
 | Network: force all egress through proxy (`proxy.forced`, opt-in) | ✅ Kernel pins to `localhost:<proxy_port>` (full) | ⚠️ Kernel blocks direct `:443`; port-based residual `evil.com:<proxy_port>` until [#114](https://github.com/navikt/cplt/issues/114) | ⚠️ Same as Landlock (no net namespace) |
@@ -121,6 +122,7 @@ On Linux, cplt can optionally layer **Bubblewrap** (`bwrap`) on top of Landlock 
 3. **Mount namespace** — the whole host filesystem is bind-mounted **read-only** (`--ro-bind / /`); write access is granted only at the specific paths carrying a writable Landlock rule (re-bound writable at their real locations). The host root is therefore *enumerable* inside the namespace — the mount namespace only changes the mount topology, it does **not** hide arbitrary files. Confidentiality is Landlock's job (deny-by-default): a path with no read rule is denied by Landlock even though it appears in the mount table.
 4. **Private `/tmp`** — `/tmp` is a fresh, empty `tmpfs` that carries no exec-bearing Landlock rule, so the "no exec from `/tmp`" guarantee holds. The scratch dir (write+exec) is kept at its real path and is never overlaid on `/tmp`; a writable path that legitimately lives under `/tmp` (e.g. a `--project-dir` in `/tmp`) is re-bound *after* the tmpfs so it stays usable.
 5. **User namespace** — unprivileged operation, no root required. The agent maps to the **invoking host UID** (there is no UID-0 mapping) and holds no real capabilities on the host.
+6. **Git-persistence read-only re-bind** — the project's `.git/hooks`, `.git/config`, `.gitmodules`, and `.cplt.toml` live *inside* the writable project tree, which Landlock cannot carve a sub-deny out of, so on the Landlock-only path they stay writable (a persistence-escape gap vs macOS). When bwrap is active these pre-existing paths are re-bound **read-only** (`--ro-bind`, emitted after the writable project bind so it shadows it), restoring macOS parity for the primary vector — an agent can no longer plant a `.git/hooks/post-commit` that runs unsandboxed on the next `git` run. **Residual:** a read-only bind only protects paths that *already exist*; a file absent at launch (e.g. a repo with no `.gitmodules`) can still be created, and this mitigation requires bwrap — the Landlock-only path remains exposed.
 
 Bubblewrap **deliberately does not** create a network namespace (see limitations below), so it is **not a network or confidentiality boundary**.
 
@@ -271,6 +273,8 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 **`--allow-private-domain` weakens DNS rebinding protection for named domains.** When a domain is listed in `proxy.allow_private_domains` (or `--allow-private-domain`), the proxy skips the post-DNS private IP check for that domain. This is intentional for corporate intranet services (e.g. `intern.nav.no`) that legitimately resolve to RFC 1918 addresses. The accepted risk: if DNS for a listed domain is poisoned or hijacked, a compromised agent could reach arbitrary private hosts on your internal network — not just the intended service. All other proxy checks (port, allowlist, blocklist) still apply. Only list domains you control and whose DNS you trust.
 
 **`~/.config/gh/hosts.yml` is readable.** When gh guard is enabled, Copilot gets its token via a one-time cached file (deleted after first read). When gh guard is disabled, `gh auth token` is available inside the sandbox. This file contains a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable (not the entire `.config/gh` directory). With outbound port 443 allowed, a compromised agent could theoretically exfiltrate this token. However, the token grants access to GitHub — which Copilot is already connected to. Users who want to mitigate this can use `--deny-path ~/.config/gh` (Copilot will fall back to Keychain auth).
+
+**`block_auth_token` is best-effort, not a same-UID boundary.** When gh guard is enabled with `block_auth_token` (opt-in), cplt withholds `GH_TOKEN` from the environment and instead caches the token to `$SCRATCH/.gh-token` (mode `0600`), serving it once via the `gh` wrapper's `gh auth token` callback and deleting the file after the first read. This genuinely prevents the token from appearing as an inherited env var in every child's `/proc/*/environ`, and the one-time deletion narrows the file's exposure window. It does **not** make the token confidential against an adversarial agent: the scratch dir *is* the agent's `TMPDIR`, and the `gh` wrapper runs as the agent's own UID inside the sandbox, so anything the wrapper can read the agent can read at the same UID. A same-UID `deny` rule is therefore illusory (and would break the legitimate wrapper read, which happens inside the sandbox), so cplt does not add one. A determined agent that `cat`s `$TMPDIR/.gh-token` before the legitimate consumer still obtains the token. Treat `block_auth_token` as reducing accidental/env-based leakage, not as a boundary against a hostile agent — the token grants access to GitHub, which Copilot is connected to anyway.
 
 *Possible mitigation:* A repo-scoped MCP proxy or fine-grained PAT that limits token scope to the current repository only. See issue #4 for investigation.
 
@@ -581,6 +585,7 @@ Linux-specific tool directories use XDG-style paths:
 3. **No auth integration**: Linux v1 supports env token + `gh auth` only (no D-Bus/Secret Service).
 4. **Copilot extraction**: The macOS SEA extraction path is unknown on Linux — `ensure_copilot_extracted()` is skipped.
 5. **No localhost isolation at kernel level**: Landlock network rules are port-based only — they cannot distinguish `localhost:443` from `remote:443`. On macOS, Seatbelt blocks localhost outbound separately. On Linux, use `--with-proxy` for localhost SSRF protection (the proxy resolves DNS and blocks private IPs).
+6. **`--allow-localhost-any` disables ALL kernel network restriction on Linux**: because Landlock is port-based and cannot express "any localhost port but no remote host", opening all localhost ports requires dropping *every* Landlock TCP-connect rule. The result is unrestricted outbound TCP at the kernel level — an agent can raw-socket to any remote `host:port` and exfiltrate directly, not just reach localhost. macOS (Seatbelt) still pins `localhost:*` and is unaffected. cplt emits a prominent warning when this flag is set on Linux. **Prefer `--proxy-forced`** (which supersedes `allow_localhost_any` — see [Proxy-forced mode](#proxy-forced-mode-53)) or scope to specific ports with `--allow-localhost <PORT>`, which keeps kernel connect-restriction on.
 
 The proxy provides:
 
@@ -691,8 +696,8 @@ Repository maintainers can commit a `.cplt.toml` to configure sandbox settings f
 #### Trust store integrity
 
 - Trust entries are stored in `~/.config/cplt/trust/` — protected from the sandbox (the agent cannot self-approve).
-- Each entry is keyed by a SHA-256 fingerprint of the canonical repo path + normalized remote URL.
-- Remote URLs are normalized (SSH/HTTPS variants, credentials stripped, ports removed) so the same repo accessed via different URLs shares one trust entry.
+- Each entry's **filename** is a SHA-256 fingerprint of the normalized git remote URL (or the canonicalized project path when there is no remote). Remote URLs are normalized (SSH/HTTPS variants, credentials stripped, ports removed) so the same repo accessed via different URLs shares one trust entry.
+- **The remote URL is not an authenticity signal.** It is attacker-controllable: a malicious repo can `git remote set-url origin <victim>` and copy the victim's approved `[propose]` block verbatim (so the content hash also matches) to look up the victim's trust entry and inherit its approved permissions — a confused-deputy escalation. To defeat this, every approval is **also bound to the absolute local checkout path** it was granted at (`repo.path`). Before applying a trust entry, cplt requires the current project directory to match that recorded path (canonicalized); a matching fingerprint presented from a *different* path is **not** auto-trusted and triggers a re-approval prompt. An attacker cannot satisfy this without already controlling the victim's exact on-disk location. Legacy entries with no recorded path are treated as unmatched (one-time re-approval).
 - Trust writes are atomic (temp file + rename) to prevent corruption from interrupted writes.
 
 #### Threat scenarios
@@ -705,6 +710,7 @@ Repository maintainers can commit a `.cplt.toml` to configure sandbox settings f
 | `.cplt.toml` blocks critical env vars via `[deny].env` | `[deny]` can only tighten — removing env vars reduces attack surface |
 | Path traversal in deny/allow paths | `..` components rejected at parse time |
 | Agent self-approves via trust store | Trust dir (`~/.config/cplt/trust/`) is outside the sandbox |
+| Origin-URL spoof to inherit a victim's approval (`git remote set-url origin <victim>` + copy `[propose]`) | Approvals are bound to the local checkout path; a match from a different path is not auto-trusted (re-approval required) |
 
 ### GPG Signing Risk Analysis (`--allow-gpg-signing`)
 

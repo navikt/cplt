@@ -55,6 +55,15 @@ pub struct AcceptedProposals {
 /// project path as fallback. Returns a hex-encoded SHA-256 (full 64 chars)
 /// for use as a filename. This ensures collision resistance and stability
 /// across Rust versions/platforms.
+///
+/// # Security — the fingerprint is NOT an authenticity signal
+///
+/// The remote URL is attacker-controllable (`git remote set-url origin
+/// <victim>`), so the fingerprint alone cannot prove that a repo is the one an
+/// approval was granted for. Consumers MUST additionally verify the local
+/// checkout path with [`approved_path_matches`] before applying a trust
+/// entry's approved keys. See that function's docs for the confused-deputy
+/// attack this defends against.
 pub fn repo_fingerprint(project_dir: &Path) -> String {
     let identity = canonical_remote(project_dir).unwrap_or_else(|| {
         // Canonicalize to handle symlinks/relative paths consistently
@@ -370,6 +379,36 @@ pub fn approval_is_stale(stored_hash: &str, current_hash: &str) -> bool {
     stored_hash != current_hash
 }
 
+/// Check whether a trust entry was approved at the current local checkout path.
+///
+/// # Why (Finding 4 — trust identity is a spoofable git origin URL)
+///
+/// [`repo_fingerprint`] keys the trust store on the normalized git remote URL,
+/// which the repo can forge: a malicious checkout can `git remote set-url
+/// origin <victim>` and copy the victim's approved `[propose]` block verbatim
+/// (so the pinned content hash matches too) to inherit the victim's approved
+/// dangerous permissions with no re-prompt — a classic confused-deputy
+/// escalation. An origin-URL match is therefore NOT sufficient authentication.
+///
+/// To defeat this we additionally bind every approval to the absolute *local
+/// checkout path* where it was granted (recorded in `repo.path`). Presenting a
+/// trusted fingerprint from a DIFFERENT on-disk location no longer auto-applies
+/// — the user must re-approve. An attacker cannot place their repo at the
+/// victim's exact path without already controlling that location.
+///
+/// Both sides are canonicalized (resolving symlinks / `.` / `..`) so cosmetic
+/// path differences don't force spurious re-approval — the same repo at the
+/// same path stays trusted. A legacy entry with an empty `path` (written before
+/// path binding existed) matches nothing, forcing a one-time re-approval that
+/// records the real path.
+pub fn approved_path_matches(entry: &TrustEntry, project_dir: &Path) -> bool {
+    if entry.repo.path.is_empty() {
+        return false;
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(Path::new(&entry.repo.path)) == canon(project_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +621,55 @@ approved_at = "2026-05-01T12:00:00Z"
             !approval_is_stale(&current, &current),
             "matching non-empty stored hash must stay fresh (no false re-prompt)"
         );
+    }
+
+    #[test]
+    fn approved_path_matches_same_path() {
+        // Same remote + same local checkout path → still trusted (no false re-prompt).
+        let dir = std::env::temp_dir();
+        let entry = TrustEntry {
+            repo: RepoIdentity {
+                remote: "github.com/navikt/spleis".to_string(),
+                path: dir.to_string_lossy().into_owned(),
+            },
+            ..Default::default()
+        };
+        assert!(approved_path_matches(&entry, &dir));
+    }
+
+    #[test]
+    fn approved_path_mismatch_is_not_trusted() {
+        // Finding 4: a malicious repo with the victim's remote (same fingerprint,
+        // same copied content hash) presented from a DIFFERENT local path must
+        // NOT inherit the victim's approval — origin match alone is insufficient.
+        let entry = TrustEntry {
+            repo: RepoIdentity {
+                remote: "github.com/navikt/spleis".to_string(),
+                path: "/home/victim/spleis".to_string(),
+            },
+            ..Default::default()
+        };
+        assert!(!approved_path_matches(
+            &entry,
+            Path::new("/home/attacker/evil-clone")
+        ));
+    }
+
+    #[test]
+    fn approved_path_empty_legacy_is_not_trusted() {
+        // A legacy entry (empty path, pre path-binding) pins no location, so it
+        // must force a one-time re-approval rather than auto-trusting anywhere.
+        let entry = TrustEntry {
+            repo: RepoIdentity {
+                remote: "github.com/navikt/spleis".to_string(),
+                path: String::new(),
+            },
+            ..Default::default()
+        };
+        assert!(!approved_path_matches(
+            &entry,
+            Path::new("/home/user/spleis")
+        ));
     }
 
     #[test]

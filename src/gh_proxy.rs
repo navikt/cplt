@@ -1441,7 +1441,14 @@ pub struct GatePolicy {
     pub mode: crate::config::EnforcementMode,
     /// Enforce same-repo check for ScopeCheck commands.
     pub scope_check: bool,
-    /// Block `gh auth token` (token exfiltration prevention).
+    /// Block `gh auth token` from printing the raw token to any caller, serving
+    /// it once from a 0600 scratch file that is deleted after the first read.
+    ///
+    /// Best-effort, not a same-UID boundary (Finding 3): it keeps the token out
+    /// of the process environment and off `gh auth token`'s stdout for later
+    /// callers, but the cache file lives in the agent's own `TMPDIR`, so a
+    /// determined same-UID agent can still read it before the legitimate
+    /// consumer. See `cache_gh_token_to_file`.
     pub block_auth_token: bool,
     /// Policy for commands not in the classification table.
     pub unknown_command: UnknownCommandDecision,

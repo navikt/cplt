@@ -11,9 +11,20 @@
 //!
 //! Landlock is allowlist-only — it cannot deny access to subpaths within an
 //! allowed directory. On macOS, SBPL can deny `.env` reads and `.git/hooks`
-//! writes inside the project dir at the kernel level. On Linux, these
-//! protections come from the proxy layer (exfiltration blocking) and
-//! environment hardening (GIT_CONFIG overrides), not from filesystem rules.
+//! writes inside the project dir at the kernel level. Landlock cannot, so this
+//! is a real platform asymmetry — do not overclaim parity:
+//!
+//! - `.env` / secret reads: the project tree is readable, but the CONNECT
+//!   proxy blocks HTTPS exfiltration of whatever is read (defense-in-depth,
+//!   not a read deny).
+//! - `.git/hooks`, `.git/config`, `.gitmodules`, `.cplt.toml`: these stay
+//!   **writable** under Landlock alone. Env hardening (`GIT_CONFIG_NOSYSTEM`,
+//!   the injected `GIT_CONFIG_*` overrides) constrains git's *config
+//!   resolution* for commands run inside the sandbox — it does NOT stop the
+//!   agent from writing a `.git/hooks/post-commit` that then runs unsandboxed
+//!   the next time the user runs git. That persistence gap is only closed when
+//!   the Bubblewrap layer is active, which re-binds the project's pre-existing
+//!   git-persistence paths read-only (see `sandbox_bubblewrap::build_bwrap_args`).
 //!
 //! Landlock network rules (ABI v4+) are port-based, not address-based.
 //! This means port 443 allows connecting to ANY host on that port, including
@@ -696,9 +707,12 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // them to the ruleset — Landlock is deny-by-default.
     //
     // Note: This means we cannot deny subpaths within an allowed tree
-    // (e.g. .env files inside the project dir). Those protections come
-    // from the proxy (blocks exfiltration) and env hardening (blocks
-    // hook injection). See module-level doc comment.
+    // (e.g. .env files, or .git/hooks, inside the project dir). For .env the
+    // proxy blocks exfiltration (defense-in-depth). But project-internal
+    // .git/hooks / .git/config / .gitmodules / .cplt.toml stay WRITABLE here —
+    // env hardening does NOT stop an agent from planting a hook that runs
+    // unsandboxed on the next git invocation. That gap is closed only by the
+    // Bubblewrap read-only re-bind. See module-level doc comment.
 
     // Landlock network rules are port-based only — they cannot distinguish
     // localhost from remote hosts. When allow_localhost_any is true, we must
@@ -796,8 +810,11 @@ pub fn describe_policy(policy: &LandlockPolicy) -> String {
 
     out.push_str("# Note: Landlock is allowlist-only. Paths not listed above are denied.\n");
     out.push_str(
-        "# Intra-project deny rules (.env, .pem, .git/hooks) are enforced by\n\
-         # environment hardening and proxy filtering, not filesystem rules.\n",
+        "# Landlock cannot deny subpaths inside the writable project dir, so\n\
+         # .env/.pem reads are mitigated only by proxy exfiltration filtering,\n\
+         # and .git/hooks / .git/config / .gitmodules / .cplt.toml stay WRITABLE\n\
+         # (a persistence asymmetry vs macOS). Bubblewrap, when active, re-binds\n\
+         # the project's pre-existing git-persistence paths read-only.\n",
     );
 
     out

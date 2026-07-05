@@ -122,8 +122,12 @@ pub(crate) fn check_availability() -> Option<PathBuf> {
 /// [`build_bwrap_args`] (plus `/bin/true`) so the probe can never drift from
 /// the real invocation. Catches hardened hosts where `bwrap` exists but user
 /// namespaces are disabled.
-pub(crate) fn test_functionality(bwrap_path: &Path, fs_rules: &[FsRule]) -> Result<(), String> {
-    let mut args = build_bwrap_args(fs_rules);
+pub(crate) fn test_functionality(
+    bwrap_path: &Path,
+    fs_rules: &[FsRule],
+    ro_protect: &[PathBuf],
+) -> Result<(), String> {
+    let mut args = build_bwrap_args(fs_rules, ro_protect);
     args.push("--".to_string());
     args.push("/bin/true".to_string());
 
@@ -171,7 +175,18 @@ pub(crate) fn test_functionality(bwrap_path: &Path, fs_rules: &[FsRule]) -> Resu
 /// Paths managed by bwrap (`/proc`, `/dev`, `/sys`) and the `/tmp` mount point
 /// itself are skipped in step 4 — binding host `/tmp` back over the tmpfs would
 /// re-expose host temp files and re-break the exec guarantee.
-pub(crate) fn build_bwrap_args(fs_rules: &[FsRule]) -> Vec<String> {
+///
+/// 5. Finally, for every path in `ro_protect` that exists, `--ro-bind <p> <p>`
+///    is emitted *after* the writable binds so it shadows them read-only. This
+///    is the Finding 1 persistence mitigation: the project's `.git/hooks` (and
+///    the other git-persistence files macOS denies) live inside the writable
+///    project tree, which Landlock cannot carve a sub-deny out of. A read-only
+///    bwrap mount restores parity — an agent can no longer plant a hook that
+///    runs unsandboxed on the next `git` invocation. Only paths that already
+///    exist are bound (bwrap errors on a missing bind source, and a read-only
+///    bind cannot protect a path the attacker would have to *create* — that
+///    residual is documented in SECURITY.md).
+pub(crate) fn build_bwrap_args(fs_rules: &[FsRule], ro_protect: &[PathBuf]) -> Vec<String> {
     let mut args = Vec::new();
 
     // ── Namespace isolation (network intentionally shared — see module docs) ──
@@ -215,7 +230,38 @@ pub(crate) fn build_bwrap_args(fs_rules: &[FsRule]) -> Vec<String> {
         args.extend(["--bind".to_string(), path_str.clone(), path_str]);
     }
 
+    // ── Read-only overlays for git-persistence paths (Finding 1) ──
+    // Emitted last so they shadow the writable project bind above.
+    for path in ro_protect {
+        // bwrap errors on a non-existent bind source; a read-only bind also
+        // cannot protect a path that does not yet exist. Skip missing paths
+        // (mirrors the writable-bind handling and keeps the probe from failing).
+        if !path.exists() {
+            continue;
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        args.extend(["--ro-bind".to_string(), path_str.clone(), path_str]);
+    }
+
     args
+}
+
+/// Project-internal paths that macOS write-denies for persistence prevention
+/// but Landlock cannot (they live inside the writable project tree). When
+/// Bubblewrap is active these are re-bound read-only. Only the ones that exist
+/// on disk are ultimately bound (see [`build_bwrap_args`]).
+///
+/// Mirrors `sandbox_profile::emit_sensitive_project_denies` /
+/// `emit_git_hooks`: `.git/hooks` (persistence via planted hooks), `.git/config`
+/// (`core.hooksPath` / `insteadOf` hijack), `.gitmodules` (submodule supply
+/// chain), and `.cplt.toml` (the agent tampering with its own sandbox config).
+pub(crate) fn git_persistence_paths(project_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        project_dir.join(".git/hooks"),
+        project_dir.join(".git/config"),
+        project_dir.join(".gitmodules"),
+        project_dir.join(".cplt.toml"),
+    ]
 }
 
 /// Resolve whether bubblewrap should wrap this run, and build the wrapper.
@@ -233,10 +279,11 @@ pub(crate) fn resolve(
     fs_rules: &[FsRule],
     net_rules: &[NetRule],
     restrict_net_connect: bool,
+    ro_protect: &[PathBuf],
 ) -> Result<Option<BubblewrapWrapper>, String> {
     match use_bubblewrap {
         Some(false) => Ok(None),
-        Some(true) => build_wrapper(fs_rules, net_rules, restrict_net_connect, true)
+        Some(true) => build_wrapper(fs_rules, net_rules, restrict_net_connect, ro_protect, true)
             .map(Some)
             .map_err(|e| {
                 format!(
@@ -244,7 +291,7 @@ pub(crate) fn resolve(
                      Install bubblewrap or remove --use-bubblewrap."
                 )
             }),
-        None => match build_wrapper(fs_rules, net_rules, restrict_net_connect, false) {
+        None => match build_wrapper(fs_rules, net_rules, restrict_net_connect, ro_protect, false) {
             Ok(wrapper) => Ok(Some(wrapper)),
             Err(e) => {
                 crate::ui::warn(&format!(
@@ -260,11 +307,12 @@ fn build_wrapper(
     fs_rules: &[FsRule],
     net_rules: &[NetRule],
     restrict_net_connect: bool,
+    ro_protect: &[PathBuf],
     strict: bool,
 ) -> Result<BubblewrapWrapper, String> {
     let bwrap_path = check_availability().ok_or_else(|| "bwrap not found in PATH".to_string())?;
-    test_functionality(&bwrap_path, fs_rules)?;
-    let bwrap_args = build_bwrap_args(fs_rules);
+    test_functionality(&bwrap_path, fs_rules, ro_protect)?;
+    let bwrap_args = build_bwrap_args(fs_rules, ro_protect);
     Ok(BubblewrapWrapper {
         bwrap_path,
         bwrap_args,
@@ -500,7 +548,7 @@ mod tests {
 
     #[test]
     fn args_isolate_expected_namespaces() {
-        let args = build_bwrap_args(&[]);
+        let args = build_bwrap_args(&[], &[]);
         assert!(args.contains(&"--unshare-pid".to_string()));
         assert!(args.contains(&"--unshare-ipc".to_string()));
         assert!(args.contains(&"--unshare-uts".to_string()));
@@ -513,7 +561,7 @@ mod tests {
 
     #[test]
     fn args_set_up_base_mounts() {
-        let args = build_bwrap_args(&[]);
+        let args = build_bwrap_args(&[], &[]);
         assert!(args.windows(3).any(|w| w == ["--ro-bind", "/", "/"]));
         assert!(args.windows(2).any(|w| w == ["--proc", "/proc"]));
         assert!(args.windows(2).any(|w| w == ["--dev", "/dev"]));
@@ -534,7 +582,7 @@ mod tests {
                 ioctl: false,
             },
         }];
-        let args = build_bwrap_args(&rules);
+        let args = build_bwrap_args(&rules, &[]);
         let tmp_bind = args
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == "/tmp" && w[2] == "/tmp");
@@ -553,7 +601,7 @@ mod tests {
             "test premise: tempdir lives under the system temp dir"
         );
         let rules = vec![writable_rule(&dir_str)];
-        let args = build_bwrap_args(&rules);
+        let args = build_bwrap_args(&rules, &[]);
 
         let tmpfs_idx = args.iter().position(|a| a == "--tmpfs").expect("tmpfs");
         let bind_idx = args
@@ -576,7 +624,7 @@ mod tests {
         // non-bwrap configuration kernel-denies by default.
         let dir = tempfile::tempdir().expect("tempdir");
         let scratch_like = writable_rule(&dir.path().to_string_lossy());
-        let args = build_bwrap_args(&[scratch_like]);
+        let args = build_bwrap_args(&[scratch_like], &[]);
 
         // No mount operation may target /tmp as its destination other than the
         // tmpfs itself.
@@ -590,7 +638,7 @@ mod tests {
     #[test]
     fn nonexistent_writable_paths_are_skipped() {
         let rules = vec![writable_rule("/definitely/not/a/real/path/xyzzy")];
-        let args = build_bwrap_args(&rules);
+        let args = build_bwrap_args(&rules, &[]);
         assert!(!args.iter().any(|a| a.contains("xyzzy")));
     }
 
@@ -601,7 +649,7 @@ mod tests {
             writable_rule("/proc/self"),
             writable_rule("/sys/fs/cgroup"),
         ];
-        let args = build_bwrap_args(&rules);
+        let args = build_bwrap_args(&rules, &[]);
         assert!(
             !args
                 .windows(3)
@@ -621,6 +669,51 @@ mod tests {
 
     #[test]
     fn resolve_disabled_returns_none() {
-        assert!(resolve(Some(false), &[], &[], true).unwrap().is_none());
+        assert!(resolve(Some(false), &[], &[], true, &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn git_hooks_are_rebound_read_only_after_writable_project() {
+        // Finding 1: an existing project/.git/hooks inside the writable project
+        // tree must be re-bound read-only, and AFTER the writable project bind so
+        // the read-only mount shadows it (bwrap applies mounts in argument order).
+        let proj = tempfile::tempdir().expect("tempdir");
+        let hooks = proj.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).expect("create .git/hooks");
+        let proj_str = proj.path().to_string_lossy().into_owned();
+        let hooks_str = hooks.to_string_lossy().into_owned();
+
+        let rules = vec![writable_rule(&proj_str)];
+        let ro = git_persistence_paths(proj.path());
+        let args = build_bwrap_args(&rules, &ro);
+
+        let proj_bind_idx = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == proj_str && w[2] == proj_str)
+            .expect("writable project must be bound");
+        let hooks_ro_idx = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == hooks_str && w[2] == hooks_str)
+            .expect(".git/hooks must be re-bound read-only");
+        assert!(
+            hooks_ro_idx > proj_bind_idx,
+            "read-only .git/hooks bind must come AFTER the writable project bind"
+        );
+    }
+
+    #[test]
+    fn nonexistent_git_persistence_paths_are_skipped() {
+        // A read-only bind of a missing path would make bwrap error (failing the
+        // probe) and cannot protect a not-yet-created file anyway — skip it.
+        let proj = tempfile::tempdir().expect("tempdir");
+        // No .git/hooks, .gitmodules, or .cplt.toml created.
+        let ro = git_persistence_paths(proj.path());
+        let args = build_bwrap_args(&[], &ro);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains(".git/hooks") || a.contains(".gitmodules")),
+            "missing git-persistence paths must not be bound"
+        );
     }
 }

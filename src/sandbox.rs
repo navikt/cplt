@@ -335,9 +335,30 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
              Docker socket access is not yet implemented in the Landlock backend.",
         );
     }
+    // Finding 2: on Linux, allow_localhost_any drops EVERY Landlock TCP-connect
+    // rule (any host, any port), not just localhost — Landlock is port-based and
+    // cannot express "all localhost ports only". This disables kernel network
+    // restriction entirely; an agent can raw-socket to any remote host:port.
+    // macOS still pins localhost at the kernel level, so this is Linux-specific.
+    // proxy.forced supersedes it (reconciled earlier) and is the safe choice.
+    if config.allow_localhost_any {
+        ui::warn(
+            "--allow-localhost-any DISABLES kernel network restriction entirely on Linux: \
+             Landlock is port-based and cannot allow 'all localhost ports' without allowing \
+             the same ports on every remote host, so ALL Landlock TCP-connect rules are dropped \
+             (an agent can then connect to any host:port directly). macOS still pins localhost. \
+             Prefer --proxy-forced (which supersedes this flag) or specific --allow-localhost <PORT>.",
+        );
+    }
 
     let policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);
+
+    // Finding 1: Landlock cannot deny subpaths inside the writable project tree,
+    // so the project's .git/hooks (and other git-persistence files) stay
+    // writable — a persistence-escape vector. When Bubblewrap is active we
+    // re-bind those pre-existing paths read-only to restore macOS parity.
+    let ro_protect = bubblewrap::git_persistence_paths(config.project_dir);
 
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
@@ -348,6 +369,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         &policy.fs_rules,
         &policy.net_rules,
         policy.restrict_net_connect,
+        &ro_protect,
     )?;
 
     // Pre-compute everything in the parent process.

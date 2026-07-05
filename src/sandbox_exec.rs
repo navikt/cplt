@@ -149,8 +149,17 @@ fn configure_command(
             if gh_guard.inject_token {
                 inject_gh_token_if_needed(cmd, agent);
             }
-            // Cache token to file so the wrapper can serve `gh auth token` requests
-            // without exposing the token as an env var to all child processes.
+            // Cache token to file so the wrapper can serve `gh auth token`
+            // requests without exposing the token as an env var to all child
+            // processes. NOTE (Finding 3): this is best-effort, NOT a same-UID
+            // boundary. The scratch dir is the agent's TMPDIR, and the gh
+            // wrapper runs as the agent's UID *inside* the sandbox, so whatever
+            // the wrapper can read the agent can read too. What this buys: the
+            // token is not an inherited env var (so it can't leak via `/proc/*/
+            // environ` of every child), and the file is 0600 and deleted after
+            // the first read (see `serve_cached_gh_token`), which narrows — but
+            // does not close — the window. A determined agent that reads
+            // `$TMPDIR/.gh-token` before the legitimate consumer still wins.
             if gh_guard.block_auth_token {
                 cache_gh_token_to_file(scratch, agent);
             }
@@ -203,7 +212,21 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
 ///
 /// The gh wrapper script reads this file to serve `gh auth token` requests
 /// without exposing the token as an environment variable to all child processes.
-/// The file is owner-readable only (mode 0o600).
+/// The file is owner-readable only (mode 0o600) and is deleted after the first
+/// read (see `serve_cached_gh_token`).
+///
+/// # Security scope (Finding 3): best-effort, not a same-UID boundary
+///
+/// The scratch dir IS the agent's `TMPDIR`, and the gh wrapper that consumes
+/// this file runs as the agent's own UID *inside* the sandbox. Anything the
+/// wrapper can read the agent can read at the same UID, so a filesystem `deny`
+/// on this path is not viable (it would break the wrapper). What
+/// `block_auth_token` genuinely delivers is keeping the token OUT of the
+/// process environment so it can't be scraped from every child's `/proc/*/
+/// environ`; the 0600 mode + one-time-read deletion narrow the file's exposure
+/// window. They do NOT prevent a determined same-UID agent from `cat`-ing
+/// `$TMPDIR/.gh-token` before the legitimate read. Do not treat this as
+/// confidentiality against an adversarial agent.
 fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent) {
     // Only cache for Copilot — other agents have their own auth
     if agent != Agent::Copilot {

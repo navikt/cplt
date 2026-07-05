@@ -1151,10 +1151,30 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                 // Check trust store — validate content hash
                 if let Some(t) = trust::load_trust(&project_dir) {
                     let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+                    // Finding 4: the trust file is keyed on the git origin URL, which
+                    // the repo can forge (`git remote set-url origin <victim>` + copy
+                    // the victim's approved [propose] block so the content hash matches
+                    // too). Bind the approval to the local checkout path: a matching
+                    // fingerprint presented from a DIFFERENT path is NOT auto-trusted,
+                    // defeating the confused-deputy escalation.
+                    if !trust::approved_path_matches(&t, &project_dir) {
+                        if !resolved.quiet {
+                            let where_approved = if t.repo.path.is_empty() {
+                                "an unrecorded location".to_string()
+                            } else {
+                                t.repo.path.clone()
+                            };
+                            ui::warn(&format!(
+                                ".cplt.toml for this remote was approved at a different path ({where_approved}) — \
+                                 not auto-trusting here. Re-approve with `cplt trust accept`.",
+                            ));
+                        }
+                        Vec::new()
+                    }
                     // Treat a legacy empty stored hash as STALE (see approval_is_stale):
                     // it pins nothing, so applying its keys against arbitrary proposal
                     // *values* with no re-prompt would be unsafe.
-                    if trust::approval_is_stale(&t.accepted.content_hash, &current_hash) {
+                    else if trust::approval_is_stale(&t.accepted.content_hash, &current_hash) {
                         // Proposals changed since approval (or a legacy unpinned
                         // entry) — invalidate and require re-approval.
                         if !resolved.quiet {
@@ -3314,6 +3334,23 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         if hash_mismatch {
             println!("{blue}[cplt]{nc}  {red}⚠ Permissions have changed since last approval!{nc}");
             println!("{blue}[cplt]{nc}  {red}  Run `cplt trust accept --all` to re-approve.{nc}");
+        }
+
+        // Finding 4: approval is bound to the local checkout path. If this repo's
+        // origin matches a trusted entry but sits at a different path, the keys
+        // shown above will NOT auto-apply — surface that honestly.
+        if !trust::approved_path_matches(entry, project_dir) {
+            println!(
+                "{blue}[cplt]{nc}  {red}⚠ Approved at a different path ({}) — not auto-trusted here.{nc}",
+                if entry.repo.path.is_empty() {
+                    "unrecorded"
+                } else {
+                    &entry.repo.path
+                }
+            );
+            println!(
+                "{blue}[cplt]{nc}  {red}  Run `cplt trust accept` to approve at this path.{nc}"
+            );
         }
     } else if has_pending {
         println!();
