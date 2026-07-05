@@ -635,25 +635,30 @@ else:
         );
     }
 
-    /// FS negative: writing to a path outside the project (the HOME root, which
-    /// has no writable rule) must be kernel-denied. Uses a hermetic fake HOME so
-    /// the probe writes a real file rather than passing on a missing directory.
+    /// FS negative: writing outside the project and outside every writable rule
+    /// (project dir, /tmp, scratch cache subtree) must be kernel-denied. Targets
+    /// the real HOME root: a fake HOME from `tempfile::tempdir()` would live
+    /// under /tmp, which is writable by design (read+write, non-exec), so it
+    /// cannot demonstrate the deny.
     #[test]
     fn landlock_denies_write_outside_project() {
         require_landlock!();
         let project = create_test_project();
-        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
-        let (code, stdout, _) = run_sandboxed_home(
-            project.path(),
-            fake_home.path(),
-            "echo escape > ~/escape.txt 2>&1 && echo WROTE || echo WRITE_DENIED",
+        let escape = home_dir().join("cplt-landlock-escape-probe.txt");
+        let _ = fs::remove_file(&escape);
+        let script = format!(
+            "echo escape > '{}' 2>&1 && echo WROTE || echo WRITE_DENIED",
+            escape.display()
         );
+        let (code, stdout, stderr) = run_sandboxed(project.path(), &script);
+        let created = escape.exists();
+        let _ = fs::remove_file(&escape);
         assert!(
             stdout.contains("WRITE_DENIED") && !stdout.contains("WROTE"),
-            "writing to the HOME root outside the project must be denied — code: {code}, stdout: {stdout}"
+            "writing to the HOME root outside the project must be denied — code: {code}, stdout: {stdout}, stderr: {stderr}"
         );
         assert!(
-            !fake_home.path().join("escape.txt").exists(),
+            !created,
             "no file should have been created outside the project"
         );
     }
@@ -810,8 +815,11 @@ else:
             git -c commit.gpgSign=false commit -m "init" &&
             git log --oneline
         "#;
-        let (code, stdout, _) = run_sandboxed(project.path(), script);
-        assert_eq!(code, 0, "Git workflow should work inside sandbox");
+        let (code, stdout, stderr) = run_sandboxed(project.path(), script);
+        assert_eq!(
+            code, 0,
+            "Git workflow should work inside sandbox — stdout: {stdout}, stderr: {stderr}"
+        );
         assert!(stdout.contains("init"));
     }
 
