@@ -111,37 +111,57 @@ jobs:
           key: Linux-integration-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: Linux-integration-cargo-
 
-      - name: Verify Landlock availability
-        id: landlock
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces
+        run: |
+          # Ubuntu 23.10+ (incl. ubuntu-latest = 24.04) restricts unprivileged
+          # user namespaces via AppArmor, which blocks unprivileged bwrap. Clear
+          # the knob so bwrap can create namespaces. Guarded so the step does not
+          # fail on images where the sysctl does not exist — the functional probe
+          # below is the real gate.
+          if sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; then
+            echo "Disabled apparmor_restrict_unprivileged_userns"
+          else
+            echo "sysctl kernel.apparmor_restrict_unprivileged_userns not present — skipping"
+          fi
+
+      - name: Verify sandbox capabilities
         run: |
           echo "Kernel: $(uname -r)"
 
-          if [ ! -r /sys/kernel/security/lsm ]; then
-            echo "::warning::securityfs not readable — Landlock tests will be skipped by require_landlock!()"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ -r /sys/kernel/security/lsm ]; then
+            echo "LSM: $(cat /sys/kernel/security/lsm)"
+          else
+            echo "::warning::securityfs not readable"
           fi
 
-          lsm="$(cat /sys/kernel/security/lsm)"
-          echo "LSM: $lsm"
-
-          if ! printf '%s\n' "$lsm" | grep -qw landlock; then
-            echo "::warning::Landlock not in LSM list — tests will be skipped by require_landlock!()"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ -r /sys/kernel/security/landlock/abi_version ]; then
+            echo "Landlock ABI: $(cat /sys/kernel/security/landlock/abi_version)"
+          else
+            echo "::warning::Landlock abi_version not readable"
           fi
 
-          if [ ! -r /sys/kernel/security/landlock/abi_version ]; then
-            echo "::warning::Landlock in LSM but abi_version not readable (securityfs may not be fully mounted)"
-            echo "::warning::Tests will still run — require_landlock!() skips individual tests at runtime"
-            echo "available=partial" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          echo "bwrap: $(bwrap --version)"
 
-          echo "Landlock ABI: $(cat /sys/kernel/security/landlock/abi_version)"
-          echo "available=true" >> "$GITHUB_OUTPUT"
+          # Functional bwrap probe with the exact namespace set cplt uses. If
+          # this fails the whole job fails — CPLT_TEST_REQUIRE_SANDBOX below
+          # then also turns every skipped sandbox test into a hard failure.
+          bwrap --unshare-user --unshare-pid \
+            --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp \
+            /bin/true
+          echo "bwrap functional probe: OK"
 
-      - name: Run all Linux tests
+      - name: Run all Linux tests (skips fail the job)
+        # CPLT_TEST_REQUIRE_SANDBOX=1 makes require_landlock!/require_bwrap!/
+        # require_curl! panic instead of skip, so a missing capability (e.g.
+        # bubblewrap uninstalled — issue #113) turns this job red rather than
+        # silently passing.
+        env:
+          CPLT_TEST_REQUIRE_SANDBOX: "1"
         run: cargo test --verbose
 
   # Build test binaries on PRs — downloadable from the workflow run page.
