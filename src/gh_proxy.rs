@@ -899,7 +899,15 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             idx += 1;
             continue;
         }
-        if arg.starts_with("-R") && arg.len() > 2 && !arg.starts_with("-R=") {
+        // `-R=owner/repo` (attached-equals form) — strip the leading '=' so the
+        // value is captured. Without this the flag is silently dropped by the
+        // generic `arg.contains('=')` skip below and treated as current-repo.
+        if let Some(val) = arg.strip_prefix("-R=") {
+            global_repo_flag = Some(val.to_string());
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with("-R") && arg.len() > 2 {
             global_repo_flag = Some(arg[2..].to_string());
             idx += 1;
             continue;
@@ -962,12 +970,17 @@ pub fn parse_command(args: &[&str]) -> Option<ParsedCommand> {
             if let Some(val) = arg.strip_prefix("--method=") {
                 method = Some(val.to_uppercase());
             } else if arg.starts_with("-X") && arg.len() > 2 {
-                // -XPOST form (short flag with attached value)
-                method = Some(arg[2..].to_uppercase());
+                // -XPOST or -X=POST form (short flag with attached value).
+                // Strip an optional leading '=' so `-X=DELETE` is not read as the
+                // bogus method "=DELETE" (which would bypass the DELETE block).
+                let val = arg[2..].strip_prefix('=').unwrap_or(&arg[2..]);
+                method = Some(val.to_uppercase());
             } else if let Some(val) = arg.strip_prefix("--repo=") {
                 repo_flag = Some(val.to_string());
             } else if arg.starts_with("-R") && arg.len() > 2 {
-                repo_flag = Some(arg[2..].to_string());
+                // Handle both `-Rowner/repo` and `-R=owner/repo`.
+                let val = arg[2..].strip_prefix('=').unwrap_or(&arg[2..]);
+                repo_flag = Some(val.to_string());
             } else if arg.starts_with("--field=")
                 || arg.starts_with("--raw-field=")
                 || arg.starts_with("--input=")
@@ -1131,12 +1144,30 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
             .split('?')
             .next()
             .unwrap_or(endpoint);
-        if normalized == "graphql" || normalized == "/graphql" {
+        // Extract the path component so a fully-qualified URL
+        // (`https://api.github.com/graphql`) is caught too, not just the
+        // relative `graphql` / `/graphql` forms.
+        let path = normalized
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('/'))
+            .map_or(normalized, |(_, p)| p);
+        if path.trim_start_matches('/') == "graphql" {
             return PolicyResult {
                 decision: Decision::Block,
                 reason: "gh api graphql allows arbitrary mutations — use specific REST endpoints instead",
             };
         }
+    }
+
+    // Evaluate the HTTP method BEFORE the input-flags shortcut. DELETE is always
+    // destructive, so `gh api -X DELETE /repos/o/r/x -f k=v` must hit this block
+    // rather than being reclassified as a scope-checkable write just because it
+    // also carries input fields.
+    if matches!(cmd.method.as_deref(), Some("DELETE")) {
+        return PolicyResult {
+            decision: Decision::Block,
+            reason: "gh api DELETE is destructive — not permitted even with allow_api_write",
+        };
     }
 
     // If input flags are present, it's implicitly a write
@@ -1159,11 +1190,7 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
             decision: Decision::ScopeCheck,
             reason: "gh api GET — scope-checked",
         },
-        // DELETE is destructive regardless of allow_api_write
-        Some("DELETE") => PolicyResult {
-            decision: Decision::Block,
-            reason: "gh api DELETE is destructive — not permitted even with allow_api_write",
-        },
+        // DELETE handled above (before the input-flags shortcut).
         Some(_) => {
             if allow_api_write {
                 PolicyResult {
@@ -1256,8 +1283,18 @@ fn extract_repo_from_api_path(endpoint: &str) -> Option<String> {
     let path = endpoint.strip_prefix('/').unwrap_or(endpoint);
     let parts: Vec<&str> = path.split('/').collect();
 
-    // Must start with "repos" and have at least owner + repo
-    if parts.len() >= 3 && parts[0] == "repos" && !parts[1].is_empty() && !parts[2].is_empty() {
+    // Must start with "repos" and have at least owner + repo.
+    // Reject "." / ".." segments — they are not valid owner/repo names and could
+    // otherwise be used to craft a path that string-matches the current repo
+    // while resolving elsewhere.
+    let is_dot = |s: &str| s == "." || s == "..";
+    if parts.len() >= 3
+        && parts[0] == "repos"
+        && !parts[1].is_empty()
+        && !parts[2].is_empty()
+        && !is_dot(parts[1])
+        && !is_dot(parts[2])
+    {
         Some(format!("{}/{}", parts[1], parts[2]))
     } else {
         None
@@ -1432,6 +1469,33 @@ impl Default for GatePolicy {
     }
 }
 
+/// True if a `gh auth status` argument requests that the token be printed.
+///
+/// A naive exact match on `--show-token`/`-t` misses the equivalent spellings
+/// that gh (cobra/pflag) accepts, every one of which leaks the OAuth token:
+///   • `--show-token`       — canonical long form
+///   • `--show-token=true`  — long form with an attached boolean value
+///   • `-t`                 — short form
+///   • `-at` / `-ta`        — bundled single-dash boolean cluster (auth status
+///                            also accepts `-a`/`--active`, so shorthands combine)
+///
+/// A single-dash cluster containing `t` reveals the token; a `--`-prefixed long
+/// flag (e.g. `--tags`) is NOT a cluster and must never be treated as one, or the
+/// guard would misfire on unrelated flags. This check must stay conservative
+/// (fail closed): any credible spelling of the token flag has to be caught here
+/// because the POLICY table classifies `auth status` as a read-only Allow.
+fn arg_reveals_token(arg: &str) -> bool {
+    if arg == "--show-token" || arg.starts_with("--show-token=") {
+        return true;
+    }
+    // Single-dash short cluster (`-t`, `-at`, `-ta`, …) — explicitly NOT a
+    // `--long` flag, so `--tags` and friends are excluded.
+    if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
+        return arg[1..].contains('t');
+    }
+    false
+}
+
 /// Evaluate a full command and return a human-friendly verdict.
 ///
 /// This is the entry point used by the `gh-gate` subcommand.
@@ -1443,13 +1507,25 @@ pub fn gate(args: &[&str], project_dir: &Path, policy: &GatePolicy) -> Result<()
         return Ok(());
     };
 
-    // Handle `gh auth token` block (credential exfiltration prevention)
+    // Handle token-revealing `gh auth` commands (credential exfiltration prevention).
+    //
+    // Two paths print the raw OAuth token:
+    //   • `gh auth token`             — dedicated token printer
+    //   • `gh auth status --show-token` / `-t` — prints the token alongside status
+    // The POLICY table classifies `auth status` as a read-only Allow, so every
+    // spelling of the token flag (`--show-token`, `--show-token=true`, `-t`, and
+    // bundled `-at`/`-ta` clusters — see `arg_reveals_token`) must be caught here
+    // or it leaks the token with the default config. Plain `gh auth status` (no
+    // token flag) stays allowed.
+    let reveals_token_via_status = cmd.command == "auth"
+        && cmd.subcommand.as_deref() == Some("status")
+        && args.iter().any(|a| arg_reveals_token(a));
     if policy.block_auth_token
         && cmd.command == "auth"
-        && cmd.subcommand.as_deref() == Some("token")
+        && (cmd.subcommand.as_deref() == Some("token") || reveals_token_via_status)
     {
         return Err(
-            "⚠️ BLOCKED by sandbox: 'gh auth token' is not allowed in this environment.\n\
+            "⚠️ BLOCKED by sandbox: revealing the GitHub token is not allowed in this environment.\n\
              Reason: token exfiltration prevention — use GH_TOKEN env var instead.\n\
              This operation is restricted by the cplt sandbox to prevent credential leaks.\n\
              Please make a note of this for the human operator and continue with your remaining work."
@@ -1536,7 +1612,11 @@ pub fn gate(args: &[&str], project_dir: &Path, policy: &GatePolicy) -> Result<()
 
 /// Git subcommands that perform remote writes.
 /// Blocked by the git wrapper to prevent agents from pushing code.
-const GIT_BLOCKED_SUBCOMMANDS: &[&str] = &["push", "request-pull", "send-pack", "subtree"];
+///
+/// `subtree` is NOT here: only `git subtree push` is a remote write — the
+/// `add`/`pull`/`split`/`merge` subcommands are local operations. It is handled
+/// as a special case in `gate_git` so the local forms stay allowed.
+const GIT_BLOCKED_SUBCOMMANDS: &[&str] = &["push", "request-pull", "send-pack"];
 
 /// Git subcommands that are always allowed (read-only or local-only).
 const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
@@ -1626,7 +1706,219 @@ const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
     // Misc
     "submodule",
     "lfs",
+    // subtree: local forms (add/pull/split/merge) allowed; `subtree push` is
+    // blocked as a special case in gate_git.
+    "subtree",
 ];
+
+/// `git push` flags that consume a following space-separated value.
+///
+/// NOTE: `--force-with-lease` and `--signed` are intentionally absent. They only
+/// accept an `=`-attached value (`--force-with-lease=ref`, `--signed=true`) — never
+/// a space-separated argument. Listing them here would wrongly swallow the next
+/// positional (the remote/refspec), both false-blocking legitimate pushes and
+/// corrupting branch detection. This single list is shared by all push parsers so
+/// the rule can't drift between copies.
+const PUSH_FLAGS_WITH_VALUE: &[&str] =
+    &["--repo", "--receive-pack", "--exec", "-o", "--push-option"];
+
+/// True if `arg` is a force-push *flag* (`--force`, `-f`, or a `--force-with-lease`/
+/// `--force-if-includes` variant, which may carry an `=`-attached value).
+fn is_force_push_flag(arg: &str) -> bool {
+    arg == "--force"
+        || arg == "-f"
+        || arg.starts_with("--force-with-lease")
+        || arg.starts_with("--force-if-includes")
+}
+
+/// Collect the positional arguments (remote, refspecs) from `git push` args,
+/// skipping flags and any values they consume. Shared so remote/branch/force
+/// parsing all see the same positional set.
+fn push_positionals<'a>(push_args: &[&'a str]) -> Vec<&'a str> {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < push_args.len() {
+        let arg = push_args[i];
+        if arg == "--" {
+            // Everything after `--` is positional.
+            positionals.extend_from_slice(&push_args[i + 1..]);
+            break;
+        }
+        if arg.starts_with('-') {
+            if !arg.contains('=') && PUSH_FLAGS_WITH_VALUE.contains(&arg) {
+                i += 2; // skip flag and its value
+            } else {
+                i += 1; // boolean flag or `--flag=value`
+            }
+            continue;
+        }
+        positionals.push(arg);
+        i += 1;
+    }
+    positionals
+}
+
+/// Whether a `git push` invocation performs a force update.
+///
+/// Recognizes both explicit force flags AND the `+`-prefixed refspec shorthand
+/// (`git push origin +main`, `+feature:feature`), which forces the update with no
+/// flag at all. The refspec form is checked only against positionals so a `+` in a
+/// flag value can't produce a false positive.
+fn push_is_force(push_args: &[&str]) -> bool {
+    if push_args.iter().any(|a| is_force_push_flag(a)) {
+        return true;
+    }
+    push_positionals(push_args)
+        .iter()
+        .any(|a| a.starts_with('+'))
+}
+
+/// Resolve the destination branch a refspec targets.
+///
+/// Strips a leading `+` (force marker) and, for `src:dst` refspecs, returns the
+/// `dst` half with any `refs/heads/` or `refs/for/` prefix removed. For a plain
+/// branch token, returns it unchanged (minus the `+`). This ensures a `+`-forced
+/// refspec such as `+main` or `+HEAD:refs/heads/main` is still recognized as
+/// targeting the default branch.
+fn refspec_target_branch(refspec: &str) -> &str {
+    let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+    if let Some((_src, dst)) = refspec.split_once(':') {
+        dst.strip_prefix("refs/heads/")
+            .or_else(|| dst.strip_prefix("refs/for/"))
+            .unwrap_or(dst)
+    } else {
+        refspec
+    }
+}
+
+/// The remote whose URL defines the enforced repository scope.
+///
+/// The gh-guard reads `git remote get-url origin` at gate time, so only mutations
+/// that create or retarget `origin` can bypass scope — management of other remotes
+/// (upstream, fork, …) is harmless and must stay allowed.
+const SCOPE_REMOTE: &str = "origin";
+
+/// `git remote add` flags that consume a following value (so the value is not
+/// mistaken for the remote name when locating the positional arguments).
+const REMOTE_ADD_VALUE_FLAGS: &[&str] = &["-t", "-m"];
+
+/// True if a `git remote <verb> …` invocation creates or retargets `origin`'s URL.
+///
+/// Only the verbs that can point `origin` at a new URL threaten scope integrity:
+///   • `set-url origin …` — rewrites origin's URL in place.
+///   • `add origin …`     — (re)creates origin pointing at the given URL.
+///   • `rename <x> origin` — promotes another remote to become `origin`.
+/// Non-origin forms (`add upstream`, `rename a b`, `set-url upstream`), plus
+/// `remove`/`rm` and read-only verbs, are left alone.
+fn remote_verb_retargets_origin(verb: &str, verb_args: &[&str]) -> bool {
+    let value_flags: &[&str] = if verb == "add" {
+        REMOTE_ADD_VALUE_FLAGS
+    } else {
+        &[]
+    };
+    // Positional (non-flag) tokens, skipping flags and any values they consume.
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < verb_args.len() {
+        let a = verb_args[i];
+        if a.starts_with('-') {
+            if value_flags.contains(&a) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        positionals.push(a);
+        i += 1;
+    }
+    match verb {
+        // `add`/`set-url`: the first positional is the remote name.
+        "add" | "set-url" => positionals.first().copied() == Some(SCOPE_REMOTE),
+        // `rename <old> <new>`: only promoting a remote *to* `origin` retargets scope.
+        "rename" => positionals.get(1).copied() == Some(SCOPE_REMOTE),
+        _ => false,
+    }
+}
+
+/// Detect `git` invocations that would change which repository the `origin` remote
+/// points at.
+///
+/// The gh-guard derives the enforced repository scope by reading
+/// `git remote get-url origin` at gate time. If an agent can create or rewrite
+/// `origin`'s URL (directly, or via git's URL-rewrite config), it can retarget
+/// every "in-scope" operation to an arbitrary repository. So while the git guard
+/// is active, mutating `origin`'s URL is blocked. Managing other remotes
+/// (`git remote add upstream …`, `rename`, `remove`) and read-only inspection
+/// (`git remote -v`, `git remote get-url origin`, `git config --get …`) are
+/// unaffected — those cannot redirect the scope source.
+fn is_remote_scope_mutation(sub: &str, sub_args: &[&str]) -> bool {
+    match sub {
+        "remote" => {
+            // First non-flag token is the verb. No verb → list (read-only).
+            let Some(verb_idx) = sub_args.iter().position(|a| !a.starts_with('-')) else {
+                return false;
+            };
+            let verb = sub_args[verb_idx];
+            if matches!(verb, "add" | "set-url" | "rename") {
+                remote_verb_retargets_origin(verb, &sub_args[verb_idx + 1..])
+            } else {
+                false
+            }
+        }
+        "config" => config_sets_remote_url(sub_args),
+        _ => false,
+    }
+}
+
+/// True if `git config` args write to a key that can redirect the enforced scope.
+///
+/// Two key families qualify, both of which persistently change where a github.com
+/// URL resolves:
+///   • `remote.origin.url` / `remote.origin.pushurl` — the scope is read from
+///     `origin`, so retargeting its URL is a direct bypass. Non-origin remote
+///     URLs (`remote.upstream.url`) are harmless and stay allowed.
+///   • `url.<base>.insteadOf` / `url.<base>.pushInsteadOf` — git's URL-rewrite
+///     rules silently redirect `fetch`/`pull`/`clone`/`push` transport for any
+///     matching URL, an equivalent transport-remap (code-injection) vector.
+///
+/// Reads (`--get`, `--get-all`, `--get-regexp`, `--list`, and the bare
+/// `git config <key>` form that just prints the value) are allowed; only a key
+/// with a following value (a set) is treated as a scope mutation. Keys are matched
+/// case-insensitively, as git config key names are case-insensitive.
+fn config_sets_remote_url(sub_args: &[&str]) -> bool {
+    const READ_FLAGS: &[&str] = &[
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--list",
+        "-l",
+    ];
+    if sub_args
+        .iter()
+        .any(|a| READ_FLAGS.contains(&a.to_lowercase().as_str()))
+    {
+        return false;
+    }
+    for (idx, arg) in sub_args.iter().enumerate() {
+        let key = arg.to_lowercase();
+        let redirects_scope = key == "remote.origin.url"
+            || key == "remote.origin.pushurl"
+            || (key.starts_with("url.")
+                && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof")));
+        if redirects_scope {
+            // A non-flag token after the key is the value → this is a write.
+            return sub_args.get(idx + 1).is_some_and(|v| !v.starts_with('-'));
+        }
+    }
+    false
+}
+
+/// True if the invocation is `git subtree push` (the only remote-write subtree form).
+fn is_subtree_push(sub_args: &[&str]) -> bool {
+    sub_args.iter().find(|a| !a.starts_with('-')).copied() == Some("push")
+}
 
 /// Evaluate a git command. Returns Ok(()) if allowed, Err with message if blocked.
 ///
@@ -1703,6 +1995,36 @@ pub fn gate_git(
         return Ok(());
     };
 
+    // Arguments belonging to the subcommand (everything after it).
+    let sub_args = &args[i + 1..];
+
+    // Scope integrity: block mutation of remote URLs while the guard is active.
+    // The gh-guard reads `origin` to determine the enforced repo scope, so
+    // rewriting a remote's URL would let an agent redirect in-scope operations
+    // to another repository. `git remote`/`git config` are otherwise allowed
+    // (read-only inspection), so this must be intercepted explicitly.
+    if is_remote_scope_mutation(sub, sub_args) {
+        return Err(format!(
+            "⚠️ BLOCKED by sandbox: 'git {sub}' would change a remote's URL.\n\
+             The gh-guard derives the enforced repository scope from the 'origin' remote;\n\
+             rewriting it could redirect in-scope operations to another repository.\n\
+             Read-only inspection (git remote -v, git config --get remote.origin.url) is still allowed.\n\
+             Please make a note of this for the human operator and continue with your remaining work."
+        ));
+    }
+
+    // `git subtree push` is a remote write — block it like a bare push while
+    // leaving the local subtree forms (add/pull/split/merge) allowed.
+    if prevent_push && sub == "subtree" && is_subtree_push(sub_args) {
+        return Err(
+            "⚠️ BLOCKED by sandbox: 'git subtree push' is not allowed in this environment.\n\
+             Push prevention is enabled — 'subtree push' performs a remote write.\n\
+             Local subtree operations (add/pull/split/merge) are still allowed.\n\
+             Please make a note of this for the human operator and continue with your remaining work."
+                .to_string(),
+        );
+    }
+
     if prevent_push && GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
         // When protect_default_branch_only is set, only block pushes targeting
         // the default branch (main/master). Feature branch pushes are allowed,
@@ -1726,12 +2048,7 @@ pub fn gate_git(
             if is_feature_branch {
                 // Feature branch push allowed, but still enforce force-push prevention
                 if prevent_force_push {
-                    let has_force = push_args.iter().any(|a| {
-                        *a == "--force"
-                            || *a == "-f"
-                            || a.starts_with("--force-with-lease")
-                            || a.starts_with("--force-if-includes")
-                    });
+                    let has_force = push_is_force(push_args);
                     if has_force {
                         return Err(
                             "⚠️ BLOCKED by sandbox: 'git push --force' is not allowed in this environment.\n\
@@ -1748,12 +2065,7 @@ pub fn gate_git(
         // Check allow_push exception rules before blocking
         if sub == "push" && !allow_push_rules.is_empty() {
             let push_args = &args[i + 1..];
-            let has_force = push_args.iter().any(|a| {
-                *a == "--force"
-                    || *a == "-f"
-                    || a.starts_with("--force-with-lease")
-                    || a.starts_with("--force-if-includes")
-            });
+            let has_force = push_is_force(push_args);
             let (remote, branch) = extract_push_remote_and_branch(push_args, real_git);
             if matches_allow_push_rule(
                 allow_push_rules,
@@ -1777,12 +2089,7 @@ pub fn gate_git(
     // check for force push flags on push commands
     if !prevent_push && prevent_force_push && sub == "push" {
         let push_args = &args[i + 1..];
-        let has_force = push_args.iter().any(|a| {
-            *a == "--force"
-                || *a == "-f"
-                || a.starts_with("--force-with-lease")
-                || a.starts_with("--force-if-includes")
-        });
+        let has_force = push_is_force(push_args);
         if has_force {
             return Err(
                 "⚠️ BLOCKED by sandbox: 'git push --force' is not allowed in this environment.\n\
@@ -1827,58 +2134,24 @@ fn is_default_branch(branch: &str) -> bool {
 /// Extract the target branch from `git push` arguments.
 ///
 /// Parses refspecs like `origin feature-branch`, `origin HEAD:refs/heads/feature`,
-/// or just `feature-branch`. Returns None if no explicit branch target found.
+/// `origin +main` (force), or just `feature-branch`. Returns None if no explicit
+/// branch target found (e.g. `git push origin`, where the current branch is pushed).
 fn extract_push_target_branch<'a>(push_args: &[&'a str]) -> Option<&'a str> {
-    // Push flags that consume a value
-    const PUSH_FLAGS_WITH_VALUE: &[&str] = &[
-        "--repo",
-        "--receive-pack",
-        "--exec",
-        "-o",
-        "--push-option",
-        "--signed",
-        "--force-with-lease",
-    ];
-
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < push_args.len() {
-        let arg = push_args[i];
-        if arg == "--" {
-            // Everything after -- is positional
-            positionals.extend_from_slice(&push_args[i + 1..]);
-            break;
-        }
-        if arg.contains('=') && arg.starts_with('-') {
-            // --flag=value, skip
-            i += 1;
-            continue;
-        }
-        if PUSH_FLAGS_WITH_VALUE.contains(&arg) {
-            i += 2;
-            continue;
-        }
-        if arg.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        positionals.push(arg);
-        i += 1;
-    }
+    let positionals = push_positionals(push_args);
 
     // `git push [remote] [refspec...]`
     // positionals[0] is usually the remote, positionals[1+] are refspecs
     match positionals.len() {
         0 => None, // `git push` — pushes current branch
         1 => {
-            // Could be remote OR refspec. If it looks like a remote name, no branch specified.
-            // Common remotes: origin, upstream, fork, etc.
-            // If it contains a colon, it's a refspec like "HEAD:refs/heads/branch"
+            // Could be remote OR refspec. A colon (`HEAD:refs/heads/branch`) or a
+            // leading `+` (forced refspec) means an explicit target; a bare word
+            // is just a remote name with no branch specified.
             let arg = positionals[0];
-            if let Some(dst) = extract_branch_from_refspec(arg) {
-                Some(dst)
+            if arg.contains(':') || arg.starts_with('+') {
+                Some(refspec_target_branch(arg))
             } else {
-                None // Just a remote name, no explicit branch
+                None
             }
         }
         _ => {
@@ -1887,37 +2160,14 @@ fn extract_push_target_branch<'a>(push_args: &[&'a str]) -> Option<&'a str> {
             // This prevents bypass via `git push origin feature main` where "main" is the
             // second refspec and would be missed if we only check the first.
             for refspec in &positionals[1..] {
-                let branch = extract_branch_from_refspec(refspec).unwrap_or(refspec);
+                let branch = refspec_target_branch(refspec);
                 if is_default_branch(branch) {
                     return Some(branch);
                 }
             }
-            // No default branch found — return first refspec for caller context
-            let refspec = positionals[1];
-            if let Some(dst) = extract_branch_from_refspec(refspec) {
-                Some(dst)
-            } else {
-                // Plain branch name like "feature-branch"
-                Some(refspec)
-            }
+            // No default branch found — return first refspec for caller context.
+            Some(refspec_target_branch(positionals[1]))
         }
-    }
-}
-
-/// Parse a git refspec and extract the destination branch.
-///
-/// Refspecs: `src:dst`, `HEAD:refs/heads/branch`, or just a branch name.
-/// Returns the destination part (after `:`) or None if no colon.
-fn extract_branch_from_refspec(refspec: &str) -> Option<&str> {
-    if let Some((_src, dst)) = refspec.split_once(':') {
-        // Strip refs/heads/ prefix if present
-        let branch = dst
-            .strip_prefix("refs/heads/")
-            .or_else(|| dst.strip_prefix("refs/for/"))
-            .unwrap_or(dst);
-        Some(branch)
-    } else {
-        None
     }
 }
 
@@ -1951,38 +2201,8 @@ fn extract_push_remote_and_branch(
         None => real_git.and_then(resolve_current_branch),
     };
 
-    // Extract remote (first positional that's not a refspec)
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < push_args.len() {
-        let arg = push_args[i];
-        if arg == "--" {
-            break;
-        }
-        if arg.starts_with('-') {
-            // Skip flags with values
-            if arg.contains('=')
-                || ![
-                    "--repo",
-                    "--receive-pack",
-                    "--exec",
-                    "-o",
-                    "--push-option",
-                    "--signed",
-                    "--force-with-lease",
-                ]
-                .contains(&arg)
-            {
-                i += 1;
-            } else {
-                i += 2;
-            }
-            continue;
-        }
-        positionals.push(arg);
-        i += 1;
-    }
-    let remote = positionals.first().map(ToString::to_string);
+    // Extract remote (first positional — the remote name).
+    let remote = push_positionals(push_args).first().map(ToString::to_string);
 
     (remote, branch)
 }
@@ -3274,5 +3494,510 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // ── Guard hardening regression tests (issue #116) ───────────────
+
+    // Bug 1: `gh auth status --show-token`/`-t` leaks the token even though the
+    // POLICY table marks `auth status` as a read-only Allow.
+    #[test]
+    fn gh_auth_status_show_token_blocked() {
+        let dir = std::path::Path::new(".");
+        let policy = GatePolicy::default(); // block_auth_token = true
+        assert!(gate(&["auth", "status", "--show-token"], dir, &policy).is_err());
+        assert!(gate(&["auth", "status", "-t"], dir, &policy).is_err());
+        // pflag flag variants that bypass an exact-string match must be caught too.
+        assert!(gate(&["auth", "status", "--show-token=true"], dir, &policy).is_err());
+        assert!(gate(&["auth", "status", "-at"], dir, &policy).is_err()); // bundled -a -t
+        assert!(gate(&["auth", "status", "-ta"], dir, &policy).is_err()); // bundle, other order
+        // `gh auth token` remains blocked.
+        assert!(gate(&["auth", "token"], dir, &policy).is_err());
+        // Plain `gh auth status` (no token flag) is still allowed.
+        assert!(gate(&["auth", "status"], dir, &policy).is_ok());
+        // `-a`/`--active` alone (no token) and unrelated `--`-long flags must not misfire.
+        assert!(gate(&["auth", "status", "-a"], dir, &policy).is_ok());
+        assert!(gate(&["auth", "status", "--tags"], dir, &policy).is_ok());
+
+        // When block_auth_token is disabled, --show-token is allowed.
+        let unlocked = GatePolicy {
+            block_auth_token: false,
+            ..Default::default()
+        };
+        assert!(gate(&["auth", "status", "--show-token"], dir, &unlocked).is_ok());
+    }
+
+    // Bug 2: scope is derived from `origin`'s URL, so rewriting a remote URL
+    // must be blocked while read-only inspection stays allowed.
+    #[test]
+    fn git_remote_url_mutation_blocked_scope_integrity() {
+        // Mutating remote URLs / identity is blocked.
+        assert!(
+            gate_git(
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://github.com/evil/repo"
+                ],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "https://github.com/evil/repo"
+                ],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        // Re-creating `origin` pointing elsewhere is the same bypass.
+        assert!(
+            gate_git(
+                &["remote", "add", "origin", "https://github.com/evil/repo"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        // Promoting another remote *to* `origin` retargets the scope source.
+        assert!(
+            gate_git(
+                &["remote", "rename", "upstream", "origin"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        // `git config remote.origin.url <value>` is a write → blocked.
+        assert!(
+            gate_git(
+                &[
+                    "config",
+                    "remote.origin.url",
+                    "https://github.com/evil/repo"
+                ],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+
+        // Read-only inspection stays allowed.
+        assert!(gate_git(&["remote", "-v"], true, true, false, &[], None).is_ok());
+        assert!(gate_git(&["remote"], true, true, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["remote", "get-url", "origin"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        assert!(gate_git(&["remote", "show", "origin"], true, true, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["config", "--get", "remote.origin.url"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        // Bare read form `git config remote.origin.url` (prints the value).
+        assert!(
+            gate_git(
+                &["config", "remote.origin.url"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        // Unrelated config writes are unaffected.
+        assert!(gate_git(&["config", "user.name", "x"], true, true, false, &[], None).is_ok());
+    }
+
+    // Finding 2: git's URL-rewrite keys (`url.<base>.insteadOf` /
+    // `pushInsteadOf`) persistently redirect where github.com URLs resolve, an
+    // equivalent transport-remap vector — they must be blocked like remote URL sets.
+    #[test]
+    fn git_config_insteadof_rewrite_blocked() {
+        // Setting an insteadOf / pushInsteadOf rewrite is blocked.
+        assert!(
+            gate_git(
+                &[
+                    "config",
+                    "url.https://evil/.insteadOf",
+                    "https://github.com/"
+                ],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &[
+                    "config",
+                    "url.https://evil/.pushInsteadOf",
+                    "https://github.com/"
+                ],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        // Reads of the same key stay allowed.
+        assert!(
+            gate_git(
+                &["config", "--get", "url.https://evil/.insteadOf"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        // Bare read form (prints the value) stays allowed.
+        assert!(
+            gate_git(
+                &["config", "url.https://evil/.insteadOf"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    // Finding 3: managing NON-origin remotes doesn't touch the scope source and
+    // must stay allowed; only mutations that create/retarget `origin` are blocked.
+    #[test]
+    fn git_nonorigin_remote_management_allowed() {
+        // Non-origin management: allowed (was previously over-blocked).
+        for args in [
+            &["remote", "add", "upstream", "https://github.com/other/repo"][..],
+            &["remote", "rename", "oldfork", "newfork"][..],
+            &["remote", "remove", "upstream"][..],
+            &["remote", "rm", "upstream"][..],
+            &[
+                "remote",
+                "set-url",
+                "upstream",
+                "https://github.com/other/repo",
+            ][..],
+            // Renaming origin away / removing origin can't redirect (re-adding
+            // origin is itself blocked), so it is allowed.
+            &["remote", "rename", "origin", "backup"][..],
+            &["remote", "remove", "origin"][..],
+            // Non-origin config URL sets are unrelated to scope.
+            &[
+                "config",
+                "remote.upstream.url",
+                "https://github.com/other/repo",
+            ][..],
+        ] {
+            assert!(
+                gate_git(args, true, true, false, &[], None).is_ok(),
+                "expected allowed: git {}",
+                args.join(" ")
+            );
+        }
+
+        // Origin-retargeting mutations: still blocked (scope-bypass prevention).
+        for args in [
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/evil/repo",
+            ][..],
+            &["remote", "add", "origin", "https://github.com/evil/repo"][..],
+            &["remote", "rename", "upstream", "origin"][..],
+        ] {
+            assert!(
+                gate_git(args, true, true, false, &[], None).is_err(),
+                "expected blocked: git {}",
+                args.join(" ")
+            );
+        }
+
+        // The origin-retarget block also holds under force-push-only policy,
+        // and still does not over-block non-origin management there.
+        assert!(
+            gate_git(
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://github.com/evil/repo"
+                ],
+                false,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &["remote", "add", "upstream", "https://github.com/other/repo"],
+                false,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    // Bug 3: a leading `+` on a refspec forces the update and must be recognized
+    // both for default-branch protection and force-push prevention.
+    #[test]
+    fn git_plus_refspec_force_detected() {
+        // `+main` targets the default branch under protect_default_branch_only.
+        assert!(gate_git(&["push", "origin", "+main"], true, true, true, &[], None).is_err());
+        assert!(gate_git(&["push", "origin", "+master"], true, true, true, &[], None).is_err());
+        assert!(
+            gate_git(
+                &["push", "origin", "+HEAD:refs/heads/main"],
+                true,
+                true,
+                true,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        // `+feature:feature` is a force update under prevent_force_push (push allowed).
+        assert!(
+            gate_git(
+                &["push", "origin", "+feature:feature"],
+                false,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+        // Sanity: the non-force forms remain allowed.
+        assert!(
+            gate_git(
+                &["push", "origin", "feature:feature"],
+                false,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        // `+feature` is a force to a feature branch: blocked when force-push is
+        // prevented, but allowed when it is not (prevent_force_push=false).
+        assert!(gate_git(&["push", "origin", "+feature"], true, true, true, &[], None).is_err());
+        assert!(
+            gate_git(
+                &["push", "origin", "+feature"],
+                true,
+                false,
+                true,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    // Bug 4: `--force-with-lease`/`--signed` take only `=`-attached values, so
+    // they must NOT swallow the following remote/refspec.
+    #[test]
+    fn git_force_with_lease_space_form_not_value_consuming() {
+        use crate::config::ResolvedPushRule;
+        let rules = vec![ResolvedPushRule {
+            remote: Some("origin".to_string()),
+            branches: vec!["agent/*".to_string()],
+            force: true,
+        }];
+        // The remote/branch must parse correctly (not be eaten by --force-with-lease).
+        assert!(
+            gate_git(
+                &["push", "--force-with-lease", "origin", "agent/x"],
+                true,
+                true,
+                false,
+                &rules,
+                None
+            )
+            .is_ok()
+        );
+        // Branch parsing is correct with the flag present.
+        let (remote, branch) =
+            extract_push_remote_and_branch(&["--force-with-lease", "origin", "agent/x"], None);
+        assert_eq!(remote.as_deref(), Some("origin"));
+        assert_eq!(branch.as_deref(), Some("agent/x"));
+        let (remote, branch) =
+            extract_push_remote_and_branch(&["--signed", "origin", "agent/y"], None);
+        assert_eq!(remote.as_deref(), Some("origin"));
+        assert_eq!(branch.as_deref(), Some("agent/y"));
+    }
+
+    // Bug 5: DELETE must be blocked even when input flags are also present.
+    #[test]
+    fn api_delete_with_input_flags_blocked() {
+        let parsed = parse_command(&["api", "-X", "DELETE", "/repos/o/r/x", "-f", "k=v"]).unwrap();
+        assert!(parsed.has_input_flags);
+        assert_eq!(parsed.method.as_deref(), Some("DELETE"));
+        assert_eq!(
+            evaluate_with_policy(&parsed, true).decision,
+            Decision::Block,
+            "DELETE with input flags must be blocked even with allow_api_write"
+        );
+        assert_eq!(
+            evaluate_with_policy(&parsed, false).decision,
+            Decision::Block
+        );
+    }
+
+    // Bug 6: only `git subtree push` is a remote write; local forms are allowed.
+    #[test]
+    fn git_subtree_local_allowed_push_blocked() {
+        assert!(
+            gate_git(
+                &[
+                    "subtree",
+                    "add",
+                    "--prefix=lib",
+                    "https://example/x",
+                    "main"
+                ],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["subtree", "pull", "--prefix=lib", "origin", "main"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["subtree", "split", "--prefix=lib"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["subtree", "push", "--prefix=lib", "origin", "main"],
+                true,
+                true,
+                false,
+                &[],
+                None
+            )
+            .is_err()
+        );
+    }
+
+    // Lower-severity: full-URL graphql evades the relative-form block.
+    #[test]
+    fn api_graphql_full_url_blocked() {
+        for ep in ["graphql", "/graphql", "https://api.github.com/graphql"] {
+            let cmd = ParsedCommand {
+                command: "api".to_string(),
+                subcommand: None,
+                repo_flag: None,
+                method: Some("POST".to_string()),
+                has_input_flags: false,
+                api_endpoint: Some(ep.to_string()),
+            };
+            assert_eq!(
+                evaluate_with_policy(&cmd, true).decision,
+                Decision::Block,
+                "graphql endpoint '{ep}' must be blocked"
+            );
+        }
+    }
+
+    // Lower-severity: `.`/`..` path segments must not resolve to a repo.
+    #[test]
+    fn extract_repo_rejects_dot_segments() {
+        assert_eq!(extract_repo_from_api_path("/repos/./cplt/pulls"), None);
+        assert_eq!(extract_repo_from_api_path("/repos/navikt/../pulls"), None);
+        assert_eq!(extract_repo_from_api_path("repos/../../etc/passwd"), None);
+    }
+
+    // Lower-severity: `-R=`/`-X=` attached-equals in the api parser.
+    #[test]
+    fn parse_api_attached_equals_flags() {
+        let cmd = parse_command(&["api", "/repos/owner/repo/pulls", "-R=owner/repo"]).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("owner/repo"));
+        let cmd = parse_command(&["api", "-X=DELETE", "/repos/o/r/x/1"]).unwrap();
+        assert_eq!(cmd.method.as_deref(), Some("DELETE"));
+    }
+
+    // Lower-severity: global `-R=other/repo` before the subcommand must not be dropped.
+    #[test]
+    fn parse_global_repo_attached_equals_before_command() {
+        let cmd = parse_command(&["-R=navikt/cplt", "pr", "list"]).unwrap();
+        assert_eq!(cmd.repo_flag.as_deref(), Some("navikt/cplt"));
+        assert_eq!(cmd.command, "pr");
+        assert_eq!(cmd.subcommand.as_deref(), Some("list"));
     }
 }
