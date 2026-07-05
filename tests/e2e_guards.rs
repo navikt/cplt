@@ -946,9 +946,6 @@ fn git_gate_protect_default_blocks_multi_refspec_with_main() {
 mod sandbox_integration {
     use super::*;
     use std::fs;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     fn sandbox_exec_available() -> bool {
         Command::new("sandbox-exec")
@@ -967,27 +964,18 @@ mod sandbox_integration {
         };
     }
 
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let path = base.join(format!(
-                ".cplt-guard-test-{name}-{}-{id}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).expect("create temp dir");
-            Self { path }
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
+    /// Create a temp dir inside the cplt repo (not /tmp): the sandbox denies
+    /// process-exec under /private/tmp and /private/var/folders, so the fake
+    /// wrapper/agent scripts here must live in an exec-allowed location.
+    ///
+    /// Backed by `tempfile::TempDir`, so it auto-deletes on drop — including on
+    /// panic (Drop runs during unwind). The `.cplt-e2e-` prefix keeps the single
+    /// defensive `.gitignore` pattern effective if a run is SIGKILLed.
+    fn temp_project(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!(".cplt-e2e-guard-{name}-"))
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create temp dir")
     }
 
     /// Test the full pipeline: fake agent script calls gh wrapper → cplt gh-gate → blocked.
@@ -995,7 +983,7 @@ mod sandbox_integration {
     fn wrapper_blocks_gh_pr_merge_in_sandbox() {
         require_sandbox!();
 
-        let tmp = TempDir::new("gh-wrapper");
+        let tmp = temp_project("gh-wrapper");
         let cplt = binary_path();
         let cplt_str = cplt.to_string_lossy();
 
@@ -1003,7 +991,7 @@ mod sandbox_integration {
         let run_git = |args: &[&str]| {
             Command::new("git")
                 .args(args)
-                .current_dir(&tmp.path)
+                .current_dir(tmp.path())
                 .env("GIT_AUTHOR_NAME", "Test")
                 .env("GIT_AUTHOR_EMAIL", "test@test.com")
                 .env("GIT_COMMITTER_NAME", "Test")
@@ -1024,7 +1012,7 @@ mod sandbox_integration {
         let wrapper_content = format!(
             "#!/bin/sh\nexec {cplt_str} gh-gate --real-gh /usr/bin/true --mode=block --scope-check --block-auth-token --unknown-command=block -- \"$@\"\n"
         );
-        let bin_dir = tmp.path.join("bin");
+        let bin_dir = tmp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let wrapper_path = bin_dir.join("gh");
         fs::write(&wrapper_path, &wrapper_content).unwrap();
@@ -1068,11 +1056,11 @@ else
     echo "RESULT:cross_repo:BLOCKED"
 fi
 "#,
-            project = tmp.path.display(),
+            project = tmp.path().display(),
             bin_dir = bin_dir.display(),
         );
 
-        let agent_path = tmp.path.join("agent.sh");
+        let agent_path = tmp.path().join("agent.sh");
         fs::write(&agent_path, &agent_script).unwrap();
         #[cfg(unix)]
         {
@@ -1082,7 +1070,7 @@ fi
 
         let output = Command::new("/bin/sh")
             .arg(&agent_path)
-            .current_dir(&tmp.path)
+            .current_dir(tmp.path())
             .output()
             .expect("agent script should run");
 
@@ -1112,7 +1100,7 @@ fi
     fn wrapper_blocks_git_push_in_sandbox() {
         require_sandbox!();
 
-        let tmp = TempDir::new("git-wrapper");
+        let tmp = temp_project("git-wrapper");
         let cplt = binary_path();
         let cplt_str = cplt.to_string_lossy();
 
@@ -1120,7 +1108,7 @@ fi
         let wrapper_content = format!(
             "#!/bin/sh\nexec {cplt_str} git-gate --real-git /usr/bin/true --mode=block --prevent-push=true --prevent-force-push=true -- \"$@\"\n"
         );
-        let bin_dir = tmp.path.join("bin");
+        let bin_dir = tmp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let wrapper_path = bin_dir.join("git");
         fs::write(&wrapper_path, &wrapper_content).unwrap();
@@ -1180,7 +1168,7 @@ fi
             bin_dir = bin_dir.display(),
         );
 
-        let agent_path = tmp.path.join("agent.sh");
+        let agent_path = tmp.path().join("agent.sh");
         fs::write(&agent_path, &agent_script).unwrap();
         #[cfg(unix)]
         {
@@ -1190,7 +1178,7 @@ fi
 
         let output = Command::new("/bin/sh")
             .arg(&agent_path)
-            .current_dir(&tmp.path)
+            .current_dir(tmp.path())
             .output()
             .expect("agent script should run");
 

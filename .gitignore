@@ -1,28 +1,13 @@
 /target/
 
-# Temp dirs created by e2e tests (cleaned on drop, but may survive panics/kills)
+# Defensive: e2e/integration tests scaffold fixtures into repo-root TempDirs
+# (process-exec is denied under /tmp, so they can't live in the system temp
+# dir). tempfile::TempDir removes them on drop — including on panic — so this
+# pattern only catches the rare case where a run is SIGKILLed before cleanup.
 .cplt-e2e-*
-.cplt-smoke-*
-.cplt-fake-copilot-*
 
-# Test artifact leftovers (e2e_projects scaffold dirs if tests crash at repo root)
-api/
-core/
-src/main/java/
-src/main/kotlin/
-nvim.log
-dist/
-internal/
-new-dir/
-output.txt
-src/utils.rs
-src/test/
-tests/test_new.py
 .DS_Store
 .idea
-.cplt-fake-trust-locked-*/
-misc/coding-team/
-GH-CLI-SECURITY-TEST-REPORT.md
 
 # Local agent worktrees/metadata — never track
 .claude/

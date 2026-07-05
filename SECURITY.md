@@ -273,6 +273,13 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 
 *Possible mitigation:* A repo-scoped MCP proxy or fine-grained PAT that limits token scope to the current repository only. See issue #4 for investigation.
 
+**The gh/git guards are a best-effort command filter, not a kernel boundary.** The "gh guard" and "git guard" rows in the threat-model table above describe command-level interception, and two properties bound what they can promise:
+
+- **Opt-in.** Both guards default to `enabled = false` (soft rollout). Out of the box cplt performs **no** gh/git command filtering — the fail-closed posture (block mode, default-deny unknown subcommands, scope check, `block_auth_token`, `allow_api_write=false`) only takes effect once an operator sets `gh_guard.enabled = true` / `git_guard.enabled = true` (or passes the equivalent flags). A user who assumes "cplt guards git" without opting in gets nothing.
+- **PATH-shim enforcement.** The guards work by writing `gh`/`git` shims into a scratch `bin/` dir and prepending it to `PATH`; the shim calls back into cplt for a policy decision before `exec`ing the real binary. The real `/usr/bin/git` and `/usr/bin/gh` are untouched, so any agent that invokes the binary by **absolute path** (`/usr/bin/git push`), **escapes the alias** (`\git`, `env git`), **resets `PATH`**, or **shells out from another runtime** (`subprocess.run(["/usr/bin/git", "push"])`) bypasses the guard entirely. Command classification (force-push detection, scope checks, `gh auth token` blocking, DELETE blocking) therefore only constrains a *cooperative* agent that goes through the shim — it is not a boundary against an adversarial one.
+
+The guards raise the bar against accidental and prompt-injected-but-cooperative misuse; they are not a substitute for the kernel-enforced filesystem/exec isolation that does hold against an adversarial agent. On the *network* side, proxy-forced mode (issues #53 / #117) is the kernel-backed complement: it forces all egress through the cplt proxy at the packet level rather than via tamperable `HTTPS_PROXY` env vars, so a bypassed `git push` / `gh api` write still has to traverse the proxy. Command-level intent (e.g. `GET` vs `DELETE` to `api.github.com`) remains invisible to a CONNECT proxy, so the guards and the proxy cover different layers.
+
 **DNS tunneling** is the one channel we cannot inspect. However:
 - Bandwidth is ~15 KB/s at best (encoding overhead in subdomain labels)
 - Requires attacker-controlled authoritative DNS server

@@ -53,9 +53,13 @@ mod project_tests {
     // ── TempProject ────────────────────────────────────────────────
 
     /// A temporary project directory with realistic file structure.
-    /// Cleaned up on drop.
+    ///
+    /// Backed by a `tempfile::TempDir` so it auto-deletes on drop — including
+    /// when a test panics (Drop runs during unwind).
     struct TempProject {
-        root: PathBuf,
+        /// Owns the directory; dropping it removes the tree. Kept alive for the
+        /// lifetime of the `TempProject`.
+        dir: tempfile::TempDir,
     }
 
     impl TempProject {
@@ -63,25 +67,28 @@ mod project_tests {
         /// Process-exec is denied in /private/tmp and /private/var/folders,
         /// so temp projects must live in a path that allows exec. The cplt
         /// repo dir (CARGO_MANIFEST_DIR) is in a normal filesystem location.
+        ///
+        /// The `.cplt-e2e-` prefix keeps the single defensive `.gitignore`
+        /// pattern effective if a run is SIGKILLed before Drop can fire.
         fn new(name: &str) -> Self {
-            let id = PROJECT_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let root = base.join(format!(".cplt-e2e-{name}-{}-{id}", std::process::id()));
-            fs::create_dir_all(&root).expect("create project dir");
-            TempProject { root }
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(".cplt-e2e-{name}-"))
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+                .expect("create project dir");
+            TempProject { dir }
         }
 
         fn path(&self) -> &Path {
-            &self.root
+            self.dir.path()
         }
 
         fn canonical_path(&self) -> PathBuf {
-            fs::canonicalize(&self.root).expect("canonicalize project dir")
+            fs::canonicalize(self.dir.path()).expect("canonicalize project dir")
         }
 
         /// Write a file relative to project root, creating parent dirs.
         fn write_file(&self, rel_path: &str, content: &str) {
-            let path = self.root.join(rel_path);
+            let path = self.dir.path().join(rel_path);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).expect("create parent dirs");
             }
@@ -93,7 +100,7 @@ mod project_tests {
             let run = |args: &[&str]| {
                 Command::new("git")
                     .args(args)
-                    .current_dir(&self.root)
+                    .current_dir(self.dir.path())
                     .env("GIT_AUTHOR_NAME", "Test")
                     .env("GIT_AUTHOR_EMAIL", "test@example.com")
                     .env("GIT_COMMITTER_NAME", "Test")
@@ -243,12 +250,6 @@ fun main() {
             p.git_init();
             p.write_file(".env", "DB_URL=jdbc:postgresql://localhost/prod\n");
             p
-        }
-    }
-
-    impl Drop for TempProject {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 

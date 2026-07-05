@@ -338,24 +338,24 @@ mod e2e_tests {
     #[test]
     fn e2e_deny_path_overrides_project() {
         require_copilot!();
-        // Create a temp subdir inside the project to deny
-        let project = project_dir();
-        let deny_dir = project.join("test-deny-e2e-target");
+        // Create a temp project with a subdir to deny. TempDir auto-cleans on
+        // drop (including panic); the project path is passed explicitly so no
+        // fixture is written into the repo checkout.
+        let project = tempfile::tempdir().unwrap();
+        let deny_dir = project.path().join("test-deny-e2e-target");
         std::fs::create_dir_all(&deny_dir).unwrap();
         let deny_dir_canonical = std::fs::canonicalize(&deny_dir).unwrap();
 
         let output = cplt_cmd()
             .args([
+                "--project-dir",
+                &project.path().to_string_lossy(),
                 "--deny-path",
                 &deny_dir.to_string_lossy(),
                 "--print-profile",
             ])
-            .current_dir(&project)
             .output()
             .expect("binary should run");
-
-        // Cleanup
-        std::fs::remove_dir(&deny_dir).ok();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let deny_str = deny_dir_canonical.to_string_lossy();
@@ -917,13 +917,18 @@ mod e2e_tests {
     // ============================================================
 
     /// Create a fake copilot script that prints its environment and exits.
-    /// Placed inside the project dir so the sandbox allows execution
-    /// (process-exec is denied in /tmp).
-    fn create_fake_copilot() -> PathBuf {
-        let id = FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = project_dir().join(format!(".cplt-fake-copilot-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("copilot");
+    /// Placed inside the project dir (repo root) so the sandbox allows execution
+    /// (process-exec is denied in /tmp and /private/var/folders).
+    ///
+    /// Returns a `tempfile::TempDir` that removes the script directory on drop —
+    /// including on panic (Drop runs during unwind). The `.cplt-e2e-` prefix
+    /// keeps the single defensive `.gitignore` pattern effective on SIGKILL.
+    fn create_fake_copilot() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-copilot-")
+            .tempdir_in(project_dir())
+            .expect("create fake copilot dir");
+        let script = dir.path().join("copilot");
         std::fs::write(&script, "#!/bin/sh\nenv | sort\n").unwrap();
         #[cfg(unix)]
         {
@@ -937,7 +942,7 @@ mod e2e_tests {
     fn run_with_fake_copilot(extra_args: &[&str], extra_env: &[(&str, &str)]) -> (String, String) {
         let fake_dir = create_fake_copilot();
         let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{current_path}", fake_dir.display());
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
         let mut cmd = Command::new(binary_path());
         cmd.args(["--yes", "--no-validate"])
@@ -951,7 +956,6 @@ mod e2e_tests {
         }
 
         let output = cmd.output().expect("binary should run");
-        std::fs::remove_dir_all(&fake_dir).ok();
 
         (
             String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1121,17 +1125,22 @@ mod e2e_tests {
     }
 
     /// Create a temp project dir inside the repo root (not /tmp, which denies exec).
-    fn create_smoke_project(name: &str) -> (PathBuf, impl Drop) {
-        let id = FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let base = std::fs::canonicalize(".").unwrap();
-        let dir = base.join(format!(".cplt-smoke-{name}-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    ///
+    /// Backed by `tempfile::TempDir`, so it auto-deletes on drop — including on
+    /// panic (Drop runs during unwind). Callers keep the returned `TempDir`
+    /// alive for the duration of the test. The `.cplt-e2e-` prefix keeps the
+    /// single defensive `.gitignore` pattern effective on SIGKILL.
+    fn create_smoke_project(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!(".cplt-e2e-smoke-{name}-"))
+            .tempdir_in(project_dir())
+            .expect("create smoke project dir");
 
         // Initialize git so Copilot doesn't complain
         let run_git = |args: &[&str]| {
             Command::new("git")
                 .args(args)
-                .current_dir(&dir)
+                .current_dir(dir.path())
                 .env("GIT_AUTHOR_NAME", "Test")
                 .env("GIT_AUTHOR_EMAIL", "test@test.com")
                 .env("GIT_COMMITTER_NAME", "Test")
@@ -1141,14 +1150,7 @@ mod e2e_tests {
         };
         run_git(&["init", "-b", "main"]);
 
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let cleanup = Cleanup(dir.clone());
-        (dir, cleanup)
+        dir
     }
 
     fn uuid() -> String {
@@ -1165,7 +1167,8 @@ mod e2e_tests {
     fn smoke_copilot_reads_project_file() {
         require_copilot!();
         require_sandbox!();
-        let (dir, _cleanup) = create_smoke_project("read");
+        let tmp = create_smoke_project("read");
+        let dir = tmp.path().to_path_buf();
         let token = uuid();
         std::fs::write(dir.join("canary.txt"), &token).unwrap();
 
@@ -1210,7 +1213,8 @@ mod e2e_tests {
     fn smoke_copilot_writes_project_file() {
         require_copilot!();
         require_sandbox!();
-        let (dir, _cleanup) = create_smoke_project("write");
+        let tmp = create_smoke_project("write");
+        let dir = tmp.path().to_path_buf();
         let token = uuid();
 
         let prompt = format!(
@@ -1243,7 +1247,8 @@ mod e2e_tests {
     fn smoke_copilot_runs_shell_command() {
         require_copilot!();
         require_sandbox!();
-        let (dir, _cleanup) = create_smoke_project("shell");
+        let tmp = create_smoke_project("shell");
+        let dir = tmp.path().to_path_buf();
         let token = uuid();
 
         // Create a script that prints the hidden token
@@ -1296,7 +1301,8 @@ mod e2e_tests {
     fn smoke_copilot_env_blocked_by_default() {
         require_copilot!();
         require_sandbox!();
-        let (dir, _cleanup) = create_smoke_project("env-deny");
+        let tmp = create_smoke_project("env-deny");
+        let dir = tmp.path().to_path_buf();
         let token = uuid();
 
         // Write a .env file with a unique canary
@@ -1342,7 +1348,8 @@ mod e2e_tests {
         require_copilot!();
         require_sandbox!();
 
-        let (dir, _cleanup) = create_smoke_project("json");
+        let tmp = create_smoke_project("json");
+        let dir = tmp.path().to_path_buf();
         let token = uuid();
 
         let prompt = format!("Respond with ONLY this exact text: {token}");
@@ -1392,7 +1399,8 @@ mod e2e_tests {
     fn smoke_copilot_with_scratch_dir() {
         require_copilot!();
         require_sandbox!();
-        let (dir, _cleanup) = create_smoke_project("scratch");
+        let tmp = create_smoke_project("scratch");
+        let dir = tmp.path().to_path_buf();
         let token = uuid();
 
         // Create a script that writes to $TMPDIR then reads it back.
@@ -1460,7 +1468,7 @@ mod e2e_tests {
         // Simulate being inside a cplt sandbox by setting __CPLT_WRAPPED
         let fake_dir = create_fake_copilot();
         let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{current_path}", fake_dir.display());
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate", "--", "--version"])
@@ -1469,8 +1477,6 @@ mod e2e_tests {
             .env("__CPLT_WRAPPED", "1")
             .output()
             .expect("binary should run");
-
-        std::fs::remove_dir_all(&fake_dir).ok();
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -1512,23 +1518,23 @@ mod e2e_tests {
 
     #[test]
     fn e2e_symlink_self_detection_fails_gracefully() {
-        // Create a directory with only a copilot symlink pointing to cplt itself
-        let id = FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = project_dir().join(format!(".cplt-symlink-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Create a directory with only a copilot symlink pointing to cplt itself.
+        // TempDir (under the repo root, exec-allowed) auto-cleans on drop/panic.
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-symlink-test-")
+            .tempdir_in(project_dir())
+            .expect("create symlink test dir");
 
         #[cfg(unix)]
-        std::os::unix::fs::symlink(binary_path(), dir.join("copilot")).unwrap();
+        std::os::unix::fs::symlink(binary_path(), dir.path().join("copilot")).unwrap();
 
         // PATH contains ONLY the symlink dir — no real copilot anywhere
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate", "--", "--version"])
             .current_dir(project_dir())
-            .env("PATH", dir.display().to_string())
+            .env("PATH", dir.path().display().to_string())
             .output()
             .expect("binary should run");
-
-        std::fs::remove_dir_all(&dir).ok();
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -2638,11 +2644,15 @@ mod e2e_tests {
     // --- Copilot flag forwarding tests ---
 
     /// Create a fake copilot script that prints its argv (one per line) and exits.
-    fn create_fake_copilot_argv() -> PathBuf {
-        let id = FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = project_dir().join(format!(".cplt-fake-copilot-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("copilot");
+    ///
+    /// Returns a `tempfile::TempDir` (under the repo root, exec-allowed) that
+    /// auto-deletes on drop, including on panic.
+    fn create_fake_copilot_argv() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-copilot-")
+            .tempdir_in(project_dir())
+            .expect("create fake copilot dir");
+        let script = dir.path().join("copilot");
         // Print each argument on its own line, prefixed with "ARG:" for easy grep
         std::fs::write(
             &script,
@@ -2661,7 +2671,7 @@ mod e2e_tests {
     fn run_fake_copilot_argv(cplt_args: &[&str]) -> (String, String) {
         let fake_dir = create_fake_copilot_argv();
         let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{current_path}", fake_dir.display());
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate"])
@@ -2670,7 +2680,6 @@ mod e2e_tests {
             .env("PATH", &new_path)
             .output()
             .expect("binary should run");
-        std::fs::remove_dir_all(&fake_dir).ok();
 
         (
             String::from_utf8_lossy(&output.stdout).to_string(),
@@ -3088,13 +3097,13 @@ mod e2e_tests {
         require_sandbox!();
         let (repo, config_file) = make_trust_repo("deny-env", "[deny]\nenv = [\"VAULT_TOKEN\"]\n");
 
-        // Create fake copilot in the project dir (sandbox allows exec there)
-        let fake_dir = project_dir().join(format!(
-            ".cplt-fake-deny-env-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&fake_dir).unwrap();
-        let script = fake_dir.join("copilot");
+        // Create fake copilot in a repo-root TempDir (sandbox allows exec there;
+        // auto-cleans on drop/panic).
+        let fake_dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-deny-env-")
+            .tempdir_in(project_dir())
+            .expect("create fake copilot dir");
+        let script = fake_dir.path().join("copilot");
         std::fs::write(&script, "#!/bin/sh\nenv | sort\n").unwrap();
         #[cfg(unix)]
         {
@@ -3102,7 +3111,7 @@ mod e2e_tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{current_path}", fake_dir.display());
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate", "--", "--version"])
@@ -3120,7 +3129,6 @@ mod e2e_tests {
         );
 
         let _ = std::fs::remove_dir_all(&repo);
-        let _ = std::fs::remove_dir_all(&fake_dir);
     }
 
     #[test]
@@ -3129,13 +3137,13 @@ mod e2e_tests {
         let (repo, config_file) =
             make_trust_repo("accept-flag", "[propose]\nallow_localhost_any = true\n");
 
-        // Create fake copilot in project dir (sandbox allows exec there)
-        let fake_dir = project_dir().join(format!(
-            ".cplt-fake-accept-flag-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&fake_dir).unwrap();
-        let script = fake_dir.join("copilot");
+        // Create fake copilot in a repo-root TempDir (sandbox allows exec there;
+        // auto-cleans on drop/panic).
+        let fake_dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-accept-flag-")
+            .tempdir_in(project_dir())
+            .expect("create fake copilot dir");
+        let script = fake_dir.path().join("copilot");
         std::fs::write(&script, "#!/bin/sh\necho ok\n").unwrap();
         #[cfg(unix)]
         {
@@ -3143,7 +3151,7 @@ mod e2e_tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{current_path}", fake_dir.display());
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
         // Run with flag — should succeed
         let output = Command::new(binary_path())
@@ -3177,7 +3185,6 @@ mod e2e_tests {
         );
 
         let _ = std::fs::remove_dir_all(&repo);
-        let _ = std::fs::remove_dir_all(&fake_dir);
     }
 
     #[test]
@@ -3220,14 +3227,14 @@ mod e2e_tests {
         let (repo, config_file) =
             make_trust_repo("trust-locked", "[propose]\nallow_localhost_any = true\n");
 
-        // Create fake copilot in the project dir (sandbox allows exec there)
-        let fake_dir = project_dir().join(format!(
-            ".cplt-fake-trust-locked-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&fake_dir).unwrap();
+        // Create fake copilot in a repo-root TempDir (sandbox allows exec there;
+        // auto-cleans on drop/panic).
+        let fake_dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-trust-locked-")
+            .tempdir_in(project_dir())
+            .expect("create fake copilot dir");
         let cplt_binary = binary_path();
-        let script = fake_dir.join("copilot");
+        let script = fake_dir.path().join("copilot");
         std::fs::write(
             &script,
             format!(
@@ -3242,7 +3249,7 @@ mod e2e_tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{current_path}", fake_dir.display());
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
         let output = Command::new(binary_path())
             .args([
@@ -3280,7 +3287,6 @@ mod e2e_tests {
         );
 
         let _ = std::fs::remove_dir_all(&repo);
-        let _ = std::fs::remove_dir_all(&fake_dir);
     }
 
     // ── cplt init e2e tests ────────────────────────────────────────

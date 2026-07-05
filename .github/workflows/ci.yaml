@@ -89,6 +89,19 @@ jobs:
       - name: Run all tests
         run: cargo test --verbose
 
+      - name: Assert working tree is clean (no leaked test artifacts)
+        run: |
+          # E2E/integration tests must scaffold fixtures into TempDir-scoped
+          # locations that auto-delete on drop. Any leftover here means a test
+          # wrote into the checkout and failed to clean up — fail the job so the
+          # invariant is enforced (issue #112).
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Working tree is dirty after tests — a test leaked artifacts into the repo:"
+            git status --porcelain
+            exit 1
+          fi
+          echo "Working tree clean — no test artifacts leaked"
+
   # Linux integration tests — Landlock kernel enforcement (requires Linux 5.13+)
   linux-integration-tests:
     runs-on: ubuntu-latest
@@ -166,6 +179,19 @@ jobs:
         env:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
         run: cargo test --verbose
+
+      - name: Assert working tree is clean (no leaked test artifacts)
+        run: |
+          # E2E/integration tests must scaffold fixtures into TempDir-scoped
+          # locations that auto-delete on drop. Any leftover here means a test
+          # wrote into the checkout and failed to clean up — fail the job so the
+          # invariant is enforced (issue #112).
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Working tree is dirty after tests — a test leaked artifacts into the repo:"
+            git status --porcelain
+            exit 1
+          fi
+          echo "Working tree clean — no test artifacts leaked"
 
   # Build test binaries on PRs — downloadable from the workflow run page.
   # Lets testers try changes without installing the Rust toolchain.
