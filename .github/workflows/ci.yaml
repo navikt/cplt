@@ -326,3 +326,28 @@ jobs:
           name: cplt-${{ matrix.target }}
           path: cplt-${{ matrix.target }}.tar.gz
           retention-days: 7
+
+  # Single aggregate gate for branch-protection / merge-queue. Set THIS check
+  # (context name: ci-ok) as the SOLE required status check in the ruleset,
+  # instead of listing each job. Then adding/renaming/removing a CI job never
+  # needs a ruleset (admin) edit, and a renamed required check can't silently
+  # stop being enforced. Runs on pull_request and merge_group (inherited from
+  # this workflow's `on:`), so it gates both PRs and queue entries.
+  ci-ok:
+    name: ci-ok
+    if: ${{ always() }}
+    needs: [unit-tests, integration-tests, linux-integration-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all gating jobs to have succeeded
+        run: |
+          results='${{ join(needs.*.result, ',') }}'
+          echo "gating job results: $results"
+          for r in $(echo "$results" | tr ',' ' '); do
+            if [ "$r" != "success" ]; then
+              echo "::error::ci-ok: a required job did not succeed (result: $r)"
+              exit 1
+            fi
+          done
+          echo "ci-ok: all required jobs succeeded"
