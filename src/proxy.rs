@@ -116,7 +116,7 @@ pub type ResolverFn = Arc<dyn Fn(&str, u16) -> Option<std::net::SocketAddr> + Se
 /// this proxy and issuing a nested `CONNECT host:port` for the real target — but
 /// only *after* every one of cplt's hostname-based policy checks has passed. The
 /// upstream proxy must never receive a request that cplt's policy would block.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpstreamProxy {
     /// Host of the upstream proxy (no scheme, no port).
     pub host: String,
@@ -127,6 +127,26 @@ pub struct UpstreamProxy {
     /// carried no credentials. Held here so the secret is parsed once at
     /// startup rather than reconstructed per connection.
     pub proxy_authorization: Option<String>,
+}
+
+/// Manual `Debug` that never prints the credential.
+///
+/// SECURITY: `proxy_authorization` holds base64(`user:pass`). A derived `Debug`
+/// would splice that secret into any `{:?}` log line or panic message, so it is
+/// rendered only as a presence marker (`Some("<redacted>")` / `None`). Host and
+/// port carry no secret and are printed to keep the value useful for
+/// diagnostics.
+impl std::fmt::Debug for UpstreamProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamProxy")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field(
+                "proxy_authorization",
+                &self.proxy_authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl UpstreamProxy {
@@ -173,9 +193,32 @@ impl UpstreamProxy {
             None => (None, authority),
         };
 
-        let (host, port_str) = hostport.rsplit_once(':').ok_or_else(|| {
-            format!("upstream proxy URL must include a port, e.g. http://host:8080: '{url}'")
-        })?;
+        // Split host from port. IPv6 literals contain multiple ':' and so must
+        // be bracketed (`[::1]:3128`) to be unambiguous — the brackets are
+        // stripped from the stored host but restored when forming a socket
+        // address (see `socket_addr`). An UNbracketed value with more than one
+        // ':' is an ambiguous IPv6 literal (e.g. `::1:3128`): rather than
+        // mis-splitting on the last ':' and silently connecting somewhere
+        // unintended, reject it as a config error (fail-closed).
+        let (host, port_str) = if let Some(rest) = hostport.strip_prefix('[') {
+            let (h, after) = rest
+                .split_once(']')
+                .ok_or_else(|| format!("upstream proxy URL has an unclosed '[' in '{url}'"))?;
+            let port_str = after.strip_prefix(':').ok_or_else(|| {
+                format!(
+                    "bracketed IPv6 upstream proxy must include a port, e.g. http://[::1]:3128: '{url}'"
+                )
+            })?;
+            (h, port_str)
+        } else if hostport.matches(':').count() > 1 {
+            return Err(format!(
+                "ambiguous IPv6 upstream proxy address '{hostport}' must be bracketed, e.g. http://[::1]:3128: '{url}'"
+            ));
+        } else {
+            hostport.rsplit_once(':').ok_or_else(|| {
+                format!("upstream proxy URL must include a port, e.g. http://host:8080: '{url}'")
+            })?
+        };
         if host.is_empty() {
             return Err(format!("upstream proxy URL is missing a host: '{url}'"));
         }
@@ -210,6 +253,18 @@ impl UpstreamProxy {
         }
         req.push_str("\r\n");
         req
+    }
+
+    /// The `host:port` string used to open the TCP connection to the upstream
+    /// proxy. An IPv6 literal host (stored without brackets) is wrapped back in
+    /// brackets so the result is a valid socket address (`[::1]:3128`); names
+    /// and IPv4 addresses are used verbatim.
+    fn socket_addr(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
     }
 }
 
@@ -850,7 +905,7 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // host rather than the user's machine. Skipping the branch here keeps every
     // localhost carve-out local, and the direct path's stricter resolved-IP
     // loopback check (below) still applies.
-    if !localhost_connect_allowed && let Some(upstream) = state.upstream.clone() {
+    if !localhost_connect_allowed && let Some(upstream) = state.upstream.as_ref() {
         // SSRF / DNS-rebinding guard for the forwarded path. We apply the SAME
         // resolved-IP check the direct path applies below, so upstream and
         // direct mode treat a *resolvable* host identically: a public name
@@ -880,7 +935,7 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
             let _ = client.shutdown(std::net::Shutdown::Both);
             return;
         }
-        connect_via_upstream(client, &host, port, target, &upstream, state);
+        connect_via_upstream(client, &host, port, target, upstream, state);
         return;
     }
 
@@ -1003,7 +1058,7 @@ fn connect_via_upstream(
     let log_level = state.log_level;
 
     // Connect to the upstream proxy itself (not the target).
-    let upstream_addr = format!("{}:{}", upstream.host, upstream.port);
+    let upstream_addr = upstream.socket_addr();
     let Some(socket_addr) = upstream_addr
         .to_socket_addrs()
         .ok()
@@ -1155,8 +1210,12 @@ fn consume_until_header_end(remote: &mut TcpStream) -> std::io::Result<()> {
     // line boundary — start the newline counter at 1. If the very next line is
     // empty (the common `200\r\n\r\n` case with no extra headers), the next \n
     // takes us to 2 and ends the block. Any header byte resets the counter.
+    // `usize`, not `u8`: a hostile/broken upstream that streams a long run of
+    // newline-ish bytes must never overflow this counter (panic in debug, wrap
+    // in release). The `total` cap below independently bounds the loop so the
+    // read can never be unbounded regardless of the byte pattern.
     let mut byte = [0u8; 1];
-    let mut consecutive_newlines = 1u8;
+    let mut consecutive_newlines = 1usize;
     let mut total = 0usize;
     loop {
         if remote.read(&mut byte)? == 0 {
@@ -2606,6 +2665,68 @@ mod tests {
     }
 
     #[test]
+    fn upstream_debug_redacts_credential() {
+        let up = UpstreamProxy::parse("http://alice:s3cr3tpw@corp.example.com:8080").unwrap();
+        let cred = up
+            .proxy_authorization
+            .clone()
+            .expect("credential should be present");
+        let shown = format!("{up:?}");
+        // Neither the base64 credential nor the raw password may ever appear.
+        assert!(
+            !shown.contains(&cred),
+            "Debug leaked the base64 credential: {shown}"
+        );
+        assert!(
+            !shown.contains("s3cr3tpw"),
+            "Debug leaked the raw password: {shown}"
+        );
+        // The host is safe and useful, and the secret is shown as a marker only.
+        assert!(
+            shown.contains("corp.example.com"),
+            "Debug missing host: {shown}"
+        );
+        assert!(
+            shown.contains("<redacted>"),
+            "Debug should mark the secret: {shown}"
+        );
+        // With no credentials, the field is rendered as None.
+        let noauth = UpstreamProxy::parse("http://corp.example.com:8080").unwrap();
+        assert!(format!("{noauth:?}").contains("proxy_authorization: None"));
+    }
+
+    #[test]
+    fn upstream_parse_bracketed_ipv6_strips_brackets_and_keeps_port() {
+        let up = UpstreamProxy::parse("http://[::1]:3128").unwrap();
+        assert_eq!(up.host, "::1");
+        assert_eq!(up.port, 3128);
+        // The upstream connect target must be a valid socket address, i.e. the
+        // brackets are restored for the IPv6 literal.
+        let addr = up.socket_addr();
+        assert_eq!(addr, "[::1]:3128");
+        assert!(
+            addr.parse::<std::net::SocketAddr>().is_ok(),
+            "connect target must be a valid socket addr: {addr}"
+        );
+    }
+
+    #[test]
+    fn upstream_parse_ipv4_host_and_port_unchanged() {
+        let up = UpstreamProxy::parse("http://host:8080").unwrap();
+        assert_eq!(up.host, "host");
+        assert_eq!(up.port, 8080);
+        assert_eq!(up.socket_addr(), "host:8080");
+    }
+
+    #[test]
+    fn upstream_parse_rejects_unbracketed_ipv6() {
+        // `::1:3128` is ambiguous (host vs. port) — must fail closed rather than
+        // mis-split on the last ':'.
+        assert!(UpstreamProxy::parse("http://::1:3128").is_err());
+        assert!(UpstreamProxy::parse("::1:3128").is_err());
+    }
+
+    #[test]
     fn upstream_connect_request_has_correct_line_and_host() {
         let up = UpstreamProxy::parse("http://proxy.example.com:8080").unwrap();
         let req = up.connect_request("example.com", 443);
@@ -2626,6 +2747,50 @@ mod tests {
             "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\
              Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn consume_until_header_end_handles_many_blank_lines_without_panic() {
+        use std::io::Write as _;
+        require_localhost_tcp!();
+        // A hostile/broken upstream sends thousands of blank lines. This must
+        // not overflow the newline counter or panic; the header block ends at
+        // the first blank line and the call returns cleanly.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all("\r\n".repeat(10_000).as_bytes());
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let res = consume_until_header_end(&mut client);
+        assert!(res.is_ok(), "expected clean handling, got {res:?}");
+        writer.join().ok();
+    }
+
+    #[test]
+    fn consume_until_header_end_rejects_oversized_header_block() {
+        use std::io::Write as _;
+        require_localhost_tcp!();
+        // An upstream that streams a header block with no terminating blank
+        // line larger than the cap must be rejected (not read unbounded / hang).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(&vec![b'A'; 70_000]);
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let err = consume_until_header_end(&mut client)
+            .expect_err("oversized header block should be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        writer.join().ok();
     }
 
     #[test]
