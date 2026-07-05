@@ -171,6 +171,13 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         proxy_enabled,
         src(c.proxy.enabled.is_some())
     );
+    let proxy_forced = c.proxy.forced.unwrap_or(false);
+    println!(
+        "{blue}[cplt]{nc}    forced           = {}{}{nc}{}",
+        if proxy_forced { yellow } else { green },
+        proxy_forced,
+        src(c.proxy.forced.is_some())
+    );
     println!(
         "{blue}[cplt]{nc}    port             = {}{}",
         c.proxy.port.unwrap_or(0),

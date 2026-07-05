@@ -41,6 +41,7 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 | --------------------------- | ------------------------------------------------------------------------------------------------ |
 | `--with-proxy`              | Explicitly enable the proxy (no-op when proxy is already on by default).                         |
 | `--no-proxy`                | Disable the proxy for this run.                                                                  |
+| `--proxy-forced` / `--no-proxy-forced` | Force **all** egress through the proxy (opt-in, default off): make the proxy mandatory and restrict kernel egress to the proxy port. Fails closed; conflicts with `--no-proxy`. See [Proxy-forced mode](#proxy-forced-mode). |
 | `--proxy-port <PORT>`       | Which port the proxy listens on (default: 0, OS-assigned ephemeral).                             |
 | `--blocked-domains <FILE>`  | Domains to block, one per line. Re-read every ~5s (edit live, changes take effect within seconds). |
 | `--allowed-domains <FILE>`  | Domains to allow — only listed domains can connect. Validated at startup (fail-closed); re-read every 5s.  |
@@ -55,6 +56,44 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 > **Localhost traffic** (MCP servers, dev servers) bypasses the proxy via `NO_PROXY` and will not appear in the audit log.
 >
 > **Quiet mode** (`-q` / `sandbox.quiet = true`) suppresses the startup banner. Proxy stderr output is controlled separately by `--proxy-log-level` (default: `none` — silent). Use `--proxy-log` to capture all connections to a file.
+
+## Proxy-forced mode
+
+By default the proxy is **advisory at the kernel level**: outbound TCP to `*:443` is allowed by the sandbox, and traffic is routed through the proxy only because cplt sets `HTTP_PROXY`/`HTTPS_PROXY`/`NODE_USE_ENV_PROXY=1`. A tool that opens a raw socket, or an agent that runs `env -u HTTPS_PROXY -u HTTP_PROXY …`, can reach the internet on `:443` **without** passing through the proxy — bypassing all domain filtering.
+
+**Proxy-forced mode (`#53`) closes that bypass.** It is **opt-in and off by default** (making it the default is tracked in [#71](https://github.com/navikt/cplt/issues/71)). Enable it per run or in config:
+
+```bash
+cplt --proxy-forced -- -p "fix the tests"
+```
+
+```bash
+cplt config set proxy.forced true
+```
+
+```toml
+[proxy]
+forced = true
+```
+
+**What it changes:**
+
+- **The proxy becomes mandatory.** It is forced on regardless of other proxy defaults.
+- **Kernel egress is restricted to the proxy port.** Instead of allowing outbound `*:443`, the sandbox allows outbound only to the proxy's listening port (plus any configured localhost ports). Direct `:443` connections that skip the proxy are blocked at the kernel level, so raw sockets and `env`-unset attempts can no longer reach the network over a direct `:443` connection. Traffic that does reach the network goes through the proxy, which then applies domain allow/block filtering as usual. (How *complete* this is depends on the platform — see the asymmetry note below; on Linux a narrow residual on the proxy port remains.)
+
+**Platform asymmetry (important — enforcement is not equal):**
+
+- **macOS (Seatbelt):** the profile pins egress to `localhost:<proxy_port>`. There is no direct-network path at all — full enforcement, no residual.
+- **Linux (Landlock):** Landlock is **port-based and cannot pin to localhost**. Proxy-forced drops the `:443` rule and allows only the proxy port, which blocks direct `:443` to any host — but a narrow `evil.com:<proxy_port>` channel remains reachable if a remote host happens to answer on that exact port. Closing this residual requires a network namespace and is tracked in [#114](https://github.com/navikt/cplt/issues/114). Until then, treat Linux proxy-forced as "no direct `:443` bypass" rather than "no egress except the proxy."
+
+**Fail-closed behavior:**
+
+- If the mandatory proxy cannot bind/start, cplt **refuses to launch the agent** — it never falls back to open networking.
+- `--proxy-forced` **conflicts with `--no-proxy`** (and with `proxy.enabled = false`). cplt errors out with a clear message rather than silently picking a side.
+
+**Interaction with allowed-domains:** proxy-forced only changes *kernel* egress (which port the sandbox permits). It does **not** replace domain filtering — the proxy still enforces `allowed_domains` / `blocked_domains` on the traffic it carries. Use proxy-forced together with an allowlist to get "only these domains, and no way around the proxy." A default per-agent allowlist that would pair naturally with this mode is tracked in [#52](https://github.com/navikt/cplt/issues/52).
+
+**Raw-TCP tradeoff (by design):** tools that are not proxy-aware (they ignore `HTTP_PROXY`, or need a non-CONNECT/non-HTTPS protocol) lose direct network access under proxy-forced. That is the point of the mode — the only sanctioned path off the machine is the CONNECT proxy. If you genuinely need such a tool you can add its port with `--allow-port`, but be aware that an extra allowed port opens a **direct** kernel egress channel on that port that does **not** pass through the proxy (and is therefore not domain-filtered) — it reopens exactly the kind of bypass proxy-forced exists to close. Prefer leaving proxy-forced off for those workloads rather than punching a hole through it.
 
 ## Domain filtering
 

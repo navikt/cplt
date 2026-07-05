@@ -237,6 +237,11 @@ pub struct AuditConfig {
 pub struct ProxyConfig {
     /// Enable the CONNECT proxy (default: true when not set in config).
     pub enabled: Option<bool>,
+    /// Force all egress through the proxy (default: false).
+    /// When true, the CONNECT proxy is mandatory and kernel-level egress is
+    /// restricted to the proxy port only (no direct `*:443`). Fails closed:
+    /// if the proxy cannot start, the agent is not launched. See #53.
+    pub forced: Option<bool>,
     /// Proxy listen port (default: 0, OS-assigned ephemeral port).
     pub port: Option<u16>,
     /// Path to blocked domains file.
@@ -417,6 +422,9 @@ pub struct ResolvedPushRule {
 #[derive(Debug)]
 pub struct Resolved {
     pub with_proxy: bool,
+    /// Force all egress through the proxy (proxy mandatory, kernel egress
+    /// restricted to the proxy port, fail-closed). See #53.
+    pub proxy_forced: bool,
     pub proxy_port: u16,
     pub blocked_domains: Option<PathBuf>,
     pub allowed_domains: Option<PathBuf>,
@@ -463,6 +471,7 @@ pub struct Resolved {
 #[derive(Debug, Default)]
 pub struct CliFlags {
     pub proxy: FeatureToggle,
+    pub proxy_forced: FeatureToggle,
     pub proxy_port: Option<u16>,
     pub blocked_domains: Option<PathBuf>,
     pub allowed_domains: Option<PathBuf>,

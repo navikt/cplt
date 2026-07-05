@@ -420,6 +420,7 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 | --------------------------- | ------------------------------------------------------------------------------------------------ |
 | `--with-proxy`              | Explicitly enable the proxy (no-op when proxy is already on by default).                         |
 | `--no-proxy`                | Disable the proxy for this run.                                                                  |
+| `--proxy-forced` / `--no-proxy-forced` | Force **all** egress through the proxy (opt-in, off by default): restrict kernel egress to the proxy port so raw sockets / `env -u HTTPS_PROXY` can't bypass it. Fails closed; conflicts with `--no-proxy`. macOS pins to `localhost:<proxy_port>` (full); Linux blocks direct `:443` but has a port-based residual until [#114](https://github.com/navikt/cplt/issues/114). See [docs/proxy.md](docs/proxy.md#proxy-forced-mode). |
 | `--proxy-port <PORT>`       | Which port the proxy listens on (default: 0, OS-assigned ephemeral).                             |
 | `--blocked-domains <FILE>`  | Domains to block, one per line. Re-read every ~5s (edit live, changes take effect within seconds). |
 | `--allowed-domains <FILE>`  | Domains to allow — only listed domains can connect. Validated at startup (fail-closed); re-read every 5s.  |
@@ -895,8 +896,10 @@ The proxy is **on by default** — logs and filters all outbound connections. Fe
 - **Domain blocking** — block exfiltration infrastructure (paste sites, webhooks)
 - **Domain allowlisting** — restrict to known-safe domains only
 - **Audit log** — persistent file log for post-session review
+- **Proxy-forced mode** (opt-in) — restrict kernel egress to the proxy port so the proxy can't be bypassed. Full enforcement on macOS; Linux blocks direct `:443` with a port-based residual until [#114](https://github.com/navikt/cplt/issues/114)
 
 ```bash
+cplt --proxy-forced -- -p "fix tests"                # force all egress through the proxy
 cplt --no-proxy -- -p "fix tests"                    # disable for one run
 cplt --blocked-domains blocked-domains.txt -- -p "x"  # block known-bad domains
 cplt --allowed-domains allowed-domains.txt -- -p "x"  # allowlist mode

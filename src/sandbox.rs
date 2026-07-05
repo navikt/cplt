@@ -101,6 +101,10 @@ pub struct SandboxConfig<'a> {
     pub extra_ports: &'a [u16],
     pub localhost_ports: &'a [u16],
     pub proxy_port: Option<u16>,
+    /// Force all egress through the proxy: restrict kernel-level egress to the
+    /// proxy port only, dropping the default `*:443` allowance (#53). Consumed
+    /// by the Landlock net-rule builder.
+    pub proxy_forced: bool,
     pub allow_env_files: bool,
     pub allow_localhost_any: bool,
     pub scratch_dir: Option<&'a Path>,
@@ -263,6 +267,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         extra_ports: config.extra_ports,
         localhost_ports: config.localhost_ports,
         proxy_port: config.proxy_port,
+        proxy_forced: config.proxy_forced,
         allow_env_files: config.allow_env_files,
         allow_localhost_any: config.allow_localhost_any,
         scratch_dir: config.scratch_dir,

@@ -41,12 +41,14 @@ See [SECURITY.md](../SECURITY.md) for the full threat model and honest gaps.
 - **`sandbox-exec` is deprecated** — Apple has not removed it but may in future macOS versions
 - **SBPL has no domain-based filtering** — the optional CONNECT proxy provides domain blocking
 - **Keychain access required** — Copilot stores auth tokens in macOS Keychain
+- **Proxy-forced mode gets full enforcement** — with `--proxy-forced` / `proxy.forced = true` ([#53](https://github.com/navikt/cplt/issues/53), opt-in, off by default), SBPL pins outbound egress to `localhost:<proxy_port>`. Because Seatbelt can pin to localhost, there is **no residual** on macOS: no direct `:443` path exists, so raw sockets and `env -u HTTPS_PROXY` cannot bypass the proxy. Fails closed if the proxy cannot start; conflicts with `--no-proxy`
 
 ### Linux
 
 - **Kernel 5.13+ required** — Landlock LSM must be enabled (`cat /sys/kernel/security/lsm`)
 - **TCP port filtering requires kernel 6.7+** — older kernels get filesystem-only enforcement; network security via proxy only
 - **Landlock network rules are port-based only** — cannot distinguish localhost from remote. When `--allow-localhost-any` is set, kernel TCP connect filtering is disabled entirely (the proxy still enforces domain filtering and port restrictions for remote connections)
+- **Proxy-forced mode is only partial on Linux** — with `--proxy-forced` / `proxy.forced = true` ([#53](https://github.com/navikt/cplt/issues/53), opt-in, off by default), Landlock drops the `:443` rule and allows only the proxy port, which blocks direct `:443` to any host and forces HTTPS through the CONNECT proxy. But because Landlock is **port-based and cannot pin to localhost**, a narrow `evil.com:<proxy_port>` channel remains reachable if a remote host answers on that exact port — so this is "no direct `:443` bypass," not "no egress except the proxy." Closing the residual needs a network namespace, tracked in [#114](https://github.com/navikt/cplt/issues/114). (macOS has no such residual — SBPL pins to `localhost:<proxy_port>`.) Fails closed if the proxy cannot start; conflicts with `--no-proxy`
 - **Gradle/JVM on Linux** — Gradle daemon uses ephemeral localhost ports. Use `--allow-localhost-any` or `cplt config set sandbox.allow_localhost_any true` to allow Gradle client↔daemon communication. If JVM startup itself fails, also add `--allow-tmp-exec` (native lib loading from temp)
 - **Landlock cannot deny subpaths within allowed paths** — unlike macOS Seatbelt, Landlock cannot deny `.env` reads or `.git/hooks` writes *inside* the project directory at the kernel level. Defense-in-depth comes from the proxy (blocks exfiltration) and env hardening (`GIT_CONFIG_NOSYSTEM`, etc.)
 - **`--deny-path` has no effect** — Landlock is allowlist-only; a runtime warning is emitted

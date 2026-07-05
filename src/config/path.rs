@@ -46,6 +46,10 @@ pub fn default_config_contents() -> String {
 # Disable with --no-proxy or set enabled = false below.
 [proxy]
 # enabled = true
+# Force all egress through the proxy: makes the proxy mandatory and restricts
+# kernel-level egress to the proxy port only (no direct *:443). Fails closed —
+# if the proxy cannot start, the agent is not launched. (default: false)
+# forced = false
 # port = 0  # 0 = OS-assigned ephemeral port (avoids conflicts, default)
 # blocked_domains = "~/.config/cplt/blocked-domains.txt"
 # allowed_domains = "~/.config/cplt/allowed-domains.txt"

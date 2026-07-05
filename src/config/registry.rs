@@ -51,6 +51,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "proxy",
+        key: "forced",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Force all egress through the proxy: make the proxy mandatory and restrict kernel-level egress to the proxy port only (no direct *:443). Fails closed if the proxy cannot start.",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
         key: "port",
         value_type: ConfigValueType::U16,
         dangerous: false,

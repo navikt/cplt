@@ -76,6 +76,13 @@ impl Config {
         // Proxy: FeatureToggle resolves --with-proxy/--no-proxy against config default (true).
         let with_proxy = cli.proxy.resolve(self.proxy.enabled.unwrap_or(true));
 
+        // Proxy-forced: FeatureToggle resolves --proxy-forced/--no-proxy-forced
+        // against config default (false). When true, the proxy is mandatory and
+        // kernel egress is locked to the proxy port (#53). Orchestration in main.rs
+        // enforces proxy-on + fail-closed; the conflict with an explicitly disabled
+        // proxy is reported there.
+        let proxy_forced = cli.proxy_forced.resolve(self.proxy.forced.unwrap_or(false));
+
         // Port: CLI (if provided) > config > 0 (OS-assigned ephemeral port)
         let proxy_port = cli.proxy_port.or(self.proxy.port).unwrap_or(0);
 
@@ -387,6 +394,7 @@ impl Config {
 
         Ok(Resolved {
             with_proxy,
+            proxy_forced,
             proxy_port,
             blocked_domains,
             allowed_domains,
@@ -978,6 +986,56 @@ validate = false
         let config: Config = toml::from_str("[proxy]\nenabled = true\n").unwrap();
         let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(resolved.with_proxy);
+    }
+
+    #[test]
+    fn cli_proxy_forced_flag_overrides_config_disabled() {
+        let config: Config = toml::from_str("[proxy]\nforced = false\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                proxy_forced: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.proxy_forced);
+    }
+
+    #[test]
+    fn no_proxy_forced_flag_overrides_config_enabled() {
+        let config: Config = toml::from_str("[proxy]\nforced = true\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                proxy_forced: FeatureToggle::ForceOff,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!resolved.proxy_forced);
+    }
+
+    #[test]
+    fn config_proxy_forced_used_when_no_cli_flag() {
+        let config: Config = toml::from_str("[proxy]\nforced = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.proxy_forced);
+    }
+
+    #[test]
+    fn proxy_forced_defaults_false_when_neither_flag_nor_config() {
+        let config = Config::default();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(!resolved.proxy_forced);
+    }
+
+    #[test]
+    fn no_proxy_forced_wins_over_proxy_forced_flag() {
+        let config = Config::default();
+        let resolved = config
+            .merge(CliFlags {
+                proxy_forced: FeatureToggle::from_pair(true, true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!resolved.proxy_forced);
     }
 
     #[test]

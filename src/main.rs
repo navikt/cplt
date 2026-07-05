@@ -123,6 +123,17 @@ struct Cli {
     #[arg(long)]
     no_proxy: bool,
 
+    /// Force all egress through the proxy (#53). Makes the proxy mandatory and
+    /// restricts kernel-level egress to the proxy port only (no direct *:443),
+    /// closing the raw-socket / `env -u HTTPS_PROXY` bypass. Fails closed: if the
+    /// proxy cannot start, the agent is not launched. Conflicts with --no-proxy.
+    #[arg(long)]
+    proxy_forced: bool,
+
+    /// Disable proxy-forced mode, even if enabled in config file.
+    #[arg(long)]
+    no_proxy_forced: bool,
+
     /// Port for the local proxy to listen on [default: ephemeral port].
     /// Only relevant when --with-proxy is enabled.
     #[arg(long, value_name = "PORT")]
@@ -969,6 +980,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
     };
     let mut resolved = match cfg.merge(config::CliFlags {
         proxy: config::FeatureToggle::from_pair(cli.with_proxy, cli.no_proxy),
+        proxy_forced: config::FeatureToggle::from_pair(cli.proxy_forced, cli.no_proxy_forced),
         proxy_port: cli.proxy_port,
         blocked_domains: cli.blocked_domains.clone(),
         allowed_domains: cli.allowed_domains.clone(),
@@ -1265,6 +1277,22 @@ fn start_proxy_if_enabled(
     cli: &Cli,
     config_path: Option<&PathBuf>,
 ) -> anyhow::Result<Option<proxy::ProxyHandle>> {
+    // Proxy-forced (#53): the proxy is mandatory. `with_proxy` defaults to true,
+    // so the only way it is false here is an explicit disable (--no-proxy or
+    // proxy.enabled = false) — that conflicts with --proxy-forced. Reject it
+    // rather than silently picking a side, then force the proxy on so the
+    // fail-closed start path below applies.
+    if resolved.proxy_forced {
+        if !resolved.with_proxy {
+            bail!(
+                "conflicting options: --proxy-forced requires the proxy, but it was \
+                 explicitly disabled (--no-proxy or proxy.enabled = false). \
+                 Remove one of them."
+            );
+        }
+        resolved.with_proxy = true;
+    }
+
     if !resolved.with_proxy || cli.print_profile {
         return Ok(None);
     }
@@ -1354,7 +1382,18 @@ fn start_proxy_if_enabled(
             // injected by sandbox_exec::exec() when proxy_port is Some.
             Ok(Some(handle))
         }
-        Err(e) => bail!("Failed to start proxy: {e}"),
+        Err(e) => {
+            // Fail closed under proxy-forced (#53): never fall back to open
+            // networking. Refuse to launch the agent if the mandatory proxy
+            // cannot bind/start.
+            if resolved.proxy_forced {
+                bail!(
+                    "proxy-forced mode: the mandatory proxy failed to start ({e}); \
+                     refusing to launch the agent (fail-closed, no open networking)"
+                );
+            }
+            bail!("Failed to start proxy: {e}")
+        }
     }
 }
 
@@ -1606,6 +1645,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         extra_ports: &resolved.allow_ports,
         localhost_ports: &resolved.allow_localhost,
         proxy_port: proxy_port_for_profile,
+        proxy_forced: resolved.proxy_forced,
         allow_env_files: resolved.allow_env_files,
         allow_localhost_any: resolved.allow_localhost_any,
         scratch_dir: scratch_path,
@@ -2118,6 +2158,7 @@ fn run_exec_command(
         extra_ports: &resolved.allow_ports,
         localhost_ports: &resolved.allow_localhost,
         proxy_port: proxy_port_for_profile,
+        proxy_forced: resolved.proxy_forced,
         allow_env_files: resolved.allow_env_files,
         allow_localhost_any: resolved.allow_localhost_any,
         scratch_dir: scratch_path,

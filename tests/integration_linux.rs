@@ -1590,4 +1590,72 @@ else:
             "outbound TCP to port {port} must stay Landlock-blocked under bwrap — code: {code}, stdout: {stdout}"
         );
     }
+
+    // ── Proxy-forced networking (#53) ─────────────────────────────
+    //
+    // `--proxy-forced` makes the CONNECT proxy mandatory and restricts kernel
+    // egress to the proxy port ONLY: on Linux the default `443` allow rule is
+    // dropped so the sole allowed egress port is the proxy's own ephemeral port
+    // (plus any configured localhost ports). A direct TCP connect to any other
+    // port is therefore Landlock-blocked (EPERM), forcing all HTTPS through the
+    // domain-filtering proxy and closing the `env -u HTTPS_PROXY` / raw-socket
+    // bypass.
+    //
+    // COVERAGE LIMITATION (positive control): a truly robust "connect TO the
+    // proxy port succeeds" probe is infeasible from a binary-level test, because
+    // the proxy binds an ephemeral port chosen at launch and the test cannot
+    // learn that port number from outside the sandbox. Rather than fake it (e.g.
+    // asserting against a guessed/fixed port), we rely on the negative probe
+    // below plus Agent B's unit tests on `generate_policy`, which assert the
+    // exact net-rule set (proxy port present, 443 absent) with a known port.
+
+    /// Negative probe: under `--proxy-forced`, a direct TCP connect to an
+    /// arbitrary non-proxy port Q must be kernel-blocked. A live listener on Q
+    /// distinguishes "blocked by Landlock" (EPERM) from "nothing listening"
+    /// (ECONNREFUSED) — same mechanism as `landlock_blocks_outbound_tcp`. Q is a
+    /// fresh ephemeral port, so it can never collide with the proxy's own port;
+    /// with the 443 seed dropped, Q is denied.
+    #[test]
+    fn proxy_forced_blocks_direct_tcp_to_nonproxy_port() {
+        require_landlock!(4);
+        let project = create_test_project();
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let script =
+            format!("bash -c 'echo > /dev/tcp/127.0.0.1/{port}' 2>&1 || echo CONNECT_FAILED");
+        let (code, stdout, stderr) =
+            run_sandboxed_with_flags(project.path(), &["--proxy-forced"], &script);
+        drop(listener);
+
+        assert!(
+            code != 0 || stdout.contains("CONNECT_FAILED"),
+            "under --proxy-forced, direct TCP to non-proxy port {port} must be Landlock-blocked — code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    /// Sanity: `--proxy-forced` must not be accidentally over-restrictive. In-
+    /// sandbox filesystem work (write then read a project-local file) must still
+    /// succeed — the mode only tightens network egress, not the filesystem rules.
+    #[test]
+    fn proxy_forced_still_allows_project_and_basic_ops() {
+        require_landlock!();
+        let project = create_test_project();
+
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--proxy-forced"],
+            "echo proxy-forced-ok > pf_probe.txt && cat pf_probe.txt",
+        );
+        assert_eq!(
+            code, 0,
+            "--proxy-forced must not break project filesystem ops — stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("proxy-forced-ok"),
+            "expected to read back the project-local file under --proxy-forced — stdout: {stdout}"
+        );
+    }
 }

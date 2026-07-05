@@ -70,6 +70,7 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
             "too dangerous for repo config — would affect all team members"
         }
         ("proxy", "enabled") => "proxy settings are machine-specific, not project policy",
+        ("proxy", "forced") => "proxy settings are machine-specific, not project policy",
         ("proxy", "port") => "proxy port is machine-specific, not project policy",
         ("proxy", "log_file") => "log paths are machine-specific, not project policy",
         ("proxy", "log_level") => "log level is a personal preference, not project policy",

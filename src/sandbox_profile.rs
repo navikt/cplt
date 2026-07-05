@@ -44,6 +44,10 @@ pub struct ProfileOptions<'a> {
     pub extra_ports: &'a [u16],
     pub localhost_ports: &'a [u16],
     pub proxy_port: Option<u16>,
+    /// Force all egress through the proxy: restrict the SBPL `network-outbound`
+    /// rule to `localhost:{proxy_port}` only, dropping the default `*:443`
+    /// allowance (#53). Consumed by the SBPL builder.
+    pub proxy_forced: bool,
     /// Allow reading .env files and private keys in the project dir.
     pub allow_env_files: bool,
     /// Allow outbound TCP to localhost on all ports.
@@ -178,6 +182,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         opts.allow_localhost_any,
         opts.proxy_port,
         opts.localhost_ports,
+        opts.proxy_forced,
     );
     // Sensitive project file denies MUST come after all user-configured allows.
     // SBPL uses last-match-wins, so a user allow like `allow.read = ["~/Repos"]`
@@ -1240,6 +1245,7 @@ fn emit_network_rules(
     allow_localhost_any: bool,
     proxy_port: Option<u16>,
     localhost_ports: &[u16],
+    proxy_forced: bool,
 ) {
     // Network — outbound restricted to HTTPS/HTTP, localhost blocked by default.
     // Copilot CLI connects directly to api.githubcopilot.com:443 etc.
@@ -1258,7 +1264,20 @@ fn emit_network_rules(
     // All Copilot/GitHub APIs use HTTPS — port 80 is not needed and would
     // allow unencrypted exfiltration. Use --allow-port 80 if required.
     sbpl!(sb, "(deny network-outbound (remote tcp))");
-    sbpl!(sb, "(allow network-outbound (remote ip \"*:443\"))");
+    // Proxy-forced mode (#53): do NOT allow direct egress to `*:443`. Instead
+    // the only outbound allowance is `localhost:{proxy_port}`, emitted below with
+    // the other localhost carve-outs. Unlike Landlock (port-based), SBPL CAN pin
+    // to localhost, so this gives macOS FULL enforcement with no residual: a
+    // direct connect to any remote host on :443 is denied and all HTTPS must go
+    // through the CONNECT proxy, defeating the `env -u HTTPS_PROXY` bypass.
+    //
+    // Fail closed: if `proxy_forced` is set but `proxy_port` is None (a
+    // contradiction the orchestration already prevents), we emit NO outbound-443
+    // rule and NO localhost proxy carve-out — the deny-by-default profile then
+    // blocks all remote TCP, which is the safe failure rather than an open one.
+    if !proxy_forced {
+        sbpl!(sb, "(allow network-outbound (remote ip \"*:443\"))");
+    }
 
     // Extra ports (e.g., MCP servers, custom services)
     for port in extra_ports {
@@ -1327,4 +1346,107 @@ fn emit_network_rules(
         sb,
         "(allow network-outbound (remote unix-socket (subpath \"{home}/.gradle\")))"
     );
+}
+
+// ── Tests (cross-platform: SBPL text generation only) ──────────
+//
+// These assert the generated profile *string* contains the right rules. They
+// do NOT prove the macOS kernel enforces them — that is verified at runtime by
+// the `integration` suite, which can only run on macOS/CI.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `ProfileOptions` for SBPL-string tests.
+    fn test_options<'a>(
+        project_dir: &'a std::path::Path,
+        home_dir: &'a std::path::Path,
+    ) -> ProfileOptions<'a> {
+        ProfileOptions {
+            project_dir,
+            home_dir,
+            extra_read: &[],
+            extra_write: &[],
+            allow_socket: &[],
+            extra_deny: &[],
+            existing_home_tool_dirs: None,
+            existing_app_dirs: None,
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            proxy_forced: false,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            allow_tmp_exec: false,
+            copilot_install_dir: None,
+            java_home: None,
+            git_hooks_path: None,
+            git_common_dir: None,
+            allow_gpg_signing: false,
+            deny_clipboard: false,
+            allow_jvm_attach: false,
+            allow_docker: false,
+            electron_app_dir: None,
+            agent: crate::agent::Agent::Copilot,
+            agent_dirs: &[],
+            allow_cache_exec: &[],
+            allow_cache_exec_any: false,
+            allow_browser: false,
+        }
+    }
+
+    #[test]
+    fn default_path_allows_wildcard_443() {
+        // Regression guard: with proxy_forced=false the broad `*:443` allowance
+        // must remain exactly as before #53.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let opts = test_options(project, home);
+        assert!(!opts.proxy_forced);
+        let p = generate_profile(&opts);
+
+        assert!(p.contains("(allow network-outbound (remote ip \"*:443\"))"));
+    }
+
+    #[test]
+    fn proxy_forced_replaces_443_with_localhost_proxy() {
+        // #53: with proxy_forced=true the broad `*:443` rule is dropped and the
+        // only outbound allowance is `localhost:{proxy_port}` — SBPL can pin to
+        // localhost, so macOS gets full enforcement with no residual.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        opts.proxy_forced = true;
+        opts.proxy_port = Some(8080);
+        let p = generate_profile(&opts);
+
+        assert!(
+            p.contains("(allow network-outbound (remote ip \"localhost:8080\"))"),
+            "proxy_forced must pin outbound to the localhost proxy port"
+        );
+        assert!(
+            !p.contains("\"*:443\""),
+            "proxy_forced must drop the broad *:443 allowance"
+        );
+    }
+
+    #[test]
+    fn proxy_forced_without_port_fails_closed_no_443() {
+        // Defensive fail-closed: proxy_forced with no proxy port is a
+        // contradiction the orchestration prevents, but the profile must still
+        // omit `*:443` (deny remote TCP) rather than re-emit the broad allow.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        opts.proxy_forced = true;
+        opts.proxy_port = None;
+        let p = generate_profile(&opts);
+
+        assert!(
+            !p.contains("\"*:443\""),
+            "fail-closed: proxy_forced without a port must not emit *:443"
+        );
+    }
 }

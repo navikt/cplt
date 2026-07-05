@@ -379,6 +379,7 @@ mod macos_tests {
             extra_ports: &[],
             localhost_ports: &[],
             proxy_port: None,
+            proxy_forced: false,
             allow_env_files: false,
             allow_localhost_any: false,
             scratch_dir: None,
@@ -1535,5 +1536,89 @@ except Exception as e:
         );
 
         let _ = fs::remove_file(&profile);
+    }
+
+    // ── Proxy-forced networking (#53) ─────────────────────────────
+    //
+    // `--proxy-forced` makes the CONNECT proxy mandatory and, on macOS, pins the
+    // SBPL `network-outbound` rule to `localhost:{proxy_port}` while dropping the
+    // default `*:443` allowance. Unlike Landlock (port-based), SBPL can pin to
+    // localhost, so macOS gets full enforcement with no residual.
+
+    /// Positive + negative in one profile: the generated SBPL profile with
+    /// `proxy_forced = true` and a concrete `proxy_port` must (a) pin outbound to
+    /// `localhost:{proxy_port}` and (b) NOT allow direct `*:443` egress.
+    ///
+    /// This inspects the REAL profile via `generate_profile` (the same path the
+    /// other `real_profile_*` tests use) rather than `--print-profile`, on
+    /// purpose: `--print-profile` never starts the proxy, so `proxy_port` is
+    /// `None` there and the `localhost:{port}` pin can never appear — asserting
+    /// the pin against `--print-profile` output would be a false premise. Setting
+    /// a concrete `proxy_port` here is the honest way to observe the pin. No
+    /// `require_sandbox!` guard: this is pure profile-string generation and does
+    /// not invoke `sandbox-exec`.
+    #[test]
+    fn real_profile_proxy_forced_pins_localhost_and_drops_443() {
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let mut opts = default_opts(&project, &home);
+        opts.proxy_forced = true;
+        opts.proxy_port = Some(45123);
+        let profile = generate_profile(&opts);
+
+        assert!(
+            profile.contains("(allow network-outbound (remote ip \"localhost:45123\"))"),
+            "proxy-forced profile must pin outbound to localhost:45123, got:\n{profile}"
+        );
+        assert!(
+            !profile.contains("\"*:443\""),
+            "proxy-forced profile must NOT allow direct *:443 egress, got:\n{profile}"
+        );
+    }
+
+    /// Contrast control that keeps the negative assertion above meaningful: the
+    /// DEFAULT profile (proxy_forced = false) DOES allow `*:443`. Without this,
+    /// "profile lacks *:443" could pass vacuously if the rule were renamed or
+    /// removed for unrelated reasons.
+    #[test]
+    fn real_profile_default_allows_wildcard_443() {
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let opts = default_opts(&project, &home);
+        let profile = generate_profile(&opts);
+
+        assert!(
+            profile.contains("\"*:443\""),
+            "default (non-proxy-forced) profile must allow *:443, got:\n{profile}"
+        );
+    }
+
+    /// Binary-level smoke: `cplt --proxy-forced --print-profile` must not emit a
+    /// direct `*:443` allowance. NOTE (coverage limit): `--print-profile` does
+    /// NOT start the proxy, so `proxy_port` is `None` and the
+    /// `localhost:{port}` pin cannot appear in this output — that positive is
+    /// covered by `real_profile_proxy_forced_pins_localhost_and_drops_443`, which
+    /// sets a concrete port. Asserting the pin here would be a false premise, so
+    /// this test only checks the `*:443` drop.
+    #[test]
+    fn binary_print_profile_proxy_forced_drops_443() {
+        // No require_sandbox!(): `--print-profile` only generates and prints the
+        // SBPL text; it never invokes sandbox-exec, so it runs even when nested.
+        let project = fs::canonicalize(".").unwrap();
+        let output = Command::new(binary_path())
+            .args([
+                "--proxy-forced",
+                "--print-profile",
+                "--project-dir",
+                &project.to_string_lossy(),
+            ])
+            .env("HOME", home_dir())
+            .output()
+            .expect("Failed to run cplt --print-profile");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("\"*:443\""),
+            "`--proxy-forced --print-profile` must not allow direct *:443 egress, got:\n{stdout}"
+        );
     }
 }

@@ -100,6 +100,7 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | .git/config write in project | ✅ Kernel deny | ⚠️ Env hardening + proxy | ⚠️ Env hardening + proxy |
 | Network: outbound port filtering | ✅ Kernel (all versions) | ✅ Kernel (6.7+) / ⚠️ Proxy only (<6.7) | ✅ Same as Landlock (no net namespace) |
 | Network: localhost isolation | ✅ Kernel deny | ⚠️ Proxy domain filtering | ⚠️ Proxy domain filtering (no net namespace) |
+| Network: force all egress through proxy (`proxy.forced`, opt-in) | ✅ Kernel pins to `localhost:<proxy_port>` (full) | ⚠️ Kernel blocks direct `:443`; port-based residual `evil.com:<proxy_port>` until [#114](https://github.com/navikt/cplt/issues/114) | ⚠️ Same as Landlock (no net namespace) |
 | Exec from /tmp | ✅ Kernel deny | ✅ Landlock deny | ✅ Landlock deny |
 | Dangerous syscalls | N/A (Seatbelt covers) | ✅ seccomp-BPF | ✅ seccomp-BPF |
 | PID namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
@@ -479,6 +480,23 @@ The proxy handles CONNECT tunnels only (non-CONNECT returns 405). Each TCP conne
 - **Invalid UTF-8:** Replaced with U+FFFD via `from_utf8_lossy`, which won't match any domain — fail-safe
 - **Relay timeout:** 60-second read timeout on both directions prevents idle connection resource exhaustion
 
+#### Proxy-forced mode (#53)
+
+By default the proxy is **advisory at the kernel level**: the sandbox allows outbound TCP to `*:443`, and traffic reaches the proxy only because cplt injects `HTTP_PROXY`/`HTTPS_PROXY`/`NODE_USE_ENV_PROXY=1`. A raw socket, or an agent that runs `env -u HTTPS_PROXY -u HTTP_PROXY …`, can still reach any host on `:443` **without** traversing the proxy — bypassing all domain filtering.
+
+Proxy-forced mode restricts **kernel-level egress to the proxy port only**, so the proxy becomes the sole sanctioned path off the machine. It is **opt-in and off by default** (flipping it to the default is tracked in [#71](https://github.com/navikt/cplt/issues/71)). When enabled:
+
+- **The proxy is mandatory.** It is forced on. If it was explicitly disabled (`--no-proxy` / `proxy.enabled = false`) the launch is a conflict and cplt **errors out** rather than silently choosing a side.
+- **Fail-closed:** if the mandatory proxy cannot bind/start, cplt **refuses to launch the agent** — it never falls back to open networking.
+- **Domain filtering is unchanged.** Proxy-forced only changes which port the kernel permits; the proxy still enforces `allowed_domains` / `blocked_domains` on everything it carries. Pairing proxy-forced with an allowlist gives "only these domains, with no way around the proxy" (a default per-agent allowlist is tracked in [#52](https://github.com/navikt/cplt/issues/52)).
+
+**Platform asymmetry — enforcement is not equal:**
+
+- **macOS (Seatbelt):** the SBPL profile replaces the `*:443` allow with `localhost:<proxy_port>` only. Seatbelt *can* pin to localhost, so there is **no residual** — no direct-network path exists and the `env -u HTTPS_PROXY` / raw-socket bypass is fully closed.
+- **Linux (Landlock):** Landlock drops the `:443` rule and allows only the proxy port. This blocks direct `:443` to any host and forces HTTPS through the proxy — but Landlock is **port-based and cannot pin to localhost**, so a narrow `evil.com:<proxy_port>` channel remains reachable if a remote host answers on that exact port. This is "no direct `:443` bypass," **not** "no egress except the proxy." Closing the residual requires a network namespace and is tracked in [#114](https://github.com/navikt/cplt/issues/114).
+
+> **Escape-hatch caveat:** `--allow-port <PORT>` still opens a **direct** kernel egress channel on that port that does not pass through the proxy (on both platforms). Using it under proxy-forced reopens exactly the kind of unfiltered bypass this mode exists to close.
+
 ### Layer 1L: Landlock + seccomp Kernel Sandbox (Linux)
 
 On Linux, kernel-level enforcement uses two complementary mechanisms:
@@ -755,6 +773,7 @@ The only viable options are `(allow network-outbound (remote tcp))` (allow all) 
 - **Outbound TCP is allowed** in the sandbox profile, restricted to port 443 (+ `--allow-port`)
 - **Filesystem isolation is the primary security control** — credentials are kernel-blocked regardless of network policy
 - **The proxy** (when enabled) provides connection logging, domain blocking, port enforcement, and DNS rebinding protection for all traffic including Copilot
+- **By default the proxy is not mandatory** — because `*:443` is kernel-allowed, a raw socket or `env -u HTTPS_PROXY` can reach the network without traversing the proxy. Opt into **proxy-forced mode** (`--proxy-forced` / `proxy.forced = true`, #53) to restrict kernel egress to the proxy port and close that bypass. Enforcement is asymmetric: macOS pins to `localhost:<proxy_port>` (full, no residual); Linux blocks direct `:443` but is port-based, so a narrow `evil.com:<proxy_port>` residual remains until [#114](https://github.com/navikt/cplt/issues/114). See [Layer 2 → Proxy-forced mode](#proxy-forced-mode-53)
 
 ### Self-Update Security (`cplt update`)
 

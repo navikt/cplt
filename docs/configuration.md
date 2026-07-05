@@ -78,6 +78,7 @@ with an explanation — set them in `~/.config/cplt/config.toml` instead:
 | `sandbox.allow_cache_exec` | cache paths differ per machine |
 | `sandbox.allow_cache_exec_any` | too broad for repo policy |
 | `proxy.enabled` | local proxy preference |
+| `proxy.forced` | forcing all egress through the proxy is a local security preference, not project policy |
 | `proxy.port` | port conflicts are machine-specific |
 | `proxy.log_file` | local log path |
 | `proxy.log_level` | local verbosity preference |
@@ -127,6 +128,10 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 ```toml
 [proxy]
 # enabled = true             # Default: true — disable with --no-proxy or set false
+# forced = false             # Default: false (opt-in). Force ALL egress through the proxy:
+#                            # restrict kernel egress to the proxy port (no direct *:443),
+#                            # closing the raw-socket / env-unset bypass. Fails closed if the
+#                            # proxy can't start; conflicts with proxy.enabled = false. See docs/proxy.md
 # port = 0                   # Default: 0 (OS-assigned ephemeral port)
 # blocked_domains = "~/.config/cplt/blocked-domains.txt"
 # allowed_domains = "~/.config/cplt/allowed-domains.txt"

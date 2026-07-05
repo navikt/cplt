@@ -646,9 +646,30 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 
     // ── Network rules (requires ABI v4+, kernel 6.7+) ──
-    // Always allow HTTPS (443) — Copilot needs it to reach GitHub APIs.
+    // Default: allow HTTPS (443) — Copilot needs it to reach GitHub APIs.
     // This mirrors the macOS SBPL profile which allows outbound 443.
-    let mut net_rules = vec![NetRule { port: 443 }];
+    //
+    // Proxy-forced mode (#53): drop the 443 seed so the ONLY allowed egress
+    // port is the proxy port (plus any configured localhost ports). Landlock
+    // network rules are port-based and CANNOT pin to localhost, so restricting
+    // the allowed port set to the proxy port is how we force all HTTPS traffic
+    // through the CONNECT proxy — a direct connect to any host on :443 is then
+    // kernel-denied, defeating the `env -u HTTPS_PROXY` / raw-socket bypass.
+    //
+    // Fail closed: if `proxy_forced` is set but no proxy port is present
+    // (a contradiction the orchestration in main.rs already prevents), we still
+    // emit a policy with NO 443 rule rather than silently re-seeding 443 — an
+    // over-restrictive (deny) policy is the safe failure, not an open one.
+    //
+    // Residual (Linux only): because Landlock is port-based, allowing the proxy
+    // port also allows `evil.com:<proxy_port>` if something listens there. That
+    // narrow channel is closed by #114 (netns + localhost pinning). On macOS the
+    // SBPL profile pins to `localhost:<proxy_port>`, so there is no residual.
+    let mut net_rules = if config.proxy_forced {
+        Vec::new()
+    } else {
+        vec![NetRule { port: 443 }]
+    };
     if let Some(port) = config.proxy_port
         && !net_rules.iter().any(|r| r.port == port)
     {
@@ -1478,6 +1499,7 @@ mod tests {
             extra_ports: &[],
             localhost_ports: &[],
             proxy_port: None,
+            proxy_forced: false,
             allow_env_files: false,
             allow_localhost_any: false,
             scratch_dir: None,
@@ -1859,6 +1881,56 @@ mod tests {
         let policy = generate_policy(&config);
 
         assert!(policy.net_rules.iter().any(|r| r.port == 8080));
+    }
+
+    #[test]
+    fn default_path_seeds_443() {
+        // Regression guard: with proxy_forced=false the default path must still
+        // seed the 443 allowance exactly as before #53.
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let config = test_config(&project, &home);
+        assert!(!config.proxy_forced);
+        let policy = generate_policy(&config);
+
+        assert!(policy.net_rules.iter().any(|r| r.port == 443));
+    }
+
+    #[test]
+    fn proxy_forced_drops_443_and_allows_only_proxy_port() {
+        // #53: with proxy_forced=true the ONLY allowed egress port must be the
+        // proxy port — 443 must NOT be seeded, so direct HTTPS is kernel-denied
+        // and all traffic is forced through the proxy.
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.proxy_forced = true;
+        config.proxy_port = Some(8080);
+        let policy = generate_policy(&config);
+
+        assert!(policy.net_rules.iter().any(|r| r.port == 8080));
+        assert!(
+            !policy.net_rules.iter().any(|r| r.port == 443),
+            "proxy_forced must not seed the 443 rule"
+        );
+    }
+
+    #[test]
+    fn proxy_forced_without_port_fails_closed_no_443() {
+        // Defensive fail-closed: proxy_forced with no proxy port is a
+        // contradiction the orchestration prevents, but we must still produce a
+        // deny (no 443) policy rather than silently re-adding 443.
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.proxy_forced = true;
+        config.proxy_port = None;
+        let policy = generate_policy(&config);
+
+        assert!(
+            !policy.net_rules.iter().any(|r| r.port == 443),
+            "fail-closed: proxy_forced without a port must not re-add 443"
+        );
     }
 
     #[test]
