@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Run the required checks on the merge queue's temporary ref. The ruleset
+  # requires unit-tests / integration-tests / linux-integration-tests before
+  # merge; without this trigger those checks never report in the merge_group
+  # context, so queued entries wait until the 60-min timeout and fail to merge.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
