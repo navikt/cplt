@@ -969,7 +969,17 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 /// merged into `allow_read`/`allow_write`, which the backends already handle;
 /// this only ever *adds* access.
 fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) {
-    let env: Vec<(String, String)> = std::env::vars().collect();
+    // Read only the handful of recognized tool-path vars rather than snapshotting
+    // the entire parent environment — no need to copy unrelated secrets (tokens,
+    // credentials) into a Vec just to inspect a fixed, small set of names.
+    let env: Vec<(String, String)> = cplt::sandbox::TOOL_PATH_ENV_VARS
+        .iter()
+        .filter_map(|tv| {
+            std::env::var(tv.name)
+                .ok()
+                .map(|v| (tv.name.to_string(), v))
+        })
+        .collect();
     for ovr in cplt::sandbox::tool_path_env_overrides(&env, home) {
         // canonicalize() also serves as the existence check: a missing path errors.
         let Ok(path) = std::fs::canonicalize(&ovr.path) else {
