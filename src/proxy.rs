@@ -687,6 +687,43 @@ fn handle_connection(mut client: TcpStream, state: &ProxyState) {
     }
 }
 
+/// Resolve `host:port` to a socket address using the same local DNS path the
+/// direct-connect flow uses, honoring the test-only injected resolver.
+///
+/// Returns `None` when the name does not resolve locally. Callers distinguish
+/// two meanings of `None`: on the direct path it is a hard DNS failure (502);
+/// on the upstream-forward path it means "this host is only resolvable by the
+/// corporate proxy" (split-horizon DNS) and the tunnel is forwarded anyway.
+/// Centralizing resolution here keeps the resolved-IP SSRF guard identical for
+/// both paths.
+#[cfg_attr(not(test), allow(unused_variables))] // `state` only used by the test resolver
+fn resolve_locally(state: &ProxyState, host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    #[cfg(test)]
+    {
+        // In tests, an injected resolver can fake DNS responses (e.g. to
+        // simulate DNS rebinding where evil.example.com → 169.254.169.254).
+        if let Some(ref resolver) = state.resolver {
+            return resolver(host, port);
+        }
+    }
+    let addr_str = format!("{host}:{port}");
+    addr_str.to_socket_addrs().ok().and_then(|mut a| a.next())
+}
+
+/// Apply the resolved-IP SSRF / DNS-rebinding guard.
+///
+/// Returns `true` when the target must be BLOCKED: it resolves to a
+/// private/link-local IP that is neither loopback nor covered by an
+/// `allow_private_domains` entry. This is the exact policy the direct-connect
+/// path enforces inline; the upstream-forward path reuses it so both modes
+/// treat a resolvable host identically.
+fn resolved_ip_blocked(state: &ProxyState, host: &str, socket_addr: &std::net::SocketAddr) -> bool {
+    let private_domains = state.get_private_domains();
+    is_private_ip(&socket_addr.ip())
+        && !is_domain_match(host, &private_domains)
+        && !socket_addr.ip().is_loopback()
+}
+
 fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // Parse host:port
     let (host, port) = match target.rsplit_once(':') {
@@ -766,48 +803,53 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // block. A blocked/blocklisted/wrong-port target has already returned 403
     // above and never reaches this code.
     //
-    // We branch here, before local DNS resolution, on purpose: when forwarding,
-    // cplt never opens a socket to the target itself, so the resolved-IP guards
-    // below (which defend the *direct* connection against DNS rebinding to
-    // private IPs) do not apply. The upstream proxy performs its own name
-    // resolution — often via corporate split-horizon DNS that is unreachable
-    // from this host — so resolving locally would break legitimate targets.
-    if let Some(upstream) = state.upstream.clone() {
+    // Loopback carve-out (--allow-localhost): a target permitted only because
+    // it is loopback must connect DIRECTLY, never via the upstream. Forwarding
+    // `127.0.0.1`/`localhost` to the corporate proxy is nonsensical — it would
+    // resolve loopback on the UPSTREAM's side, reaching a service on the proxy
+    // host rather than the user's machine. Skipping the branch here keeps every
+    // localhost carve-out local, and the direct path's stricter resolved-IP
+    // loopback check (below) still applies.
+    if !localhost_connect_allowed && let Some(upstream) = state.upstream.clone() {
+        // SSRF / DNS-rebinding guard for the forwarded path. We apply the SAME
+        // resolved-IP check the direct path applies below, so upstream and
+        // direct mode treat a *resolvable* host identically: a public name
+        // whose A record points at a private/link-local IP (e.g. an
+        // attacker-registered domain aimed at 10.x or the 169.254.169.254 cloud
+        // metadata endpoint) is BLOCKED, never forwarded. Hosts explicitly
+        // trusted via `allow_private_domains` are forwarded exactly as they are
+        // permitted in direct mode — that is how legitimate corporate-internal
+        // targets that resolve to private IPs keep working.
+        //
+        // Residual, stated honestly: a name that ONLY the corporate proxy can
+        // resolve (split-horizon DNS, not resolvable from this host) yields no
+        // local IP to check, so it is forwarded without a resolved-IP check.
+        // Reaching such names is the intended purpose of upstream mode; the
+        // hostname allow/block/port gates above still constrain it.
+        if let Some(socket_addr) = resolve_locally(state, &host, port)
+            && resolved_ip_blocked(state, &host, &socket_addr)
+        {
+            log_connection(
+                "CONNECT",
+                target,
+                "BLOCKED-PRIVATE-RESOLVED",
+                log_file,
+                log_level,
+            );
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to private IP\r\n");
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            return;
+        }
         connect_via_upstream(client, &host, port, target, &upstream, state);
         return;
     }
 
-    // Resolve DNS FIRST, then check the resolved IP
-    let addr_str = format!("{host}:{port}");
-    #[cfg(test)]
-    let socket_addr = {
-        // In tests, an injected resolver can fake DNS responses (e.g. to simulate
-        // DNS rebinding where evil.localhost → 169.254.169.254).
-        if let Some(ref resolver) = state.resolver {
-            if let Some(a) = resolver(&host, port) {
-                a
-            } else {
-                log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
-                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-                return;
-            }
-        } else if let Some(a) = addr_str.to_socket_addrs().ok().and_then(|mut a| a.next()) {
-            a
-        } else {
-            log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-            return;
-        }
-    };
-    #[cfg(not(test))]
-    let socket_addr = {
-        if let Some(a) = addr_str.to_socket_addrs().ok().and_then(|mut a| a.next()) {
-            a
-        } else {
-            log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-            return;
-        }
+    // Resolve DNS FIRST, then check the resolved IP. A local resolution failure
+    // on the direct path is a hard error — there is no upstream to defer to.
+    let Some(socket_addr) = resolve_locally(state, &host, port) else {
+        log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
+        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        return;
     };
 
     // Hard requirement for the localhost carve-out: a target that was only
@@ -2743,5 +2785,324 @@ mod tests {
             .shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Flexible upstream-proxy builder for the policy-ordering tests: lets each
+    /// test vary the allowed ports, allowlist file, private-domain allowlist,
+    /// and injected resolver while forwarding through `upstream`.
+    #[allow(clippy::too_many_arguments)]
+    fn make_proxy_with_upstream_opts(
+        upstream: UpstreamProxy,
+        blocked_file: PathBuf,
+        allowed_ports: Vec<u16>,
+        allowed_domains_file: Option<PathBuf>,
+        cli_private_domains: Vec<String>,
+        resolver: Option<ResolverFn>,
+    ) -> ProxyHandle {
+        start(ProxyOptions {
+            port: 0,
+            blocked_file,
+            allowed_ports,
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
+            allowed_domains_file,
+            allowed_domains_initial: Vec::new(),
+            cli_private_domains,
+            config_private_domains: Vec::new(),
+            config_file: None,
+            log_file: None,
+            log_level: ProxyLogLevel::None,
+            timeout: Duration::from_secs(5),
+            upstream: Some(upstream),
+            resolver,
+        })
+        .expect("proxy start failed")
+    }
+
+    /// How a broken fake upstream should misbehave after accepting a connection.
+    #[derive(Clone, Copy)]
+    enum BrokenUpstream {
+        /// Reply with a non-2xx CONNECT status (upstream refuses the tunnel).
+        Refuse403,
+        /// Accept the connection then close immediately without any reply.
+        CloseEarly,
+    }
+
+    /// Spawn a fake upstream that always fails the CONNECT — used to prove cplt
+    /// surfaces a clean 502 (and does not hang) when the upstream refuses or
+    /// disappears. Returns (port, shutdown flag).
+    fn spawn_broken_upstream(mode: BrokenUpstream) -> (u16, Arc<std::sync::atomic::AtomicBool>) {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).ok();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = shutdown.clone();
+        std::thread::spawn(move || {
+            loop {
+                if s.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => match mode {
+                        BrokenUpstream::Refuse403 => {
+                            stream.set_nonblocking(false).ok();
+                            let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+                            // Drop the stream — tunnel never established.
+                        }
+                        BrokenUpstream::CloseEarly => {
+                            // Drop immediately without replying.
+                            drop(stream);
+                        }
+                    },
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+        (port, shutdown)
+    }
+
+    /// Security invariant (Finding 3a): a fail-closed allowlist rejects a target
+    /// BEFORE the upstream proxy is contacted. The allowlist gate must run ahead
+    /// of forwarding, exactly as the blocklist gate does.
+    #[test]
+    fn proxy_allowlist_blocks_before_upstream() {
+        require_localhost_tcp!();
+
+        let dir = test_dir("upstream-allowlist");
+        let allowlist = dir.join("allowed.txt");
+        std::fs::write(&allowlist, "allowed.example.com\n").unwrap();
+
+        let upstream_srv = spawn_fake_upstream();
+        let upstream =
+            UpstreamProxy::parse(&format!("http://127.0.0.1:{}", upstream_srv.port)).unwrap();
+        let proxy = make_proxy_with_upstream_opts(
+            upstream,
+            PathBuf::from("/dev/null"),
+            vec![443, 80],
+            Some(allowlist),
+            Vec::new(),
+            None,
+        );
+
+        let status = proxy_connect(proxy.port, "notallowed.example.com:443");
+        assert!(
+            status.contains("403"),
+            "domain not in allowlist must be rejected; got: {status}"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !upstream_srv
+                .contacted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "upstream must NOT be contacted for a domain outside the allowlist"
+        );
+
+        proxy.shutdown();
+        upstream_srv
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Security invariant (Finding 3b): a disallowed port is rejected BEFORE the
+    /// upstream proxy is contacted. The port gate must run ahead of forwarding.
+    #[test]
+    fn proxy_disallowed_port_blocks_before_upstream() {
+        require_localhost_tcp!();
+
+        let upstream_srv = spawn_fake_upstream();
+        let upstream =
+            UpstreamProxy::parse(&format!("http://127.0.0.1:{}", upstream_srv.port)).unwrap();
+        // Only 443/80 allowed; 22 is not.
+        let proxy = make_proxy_with_upstream_opts(
+            upstream,
+            PathBuf::from("/dev/null"),
+            vec![443, 80],
+            None,
+            Vec::new(),
+            None,
+        );
+
+        let status = proxy_connect(proxy.port, "example.com:22");
+        assert!(
+            status.contains("403"),
+            "disallowed port must be rejected; got: {status}"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !upstream_srv
+                .contacted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "upstream must NOT be contacted for a disallowed port"
+        );
+
+        proxy.shutdown();
+        upstream_srv
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Robustness (Finding 3c): when the upstream refuses with a non-2xx status,
+    /// cplt returns a clean 502 to the client instead of hanging or splicing.
+    #[test]
+    fn proxy_upstream_non_2xx_returns_502() {
+        require_localhost_tcp!();
+
+        let (up_port, up_shutdown) = spawn_broken_upstream(BrokenUpstream::Refuse403);
+        let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{up_port}")).unwrap();
+        let proxy = make_proxy_with_upstream_opts(
+            upstream,
+            PathBuf::from("/dev/null"),
+            vec![443, 80],
+            None,
+            Vec::new(),
+            None,
+        );
+
+        let status = proxy_connect(proxy.port, "example.com:443");
+        assert!(
+            status.contains("502"),
+            "upstream 403 refusal must surface as 502 to the client; got: {status}"
+        );
+
+        proxy.shutdown();
+        up_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Robustness (Finding 3c): when the upstream accepts then closes before
+    /// replying, cplt returns a clean 502 instead of hanging.
+    #[test]
+    fn proxy_upstream_early_close_returns_502() {
+        require_localhost_tcp!();
+
+        let (up_port, up_shutdown) = spawn_broken_upstream(BrokenUpstream::CloseEarly);
+        let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{up_port}")).unwrap();
+        let proxy = make_proxy_with_upstream_opts(
+            upstream,
+            PathBuf::from("/dev/null"),
+            vec![443, 80],
+            None,
+            Vec::new(),
+            None,
+        );
+
+        let status = proxy_connect(proxy.port, "example.com:443");
+        assert!(
+            status.contains("502"),
+            "upstream closing early must surface as 502 to the client; got: {status}"
+        );
+
+        proxy.shutdown();
+        up_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Security invariant (Finding 3d / SSRF fix): a host that resolves locally
+    /// to a private/link-local IP and is NOT in allow_private_domains is blocked
+    /// BEFORE the upstream is contacted — the same resolved-IP guard the direct
+    /// path applies. Simulates an attacker-registered public name whose A record
+    /// points at the cloud metadata endpoint.
+    #[test]
+    fn proxy_private_resolved_ip_blocks_before_upstream() {
+        require_localhost_tcp!();
+
+        let imds_addr: std::net::IpAddr = "169.254.169.254".parse().unwrap();
+        let resolver: ResolverFn = Arc::new(move |host: &str, port: u16| {
+            if host == "evil.example.com" {
+                Some(std::net::SocketAddr::new(imds_addr, port))
+            } else {
+                None
+            }
+        });
+
+        let upstream_srv = spawn_fake_upstream();
+        let upstream =
+            UpstreamProxy::parse(&format!("http://127.0.0.1:{}", upstream_srv.port)).unwrap();
+        let proxy = make_proxy_with_upstream_opts(
+            upstream,
+            PathBuf::from("/dev/null"),
+            vec![443, 80],
+            None,
+            Vec::new(),
+            Some(resolver),
+        );
+
+        let status = proxy_connect(proxy.port, "evil.example.com:443");
+        assert!(
+            status.contains("403"),
+            "public name resolving to a private IP must be blocked; got: {status}"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !upstream_srv
+                .contacted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "upstream must NOT be contacted for a host that resolves to a private IP"
+        );
+
+        proxy.shutdown();
+        upstream_srv
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Positive counterpart to the SSRF fix: the legitimate corporate-internal
+    /// case still works. A host that resolves to a private IP but IS listed in
+    /// allow_private_domains is forwarded to the upstream, exactly as it would be
+    /// permitted in direct mode.
+    #[test]
+    fn proxy_private_resolved_ip_forwarded_when_in_allow_private_domains() {
+        require_localhost_tcp!();
+
+        let internal_addr: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        let resolver: ResolverFn = Arc::new(move |host: &str, port: u16| {
+            if host == "intranet.corp.example" {
+                Some(std::net::SocketAddr::new(internal_addr, port))
+            } else {
+                None
+            }
+        });
+
+        let upstream_srv = spawn_fake_upstream();
+        let upstream =
+            UpstreamProxy::parse(&format!("http://127.0.0.1:{}", upstream_srv.port)).unwrap();
+        let proxy = make_proxy_with_upstream_opts(
+            upstream,
+            PathBuf::from("/dev/null"),
+            vec![443, 80],
+            None,
+            vec!["intranet.corp.example".to_string()],
+            Some(resolver),
+        );
+
+        let status = proxy_connect(proxy.port, "intranet.corp.example:443");
+        assert!(
+            status.contains("200"),
+            "allow_private_domains host must be forwarded to upstream; got: {status}"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            upstream_srv
+                .contacted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "upstream MUST be contacted for an allow_private_domains internal host"
+        );
+        let line = upstream_srv.last_connect_line.lock().unwrap().clone();
+        assert_eq!(
+            line.as_deref(),
+            Some("CONNECT intranet.corp.example:443 HTTP/1.1")
+        );
+
+        proxy.shutdown();
+        upstream_srv
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
