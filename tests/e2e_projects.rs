@@ -2414,9 +2414,11 @@ else
     echo "RESULT:tcp_ipv6_bind:SKIP:no python3"
 fi
 
-# Test 5: TCP on 0.0.0.0 — known SBPL limitation: "localhost" matches INADDR_ANY.
-# SBPL only accepts `*` or `localhost` as host, and `localhost` includes 0.0.0.0.
-# We document this gap rather than asserting it's denied.
+# Test 5: TCP bind on 0.0.0.0 (wildcard / all interfaces).
+# #126 Tier 2: cplt INTENTIONALLY emits `(allow network-bind (local ip "*:*"))`
+# (see sandbox_profile.rs — it must cover IPv4 127.0.0.1 bind() which SBPL's
+# "localhost" host does not match), so a wildcard bind is EXPECTED TO SUCCEED.
+# Assert that specific documented outcome instead of accepting allowed-or-denied.
 if command -v python3 >/dev/null 2>&1; then
     BIND_ALL_RESULT=$(python3 -c "
 import socket
@@ -2431,12 +2433,11 @@ except Exception as e:
     print(f'DENIED:{{e}}')
 " 2>&1)
     case "$BIND_ALL_RESULT" in
-        DENIED*)
-            echo "RESULT:tcp_wildcard_bind:OK:denied"
-            ;;
         ALLOWED*)
-            # Known SBPL limitation — not a test failure
-            echo "RESULT:tcp_wildcard_bind:OK:allowed_sbpl_limitation"
+            echo "RESULT:tcp_wildcard_bind:OK:allowed"
+            ;;
+        DENIED*)
+            echo "RESULT:tcp_wildcard_bind:FAIL:unexpectedly_denied:$BIND_ALL_RESULT"
             ;;
         *)
             echo "RESULT:tcp_wildcard_bind:FAIL:$BIND_ALL_RESULT"

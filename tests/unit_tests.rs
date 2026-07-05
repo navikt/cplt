@@ -379,26 +379,15 @@ fn allow_private_domains_rejects_empty_string() {
     assert!(result.is_err(), "empty domain should be rejected");
 }
 
-#[test]
-fn allow_private_domains_bypasses_private_ip_check() {
-    use cplt::proxy::{is_domain_match, is_private_ip};
-    // Simulate the bypass condition in handle_connect:
-    // block if private IP AND not in allow_private_domains
-    let private_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-    let allow_private = vec!["intern.nav.no".to_string()];
-
-    // Domain in list → should NOT be blocked
-    assert!(
-        !is_private_ip(&private_ip) || is_domain_match("mcp.intern.nav.no", &allow_private),
-        "domain in allow_private_domains should bypass private IP block"
-    );
-
-    // Domain not in list → should be blocked
-    assert!(
-        is_private_ip(&private_ip) && !is_domain_match("evil.com", &allow_private),
-        "domain not in allow_private_domains should still be blocked"
-    );
-}
+// #126 Tier 2: `allow_private_domains_bypasses_private_ip_check` used to live
+// here, but it only re-implemented the guard's boolean expression with local
+// constants and never drove `handle_connect`, so deleting the real private-IP
+// SSRF guard left it green (vacuous). `handle_connect` and the test-only DNS
+// resolver are private to the `cplt` crate and cannot be reached from this
+// external integration-test crate, so the real end-to-end replacement lives in
+// `src/proxy.rs`: `proxy_blocks_private_ip_resolution_when_not_allowlisted` and
+// `proxy_allowlist_bypasses_private_ip_block`. The `is_domain_match` suffix
+// semantics this test also touched are still covered below.
 
 #[test]
 fn allow_private_domains_suffix_match() {
@@ -2351,11 +2340,12 @@ fn allow_localhost_any_affects_both_backends() {
         allow_cache_exec_any: false,
         allow_browser: false,
     });
-    // macOS SBPL should allow all localhost ports
+    // macOS SBPL should allow all localhost ports.
+    // #126 Tier 2: dropped the always-true `|| p.contains("network-outbound")`
+    // disjunct (every profile contains that substring) so this now actually
+    // asserts the unrestricted localhost outbound rule is present.
     assert!(
-        p.contains(r#"(allow network-outbound (local ip "localhost:*"))"#)
-            || p.contains(r#"(allow network-outbound (remote ip "localhost:*"))"#)
-            || p.contains("network-outbound"),
+        p.contains(r#"(allow network-outbound (remote ip "localhost:*"))"#),
         "macOS profile should have unrestricted localhost outbound when allow_localhost_any=true"
     );
 
@@ -5241,11 +5231,21 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
         p.contains("Socket access skipped: --deny-path overlaps with /Users/test/.codex/codex-lsp/daemon/daemon.sock"),
         "Profile must skip the socket rules when a parent directory is denied"
     );
+    // #126 Tier 2: socket allows are emitted with `(literal ...)`, never
+    // `(subpath ...)`, so the old `!contains(subpath …)` assertion targeted a
+    // rule form that is never generated and could never catch a regression.
+    // Target the actual `(literal ...)` form the socket rules use.
     assert!(
         !p.contains(
-            r#"(allow file-read* (subpath "/Users/test/.codex/codex-lsp/daemon/daemon.sock"))"#
+            r#"(allow file-read* (literal "/Users/test/.codex/codex-lsp/daemon/daemon.sock"))"#
         ),
-        "Profile must not contain allows when parent is denied"
+        "Profile must not contain socket allows when parent dir is denied"
+    );
+    assert!(
+        !p.contains(
+            r#"(allow network-outbound (remote unix-socket (literal "/Users/test/.codex/codex-lsp/daemon/daemon.sock")))"#
+        ),
+        "Profile must not contain socket network allows when parent dir is denied"
     );
 }
 
@@ -6578,6 +6578,7 @@ fn registry_keys_match_validate_all_valid_keys_fixture() {
     let toml = r#"
 [proxy]
 enabled = false
+forced = false
 port = 18080
 blocked_domains = "file.txt"
 allowed_domains = "file.txt"
@@ -6589,15 +6590,15 @@ allow_private_domains = []
 [allow]
 read = []
 write = []
+socket = []
 ports = []
 localhost = []
-net = []
 
 [deny]
 paths = []
-net = []
 
 [sandbox]
+agent = "copilot"
 validate = true
 allow_env_files = false
 allow_localhost_any = false
@@ -6607,26 +6608,36 @@ allow_lifecycle_scripts = false
 allow_gpg_signing = false
 allow_tmp_exec = false
 scratch_dir = false
+use_bubblewrap = false
 quiet = false
+yes = false
+allow_jvm_attach = false
+allow_docker = false
 allow_cache_exec = []
 allow_cache_exec_any = false
-allow_jvm_attach = false
 allow_browser = false
+git_push_prevention = false
 
 [gh_guard]
 enabled = false
-log_level = "blocked"
-format = "text"
+mode = "warn"
+scope_check = true
+block_auth_token = true
+inject_token = false
+unknown_command = "warn"
+allow_api_write = false
 
 [git_guard]
 enabled = false
-log_level = "blocked"
-format = "text"
+mode = "warn"
+prevent_push = true
+prevent_force_push = true
+protect_default_branch_only = false
 
 [audit]
 enabled = false
-log_file = "audit.log"
-log_level = "blocked"
+destination = "stderr"
+level = "blocked"
 format = "text"
 "#;
 
@@ -6638,9 +6649,12 @@ format = "text"
         if excluded.contains(&dotted.as_str()) {
             continue;
         }
+        // #126 Tier 2: dropped the always-true `|| toml.contains("[{section}]")`
+        // disjunct — with it, adding a new key to an EXISTING section passed
+        // silently because the section header was already present. Each key must
+        // now actually appear as `key =` in the fixture.
         assert!(
-            toml.contains(&format!("{} =", key_info.key))
-                || toml.contains(&format!("[{}]", key_info.section)),
+            toml.contains(&format!("{} =", key_info.key)),
             "registry key '{dotted}' is not covered by the fixture TOML in \
              `registry_keys_match_validate_all_valid_keys_fixture` — add it"
         );

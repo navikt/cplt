@@ -1432,6 +1432,58 @@ mod tests {
         );
     }
 
+    /// #126 Tier 1b: SBPL uses last-match-wins, so every security `(deny ...)`
+    /// MUST be emitted AFTER the broader `(allow ...)` it overrides. Nothing
+    /// asserted this ordering, so reordering a deny before its allow (silently
+    /// permitting `.git/config` writes or credential reads) left every other test
+    /// green. This pins the byte-offset ordering for the sensitive rules.
+    #[test]
+    fn sensitive_denies_come_after_their_broader_allows() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home));
+
+        // Helper: assert `allow` appears strictly before `deny` in the profile.
+        let assert_deny_after_allow = |allow: &str, deny: &str| {
+            let a = p
+                .find(allow)
+                .unwrap_or_else(|| panic!("expected allow rule missing from profile: {allow}"));
+            let d = p
+                .find(deny)
+                .unwrap_or_else(|| panic!("expected deny rule missing from profile: {deny}"));
+            assert!(
+                a < d,
+                "SBPL last-match-wins violated: deny must come AFTER its allow.\n  \
+                 allow @ {a}: {allow}\n  deny  @ {d}: {deny}"
+            );
+        };
+
+        // Project-dir write allow must precede the .git write denies it overrides.
+        assert_deny_after_allow(
+            r#"(allow file-write* (subpath "/projects/app"))"#,
+            r#"(deny file-write* (subpath "/projects/app/.git/hooks"))"#,
+        );
+        assert_deny_after_allow(
+            r#"(allow file-write* (subpath "/projects/app"))"#,
+            r#"(deny file-write* (literal "/projects/app/.git/config"))"#,
+        );
+        assert_deny_after_allow(
+            r#"(allow file-write* (subpath "/projects/app"))"#,
+            r#"(deny file-write* (literal "/projects/app/.cplt.toml"))"#,
+        );
+
+        // The broad ~/.m2 tool-dir read allow must precede the credential-file deny
+        // (`.m2/settings.xml` lives inside the allowed dir — DENIED_HOME_SUBPATHS).
+        assert_deny_after_allow(
+            r#"(allow file-read* (subpath "/Users/test/.m2"))"#,
+            r#"(deny file-read* (literal "/Users/test/.m2/settings.xml"))"#,
+        );
+        assert_deny_after_allow(
+            r#"(allow file-read* (subpath "/Users/test/.gradle"))"#,
+            r#"(deny file-read* (literal "/Users/test/.gradle/gradle.properties"))"#,
+        );
+    }
+
     #[test]
     fn proxy_forced_without_port_fails_closed_no_443() {
         // Defensive fail-closed: proxy_forced with no proxy port is a

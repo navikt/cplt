@@ -818,6 +818,84 @@ mod macos_tests {
         );
     }
 
+    // ── Credential-dir read denial (planted secrets in a temp HOME) ──
+    //
+    // #126 Tier 1a: the older `sandbox_blocks_ssh_read`/`_aws`/... tests build a
+    // HAND-WRITTEN SBPL profile and self-skip whenever ~/.ssh etc. are absent
+    // (always true on a fresh CI runner), so dropping a credential deny from
+    // cplt's REAL profile shipped green. This test closes that gap:
+    //   • it points `home_dir` at a throwaway temp HOME and PLANTS fake secrets,
+    //   • it generates cplt's REAL profile via `generate_profile` (write_real_profile),
+    //   • it asserts each planted secret read is DENIED at the kernel level and the
+    //     sentinel contents never leak, with an allowed project-file read as a
+    //     positive control.
+    //
+    // Crucially it is NOT vacuous: `.m2/settings.xml` and `.gradle/gradle.properties`
+    // sit UNDER the broad `~/.m2` / `~/.gradle` tool-dir read allows (DENIED_HOME_SUBPATHS),
+    // so if the credential deny is removed from `emit_deny_rules` — or reordered
+    // before its allow — those reads succeed and this test turns red.
+    #[test]
+    fn real_profile_blocks_planted_credentials_in_temp_home() {
+        require_sandbox!();
+
+        // Positive control lives in the REAL project dir (allowed for read).
+        let project = fs::canonicalize(".").unwrap();
+
+        // Throwaway HOME with planted secrets — never touches the developer's real ~.
+        let home = std::env::temp_dir().join(format!("cplt-credhome-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+
+        // (relative path under HOME, sentinel contents). The `.ssh`/`.aws` entries
+        // cover the hard-denied dotfiles; `.m2`/`.gradle` cover credential files that
+        // live inside otherwise-allowed tool dirs (the real last-match-wins case).
+        let planted: &[(&str, &str)] = &[
+            (".ssh/id_rsa", "SENTINEL_SSH_PRIVATE_KEY_c0ffee"),
+            (".aws/credentials", "SENTINEL_AWS_SECRET_deadbeef"),
+            (".m2/settings.xml", "SENTINEL_M2_REGISTRY_PASSWORD_1234"),
+            (".gradle/gradle.properties", "SENTINEL_GRADLE_TOKEN_5678"),
+        ];
+        for (rel, contents) in planted {
+            let path = home.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+        }
+
+        let home = fs::canonicalize(&home).unwrap();
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+
+        // Every planted secret must be unreadable AND its sentinel must never leak.
+        let mut failures: Vec<String> = Vec::new();
+        for (rel, sentinel) in planted {
+            let secret = home.join(rel);
+            let cmd = format!("cat '{}' 2>&1; echo EXIT:$?", secret.display());
+            let (output, _) = run_sandboxed(&profile, &cmd);
+            let denied = output.contains("Operation not permitted") || output.contains("EXIT:1");
+            let leaked = output.contains(sentinel);
+            if !denied || leaked {
+                failures.push(format!(
+                    "{rel}: denied={denied} leaked={leaked} output={output:?}"
+                ));
+            }
+        }
+
+        // Positive control: an allowed project file must still be readable.
+        let (ctrl_out, ctrl_ok) = run_sandboxed(&profile, "cat Cargo.toml | head -1");
+
+        fs::remove_dir_all(&home).ok();
+        fs::remove_file(&profile).ok();
+
+        assert!(
+            failures.is_empty(),
+            "cplt's real profile must DENY planted credential reads: {failures:?}"
+        );
+        assert!(
+            ctrl_ok && ctrl_out.contains("[package]"),
+            "positive control: allowed project file must be readable, got: {ctrl_out}"
+        );
+    }
+
     // ── GPG signing ─────────────────────────────────────────────
 
     #[test]
