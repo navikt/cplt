@@ -498,21 +498,19 @@ fn proxy_upstream_no_proxy_cli_overrides_config() {
 #[test]
 fn proxy_upstream_no_proxy_merges_env() {
     use cplt::config::{CliFlags, Config};
-    // The ambient NO_PROXY/no_proxy is merged on top of config/CLI. Use a
-    // process-unique value to avoid clobbering a real developer setting.
-    // SAFETY: single-threaded within this test; we set then immediately merge
-    // then remove. No other test asserts on this exact hostname.
-    unsafe {
-        std::env::set_var("NO_PROXY", ".env-host.example.io, other.example");
-    }
+    // The ambient NO_PROXY/no_proxy is merged on top of config/CLI. Inject the
+    // value directly via merge_with_no_proxy_env instead of mutating the
+    // process-global environment: cargo runs tests on parallel threads, and
+    // set_var/remove_var is UB while sibling tests read env (edition 2024),
+    // besides clobbering a developer's real NO_PROXY.
     let toml = "[proxy]\nupstream_no_proxy = [\"config-host.example.com\"]\n";
     let resolved = Config::parse(toml)
         .unwrap()
-        .merge(CliFlags::default())
+        .merge_with_no_proxy_env(
+            CliFlags::default(),
+            Some(".env-host.example.io, other.example".to_string()),
+        )
         .unwrap();
-    unsafe {
-        std::env::remove_var("NO_PROXY");
-    }
     assert!(
         resolved
             .proxy_upstream_no_proxy

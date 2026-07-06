@@ -73,6 +73,22 @@ impl Config {
     /// Returns an error if a deny path from config cannot be resolved
     /// (security-critical: silently dropping deny rules is dangerous).
     pub fn merge(&self, cli: CliFlags) -> Result<Resolved, ConfigError> {
+        self.merge_with_no_proxy_env(cli, no_proxy_env_value())
+    }
+
+    /// Same as [`merge`](Self::merge) but with the ambient `NO_PROXY`/`no_proxy`
+    /// value injected explicitly rather than read from the process environment.
+    ///
+    /// `merge` is the normal entry point (it reads the real environment); this
+    /// variant exists so tests can exercise the NO_PROXY-merge path
+    /// deterministically without mutating process-global env — which is UB under
+    /// concurrent test threads (edition 2024) and would clobber a developer's
+    /// real setting. Pass `None` for "no ambient NO_PROXY".
+    pub fn merge_with_no_proxy_env(
+        &self,
+        cli: CliFlags,
+        no_proxy_env: Option<String>,
+    ) -> Result<Resolved, ConfigError> {
         // Proxy: FeatureToggle resolves --with-proxy/--no-proxy against config default (true).
         let with_proxy = cli.proxy.resolve(self.proxy.enabled.unwrap_or(true));
 
@@ -142,7 +158,7 @@ impl Config {
                 .iter()
                 .filter_map(|e| crate::proxy::normalize_no_proxy_entry(e))
                 .collect();
-            if let Some(env) = no_proxy_env_value() {
+            if let Some(env) = no_proxy_env {
                 merged.extend(crate::proxy::parse_no_proxy_list(&env));
             }
             merged.sort_unstable();

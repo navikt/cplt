@@ -372,9 +372,10 @@ pub struct ProxyState {
     upstream: Option<UpstreamProxy>,
 
     // Hosts that BYPASS `upstream` and are connected to directly (NO_PROXY).
-    // Normalized (lowercase, no leading dots) at config-merge time. Empty when
-    // no upstream is configured makes this a no-op. Consulted with
-    // `is_domain_match` (exact + subdomain), like the other domain lists.
+    // Normalized (lowercase, no leading/trailing dots) at config-merge time.
+    // A no-op when `upstream` is None: the list is only consulted inside the
+    // upstream-forward branch of handle_connect. Consulted with `is_domain_match`
+    // (exact + subdomain), like the other domain lists.
     upstream_no_proxy: Vec<String>,
 
     // Test-only: injectable DNS resolver to simulate fake DNS responses.
@@ -1393,8 +1394,13 @@ fn host_matches_no_proxy(host: &str, no_proxy: &[String]) -> bool {
 }
 
 /// Normalize a single NO_PROXY-style entry so `is_domain_match` handles it
-/// consistently with cplt's other domain lists: trim, lowercase, and strip a
-/// leading dot (`.example.com` → `example.com`).
+/// consistently with cplt's other domain lists: trim, lowercase, and strip
+/// leading AND trailing dots (`.example.com.` → `example.com`).
+///
+/// The trailing dot matters: the CONNECT host is normalized via
+/// `normalize_hostname`, which strips a trailing dot, so an FQDN entry like
+/// `example.com.` would otherwise never match `example.com`. Stripping it here
+/// mirrors `parse_domain_file` / `is_blocked_in_content` (`trim_end_matches('.')`).
 ///
 /// Returns `None` for entries that must be ignored:
 /// - empty (blank field from a trailing comma or stray whitespace), and
@@ -1406,6 +1412,7 @@ pub fn normalize_no_proxy_entry(raw: &str) -> Option<String> {
     let s = raw
         .trim()
         .trim_start_matches('.')
+        .trim_end_matches('.')
         .trim()
         .to_ascii_lowercase();
     if s.is_empty() || s == "*" {
@@ -3449,8 +3456,8 @@ mod tests {
         assert!(!host_matches_no_proxy("example.com", &[]));
     }
 
-    /// Entry normalization: trim, lowercase, strip a leading dot; empty and a
-    /// bare `*` are dropped.
+    /// Entry normalization: trim, lowercase, strip leading AND trailing dots;
+    /// empty and a bare `*` are dropped.
     #[test]
     fn no_proxy_entry_normalization() {
         assert_eq!(
@@ -3461,9 +3468,32 @@ mod tests {
             normalize_no_proxy_entry("  host.example  "),
             Some("host.example".to_string())
         );
+        // FQDN with a trailing dot must normalize the same as without, so it
+        // matches the CONNECT host (which normalize_hostname strips too).
+        assert_eq!(
+            normalize_no_proxy_entry("example.com."),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            normalize_no_proxy_entry(".example.com."),
+            Some("example.com".to_string())
+        );
         assert_eq!(normalize_no_proxy_entry(""), None);
         assert_eq!(normalize_no_proxy_entry("   "), None);
+        assert_eq!(normalize_no_proxy_entry("."), None);
         assert_eq!(normalize_no_proxy_entry("*"), None);
+    }
+
+    /// A trailing-dot FQDN entry (`example.com.`) matches the plain host
+    /// `example.com`: the entry is normalized, then compared against the host
+    /// which `is_domain_match` normalizes via `normalize_hostname`. Without the
+    /// trailing-dot strip the corporate proxy would be used for a NO_PROXY host.
+    #[test]
+    fn no_proxy_trailing_dot_entry_matches_host() {
+        let list = parse_no_proxy_list("example.com.");
+        assert_eq!(list, vec!["example.com".to_string()]);
+        assert!(host_matches_no_proxy("example.com", &list));
+        assert!(host_matches_no_proxy("sub.example.com", &list));
     }
 
     /// A NO_PROXY env value is comma/whitespace-separated, normalized, with
@@ -3672,5 +3702,59 @@ mod tests {
             .shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Companion NEGATIVE test to `proxy_no_proxy_host_takes_direct_path_not_upstream`
+    /// (which sets allow_private_domains): a no-proxy host that resolves to a
+    /// PRIVATE IP but is NOT an allow_private_domains entry is BLOCKED with 403 by
+    /// the direct path's resolved-IP SSRF guard, and the upstream is never used.
+    ///
+    /// This is the feature's central gotcha: NO_PROXY diverts an internal host to
+    /// cplt's DIRECT path, which then applies the private-IP guard — so the same
+    /// internal host must ALSO be in `proxy.allow_private_domains` to connect.
+    #[test]
+    fn proxy_no_proxy_host_private_ip_blocked_without_allow_private() {
+        require_localhost_tcp!();
+
+        let upstream_srv = spawn_fake_upstream();
+        let upstream =
+            UpstreamProxy::parse(&format!("http://127.0.0.1:{}", upstream_srv.port)).unwrap();
+
+        // The no-proxy host resolves to an RFC1918 private IP.
+        let private_ip: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        let resolver: ResolverFn = Arc::new(move |host: &str, _port: u16| match host {
+            "internal.corp.example" => Some(std::net::SocketAddr::new(private_ip, 443)),
+            _ => None,
+        });
+
+        // NOTE: cli_private_domains is EMPTY — the host is NOT permitted to
+        // resolve to a private IP.
+        let proxy = make_proxy_with_no_proxy(
+            upstream,
+            vec!["internal.corp.example".to_string()],
+            PathBuf::from("/dev/null"),
+            Vec::new(),
+            Some(resolver),
+        );
+
+        let status = proxy_connect(proxy.port, "internal.corp.example:443");
+        assert!(
+            status.contains("403"),
+            "a no-proxy host resolving to a private IP without allow_private_domains \
+             must be 403; got: {status}"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !upstream_srv
+                .contacted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "upstream must NOT be contacted for a no-proxy host"
+        );
+
+        proxy.shutdown();
+        upstream_srv
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }

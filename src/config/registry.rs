@@ -119,7 +119,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::StrArray,
         dangerous: false,
         default_display: "[]",
-        description: "Hosts that BYPASS the upstream proxy and are connected to directly (like NO_PROXY). Only meaningful with proxy.upstream. Suffix matching: \"example.com\" covers all subdomains. Merged with the ambient NO_PROXY/no_proxy environment. All of cplt's domain/port/SSRF filtering still applies — the host is just connected directly instead of forwarded.",
+        description: "Hosts that BYPASS the upstream proxy and are connected to directly (like NO_PROXY). Only meaningful with proxy.upstream. Suffix matching: \"example.com\" covers all subdomains; CIDR/IP ranges are NOT honored. Merged additively with the ambient NO_PROXY/no_proxy environment. All of cplt's domain/port/SSRF filtering still applies — so an internal host that resolves to a private IP is BLOCKED (403) unless you ALSO add it to proxy.allow_private_domains.",
     },
     ConfigKeyInfo {
         section: "proxy",
