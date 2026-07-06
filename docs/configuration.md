@@ -53,11 +53,12 @@ Use `cplt config explain` to see what a key does and how to set it.
 
 ## Policy presets
 
-Instead of toggling individual flags, pick a named **preset** that sets a
-baseline for the five main sandbox toggles with one flag or config key:
+Instead of toggling individual flags, pick a named **preset** — a security
+*posture* that sets a baseline for the five sandbox toggles **and** the safety
+features (`gh_guard`, `git_guard`, forced-proxy egress) with one flag or key:
 
 ```bash
-cplt --preset strict       # deny-default: nothing extra allowed
+cplt --preset strict       # locked down: toggles off + guards + forced proxy on
 cplt --preset standard     # the current defaults (no-op baseline)
 cplt --preset permissive   # localhost + tmp exec + lifecycle scripts on
 cplt --preset full-trust   # everything on (docker, env files, tmp exec, localhost, lifecycle)
@@ -70,17 +71,25 @@ Or in config:
 preset = "standard"
 ```
 
-| Preset | localhost (`allow_localhost_any`) | env files (`allow_env_files`) | tmp exec (`allow_tmp_exec`) | docker (`allow_docker`) | lifecycle (`allow_lifecycle_scripts`) |
-|--------|:---:|:---:|:---:|:---:|:---:|
-| `strict` | off | off | off | off | off |
-| `standard` | off | off | off¹ | off | off |
-| `permissive` | **on** | off | **on** | off | **on** |
-| `full-trust` | **on** | **on** | **on** | **on** | **on** |
+| Preset | localhost (`allow_localhost_any`) | env files (`allow_env_files`) | tmp exec (`allow_tmp_exec`) | docker (`allow_docker`) | lifecycle (`allow_lifecycle_scripts`) | `gh_guard` | `git_guard` | `proxy.forced` |
+|--------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `strict` | off | off | off | off | off | **on** | **on** | **on** |
+| `standard` | off | off | off¹ | off | off | off | off | off |
+| `permissive` | **on** | off | **on** | off | **on** | off | off | off |
+| `full-trust` | **on** | **on** | **on** | **on** | **on** | off | off | off |
 
 ¹ `standard` leaves the per-session scratch directory on (the default), which is
 what most tools need — `allow_tmp_exec` (raw `/tmp` exec) stays off. `standard`
 is identical to cplt's hardcoded defaults, so omitting `--preset` behaves exactly
 like `--preset standard`.
+
+**Only `strict` enables the safety features.** It hardens the two dimensions that
+matter most — `gh_guard` (gate GitHub traffic), `git_guard` (block push/force-push),
+and `proxy.forced` (mandatory proxy, kernel egress locked to it). `standard`,
+`permissive`, and `full-trust` all leave those three at their default (off), so
+selecting them changes nothing about guards or forced egress. `strict` enables
+only *safety* features, so `config set sandbox.preset strict` needs no `--force`
+(unlike `permissive`/`full-trust`, which weaken the sandbox).
 
 **Precedence — the preset is only a baseline.** An explicit individual flag or
 config value always overrides the preset, whichever source the preset came from:

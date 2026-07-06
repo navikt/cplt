@@ -154,17 +154,24 @@ impl<'de> Deserialize<'de> for UnknownCommandPolicy {
     }
 }
 
-/// Named policy preset — sets a baseline for the five sandbox toggles with one
-/// flag/key. Individual flags and config values still override the baseline
-/// (see the merge logic in `loading.rs`).
+/// Named policy preset — a security *posture*, not just a filesystem/exec
+/// permission profile. Sets a baseline across two axes with one flag/key:
+/// the five sandbox toggles AND the safety features (`gh_guard`, `git_guard`,
+/// forced-proxy egress). Individual flags and config values still override the
+/// baseline (see the merge logic in `loading.rs`).
 ///
-/// `Standard` is a no-op baseline (all five toggles off), identical to cplt's
-/// hardcoded defaults, so passing no preset behaves exactly like `standard`.
+/// Only `Strict` enables the safety features; `Standard`/`Permissive`/
+/// `FullTrust` leave them at their default (off). `Standard` is a no-op
+/// baseline (all five toggles off, no guards, no forced proxy) identical to
+/// cplt's hardcoded defaults, so passing no preset behaves exactly like
+/// `standard`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Preset {
-    /// Deny-default: no localhost, env files, tmp exec, docker, or lifecycle scripts.
+    /// Locked-down posture: no localhost, env files, tmp exec, docker, or
+    /// lifecycle scripts, AND gh_guard + git_guard + forced-proxy egress on.
     Strict,
-    /// The current defaults (scratch dir stays on; all five toggles off).
+    /// The current defaults (scratch dir stays on; all five toggles off, no
+    /// guards, no forced proxy).
     Standard,
     /// Developer-friendly: localhost, tmp exec, and lifecycle scripts on.
     Permissive,
@@ -173,17 +180,27 @@ pub enum Preset {
     FullTrust,
 }
 
-/// The five sandbox toggle values a [`Preset`] establishes as a baseline.
+/// The baseline a [`Preset`] establishes: the five sandbox toggles plus the
+/// three safety features (gh_guard, git_guard, forced proxy). The toggles
+/// *weaken* the sandbox (dangerous when on); the safety features *harden* it
+/// (never dangerous). Only [`enabled_dangerous_names`](Self::enabled_dangerous_names)
+/// — keyed on the five toggles — gates the `--force`/validate safeguards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PresetToggles {
+pub struct PresetBaseline {
     pub allow_localhost_any: bool,
     pub allow_env_files: bool,
     pub allow_tmp_exec: bool,
     pub allow_docker: bool,
     pub allow_lifecycle_scripts: bool,
+    /// Safety feature: gate `gh`/GitHub-API traffic through the guard.
+    pub gh_guard_enabled: bool,
+    /// Safety feature: block dangerous `git` operations (push/force-push).
+    pub git_guard_enabled: bool,
+    /// Safety feature: mandatory proxy, kernel egress locked to the proxy port.
+    pub proxy_forced: bool,
 }
 
-impl PresetToggles {
+impl PresetBaseline {
     /// Human-readable names of the toggles this baseline turns **on**, in a
     /// stable display order. Every one of these five toggles is treated as
     /// dangerous when set explicitly (each has `dangerous: true` in the
@@ -192,7 +209,7 @@ impl PresetToggles {
     /// name exactly what a dangerous preset turns on.
     ///
     /// Deriving the list from the actual toggle values means a preset warning
-    /// can never drift out of sync with what [`Preset::toggles`] enables.
+    /// can never drift out of sync with what [`Preset::baseline`] enables.
     pub fn enabled_dangerous_names(self) -> Vec<&'static str> {
         let mut names = Vec::new();
         if self.allow_tmp_exec {
@@ -235,37 +252,59 @@ impl Preset {
     /// and should trigger the same dangerous-setting safeguards as the
     /// individual toggles it turns on.
     pub fn enabled_dangerous_names(self) -> Vec<&'static str> {
-        self.toggles().enabled_dangerous_names()
+        self.baseline().enabled_dangerous_names()
     }
 
-    /// Map the preset to its baseline toggle values.
+    /// Map the preset to its baseline values (five sandbox toggles + three
+    /// safety features).
     ///
-    /// Note `Strict` and `Standard` produce the same five values — the only
-    /// difference between them (the scratch dir) is not a preset-controlled
-    /// toggle and stays at its default (on). `Standard` is kept as a distinct,
-    /// explicit "no-op baseline" name for the common case.
-    pub fn toggles(self) -> PresetToggles {
+    /// `Strict` and `Standard` share the same five *toggle* values (all off),
+    /// but differ on the safety features: only `Strict` turns on gh_guard,
+    /// git_guard, and forced-proxy egress — a genuine locked-down posture.
+    /// `Standard` is the no-op baseline (everything off), identical to cplt's
+    /// hardcoded defaults. The scratch dir is not a preset-controlled toggle
+    /// and stays at its default (on) for every preset.
+    pub fn baseline(self) -> PresetBaseline {
         match self {
-            Self::Strict | Self::Standard => PresetToggles {
+            Self::Strict => PresetBaseline {
                 allow_localhost_any: false,
                 allow_env_files: false,
                 allow_tmp_exec: false,
                 allow_docker: false,
                 allow_lifecycle_scripts: false,
+                gh_guard_enabled: true,
+                git_guard_enabled: true,
+                proxy_forced: true,
             },
-            Self::Permissive => PresetToggles {
+            Self::Standard => PresetBaseline {
+                allow_localhost_any: false,
+                allow_env_files: false,
+                allow_tmp_exec: false,
+                allow_docker: false,
+                allow_lifecycle_scripts: false,
+                gh_guard_enabled: false,
+                git_guard_enabled: false,
+                proxy_forced: false,
+            },
+            Self::Permissive => PresetBaseline {
                 allow_localhost_any: true,
                 allow_env_files: false,
                 allow_tmp_exec: true,
                 allow_docker: false,
                 allow_lifecycle_scripts: true,
+                gh_guard_enabled: false,
+                git_guard_enabled: false,
+                proxy_forced: false,
             },
-            Self::FullTrust => PresetToggles {
+            Self::FullTrust => PresetBaseline {
                 allow_localhost_any: true,
                 allow_env_files: true,
                 allow_tmp_exec: true,
                 allow_docker: true,
                 allow_lifecycle_scripts: true,
+                gh_guard_enabled: false,
+                git_guard_enabled: false,
+                proxy_forced: false,
             },
         }
     }

@@ -186,7 +186,7 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
     if let Some(sandbox) = table.get("sandbox").and_then(|v| v.as_table()) {
         // A preset is dangerous when its baseline enables any of the guarded
         // toggles — `permissive` and `full-trust` do, `strict`/`standard` do
-        // not. Derive the enabled toggles from `Preset::toggles()` (via
+        // not. Derive the enabled toggles from `Preset::baseline()` (via
         // `enabled_dangerous_names`) so this warning names exactly what the
         // preset turns on and cannot drift from the preset definitions.
         if let Some(preset_str) = sandbox.get("preset").and_then(toml::Value::as_str)

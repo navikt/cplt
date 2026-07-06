@@ -73,24 +73,35 @@ impl Config {
     /// Returns an error if a deny path from config cannot be resolved
     /// (security-critical: silently dropping deny rules is dangerous).
     pub fn merge(&self, cli: CliFlags) -> Result<Resolved, ConfigError> {
-        // Policy preset: sets a BASELINE for the five sandbox toggles below.
-        // Precedence for the preset itself: CLI (--preset) wins over config
-        // ([sandbox] preset). The baseline it implies is the *lowest* layer for
-        // each toggle — explicit individual CLI flags and config values still
-        // override it (see each `*.to_option().or(config).unwrap_or(baseline)`).
+        // Policy preset: sets a BASELINE spanning two axes — the five sandbox
+        // toggles below AND the three safety features (gh_guard, git_guard,
+        // proxy.forced). Precedence for the preset itself: CLI (--preset) wins
+        // over config ([sandbox] preset). The baseline it implies is the
+        // *lowest* layer for each field — explicit individual CLI flags and
+        // config values still override it (see each
+        // `*.to_option().or(config).unwrap_or(baseline)` for toggles and the
+        // `.resolve(config.or(...).unwrap_or(baseline))` for the guards/proxy).
         let preset = cli.preset.or(self.sandbox.preset);
-        // No preset == "standard" == cplt's hardcoded defaults (all five off).
-        let baseline = preset.unwrap_or(Preset::Standard).toggles();
+        // No preset == "standard" == cplt's hardcoded defaults (all five
+        // toggles off, no guards, no forced proxy). Only `strict` turns the
+        // safety features on.
+        let baseline = preset.unwrap_or(Preset::Standard).baseline();
 
         // Proxy: FeatureToggle resolves --with-proxy/--no-proxy against config default (true).
         let with_proxy = cli.proxy.resolve(self.proxy.enabled.unwrap_or(true));
 
-        // Proxy-forced: FeatureToggle resolves --proxy-forced/--no-proxy-forced
-        // against config default (false). When true, the proxy is mandatory and
-        // kernel egress is locked to the proxy port (#53). Orchestration in main.rs
-        // enforces proxy-on + fail-closed; the conflict with an explicitly disabled
-        // proxy is reported there.
-        let proxy_forced = cli.proxy_forced.resolve(self.proxy.forced.unwrap_or(false));
+        // Proxy-forced: FeatureToggle resolves --proxy-forced/--no-proxy-forced,
+        // then the explicit config value, then the preset baseline (false unless
+        // `strict`). Precedence: CLI flag > config > preset > default(off) —
+        // mirrors the toggle pattern, with the preset threaded in as the lowest
+        // layer. When true, the proxy is mandatory and kernel egress is locked
+        // to the proxy port (#53). Orchestration in main.rs enforces proxy-on +
+        // fail-closed; the conflict with an explicitly disabled proxy is
+        // reported there (so `--preset strict` with proxy.enabled=false fails
+        // closed rather than silently).
+        let proxy_forced = cli
+            .proxy_forced
+            .resolve(self.proxy.forced.unwrap_or(baseline.proxy_forced));
 
         // Port: CLI (if provided) > config > 0 (OS-assigned ephemeral port)
         let proxy_port = cli.proxy_port.or(self.proxy.port).unwrap_or(0);
@@ -335,11 +346,14 @@ impl Config {
 
         // gh-guard: CLI flag overrides enabled; sub-options come from [gh_proxy] config.
         // Backward compat: old `sandbox.gh_proxy = true` is treated as `gh_guard.enabled = true`.
+        // Precedence: CLI flag > config value > preset baseline > default(off).
+        // Only `strict` sets the baseline on — every other preset (and none)
+        // leaves it at `false`, so resolution is unchanged for them.
         let gh_guard_enabled_default = self
             .gh_guard
             .enabled
             .or(self.sandbox.gh_proxy)
-            .unwrap_or(false);
+            .unwrap_or(baseline.gh_guard_enabled);
         let gh_guard_enabled = cli.gh_guard.resolve(gh_guard_enabled_default);
         let gh_guard = GhGuardPolicy {
             enabled: gh_guard_enabled,
@@ -355,11 +369,13 @@ impl Config {
         };
 
         // git-guard: CLI flag overrides enabled. Backward compat from sandbox.git_push_prevention.
+        // Precedence: CLI flag > config value > preset baseline > default(off).
+        // Only `strict` sets the baseline on; unchanged for every other case.
         let git_guard_enabled_default = self
             .git_guard
             .enabled
             .or(self.sandbox.git_push_prevention)
-            .unwrap_or(false);
+            .unwrap_or(baseline.git_guard_enabled);
         let git_guard_enabled = cli.git_push_prevention.resolve(git_guard_enabled_default);
         let git_guard = GitGuardPolicy {
             enabled: git_guard_enabled,
@@ -1776,5 +1792,150 @@ validate = false
     fn preset_deserialize_rejects_unknown_value() {
         let err = toml::from_str::<Config>("[sandbox]\npreset = \"yolo\"\n").unwrap_err();
         assert!(err.to_string().contains("invalid preset"), "got: {err}");
+    }
+
+    /// Snapshot of the three safety-feature values a preset can set as a
+    /// baseline: (gh_guard.enabled, git_guard.enabled, proxy_forced).
+    fn posture_snapshot(r: &Resolved) -> (bool, bool, bool) {
+        (r.gh_guard.enabled, r.git_guard.enabled, r.proxy_forced)
+    }
+
+    #[test]
+    fn preset_strict_enables_guards_and_forced_proxy() {
+        // strict is a real posture: five toggles off, but the safety features on.
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            toggle_snapshot(&resolved),
+            (false, false, false, false, false)
+        );
+        assert_eq!(posture_snapshot(&resolved), (true, true, true));
+    }
+
+    #[test]
+    fn preset_standard_leaves_guards_and_proxy_off() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Standard),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(posture_snapshot(&resolved), (false, false, false));
+    }
+
+    #[test]
+    fn preset_permissive_leaves_guards_and_proxy_off() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Permissive),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(posture_snapshot(&resolved), (false, false, false));
+    }
+
+    #[test]
+    fn preset_full_trust_leaves_guards_and_proxy_off() {
+        // full-trust weakens the sandbox but does NOT touch the safety features.
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::FullTrust),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(posture_snapshot(&resolved), (false, false, false));
+    }
+
+    #[test]
+    fn no_preset_equals_standard_posture_defaults() {
+        // The critical no-regression test: no preset must resolve EXACTLY like
+        // `standard` (and today's hardcoded defaults) across every posture
+        // field — guards off, forced proxy off — not just the five toggles.
+        let none = Config::default().merge(CliFlags::default()).unwrap();
+        let standard = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Standard),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(posture_snapshot(&none), (false, false, false));
+        assert_eq!(posture_snapshot(&none), posture_snapshot(&standard));
+        assert_eq!(toggle_snapshot(&none), toggle_snapshot(&standard));
+    }
+
+    #[test]
+    fn explicit_config_gh_guard_disabled_overrides_strict() {
+        // preset = strict (gh_guard baseline ON) but an explicit config value
+        // pins it OFF → explicit wins; git_guard + forced proxy still follow strict.
+        let config: Config =
+            toml::from_str("[sandbox]\npreset = \"strict\"\n[gh_guard]\nenabled = false\n")
+                .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.gh_guard.enabled,
+            "explicit gh_guard.enabled=false must win over strict baseline"
+        );
+        assert!(resolved.git_guard.enabled, "git_guard still follows strict");
+        assert!(resolved.proxy_forced, "proxy.forced still follows strict");
+    }
+
+    #[test]
+    fn explicit_config_git_guard_disabled_overrides_strict() {
+        let config: Config =
+            toml::from_str("[sandbox]\npreset = \"strict\"\n[git_guard]\nenabled = false\n")
+                .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.git_guard.enabled,
+            "explicit git_guard.enabled=false must win over strict baseline"
+        );
+        assert!(resolved.gh_guard.enabled);
+        assert!(resolved.proxy_forced);
+    }
+
+    #[test]
+    fn explicit_config_proxy_forced_disabled_overrides_strict() {
+        let config: Config =
+            toml::from_str("[sandbox]\npreset = \"strict\"\n[proxy]\nforced = false\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.proxy_forced,
+            "explicit proxy.forced=false must win over strict baseline"
+        );
+        assert!(resolved.gh_guard.enabled);
+        assert!(resolved.git_guard.enabled);
+    }
+
+    #[test]
+    fn strict_preset_plus_allow_localhost_any_reconciles_off() {
+        // #53 interaction: --preset strict turns proxy.forced ON (baseline);
+        // an explicit --allow-localhost-any turns that toggle ON (CLI wins over
+        // baseline). The two are mutually exclusive, so reconcile forces
+        // allow_localhost_any back off (with the caller warning) — proxy.forced
+        // wins and kernel egress stays locked.
+        let mut resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                allow_localhost_any: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.proxy_forced, "strict forces the proxy");
+        assert!(
+            resolved.allow_localhost_any,
+            "explicit flag set it on first"
+        );
+        assert!(
+            resolved.reconcile_proxy_forced(),
+            "reconcile must report it superseded allow_localhost_any"
+        );
+        assert!(
+            !resolved.allow_localhost_any,
+            "proxy.forced wins: localhost-any forced off"
+        );
     }
 }
