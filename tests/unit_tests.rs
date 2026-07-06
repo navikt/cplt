@@ -7166,7 +7166,7 @@ fn audit_reports_net_change_even_after_commit() {
             let sh = changes.iter().find(|c| c.path == "deploy.sh").unwrap();
             assert_eq!(sh.sensitive, Some("shell script"));
         }
-        AuditReport::Unavailable { .. } => panic!("expected Available report"),
+        other => panic!("expected Available report, got {other:?}"),
     }
 }
 
@@ -7193,7 +7193,7 @@ fn audit_reports_new_untracked_file() {
             assert!(f.is_some(), "untracked file must be reported");
             assert!(f.unwrap().is_new_untracked);
         }
-        AuditReport::Unavailable { .. } => panic!("expected Available report"),
+        other => panic!("expected Available report, got {other:?}"),
     }
 }
 
@@ -7206,4 +7206,128 @@ fn audit_unavailable_for_non_git_dir() {
         baseline.finish(0),
         AuditReport::Unavailable { .. }
     ));
+}
+
+/// FIX 3 + FIX 4: a tracked-file DELETION surfaces with `+0 -N`, and a rename
+/// surfaces (under `--no-renames`) as a deletion of the old path plus an
+/// addition of the new one — not a single mangled `old => new` row. Paths with
+/// spaces round-trip verbatim thanks to `-z`.
+#[test]
+fn audit_reports_deletion_and_rename_as_delete_plus_add() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("keep.rs"), "a\nb\nc\n").unwrap();
+    std::fs::write(dir.join("gone.rs"), "x\ny\n").unwrap();
+    std::fs::write(dir.join("old name.rs"), "1\n2\n3\n").unwrap();
+    git_in(dir, &["add", "."]);
+    git_in(
+        dir,
+        &["-c", "commit.gpgSign=false", "commit", "-q", "-m", "init"],
+    );
+
+    let baseline = Baseline::capture(dir);
+    // Delete a tracked file and rename another (git mv → staged rename).
+    std::fs::remove_file(dir.join("gone.rs")).unwrap();
+    git_in(dir, &["mv", "old name.rs", "new name.rs"]);
+
+    match baseline.finish(0) {
+        AuditReport::Available { changes, .. } => {
+            let by = |p: &str| changes.iter().find(|c| c.path == p).cloned();
+
+            let del = by("gone.rs").expect("deletion must appear");
+            assert_eq!(del.added, Some(0), "deletion has +0");
+            assert_eq!(del.deleted, Some(2), "deletion shows removed lines");
+
+            // Rename with --no-renames = delete of old + add of new (spaced OK).
+            let old = by("old name.rs").expect("rename old path must appear");
+            assert_eq!(old.added, Some(0));
+            assert_eq!(old.deleted, Some(3));
+            let new = by("new name.rs").expect("rename new path must appear");
+            assert_eq!(new.added, Some(3));
+            assert_eq!(new.deleted, Some(0));
+
+            // No mangled combined row should exist.
+            assert!(
+                by("old name.rs => new name.rs").is_none(),
+                "must not emit a combined rename row"
+            );
+        }
+        other => panic!("expected Available report, got {other:?}"),
+    }
+}
+
+/// FIX 5: in an empty repo (`git init`, no commits) tracked-change auditing is
+/// unavailable, but a NEW UNTRACKED file the agent creates must still be
+/// surfaced — a bootstrap session is not a blind spot.
+#[test]
+fn audit_reports_untracked_in_empty_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git_in(dir, &["init", "-q", "-b", "main"]);
+
+    // No commits yet → no baseline SHA.
+    let baseline = Baseline::capture(dir);
+    std::fs::write(dir.join("bootstrap.sh"), "#!/bin/sh\n").unwrap();
+
+    match baseline.finish(0) {
+        AuditReport::Available {
+            changes,
+            tracked_audited,
+            ..
+        } => {
+            assert!(!tracked_audited, "empty repo cannot audit tracked changes");
+            let f = changes
+                .iter()
+                .find(|c| c.path == "bootstrap.sh")
+                .expect("new untracked file must be reported in empty repo");
+            assert!(f.is_new_untracked);
+            assert_eq!(f.sensitive, Some("shell script"));
+        }
+        other => panic!("expected Available (untracked-only) report, got {other:?}"),
+    }
+}
+
+/// FIX 1 (honesty, end-to-end): a real baseline whose pinned commit becomes
+/// UNREACHABLE mid-session (agent runs `git gc --prune=now`) must report
+/// `Incomplete` — never a false clean/empty `Available`. This is the dangerous
+/// false-negative direction the audit exists to prevent.
+#[test]
+fn audit_reports_incomplete_when_baseline_commit_pruned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("app.rs"), "fn main() {}\n").unwrap();
+    git_in(dir, &["add", "."]);
+    git_in(
+        dir,
+        &["-c", "commit.gpgSign=false", "commit", "-q", "-m", "init"],
+    );
+
+    // Pin the baseline at the current commit.
+    let baseline = Baseline::capture(dir);
+
+    // Agent rewrites history and prunes: the pinned commit is now unreachable,
+    // so `git diff <pinned-sha>` fails.
+    std::fs::write(dir.join("app.rs"), "fn main() { let _ = 1; }\n").unwrap();
+    git_in(dir, &["add", "."]);
+    git_in(
+        dir,
+        &[
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-q",
+            "--amend",
+            "-m",
+            "rewritten",
+        ],
+    );
+    git_in(dir, &["reflog", "expire", "--expire=now", "--all"]);
+    git_in(dir, &["gc", "--prune=now", "-q"]);
+
+    match baseline.finish(0) {
+        AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
+        other => panic!("expected Incomplete after prune, got {other:?}"),
+    }
 }

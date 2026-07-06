@@ -24,9 +24,17 @@
 
 use crate::ui;
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Upper bound on any single git invocation. The audit runs on EVERY sandboxed
+/// start (baseline capture) and after exit; a hung git (NFS stall, index-lock
+/// contention, corrupt repo) must never hang cplt. On timeout the child is
+/// killed and the query degrades to a failure (`None`) → an honest "incomplete"
+/// report rather than a false "clean" one.
+const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A matcher against a changed path, used to classify sensitive files.
 ///
@@ -117,16 +125,23 @@ pub struct NumStat {
     pub deleted: Option<u64>,
 }
 
-/// Parse the output of `git diff --numstat <sha>`.
+/// Parse the output of `git diff --numstat -z --no-renames <sha>`.
 ///
-/// Each line is `<added>\t<deleted>\t<path>`; binary files use `-` for the
-/// counts. Pure function so the net-change computation is unit-testable without
-/// invoking git.
+/// With `-z`, records are NUL-terminated and paths are emitted **verbatim**
+/// (git never quotes/C-escapes them), so spaces and non-ASCII survive intact.
+/// Within a record the three fields are `<added>\t<deleted>\t<path>`; binary
+/// files use `-` for the counts. `--no-renames` guarantees every record is a
+/// plain path (no `old\0new` rename pair), so a rename surfaces honestly as a
+/// deletion plus an addition. Pure function so the net-change computation is
+/// unit-testable without invoking git.
 pub fn parse_numstat(output: &str) -> Vec<NumStat> {
     output
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
+        .split('\0')
+        .filter_map(|record| {
+            if record.is_empty() {
+                return None; // trailing NUL yields an empty final record
+            }
+            let mut parts = record.splitn(3, '\t');
             let added = parts.next()?;
             let deleted = parts.next()?;
             let path = parts.next()?;
@@ -142,26 +157,20 @@ pub fn parse_numstat(output: &str) -> Vec<NumStat> {
         .collect()
 }
 
-/// Parse the untracked (`??`) entries from `git status --porcelain -uall`.
+/// Parse the untracked (`??`) entries from `git status --porcelain -z -uall`.
 ///
-/// Returns a sorted set of repo-relative paths. Pure function — the before/after
+/// With `-z`, entries are NUL-separated and paths are emitted **verbatim** (no
+/// double-quoting/C-escaping), which hardens parsing for paths with spaces or
+/// non-ASCII characters. Rename entries emit the old path as a separate NUL
+/// field, but those never carry the `?? ` prefix, so filtering on it naturally
+/// keeps only genuine untracked paths. Pure function — the before/after
 /// untracked sets feed [`new_untracked`].
 pub fn parse_untracked(porcelain: &str) -> BTreeSet<String> {
     porcelain
-        .lines()
-        .filter_map(|line| line.strip_prefix("?? "))
-        .map(unquote_path)
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("?? "))
+        .map(ToString::to_string)
         .collect()
-}
-
-/// git porcelain quotes paths containing special characters in double quotes.
-/// Strip the surrounding quotes for display; leave other paths untouched.
-fn unquote_path(raw: &str) -> String {
-    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-        raw[1..raw.len() - 1].to_string()
-    } else {
-        raw.to_string()
-    }
 }
 
 /// Net-new untracked files = files untracked *after* the session that were not
@@ -192,16 +201,28 @@ pub struct FileChange {
 /// The generated audit report, ready to print.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditReport {
-    /// The project directory is not a git repository, or has no commits — a net
-    /// change audit is not possible. Timing is still reported.
+    /// The project directory is not a git repository (or git is unavailable) and
+    /// nothing at all could be measured. Timing is still reported.
     Unavailable { duration: Duration, exit_code: u8 },
-    /// A net-change audit against the pinned baseline commit.
+    /// A baseline commit existed, but a post-run git query **failed** — e.g. the
+    /// agent ran `git gc --prune=now` (pinned SHA unreachable), deleted/renamed
+    /// `.git`, corrupted the index, or git timed out. Net changes could NOT be
+    /// measured. This is deliberately distinct from a clean "no changes" report:
+    /// the audit must never affirm a clean session it was unable to verify.
+    Incomplete { duration: Duration, exit_code: u8 },
+    /// A change audit. When `tracked_audited` is true the changes were measured
+    /// against the pinned baseline commit; when false there was no baseline
+    /// commit (e.g. a fresh `git init`) and only NEW UNTRACKED files could be
+    /// surfaced — tracked-change auditing is unavailable in that case.
     Available {
         duration: Duration,
         exit_code: u8,
         changes: Vec<FileChange>,
         total_added: u64,
         total_deleted: u64,
+        /// True when tracked changes were diffed against a pinned baseline; false
+        /// in the no-baseline case where only untracked additions are shown.
+        tracked_audited: bool,
     },
 }
 
@@ -231,13 +252,12 @@ impl Baseline {
         let pinned_sha = git_output(project_dir, &["rev-parse", "HEAD"])
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let before_untracked = if pinned_sha.is_some() {
-            git_output(project_dir, &["status", "--porcelain", "-uall"])
-                .map(|s| parse_untracked(&s))
-                .unwrap_or_default()
-        } else {
-            BTreeSet::new()
-        };
+        // Capture the pre-run untracked set REGARDLESS of whether a baseline
+        // commit exists: in a fresh `git init` (no commits) we still want to
+        // surface the files the agent creates during the session.
+        let before_untracked = git_output(project_dir, &["status", "--porcelain", "-z", "-uall"])
+            .map(|s| parse_untracked(&s))
+            .unwrap_or_default();
         Self {
             start,
             project_dir: project_dir.to_path_buf(),
@@ -251,22 +271,84 @@ impl Baseline {
     /// committed or reset them) and computes net-new untracked files.
     pub fn finish(self, exit_code: u8) -> AuditReport {
         let duration = self.start.elapsed();
+
+        // The after-untracked query. `None` means the git command FAILED (git
+        // gone, corrupt repo, timeout) — genuinely distinct from `Some(empty)`
+        // (git succeeded and reported no untracked files). We must never treat a
+        // failure as "no changes".
+        let after_untracked_opt =
+            git_output(&self.project_dir, &["status", "--porcelain", "-z", "-uall"])
+                .map(|s| parse_untracked(&s));
+
         let Some(sha) = self.pinned_sha else {
-            return AuditReport::Unavailable {
+            // No baseline commit (e.g. fresh `git init`). Tracked-change
+            // auditing is unavailable, but we still surface NEW UNTRACKED files
+            // the agent created so a bootstrap session isn't a blind spot.
+            let Some(after_untracked) = after_untracked_opt else {
+                // Even the untracked query failed → nothing measurable at all.
+                return AuditReport::Unavailable {
+                    duration,
+                    exit_code,
+                };
+            };
+            let new_files = new_untracked(&self.before_untracked, &after_untracked);
+            if new_files.is_empty() {
+                return AuditReport::Unavailable {
+                    duration,
+                    exit_code,
+                };
+            }
+            let changes = new_files
+                .into_iter()
+                .map(|path| {
+                    let sensitive = classify_path(&path);
+                    FileChange {
+                        path,
+                        added: None,
+                        deleted: None,
+                        is_new_untracked: true,
+                        sensitive,
+                    }
+                })
+                .collect();
+            return AuditReport::Available {
                 duration,
                 exit_code,
+                changes,
+                total_added: 0,
+                total_deleted: 0,
+                tracked_audited: false,
             };
         };
 
         // Net TRACKED changes vs the *pinned* commit — not moving HEAD.
-        let tracked = git_output(&self.project_dir, &["diff", "--numstat", &sha])
-            .map(|out| parse_numstat(&out))
-            .unwrap_or_default();
+        // `--no-renames` makes a rename surface as an explicit deletion +
+        // addition; `-z` emits paths verbatim. A `None` here means the diff
+        // command FAILED (e.g. the agent ran `git gc` and the pinned commit is
+        // now unreachable, or the index is locked/corrupt, or git timed out).
+        // Reporting that as an empty/clean audit would falsely affirm a clean
+        // session we could not actually verify, so we surface it honestly as
+        // Incomplete instead.
+        let Some(tracked_out) = git_output(
+            &self.project_dir,
+            &["diff", "--numstat", "-z", "--no-renames", &sha],
+        ) else {
+            return AuditReport::Incomplete {
+                duration,
+                exit_code,
+            };
+        };
+        let tracked = parse_numstat(&tracked_out);
 
+        // Likewise, a failed after-untracked query with a valid baseline is an
+        // incomplete audit — not a clean one.
+        let Some(after_untracked) = after_untracked_opt else {
+            return AuditReport::Incomplete {
+                duration,
+                exit_code,
+            };
+        };
         // Net NEW untracked files: after-untracked MINUS before-untracked.
-        let after_untracked = git_output(&self.project_dir, &["status", "--porcelain", "-uall"])
-            .map(|s| parse_untracked(&s))
-            .unwrap_or_default();
         let new_files = new_untracked(&self.before_untracked, &after_untracked);
 
         let mut total_added = 0u64;
@@ -304,6 +386,7 @@ impl Baseline {
             changes,
             total_added,
             total_deleted,
+            tracked_audited: true,
         }
     }
 }
@@ -324,17 +407,36 @@ impl AuditReport {
                     "change audit unavailable: project is not a git repository (or has no commits)",
                 );
             }
+            AuditReport::Incomplete {
+                duration,
+                exit_code,
+            } => {
+                ui::info(&format!(
+                    "Session ended (exit {exit_code}, {})",
+                    human_duration(*duration)
+                ));
+                // Distinct, honest outcome: a baseline existed but git could not
+                // measure the net changes. Never rendered as a clean session.
+                ui::warn("audit incomplete — could not verify project changes");
+            }
             AuditReport::Available {
                 duration,
                 exit_code,
                 changes,
                 total_added,
                 total_deleted,
+                tracked_audited,
             } => {
                 ui::info(&format!(
                     "Session ended (exit {exit_code}, {})",
                     human_duration(*duration)
                 ));
+                if !tracked_audited {
+                    // No baseline commit: only untracked additions are shown.
+                    ui::warn(
+                        "tracked-change audit unavailable (no baseline commit); showing new untracked files only",
+                    );
+                }
                 if changes.is_empty() {
                     ui::info("no project file changes");
                     return;
@@ -380,18 +482,65 @@ fn human_duration(d: Duration) -> String {
 }
 
 /// Run `git` in `project_dir`, returning stdout on success or `None` on any
-/// failure (git missing, non-zero exit, non-UTF8). Never panics — git absence
-/// must degrade cleanly.
+/// failure (git missing, non-zero exit, timeout, non-UTF8). Never panics — git
+/// absence or a hang must degrade cleanly.
+///
+/// `--no-optional-locks` is prepended so read-only queries (`status`) never take
+/// the index lock — avoiding contention with a concurrent git and needless disk
+/// writes. The call is bounded by [`GIT_TIMEOUT`]: the child is spawned, its
+/// stdout drained on a helper thread (so a large diff can't fill the pipe buffer
+/// and deadlock while we poll), and on timeout the child is killed and reaped
+/// (no zombie) before returning `None`.
 fn git_output(project_dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let mut child = Command::new("git")
+        .arg("--no-optional-locks")
         .args(args)
         .current_dir(project_dir)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+
+    // Drain stdout on a helper thread so git can never block writing to a full
+    // pipe while the main thread waits for it to exit.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Timed out: kill and reap so we don't leak a zombie, then
+                    // let the reader observe EOF and join.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+        }
+    };
+
+    // Child exited; its stdout write end is closed, so the reader hits EOF.
+    let buf = reader.join().ok()?;
+    if !status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Wrap a sandboxed exec with the audit lifecycle: capture the baseline just
@@ -511,7 +660,8 @@ mod tests {
 
     #[test]
     fn parse_numstat_parses_counts_and_binary() {
-        let out = "40\t2\tsrc/main.rs\n0\t10\tREADME.md\n-\t-\tlogo.png\n";
+        // `-z`: TAB between the three fields, NUL between records (trailing NUL).
+        let out = "40\t2\tsrc/main.rs\x000\t10\tREADME.md\x00-\t-\tlogo.png\x00";
         let parsed = parse_numstat(out);
         assert_eq!(parsed.len(), 3);
         assert_eq!(
@@ -526,11 +676,51 @@ mod tests {
         assert_eq!(parsed[2].deleted, None);
     }
 
+    /// FIX 4: under `-z` git emits paths verbatim, so a filename with a space
+    /// round-trips without quoting/C-escaping mangling.
+    #[test]
+    fn parse_numstat_handles_spaced_path_under_z() {
+        let out = "3\t1\tmy notes.txt\0";
+        let parsed = parse_numstat(out);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "my notes.txt");
+        assert_eq!(parsed[0].added, Some(3));
+        assert_eq!(parsed[0].deleted, Some(1));
+    }
+
+    /// FIX 3: a rename under `--no-renames` surfaces as a deletion (`+0 -N`) of
+    /// the old path plus an addition of the new path — two plain records the
+    /// parser handles independently.
+    #[test]
+    fn parse_numstat_rename_as_delete_plus_add() {
+        // What `git diff --numstat -z --no-renames` emits for `old.txt`→`new.txt`.
+        let out = "0\t2\told.txt\x002\t0\tnew.txt\x00";
+        let parsed = parse_numstat(out);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].path, "old.txt");
+        assert_eq!(parsed[0].added, Some(0));
+        assert_eq!(parsed[0].deleted, Some(2));
+        assert_eq!(parsed[1].path, "new.txt");
+        assert_eq!(parsed[1].added, Some(2));
+        assert_eq!(parsed[1].deleted, Some(0));
+    }
+
     #[test]
     fn parse_untracked_extracts_question_entries() {
-        let porcelain = " M src/main.rs\n?? new.txt\n?? sub/dir/x.sh\nA  staged.rs\n";
+        // `-z`: entries NUL-separated; a rename emits its old path as a bare
+        // trailing field ("app.rs") which lacks the `?? ` prefix and is dropped.
+        let porcelain = " M src/main.rs\0R  renamed.rs\0app.rs\0?? new.txt\0?? sub/dir/x.sh\0";
         let untracked = parse_untracked(porcelain);
         assert_eq!(untracked, set(&["new.txt", "sub/dir/x.sh"]));
+    }
+
+    /// FIX 4: an untracked path containing a space round-trips verbatim under
+    /// `-z` (no surrounding quotes to strip).
+    #[test]
+    fn parse_untracked_handles_spaced_path_under_z() {
+        let porcelain = "?? my file.txt\0?? plain.rs\0";
+        let untracked = parse_untracked(porcelain);
+        assert_eq!(untracked, set(&["my file.txt", "plain.rs"]));
     }
 
     #[test]
@@ -543,9 +733,25 @@ mod tests {
         };
         match base.finish(0) {
             AuditReport::Unavailable { exit_code, .. } => assert_eq!(exit_code, 0),
-            other @ AuditReport::Available { .. } => {
-                panic!("expected Unavailable, got {other:?}")
-            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// FIX 1 (honesty): a VALID baseline whose post-run diff FAILS must report
+    /// `Incomplete`, never a clean/empty `Available`. Here the pinned SHA is
+    /// non-empty but the project dir isn't a git repo, so `git diff <sha>`
+    /// fails — the code must not silently treat that as "no changes".
+    #[test]
+    fn finish_reports_incomplete_when_diff_fails_with_valid_baseline() {
+        let base = Baseline {
+            start: Instant::now(),
+            project_dir: PathBuf::from("/nonexistent"),
+            pinned_sha: Some("deadbeef".to_string()),
+            before_untracked: BTreeSet::new(),
+        };
+        match base.finish(0) {
+            AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
+            other => panic!("expected Incomplete, got {other:?}"),
         }
     }
 }
