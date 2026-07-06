@@ -147,6 +147,52 @@ Localhost outbound is blocked by default, which prevents sandboxed processes fro
 
 **Fix:** Use `cplt config set allow.localhost <PORT>` for specific services, or `cplt config set sandbox.allow_localhost_any true` for build tools that use random ports (Next.js, Vite, esbuild).
 
+## App/build can't reach the network under cplt (proxy env vars)
+
+**Symptom:** Your own app, `gradle run`, a test suite, or any HTTP client "can't reach the network under cplt" — connections time out or fail — but the same code works fine when you run it outside cplt.
+
+**Mechanism.** When the proxy is enabled (the default), cplt injects the standard proxy environment variables into the sandboxed session so agent traffic can be filtered and logged ([`src/sandbox_exec.rs`](../src/sandbox_exec.rs)):
+
+```
+HTTP_PROXY   HTTPS_PROXY   http_proxy   https_proxy   NODE_USE_ENV_PROXY=1
+```
+
+These are inherited by **every** process in the session — not just the agent, but your app, build tool, and tests too. Any HTTP client that reads these variables now routes through cplt's local CONNECT proxy on `127.0.0.1`.
+
+That routing is not, by itself, a block. **By default the proxy runs in allow-all mode:** with no allowlist file configured it enforces no domain allowlist (`src/proxy.rs` — "no file configured = no allowlist"), and `proxy.forced` is off by default, so cplt does **not** restrict which outbound domains your app may reach. It observes traffic; it does not deny it unless you configure an allowlist or blocklist.
+
+So a *wholesale* "no connectivity at all" is almost always the **client mishandling the proxy env vars**, not cplt policy. Outside cplt those variables aren't set, so a buggy client silently connects directly and appears to "work" — which makes cplt look like the culprit when it isn't.
+
+**Concrete example — Ktor 3.5.0.** Ktor **3.5.0** shipped a known proxy-handling regression that breaks requests when `HTTP(S)_PROXY` is set; it is **fixed in 3.5.1**. If your app uses Ktor's client, upgrade to **3.5.1 or newer**. This is a client-library bug that surfaces under cplt only because cplt is what sets the proxy env vars — cplt is not blocking the traffic.
+
+**How to diagnose (see whether the proxy blocked anything):**
+
+Run with the proxy audit log and watch what the proxy actually does:
+
+```bash
+# Write every CONNECT and its outcome to a file (records everything, regardless of log level):
+cplt --proxy-log ./proxy.log -- -p "run my app"
+
+# Or raise stderr verbosity to see connections live (none | error | blocked | all):
+cplt --proxy-log-level all -- -p "run my app"
+```
+
+Or persist it in config:
+
+```bash
+cplt config set proxy.log_file ~/cplt-proxy.log
+cplt config set proxy.log_level all
+```
+
+Then interpret the log:
+
+- If you see the request's host **flowing through** (or the log shows nothing `BLOCKED`), the proxy allowed it — the fault is **client-side proxy handling**. Confirm your HTTP client honors the standard `HTTP_PROXY`/`HTTPS_PROXY` variables, and upgrade known-buggy versions (e.g. Ktor 3.5.0 → 3.5.1+).
+- If you see `BLOCKED-ALLOWLIST` / `BLOCKED` lines, you *have* configured an allowlist or blocklist and the domain isn't permitted — that's a policy question, not a client bug.
+
+> **Upstream corporate proxies are a different scenario.** The above is about cplt's *own* proxy. If your organization requires outbound HTTPS to go through a corporate proxy, cplt can chain to it — `proxy.upstream` / `--proxy-upstream` (see `cplt config explain proxy.upstream`). Per-host bypass of that upstream — letting a specific internal host connect directly rather than via the corporate proxy — is a separate upstream-chaining concern; don't conflate it with the domain filtering above.
+
+> **`sandbox.allow_browser` is not a network switch.** It only lets the agent open URLs in your default browser for OAuth code flows. It has nothing to do with whether your app can make HTTP requests — toggling it will not fix (or cause) the connectivity symptom above.
+
 ## Docker and Testcontainers
 
 Docker is **intentionally blocked** — `~/.docker` is denied and the Docker socket is not accessible. This is by design: Docker gives near-root access to the host system, which defeats the purpose of sandboxing.
