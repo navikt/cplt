@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use super::error::ConfigError;
 use super::path::{config_path, expand_tilde, resolve_config_path};
 use super::types::{
-    CliFlags, Config, EnforcementMode, GhGuardPolicy, GitGuardPolicy, LoadedConfig, Resolved,
-    ResolvedPushRule, UnknownCommandPolicy,
+    CliFlags, Config, EnforcementMode, GhGuardPolicy, GitGuardPolicy, LoadedConfig, Preset,
+    Resolved, ResolvedPushRule, UnknownCommandPolicy,
 };
 use crate::sandbox::{HardeningCategory, validate_sbpl_path};
 use crate::ui;
@@ -89,15 +89,35 @@ impl Config {
         cli: CliFlags,
         no_proxy_env: Option<String>,
     ) -> Result<Resolved, ConfigError> {
+        // Policy preset: sets a BASELINE spanning two axes — the five sandbox
+        // toggles below AND the three safety features (gh_guard, git_guard,
+        // proxy.forced). Precedence for the preset itself: CLI (--preset) wins
+        // over config ([sandbox] preset). The baseline it implies is the
+        // *lowest* layer for each field — explicit individual CLI flags and
+        // config values still override it (see each
+        // `*.to_option().or(config).unwrap_or(baseline)` for toggles and the
+        // `.resolve(config.or(...).unwrap_or(baseline))` for the guards/proxy).
+        let preset = cli.preset.or(self.sandbox.preset);
+        // No preset == "standard" == cplt's hardcoded defaults (all five
+        // toggles off, no guards, no forced proxy). Only `strict` turns the
+        // safety features on.
+        let baseline = preset.unwrap_or(Preset::Standard).baseline();
+
         // Proxy: FeatureToggle resolves --with-proxy/--no-proxy against config default (true).
         let with_proxy = cli.proxy.resolve(self.proxy.enabled.unwrap_or(true));
 
-        // Proxy-forced: FeatureToggle resolves --proxy-forced/--no-proxy-forced
-        // against config default (false). When true, the proxy is mandatory and
-        // kernel egress is locked to the proxy port (#53). Orchestration in main.rs
-        // enforces proxy-on + fail-closed; the conflict with an explicitly disabled
-        // proxy is reported there.
-        let proxy_forced = cli.proxy_forced.resolve(self.proxy.forced.unwrap_or(false));
+        // Proxy-forced: FeatureToggle resolves --proxy-forced/--no-proxy-forced,
+        // then the explicit config value, then the preset baseline (false unless
+        // `strict`). Precedence: CLI flag > config > preset > default(off) —
+        // mirrors the toggle pattern, with the preset threaded in as the lowest
+        // layer. When true, the proxy is mandatory and kernel egress is locked
+        // to the proxy port (#53). Orchestration in main.rs enforces proxy-on +
+        // fail-closed; the conflict with an explicitly disabled proxy is
+        // reported there (so `--preset strict` with proxy.enabled=false fails
+        // closed rather than silently).
+        let proxy_forced = cli
+            .proxy_forced
+            .resolve(self.proxy.forced.unwrap_or(baseline.proxy_forced));
 
         // Port: CLI (if provided) > config > 0 (OS-assigned ephemeral port)
         let proxy_port = cli.proxy_port.or(self.proxy.port).unwrap_or(0);
@@ -244,12 +264,13 @@ impl Config {
             !self.sandbox.validate.unwrap_or(true)
         };
 
-        // Allow-env-files: CLI flag wins, then config, then false (deny by default)
-        let allow_env_files = if cli.allow_env_files {
-            true
-        } else {
-            self.sandbox.allow_env_files.unwrap_or(false)
-        };
+        // Allow-env-files: explicit CLI flag wins, then explicit config value,
+        // then the preset baseline (false when no preset — deny by default).
+        let allow_env_files = cli
+            .allow_env_files
+            .to_option()
+            .or(self.sandbox.allow_env_files)
+            .unwrap_or(baseline.allow_env_files);
 
         // Allow-ports: merge config + CLI
         let mut allow_ports = self.allow.ports.clone();
@@ -263,12 +284,13 @@ impl Config {
         allow_localhost.sort_unstable();
         allow_localhost.dedup();
 
-        // Allow-localhost-any: CLI flag wins, then config, then false
-        let allow_localhost_any = if cli.allow_localhost_any {
-            true
-        } else {
-            self.sandbox.allow_localhost_any.unwrap_or(false)
-        };
+        // Allow-localhost-any: explicit CLI flag wins, then explicit config
+        // value, then the preset baseline (false when no preset).
+        let allow_localhost_any = cli
+            .allow_localhost_any
+            .to_option()
+            .or(self.sandbox.allow_localhost_any)
+            .unwrap_or(baseline.allow_localhost_any);
 
         // Pass-env: merge config + CLI
         let mut pass_env = self.sandbox.pass_env.clone();
@@ -283,12 +305,13 @@ impl Config {
             self.sandbox.inherit_env.unwrap_or(false)
         };
 
-        // Allow-lifecycle-scripts: CLI flag wins, then config, then false (blocked by default)
-        let allow_lifecycle_scripts = if cli.allow_lifecycle_scripts {
-            true
-        } else {
-            self.sandbox.allow_lifecycle_scripts.unwrap_or(false)
-        };
+        // Allow-lifecycle-scripts: explicit CLI flag wins, then explicit config
+        // value, then the preset baseline (false when no preset — blocked).
+        let allow_lifecycle_scripts = cli
+            .allow_lifecycle_scripts
+            .to_option()
+            .or(self.sandbox.allow_lifecycle_scripts)
+            .unwrap_or(baseline.allow_lifecycle_scripts);
 
         // Allow-gpg-signing: CLI flag wins, then config, then false (blocked by default)
         let allow_gpg_signing = if cli.allow_gpg_signing {
@@ -307,19 +330,21 @@ impl Config {
             self.sandbox.allow_jvm_attach.unwrap_or(false)
         };
 
-        // Allow-docker: CLI flag wins, then config, then false (blocked by default)
-        let allow_docker = if cli.allow_docker {
-            true
-        } else {
-            self.sandbox.allow_docker.unwrap_or(false)
-        };
+        // Allow-docker: explicit CLI flag wins, then explicit config value,
+        // then the preset baseline (false when no preset — blocked).
+        let allow_docker = cli
+            .allow_docker
+            .to_option()
+            .or(self.sandbox.allow_docker)
+            .unwrap_or(baseline.allow_docker);
 
-        // Allow-tmp-exec: CLI flag wins, then config, then false (blocked by default)
-        let allow_tmp_exec = if cli.allow_tmp_exec {
-            true
-        } else {
-            self.sandbox.allow_tmp_exec.unwrap_or(false)
-        };
+        // Allow-tmp-exec: explicit CLI flag wins, then explicit config value,
+        // then the preset baseline (false when no preset — blocked).
+        let allow_tmp_exec = cli
+            .allow_tmp_exec
+            .to_option()
+            .or(self.sandbox.allow_tmp_exec)
+            .unwrap_or(baseline.allow_tmp_exec);
 
         // Allow-cache-exec: merge config + CLI (list of subdir names)
         let mut allow_cache_exec = self.sandbox.allow_cache_exec.clone();
@@ -366,11 +391,14 @@ impl Config {
 
         // gh-guard: CLI flag overrides enabled; sub-options come from [gh_proxy] config.
         // Backward compat: old `sandbox.gh_proxy = true` is treated as `gh_guard.enabled = true`.
+        // Precedence: CLI flag > config value > preset baseline > default(off).
+        // Only `strict` sets the baseline on — every other preset (and none)
+        // leaves it at `false`, so resolution is unchanged for them.
         let gh_guard_enabled_default = self
             .gh_guard
             .enabled
             .or(self.sandbox.gh_proxy)
-            .unwrap_or(false);
+            .unwrap_or(baseline.gh_guard_enabled);
         let gh_guard_enabled = cli.gh_guard.resolve(gh_guard_enabled_default);
         let gh_guard = GhGuardPolicy {
             enabled: gh_guard_enabled,
@@ -386,11 +414,13 @@ impl Config {
         };
 
         // git-guard: CLI flag overrides enabled. Backward compat from sandbox.git_push_prevention.
+        // Precedence: CLI flag > config value > preset baseline > default(off).
+        // Only `strict` sets the baseline on; unchanged for every other case.
         let git_guard_enabled_default = self
             .git_guard
             .enabled
             .or(self.sandbox.git_push_prevention)
-            .unwrap_or(false);
+            .unwrap_or(baseline.git_guard_enabled);
         let git_guard_enabled = cli.git_push_prevention.resolve(git_guard_enabled_default);
         let git_guard = GitGuardPolicy {
             enabled: git_guard_enabled,
@@ -487,6 +517,7 @@ impl Config {
             yes,
             gh_guard,
             git_guard,
+            preset,
             agent: self.sandbox.agent.clone(),
             deny_env: Vec::new(),
         })
@@ -565,6 +596,13 @@ impl Resolved {
         eprintln!();
         eprintln!("{blue}[cplt]{nc} ── Sandbox Configuration ─────────────────────────");
         eprintln!();
+
+        if let Some(preset) = self.preset {
+            eprintln!(
+                "{blue}[cplt]{nc}  {dim}Preset:{nc}        {green}{preset}{nc}         {dim}baseline — individual flags still override{nc}"
+            );
+            eprintln!();
+        }
 
         // Filesystem
         eprintln!("{blue}[cplt]{nc}  {dim}Filesystem:{nc}");
@@ -1008,7 +1046,7 @@ impl Resolved {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::FeatureToggle;
+    use super::super::types::{FeatureToggle, Preset};
     use super::*;
 
     #[test]
@@ -1316,7 +1354,7 @@ validate = false
         let config = Config::default();
         let resolved = config
             .merge(CliFlags {
-                allow_env_files: true,
+                allow_env_files: FeatureToggle::ForceOn,
                 ..Default::default()
             })
             .unwrap();
@@ -1612,6 +1650,351 @@ validate = false
             resolved
                 .allow_private_domains
                 .contains(&"intern.nav.no".to_string())
+        );
+    }
+
+    // ── Policy presets (issue #59) ───────────────────────────────────
+    //
+    // The preset sets a BASELINE for five toggles; explicit individual
+    // flags/config values override it. `standard`/no-preset is a no-op
+    // baseline equal to cplt's hardcoded defaults.
+
+    /// Snapshot of the five preset-controlled toggle values, for terse asserts.
+    fn toggle_snapshot(r: &Resolved) -> (bool, bool, bool, bool, bool) {
+        (
+            r.allow_localhost_any,
+            r.allow_env_files,
+            r.allow_tmp_exec,
+            r.allow_docker,
+            r.allow_lifecycle_scripts,
+        )
+    }
+
+    #[test]
+    fn preset_strict_maps_to_all_off() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            toggle_snapshot(&resolved),
+            (false, false, false, false, false)
+        );
+        assert_eq!(resolved.preset, Some(Preset::Strict));
+    }
+
+    #[test]
+    fn preset_standard_maps_to_all_off() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Standard),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            toggle_snapshot(&resolved),
+            (false, false, false, false, false)
+        );
+        // scratch dir stays on by default — not a preset-controlled toggle.
+        assert!(resolved.scratch_dir);
+    }
+
+    #[test]
+    fn preset_permissive_maps_localhost_tmp_lifecycle_on() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Permissive),
+                ..Default::default()
+            })
+            .unwrap();
+        // localhost, tmp exec, lifecycle ON; env files + docker OFF.
+        assert_eq!(toggle_snapshot(&resolved), (true, false, true, false, true));
+    }
+
+    #[test]
+    fn preset_full_trust_maps_to_all_on() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::FullTrust),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(toggle_snapshot(&resolved), (true, true, true, true, true));
+    }
+
+    #[test]
+    fn preset_from_name_roundtrips_canonical_names() {
+        assert_eq!(Preset::from_name("strict"), Some(Preset::Strict));
+        assert_eq!(Preset::from_name("standard"), Some(Preset::Standard));
+        assert_eq!(Preset::from_name("permissive"), Some(Preset::Permissive));
+        assert_eq!(Preset::from_name("full-trust"), Some(Preset::FullTrust));
+        assert_eq!(Preset::from_name("bogus"), None);
+    }
+
+    #[test]
+    fn preset_enabled_dangerous_names_matches_toggles() {
+        // Safe presets enable nothing dangerous.
+        assert!(Preset::Strict.enabled_dangerous_names().is_empty());
+        assert!(Preset::Standard.enabled_dangerous_names().is_empty());
+        // Permissive names exactly its three toggles, in display order.
+        assert_eq!(
+            Preset::Permissive.enabled_dangerous_names(),
+            vec!["tmp-exec", "localhost-any", "lifecycle-scripts"]
+        );
+        // Full-trust adds docker + env-files.
+        assert_eq!(
+            Preset::FullTrust.enabled_dangerous_names(),
+            vec![
+                "tmp-exec",
+                "localhost-any",
+                "lifecycle-scripts",
+                "docker",
+                "env-files"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_preset_equals_standard_defaults() {
+        // No preset must be byte-for-byte the same five toggles as `standard`
+        // (and as today's hardcoded defaults) — no behavior change.
+        let none = Config::default().merge(CliFlags::default()).unwrap();
+        let standard = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Standard),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(toggle_snapshot(&none), (false, false, false, false, false));
+        assert_eq!(toggle_snapshot(&none), toggle_snapshot(&standard));
+        assert_eq!(none.preset, None);
+    }
+
+    #[test]
+    fn explicit_config_value_overrides_preset() {
+        // preset = permissive (tmp exec ON) but an explicit config value pins it
+        // OFF → tmp exec is off, everything else follows permissive.
+        let config: Config =
+            toml::from_str("[sandbox]\npreset = \"permissive\"\nallow_tmp_exec = false\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.allow_tmp_exec,
+            "explicit config value must win over preset"
+        );
+        assert!(
+            resolved.allow_localhost_any,
+            "other permissive toggles still apply"
+        );
+        assert!(resolved.allow_lifecycle_scripts);
+    }
+
+    #[test]
+    fn explicit_cli_flag_overrides_preset() {
+        // --preset permissive --no-allow-tmp-exec → permissive-except-tmp-exec.
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Permissive),
+                allow_tmp_exec: FeatureToggle::ForceOff,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !resolved.allow_tmp_exec,
+            "explicit CLI flag must win over preset"
+        );
+        assert!(resolved.allow_localhost_any);
+        assert!(resolved.allow_lifecycle_scripts);
+    }
+
+    #[test]
+    fn cli_flag_forces_toggle_on_over_strict_preset() {
+        // --preset strict --allow-docker → docker on despite the strict baseline.
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                allow_docker: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.allow_docker);
+        assert!(!resolved.allow_tmp_exec, "other strict toggles remain off");
+    }
+
+    #[test]
+    fn cli_preset_overrides_config_preset() {
+        // config preset = full-trust, CLI --preset strict → strict wins.
+        let config: Config = toml::from_str("[sandbox]\npreset = \"full-trust\"\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            toggle_snapshot(&resolved),
+            (false, false, false, false, false)
+        );
+        assert_eq!(resolved.preset, Some(Preset::Strict));
+    }
+
+    #[test]
+    fn config_preset_applies_when_no_cli_preset() {
+        let config: Config = toml::from_str("[sandbox]\npreset = \"full-trust\"\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert_eq!(toggle_snapshot(&resolved), (true, true, true, true, true));
+        assert_eq!(resolved.preset, Some(Preset::FullTrust));
+    }
+
+    #[test]
+    fn preset_deserialize_rejects_unknown_value() {
+        let err = toml::from_str::<Config>("[sandbox]\npreset = \"yolo\"\n").unwrap_err();
+        assert!(err.to_string().contains("invalid preset"), "got: {err}");
+    }
+
+    /// Snapshot of the three safety-feature values a preset can set as a
+    /// baseline: (gh_guard.enabled, git_guard.enabled, proxy_forced).
+    fn posture_snapshot(r: &Resolved) -> (bool, bool, bool) {
+        (r.gh_guard.enabled, r.git_guard.enabled, r.proxy_forced)
+    }
+
+    #[test]
+    fn preset_strict_enables_guards_and_forced_proxy() {
+        // strict is a real posture: five toggles off, but the safety features on.
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            toggle_snapshot(&resolved),
+            (false, false, false, false, false)
+        );
+        assert_eq!(posture_snapshot(&resolved), (true, true, true));
+    }
+
+    #[test]
+    fn preset_standard_leaves_guards_and_proxy_off() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Standard),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(posture_snapshot(&resolved), (false, false, false));
+    }
+
+    #[test]
+    fn preset_permissive_leaves_guards_and_proxy_off() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Permissive),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(posture_snapshot(&resolved), (false, false, false));
+    }
+
+    #[test]
+    fn preset_full_trust_leaves_guards_and_proxy_off() {
+        // full-trust weakens the sandbox but does NOT touch the safety features.
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::FullTrust),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(posture_snapshot(&resolved), (false, false, false));
+    }
+
+    #[test]
+    fn no_preset_equals_standard_posture_defaults() {
+        // The critical no-regression test: no preset must resolve EXACTLY like
+        // `standard` (and today's hardcoded defaults) across every posture
+        // field — guards off, forced proxy off — not just the five toggles.
+        let none = Config::default().merge(CliFlags::default()).unwrap();
+        let standard = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Standard),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(posture_snapshot(&none), (false, false, false));
+        assert_eq!(posture_snapshot(&none), posture_snapshot(&standard));
+        assert_eq!(toggle_snapshot(&none), toggle_snapshot(&standard));
+    }
+
+    #[test]
+    fn explicit_config_gh_guard_disabled_overrides_strict() {
+        // preset = strict (gh_guard baseline ON) but an explicit config value
+        // pins it OFF → explicit wins; git_guard + forced proxy still follow strict.
+        let config: Config =
+            toml::from_str("[sandbox]\npreset = \"strict\"\n[gh_guard]\nenabled = false\n")
+                .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.gh_guard.enabled,
+            "explicit gh_guard.enabled=false must win over strict baseline"
+        );
+        assert!(resolved.git_guard.enabled, "git_guard still follows strict");
+        assert!(resolved.proxy_forced, "proxy.forced still follows strict");
+    }
+
+    #[test]
+    fn explicit_config_git_guard_disabled_overrides_strict() {
+        let config: Config =
+            toml::from_str("[sandbox]\npreset = \"strict\"\n[git_guard]\nenabled = false\n")
+                .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.git_guard.enabled,
+            "explicit git_guard.enabled=false must win over strict baseline"
+        );
+        assert!(resolved.gh_guard.enabled);
+        assert!(resolved.proxy_forced);
+    }
+
+    #[test]
+    fn explicit_config_proxy_forced_disabled_overrides_strict() {
+        let config: Config =
+            toml::from_str("[sandbox]\npreset = \"strict\"\n[proxy]\nforced = false\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.proxy_forced,
+            "explicit proxy.forced=false must win over strict baseline"
+        );
+        assert!(resolved.gh_guard.enabled);
+        assert!(resolved.git_guard.enabled);
+    }
+
+    #[test]
+    fn strict_preset_plus_allow_localhost_any_reconciles_off() {
+        // #53 interaction: --preset strict turns proxy.forced ON (baseline);
+        // an explicit --allow-localhost-any turns that toggle ON (CLI wins over
+        // baseline). The two are mutually exclusive, so reconcile forces
+        // allow_localhost_any back off (with the caller warning) — proxy.forced
+        // wins and kernel egress stays locked.
+        let mut resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                allow_localhost_any: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.proxy_forced, "strict forces the proxy");
+        assert!(
+            resolved.allow_localhost_any,
+            "explicit flag set it on first"
+        );
+        assert!(
+            resolved.reconcile_proxy_forced(),
+            "reconcile must report it superseded allow_localhost_any"
+        );
+        assert!(
+            !resolved.allow_localhost_any,
+            "proxy.forced wins: localhost-any forced off"
         );
     }
 }

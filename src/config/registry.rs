@@ -198,6 +198,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "preset",
+        value_type: ConfigValueType::Str,
+        dangerous: false,
+        default_display: "standard",
+        description: "Security posture baseline: \"strict\" (all toggles off AND gh_guard + git_guard + proxy.forced ON — locked down), \"standard\" (default, no-op), \"permissive\", or \"full-trust\". Only strict enables the guards/forced proxy; the others leave them at default. Individual keys/flags override it.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "validate",
         value_type: ConfigValueType::Bool,
         dangerous: false,

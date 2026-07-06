@@ -51,6 +51,68 @@ into saved config:
 
 Use `cplt config explain` to see what a key does and how to set it.
 
+## Policy presets
+
+Instead of toggling individual flags, pick a named **preset** — a security
+*posture* that sets a baseline for the five sandbox toggles **and** the safety
+features (`gh_guard`, `git_guard`, forced-proxy egress) with one flag or key:
+
+```bash
+cplt --preset strict       # locked down: toggles off + guards + forced proxy on
+cplt --preset standard     # the current defaults (no-op baseline)
+cplt --preset permissive   # localhost + tmp exec + lifecycle scripts on
+cplt --preset full-trust   # everything on (docker, env files, tmp exec, localhost, lifecycle)
+```
+
+Or in config:
+
+```toml
+[sandbox]
+preset = "standard"
+```
+
+| Preset | localhost (`allow_localhost_any`) | env files (`allow_env_files`) | tmp exec (`allow_tmp_exec`) | docker (`allow_docker`) | lifecycle (`allow_lifecycle_scripts`) | `gh_guard` | `git_guard` | `proxy.forced` |
+|--------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `strict` | off | off | off | off | off | **on** | **on** | **on** |
+| `standard` | off | off | off¹ | off | off | off | off | off |
+| `permissive` | **on** | off | **on** | off | **on** | off | off | off |
+| `full-trust` | **on** | **on** | **on** | **on** | **on** | off | off | off |
+
+¹ `standard` leaves the per-session scratch directory on (the default), which is
+what most tools need — `allow_tmp_exec` (raw `/tmp` exec) stays off. `standard`
+is identical to cplt's hardcoded defaults, so omitting `--preset` behaves exactly
+like `--preset standard`.
+
+**Only `strict` enables the safety features.** It hardens the two dimensions that
+matter most — `gh_guard` (gate GitHub traffic), `git_guard` (block push/force-push),
+and `proxy.forced` (mandatory proxy, kernel egress locked to it). `standard`,
+`permissive`, and `full-trust` all leave those three at their default (off), so
+selecting them changes nothing about guards or forced egress. `strict` enables
+only *safety* features, so `config set sandbox.preset strict` needs no `--force`
+(unlike `permissive`/`full-trust`, which weaken the sandbox).
+
+**Precedence — the preset is only a baseline.** An explicit individual flag or
+config value always overrides the preset, whichever source the preset came from:
+
+```bash
+# permissive baseline, but keep tmp exec blocked:
+cplt --preset permissive --no-allow-tmp-exec
+
+# strict baseline, but allow docker just for this run:
+cplt --preset strict --allow-docker
+```
+
+The resolution order for each toggle is: **explicit CLI flag → explicit config
+value → preset baseline → hardcoded default (off)**. The preset itself resolves
+CLI (`--preset`) over config (`[sandbox] preset`). Each preset-controlled flag has
+a matching `--no-…` form (`--no-allow-localhost-any`, `--no-allow-env-files`,
+`--no-allow-tmp-exec`, `--no-allow-docker`, `--no-allow-lifecycle-scripts`) so you
+can opt a single toggle out of a permissive/full-trust baseline.
+
+Presets are **global-only** — they cannot be requested from a repo `.cplt.toml`,
+because a single preset would silently pull in several dangerous permissions and
+defeat per-key trust review. A repo must propose individual keys instead.
+
 Use **repo config + trust** for project-specific sandbox permissions that
 belong to the repository, and **global config** for machine-specific paths:
 
@@ -67,6 +129,7 @@ with an explanation — set them in `~/.config/cplt/config.toml` instead:
 
 | Key | Why |
 |---|---|
+| `sandbox.preset` | composes several dangerous permissions into one baseline — a repo must request individual keys so each is reviewed and trusted separately |
 | `sandbox.agent` | preferred agent depends on what's installed locally |
 | `sandbox.quiet` | local output preference |
 | `sandbox.yes` | local prompt-skip preference |

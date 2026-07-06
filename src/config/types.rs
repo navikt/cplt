@@ -154,6 +154,187 @@ impl<'de> Deserialize<'de> for UnknownCommandPolicy {
     }
 }
 
+/// Named policy preset — a security *posture*, not just a filesystem/exec
+/// permission profile. Sets a baseline across two axes with one flag/key:
+/// the five sandbox toggles AND the safety features (`gh_guard`, `git_guard`,
+/// forced-proxy egress). Individual flags and config values still override the
+/// baseline (see the merge logic in `loading.rs`).
+///
+/// Only `Strict` enables the safety features; `Standard`/`Permissive`/
+/// `FullTrust` leave them at their default (off). `Standard` is a no-op
+/// baseline (all five toggles off, no guards, no forced proxy) identical to
+/// cplt's hardcoded defaults, so passing no preset behaves exactly like
+/// `standard`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Preset {
+    /// Locked-down posture: no localhost, env files, tmp exec, docker, or
+    /// lifecycle scripts, AND gh_guard + git_guard + forced-proxy egress on.
+    Strict,
+    /// The current defaults (scratch dir stays on; all five toggles off, no
+    /// guards, no forced proxy).
+    Standard,
+    /// Developer-friendly: localhost, tmp exec, and lifecycle scripts on.
+    Permissive,
+    /// Everything allowed (equivalent to enabling all five toggles).
+    #[value(name = "full-trust")]
+    FullTrust,
+}
+
+/// The baseline a [`Preset`] establishes: the five sandbox toggles plus the
+/// three safety features (gh_guard, git_guard, forced proxy). The toggles
+/// *weaken* the sandbox (dangerous when on); the safety features *harden* it
+/// (never dangerous). Only [`enabled_dangerous_names`](Self::enabled_dangerous_names)
+/// — keyed on the five toggles — gates the `--force`/validate safeguards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresetBaseline {
+    pub allow_localhost_any: bool,
+    pub allow_env_files: bool,
+    pub allow_tmp_exec: bool,
+    pub allow_docker: bool,
+    pub allow_lifecycle_scripts: bool,
+    /// Safety feature: gate `gh`/GitHub-API traffic through the guard.
+    pub gh_guard_enabled: bool,
+    /// Safety feature: block dangerous `git` operations (push/force-push).
+    pub git_guard_enabled: bool,
+    /// Safety feature: mandatory proxy, kernel egress locked to the proxy port.
+    pub proxy_forced: bool,
+}
+
+impl PresetBaseline {
+    /// Human-readable names of the toggles this baseline turns **on**, in a
+    /// stable display order. Every one of these five toggles is treated as
+    /// dangerous when set explicitly (each has `dangerous: true` in the
+    /// registry and its own `config validate` warning), so this doubles as
+    /// "the dangerous settings this preset enables" — used to warn about and
+    /// name exactly what a dangerous preset turns on.
+    ///
+    /// Deriving the list from the actual toggle values means a preset warning
+    /// can never drift out of sync with what [`Preset::baseline`] enables.
+    pub fn enabled_dangerous_names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.allow_tmp_exec {
+            names.push("tmp-exec");
+        }
+        if self.allow_localhost_any {
+            names.push("localhost-any");
+        }
+        if self.allow_lifecycle_scripts {
+            names.push("lifecycle-scripts");
+        }
+        if self.allow_docker {
+            names.push("docker");
+        }
+        if self.allow_env_files {
+            names.push("env-files");
+        }
+        names
+    }
+}
+
+impl Preset {
+    /// Parse a preset from its canonical string name (as used in the config
+    /// file and on the CLI). Shared by `Deserialize` and by
+    /// validation/`config set` so the accepted names cannot drift between
+    /// parsing paths.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "strict" => Some(Self::Strict),
+            "standard" => Some(Self::Standard),
+            "permissive" => Some(Self::Permissive),
+            "full-trust" => Some(Self::FullTrust),
+            _ => None,
+        }
+    }
+
+    /// The dangerous sandbox toggles this preset enables, by name. Empty for
+    /// `strict`/`standard` (no-op baselines); non-empty for `permissive` and
+    /// `full-trust`. A non-empty result means the preset weakens the sandbox
+    /// and should trigger the same dangerous-setting safeguards as the
+    /// individual toggles it turns on.
+    pub fn enabled_dangerous_names(self) -> Vec<&'static str> {
+        self.baseline().enabled_dangerous_names()
+    }
+
+    /// Map the preset to its baseline values (five sandbox toggles + three
+    /// safety features).
+    ///
+    /// `Strict` and `Standard` share the same five *toggle* values (all off),
+    /// but differ on the safety features: only `Strict` turns on gh_guard,
+    /// git_guard, and forced-proxy egress — a genuine locked-down posture.
+    /// `Standard` is the no-op baseline (everything off), identical to cplt's
+    /// hardcoded defaults. The scratch dir is not a preset-controlled toggle
+    /// and stays at its default (on) for every preset.
+    pub fn baseline(self) -> PresetBaseline {
+        match self {
+            Self::Strict => PresetBaseline {
+                allow_localhost_any: false,
+                allow_env_files: false,
+                allow_tmp_exec: false,
+                allow_docker: false,
+                allow_lifecycle_scripts: false,
+                gh_guard_enabled: true,
+                git_guard_enabled: true,
+                proxy_forced: true,
+            },
+            Self::Standard => PresetBaseline {
+                allow_localhost_any: false,
+                allow_env_files: false,
+                allow_tmp_exec: false,
+                allow_docker: false,
+                allow_lifecycle_scripts: false,
+                gh_guard_enabled: false,
+                git_guard_enabled: false,
+                proxy_forced: false,
+            },
+            Self::Permissive => PresetBaseline {
+                allow_localhost_any: true,
+                allow_env_files: false,
+                allow_tmp_exec: true,
+                allow_docker: false,
+                allow_lifecycle_scripts: true,
+                gh_guard_enabled: false,
+                git_guard_enabled: false,
+                proxy_forced: false,
+            },
+            Self::FullTrust => PresetBaseline {
+                allow_localhost_any: true,
+                allow_env_files: true,
+                allow_tmp_exec: true,
+                allow_docker: true,
+                allow_lifecycle_scripts: true,
+                gh_guard_enabled: false,
+                git_guard_enabled: false,
+                proxy_forced: false,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for Preset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Strict => write!(f, "strict"),
+            Self::Standard => write!(f, "standard"),
+            Self::Permissive => write!(f, "permissive"),
+            Self::FullTrust => write!(f, "full-trust"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Preset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::from_name(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "invalid preset '{s}': expected \"strict\", \"standard\", \"permissive\", or \"full-trust\""
+            ))
+        })
+    }
+}
+
 /// `[gh_guard]` — gh CLI command filtering for sandboxed agents.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -304,6 +485,12 @@ pub struct SandboxConfig {
     /// Preferred AI coding agent (default: auto-detect from PATH).
     /// Use this instead of always passing --agent on the command line.
     pub agent: Option<String>,
+    /// Named policy preset that sets a baseline for the five sandbox toggles
+    /// (allow_localhost_any, allow_env_files, allow_tmp_exec, allow_docker,
+    /// allow_lifecycle_scripts). Individual keys/flags still override it.
+    /// One of "strict", "standard", "permissive", "full-trust". Default: none
+    /// (equivalent to "standard" — a no-op baseline).
+    pub preset: Option<Preset>,
     /// Run sandbox-exec validation test on startup (default: true).
     pub validate: Option<bool>,
     /// Allow reading .env files and private keys in project dir (default: false).
@@ -488,6 +675,10 @@ pub struct Resolved {
     pub yes: bool,
     pub gh_guard: GhGuardPolicy,
     pub git_guard: GitGuardPolicy,
+    /// Active policy preset after merging CLI + config (None = no preset given).
+    /// Purely informational — the baseline it implies is already applied to the
+    /// individual toggle fields above. Used for the startup summary / config show.
+    pub preset: Option<Preset>,
     /// Preferred agent from config (None = auto-detect).
     pub agent: Option<String>,
     /// Env vars to strip from the sandbox environment (from repo config [deny] section).
@@ -500,6 +691,8 @@ pub struct Resolved {
 /// `true` as an explicit CLI override.
 #[derive(Debug, Default)]
 pub struct CliFlags {
+    /// Policy preset from `--preset` (None = not given). CLI wins over config.
+    pub preset: Option<Preset>,
     pub proxy: FeatureToggle,
     pub proxy_forced: FeatureToggle,
     pub proxy_port: Option<u16>,
@@ -521,17 +714,23 @@ pub struct CliFlags {
     pub deny_paths: Vec<PathBuf>,
     pub allow_ports: Vec<u16>,
     pub allow_localhost: Vec<u16>,
-    pub allow_localhost_any: bool,
-    pub allow_env_files: bool,
+    /// Preset-controlled toggle: tri-state so `--no-allow-localhost-any` can
+    /// force it off, overriding a permissive/full-trust preset baseline.
+    pub allow_localhost_any: FeatureToggle,
+    /// Preset-controlled toggle (see `allow_localhost_any`).
+    pub allow_env_files: FeatureToggle,
     pub no_validate: bool,
     pub pass_env: Vec<String>,
     pub inherit_env: bool,
-    pub allow_lifecycle_scripts: bool,
+    /// Preset-controlled toggle (see `allow_localhost_any`).
+    pub allow_lifecycle_scripts: FeatureToggle,
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
-    pub allow_docker: bool,
-    pub allow_tmp_exec: bool,
+    /// Preset-controlled toggle (see `allow_localhost_any`).
+    pub allow_docker: FeatureToggle,
+    /// Preset-controlled toggle (see `allow_localhost_any`).
+    pub allow_tmp_exec: FeatureToggle,
     pub allow_cache_exec: Vec<String>,
     pub allow_cache_exec_any: bool,
     pub allow_browser: bool,

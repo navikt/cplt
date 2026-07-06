@@ -115,6 +115,18 @@ pub fn default_config_contents() -> String {
 # Supported: copilot, opencode, gemini, antigravity, pi, claude, shell
 # agent = "copilot"
 #
+# Named policy preset — sets a baseline for the five sandbox toggles below
+# (allow_localhost_any, allow_env_files, allow_tmp_exec, allow_docker,
+# allow_lifecycle_scripts). Individual keys still override the preset.
+#   strict      = all five off (deny-default)
+#   standard    = current defaults (all five off, scratch dir stays on)
+#   permissive  = localhost + tmp exec + lifecycle scripts on
+#   full-trust  = all five on
+# Omit for "standard" (a no-op baseline). E.g. permissive but keep tmp exec off:
+#   preset = "permissive"
+#   allow_tmp_exec = false
+# preset = "standard"
+#
 # Run sandbox-exec validation test on every launch (default: true).
 # Disable to save ~200ms startup if you trust your config.
 # validate = true

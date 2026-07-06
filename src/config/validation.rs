@@ -11,7 +11,7 @@
 //! surfaced as a warning at load time and as diagnostics in `cplt config validate`.
 
 use super::registry::CONFIG_KEYS;
-use super::types::Config;
+use super::types::{Config, Preset};
 
 // ── Config validation (unknown key detection) ────────────────────────
 
@@ -184,6 +184,25 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
 
     // Warn about dangerous settings
     if let Some(sandbox) = table.get("sandbox").and_then(|v| v.as_table()) {
+        // A preset is dangerous when its baseline enables any of the guarded
+        // toggles — `permissive` and `full-trust` do, `strict`/`standard` do
+        // not. Derive the enabled toggles from `Preset::baseline()` (via
+        // `enabled_dangerous_names`) so this warning names exactly what the
+        // preset turns on and cannot drift from the preset definitions.
+        if let Some(preset_str) = sandbox.get("preset").and_then(toml::Value::as_str)
+            && let Some(preset) = Preset::from_name(preset_str)
+        {
+            let enabled = preset.enabled_dangerous_names();
+            if !enabled.is_empty() {
+                diagnostics.push(ConfigDiagnostic {
+                    level: DiagnosticLevel::Warning,
+                    message: format!(
+                        "sandbox.preset = \"{preset}\": enables {} (DANGEROUS)",
+                        enabled.join(", ")
+                    ),
+                });
+            }
+        }
         if sandbox.get("inherit_env").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
@@ -406,6 +425,70 @@ quiet = false
                 d.level == DiagnosticLevel::Warning && d.message.contains("DANGEROUS")
             })
         );
+    }
+
+    #[test]
+    fn validate_warns_about_dangerous_preset_permissive() {
+        let toml = "[sandbox]\npreset = \"permissive\"\n";
+        let diagnostics = validate_config(toml);
+        let warning = diagnostics
+            .iter()
+            .find(|d| d.level == DiagnosticLevel::Warning && d.message.contains("preset"))
+            .unwrap_or_else(|| panic!("should warn about permissive preset: {diagnostics:?}"));
+        assert!(warning.message.contains("DANGEROUS"), "{}", warning.message);
+        // Names exactly the toggles permissive enables (and none it doesn't).
+        assert!(warning.message.contains("tmp-exec"), "{}", warning.message);
+        assert!(
+            warning.message.contains("localhost-any"),
+            "{}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("lifecycle-scripts"),
+            "{}",
+            warning.message
+        );
+        assert!(!warning.message.contains("docker"), "{}", warning.message);
+        assert!(
+            !warning.message.contains("env-files"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn validate_warns_about_dangerous_preset_full_trust() {
+        let toml = "[sandbox]\npreset = \"full-trust\"\n";
+        let diagnostics = validate_config(toml);
+        let warning = diagnostics
+            .iter()
+            .find(|d| d.level == DiagnosticLevel::Warning && d.message.contains("preset"))
+            .unwrap_or_else(|| panic!("should warn about full-trust preset: {diagnostics:?}"));
+        assert!(warning.message.contains("DANGEROUS"), "{}", warning.message);
+        // full-trust enables all five toggles, including docker + env-files.
+        for name in [
+            "tmp-exec",
+            "localhost-any",
+            "lifecycle-scripts",
+            "docker",
+            "env-files",
+        ] {
+            assert!(warning.message.contains(name), "{}", warning.message);
+        }
+    }
+
+    #[test]
+    fn validate_no_warning_for_safe_presets() {
+        for preset in ["strict", "standard"] {
+            let toml = format!("[sandbox]\npreset = \"{preset}\"\n");
+            let diagnostics = validate_config(&toml);
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.level == DiagnosticLevel::Warning),
+                "preset={preset} should not warn: {diagnostics:?}"
+            );
+        }
     }
 
     #[test]

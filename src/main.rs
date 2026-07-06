@@ -105,6 +105,18 @@ struct Cli {
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 
+    /// Apply a named policy preset that sets a baseline for the five sandbox
+    /// toggles (localhost, env files, tmp exec, docker, lifecycle scripts).
+    /// Individual flags still override it (e.g. `--preset permissive
+    /// --no-allow-tmp-exec`). Resolved in order: this flag > [sandbox] preset
+    /// config. `standard` (the default when omitted) is a no-op baseline.
+    ///   strict:      all five off (deny-default)
+    ///   standard:    current defaults (all five off, scratch dir stays on)
+    ///   permissive:  localhost + tmp exec + lifecycle scripts on
+    ///   full-trust:  all five on
+    #[arg(long, value_name = "PRESET")]
+    preset: Option<config::Preset>,
+
     /// Which directory the agent can read and write to.
     /// Defaults to the current git repository root, or the working directory
     /// if you're not inside a git repo.
@@ -237,12 +249,30 @@ struct Cli {
     #[arg(long)]
     allow_localhost_any: bool,
 
+    // The paired --allow-*/--no-allow-* preset toggles below (localhost-any,
+    // env-files, lifecycle-scripts, docker, tmp-exec) deliberately do NOT use
+    // clap `conflicts_with`. This matches the convention for every paired
+    // toggle in this tool (--with-proxy/--no-proxy, --quiet/--no-quiet, …):
+    // contradictions are resolved by `FeatureToggle::from_pair`, where OFF
+    // wins if both are passed. Off-wins is the safe default for a security
+    // tool — a stray `--allow-*` can never silently re-enable a toggle the
+    // user also disabled — so we accept the pair rather than erroring on it.
+    /// Force localhost-any off, overriding a permissive/full-trust preset or a
+    /// config value. Use with --preset to opt out of just this toggle.
+    #[arg(long)]
+    no_allow_localhost_any: bool,
+
     /// Allow the agent to read, write, and delete .env files, private keys
     /// (.pem, .key), and other sensitive files in the project directory.
     /// These are blocked by default because they often contain secrets that
     /// a rogue agent could exfiltrate or destroy.
     #[arg(long)]
     allow_env_files: bool,
+
+    /// Force env-file access off, overriding a full-trust preset or a config
+    /// value. Use with --preset to opt out of just this toggle.
+    #[arg(long)]
+    no_allow_env_files: bool,
 
     /// Pass an additional environment variable through to the sandbox.
     /// By default, only a safe allowlist of env vars is passed (PATH, HOME,
@@ -276,6 +306,11 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
 `--ignore-scripts` in npm and adding specific trusted packages instead."
     )]
     allow_lifecycle_scripts: bool,
+
+    /// Force lifecycle scripts off, overriding a permissive/full-trust preset or
+    /// a config value. Use with --preset to opt out of just this toggle.
+    #[arg(long)]
+    no_allow_lifecycle_scripts: bool,
 
     /// Allow GPG commit/tag signing inside the sandbox (DANGEROUS).
     /// Exposes the GPG agent socket — enables signing AND decryption requests.
@@ -313,6 +348,11 @@ that Docker volume mounts are an escape hatch from the sandbox."
     )]
     allow_docker: bool,
 
+    /// Force Docker access off, overriding a full-trust preset or a config
+    /// value. Use with --preset to opt out of just this toggle.
+    #[arg(long)]
+    no_allow_docker: bool,
+
     /// Allow process execution from system temp directories (DANGEROUS).
     /// Prefer --scratch-dir which creates a controlled executable temp dir.
     #[arg(
@@ -329,6 +369,11 @@ directory. Only use --allow-tmp-exec as a last resort when --scratch-dir is
 insufficient (e.g., third-party tools that hardcode /tmp for executables)."
     )]
     allow_tmp_exec: bool,
+
+    /// Force tmp exec off, overriding a permissive/full-trust preset or a config
+    /// value. Use with --preset to opt out of just this toggle.
+    #[arg(long)]
+    no_allow_tmp_exec: bool,
 
     /// Allow process execution from a specific ~/Library/Caches subdirectory.
     /// By default, exec is blocked from ~/Library/Caches to prevent binary-drop
@@ -1061,6 +1106,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         Err(e) => bail!("{e}"),
     };
     let mut resolved = match cfg.merge(config::CliFlags {
+        preset: cli.preset,
         proxy: config::FeatureToggle::from_pair(cli.with_proxy, cli.no_proxy),
         proxy_forced: config::FeatureToggle::from_pair(cli.proxy_forced, cli.no_proxy_forced),
         proxy_port: cli.proxy_port,
@@ -1084,17 +1130,26 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         deny_paths: cli_deny_paths,
         allow_ports: cli.allow_ports.clone(),
         allow_localhost: cli.allow_localhost.clone(),
-        allow_localhost_any: cli.allow_localhost_any,
-        allow_env_files: cli.allow_env_files,
+        allow_localhost_any: config::FeatureToggle::from_pair(
+            cli.allow_localhost_any,
+            cli.no_allow_localhost_any,
+        ),
+        allow_env_files: config::FeatureToggle::from_pair(
+            cli.allow_env_files,
+            cli.no_allow_env_files,
+        ),
         no_validate: cli.no_validate,
         pass_env: cli.pass_env.clone(),
         inherit_env: cli.inherit_env,
-        allow_lifecycle_scripts: cli.allow_lifecycle_scripts,
+        allow_lifecycle_scripts: config::FeatureToggle::from_pair(
+            cli.allow_lifecycle_scripts,
+            cli.no_allow_lifecycle_scripts,
+        ),
         allow_gpg_signing: cli.allow_gpg_signing,
         deny_clipboard: cli.deny_clipboard,
         allow_jvm_attach: cli.allow_jvm_attach,
-        allow_docker: cli.allow_docker,
-        allow_tmp_exec: cli.allow_tmp_exec,
+        allow_docker: config::FeatureToggle::from_pair(cli.allow_docker, cli.no_allow_docker),
+        allow_tmp_exec: config::FeatureToggle::from_pair(cli.allow_tmp_exec, cli.no_allow_tmp_exec),
         allow_cache_exec: cli.allow_cache_exec.clone(),
         allow_cache_exec_any: cli.allow_cache_exec_any,
         allow_browser: cli.allow_browser,
@@ -2843,18 +2898,41 @@ fn run_config_set(
         }
     };
 
-    // Dangerous key safeguard
-    if op.key_info.dangerous
-        && !unset
-        && let Some(val) = value
-        && val == "true"
+    // Dangerous-setting safeguard. Two cases weaken the sandbox and require
+    // --force:
+    //   1. A key flagged `dangerous` in the registry set to `true`
+    //      (allow_docker, allow_tmp_exec, …) — danger is in the KEY.
+    //   2. `sandbox.preset` set to a value that enables guarded toggles
+    //      (permissive/full-trust) — danger is in the VALUE, so this must be
+    //      value-aware. strict/standard are no-op baselines and are allowed.
+    if !unset
         && !force
+        && let Some(val) = value
     {
-        ui::error(&format!(
-            "{key} is a dangerous setting — it weakens sandbox security.\n  \
-             Add --force to confirm: cplt config set {key} true --force"
-        ));
-        return ExitCode::FAILURE;
+        // Value-aware preset check: warn and name what the preset enables.
+        if op.key_info.section == "sandbox"
+            && op.key_info.key == "preset"
+            && let Some(preset) = config::Preset::from_name(val)
+        {
+            let enabled = preset.enabled_dangerous_names();
+            if !enabled.is_empty() {
+                ui::error(&format!(
+                    "{key} = {val} enables dangerous settings ({}) — it weakens sandbox security.\n  \
+                     Add --force to confirm: cplt config set {key} {val} --force",
+                    enabled.join(", ")
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
+
+        // Key-level dangerous-bool check.
+        if op.key_info.dangerous && val == "true" {
+            ui::error(&format!(
+                "{key} is a dangerous setting — it weakens sandbox security.\n  \
+                 Add --force to confirm: cplt config set {key} true --force"
+            ));
+            return ExitCode::FAILURE;
+        }
     }
 
     // Load or create document

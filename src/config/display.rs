@@ -275,6 +275,13 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
 
     // [sandbox]
     println!("{blue}[cplt]{nc}  {dim}[sandbox]{nc}");
+    match c.sandbox.preset {
+        Some(preset) => println!(
+            "{blue}[cplt]{nc}    preset                = {preset}{}",
+            src(true)
+        ),
+        None => println!("{blue}[cplt]{nc}    preset                = {dim}standard (default){nc}"),
+    }
     let validate = c.sandbox.validate.unwrap_or(true);
     println!(
         "{blue}[cplt]{nc}    validate              = {}{}",

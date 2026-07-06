@@ -305,6 +305,17 @@ cplt [OPTIONS] [-- <AGENT_ARGS>...]
 
 Everything after `--` is passed directly to the agent process (copilot, opencode, gemini, antigravity, pi, claude, or shell).
 
+### Policy presets
+
+Pick a named preset to set a baseline for the five main sandbox toggles with one flag, instead of listing individual flags. Individual flags still override the preset (e.g. `--preset permissive --no-allow-tmp-exec`). Also settable as `[sandbox] preset = "…"` in config. See [Policy presets](docs/configuration.md#policy-presets).
+
+| Flag                       | What it does                                                                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `--preset strict`          | Deny-default: localhost, env files, tmp exec, docker, and lifecycle scripts all off.                                              |
+| `--preset standard`        | Current defaults (all five off, scratch dir stays on). Equivalent to passing no preset.                                          |
+| `--preset permissive`      | Turns on `allow_localhost_any`, `allow_tmp_exec`, and `allow_lifecycle_scripts`.                                                 |
+| `--preset full-trust`      | ⚠️ **Dangerous.** Turns on all five (adds `allow_env_files` and `allow_docker`).                                                 |
+
 ### File access
 
 The project directory is the primary writable workspace, plus a narrow allowlist required for auth, runtime, and tooling (see capability table above). Everything else (SSH keys, cloud credentials, etc.) is blocked by the kernel.
