@@ -59,11 +59,15 @@ enum Matcher {
 ///
 /// Order matters only for the reason string when multiple entries match; the
 /// first match wins. Patterns cover CI/CD, container, dependency manifests and
-/// lockfiles, shell scripts, build automation, env files, tool config, and the
-/// sandbox config itself — categories where an unreviewed change is high-risk.
+/// lockfiles, package-registry credentials, private keys, shell scripts, build
+/// automation, env files, tool config, and the sandbox config itself —
+/// categories where an unreviewed change is high-risk.
 const SENSITIVE_PATTERNS: &[(Matcher, &str)] = &[
     (Matcher::Dir(".github/workflows"), "CI/CD workflow"),
     (Matcher::Dir(".github/actions"), "CI/CD action"),
+    // Non-GitHub CI: NAV uses GitLab in places, so these matter too.
+    (Matcher::Name(".gitlab-ci.yml"), "CI/CD"),
+    (Matcher::Name("Jenkinsfile"), "CI/CD"),
     (Matcher::Name("Dockerfile"), "container image"),
     (Matcher::Prefix("docker-compose"), "container config"),
     (Matcher::Name("package.json"), "dependency manifest"),
@@ -75,7 +79,31 @@ const SENSITIVE_PATTERNS: &[(Matcher, &str)] = &[
         Matcher::PrefixSuffix("requirements", ".txt"),
         "dependency manifest",
     ),
+    // The npm-family lockfiles do NOT end in `.lock`, so the generic `.lock`
+    // suffix below misses them. Editing e.g. package-lock.json integrity hashes
+    // or resolved URLs is a supply-chain vector — flag them explicitly.
+    (Matcher::Name("package-lock.json"), "dependency lockfile"),
+    (Matcher::Name("npm-shrinkwrap.json"), "dependency lockfile"),
+    (Matcher::Name("pnpm-lock.yaml"), "dependency lockfile"),
+    (Matcher::Name("bun.lockb"), "dependency lockfile"),
     (Matcher::Suffix(".lock"), "dependency lockfile"),
+    // Package-registry config can carry auth tokens or redirect installs to a
+    // hostile registry (dependency-confusion / token exfiltration).
+    (
+        Matcher::Name(".npmrc"),
+        "package registry credentials/config",
+    ),
+    (
+        Matcher::Name(".pypirc"),
+        "package registry credentials/config",
+    ),
+    // Private keys / SSH identities.
+    (Matcher::Suffix(".pem"), "private key / credential"),
+    (Matcher::Suffix(".key"), "private key / credential"),
+    (Matcher::Name("id_rsa"), "private key / credential"),
+    (Matcher::Name("id_ed25519"), "private key / credential"),
+    (Matcher::Name("id_ecdsa"), "private key / credential"),
+    (Matcher::Name("id_dsa"), "private key / credential"),
     (Matcher::Suffix(".sh"), "shell script"),
     (Matcher::Name("Makefile"), "build automation"),
     (Matcher::Name("Justfile"), "build automation"),
@@ -239,6 +267,12 @@ pub struct Baseline {
     pinned_sha: Option<String>,
     /// Untracked paths present before the run.
     before_untracked: BTreeSet<String>,
+    /// Whether the pre-run `git status` actually SUCCEEDED. When it failed,
+    /// `before_untracked` is an empty set that does NOT mean "no untracked
+    /// files" — using it to compute the after−before delta would over-report
+    /// every pre-existing untracked file as NEW. `finish` consults this to emit
+    /// an honest `Incomplete` instead of false-positive "new" files.
+    before_ok: bool,
 }
 
 impl Baseline {
@@ -254,8 +288,12 @@ impl Baseline {
             .filter(|s| !s.is_empty());
         // Capture the pre-run untracked set REGARDLESS of whether a baseline
         // commit exists: in a fresh `git init` (no commits) we still want to
-        // surface the files the agent creates during the session.
-        let before_untracked = git_output(project_dir, &["status", "--porcelain", "-z", "-uall"])
+        // surface the files the agent creates during the session. Track whether
+        // the query SUCCEEDED so `finish` never mistakes a failed capture (empty
+        // set) for a genuinely empty untracked set and over-reports.
+        let before_status = git_output(project_dir, &["status", "--porcelain", "-z", "-uall"]);
+        let before_ok = before_status.is_some();
+        let before_untracked = before_status
             .map(|s| parse_untracked(&s))
             .unwrap_or_default();
         Self {
@@ -263,6 +301,7 @@ impl Baseline {
             project_dir: project_dir.to_path_buf(),
             pinned_sha,
             before_untracked,
+            before_ok,
         }
     }
 
@@ -279,6 +318,20 @@ impl Baseline {
         let after_untracked_opt =
             git_output(&self.project_dir, &["status", "--porcelain", "-z", "-uall"])
                 .map(|s| parse_untracked(&s));
+
+        // Guard against the over-report bias: if the BEFORE `git status` failed
+        // yet the AFTER one succeeded, the repo plainly exists (after worked) but
+        // `before_untracked` is an untrustworthy empty set. Computing after−before
+        // would flag every pre-existing untracked file as NEW. We can't compute a
+        // trustworthy untracked delta, so surface an honest `Incomplete` rather
+        // than false positives. (If the after query ALSO failed we fall through:
+        // the no-baseline path reports Unavailable, the baseline path Incomplete.)
+        if !self.before_ok && after_untracked_opt.is_some() {
+            return AuditReport::Incomplete {
+                duration,
+                exit_code,
+            };
+        }
 
         let Some(sha) = self.pinned_sha else {
             // No baseline commit (e.g. fresh `git init`). Tracked-change
@@ -404,7 +457,7 @@ impl AuditReport {
                     human_duration(*duration)
                 ));
                 ui::warn(
-                    "change audit unavailable: project is not a git repository (or has no commits)",
+                    "change audit unavailable: not a git repository, no commits yet, or git unavailable",
                 );
             }
             AuditReport::Incomplete {
@@ -609,6 +662,60 @@ mod tests {
             Some("dependency manifest")
         );
         assert_eq!(classify_path("yarn.lock"), Some("dependency lockfile"));
+        // `.lock`-suffixed lockfiles across ecosystems still match the suffix rule.
+        assert_eq!(classify_path("composer.lock"), Some("dependency lockfile"));
+        assert_eq!(classify_path("poetry.lock"), Some("dependency lockfile"));
+        assert_eq!(classify_path("flake.lock"), Some("dependency lockfile"));
+        // The npm family does NOT end in `.lock`, so each needs an explicit
+        // exact-name matcher; without it, a package-lock.json supply-chain edit
+        // would show WITHOUT the sensitive flag.
+        assert_eq!(
+            classify_path("package-lock.json"),
+            Some("dependency lockfile")
+        );
+        assert_eq!(
+            classify_path("frontend/package-lock.json"),
+            Some("dependency lockfile")
+        );
+        assert_eq!(
+            classify_path("npm-shrinkwrap.json"),
+            Some("dependency lockfile")
+        );
+        assert_eq!(classify_path("pnpm-lock.yaml"), Some("dependency lockfile"));
+        assert_eq!(classify_path("bun.lockb"), Some("dependency lockfile"));
+    }
+
+    #[test]
+    fn classifier_flags_registry_credentials_ci_and_private_keys() {
+        // Package-registry config (auth tokens / registry redirection).
+        assert_eq!(
+            classify_path(".npmrc"),
+            Some("package registry credentials/config")
+        );
+        assert_eq!(
+            classify_path(".pypirc"),
+            Some("package registry credentials/config")
+        );
+        // Non-GitHub CI.
+        assert_eq!(classify_path(".gitlab-ci.yml"), Some("CI/CD"));
+        assert_eq!(classify_path("ci/Jenkinsfile"), Some("CI/CD"));
+        // Private keys / SSH identities.
+        assert_eq!(
+            classify_path("certs/server.pem"),
+            Some("private key / credential")
+        );
+        assert_eq!(
+            classify_path("tls/private.key"),
+            Some("private key / credential")
+        );
+        assert_eq!(
+            classify_path(".ssh/id_rsa"),
+            Some("private key / credential")
+        );
+        assert_eq!(
+            classify_path("id_ed25519"),
+            Some("private key / credential")
+        );
     }
 
     #[test]
@@ -730,6 +837,7 @@ mod tests {
             project_dir: PathBuf::from("/nonexistent"),
             pinned_sha: None,
             before_untracked: BTreeSet::new(),
+            before_ok: true,
         };
         match base.finish(0) {
             AuditReport::Unavailable { exit_code, .. } => assert_eq!(exit_code, 0),
@@ -748,10 +856,49 @@ mod tests {
             project_dir: PathBuf::from("/nonexistent"),
             pinned_sha: Some("deadbeef".to_string()),
             before_untracked: BTreeSet::new(),
+            before_ok: true,
         };
         match base.finish(0) {
             AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
             other => panic!("expected Incomplete, got {other:?}"),
+        }
+    }
+
+    /// FIX 4 (over-report bias): when the BEFORE `git status` failed
+    /// (`before_ok = false`) but the AFTER query succeeds in a real repo that
+    /// has pre-existing untracked files, the code must NOT flag those as new.
+    /// It cannot compute a trustworthy delta, so it reports `Incomplete` rather
+    /// than an `Available` full of false-positive "new" files.
+    #[test]
+    fn finish_reports_incomplete_when_before_status_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ok = Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping: git unavailable");
+            return;
+        }
+        // A pre-existing untracked file the agent did NOT create.
+        std::fs::write(dir.path().join("preexisting.txt"), b"x").unwrap();
+
+        let base = Baseline {
+            start: Instant::now(),
+            project_dir: dir.path().to_path_buf(),
+            // No baseline commit (fresh init); the after `git status` still works.
+            pinned_sha: None,
+            // Simulate a failed BEFORE capture: empty set, but NOT trustworthy.
+            before_untracked: BTreeSet::new(),
+            before_ok: false,
+        };
+        match base.finish(0) {
+            AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
+            other => panic!("expected Incomplete (untrustworthy delta), got {other:?}"),
         }
     }
 }
