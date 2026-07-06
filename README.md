@@ -311,7 +311,7 @@ Pick a named preset to set a baseline for the five main sandbox toggles with one
 
 | Flag                       | What it does                                                                                                                       |
 | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `--preset strict`          | Deny-default: localhost, env files, tmp exec, docker, and lifecycle scripts all off.                                              |
+| `--preset strict`          | Locked down: all five toggles off **and** enables `gh_guard`, `git_guard`, and `proxy.forced` (forced-proxy egress).              |
 | `--preset standard`        | Current defaults (all five off, scratch dir stays on). Equivalent to passing no preset.                                          |
 | `--preset permissive`      | Turns on `allow_localhost_any`, `allow_tmp_exec`, and `allow_lifecycle_scripts`.                                                 |
 | `--preset full-trust`      | ⚠️ **Dangerous.** Turns on all five (adds `allow_env_files` and `allow_docker`).                                                 |
