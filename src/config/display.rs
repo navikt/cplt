@@ -204,6 +204,13 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     if let Some(ref ad) = c.proxy.allowed_domains {
         println!("{blue}[cplt]{nc}    allowed_domains  = \"{ad}\"");
     }
+    let default_allowlist = c.proxy.default_allowlist.unwrap_or(false);
+    println!(
+        "{blue}[cplt]{nc}    default_allowlist = {}{}{nc}{}",
+        if default_allowlist { green } else { yellow },
+        default_allowlist,
+        src(c.proxy.default_allowlist.is_some())
+    );
     if let Some(ref lf) = c.proxy.log_file {
         println!("{blue}[cplt]{nc}    log_file         = \"{lf}\"");
     }

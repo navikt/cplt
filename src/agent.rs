@@ -8,6 +8,44 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+/// Package registries that virtually every coding agent needs to fetch
+/// dependencies (npm, Yarn, Maven, Gradle, crates.io, PyPI). This is the
+/// shared base for every agent's built-in allowlist so that, when fail-closed
+/// networking is opted into, a normal `npm/pip/cargo install` still works.
+///
+/// Entries are bare registrable domains: the proxy's `is_domain_match` does
+/// exact-or-subdomain matching, so `crates.io` also covers `static.crates.io`
+/// (both are listed explicitly for clarity, matching issue #52).
+const PACKAGE_REGISTRY_DOMAINS: &[&str] = &[
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "repo.maven.apache.org",
+    "plugins.gradle.org",
+    "crates.io",
+    "static.crates.io",
+    "pypi.org",
+    "files.pythonhosted.org",
+];
+
+/// GitHub Copilot infrastructure domains (issue #52). These are the endpoints
+/// the Copilot CLI itself talks to for auth, model access, and telemetry.
+///
+/// The list uses BARE domains, not `*.wildcard` syntax: the proxy allowlist
+/// matcher (`crate::proxy::is_domain_match`) treats each entry as an
+/// exact-or-subdomain match, so `githubcopilot.com` already covers
+/// `api.githubcopilot.com`, `proxy.githubcopilot.com`, etc. — the same effect
+/// the issue's `*.githubcopilot.com` intends — and `actions.githubusercontent.com`
+/// covers `*.actions.githubusercontent.com`. Do not add a leading `*.`; the
+/// matcher does not interpret glob syntax.
+const COPILOT_INFRA_DOMAINS: &[&str] = &[
+    "githubcopilot.com",
+    "api.github.com",
+    "github.com",
+    "copilot-proxy.githubusercontent.com",
+    "actions.githubusercontent.com",
+    "default.exp2.cds.s9ch.io",
+];
+
 /// Supported AI coding agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -187,6 +225,32 @@ impl Agent {
     /// Whether this agent needs access to ~/.copilot directory.
     pub fn needs_copilot_dir(&self) -> bool {
         matches!(self, Agent::Copilot)
+    }
+
+    /// The agent's built-in default domain allowlist — the set of domains the
+    /// agent legitimately needs to reach.
+    ///
+    /// This is the fail-closed base for `proxy.default_allowlist` (issue #52):
+    /// when that opt-in is enabled, the proxy permits ONLY these domains (merged
+    /// with any user-configured `allowed_domains`) and blocks everything else,
+    /// so a compromised agent cannot exfiltrate to an arbitrary HTTPS endpoint.
+    ///
+    /// Every agent gets the shared package-registry base; Copilot additionally
+    /// gets its GitHub Copilot infrastructure endpoints. Entries are bare
+    /// domains matched by `crate::proxy::is_domain_match` (exact or subdomain).
+    ///
+    /// NOTE: this is opt-in and does NOT change the default behaviour. For
+    /// non-Copilot agents the base list intentionally omits that agent's own
+    /// LLM endpoint — enabling `default_allowlist` for them today requires the
+    /// user to add it via `allowed_domains`. Per-agent infra lists can be added
+    /// here as those agents are hardened.
+    pub fn default_allowed_domains(&self) -> Vec<&'static str> {
+        let mut domains: Vec<&'static str> = Vec::new();
+        if matches!(self, Agent::Copilot) {
+            domains.extend_from_slice(COPILOT_INFRA_DOMAINS);
+        }
+        domains.extend_from_slice(PACKAGE_REGISTRY_DOMAINS);
+        domains
     }
 
     /// Config directories under $HOME that need read/write access.
@@ -1280,6 +1344,78 @@ mod tests {
         // (We can't easily fake PATH here, but the detection loop has no
         // claude branch — this guards against a regression in intent.)
         assert_ne!(Agent::auto_detect(), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn copilot_default_allowed_domains_matches_issue_52() {
+        let domains = Agent::Copilot.default_allowed_domains();
+        // 6 GitHub Copilot infra domains + 8 package registries = 14.
+        assert_eq!(domains.len(), 14, "copilot list: infra + registries");
+        // GitHub Copilot infrastructure (bare forms of the issue's wildcards).
+        for d in [
+            "githubcopilot.com",
+            "api.github.com",
+            "github.com",
+            "copilot-proxy.githubusercontent.com",
+            "actions.githubusercontent.com",
+            "default.exp2.cds.s9ch.io",
+        ] {
+            assert!(domains.contains(&d), "copilot infra must include {d}");
+        }
+        // Package registries.
+        for d in [
+            "registry.npmjs.org",
+            "registry.yarnpkg.com",
+            "repo.maven.apache.org",
+            "plugins.gradle.org",
+            "crates.io",
+            "static.crates.io",
+            "pypi.org",
+            "files.pythonhosted.org",
+        ] {
+            assert!(domains.contains(&d), "copilot list must include {d}");
+        }
+        // No glob syntax — the proxy matcher does exact/subdomain matching only.
+        assert!(
+            domains.iter().all(|d| !d.contains('*')),
+            "default domains must be bare (no wildcard syntax)"
+        );
+    }
+
+    #[test]
+    fn copilot_default_domains_cover_subdomains_via_matcher() {
+        // The bare `githubcopilot.com` entry must cover `*.githubcopilot.com`
+        // through the proxy's subdomain matcher — this is the contract that lets
+        // us drop the issue's `*.` prefix.
+        let domains: Vec<String> = Agent::Copilot
+            .default_allowed_domains()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(crate::proxy::is_domain_match(
+            "api.githubcopilot.com",
+            &domains
+        ));
+        assert!(crate::proxy::is_domain_match(
+            "run.actions.githubusercontent.com",
+            &domains
+        ));
+        assert!(crate::proxy::is_domain_match("github.com", &domains));
+        assert!(!crate::proxy::is_domain_match("evil.com", &domains));
+    }
+
+    #[test]
+    fn non_copilot_agents_get_registry_base_only() {
+        // Other agents share the package-registry base but not Copilot infra.
+        for agent in [Agent::OpenCode, Agent::Claude, Agent::Gemini] {
+            let domains = agent.default_allowed_domains();
+            assert_eq!(domains.len(), 8, "{agent:?} gets registry base only");
+            assert!(domains.contains(&"registry.npmjs.org"));
+            assert!(
+                !domains.contains(&"githubcopilot.com"),
+                "{agent:?} must not get Copilot infra"
+            );
+        }
     }
 
     #[test]

@@ -112,6 +112,18 @@ impl Config {
             .allowed_domains
             .or_else(|| self.proxy.allowed_domains.as_ref().map(|s| expand_tilde(s)));
 
+        // Fail-closed networking opt-in (#52). `cli.default_allowlist` is a
+        // FeatureToggle where `--default-allowlist` is the ON side and
+        // `--allow-all-domains` is the OFF side (off wins), resolved against the
+        // `proxy.default_allowlist` config default (false). `--allow-all-domains`
+        // additionally forces allow-all: main.rs uses `allow_all_domains` to
+        // clear any explicit `allowed_domains` file for the run. This is opt-in
+        // and does not change the default (allow-all) behaviour.
+        let default_allowlist = cli
+            .default_allowlist
+            .resolve(self.proxy.default_allowlist.unwrap_or(false));
+        let allow_all_domains = cli.allow_all_domains;
+
         // Proxy log file: CLI > config
         let proxy_log_file = cli
             .proxy_log_file
@@ -454,6 +466,8 @@ impl Config {
             proxy_port,
             blocked_domains,
             allowed_domains,
+            default_allowlist,
+            allow_all_domains,
             proxy_log_file,
             proxy_log_level,
             proxy_timeout,
@@ -1121,6 +1135,58 @@ validate = false
         let config: Config = toml::from_str("[proxy]\nforced = true\n").unwrap();
         let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(resolved.proxy_forced);
+    }
+
+    // ── proxy.default_allowlist (#52) precedence ────────────────────────
+
+    #[test]
+    fn default_allowlist_off_by_default() {
+        // Critical: no config, no flags => feature stays OFF (allow-all).
+        let config: Config = toml::from_str("").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.default_allowlist,
+            "default must be OFF (no behaviour change)"
+        );
+        assert!(!resolved.allow_all_domains);
+    }
+
+    #[test]
+    fn config_default_allowlist_used_when_no_cli_flag() {
+        let config: Config = toml::from_str("[proxy]\ndefault_allowlist = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.default_allowlist);
+    }
+
+    #[test]
+    fn cli_default_allowlist_overrides_config_disabled() {
+        let config: Config = toml::from_str("[proxy]\ndefault_allowlist = false\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                default_allowlist: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.default_allowlist);
+    }
+
+    #[test]
+    fn allow_all_domains_overrides_config_enabled() {
+        // --allow-all-domains is the OFF side of the toggle: it wins over the
+        // config default AND records the escape-hatch flag.
+        let config: Config = toml::from_str("[proxy]\ndefault_allowlist = true\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                default_allowlist: FeatureToggle::from_pair(false, true),
+                allow_all_domains: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !resolved.default_allowlist,
+            "--allow-all-domains must disable the default allowlist"
+        );
+        assert!(resolved.allow_all_domains);
     }
 
     #[test]

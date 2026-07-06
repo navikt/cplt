@@ -248,6 +248,13 @@ pub struct ProxyConfig {
     pub blocked_domains: Option<String>,
     /// Path to allowed domains file. When set, only listed domains are permitted.
     pub allowed_domains: Option<String>,
+    /// Opt-in fail-closed networking (issue #52, default: false). When true, the
+    /// proxy restricts egress to the running agent's built-in default allowlist
+    /// (e.g. GitHub Copilot infra + package registries for Copilot) MERGED with
+    /// any `allowed_domains` — every other domain is blocked. Overridden for a
+    /// single run by `--allow-all-domains`. Enabling this does NOT change any
+    /// other default; flipping the global default is tracked separately (#71).
+    pub default_allowlist: Option<bool>,
     /// Path to write proxy audit log (one line per CONNECT).
     pub log_file: Option<String>,
     /// Stderr verbosity level: "none", "error", "blocked", "all" (default: "none").
@@ -449,6 +456,13 @@ pub struct Resolved {
     pub proxy_port: u16,
     pub blocked_domains: Option<PathBuf>,
     pub allowed_domains: Option<PathBuf>,
+    /// Fail-closed networking opt-in (#52): restrict egress to the agent's
+    /// built-in default allowlist merged with `allowed_domains`. Already
+    /// reconciled with `--allow-all-domains` (which forces this off).
+    pub default_allowlist: bool,
+    /// Escape hatch (#52): force allow-all for this run, disabling BOTH the
+    /// default allowlist and any explicit `allowed_domains` file.
+    pub allow_all_domains: bool,
     pub proxy_log_file: Option<PathBuf>,
     pub proxy_log_level: crate::proxy::ProxyLogLevel,
     pub proxy_timeout: std::time::Duration,
@@ -505,6 +519,11 @@ pub struct CliFlags {
     pub proxy_port: Option<u16>,
     pub blocked_domains: Option<PathBuf>,
     pub allowed_domains: Option<PathBuf>,
+    /// `--default-allowlist` (on) vs `--allow-all-domains` (off); off wins.
+    /// Resolved against `proxy.default_allowlist` config.
+    pub default_allowlist: FeatureToggle,
+    /// `--allow-all-domains`: force allow-all for this run (escape hatch).
+    pub allow_all_domains: bool,
     pub proxy_log_file: Option<PathBuf>,
     pub proxy_log_level: Option<crate::proxy::ProxyLogLevel>,
     pub proxy_timeout: Option<u64>,

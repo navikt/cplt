@@ -83,6 +83,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "proxy",
+        key: "default_allowlist",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Fail-closed networking (opt-in): restrict egress to the agent's built-in default allowlist (e.g. GitHub Copilot infrastructure + package registries) merged with allowed_domains; block all other domains. Override for one run with --allow-all-domains.",
+    },
+    ConfigKeyInfo {
+        section: "proxy",
         key: "log_file",
         value_type: ConfigValueType::Str,
         dangerous: false,

@@ -152,6 +152,19 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     allowed_domains: Option<PathBuf>,
 
+    /// Enable fail-closed networking for this run (#52): restrict egress to the
+    /// agent's built-in default allowlist (GitHub Copilot infrastructure +
+    /// package registries for Copilot) merged with any --allowed-domains.
+    /// Everything else is blocked. Opt-in; overrides proxy.default_allowlist = false.
+    #[arg(long)]
+    default_allowlist: bool,
+
+    /// Escape hatch: disable the default allowlist for this run and allow all
+    /// domains (subject to the blocklist). Overrides --default-allowlist and
+    /// proxy.default_allowlist, and also ignores any --allowed-domains file.
+    #[arg(long)]
+    allow_all_domains: bool,
+
     /// Write proxy connection log to a file (one line per CONNECT).
     /// Useful for post-session audit. File is created if it doesn't exist.
     #[arg(long, value_name = "FILE")]
@@ -1066,6 +1079,12 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         proxy_port: cli.proxy_port,
         blocked_domains: cli.blocked_domains.clone(),
         allowed_domains: cli.allowed_domains.clone(),
+        // --default-allowlist enables, --allow-all-domains disables (off wins).
+        default_allowlist: config::FeatureToggle::from_pair(
+            cli.default_allowlist,
+            cli.allow_all_domains,
+        ),
+        allow_all_domains: cli.allow_all_domains,
         proxy_log_file: cli.proxy_log.clone(),
         proxy_log_level: match cli.proxy_log_level.as_deref() {
             Some(s) => match s.parse::<crate::proxy::ProxyLogLevel>() {
@@ -1397,6 +1416,7 @@ fn start_proxy_if_enabled(
     resolved: &mut config::Resolved,
     cli: &Cli,
     config_path: Option<&PathBuf>,
+    active_agent: agent::Agent,
 ) -> anyhow::Result<Option<proxy::ProxyHandle>> {
     // Proxy-forced (#53): the proxy is mandatory. `with_proxy` defaults to true,
     // so the only way it is false here is an explicit disable (--no-proxy or
@@ -1441,16 +1461,45 @@ fn start_proxy_if_enabled(
         PathBuf::from("/dev/null/no-blocklist")
     });
 
-    // Validate domain allowlist at startup (fail-closed: abort if unreadable)
-    let allowed_domains_file = resolved.allowed_domains.clone();
+    // Escape hatch (#52): --allow-all-domains forces allow-all for this run,
+    // disabling BOTH the agent default allowlist and any explicit
+    // allowed_domains file. `resolved.default_allowlist` was already forced off
+    // in the config merge when --allow-all-domains is set.
+    let allowed_domains_file = if resolved.allow_all_domains {
+        None
+    } else {
+        resolved.allowed_domains.clone()
+    };
+
+    // Fail-closed networking (#52): when proxy.default_allowlist is on, the
+    // effective allowlist is the running agent's built-in defaults, which the
+    // proxy MERGES with the user's allowed_domains file. Empty vec = feature
+    // off, so the proxy keeps today's allow-all behaviour unchanged.
+    let default_allowlist: Vec<String> = if resolved.default_allowlist {
+        active_agent
+            .default_allowed_domains()
+            .iter()
+            .map(|d| (*d).to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Validate domain allowlist file at startup (fail-closed: abort if
+    // unreadable) and capture the user-configured domains for the policy report.
+    let mut configured_domains: Vec<String> = Vec::new();
     if let Some(ref path) = allowed_domains_file {
         if path.exists() {
             match proxy::parse_domain_file(path) {
                 Ok(domains) => {
-                    if !resolved.quiet {
+                    configured_domains = domains;
+                    // Only print the legacy "N from FILE" line when the default
+                    // allowlist is off; otherwise the "Domain policy" line below
+                    // gives the complete, merged picture.
+                    if !resolved.quiet && default_allowlist.is_empty() {
                         ui::info(&format!(
                             "Domain allowlist: {} domains from {}",
-                            domains.len(),
+                            configured_domains.len(),
                             path.display()
                         ));
                     }
@@ -1463,6 +1512,26 @@ fn start_proxy_if_enabled(
                 path.display()
             ));
         }
+    }
+
+    // Report the active fail-closed policy: total permitted domains, and how
+    // many the user added on top of the agent's built-in base. The merge here
+    // mirrors the proxy's own dedup so the count matches what is enforced.
+    if !default_allowlist.is_empty() && !resolved.quiet {
+        let mut merged = default_allowlist.clone();
+        merged.extend(configured_domains.iter().cloned());
+        merged.sort_unstable();
+        merged.dedup();
+        let extra = merged.len().saturating_sub(default_allowlist.len());
+        ui::info(&format!(
+            "Domain policy: {} domains allowed (agent defaults + {} configured)",
+            merged.len(),
+            extra
+        ));
+        ui::info(
+            "Fail-closed: unknown domains are blocked (BLOCKED-ALLOWLIST in the \
+             proxy log). Add to allowed-domains or use --allow-all-domains.",
+        );
     }
 
     let port_hint = if resolved.proxy_port == 0 {
@@ -1482,6 +1551,7 @@ fn start_proxy_if_enabled(
         allow_localhost_any: resolved.allow_localhost_any,
         allowed_domains_file,
         allowed_domains_initial: Vec::new(),
+        default_allowlist,
         cli_private_domains: cli.allow_private_domains.clone(),
         config_private_domains: resolved
             .allow_private_domains
@@ -1752,7 +1822,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
 
     // Start proxy (handle returned for RAII ownership)
-    let proxy_handle = start_proxy_if_enabled(&mut resolved, &cli, config_path.as_ref())?;
+    let proxy_handle =
+        start_proxy_if_enabled(&mut resolved, &cli, config_path.as_ref(), active_agent)?;
 
     // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
     merge_tool_path_env_overrides(&mut resolved, &home_dir);
@@ -2278,7 +2349,8 @@ fn run_exec_command(
         }
     }
 
-    let proxy_handle = start_proxy_if_enabled(&mut resolved, cli, config_path.as_ref())?;
+    let proxy_handle =
+        start_proxy_if_enabled(&mut resolved, cli, config_path.as_ref(), active_agent)?;
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
 
     // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).

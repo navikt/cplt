@@ -5100,6 +5100,7 @@ enabled = false
 port = 18080
 blocked_domains = "file.txt"
 allowed_domains = "file.txt"
+default_allowlist = false
 log_file = "log.txt"
 
 [allow]
@@ -6772,6 +6773,7 @@ upstream = "http://corp-proxy.example.com:8080"
 upstream_no_proxy = []
 blocked_domains = "file.txt"
 allowed_domains = "file.txt"
+default_allowlist = false
 log_file = "log.txt"
 log_level = "none"
 timeout = 60

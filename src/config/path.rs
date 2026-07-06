@@ -53,6 +53,11 @@ pub fn default_config_contents() -> String {
 # port = 0  # 0 = OS-assigned ephemeral port (avoids conflicts, default)
 # blocked_domains = "~/.config/cplt/blocked-domains.txt"
 # allowed_domains = "~/.config/cplt/allowed-domains.txt"
+# Fail-closed networking (opt-in, default: false). When true, egress is
+# restricted to the agent's built-in default allowlist (GitHub Copilot infra +
+# package registries for Copilot) merged with allowed_domains above; every other
+# domain is blocked. Override for a single run with --allow-all-domains.
+# default_allowlist = false
 # log_file = "~/.config/cplt/proxy.log"
 # Stderr verbosity: "none" (default/silent), "error", "blocked", or "all".
 # The log_file always records everything regardless of this setting.
