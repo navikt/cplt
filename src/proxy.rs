@@ -371,6 +371,12 @@ pub struct ProxyState {
     // after all policy checks pass. When None, behavior is a direct connect.
     upstream: Option<UpstreamProxy>,
 
+    // Hosts that BYPASS `upstream` and are connected to directly (NO_PROXY).
+    // Normalized (lowercase, no leading dots) at config-merge time. Empty when
+    // no upstream is configured makes this a no-op. Consulted with
+    // `is_domain_match` (exact + subdomain), like the other domain lists.
+    upstream_no_proxy: Vec<String>,
+
     // Test-only: injectable DNS resolver to simulate fake DNS responses.
     #[cfg(test)]
     resolver: Option<ResolverFn>,
@@ -573,6 +579,9 @@ pub struct ProxyOptions {
     /// Optional upstream (corporate) proxy to forward CONNECT tunnels through.
     /// When `None`, cplt connects to targets directly (unchanged behavior).
     pub upstream: Option<UpstreamProxy>,
+    /// Normalized hosts that bypass `upstream` and are connected to directly
+    /// (NO_PROXY semantics). No-op when `upstream` is `None`.
+    pub upstream_no_proxy: Vec<String>,
 
     /// Test-only: injectable DNS resolver. Pass a closure to override DNS
     /// resolution in proxy tests (e.g. to simulate DNS rebinding).
@@ -650,6 +659,7 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         log_level: opts.log_level,
         timeout: opts.timeout,
         upstream: opts.upstream,
+        upstream_no_proxy: opts.upstream_no_proxy,
         #[cfg(test)]
         resolver: opts.resolver,
     });
@@ -898,7 +908,21 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // host rather than the user's machine. Skipping the branch here keeps every
     // localhost carve-out local, and the direct path's stricter resolved-IP
     // loopback check (below) still applies.
-    if !localhost_connect_allowed && let Some(upstream) = state.upstream.as_ref() {
+    //
+    // No-proxy carve-out (upstream_no_proxy / NO_PROXY): a target whose host
+    // matches the no-proxy list must ALSO skip this branch and fall through to
+    // the direct-connect path below, exactly as NO_PROXY makes a host bypass a
+    // corporate proxy. `host_matches_no_proxy` gates the branch. Security is
+    // preserved for free: every hostname policy gate above already ran, and the
+    // direct path re-applies the resolved-IP SSRF guard (`resolved_ip_is_blocked`
+    // at ~line 1000), so a no-proxy host is still fully policy-checked — it is
+    // just connected DIRECTLY by cplt (which runs OUTSIDE the sandbox) instead
+    // of being forwarded. Because cplt makes that connection, this also works
+    // under `proxy.forced`, where the agent itself cannot reach the network.
+    if !localhost_connect_allowed
+        && let Some(upstream) = state.upstream.as_ref()
+        && !host_matches_no_proxy(&host, &state.upstream_no_proxy)
+    {
         // SSRF / DNS-rebinding guard for the forwarded path. We apply the SAME
         // resolved-IP check the direct path applies below, so upstream and
         // direct mode treat a *resolvable* host identically: a public name
@@ -1352,6 +1376,55 @@ pub fn is_domain_match(hostname: &str, domains: &[String]) -> bool {
     false
 }
 
+/// Whether `host` must BYPASS the upstream (corporate) proxy and be connected
+/// to DIRECTLY by cplt, i.e. it matches the `upstream_no_proxy` list.
+///
+/// SECURITY: matching here does NOT bypass any filtering. Every hostname policy
+/// gate (allowlist, blocklist, port policy, private-hostname) has already run in
+/// `handle_connect` before this is consulted, and the direct-connect path this
+/// host falls through to re-applies the resolved-IP SSRF guard
+/// (`resolved_ip_is_blocked`). A no-proxy host is therefore fully policy-checked;
+/// it is merely connected directly by cplt (which runs outside the sandbox)
+/// rather than forwarded to the corporate proxy — so it also works under
+/// `proxy.forced`. Matching reuses `is_domain_match` for consistency with cplt's
+/// other domain lists (exact host + subdomain suffix).
+fn host_matches_no_proxy(host: &str, no_proxy: &[String]) -> bool {
+    is_domain_match(host, no_proxy)
+}
+
+/// Normalize a single NO_PROXY-style entry so `is_domain_match` handles it
+/// consistently with cplt's other domain lists: trim, lowercase, and strip a
+/// leading dot (`.example.com` → `example.com`).
+///
+/// Returns `None` for entries that must be ignored:
+/// - empty (blank field from a trailing comma or stray whitespace), and
+/// - a bare `*` — in NO_PROXY this means "bypass the proxy for everything". cplt
+///   deliberately does NOT honor a blanket wildcard here: silently sending ALL
+///   traffic direct would disable the corporate proxy wholesale (and any egress
+///   policy tied to it), so the wildcard is dropped. List real hosts instead.
+pub fn normalize_no_proxy_entry(raw: &str) -> Option<String> {
+    let s = raw
+        .trim()
+        .trim_start_matches('.')
+        .trim()
+        .to_ascii_lowercase();
+    if s.is_empty() || s == "*" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Parse a `NO_PROXY`/`no_proxy` environment value into normalized no-proxy
+/// entries. The value is comma- and/or whitespace-separated (both conventions
+/// appear in the wild). Entries are normalized via [`normalize_no_proxy_entry`];
+/// empty entries and a bare `*` are dropped.
+pub fn parse_no_proxy_list(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\t', '\n', '\r'])
+        .filter_map(normalize_no_proxy_entry)
+        .collect()
+}
+
 /// Parse a domain list file into normalized entries.
 /// Returns an error if the file cannot be read (fail-closed for allowlists).
 pub fn parse_domain_file(path: &std::path::Path) -> Result<Vec<String>, String> {
@@ -1795,6 +1868,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
             resolver: None,
         };
 
@@ -1820,6 +1894,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
             resolver: None,
         };
 
@@ -1850,6 +1925,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
             resolver: None,
         };
 
@@ -1883,6 +1959,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
             resolver: None,
         };
 
@@ -1922,6 +1999,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
             resolver: None,
         };
 
@@ -1983,6 +2061,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
             resolver: None,
         });
         assert!(result.is_ok());
@@ -2016,6 +2095,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
             resolver: None,
         });
         assert!(result.is_err(), "should fail when allowlist is unreadable");
@@ -2049,6 +2129,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
             resolver: None,
         };
 
@@ -2124,6 +2205,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(60),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
             resolver,
         })
         .expect("proxy start failed")
@@ -2346,6 +2428,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             resolver: Some(resolver),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
         })
         .expect("proxy start failed");
 
@@ -2403,6 +2486,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             resolver: Some(resolver),
             upstream: None,
+            upstream_no_proxy: Vec::new(),
         })
         .expect("proxy start failed");
 
@@ -2850,6 +2934,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(5),
             upstream: Some(upstream),
+            upstream_no_proxy: Vec::new(),
             resolver: None,
         })
         .expect("proxy start failed")
@@ -3057,6 +3142,7 @@ mod tests {
             log_level: ProxyLogLevel::None,
             timeout: Duration::from_secs(5),
             upstream: Some(upstream),
+            upstream_no_proxy: Vec::new(),
             resolver,
         })
         .expect("proxy start failed")
@@ -3347,5 +3433,244 @@ mod tests {
         upstream_srv
             .shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // ── upstream_no_proxy (NO_PROXY) carve-out ───────────────────────────
+
+    /// `host_matches_no_proxy` reuses `is_domain_match`: an entry matches the
+    /// exact host and all its subdomains, and an empty list matches nothing.
+    #[test]
+    fn no_proxy_matches_exact_and_subdomain() {
+        let list = vec!["example.com".to_string()];
+        assert!(host_matches_no_proxy("example.com", &list));
+        assert!(host_matches_no_proxy("internal.example.com", &list));
+        assert!(host_matches_no_proxy("a.b.example.com", &list));
+        assert!(!host_matches_no_proxy("notexample.com", &list));
+        assert!(!host_matches_no_proxy("example.com", &[]));
+    }
+
+    /// Entry normalization: trim, lowercase, strip a leading dot; empty and a
+    /// bare `*` are dropped.
+    #[test]
+    fn no_proxy_entry_normalization() {
+        assert_eq!(
+            normalize_no_proxy_entry(".Example.COM"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            normalize_no_proxy_entry("  host.example  "),
+            Some("host.example".to_string())
+        );
+        assert_eq!(normalize_no_proxy_entry(""), None);
+        assert_eq!(normalize_no_proxy_entry("   "), None);
+        assert_eq!(normalize_no_proxy_entry("*"), None);
+    }
+
+    /// A NO_PROXY env value is comma/whitespace-separated, normalized, with
+    /// empties and the bare wildcard dropped.
+    #[test]
+    fn no_proxy_env_value_parsing() {
+        let got = parse_no_proxy_list(".foo.com, bar.example\tBAZ.NET,,*");
+        assert_eq!(
+            got,
+            vec![
+                "foo.com".to_string(),
+                "bar.example".to_string(),
+                "baz.net".to_string(),
+            ]
+        );
+    }
+
+    /// A minimal fake DIRECT origin: a plain TCP listener that flips `contacted`
+    /// on accept, proving cplt connected directly rather than via the upstream.
+    struct FakeDirect {
+        port: u16,
+        contacted: Arc<std::sync::atomic::AtomicBool>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn spawn_fake_direct_target() -> FakeDirect {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).ok();
+        let port = listener.local_addr().unwrap().port();
+        let contacted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = contacted.clone();
+        let s = shutdown.clone();
+        std::thread::spawn(move || {
+            loop {
+                if s.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        c.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // Hold the stream briefly so cplt's relay setup succeeds.
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(50));
+                            drop(stream);
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+        FakeDirect {
+            port,
+            contacted,
+            shutdown,
+        }
+    }
+
+    /// Build an upstream-forwarding proxy that also honors an `upstream_no_proxy`
+    /// bypass list. Used by the NO_PROXY carve-out tests.
+    fn make_proxy_with_no_proxy(
+        upstream: UpstreamProxy,
+        upstream_no_proxy: Vec<String>,
+        blocked_file: PathBuf,
+        cli_private_domains: Vec<String>,
+        resolver: Option<ResolverFn>,
+    ) -> ProxyHandle {
+        start(ProxyOptions {
+            port: 0,
+            blocked_file,
+            allowed_ports: vec![443, 80],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
+            allowed_domains_file: None,
+            allowed_domains_initial: Vec::new(),
+            cli_private_domains,
+            config_private_domains: Vec::new(),
+            config_file: None,
+            log_file: None,
+            log_level: ProxyLogLevel::None,
+            timeout: Duration::from_secs(5),
+            upstream: Some(upstream),
+            upstream_no_proxy,
+            resolver,
+        })
+        .expect("proxy start failed")
+    }
+
+    /// Core behavior: a host in `upstream_no_proxy` takes the DIRECT path and the
+    /// upstream is NEVER contacted for it, while a host NOT in the list is still
+    /// forwarded to the upstream. Proves the bypass is scoped to the list.
+    #[test]
+    fn proxy_no_proxy_host_takes_direct_path_not_upstream() {
+        require_localhost_tcp!();
+
+        let upstream_srv = spawn_fake_upstream();
+        let upstream =
+            UpstreamProxy::parse(&format!("http://127.0.0.1:{}", upstream_srv.port)).unwrap();
+        let direct = spawn_fake_direct_target();
+
+        let direct_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let direct_port = direct.port;
+        let resolver: ResolverFn = Arc::new(move |host: &str, _port: u16| match host {
+            // The no-proxy host resolves to our local fake origin (stands in for
+            // an internal/public IP we cannot bind in a unit test).
+            "internal.corp.example" => Some(std::net::SocketAddr::new(direct_ip, direct_port)),
+            // The forwarded host is only resolvable by the (fake) upstream, so
+            // local resolution returns None and cplt forwards it as-is.
+            _ => None,
+        });
+
+        let proxy = make_proxy_with_no_proxy(
+            upstream,
+            vec!["internal.corp.example".to_string()],
+            PathBuf::from("/dev/null"),
+            // Trust the no-proxy host to resolve to loopback so the direct path's
+            // resolved-IP guard permits our local fake origin.
+            vec!["internal.corp.example".to_string()],
+            Some(resolver),
+        );
+
+        // 1. No-proxy host → DIRECT path: 200, direct origin reached, upstream not.
+        let status = proxy_connect(proxy.port, "internal.corp.example:443");
+        assert!(
+            status.contains("200"),
+            "no-proxy host should connect directly; got: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            direct.contacted.load(std::sync::atomic::Ordering::SeqCst),
+            "no-proxy host must reach the DIRECT origin"
+        );
+        assert!(
+            !upstream_srv
+                .contacted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "upstream must NOT be contacted for a no-proxy host"
+        );
+
+        // 2. A host NOT in the no-proxy list is still forwarded to the upstream.
+        let status = proxy_connect(proxy.port, "external.example.net:443");
+        assert!(
+            status.contains("200"),
+            "non-no-proxy host should be forwarded via upstream; got: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            upstream_srv
+                .contacted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "upstream MUST be contacted for a host outside the no-proxy list"
+        );
+
+        proxy.shutdown();
+        upstream_srv
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        direct
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Filtering precedence preserved: a no-proxy host that is BLOCKED by the
+    /// blocklist is still rejected with 403, and the upstream is never contacted.
+    /// The NO_PROXY carve-out only chooses direct-vs-upstream; it does NOT skip
+    /// the allow/block/port/SSRF gates that run first.
+    #[test]
+    fn proxy_no_proxy_host_still_blocked_by_policy() {
+        require_localhost_tcp!();
+
+        let dir = test_dir("no-proxy-blocked");
+        let blocked = dir.join("blocked.txt");
+        std::fs::write(&blocked, "blocked.example.com\n").unwrap();
+
+        let upstream_srv = spawn_fake_upstream();
+        let upstream =
+            UpstreamProxy::parse(&format!("http://127.0.0.1:{}", upstream_srv.port)).unwrap();
+        // The blocked host is ALSO in the no-proxy list — policy must still win.
+        let proxy = make_proxy_with_no_proxy(
+            upstream,
+            vec!["blocked.example.com".to_string()],
+            blocked,
+            Vec::new(),
+            None,
+        );
+
+        let status = proxy_connect(proxy.port, "blocked.example.com:443");
+        assert!(
+            status.contains("403"),
+            "a blocklisted no-proxy host must still be 403; got: {status}"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !upstream_srv
+                .contacted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "upstream must NOT be contacted for a blocked host"
+        );
+
+        proxy.shutdown();
+        upstream_srv
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

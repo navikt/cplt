@@ -446,6 +446,90 @@ fn proxy_upstream_invalid_url_rejected() {
 }
 
 #[test]
+fn proxy_upstream_no_proxy_parsed_from_config() {
+    use cplt::config::{CliFlags, Config};
+    // A leading-dot entry must be normalized to a bare host so is_domain_match
+    // handles it. `.contains` (not exact eq) keeps this robust against any
+    // ambient NO_PROXY on the test host.
+    let toml = "[proxy]\nupstream_no_proxy = [\".Internal.Example.COM\", \"corp.example\"]\n";
+    let resolved = Config::parse(toml)
+        .unwrap()
+        .merge(CliFlags::default())
+        .unwrap();
+    assert!(
+        resolved
+            .proxy_upstream_no_proxy
+            .contains(&"internal.example.com".to_string()),
+        "leading dot + case must normalize; got: {:?}",
+        resolved.proxy_upstream_no_proxy
+    );
+    assert!(
+        resolved
+            .proxy_upstream_no_proxy
+            .contains(&"corp.example".to_string())
+    );
+}
+
+#[test]
+fn proxy_upstream_no_proxy_cli_overrides_config() {
+    use cplt::config::{CliFlags, Config};
+    let toml = "[proxy]\nupstream_no_proxy = [\"config-only.example.com\"]\n";
+    let cli = CliFlags {
+        proxy_upstream_no_proxy: vec!["cli-host.example.net".to_string()],
+        ..Default::default()
+    };
+    let resolved = Config::parse(toml).unwrap().merge(cli).unwrap();
+    assert!(
+        resolved
+            .proxy_upstream_no_proxy
+            .contains(&"cli-host.example.net".to_string()),
+        "CLI entry must be present; got: {:?}",
+        resolved.proxy_upstream_no_proxy
+    );
+    assert!(
+        !resolved
+            .proxy_upstream_no_proxy
+            .contains(&"config-only.example.com".to_string()),
+        "CLI must override (replace) the config list; got: {:?}",
+        resolved.proxy_upstream_no_proxy
+    );
+}
+
+#[test]
+fn proxy_upstream_no_proxy_merges_env() {
+    use cplt::config::{CliFlags, Config};
+    // The ambient NO_PROXY/no_proxy is merged on top of config/CLI. Use a
+    // process-unique value to avoid clobbering a real developer setting.
+    // SAFETY: single-threaded within this test; we set then immediately merge
+    // then remove. No other test asserts on this exact hostname.
+    unsafe {
+        std::env::set_var("NO_PROXY", ".env-host.example.io, other.example");
+    }
+    let toml = "[proxy]\nupstream_no_proxy = [\"config-host.example.com\"]\n";
+    let resolved = Config::parse(toml)
+        .unwrap()
+        .merge(CliFlags::default())
+        .unwrap();
+    unsafe {
+        std::env::remove_var("NO_PROXY");
+    }
+    assert!(
+        resolved
+            .proxy_upstream_no_proxy
+            .contains(&"env-host.example.io".to_string()),
+        "NO_PROXY env entry (leading dot stripped) must be merged in; got: {:?}",
+        resolved.proxy_upstream_no_proxy
+    );
+    assert!(
+        resolved
+            .proxy_upstream_no_proxy
+            .contains(&"config-host.example.com".to_string()),
+        "config entries must survive the env merge; got: {:?}",
+        resolved.proxy_upstream_no_proxy
+    );
+}
+
+#[test]
 fn config_show_redacts_upstream_credentials() {
     // `cplt config show`/`explain` print proxy.upstream through
     // redact_upstream_url. A URL carrying `user:pass@` must never leak the
@@ -6687,6 +6771,7 @@ enabled = false
 forced = false
 port = 18080
 upstream = "http://corp-proxy.example.com:8080"
+upstream_no_proxy = []
 blocked_domains = "file.txt"
 allowed_domains = "file.txt"
 log_file = "log.txt"

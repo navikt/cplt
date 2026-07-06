@@ -216,6 +216,12 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
             crate::proxy::redact_upstream_url(up)
         );
     }
+    // No-proxy bypass list — plain hostnames, no secrets to redact.
+    if let Some(ref np) = c.proxy.upstream_no_proxy
+        && !np.is_empty()
+    {
+        println!("{blue}[cplt]{nc}    upstream_no_proxy = {np:?}");
+    }
     println!(
         "{blue}[cplt]{nc}    log_level        = \"{}\"{}",
         c.proxy.log_level.as_deref().unwrap_or("none"),
@@ -505,5 +511,22 @@ mod tests {
         assert!(from_file);
         assert!(val.contains("8080"));
         assert!(val.contains("9090"));
+    }
+
+    #[test]
+    fn get_config_value_renders_upstream_no_proxy_list() {
+        // `config show` / `explain` render proxy.upstream_no_proxy as a plain
+        // list of hostnames (no secrets to redact).
+        let info = crate::config::lookup_key("proxy.upstream_no_proxy").unwrap();
+        let raw = "[proxy]\nupstream_no_proxy = [\"internal.example.com\", \"corp.example\"]\n";
+        let loaded = LoadedConfig {
+            config: Config::parse(raw).unwrap(),
+            raw: raw.to_string(),
+            path: std::path::PathBuf::from("/tmp/fake"),
+        };
+        let (val, from_file) = get_config_value(info, Some(&loaded));
+        assert!(from_file);
+        assert!(val.contains("internal.example.com"), "got: {val}");
+        assert!(val.contains("corp.example"), "got: {val}");
     }
 }

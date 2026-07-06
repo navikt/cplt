@@ -265,6 +265,15 @@ pub struct ProxyConfig {
     /// directly. Optional basic-auth userinfo is supported
     /// ("http://user:pass@host:8080"); only the http scheme is supported.
     pub upstream: Option<String>,
+    /// Hosts that BYPASS the upstream proxy and are connected to DIRECTLY by
+    /// cplt (standard NO_PROXY behavior). Only meaningful when `upstream` is set
+    /// — a no-op otherwise. Suffix matching (`example.com` covers all
+    /// subdomains), like the other domain lists. Merged with any explicit CLI
+    /// entries and the ambient `NO_PROXY`/`no_proxy` environment variable.
+    /// A no-proxy host is still subject to ALL of cplt's filtering (domain
+    /// allow/block, port policy, resolved-IP SSRF guard); it is simply connected
+    /// directly instead of being forwarded to the corporate proxy.
+    pub upstream_no_proxy: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -441,6 +450,10 @@ pub struct Resolved {
     /// Parsed upstream (corporate) proxy to forward CONNECT tunnels through.
     /// `None` = direct connections (unchanged behavior).
     pub proxy_upstream: Option<crate::proxy::UpstreamProxy>,
+    /// Normalized hosts that bypass the upstream proxy and connect directly
+    /// (NO_PROXY semantics). Merged from config, CLI, and the `NO_PROXY` env.
+    /// A no-op when `proxy_upstream` is `None`.
+    pub proxy_upstream_no_proxy: Vec<String>,
     pub allow_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
@@ -490,6 +503,10 @@ pub struct CliFlags {
     pub proxy_timeout: Option<u64>,
     /// Upstream proxy URL from `--proxy-upstream` (unparsed; validated in merge).
     pub proxy_upstream: Option<String>,
+    /// Hosts to bypass the upstream proxy, from `--proxy-upstream-no-proxy`
+    /// (repeatable). When non-empty, overrides the config list; the ambient
+    /// `NO_PROXY` env is merged on top of whichever wins.
+    pub proxy_upstream_no_proxy: Vec<String>,
     pub allow_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,

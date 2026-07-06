@@ -125,6 +125,31 @@ impl Config {
             None => None,
         };
 
+        // Upstream no-proxy list: hosts that BYPASS the upstream and connect
+        // DIRECTLY (standard NO_PROXY behavior). CLI over config (mirrors
+        // proxy.upstream's precedence), then MERGE the ambient NO_PROXY/no_proxy
+        // env so an existing corporate setup works out of the box. Every entry is
+        // normalized (lowercase, leading dots stripped; empty and bare `*`
+        // dropped). This is a no-op at runtime when proxy.upstream is unset — the
+        // list is only consulted on the upstream-forward branch of the proxy.
+        let proxy_upstream_no_proxy = {
+            let base: Vec<String> = if cli.proxy_upstream_no_proxy.is_empty() {
+                self.proxy.upstream_no_proxy.clone().unwrap_or_default()
+            } else {
+                cli.proxy_upstream_no_proxy.clone()
+            };
+            let mut merged: Vec<String> = base
+                .iter()
+                .filter_map(|e| crate::proxy::normalize_no_proxy_entry(e))
+                .collect();
+            if let Some(env) = no_proxy_env_value() {
+                merged.extend(crate::proxy::parse_no_proxy_list(&env));
+            }
+            merged.sort_unstable();
+            merged.dedup();
+            merged
+        };
+
         // Allow private domains: merge CLI + config list, sort+dedup.
         // Validates that entries are non-empty (empty string would bypass private IP
         // check for all domains that match is_domain_match("", _), which is none — but
@@ -413,6 +438,7 @@ impl Config {
             proxy_log_level,
             proxy_timeout,
             proxy_upstream,
+            proxy_upstream_no_proxy,
             allow_private_domains,
             allow_read,
             allow_write,
@@ -444,6 +470,18 @@ impl Config {
             deny_env: Vec::new(),
         })
     }
+}
+
+/// Read the ambient `NO_PROXY`/`no_proxy` environment value, if any. Kept as a
+/// tiny standalone fn so there is a single place cplt reaches into the process
+/// environment for upstream-proxy-bypass configuration. cplt runs OUTSIDE the
+/// sandbox, so this reads the user's own shell environment — exactly the
+/// existing corporate `NO_PROXY` setup we want to honor.
+fn no_proxy_env_value() -> Option<String> {
+    std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .ok()
+        .filter(|v| !v.trim().is_empty())
 }
 
 impl Resolved {

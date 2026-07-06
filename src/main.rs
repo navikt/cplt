@@ -175,6 +175,15 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     proxy_upstream: Option<String>,
 
+    /// Host that BYPASSES the upstream proxy and is connected to directly, like
+    /// NO_PROXY. Only meaningful together with --proxy-upstream. Suffix matching:
+    /// "example.com" covers all its subdomains. Can be specified multiple times.
+    /// When set, overrides proxy.upstream_no_proxy in config; the ambient
+    /// NO_PROXY/no_proxy environment is always merged on top. cplt still enforces
+    /// all domain, port, and SSRF filtering — the host is just connected directly.
+    #[arg(long = "proxy-upstream-no-proxy", value_name = "DOMAIN")]
+    proxy_upstream_no_proxy: Vec<String>,
+
     /// Allow connections to this domain even if it resolves to a private/internal IP.
     /// Use for corporate intranet services such as internal MCP servers.
     /// Suffix matching: "intern.nav.no" covers all its subdomains.
@@ -1058,6 +1067,7 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         },
         proxy_timeout: cli.proxy_timeout,
         proxy_upstream: cli.proxy_upstream.clone(),
+        proxy_upstream_no_proxy: cli.proxy_upstream_no_proxy.clone(),
         allow_private_domains: cli.allow_private_domains.clone(),
         allow_read: cli_allow_read,
         allow_write: cli_allow_write,
@@ -1473,6 +1483,7 @@ fn start_proxy_if_enabled(
         log_level: resolved.proxy_log_level,
         timeout: resolved.proxy_timeout,
         upstream: resolved.proxy_upstream.clone(),
+        upstream_no_proxy: resolved.proxy_upstream_no_proxy.clone(),
     }) {
         Ok(handle) => {
             resolved.proxy_port = handle.port;

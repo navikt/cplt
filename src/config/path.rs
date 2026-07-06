@@ -66,6 +66,12 @@ pub fn default_config_contents() -> String {
 # then forwards approved tunnels to this proxy instead of connecting directly.
 # Optional basic auth: "http://user:pass@host:8080". Only the http scheme is supported.
 # upstream = "http://corporate-proxy.example.com:8080"
+# Hosts that BYPASS the upstream proxy and are connected to directly (like
+# NO_PROXY). Only meaningful together with `upstream`. Suffix matching:
+# "example.com" covers all its subdomains. The ambient NO_PROXY/no_proxy env var
+# is merged in automatically. All of cplt's domain/port/SSRF filtering still
+# applies — a listed host is just connected directly instead of forwarded.
+# upstream_no_proxy = ["internal.example.com"]
 
 # ─── Allowed paths ──────────────────────────────────────────
 # Additional paths the sandboxed process may access.

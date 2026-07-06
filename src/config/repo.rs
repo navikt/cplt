@@ -83,6 +83,9 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
         ("proxy", "upstream") => {
             "the corporate proxy is machine/network-specific, not project policy"
         }
+        ("proxy", "upstream_no_proxy") => {
+            "the corporate proxy is machine/network-specific, not project policy"
+        }
         _ => "not supported in repo config",
     }
 }
