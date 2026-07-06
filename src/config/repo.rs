@@ -58,6 +58,7 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
         ("sandbox", "quiet") => "controls local CLI output, not project sandbox policy",
         ("sandbox", "validate") => "controls local validation behavior, not project policy",
         ("sandbox", "scratch_dir") => "controls local temp handling, not project policy",
+        ("sandbox", "audit") => "controls local CLI output, not project sandbox policy",
         ("sandbox", "use_bubblewrap") => {
             "depends on bwrap being installed locally, not project policy"
         }

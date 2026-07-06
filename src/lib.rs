@@ -5,6 +5,7 @@
 //! with a filtering CONNECT proxy for network control.
 
 pub mod agent;
+pub mod audit;
 pub mod config;
 pub mod detect;
 pub mod discover;

@@ -316,6 +316,10 @@ impl Config {
         // Quiet: FeatureToggle resolves --quiet/--no-quiet (default: off)
         let quiet = cli.quiet.resolve(self.sandbox.quiet.unwrap_or(false));
 
+        // Audit: FeatureToggle resolves --no-audit against config (default: on).
+        // The post-session report is on by default; --no-audit forces it off.
+        let audit = cli.audit.resolve(self.sandbox.audit.unwrap_or(true));
+
         // Yes: FeatureToggle resolves --yes/--no-yes (default: off)
         let yes = cli.yes.resolve(self.sandbox.yes.unwrap_or(false));
 
@@ -437,6 +441,7 @@ impl Config {
             scratch_dir,
             use_bubblewrap,
             quiet,
+            audit,
             yes,
             gh_guard,
             git_guard,

@@ -6715,6 +6715,7 @@ allow_lifecycle_scripts = false
 allow_gpg_signing = false
 allow_tmp_exec = false
 scratch_dir = false
+audit = false
 use_bubblewrap = false
 quiet = false
 yes = false
@@ -7086,4 +7087,123 @@ fn tool_override_normal_custom_dir_is_kept() {
         tool_override_path_is_safe(std::path::Path::new("/home/tester/go-alt"), home),
         "a normal custom SUBdir of HOME must be granted"
     );
+}
+
+// ── Post-session audit report (issue #54, Phase 1) ────────────────────────────
+
+use cplt::audit::{AuditReport, Baseline};
+
+/// Run a git command in `dir`, panicking on failure. Uses fixed identity and
+/// disables GPG signing so the test is hermetic.
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@e.x")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@e.x")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git runs");
+    assert!(status.status.success(), "git {args:?} failed");
+}
+
+/// The load-bearing property: diffing against the *pinned* baseline SHA still
+/// reports the agent's net change even when the agent COMMITS it inside the
+/// session (moving HEAD would otherwise hide it).
+#[test]
+fn audit_reports_net_change_even_after_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("app.rs"), "fn main() {}\n").unwrap();
+    git_in(dir, &["add", "."]);
+    git_in(
+        dir,
+        &["-c", "commit.gpgSign=false", "commit", "-q", "-m", "init"],
+    );
+
+    // Capture the baseline BEFORE the "session".
+    let baseline = Baseline::capture(dir);
+
+    // The agent modifies a tracked file, adds a sensitive new file, and COMMITS
+    // both — moving HEAD forward. A HEAD-based diff would now show nothing.
+    std::fs::write(dir.join("app.rs"), "fn main() { println!(\"x\"); }\n").unwrap();
+    std::fs::write(dir.join("deploy.sh"), "#!/bin/sh\necho hi\n").unwrap();
+    git_in(dir, &["add", "."]);
+    git_in(
+        dir,
+        &[
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-q",
+            "-m",
+            "agent change",
+        ],
+    );
+
+    let report = baseline.finish(0);
+    match report {
+        AuditReport::Available {
+            changes,
+            total_added,
+            ..
+        } => {
+            let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+            assert!(
+                paths.contains(&"app.rs"),
+                "tracked change must appear: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"deploy.sh"),
+                "new file must appear: {paths:?}"
+            );
+            assert!(total_added >= 1, "should count added lines");
+            // The new shell script must be flagged sensitive.
+            let sh = changes.iter().find(|c| c.path == "deploy.sh").unwrap();
+            assert_eq!(sh.sensitive, Some("shell script"));
+        }
+        AuditReport::Unavailable { .. } => panic!("expected Available report"),
+    }
+}
+
+/// An agent that creates a file and leaves it untracked is still reported via
+/// the before/after untracked-set difference.
+#[test]
+fn audit_reports_new_untracked_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("app.rs"), "fn main() {}\n").unwrap();
+    git_in(dir, &["add", "."]);
+    git_in(
+        dir,
+        &["-c", "commit.gpgSign=false", "commit", "-q", "-m", "init"],
+    );
+
+    let baseline = Baseline::capture(dir);
+    std::fs::write(dir.join("leftover.txt"), "scratch\n").unwrap();
+
+    match baseline.finish(0) {
+        AuditReport::Available { changes, .. } => {
+            let f = changes.iter().find(|c| c.path == "leftover.txt");
+            assert!(f.is_some(), "untracked file must be reported");
+            assert!(f.unwrap().is_new_untracked);
+        }
+        AuditReport::Unavailable { .. } => panic!("expected Available report"),
+    }
+}
+
+/// A non-git directory degrades cleanly to "unavailable" — never an error.
+#[test]
+fn audit_unavailable_for_non_git_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let baseline = Baseline::capture(tmp.path());
+    assert!(matches!(
+        baseline.finish(0),
+        AuditReport::Unavailable { .. }
+    ));
 }

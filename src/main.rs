@@ -3,7 +3,7 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use cplt::{
-    agent, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch, trust, update,
+    agent, audit, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch, trust, update,
 };
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
@@ -466,6 +466,15 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
     /// in the config file. Overrides the config setting for this run.
     #[arg(long)]
     no_quiet: bool,
+
+    /// Suppress the post-session project-change audit report.
+    /// By default, after the sandboxed agent exits, cplt prints a trustworthy
+    /// summary of the net file changes made during the session (measured from
+    /// outside the sandbox against a pinned baseline commit). Use this to skip
+    /// it. Can also be set in config: sandbox.audit = false.
+    /// The report is also suppressed under --quiet.
+    #[arg(long)]
+    no_audit: bool,
 
     // --- Copilot pass-through flags ---
     // These are forwarded directly to the copilot process for convenience,
@@ -1082,6 +1091,8 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
         scratch: config::FeatureToggle::from_pair(cli.scratch_dir, cli.no_scratch_dir),
         use_bubblewrap: config::FeatureToggle::from_pair(cli.use_bubblewrap, cli.no_bubblewrap),
         quiet: config::FeatureToggle::from_pair(cli.quiet, cli.no_quiet),
+        // Audit is on by default; only --no-audit forces it off from the CLI.
+        audit: config::FeatureToggle::from_pair(false, cli.no_audit),
         yes: config::FeatureToggle::from_pair(cli.yes, cli.no_yes),
         gh_guard: config::FeatureToggle::from_pair(cli.gh_guard, cli.no_gh_guard),
         git_push_prevention: config::FeatureToggle::from_pair(cli.git_guard, cli.no_git_guard),
@@ -1861,18 +1872,24 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // Build agent args: extra args (e.g. --no-auto-update) + forwarded convenience flags + explicit -- args
     let copilot_args = build_copilot_args(&cli, &active_agent);
 
-    // Run agent inside sandbox
-    let exit_code = sandbox::exec_sandboxed(
-        &prepared,
-        &agent_bin,
-        &copilot_args,
-        &resolved.pass_env,
-        resolved.inherit_env,
-        &disabled_categories,
-        &resolved.deny_env,
-        &resolved.gh_guard,
-        &resolved.git_guard,
-    );
+    // Run agent inside sandbox, wrapped in the post-session audit lifecycle.
+    // The audit is on by default and suppressed by --no-audit or --quiet. The
+    // baseline is captured just before exec and the report printed just after,
+    // both in the parent (outside the sandbox) — see audit::run.
+    let audit_enabled = resolved.audit && !resolved.quiet;
+    let exit_code = audit::run(&project_dir, audit_enabled, || {
+        sandbox::exec_sandboxed(
+            &prepared,
+            &agent_bin,
+            &copilot_args,
+            &resolved.pass_env,
+            resolved.inherit_env,
+            &disabled_categories,
+            &resolved.deny_env,
+            &resolved.gh_guard,
+            &resolved.git_guard,
+        )
+    });
 
     // Cleanup
     if let Some(handle) = proxy_handle {
@@ -2318,17 +2335,23 @@ fn run_exec_command(
 
     let disabled_categories = resolved.disabled_hardening_categories();
 
-    let exit_code = sandbox::exec_sandboxed(
-        &prepared,
-        &exec_bin,
-        &exec_args,
-        &resolved.pass_env,
-        resolved.inherit_env,
-        &disabled_categories,
-        &resolved.deny_env,
-        &resolved.gh_guard,
-        &resolved.git_guard,
-    );
+    // Same audit lifecycle as the main agent flow (shared audit::run helper).
+    // In exec mode quiet defaults on (scripting UX), so the audit is off unless
+    // the user passes --no-quiet.
+    let audit_enabled = resolved.audit && !resolved.quiet;
+    let exit_code = audit::run(&project_dir, audit_enabled, || {
+        sandbox::exec_sandboxed(
+            &prepared,
+            &exec_bin,
+            &exec_args,
+            &resolved.pass_env,
+            resolved.inherit_env,
+            &disabled_categories,
+            &resolved.deny_env,
+            &resolved.gh_guard,
+            &resolved.git_guard,
+        )
+    });
 
     if let Some(handle) = proxy_handle {
         handle.shutdown();

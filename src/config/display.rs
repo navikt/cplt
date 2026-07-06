@@ -351,6 +351,12 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         scratch,
         src(c.sandbox.scratch_dir.is_some())
     );
+    let audit = c.sandbox.audit.unwrap_or(true);
+    println!(
+        "{blue}[cplt]{nc}    audit                 = {}{}",
+        audit,
+        src(c.sandbox.audit.is_some())
+    );
     match c.sandbox.use_bubblewrap {
         Some(v) => println!(
             "{blue}[cplt]{nc}    use_bubblewrap        = {v}{}",

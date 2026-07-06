@@ -166,6 +166,14 @@ pub fn default_config_contents() -> String {
 # Cleaned up automatically on exit.
 # scratch_dir = true
 #
+# Print the post-session project-change audit report (default: true). After the
+# sandboxed agent exits, cplt diffs the working tree against a pinned baseline
+# commit captured before the run and prints the net file changes to stderr,
+# flagging sensitive paths (CI/CD, Dockerfiles, lockfiles, scripts, .env, etc.).
+# Measured outside the sandbox, so it is not affected by commits/resets inside
+# the session. Suppressed by quiet or --no-audit.
+# audit = true
+#
 # Linux only: wrap the sandbox in Bubblewrap namespaces for defense-in-depth
 # (PID/IPC/UTS/cgroup/user namespaces plus a private /tmp). The host network
 # is shared so the filtering proxy keeps working. Unset = auto-detect: uses

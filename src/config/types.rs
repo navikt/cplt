@@ -341,6 +341,11 @@ pub struct SandboxConfig {
     /// Enable per-session scratch directory for TMPDIR redirect (default: true).
     /// Creates an executable temp dir so tools like `go test` and `mise` can work.
     pub scratch_dir: Option<bool>,
+    /// Print the post-session project-change audit report (default: true).
+    /// After the sandboxed agent exits, cplt diffs the working tree against a
+    /// pinned baseline commit (captured before the run) and prints the net
+    /// changes to stderr. Also suppressed by `quiet`.
+    pub audit: Option<bool>,
     /// Use Bubblewrap for namespace isolation on Linux (default: auto-detect).
     /// - `true`: Always use bwrap (fail if unavailable)
     /// - `false`: Never use bwrap (Landlock+seccomp only)
@@ -465,6 +470,8 @@ pub struct Resolved {
     pub scratch_dir: bool,
     pub use_bubblewrap: Option<bool>,
     pub quiet: bool,
+    /// Print the post-session project-change audit report (default: true).
+    pub audit: bool,
     pub yes: bool,
     pub gh_guard: GhGuardPolicy,
     pub git_guard: GitGuardPolicy,
@@ -514,6 +521,8 @@ pub struct CliFlags {
     pub scratch: FeatureToggle,
     pub use_bubblewrap: FeatureToggle,
     pub quiet: FeatureToggle,
+    /// Post-session project-change audit report (default on; `--no-audit` off).
+    pub audit: FeatureToggle,
     pub yes: FeatureToggle,
     pub gh_guard: FeatureToggle,
     pub git_push_prevention: FeatureToggle,
