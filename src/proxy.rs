@@ -905,8 +905,24 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
 
     // Enforce domain allowlist — when configured, only listed domains pass.
     // Fail-closed: if the allowlist is non-empty and the domain isn't in it, deny.
+    //
+    // Localhost carve-out: skip the allowlist gate for an opted-in localhost
+    // target, consistent with the port-policy and private-hostname gates above
+    // (both also skip when `localhost_connect_allowed`). The agent-default
+    // allowlist never contains "localhost", so without this exemption a user
+    // combining fail-closed networking with a local dev-server carve-out
+    // (`--default-allowlist --allow-localhost 3000`) would get
+    // `CONNECT localhost:3000` blocked — a surprising break of a legitimate
+    // combo. Still safe: `localhost_connect_allowed` requires both an explicit
+    // opt-in AND a loopback-spelled host, and the resolved-IP loopback check
+    // below still enforces that the target actually resolves to a loopback IP,
+    // so this exemption cannot let a non-loopback host masquerade as localhost
+    // to bypass the allowlist.
     let allowed_domains = state.get_allowed_domains();
-    if !allowed_domains.is_empty() && !is_domain_match(&host, &allowed_domains) {
+    if !localhost_connect_allowed
+        && !allowed_domains.is_empty()
+        && !is_domain_match(&host, &allowed_domains)
+    {
         log_connection("CONNECT", target, "BLOCKED-ALLOWLIST", log_file, log_level);
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist\r\n");
         return;
@@ -2427,6 +2443,73 @@ mod tests {
         assert_connect_allowed(proxy.port, "evil.com");
         proxy.shutdown();
         up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn proxy_default_allowlist_allows_localhost_carveout_but_blocks_unknown() {
+        // Combining fail-closed networking with a local dev-server carve-out
+        // (`--default-allowlist --allow-localhost <PORT>`) must let the opted-in
+        // localhost port through even though "localhost" is not in the agent
+        // default allowlist, while a non-allowlisted public domain stays blocked.
+        require_localhost_tcp!();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept the one localhost connection so the tunnel completes (200).
+        let handle = std::thread::spawn(move || {
+            listener.accept().ok();
+        });
+
+        // Pin resolution to IPv4 loopback so the tunnel reaches our listener and
+        // the resolved-IP loopback check passes (localhost connects directly,
+        // never via the upstream). evil.com never reaches resolution — it is
+        // blocked at the allowlist gate first.
+        let loopback_v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let resolver: ResolverFn =
+            Arc::new(move |_host: &str, p: u16| Some(std::net::SocketAddr::new(loopback_v4, p)));
+        let up = spawn_fake_upstream();
+        let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{}", up.port)).unwrap();
+        let proxy = start(ProxyOptions {
+            port: 0,
+            blocked_file: PathBuf::from("/dev/null"),
+            allowed_ports: vec![443, 80],
+            allow_localhost_ports: vec![port],
+            allow_localhost_any: false,
+            allowed_domains_file: None,
+            allowed_domains_initial: Vec::new(),
+            default_allowlist: copilot_defaults(),
+            cli_private_domains: Vec::new(),
+            config_private_domains: Vec::new(),
+            config_file: None,
+            log_file: None,
+            log_level: ProxyLogLevel::None,
+            timeout: Duration::from_secs(5),
+            upstream: Some(upstream),
+            upstream_no_proxy: Vec::new(),
+            resolver: Some(resolver),
+        })
+        .expect("proxy start failed");
+
+        let localhost_status = proxy_connect(proxy.port, &format!("localhost:{port}"));
+        let evil_status = proxy_connect(proxy.port, "evil.com:443");
+
+        proxy.shutdown();
+        // Fallback connect so the accept thread unblocks if the proxy didn't reach it.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        handle.join().ok();
+        up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            localhost_status.contains("200"),
+            "CONNECT localhost:{port} must be ALLOWED under --default-allowlist \
+             with --allow-localhost {port} (allowlist gate must not block the \
+             localhost carve-out); got: {localhost_status}"
+        );
+        assert!(
+            evil_status.contains("403"),
+            "evil.com must stay BLOCKED (BLOCKED-ALLOWLIST) under the default \
+             allowlist even when a localhost carve-out is active; got: {evil_status}"
+        );
     }
 
     /// Helper: make a raw CONNECT request through the proxy and return the status line.
