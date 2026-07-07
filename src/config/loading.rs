@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use super::error::ConfigError;
-use super::path::{config_path, expand_tilde, resolve_config_path};
+use super::path::{config_dir, config_path, expand_tilde, resolve_config_path};
 use super::types::{
     CliFlags, Config, EnforcementMode, GhGuardPolicy, GitGuardPolicy, LoadedConfig, Preset,
     Resolved, ResolvedPushRule, UnknownCommandPolicy,
@@ -205,6 +205,41 @@ impl Config {
             merged.sort_unstable();
             merged.dedup();
             merged
+        };
+
+        // Blocklist subscriptions (issue #144, Phase 1). GLOBAL-only, tighten-only.
+        // Parsed here so an invalid `refresh` value fails config loading (a typo
+        // is surfaced, not silently ignored). The cache lives under the cplt
+        // config dir (`~/.config/cplt/subscriptions/`) — OUTSIDE the sandbox's
+        // writable set, so the agent cannot poison it. When no blocklists are
+        // configured the set is empty and networking is unchanged from today.
+        let proxy_subscriptions = {
+            let refresh = match self.proxy.subscriptions.refresh.as_deref() {
+                Some(s) => crate::subscriptions::RefreshInterval::parse(s)
+                    .map_err(|e| ConfigError::Validation(format!("proxy.subscriptions.{e}")))?,
+                None => crate::subscriptions::RefreshInterval::Manual,
+            };
+            let mut blocklists = Vec::new();
+            for entry in &self.proxy.subscriptions.blocklists {
+                let url = entry.url().trim().to_string();
+                if url.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "proxy.subscriptions.blocklists entry has an empty url".to_string(),
+                    ));
+                }
+                blocklists.push(crate::subscriptions::BlocklistSubscription {
+                    url,
+                    sha256: entry.sha256().map(|s| s.trim().to_ascii_lowercase()),
+                });
+            }
+            let cache_dir = config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("subscriptions");
+            crate::subscriptions::SubscriptionSet {
+                refresh,
+                blocklists,
+                cache_dir,
+            }
         };
 
         // Allow private domains: merge CLI + config list, sort+dedup.
@@ -512,6 +547,7 @@ impl Config {
             proxy_timeout,
             proxy_upstream,
             proxy_upstream_no_proxy,
+            proxy_subscriptions,
             allow_private_domains,
             allow_read,
             allow_write,

@@ -473,6 +473,64 @@ pub struct ProxyConfig {
     /// allow/block, port policy, resolved-IP SSRF guard); it is simply connected
     /// directly instead of being forwarded to the corporate proxy.
     pub upstream_no_proxy: Option<Vec<String>>,
+    /// Subscribable blocklists (issue #144, Phase 1). GLOBAL-only, tighten-only.
+    /// Cached lists UNION into the effective blocklist. Rejected in repo config.
+    pub subscriptions: SubscriptionsConfig,
+}
+
+/// `[proxy.subscriptions]` — subscribable domain lists (issue #144).
+///
+/// Phase 1 is BLOCKLIST subscriptions only: tighten-only, fail-open, low-risk.
+/// This is GLOBAL-only config (`~/.config/cplt/config.toml`) — the repo config
+/// schema has no `[proxy]` table, so a `.cplt.toml` can never add a subscription.
+/// Allowlist subscriptions (security-critical, fail-closed) are a future feature.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SubscriptionsConfig {
+    /// Refresh cadence: "manual" (default), "daily", or "weekly".
+    pub refresh: Option<String>,
+    /// Blocklist subscription sources. Each entry is a bare URL string or a
+    /// `{ url, sha256 }` table with an optional pinned hash (recommended).
+    pub blocklists: Vec<BlocklistSource>,
+}
+
+/// One blocklist subscription source: a bare URL, or a table with an optional
+/// pinned SHA256. Deserialized untagged so both TOML forms work:
+///
+/// ```toml
+/// blocklists = [
+///   "https://example.com/blocklist.txt",
+///   { url = "https://example.com/pinned.txt", sha256 = "abc123..." },
+/// ]
+/// ```
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum BlocklistSource {
+    /// A bare URL string (unpinned — loads because blocklists are tighten-only).
+    Url(String),
+    /// A URL with an optional pinned SHA256 (verified after download).
+    Pinned {
+        url: String,
+        #[serde(default)]
+        sha256: Option<String>,
+    },
+}
+
+impl BlocklistSource {
+    /// The subscription URL, regardless of form.
+    pub fn url(&self) -> &str {
+        match self {
+            Self::Url(u) | Self::Pinned { url: u, .. } => u,
+        }
+    }
+
+    /// The pinned SHA256, if any.
+    pub fn sha256(&self) -> Option<&str> {
+        match self {
+            Self::Url(_) => None,
+            Self::Pinned { sha256, .. } => sha256.as_deref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -671,6 +729,10 @@ pub struct Resolved {
     /// (NO_PROXY semantics). Merged from config, CLI, and the `NO_PROXY` env.
     /// A no-op when `proxy_upstream` is `None`.
     pub proxy_upstream_no_proxy: Vec<String>,
+    /// Resolved blocklist subscriptions (issue #144, Phase 1). Empty blocklists
+    /// = feature off (behaviour byte-identical to today). Cached lists are
+    /// UNIONed into the effective blocklist. GLOBAL-only, tighten-only, fail-open.
+    pub proxy_subscriptions: crate::subscriptions::SubscriptionSet,
     pub allow_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,

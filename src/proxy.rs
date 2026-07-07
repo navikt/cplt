@@ -342,6 +342,14 @@ pub struct ProxyState {
     blocked_file: PathBuf,
     blocked_cache: Mutex<DomainCache>,
 
+    // Blocklist subscriptions (issue #144, Phase 1): domains from cached,
+    // fetched-and-verified subscription lists, frozen at startup. Empty = no
+    // subscriptions configured (behaviour identical to today). When non-empty
+    // these are UNIONed with the reloadable `blocked_file` to form the effective
+    // blocklist — tighten-only, so this can only ever ADD blocks. See
+    // `crate::subscriptions` for the fetch/verify/cache + fail-open model.
+    subscription_blocklist: Vec<String>,
+
     // Allowlist: optional file of permitted domains (fail-closed when configured)
     allowed_domains_file: Option<PathBuf>,
     allowlist_cache: Mutex<DomainCache>,
@@ -394,11 +402,26 @@ impl ProxyState {
     /// Get the current blocklist, re-reading from disk if TTL expired.
     /// On read failure, keeps last-good list and resets TTL for retry.
     fn get_blocked_domains(&self) -> Vec<String> {
-        get_cached_domains(
+        let file_domains = get_cached_domains(
             &self.blocked_cache,
             Some(&self.blocked_file),
             parse_lines_file,
-        )
+        );
+
+        // No subscriptions configured — preserve today's exact behaviour
+        // (the reloadable file + built-ins are the sole source).
+        if self.subscription_blocklist.is_empty() {
+            return file_domains;
+        }
+
+        // UNION the cached subscription blocklist(s) with the local/built-in
+        // blocklist. Tighten-only: this can only ADD blocks. Deduplicated so the
+        // effective list matches what the existing matcher expects.
+        let mut merged = file_domains;
+        merged.extend(self.subscription_blocklist.iter().cloned());
+        merged.sort_unstable();
+        merged.dedup();
+        merged
     }
 
     /// Get the effective allowlist, re-reading the user file from disk if the
@@ -583,6 +606,10 @@ impl ProxyHandle {
 pub struct ProxyOptions {
     pub port: u16,
     pub blocked_file: PathBuf,
+    /// Domains from cached blocklist subscriptions (issue #144, Phase 1), frozen
+    /// at startup. Empty = no subscriptions (unchanged behaviour). UNIONed with
+    /// `blocked_file` to form the effective blocklist. Tighten-only.
+    pub subscription_blocklist: Vec<String>,
     pub allowed_ports: Vec<u16>,
     /// Specific localhost ports explicitly opened by `--allow-localhost`.
     /// The proxy bypasses its private-IP block for CONNECT to these ports.
@@ -682,6 +709,7 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
     let state = Arc::new(ProxyState {
         blocked_file: opts.blocked_file,
         blocked_cache: Mutex::new(DomainCache::new(blocked_initial)),
+        subscription_blocklist: opts.subscription_blocklist,
         allowed_domains_file: opts.allowed_domains_file,
         allowlist_cache: Mutex::new(DomainCache::new(allowlist_initial)),
         default_allowlist: opts.default_allowlist,
@@ -1915,6 +1943,7 @@ mod tests {
             allowed_domains_file: None,
             allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: vec!["cli.example.com".to_string()],
             config_file: None,
             private_domains_cache: Mutex::new(DomainCache::new(vec![
@@ -1944,6 +1973,7 @@ mod tests {
             allowed_domains_file: None,
             allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: vec!["shared.com".to_string()],
             config_file: None,
             private_domains_cache: Mutex::new(DomainCache::new(vec!["shared.com".to_string()])),
@@ -1976,6 +2006,7 @@ mod tests {
                 "should-not-appear.com".to_string(),
             ])),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
             config_file: None,
             private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
@@ -2011,6 +2042,7 @@ mod tests {
             allowed_domains_file: None,
             allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
             config_file: None,
             private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
@@ -2047,6 +2079,7 @@ mod tests {
             allowed_domains_file: None,
             allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: vec!["cli.nav.no".to_string()],
             config_file: Some(config_path.clone()),
             private_domains_cache: Mutex::new(DomainCache {
@@ -2118,6 +2151,7 @@ mod tests {
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
             config_private_domains: Vec::new(),
             config_file: None,
@@ -2153,6 +2187,7 @@ mod tests {
             allowed_domains_file: Some(allowlist_path),
             allowed_domains_initial: Vec::new(),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
             config_private_domains: Vec::new(),
             config_file: None,
@@ -2185,6 +2220,7 @@ mod tests {
                     .unwrap(),
             }),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
             config_file: None,
             private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
@@ -2227,6 +2263,7 @@ mod tests {
         ProxyState {
             blocked_file: PathBuf::from("/dev/null"),
             blocked_cache: Mutex::new(DomainCache::new(Vec::new())),
+            subscription_blocklist: Vec::new(),
             allowed_domains_file: file,
             allowlist_cache: Mutex::new(DomainCache::new(initial)),
             default_allowlist,
@@ -2243,6 +2280,61 @@ mod tests {
             upstream_no_proxy: Vec::new(),
             resolver: None,
         }
+    }
+
+    /// Build a ProxyState with an in-memory blocklist + subscription blocklist
+    /// for issue #144 merge tests. `blocked_file` is `/dev/null` and the caches
+    /// are seeded fresh, so `get_blocked_domains` reads the in-memory values.
+    fn state_for_blocklist(file_domains: Vec<String>, subscription: Vec<String>) -> ProxyState {
+        ProxyState {
+            blocked_file: PathBuf::from("/dev/null"),
+            blocked_cache: Mutex::new(DomainCache::new(file_domains)),
+            subscription_blocklist: subscription,
+            allowed_domains_file: None,
+            allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
+            default_allowlist: Vec::new(),
+            cli_private_domains: Vec::new(),
+            config_file: None,
+            private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
+            allowed_ports: vec![443],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
+            log_file: None,
+            log_level: ProxyLogLevel::None,
+            timeout: Duration::from_secs(60),
+            upstream: None,
+            upstream_no_proxy: Vec::new(),
+            resolver: None,
+        }
+    }
+
+    #[test]
+    fn subscription_blocklist_merges_into_effective_blocklist() {
+        // Cached subscription domains UNION with the local/built-in blocklist.
+        let state = state_for_blocklist(
+            vec!["local.example".to_string()],
+            vec!["sub.example".to_string()],
+        );
+        let eff = state.get_blocked_domains();
+        assert!(is_blocked_in_list("local.example", &eff), "local kept");
+        assert!(
+            is_blocked_in_list("sub.example", &eff),
+            "subscription added"
+        );
+        // Exact-or-subdomain matcher still applies to subscription domains.
+        assert!(is_blocked_in_list("host.sub.example", &eff));
+        assert!(!is_blocked_in_list("allowed.example", &eff));
+    }
+
+    #[test]
+    fn empty_subscription_blocklist_is_noop() {
+        // No-regression: empty subscription list → exactly the file domains,
+        // byte-identical to today's behaviour.
+        let with_empty = state_for_blocklist(vec!["local.example".to_string()], Vec::new());
+        assert_eq!(
+            with_empty.get_blocked_domains(),
+            vec!["local.example".to_string()]
+        );
     }
 
     #[test]
@@ -2327,6 +2419,7 @@ mod tests {
             allowed_domains_file,
             allowed_domains_initial: Vec::new(),
             default_allowlist,
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
             config_private_domains: Vec::new(),
             config_file: None,
@@ -2478,6 +2571,7 @@ mod tests {
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
             default_allowlist: copilot_defaults(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
             config_private_domains: Vec::new(),
             config_file: None,
@@ -2551,6 +2645,7 @@ mod tests {
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
             config_private_domains: Vec::new(),
             config_file: None,
@@ -2774,6 +2869,7 @@ mod tests {
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(), // NOT allow-listed
             config_private_domains: Vec::new(),
             config_file: None,
@@ -2833,6 +2929,7 @@ mod tests {
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: vec!["corp.internal".to_string()], // allow-listed
             config_private_domains: Vec::new(),
             config_file: None,
@@ -3283,6 +3380,7 @@ mod tests {
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains: Vec::new(),
             config_private_domains: Vec::new(),
             config_file: None,
@@ -3492,6 +3590,7 @@ mod tests {
             allowed_domains_file,
             allowed_domains_initial: Vec::new(),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains,
             config_private_domains: Vec::new(),
             config_file: None,
@@ -3923,6 +4022,7 @@ mod tests {
             allowed_domains_file: None,
             allowed_domains_initial: Vec::new(),
             default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
             cli_private_domains,
             config_private_domains: Vec::new(),
             config_file: None,

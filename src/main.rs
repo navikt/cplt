@@ -3,7 +3,8 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use cplt::{
-    agent, audit, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch, trust, update,
+    agent, audit, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch, subscriptions,
+    trust, update,
 };
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
@@ -629,6 +630,17 @@ QUICK START:
         #[arg(long)]
         force: bool,
     },
+
+    /// Update subscribed blocklists (issue #144, Phase 1).
+    ///
+    /// Fetches, SHA256-verifies (when pinned), and caches every blocklist under
+    /// [proxy.subscriptions] in your global config, then reports a per-list
+    /// result. Cached lists are UNIONed into the effective blocklist on the next
+    /// run. Tighten-only and fail-open: a fetch failure keeps the last-good
+    /// cache; a pinned-hash mismatch rejects the download (tamper) and keeps the
+    /// last-good cache. Subscriptions are global-only — a repo cannot add one.
+    #[command(name = "update-lists")]
+    UpdateLists,
 
     /// Manage per-repo trust for .cplt.toml permissions.
     ///
@@ -1589,6 +1601,13 @@ fn start_proxy_if_enabled(
         );
     }
 
+    // Blocklist subscriptions (issue #144, Phase 1): union cached, verified
+    // subscription domains into the effective blocklist. Tighten-only and
+    // fail-open — a fetch/verify failure falls back to the last-good cache (or
+    // empty), and the run is NEVER blocked on the network beyond a bounded
+    // timeout. Empty when no subscriptions are configured (unchanged behaviour).
+    let subscription_blocklist = load_subscription_blocklist(resolved, resolved.quiet);
+
     let port_hint = if resolved.proxy_port == 0 {
         "ephemeral port".to_string()
     } else {
@@ -1601,6 +1620,7 @@ fn start_proxy_if_enabled(
     match proxy::start(proxy::ProxyOptions {
         port: resolved.proxy_port,
         blocked_file,
+        subscription_blocklist,
         allowed_ports: resolved.allow_ports.clone(),
         allow_localhost_ports: resolved.allow_localhost.clone(),
         allow_localhost_any: resolved.allow_localhost_any,
@@ -1646,6 +1666,146 @@ fn start_proxy_if_enabled(
             bail!("Failed to start proxy: {e}")
         }
     }
+}
+
+/// Resolve the effective subscription blocklist domains for a run (issue #144,
+/// Phase 1). Lazily refreshes stale caches when `refresh != manual` (bounded by
+/// the fetch timeout — never hangs the run), prints one-line staleness warnings,
+/// and returns the UNION of cached subscription domains to merge into the
+/// blocklist. Tighten-only and fail-open: any failure falls back to the
+/// last-good cache (or empty). Returns an empty vec when no subscriptions are
+/// configured, so networking is byte-identical to today.
+fn load_subscription_blocklist(resolved: &config::Resolved, quiet: bool) -> Vec<String> {
+    let set = &resolved.proxy_subscriptions;
+    if set.is_empty() {
+        return Vec::new();
+    }
+
+    // Lazy pre-run refresh (no-op under `refresh = "manual"`). Failures fall
+    // through to the cache; we surface tamper (verify) failures loudly.
+    let now = std::time::SystemTime::now();
+    for outcome in subscriptions::refresh_if_stale(set, &subscriptions::curl_fetch, now) {
+        if let subscriptions::UpdateOutcome::VerifyFailed {
+            url,
+            expected,
+            actual,
+        } = &outcome
+        {
+            ui::warn(&format!(
+                "SHA256 verification failed for blocklist subscription {url}!\n  \
+                 Expected: {expected}\n  Got:      {actual}\n  \
+                 Download may be corrupted or tampered with — keeping the last-good cache."
+            ));
+        }
+    }
+
+    if !quiet {
+        for warning in subscriptions::staleness_warnings(set, now) {
+            ui::warn(&warning);
+        }
+    }
+
+    let domains = subscriptions::load_cached_domains(set);
+    if !quiet && !domains.is_empty() {
+        ui::info(&format!(
+            "Blocklist subscriptions: {} domains from {} list(s)",
+            domains.len(),
+            set.blocklists.len()
+        ));
+    }
+    domains
+}
+
+/// `cplt update-lists`: fetch, verify, and cache all configured blocklist
+/// subscriptions (issue #144, Phase 1 — the explicit refresh path). Reports a
+/// per-list result. Tighten-only + fail-open: a fetch failure keeps the
+/// last-good cache; a pinned-hash mismatch REJECTS the download (tamper) and
+/// keeps the last-good cache. Never fails the process for a bad list.
+fn run_update_lists() -> ExitCode {
+    let resolved = match resolve_config_only() {
+        Ok(r) => r,
+        Err(e) => {
+            ui::error(&e.to_string());
+            return ExitCode::FAILURE;
+        }
+    };
+    let set = &resolved.proxy_subscriptions;
+
+    if set.is_empty() {
+        ui::info(
+            "No blocklist subscriptions configured. Add one under \
+             [proxy.subscriptions] in your global config, e.g.:",
+        );
+        println!(
+            "  [proxy.subscriptions]\n  blocklists = [\
+             \"https://raw.githubusercontent.com/navikt/cplt/main/blocked-domains.txt\"]"
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    ui::info(&format!(
+        "Updating {} blocklist subscription(s) (refresh = {})...",
+        set.blocklists.len(),
+        set.refresh
+    ));
+
+    let now = std::time::SystemTime::now();
+    let outcomes = subscriptions::update_all(set, &subscriptions::curl_fetch, now);
+
+    let mut had_verify_failure = false;
+    for outcome in &outcomes {
+        match outcome {
+            subscriptions::UpdateOutcome::Fetched {
+                url,
+                domains,
+                verified,
+            } => {
+                let tag = if *verified { " (sha256 verified)" } else { "" };
+                ui::ok(&format!("{url}\n    fetched {domains} domains{tag}"));
+            }
+            subscriptions::UpdateOutcome::CacheKept { url, reason } => {
+                ui::warn(&format!(
+                    "{url}\n    fetch failed ({reason}) — keeping last-good cache"
+                ));
+            }
+            subscriptions::UpdateOutcome::EmptyNoCache { url, reason } => {
+                ui::warn(&format!(
+                    "{url}\n    fetch failed ({reason}) — no cache yet, treated as empty"
+                ));
+            }
+            subscriptions::UpdateOutcome::VerifyFailed {
+                url,
+                expected,
+                actual,
+            } => {
+                had_verify_failure = true;
+                ui::error(&format!(
+                    "{url}\n    SHA256 verification FAILED — download REJECTED (tamper?), \
+                     keeping last-good cache\n    Expected: {expected}\n    Got:      {actual}"
+                ));
+            }
+        }
+    }
+
+    // A verify failure is a loud, actionable signal but is not fatal: the
+    // last-good cache is retained (tighten-only). Exit non-zero so scripts/CI
+    // can detect the tamper condition.
+    if had_verify_failure {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Load and resolve config (global + repo merge is not needed here — subscriptions
+/// are global-only). Used by `cplt update-lists`.
+fn resolve_config_only() -> anyhow::Result<config::Resolved> {
+    let loaded = config::Config::load_file()?;
+    let config = loaded.map(|l| l.config).unwrap_or_default();
+    let resolved = config
+        .merge(config::CliFlags::default())
+        .context("resolving configuration")?;
+    Ok(resolved)
 }
 
 fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
@@ -1694,6 +1854,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         return Ok(match command {
             Command::Config { action } => run_config_command(action),
             Command::Update { check, force } => run_update(check, force),
+            Command::UpdateLists => run_update_lists(),
             Command::Trust { action } => run_trust_command(action),
             Command::Init {
                 write,

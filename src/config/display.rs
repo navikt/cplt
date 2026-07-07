@@ -239,6 +239,26 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         c.proxy.timeout.unwrap_or(60),
         src(c.proxy.timeout.is_some())
     );
+    // [proxy.subscriptions] — blocklist subscriptions (issue #144, Phase 1).
+    // Global-only, tighten-only. Shown only when configured.
+    if !c.proxy.subscriptions.blocklists.is_empty() {
+        println!(
+            "{blue}[cplt]{nc}    subscriptions.refresh   = \"{}\"",
+            c.proxy.subscriptions.refresh.as_deref().unwrap_or("manual")
+        );
+        println!(
+            "{blue}[cplt]{nc}    subscriptions.blocklists = ({} list(s))",
+            c.proxy.subscriptions.blocklists.len()
+        );
+        for source in &c.proxy.subscriptions.blocklists {
+            let pin = if source.sha256().is_some() {
+                " (sha256 pinned)"
+            } else {
+                ""
+            };
+            println!("{blue}[cplt]{nc}      - {}{pin}", source.url());
+        }
+    }
     println!();
 
     // [allow]

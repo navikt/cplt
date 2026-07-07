@@ -77,6 +77,21 @@ pub fn default_config_contents() -> String {
 # is merged in automatically. All of cplt's domain/port/SSRF filtering still
 # applies — a listed host is just connected directly instead of forwarded.
 # upstream_no_proxy = ["internal.example.com"]
+#
+# Subscribable blocklists (issue #144). GLOBAL-only, tighten-only, opt-in — no
+# subscription is enabled by default, so leaving this unset keeps today's
+# behavior. Cached lists are UNIONed into the effective blocklist (they can only
+# ADD blocks). Fetch with `cplt update-lists`. A fetch/verify failure falls back
+# to the last-good cache (fail-open); an entry may pin a sha256 (recommended),
+# and a hash mismatch rejects the update with a tamper warning.
+# [proxy.subscriptions]
+# refresh = "manual"   # "manual" (default), "daily", or "weekly"
+# blocklists = [
+#     # cplt-maintained default blocklist (opt-in — add it yourself):
+#     "https://raw.githubusercontent.com/navikt/cplt/main/blocked-domains.txt",
+#     # Pin a sha256 to reject tampered downloads:
+#     # { url = "https://example.com/blocklist.txt", sha256 = "<64-hex>" },
+# ]
 
 # ─── Allowed paths ──────────────────────────────────────────
 # Additional paths the sandboxed process may access.

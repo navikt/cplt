@@ -111,6 +111,39 @@ cplt config set proxy.blocked_domains "~/.config/cplt/blocked-domains.txt"
 
 The blocklist covers webhook capture services, paste sites, file sharing, tunneling services, and IP recon endpoints. See [`blocked-domains.txt`](../blocked-domains.txt) for the full list with sources.
 
+### Subscribing to blocklists
+
+The threat landscape moves faster than cplt releases. A **blocklist subscription** keeps a local cache fresh from a maintained upstream list (issue #144, Phase 1). Cached subscription domains are **UNIONed** into the effective blocklist alongside your local `blocked_domains` file and the built-in `blocked-domains.txt` — they only ever *add* blocks.
+
+Subscriptions are **global-only** (`~/.config/cplt/config.toml`) — a repo `.cplt.toml` cannot add one, so a malicious repository can never point cplt at an attacker-controlled list.
+
+Configure them under `[proxy.subscriptions]`:
+
+```toml
+[proxy.subscriptions]
+refresh = "manual"   # "manual" (default), "daily", or "weekly"
+blocklists = [
+    # The cplt-maintained default list (opt-in — add it yourself):
+    "https://raw.githubusercontent.com/navikt/cplt/main/blocked-domains.txt",
+    # Pin a sha256 to reject tampered downloads (recommended):
+    { url = "https://example.com/blocklist.txt", sha256 = "<64-hex-digest>" },
+]
+```
+
+Fetch and cache all configured lists explicitly:
+
+```bash
+cplt update-lists
+```
+
+`cplt update-lists` reports a per-list result: how many domains were fetched, whether a pinned `sha256` verified, whether the last-good cache was kept on a fetch failure, or whether verification **FAILED** (tamper). Caches live under `~/.config/cplt/subscriptions/` — **outside** the agent's sandbox-writable paths, so a running agent cannot poison them.
+
+**Refresh:** with `refresh = "daily"` or `"weekly"`, cplt lazily re-fetches a stale cache before a run, bounded by a short timeout so it never hangs the run. With the default `"manual"`, only `cplt update-lists` refreshes. A one-line warning is printed for a cache that has never been fetched or is very old.
+
+**Tighten-only / fail-open semantics.** Blocklists can only *add* blocks, so the worst case of a bad, stale, or unreachable list is that a domain simply isn't blocked — no worse than today. Accordingly, on a fetch failure cplt keeps and uses the last-good cache (or treats the list as empty if there is none) and **never** blocks the run on the network. When a subscription pins a `sha256`, a hash mismatch **rejects** the downloaded copy, keeps the last-good cache, and warns loudly about possible tampering — but pinning is *encouraged*, not required, because an unverified blocklist cannot open an exfiltration channel.
+
+> **Allowlist subscriptions are a separate future feature.** An *allowlist* subscription would define what is *permitted* and is therefore cplt's security boundary — a tampered or MITM'd allowlist opens an exfiltration channel for every subscriber. That tier must be fail-**closed** and verification-required, and is intentionally **not** part of Phase 1. Only blocklist subscriptions exist today.
+
 ### Allowlist
 
 Restrict connections to only specific domains. When set, the proxy blocks everything not in the list:

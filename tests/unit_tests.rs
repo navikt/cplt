@@ -379,6 +379,69 @@ fn allow_private_domains_rejects_empty_string() {
     assert!(result.is_err(), "empty domain should be rejected");
 }
 
+// ── Blocklist subscriptions (issue #144, Phase 1) ────────────────────────────
+
+#[test]
+fn subscriptions_parse_bare_url_and_pinned() {
+    use cplt::config::{CliFlags, Config};
+    let toml = "\
+[proxy.subscriptions]
+refresh = \"daily\"
+blocklists = [
+  \"https://example.com/blocklist.txt\",
+  { url = \"https://example.com/pinned.txt\", sha256 = \"ABCDEF\" },
+]
+";
+    let resolved = Config::parse(toml)
+        .unwrap()
+        .merge(CliFlags::default())
+        .unwrap();
+    let set = &resolved.proxy_subscriptions;
+    assert_eq!(set.refresh, cplt::subscriptions::RefreshInterval::Daily);
+    assert_eq!(set.blocklists.len(), 2);
+    assert_eq!(set.blocklists[0].url, "https://example.com/blocklist.txt");
+    assert_eq!(set.blocklists[0].sha256, None);
+    assert_eq!(set.blocklists[1].url, "https://example.com/pinned.txt");
+    // Pinned hash is normalized to lowercase.
+    assert_eq!(set.blocklists[1].sha256.as_deref(), Some("abcdef"));
+}
+
+#[test]
+fn subscriptions_invalid_refresh_rejected() {
+    use cplt::config::{CliFlags, Config};
+    let toml = "[proxy.subscriptions]\nrefresh = \"hourly\"\n";
+    let result = Config::parse(toml).unwrap().merge(CliFlags::default());
+    assert!(result.is_err(), "invalid refresh value must be rejected");
+}
+
+#[test]
+fn subscriptions_absent_means_empty_no_regression() {
+    // No [proxy.subscriptions] configured → empty set → behaviour identical to
+    // today (nothing merged into the effective blocklist).
+    use cplt::config::{CliFlags, Config};
+    let resolved = Config::parse("")
+        .unwrap()
+        .merge(CliFlags::default())
+        .unwrap();
+    assert!(resolved.proxy_subscriptions.is_empty());
+    assert!(cplt::subscriptions::load_cached_domains(&resolved.proxy_subscriptions).is_empty());
+}
+
+#[test]
+fn repo_config_rejects_proxy_subscriptions() {
+    // A malicious repo must not be able to add a subscription. The repo config
+    // schema has no [proxy] table, so `.cplt.toml` cannot express one at all.
+    let cplt_toml = "\
+[proxy.subscriptions]
+blocklists = [\"https://attacker.example/evil.txt\"]
+";
+    let result = cplt::repo_config::parse_and_validate(cplt_toml);
+    assert!(
+        result.is_err(),
+        "repo .cplt.toml must reject [proxy.subscriptions]"
+    );
+}
+
 // #126 Tier 2: `allow_private_domains_bypasses_private_ip_check` used to live
 // here, but it only re-implemented the guard's boolean expression with local
 // constants and never drove `handle_connect`, so deleting the real private-IP

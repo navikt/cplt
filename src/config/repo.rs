@@ -86,6 +86,17 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
             "domain lists are machine-specific paths, not project policy"
         }
         ("proxy", "default_allowlist") => "proxy settings are machine-specific, not project policy",
+        // Blocklist subscriptions (issue #144) are GLOBAL-only: a malicious repo
+        // must not be able to point cplt at an attacker-controlled list. The
+        // repo config schema has no [proxy] table, so a `.cplt.toml` cannot even
+        // express these — this mirrors proxy.forced's rejection for the
+        // `config set --repo` path.
+        ("proxy", "subscriptions")
+        | ("proxy", "subscriptions.blocklists")
+        | ("proxy", "subscriptions.refresh") => {
+            "subscription sources are machine/network-specific and security-sensitive, \
+             not project policy — a repo must not be able to add a subscription"
+        }
         ("proxy", "upstream") => {
             "the corporate proxy is machine/network-specific, not project policy"
         }
