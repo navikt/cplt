@@ -1684,7 +1684,7 @@ fn load_subscription_blocklist(resolved: &config::Resolved, quiet: bool) -> Vec<
     // Lazy pre-run refresh (no-op under `refresh = "manual"`). Failures fall
     // through to the cache; we surface tamper (verify) failures loudly.
     let now = std::time::SystemTime::now();
-    for outcome in subscriptions::refresh_if_stale(set, &subscriptions::curl_fetch, now) {
+    for outcome in subscriptions::refresh_if_stale(set, &subscriptions::curl_fetch_lazy, now) {
         if let subscriptions::UpdateOutcome::VerifyFailed {
             url,
             expected,
@@ -1771,6 +1771,11 @@ fn run_update_lists() -> ExitCode {
             subscriptions::UpdateOutcome::EmptyNoCache { url, reason } => {
                 ui::warn(&format!(
                     "{url}\n    fetch failed ({reason}) — no cache yet, treated as empty"
+                ));
+            }
+            subscriptions::UpdateOutcome::WriteFailed { url, reason } => {
+                ui::warn(&format!(
+                    "{url}\n    fetched OK but cache write failed ({reason})"
                 ));
             }
             subscriptions::UpdateOutcome::VerifyFailed {

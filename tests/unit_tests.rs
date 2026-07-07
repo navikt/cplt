@@ -442,6 +442,45 @@ blocklists = [\"https://attacker.example/evil.txt\"]
     );
 }
 
+#[test]
+fn subscriptions_reject_non_https_scheme() {
+    // Only https:// (and file:// for a local mirror) are accepted. http://,
+    // junk, and `-`-prefixed values (which curl could otherwise parse as flags)
+    // must fail at config-load time.
+    use cplt::config::{CliFlags, Config};
+    for bad in [
+        "http://example.com/list.txt",
+        "ftp://example.com/list.txt",
+        "-K/tmp/evil-curlrc",
+        "--output=/tmp/pwned",
+        "example.com/list.txt",
+    ] {
+        let toml = format!("[proxy.subscriptions]\nblocklists = [\"{bad}\"]\n");
+        let result = Config::parse(&toml).unwrap().merge(CliFlags::default());
+        assert!(
+            result.is_err(),
+            "subscription url {bad:?} must be rejected at config load"
+        );
+    }
+}
+
+#[test]
+fn subscriptions_accept_https_and_file_scheme() {
+    use cplt::config::{CliFlags, Config};
+    let toml = "\
+[proxy.subscriptions]
+blocklists = [
+  \"https://example.com/list.txt\",
+  \"file:///tmp/local-mirror.txt\",
+]
+";
+    let resolved = Config::parse(toml)
+        .unwrap()
+        .merge(CliFlags::default())
+        .unwrap();
+    assert_eq!(resolved.proxy_subscriptions.blocklists.len(), 2);
+}
+
 // #126 Tier 2: `allow_private_domains_bypasses_private_ip_check` used to live
 // here, but it only re-implemented the guard's boolean expression with local
 // constants and never drove `handle_connect`, so deleting the real private-IP

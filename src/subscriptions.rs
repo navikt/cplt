@@ -33,15 +33,33 @@
 //! security-critical, fail-closed, verification-required) are explicitly **out of
 //! scope** for this module — they are a separate future feature (#144 Phase 2).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Bounded per-fetch timeout (seconds). The run must never hang on the network.
+/// Bounded per-fetch timeout (seconds) for the explicit `cplt update-lists`
+/// path. The run must never hang on the network.
 const FETCH_TIMEOUT_SECS: u64 = 20;
+
+/// Much shorter per-fetch timeout (seconds) for the *lazy* pre-run refresh path.
+/// Startup must not stall on a black-holed host, so the lazy path uses a tight
+/// budget and degrades to the last-good cache; only the explicit `update-lists`
+/// path gets the full [`FETCH_TIMEOUT_SECS`] timeout.
+const LAZY_FETCH_TIMEOUT_SECS: u64 = 5;
+
+/// Hard ceiling on a fetched blocklist response (bytes). A 1M-domain blocklist
+/// is ~20 MB, so 50 MB is a safe, generous cap. Enforced two ways: `curl` aborts
+/// early via `--max-filesize` when the server sends a `Content-Length`, and we
+/// additionally cap the bytes we actually read/buffer (for chunked or
+/// unknown-length responses `--max-filesize` is skipped) so a malicious or
+/// MITM'd host cannot stream multi-GB within the timeout and OOM-kill the parent
+/// — nor slip an oversize body past a pinned-hash check by forcing us to buffer
+/// the whole body before it is hashed.
+const MAX_FETCH_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Warn about a cache that has not been refreshed in this long.
 const STALE_WARN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -137,6 +155,11 @@ pub enum UpdateOutcome {
     },
     /// Fetch failed and there is no cache — treated as empty (safe, tighten-only).
     EmptyNoCache { url: String, reason: String },
+    /// Fetched OK but the cache could not be persisted (dir create / atomic write
+    /// failed). The last-good cache (if any) is kept and the state timestamp is
+    /// NOT advanced, so the next run retries instead of treating an unwritten
+    /// cache as "fresh".
+    WriteFailed { url: String, reason: String },
 }
 
 impl UpdateOutcome {
@@ -146,7 +169,8 @@ impl UpdateOutcome {
             Self::Fetched { url, .. }
             | Self::CacheKept { url, .. }
             | Self::VerifyFailed { url, .. }
-            | Self::EmptyNoCache { url, .. } => url,
+            | Self::EmptyNoCache { url, .. }
+            | Self::WriteFailed { url, .. } => url,
         }
     }
 
@@ -164,31 +188,85 @@ pub type Fetcher<'a> = dyn Fn(&str) -> Result<Vec<u8>, String> + 'a;
 /// timeout, https-only redirects). Mirrors the download discipline of
 /// `update.rs`. Runs in cplt's parent process, OUTSIDE the sandbox.
 pub fn curl_fetch(url: &str) -> Result<Vec<u8>, String> {
-    // Only https:// is fetched in production. file:// is permitted so operators
-    // can point at a locally-mirrored list; it is also what tests use.
-    let output = Command::new("/usr/bin/curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--proto",
-            "=https,file",
-            "--proto-redir",
-            "=https",
-            "--max-time",
-            &FETCH_TIMEOUT_SECS.to_string(),
-            "--header",
-            &format!("User-Agent: cplt/{}", env!("CARGO_PKG_VERSION")),
-            url,
-        ])
-        .output()
+    curl_fetch_inner(url, FETCH_TIMEOUT_SECS)
+}
+
+/// Lazy-path fetcher: same download discipline as [`curl_fetch`] but with the
+/// tight [`LAZY_FETCH_TIMEOUT_SECS`] budget so a stale-cache refresh before a run
+/// cannot stall startup on a slow or black-holed host.
+pub fn curl_fetch_lazy(url: &str) -> Result<Vec<u8>, String> {
+    curl_fetch_inner(url, LAZY_FETCH_TIMEOUT_SECS)
+}
+
+/// Build the `curl` argument vector for `url`. Only https:// is fetched in
+/// production; file:// is permitted so operators can point at a locally-mirrored
+/// list (and tests use it). The `--` end-of-options marker is placed immediately
+/// before the URL so a value beginning with `-` (e.g. `-K/curlrc`, `--output x`)
+/// is always treated as the positional URL, never parsed as a curl flag.
+fn curl_args(url: &str, timeout_secs: u64) -> Vec<String> {
+    vec![
+        "--fail".into(),
+        "--silent".into(),
+        "--show-error".into(),
+        "--location".into(),
+        "--proto".into(),
+        "=https,file".into(),
+        "--proto-redir".into(),
+        "=https".into(),
+        "--max-time".into(),
+        timeout_secs.to_string(),
+        "--max-filesize".into(),
+        MAX_FETCH_BYTES.to_string(),
+        "--header".into(),
+        format!("User-Agent: cplt/{}", env!("CARGO_PKG_VERSION")),
+        "--".into(),
+        url.to_string(),
+    ]
+}
+
+/// Fetch with an explicit timeout. Streams `curl`'s stdout through a hard byte
+/// ceiling ([`MAX_FETCH_BYTES`]): `--max-filesize` aborts early only when the
+/// server sends a `Content-Length`, so we ALSO stop reading the moment the body
+/// exceeds the cap and kill `curl`, guaranteeing the parent never buffers a
+/// multi-GB size bomb (which would OOM-kill cplt and defeat a pinned-hash check
+/// that must see the whole body first).
+fn curl_fetch_inner(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String> {
+    let mut child = Command::new("/usr/bin/curl")
+        .args(curl_args(url, timeout_secs))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("cannot run /usr/bin/curl: {e}"))?;
 
-    if output.status.success() {
-        Ok(output.stdout)
+    // Read at most MAX_FETCH_BYTES + 1: if we get that many, the body is over the
+    // cap. `--silent` keeps stderr tiny (only errors), so reading stdout to EOF
+    // before draining stderr cannot deadlock on a full stderr pipe.
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut buf = Vec::new();
+    let read_res = stdout
+        .by_ref()
+        .take(MAX_FETCH_BYTES + 1)
+        .read_to_end(&mut buf);
+
+    if read_res.is_err() || buf.len() as u64 > MAX_FETCH_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "response exceeds {MAX_FETCH_BYTES}-byte limit — refusing (possible size bomb)"
+        ));
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("curl did not exit cleanly: {e}"))?;
+
+    if status.success() {
+        Ok(buf)
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut stderr = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = err.read_to_string(&mut stderr);
+        }
         Err(stderr.trim().to_string())
     }
 }
@@ -347,6 +425,28 @@ fn update_one(
         }
     };
 
+    // Hard size ceiling, enforced BEFORE hashing or caching. `curl_fetch` already
+    // caps its streamed read, but re-check here so any fetcher (incl. a mirror or
+    // test double) cannot slip an oversize body past the pinned-hash check or into
+    // the cache. Oversize is rejected fail-open: the last-good cache is preserved.
+    if bytes.len() as u64 > MAX_FETCH_BYTES {
+        let reason = format!(
+            "response is {} bytes, over the {MAX_FETCH_BYTES}-byte limit — rejected",
+            bytes.len()
+        );
+        return if cache_exists {
+            UpdateOutcome::CacheKept {
+                url: sub.url.clone(),
+                reason,
+            }
+        } else {
+            UpdateOutcome::EmptyNoCache {
+                url: sub.url.clone(),
+                reason,
+            }
+        };
+    }
+
     // Optional integrity check. A mismatch REJECTS the update and keeps the
     // last-good cache — the tamper-refuse behaviour of update.rs.
     let mut verified = false;
@@ -365,11 +465,18 @@ fn update_one(
 
     let domains = parse_blocklist(&String::from_utf8_lossy(&bytes)).len();
 
-    // Best-effort cache write. If the directory or write fails we still report a
-    // fetch (tighten-only: a failed write just means the new domains are not
-    // persisted; the last-good cache — if any — remains).
-    if std::fs::create_dir_all(&set.cache_dir).is_ok() {
-        let _ = write_atomic(&path, &bytes);
+    // Persist the cache atomically, and record the fetch timestamp ONLY after the
+    // write is confirmed. If the dir create or atomic write fails we leave the
+    // prior timestamp untouched so the next run retries, rather than advancing the
+    // clock and skipping a re-fetch while serving a stale/absent cache.
+    let write_ok =
+        std::fs::create_dir_all(&set.cache_dir).is_ok() && write_atomic(&path, &bytes).is_ok();
+    if !write_ok {
+        return UpdateOutcome::WriteFailed {
+            url: sub.url.clone(),
+            reason: "could not write cache file — keeping prior state, next run retries"
+                .to_string(),
+        };
     }
 
     state.set(&sub.url, unix_secs(now), domains);
@@ -418,10 +525,22 @@ fn is_due(
     }
 }
 
-/// Lazy pre-run refresh: when `refresh != manual`, re-fetch any subscription
-/// whose cache is stale (bounded by the fetcher's timeout). Fails over to the
-/// cache — never blocks or fails the run. Returns outcomes for stale entries
-/// only (empty when nothing was due or refresh is manual).
+/// Lazy pre-run refresh: when `refresh != manual`, re-fetch AT MOST ONE stale
+/// subscription before the run, using the short lazy timeout supplied by the
+/// caller. Fails over to the cache — never blocks or fails the run.
+///
+/// # Startup-stall budget
+///
+/// A stale cache must not turn startup into an `N * timeout` stall: with N
+/// black-holed hosts, refreshing them all sequentially before every run could
+/// hang for minutes. So the lazy path spends a single small budget per run — it
+/// refreshes only the FIRST due subscription and stops. Remaining stale lists are
+/// picked up one-per-run on subsequent invocations, and every one degrades to the
+/// last-good cache on failure. The explicit `cplt update-lists` path
+/// ([`update_all`]) still refreshes every list with the full timeout.
+///
+/// Returns outcomes for the (at most one) refreshed entry, or empty when nothing
+/// was due or refresh is manual.
 pub fn refresh_if_stale(
     set: &SubscriptionSet,
     fetch: &Fetcher,
@@ -435,6 +554,9 @@ pub fn refresh_if_stale(
     for sub in &set.blocklists {
         if is_due(set, sub, &state, now) {
             outcomes.push(update_one(set, sub, fetch, now, &mut state));
+            // Spend the whole per-run lazy budget on this one list; the rest wait
+            // for future runs so startup can never stall on many dead hosts.
+            break;
         }
     }
     if !outcomes.is_empty() {
@@ -722,5 +844,136 @@ mod tests {
             assert_eq!(String::from_utf8_lossy(&bytes).trim(), "curl.example");
         }
         // curl may be unavailable in some CI images; a fetch error is tolerated.
+    }
+
+    // ── FIX 1: response size cap (DoS / pinning-bypass) ─────────────────────
+
+    #[test]
+    fn oversize_response_rejected_and_keeps_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = set_with(
+            dir.path(),
+            RefreshInterval::Manual,
+            vec![sub("mem://a", None)],
+        );
+        // Establish a last-good cache with a normal fetch.
+        update_all(&set, &|_| Ok(b"good.com\n".to_vec()), SystemTime::now());
+        assert_eq!(load_cached_domains(&set), vec!["good.com"]);
+
+        // Now the host streams a body one byte over the hard cap.
+        let oversize = vec![b'a'; (MAX_FETCH_BYTES + 1) as usize];
+        let outcomes = update_all(&set, &|_| Ok(oversize.clone()), SystemTime::now());
+        assert!(
+            matches!(outcomes[0], UpdateOutcome::CacheKept { .. }),
+            "oversize response must be rejected: {:?}",
+            outcomes[0]
+        );
+        // Last-good cache is preserved, NOT overwritten by the oversize body.
+        assert_eq!(load_cached_domains(&set), vec!["good.com"]);
+    }
+
+    #[test]
+    fn oversize_response_no_cache_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = set_with(
+            dir.path(),
+            RefreshInterval::Manual,
+            vec![sub("mem://a", None)],
+        );
+        let oversize = vec![b'a'; (MAX_FETCH_BYTES + 1) as usize];
+        let outcomes = update_all(&set, &|_| Ok(oversize.clone()), SystemTime::now());
+        assert!(matches!(outcomes[0], UpdateOutcome::EmptyNoCache { .. }));
+        assert!(load_cached_domains(&set).is_empty());
+    }
+
+    #[test]
+    fn at_cap_response_is_accepted() {
+        // Exactly at the cap is allowed; only strictly-over is rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let set = set_with(
+            dir.path(),
+            RefreshInterval::Manual,
+            vec![sub("mem://a", None)],
+        );
+        // A body at the cap that parses to one domain line.
+        let mut body = b"cap.example\n".to_vec();
+        body.resize(MAX_FETCH_BYTES as usize, b'#'); // pad with comment bytes
+        let outcomes = update_all(&set, &|_| Ok(body.clone()), SystemTime::now());
+        assert!(matches!(outcomes[0], UpdateOutcome::Fetched { .. }));
+    }
+
+    // ── FIX 2: curl `--` end-of-options guard ───────────────────────────────
+
+    #[test]
+    fn curl_args_place_double_dash_before_url() {
+        // A flag-like URL must sit AFTER `--` so curl never parses it as an option.
+        let args = curl_args("-K/tmp/evil-curlrc", FETCH_TIMEOUT_SECS);
+        let url_idx = args.iter().position(|a| a == "-K/tmp/evil-curlrc").unwrap();
+        assert_eq!(
+            args[url_idx - 1],
+            "--",
+            "the URL must be immediately preceded by the `--` end-of-options marker"
+        );
+        assert_eq!(
+            url_idx,
+            args.len() - 1,
+            "the URL must be the final argument"
+        );
+    }
+
+    #[test]
+    fn curl_args_carry_size_cap() {
+        let args = curl_args("https://example.com/list.txt", FETCH_TIMEOUT_SECS);
+        let idx = args.iter().position(|a| a == "--max-filesize").unwrap();
+        assert_eq!(args[idx + 1], MAX_FETCH_BYTES.to_string());
+    }
+
+    // ── FIX 3: lazy-refresh startup budget (one stale list per run) ──────────
+
+    #[test]
+    fn lazy_refresh_updates_at_most_one_stale_list_per_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = set_with(
+            dir.path(),
+            RefreshInterval::Daily,
+            vec![
+                sub("mem://a", None),
+                sub("mem://b", None),
+                sub("mem://c", None),
+            ],
+        );
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        // All three are due (no cache). One run refreshes exactly ONE of them.
+        let o1 = refresh_if_stale(&set, &|_| Ok(b"x.com\n".to_vec()), t0);
+        assert_eq!(o1.len(), 1, "at most one stale list refreshes per run");
+        // Next run picks up another still-stale list — again exactly one.
+        let o2 = refresh_if_stale(&set, &|_| Ok(b"x.com\n".to_vec()), t0);
+        assert_eq!(o2.len(), 1);
+    }
+
+    // ── FIX 4: state timestamp only after a confirmed cache write ────────────
+
+    #[test]
+    fn write_failure_reports_and_leaves_state_unadvanced() {
+        let dir = tempfile::tempdir().unwrap();
+        // Make the cache_dir un-creatable: its parent is a regular file.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let cache_dir = blocker.join("subscriptions");
+        let set = SubscriptionSet {
+            refresh: RefreshInterval::Manual,
+            blocklists: vec![sub("mem://a", None)],
+            cache_dir,
+        };
+        let outcomes = update_all(&set, &|_| Ok(b"a.com\n".to_vec()), SystemTime::now());
+        assert!(
+            matches!(outcomes[0], UpdateOutcome::WriteFailed { .. }),
+            "a failed cache write must report WriteFailed: {:?}",
+            outcomes[0]
+        );
+        // State was NOT persisted (dir un-creatable), so a later run still sees the
+        // list as due rather than skipping it on a bogus "fresh" timestamp.
+        let state = State::load(&set.cache_dir);
+        assert!(state.get("mem://a").is_none());
     }
 }

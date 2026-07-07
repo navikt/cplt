@@ -227,6 +227,17 @@ impl Config {
                         "proxy.subscriptions.blocklists entry has an empty url".to_string(),
                     ));
                 }
+                // Scheme allowlist, enforced at config-load time. Only https:// is
+                // fetched in production; file:// is permitted for a local mirror /
+                // offline + test path. Rejecting anything else here catches junk,
+                // `http://`, and `-`-prefixed values (which curl would otherwise try
+                // to parse as flags) before they ever reach the fetcher.
+                if !(url.starts_with("https://") || url.starts_with("file://")) {
+                    return Err(ConfigError::Validation(format!(
+                        "proxy.subscriptions.blocklists url {url:?} must start with \
+                         https:// (or file:// for a local mirror)"
+                    )));
+                }
                 blocklists.push(crate::subscriptions::BlocklistSubscription {
                     url,
                     sha256: entry.sha256().map(|s| s.trim().to_ascii_lowercase()),
