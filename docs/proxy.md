@@ -179,7 +179,7 @@ cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
 
 By default the proxy is **allow-all**: it logs and blocks known-bad domains, but any HTTPS endpoint on the internet is reachable. Because port 443 is open at the kernel level, a compromised agent or a malicious dependency could exfiltrate source code to an arbitrary host. Network control is the only defense-in-depth layer that stops exfiltration *after* an agent is compromised (issue #52).
 
-Each agent ships with a built-in **default allowlist** — the set of domains it legitimately needs. For **Copilot** this is the GitHub Copilot infrastructure plus common package registries:
+Each agent ships with a built-in **default allowlist** — the set of domains it legitimately needs, on top of a shared package-registry base. For **Copilot** this is the GitHub Copilot infrastructure plus common package registries:
 
 ```
 # GitHub Copilot infrastructure
@@ -194,6 +194,18 @@ registry.npmjs.org  registry.yarnpkg.com  repo.maven.apache.org
 plugins.gradle.org  crates.io  static.crates.io  pypi.org  files.pythonhosted.org
 ```
 
+**Per-agent infrastructure defaults.** Each agent adds its own endpoints on top of the shared registry base:
+
+- **Copilot** — GitHub Copilot infrastructure (above).
+- **Gemini** — Google Gemini API, Code Assist backend, and Google OAuth.
+- **Antigravity** — the same Google AI infrastructure as Gemini, plus `antigravity.google`.
+- **Claude** — the Anthropic API, console/login, and feature-flag telemetry.
+- **OpenCode** — only OpenCode's own infra (`opencode.ai`, `models.dev`). OpenCode is provider-agnostic, so **you must add your chosen model provider's domain** (e.g. `api.anthropic.com`, `api.openai.com`, or `generativelanguage.googleapis.com`) via `allowed_domains` for the model traffic to be permitted.
+- **Pi** — no infrastructure defaults yet; add its endpoints via `allowed_domains` when enabling the allowlist (contributions welcome).
+- **Shell** — registry base only (not an AI agent).
+
+These infra lists are best-effort defaults for this opt-in feature; anything missing shows up as `BLOCKED-ALLOWLIST` (see below) so you can add it.
+
 Turn it on to make the proxy **fail-closed** — only these domains (and your own additions) are allowed, everything else is blocked:
 
 ```bash
@@ -206,6 +218,44 @@ cplt config set proxy.default_allowlist true         # permanently
 - **Blocked attempts are visible.** Denied connections are logged as `BLOCKED-ALLOWLIST` (see `--proxy-log` / `--proxy-log-level blocked`) so you can quickly see what to add.
 - **Escape hatch.** `--allow-all-domains` disables the allowlist for a single run (and ignores any `--allowed-domains` file) — allow-all again, for debugging. It overrides both `--default-allowlist` and `proxy.default_allowlist`.
 - **Composes with the other proxy features.** The domain allowlist is enforced by the proxy regardless of `proxy.forced` (kernel egress restriction) or `proxy.upstream` (corporate-proxy forwarding): a no-proxy/upstream target still passes through the same allowlist check — the allowlist governs **which** domains, orthogonal to **how** they are routed.
+
+### Verifying / generating an agent's domain allowlist
+
+The per-agent default allowlists (see above) should be **empirically observed**, not guessed. `--observe-domains` runs the session with the proxy in **allow-all mode** and records every domain the agent contacts, then prints the set as a ready-to-paste allowlist. This is how you make a default allowlist *verifiable and exhaustive*.
+
+```bash
+# Capture what the agent contacts while doing a representative task.
+cplt --agent copilot --observe-domains -- -p "add tests for the parser and run them"
+```
+
+`--observe-domains`:
+
+- **Forces the proxy on and in allow-all mode for this run.** It overrides `--preset strict`, `--default-allowlist`, `proxy.default_allowlist`, and any configured `allowed_domains` — nothing is blocked, so you observe the *full* set the agent would contact. cplt prints a one-line notice and a warning that **this run does not enforce domain filtering** (do not treat an observe run as a protected session).
+- **Records every CONNECT** regardless of `--proxy-log` / `--proxy-log-level`, then emits the sorted, deduplicated host list to stderr (always, even under `--quiet`):
+
+```
+[cplt] observe-domains: 14 domains contacted by Copilot this session
+# add to allowed_domains (or src/agent.rs default_allowed_domains):
+# bare hosts, exact-or-subdomain match; collapse subdomains to a parent by hand
+# e.g. api.githubcopilot.com + proxy.githubcopilot.com -> githubcopilot.com
+api.github.com
+api.githubcopilot.com
+github.com
+registry.npmjs.org
+...
+```
+
+- **`--observe-domains-out <FILE>`** also writes the bare domain list (one per line) to `FILE` for scripting.
+- **Works for `cplt exec` too:** `cplt --agent claude --observe-domains exec -- npm test`.
+
+To make it representative, exercise the workflows you care about in one session: resume a chat, build, run tests, install a dependency, etc. The emitted hosts are the *raw* observed set; subdomains are **not** auto-collapsed (that needs a public-suffix heuristic that risks over-broadening). Because the allowlist matcher is **exact-or-subdomain**, you can fold related subdomains to a parent by hand — e.g. `api.githubcopilot.com` + `proxy.githubcopilot.com` → `githubcopilot.com`.
+
+**Updating the allowlist.** Paste the observed hosts into either:
+
+- your own `allowed_domains` file / `proxy.allowed_domains` config (per-project), or
+- an agent's built-in defaults in [`src/agent.rs`](../src/agent.rs) (`default_allowed_domains` and the `*_DOMAINS` consts) for a change shipped to everyone.
+
+When editing `src/agent.rs`, record **provenance** in a comment on the const — which agent + version and the date you captured the domains — so reviewers can tell whether the list is current (see the convention note above those consts). Do not fabricate provenance for lists you did not actually observe.
 
 ## Proxy operations
 
