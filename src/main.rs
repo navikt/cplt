@@ -3,7 +3,8 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use cplt::{
-    agent, audit, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch, trust, update,
+    agent, audit, check, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch, trust,
+    update,
 };
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
@@ -676,6 +677,41 @@ QUICK START:
     /// and sandbox-critical paths. Exits 0 if all critical checks pass.
     Doctor,
 
+    /// Verify & explain sandbox enforcement.
+    ///
+    /// Runs probes inside the REAL resolved sandbox/proxy (the same policy the
+    /// agent would get) and reports, for each, whether cplt allows or blocks it
+    /// AND why + the exact fix. Honours the policy-affecting flags — put them
+    /// before `check`, e.g. `cplt --preset strict check`.
+    ///
+    /// With no subcommand it runs a battery demonstrating enforcement and exits
+    /// non-zero if the sandbox is NOT enforcing (useful in CI).
+    ///
+    /// EXAMPLES:
+    ///   cplt check
+    ///     Enforcement battery + one-line verdict.
+    ///   cplt --preset strict check --json
+    ///     Machine-readable battery for CI.
+    ///   cplt check path ~/.ssh/id_rsa
+    ///     Probe a filesystem path (read, and --write).
+    ///   cplt check net evil.example
+    ///     Probe a domain against the proxy policy.
+    ///   cplt check exec docker
+    ///     Report whether a command would run or is gated.
+    #[command(after_help = "\
+NOTE:
+  Probes reflect cplt's resolved policy. A passing network probe means
+  \"cplt is not blocking this\" — not that the host is up or that an
+  arbitrary agent action would behave identically.")]
+    Check {
+        #[command(subcommand)]
+        target: Option<CheckTarget>,
+
+        /// Emit machine-readable JSON instead of the human report.
+        #[arg(long, global = true)]
+        json: bool,
+    },
+
     /// Run an arbitrary command inside the sandbox.
     ///
     /// Uses the same sandbox as `--agent shell`: filesystem isolation,
@@ -786,6 +822,45 @@ QUICK START:
         /// git arguments to evaluate and potentially pass through.
         #[arg(last = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckTarget {
+    /// Probe filesystem access to PATH inside the sandbox.
+    ///
+    /// Runs a hermetic read (and, with --write, a write) probe inside the real
+    /// sandbox and reports allowed/blocked + why + the fix. Reads nothing from
+    /// the file and never mutates user state.
+    Path {
+        /// The path to probe (file or directory).
+        path: PathBuf,
+
+        /// Also probe write access (creates and removes a probe file for
+        /// directories; append-opens an existing file without writing bytes).
+        #[arg(long)]
+        write: bool,
+    },
+
+    /// Probe a CONNECT to DOMAIN[:PORT] under the resolved proxy policy.
+    ///
+    /// Blocked targets never leave cplt. An allowed target additionally gets a
+    /// real outbound connection attempt to confirm reachability (skip with
+    /// --no-connect for a static, policy-only answer).
+    Net {
+        /// Target as `domain` or `domain:port` (default port 443).
+        target: String,
+
+        /// Explain from policy only — do not make any outbound connection.
+        #[arg(long)]
+        no_connect: bool,
+    },
+
+    /// Report whether CMD would run, is guard-blocked, or needs an allow_*.
+    Exec {
+        /// The command and its arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
     },
 }
 
@@ -1689,6 +1764,21 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         }
     }
 
+    // Handle `cplt check` before consuming cli.command, for the same reason as
+    // exec above: run_check_command needs to borrow &cli (via resolve_context)
+    // after taking the check-specific fields out.
+    #[allow(clippy::collapsible_if)]
+    if matches!(&cli.command, Some(Command::Check { .. })) {
+        if let Some(Command::Check { target, json }) = cli.command.take() {
+            // check defaults to quiet: it prints its own report, so suppress the
+            // config-loading diagnostics that would otherwise contaminate --json.
+            if !cli.no_quiet {
+                cli.quiet = true;
+            }
+            return run_check_command(&cli, target, json);
+        }
+    }
+
     // Handle subcommands (these don't need macOS or sandbox)
     if let Some(command) = cli.command {
         return Ok(match command {
@@ -1768,6 +1858,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             }
             // Exec is handled before this match (see above) — unreachable
             Command::Exec { .. } => unreachable!("Command::Exec handled before this match"),
+            // Check is handled before this match (see above) — unreachable
+            Command::Check { .. } => unreachable!("Command::Check handled before this match"),
         });
     }
 
@@ -2291,6 +2383,120 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
     bail!("exec: '{name}' not found in PATH")
 }
 
+/// A fully-built Shell sandbox plus the live resources it depends on.
+///
+/// `scratch_guard` and `proxy_handle` are RAII/handle values that must outlive
+/// any use of `prepared` (the scratch dir is cleaned up on drop; the proxy
+/// thread is shut down via the handle). `policy` is the structured Landlock
+/// model of the filesystem policy — the same rules the profile enforces —
+/// used by `cplt check` for the explain layer (`describe_policy`'s model).
+struct ShellSandbox {
+    prepared: sandbox::PreparedSandbox,
+    policy: sandbox::LandlockPolicy,
+    proxy_handle: Option<proxy::ProxyHandle>,
+    scratch_guard: Option<scratch::ScratchDir>,
+}
+
+/// Build the resolved Shell sandbox: tool discovery, scratch dir, optional
+/// proxy, and the compiled sandbox profile.
+///
+/// This is the shared setup used by both `cplt exec` and `cplt check` so their
+/// probes run under byte-for-byte the same policy. Mutates `resolved`
+/// (proxy port, tool-path env overrides) exactly as the agent launch does.
+fn prepare_shell_sandbox(
+    cli: &Cli,
+    resolved: &mut config::Resolved,
+    config_path: Option<&PathBuf>,
+    home_dir: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<ShellSandbox> {
+    let active_agent = agent::Agent::Shell;
+
+    let tool_discovery = discover::discover_tools(home_dir);
+    let existing_home_tool_dirs = tool_discovery.existing_home_tool_dirs;
+    let existing_app_dirs = tool_discovery.existing_app_dirs;
+
+    let scratch_guard = if resolved.scratch_dir {
+        scratch::ScratchDir::gc_stale(home_dir);
+        match scratch::ScratchDir::create(home_dir) {
+            Ok(s) => Some(s),
+            Err(e) => bail!("Cannot create scratch dir: {e}"),
+        }
+    } else {
+        None
+    };
+    let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
+
+    let git_hooks_path = discover::git_hooks_path(home_dir);
+    let git_common_dir = discover::git_common_dir(home_dir, project_dir);
+    let java_home_dir = std::env::var("JAVA_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .filter(|p| !crate::is_unsafe_root(p, home_dir));
+
+    let agent_dirs = active_agent.config_dirs(home_dir);
+    for dir in &agent_dirs {
+        if !dir.path.exists() {
+            let _ = std::fs::create_dir_all(&dir.path);
+        }
+    }
+
+    let proxy_handle = start_proxy_if_enabled(resolved, cli, config_path, active_agent)?;
+    let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
+
+    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
+    merge_tool_path_env_overrides(resolved, home_dir);
+
+    let sandbox_config = sandbox::SandboxConfig {
+        project_dir,
+        home_dir,
+        extra_read: &resolved.allow_read,
+        extra_write: &resolved.allow_write,
+        extra_socket: &resolved.allow_socket,
+        extra_deny: &resolved.deny_paths,
+        existing_home_tool_dirs: Some(&existing_home_tool_dirs),
+        existing_app_dirs: Some(&existing_app_dirs),
+        extra_ports: &resolved.allow_ports,
+        localhost_ports: &resolved.allow_localhost,
+        proxy_port: proxy_port_for_profile,
+        proxy_forced: resolved.proxy_forced,
+        allow_env_files: resolved.allow_env_files,
+        allow_localhost_any: resolved.allow_localhost_any,
+        scratch_dir: scratch_path,
+        allow_tmp_exec: resolved.allow_tmp_exec,
+        // shell/check have no agent install dir to grant special access to
+        copilot_install_dir: None,
+        java_home: java_home_dir.as_deref(),
+        git_hooks_path: git_hooks_path.as_deref(),
+        git_common_dir: git_common_dir.as_deref(),
+        allow_gpg_signing: resolved.allow_gpg_signing,
+        deny_clipboard: resolved.deny_clipboard,
+        allow_jvm_attach: resolved.allow_jvm_attach,
+        allow_docker: resolved.allow_docker,
+        electron_app_dir: None,
+        agent: active_agent,
+        agent_dirs: &agent_dirs,
+        allow_cache_exec: &resolved.allow_cache_exec,
+        allow_cache_exec_any: resolved.allow_cache_exec_any,
+        allow_browser: resolved.allow_browser,
+        use_bubblewrap: resolved.use_bubblewrap,
+    };
+
+    // The structured Landlock model of the fs policy — used by the check
+    // explain layer. It faithfully mirrors the enforced allow-list on both
+    // platforms (the live probe remains authoritative where they differ).
+    let policy = sandbox::generate_policy(&sandbox_config);
+    let prepared = sandbox::prepare(&sandbox_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok(ShellSandbox {
+        prepared,
+        policy,
+        proxy_handle,
+        scratch_guard,
+    })
+}
+
 /// Run an arbitrary command inside the sandbox (`cplt exec -- <cmd> [args]`).
 ///
 /// Reuses the Agent::Shell sandbox policy. Defaults to quiet+yes so it is
@@ -2374,80 +2580,20 @@ fn run_exec_command(
     // Always use the Shell sandbox policy
     let active_agent = agent::Agent::Shell;
 
-    let tool_discovery = discover::discover_tools(&home_dir);
-    let existing_home_tool_dirs = tool_discovery.existing_home_tool_dirs;
-    let existing_app_dirs = tool_discovery.existing_app_dirs;
-
-    let scratch_guard = if resolved.scratch_dir {
-        scratch::ScratchDir::gc_stale(&home_dir);
-        match scratch::ScratchDir::create(&home_dir) {
-            Ok(s) => Some(s),
-            Err(e) => bail!("Cannot create scratch dir: {e}"),
-        }
-    } else {
-        None
-    };
-    let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
-
-    let git_hooks_path = discover::git_hooks_path(&home_dir);
-    let git_common_dir = discover::git_common_dir(&home_dir, &project_dir);
-    let java_home_dir = std::env::var("JAVA_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .filter(|p| !crate::is_unsafe_root(p, &home_dir));
-
-    let agent_dirs = active_agent.config_dirs(&home_dir);
-    for dir in &agent_dirs {
-        if !dir.path.exists() {
-            let _ = std::fs::create_dir_all(&dir.path);
-        }
-    }
-
-    let proxy_handle =
-        start_proxy_if_enabled(&mut resolved, cli, config_path.as_ref(), active_agent)?;
-    let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
-
-    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
-    merge_tool_path_env_overrides(&mut resolved, &home_dir);
-
-    let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
-        project_dir: &project_dir,
-        home_dir: &home_dir,
-        extra_read: &resolved.allow_read,
-        extra_write: &resolved.allow_write,
-        extra_socket: &resolved.allow_socket,
-        extra_deny: &resolved.deny_paths,
-        existing_home_tool_dirs: Some(&existing_home_tool_dirs),
-        existing_app_dirs: Some(&existing_app_dirs),
-        extra_ports: &resolved.allow_ports,
-        localhost_ports: &resolved.allow_localhost,
-        proxy_port: proxy_port_for_profile,
-        proxy_forced: resolved.proxy_forced,
-        allow_env_files: resolved.allow_env_files,
-        allow_localhost_any: resolved.allow_localhost_any,
-        scratch_dir: scratch_path,
-        allow_tmp_exec: resolved.allow_tmp_exec,
-        // exec has no agent install dir to grant special access to
-        copilot_install_dir: None,
-        java_home: java_home_dir.as_deref(),
-        git_hooks_path: git_hooks_path.as_deref(),
-        git_common_dir: git_common_dir.as_deref(),
-        allow_gpg_signing: resolved.allow_gpg_signing,
-        deny_clipboard: resolved.deny_clipboard,
-        allow_jvm_attach: resolved.allow_jvm_attach,
-        allow_docker: resolved.allow_docker,
-        electron_app_dir: None,
-        agent: active_agent,
-        agent_dirs: &agent_dirs,
-        allow_cache_exec: &resolved.allow_cache_exec,
-        allow_cache_exec_any: resolved.allow_cache_exec_any,
-        allow_browser: resolved.allow_browser,
-        use_bubblewrap: resolved.use_bubblewrap,
-    }) {
-        Ok(s) => s,
-        Err(e) => bail!("{e}"),
-    };
+    // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
+    // with `cplt check`, which runs its probes under the identical policy.
+    let ShellSandbox {
+        prepared,
+        proxy_handle,
+        scratch_guard: _scratch_guard,
+        ..
+    } = prepare_shell_sandbox(
+        cli,
+        &mut resolved,
+        config_path.as_ref(),
+        &home_dir,
+        &project_dir,
+    )?;
 
     if cli.print_profile {
         println!("{}", sandbox::describe(&prepared));
@@ -2496,6 +2642,689 @@ fn run_exec_command(
     }
 
     Ok(ExitCode::from(exit_code))
+}
+
+// ── cplt check ─────────────────────────────────────────────────────────────
+
+/// The canonical CLI/config name for a preset (inverse of `Preset::from_name`).
+fn preset_label(p: config::Preset) -> &'static str {
+    match p {
+        config::Preset::Strict => "strict",
+        config::Preset::Standard => "standard",
+        config::Preset::Permissive => "permissive",
+        config::Preset::FullTrust => "full-trust",
+    }
+}
+
+/// Sentinel exit code meaning "the sandbox probe could not even be spawned".
+/// Distinct from any code a probe script itself returns.
+const PROBE_SPAWN_FAILED: u8 = 200;
+
+/// Wrap a string as a single-quoted shell literal (safe for arbitrary paths).
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Run a hermetic shell probe inside the resolved sandbox and return its exit
+/// code. `PROBE_SPAWN_FAILED` means the shell could not be resolved/spawned.
+fn probe_shell(
+    prepared: &sandbox::PreparedSandbox,
+    resolved: &config::Resolved,
+    disabled: &[sandbox::HardeningCategory],
+    script: &str,
+) -> u8 {
+    let Ok(shell) = agent::Agent::Shell.resolve_binary() else {
+        return PROBE_SPAWN_FAILED;
+    };
+    let args = vec!["-c".to_string(), script.to_string()];
+    sandbox::exec_sandboxed(
+        prepared,
+        &shell,
+        &args,
+        &resolved.pass_env,
+        resolved.inherit_env,
+        disabled,
+        &resolved.deny_env,
+        &resolved.gh_guard,
+        &resolved.git_guard,
+    )
+}
+
+/// Interpret a read/write probe exit code as a [`check::Decision`].
+fn decode_fs_probe(code: u8) -> check::Decision {
+    match code {
+        0 => check::Decision::Allowed,
+        PROBE_SPAWN_FAILED => check::Decision::Inconclusive,
+        _ => check::Decision::Blocked,
+    }
+}
+
+/// Probe read access to `path` inside the sandbox (opens for read, reads
+/// nothing). Works for files and directories.
+fn probe_read(
+    prepared: &sandbox::PreparedSandbox,
+    resolved: &config::Resolved,
+    disabled: &[sandbox::HardeningCategory],
+    path: &Path,
+) -> check::Decision {
+    let script = format!(
+        "exec >/dev/null 2>&1; : < {}",
+        sh_quote(&path.to_string_lossy())
+    );
+    decode_fs_probe(probe_shell(prepared, resolved, disabled, &script))
+}
+
+/// Probe write access to `path` inside the sandbox without mutating user state.
+///
+/// - Directory: create and immediately remove a uniquely-named probe file.
+/// - Existing file: append-open (no bytes written; content-preserving).
+/// - Missing file: reported [`check::Decision::Inconclusive`] (creating it would
+///   mutate state).
+fn probe_write(
+    prepared: &sandbox::PreparedSandbox,
+    resolved: &config::Resolved,
+    disabled: &[sandbox::HardeningCategory],
+    path: &Path,
+) -> check::Decision {
+    let q = sh_quote(&path.to_string_lossy());
+    let script = if path.is_dir() {
+        format!("exec >/dev/null 2>&1; f={q}/.cplt-check-write.$$; : > \"$f\" && rm -f \"$f\"")
+    } else if path.exists() {
+        // Append-open an existing file: opens for write, writes nothing.
+        format!("exec >/dev/null 2>&1; : >> {q}")
+    } else {
+        return check::Decision::Inconclusive;
+    };
+    decode_fs_probe(probe_shell(prepared, resolved, disabled, &script))
+}
+
+/// Probe whether a binary staged in a writable-but-non-executable location can
+/// be executed (binary-drop prevention). Stages in `~/.cache` — writable on both
+/// platforms yet deliberately non-executable, the canonical binary-drop vector
+/// (the scratch dir / `$TMPDIR` is intentionally executable for real tooling, so
+/// it is NOT the right target). Distinguishes a staging failure (inconclusive)
+/// from an actual exec denial (blocked).
+fn probe_tmp_exec(
+    prepared: &sandbox::PreparedSandbox,
+    resolved: &config::Resolved,
+    disabled: &[sandbox::HardeningCategory],
+) -> (check::Decision, Option<String>) {
+    let script = "\
+exec >/dev/null 2>&1
+d=\"$HOME/.cache\"
+mkdir -p \"$d\" || exit 90
+f=\"$d/.cplt-check-exec.$$\"
+printf '#!/bin/sh\\nexit 0\\n' > \"$f\" || exit 90
+chmod +x \"$f\" || { rm -f \"$f\"; exit 91; }
+\"$f\"
+r=$?
+rm -f \"$f\"
+exit $r";
+    match probe_shell(prepared, resolved, disabled, script) {
+        0 => (check::Decision::Allowed, None),
+        90 | 91 => (
+            check::Decision::Inconclusive,
+            Some("could not stage the probe binary".to_string()),
+        ),
+        PROBE_SPAWN_FAILED => (
+            check::Decision::Inconclusive,
+            Some("sandbox probe could not be spawned".to_string()),
+        ),
+        _ => (check::Decision::Blocked, None),
+    }
+}
+
+/// Pick a known-protected credential path that exists on this host, for the
+/// enforcement battery's "read is blocked" demonstration. Falls back to the
+/// home directory root (always present and never listable in the sandbox).
+fn pick_protected_read(home: &Path) -> (PathBuf, String) {
+    const CANDIDATES: &[&str] = &[
+        ".ssh/id_rsa",
+        ".ssh/id_ed25519",
+        ".ssh",
+        ".aws/credentials",
+        ".aws",
+        ".config/gh/hosts.yml",
+        ".netrc",
+        ".gnupg",
+    ];
+    for c in CANDIDATES {
+        let p = home.join(c);
+        if p.exists() {
+            return (p, format!("read ~/{c}"));
+        }
+    }
+    (home.to_path_buf(), "read $HOME (root)".to_string())
+}
+
+/// The blocklist file cplt would use, mirroring `start_proxy_if_enabled`.
+fn default_blocklist_path(resolved: &config::Resolved) -> Option<PathBuf> {
+    if let Some(ref p) = resolved.blocked_domains {
+        return Some(p.clone());
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))?;
+    for name in ["blocked-domains.txt", "blocked.txt"] {
+        let candidate = exe_dir.join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Build the effective CONNECT policy snapshot from resolved config — the same
+/// merge `start_proxy_if_enabled` performs, so `classify_connect` sees exactly
+/// what the live proxy would enforce.
+fn build_net_policy(resolved: &config::Resolved, agent: agent::Agent) -> proxy::NetPolicy {
+    let mut ports = vec![443u16];
+    ports.extend_from_slice(&resolved.allow_ports);
+    ports.sort_unstable();
+    ports.dedup();
+
+    let default_allowlist: Vec<String> = if resolved.default_allowlist {
+        agent
+            .default_allowed_domains()
+            .iter()
+            .map(|d| (*d).to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let file_domains: Vec<String> = if resolved.allow_all_domains {
+        Vec::new()
+    } else if let Some(ref path) = resolved.allowed_domains {
+        proxy::parse_domain_file(path).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let allowed_domains = if default_allowlist.is_empty() {
+        file_domains
+    } else {
+        let mut merged = default_allowlist;
+        merged.extend(file_domains);
+        merged.sort_unstable();
+        merged.dedup();
+        merged
+    };
+
+    let blocked_domains = default_blocklist_path(resolved)
+        .and_then(|p| proxy::parse_domain_file(&p).ok())
+        .unwrap_or_default();
+
+    proxy::NetPolicy {
+        allowed_ports: ports,
+        allowed_domains,
+        blocked_domains,
+        allow_localhost_ports: resolved.allow_localhost.clone(),
+        allow_localhost_any: resolved.allow_localhost_any,
+    }
+}
+
+/// Split a `host[:port]` target into `(host, port)` (default 443).
+fn split_host_port(target: &str) -> (String, u16) {
+    // IPv6 literal in brackets, optional :port after the closing bracket.
+    if let Some(stripped) = target.strip_prefix('[')
+        && let Some(end) = stripped.find(']')
+    {
+        let host = &stripped[..end];
+        let rest = &stripped[end + 1..];
+        let port = rest
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443);
+        return (host.to_string(), port);
+    }
+    match target.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
+            (h.to_string(), p.parse().unwrap_or(443))
+        }
+        _ => (target.to_string(), 443),
+    }
+}
+
+/// Best-effort outbound reachability check (cplt runs outside the sandbox).
+/// Only used for an ALLOWED target to confirm "cplt is not blocking this";
+/// never affects the decision.
+fn probe_reachable(host: &str, port: u16) -> String {
+    use std::net::ToSocketAddrs;
+    let addr = format!("{host}:{port}");
+    let Ok(mut addrs) = addr.to_socket_addrs() else {
+        return format!("policy allows it, but {host} did not resolve here");
+    };
+    let Some(sa) = addrs.next() else {
+        return format!("policy allows it, but {host} did not resolve here");
+    };
+    match std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(4)) {
+        Ok(_) => format!("reachable — connected to {sa} then closed"),
+        Err(_) => "policy allows it, but the host was not reachable from here".to_string(),
+    }
+}
+
+fn run_check_command(
+    cli: &Cli,
+    target: Option<CheckTarget>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+        bail!("cplt check requires macOS or Linux");
+    }
+    if std::env::var("__CPLT_WRAPPED").is_ok() {
+        bail!(
+            "cplt check: already inside a cplt sandbox (recursion detected). \
+             Run this command outside the sandbox."
+        );
+    }
+
+    let ResolvedContext {
+        mut resolved,
+        config_path,
+        home_dir,
+        project_dir,
+        active_agent,
+        unapproved_proposals: _,
+    } = resolve_context(cli)?;
+
+    // check prints its own report; never prompt.
+    resolved.yes = true;
+
+    let agent_name = active_agent.display_name().to_string();
+    let preset_name = resolved.preset.map(|p| preset_label(p).to_string());
+    // Snapshot the effective net policy BEFORE prepare_shell_sandbox mutates
+    // resolved (it only changes the proxy port and tool-path env, neither of
+    // which affects domain/port classification, but snapshot early to be safe).
+    let net_policy = build_net_policy(&resolved, active_agent);
+
+    let ShellSandbox {
+        prepared,
+        policy,
+        proxy_handle,
+        scratch_guard: _scratch_guard,
+    } = prepare_shell_sandbox(
+        cli,
+        &mut resolved,
+        config_path.as_ref(),
+        &home_dir,
+        &project_dir,
+    )?;
+
+    let proxy_enabled = proxy_handle.is_some();
+    let disabled = resolved.disabled_hardening_categories();
+
+    let report = match target {
+        None => build_battery(
+            &prepared,
+            &policy,
+            &net_policy,
+            proxy_enabled,
+            &resolved,
+            &disabled,
+            &home_dir,
+            &project_dir,
+            active_agent,
+            agent_name,
+            preset_name,
+        ),
+        Some(CheckTarget::Path { path, write }) => {
+            let abs = canonicalize_check_path(&path);
+            build_path_check(
+                &prepared,
+                &policy,
+                &resolved,
+                &disabled,
+                &home_dir,
+                &project_dir,
+                agent_name,
+                preset_name,
+                &abs,
+                write,
+            )
+        }
+        Some(CheckTarget::Net {
+            target: dom,
+            no_connect,
+        }) => build_net_check(
+            &net_policy,
+            proxy_enabled,
+            &dom,
+            no_connect,
+            agent_name,
+            preset_name,
+        ),
+        Some(CheckTarget::Exec { cmd }) => {
+            build_exec_check(&resolved, &project_dir, &cmd, agent_name, preset_name)
+        }
+    };
+
+    if let Some(handle) = proxy_handle {
+        handle.shutdown();
+    }
+
+    if json {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.render());
+    }
+
+    if report.exit_nonzero() {
+        Ok(ExitCode::FAILURE)
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Resolve a user-supplied check path to an absolute path without requiring it
+/// to exist (canonicalize the existing ancestor, then re-append the tail).
+fn canonicalize_check_path(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(d) => d.join(path),
+            Err(_) => path.to_path_buf(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_battery(
+    prepared: &sandbox::PreparedSandbox,
+    policy: &sandbox::LandlockPolicy,
+    net_policy: &proxy::NetPolicy,
+    proxy_enabled: bool,
+    resolved: &config::Resolved,
+    disabled: &[sandbox::HardeningCategory],
+    home_dir: &Path,
+    project_dir: &Path,
+    agent: agent::Agent,
+    agent_name: String,
+    preset_name: Option<String>,
+) -> check::Report {
+    let mut items = Vec::new();
+
+    // ── Filesystem ──
+    // Sanity: reading & writing the project dir must be ALLOWED.
+    let read_proj = probe_read(prepared, resolved, disabled, project_dir);
+    let read_proj_expl = check::explain_path(policy, home_dir, project_dir, project_dir);
+    items.push(check::CheckItem {
+        name: "read project dir".to_string(),
+        category: "filesystem".to_string(),
+        target: project_dir.display().to_string(),
+        decision: read_proj,
+        expected: Some(check::Decision::Allowed),
+        reason: read_proj_expl.reason,
+        fix: read_proj_expl.fix,
+        note: baseline_note(read_proj),
+    });
+
+    let write_proj = probe_write(prepared, resolved, disabled, project_dir);
+    items.push(check::CheckItem {
+        name: "write project dir".to_string(),
+        category: "filesystem".to_string(),
+        target: project_dir.display().to_string(),
+        decision: write_proj,
+        expected: Some(check::Decision::Allowed),
+        reason: "covered by the project-dir rule (read+write+execute).".to_string(),
+        fix: None,
+        note: baseline_note(write_proj),
+    });
+
+    // Protection: a credential path must be BLOCKED for read.
+    let (prot_path, prot_label) = pick_protected_read(home_dir);
+    let read_prot = probe_read(prepared, resolved, disabled, &prot_path);
+    let prot_expl = check::explain_path(policy, home_dir, project_dir, &prot_path);
+    items.push(check::CheckItem {
+        name: prot_label,
+        category: "filesystem".to_string(),
+        target: prot_path.display().to_string(),
+        decision: read_prot,
+        expected: Some(check::Decision::Blocked),
+        reason: prot_expl.reason,
+        fix: prot_expl.fix,
+        note: None,
+    });
+
+    // Protection: writing into the home root must be BLOCKED.
+    let write_home = probe_write(prepared, resolved, disabled, home_dir);
+    items.push(check::CheckItem {
+        name: "write $HOME (root)".to_string(),
+        category: "filesystem".to_string(),
+        target: home_dir.display().to_string(),
+        decision: write_home,
+        expected: Some(check::Decision::Blocked),
+        reason: "the home directory root is not in any write rule (deny-by-default).".to_string(),
+        fix: None,
+        note: None,
+    });
+
+    // ── Exec: binary-drop prevention ──
+    // ~/.cache is writable but non-executable unless allow_cache_exec_any opens
+    // the whole tree, so that flag — not allow_tmp_exec — governs this probe.
+    let (tmp_dec, tmp_note) = probe_tmp_exec(prepared, resolved, disabled);
+    let cache_expected = if resolved.allow_cache_exec_any {
+        check::Decision::Allowed
+    } else {
+        check::Decision::Blocked
+    };
+    items.push(check::CheckItem {
+        name: "exec staged binary (~/.cache)".to_string(),
+        category: "exec".to_string(),
+        target: "~/.cache/<probe>".to_string(),
+        decision: tmp_dec,
+        expected: Some(cache_expected),
+        reason: if resolved.allow_cache_exec_any {
+            "cache execution is enabled (allow_cache_exec_any=on).".to_string()
+        } else {
+            "executing a binary dropped into ~/.cache is blocked (writable-but-non-executable)."
+                .to_string()
+        },
+        fix: None,
+        note: tmp_note,
+    });
+
+    // ── Network ──
+    if proxy_enabled {
+        // Allowed: an agent-default domain (in the allowlist even under strict).
+        let allowed_host = agent
+            .default_allowed_domains()
+            .first()
+            .map_or_else(|| "github.com".to_string(), |s| (*s).to_string());
+        let a_expl = check::explain_domain(net_policy, &allowed_host, 443, true);
+        items.push(check::CheckItem {
+            name: format!("reach {allowed_host}"),
+            category: "network".to_string(),
+            target: format!("{allowed_host}:443"),
+            decision: a_expl.decision,
+            expected: Some(check::Decision::Allowed),
+            reason: a_expl.reason,
+            fix: a_expl.fix,
+            note: None,
+        });
+
+        // Blocked: the cloud-metadata IP (SSRF) — always refused, never leaves cplt.
+        let b_expl = check::explain_domain(net_policy, "169.254.169.254", 443, true);
+        items.push(check::CheckItem {
+            name: "reach metadata IP (SSRF)".to_string(),
+            category: "network".to_string(),
+            target: "169.254.169.254:443".to_string(),
+            decision: b_expl.decision,
+            expected: Some(check::Decision::Blocked),
+            reason: b_expl.reason,
+            fix: b_expl.fix,
+            note: None,
+        });
+    } else {
+        items.push(check::CheckItem {
+            name: "domain filtering".to_string(),
+            category: "network".to_string(),
+            target: "(proxy)".to_string(),
+            decision: check::Decision::Inconclusive,
+            expected: None,
+            reason: "the CONNECT proxy is disabled — cplt is not filtering domains this run."
+                .to_string(),
+            fix: Some(
+                "enable it with --with-proxy, or --preset strict for a full lockdown.".to_string(),
+            ),
+            note: Some("network enforcement not tested".to_string()),
+        });
+    }
+
+    check::Report::new(agent_name, preset_name, true, items)
+}
+
+/// A note for a baseline (expected-allowed) probe that unexpectedly failed —
+/// usually means the sandbox itself is unavailable here.
+fn baseline_note(decision: check::Decision) -> Option<String> {
+    match decision {
+        check::Decision::Allowed => None,
+        check::Decision::Inconclusive => Some("sandbox probe could not be spawned".to_string()),
+        check::Decision::Blocked => Some(
+            "baseline access failed — the sandbox may be unavailable here \
+             (e.g. running inside another sandbox)"
+                .to_string(),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_path_check(
+    prepared: &sandbox::PreparedSandbox,
+    policy: &sandbox::LandlockPolicy,
+    resolved: &config::Resolved,
+    disabled: &[sandbox::HardeningCategory],
+    home_dir: &Path,
+    project_dir: &Path,
+    agent_name: String,
+    preset_name: Option<String>,
+    path: &Path,
+    write: bool,
+) -> check::Report {
+    let expl = check::explain_path(policy, home_dir, project_dir, path);
+    let mut items = Vec::new();
+
+    let read_dec = probe_read(prepared, resolved, disabled, path);
+    let note = mismatch_note(read_dec, expl.read_decision());
+    items.push(check::CheckItem {
+        name: "read".to_string(),
+        category: "filesystem".to_string(),
+        target: format!("{} (read)", path.display()),
+        decision: read_dec,
+        expected: None,
+        reason: expl.reason.clone(),
+        fix: expl.fix.clone(),
+        note,
+    });
+
+    if write {
+        let write_dec = probe_write(prepared, resolved, disabled, path);
+        let (reason, fix) = if expl.write {
+            ("covered by a writable rule.".to_string(), None)
+        } else if expl.credential {
+            (
+                "protected path — writes are denied (deny-by-default).".to_string(),
+                None,
+            )
+        } else {
+            (
+                "not covered by any write rule (deny-by-default).".to_string(),
+                Some("grant write with --allow-write <PATH>.".to_string()),
+            )
+        };
+        let note = if write_dec == check::Decision::Inconclusive {
+            Some("path does not exist — cannot probe write without creating it".to_string())
+        } else {
+            mismatch_note(write_dec, expl.write_decision())
+        };
+        items.push(check::CheckItem {
+            name: "write".to_string(),
+            category: "filesystem".to_string(),
+            target: format!("{} (write)", path.display()),
+            decision: write_dec,
+            expected: None,
+            reason,
+            fix,
+            note,
+        });
+    }
+
+    check::Report::new(agent_name, preset_name, false, items)
+}
+
+/// When the live probe disagrees with the static model, the probe is
+/// authoritative — surface the difference so the explanation stays honest
+/// (e.g. a macOS SBPL deny-subpath the Landlock model cannot express).
+fn mismatch_note(probe: check::Decision, model: check::Decision) -> Option<String> {
+    if probe == check::Decision::Inconclusive || probe == model {
+        None
+    } else {
+        Some(format!(
+            "live probe says {}, the policy model predicted {} (the probe is authoritative)",
+            probe.as_str(),
+            model.as_str()
+        ))
+    }
+}
+
+fn build_net_check(
+    net_policy: &proxy::NetPolicy,
+    proxy_enabled: bool,
+    target: &str,
+    no_connect: bool,
+    agent_name: String,
+    preset_name: Option<String>,
+) -> check::Report {
+    let (host, port) = split_host_port(target);
+    let expl = check::explain_domain(net_policy, &host, port, proxy_enabled);
+
+    let note = if !no_connect && expl.decision == check::Decision::Allowed && proxy_enabled {
+        Some(probe_reachable(&host, port))
+    } else {
+        None
+    };
+
+    let item = check::CheckItem {
+        name: expl.status.clone(),
+        category: "network".to_string(),
+        target: format!("{host}:{port}"),
+        decision: expl.decision,
+        expected: None,
+        reason: expl.reason,
+        fix: expl.fix,
+        note,
+    };
+    check::Report::new(agent_name, preset_name, false, vec![item])
+}
+
+fn build_exec_check(
+    resolved: &config::Resolved,
+    project_dir: &Path,
+    cmd: &[String],
+    agent_name: String,
+    preset_name: Option<String>,
+) -> check::Report {
+    let ctx = check::ExecContext {
+        allow_docker: resolved.allow_docker,
+        allow_tmp_exec: resolved.allow_tmp_exec,
+        gh_guard: &resolved.gh_guard,
+        git_guard: &resolved.git_guard,
+        project_dir,
+    };
+    let expl = check::explain_exec(cmd, &ctx);
+    let item = check::CheckItem {
+        name: "exec".to_string(),
+        category: "exec".to_string(),
+        target: cmd.join(" "),
+        decision: expl.decision,
+        expected: None,
+        reason: expl.reason,
+        fix: expl.fix,
+        note: None,
+    };
+    check::Report::new(agent_name, preset_name, false, vec![item])
 }
 
 fn run_doctor() -> ExitCode {
