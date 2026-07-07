@@ -55,10 +55,11 @@ Use `cplt config explain` to see what a key does and how to set it.
 
 Instead of toggling individual flags, pick a named **preset** — a security
 *posture* that sets a baseline for the five sandbox toggles **and** the safety
-features (`gh_guard`, `git_guard`, forced-proxy egress) with one flag or key:
+features (`gh_guard`, `git_guard`, forced-proxy egress, fail-closed domain
+allowlist) with one flag or key:
 
 ```bash
-cplt --preset strict       # locked down: toggles off + guards + forced proxy on
+cplt --preset strict       # full lockdown: toggles off + guards + forced proxy + domain allowlist on
 cplt --preset standard     # the current defaults (no-op baseline)
 cplt --preset permissive   # localhost + tmp exec + lifecycle scripts on
 cplt --preset full-trust   # everything on (docker, env files, tmp exec, localhost, lifecycle)
@@ -71,25 +72,31 @@ Or in config:
 preset = "standard"
 ```
 
-| Preset | localhost (`allow_localhost_any`) | env files (`allow_env_files`) | tmp exec (`allow_tmp_exec`) | docker (`allow_docker`) | lifecycle (`allow_lifecycle_scripts`) | `gh_guard` | `git_guard` | `proxy.forced` |
-|--------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `strict` | off | off | off | off | off | **on** | **on** | **on** |
-| `standard` | off | off | off¹ | off | off | off | off | off |
-| `permissive` | **on** | off | **on** | off | **on** | off | off | off |
-| `full-trust` | **on** | **on** | **on** | **on** | **on** | off | off | off |
+| Preset | localhost (`allow_localhost_any`) | env files (`allow_env_files`) | tmp exec (`allow_tmp_exec`) | docker (`allow_docker`) | lifecycle (`allow_lifecycle_scripts`) | `gh_guard` | `git_guard` | `proxy.forced` | `proxy.default_allowlist` |
+|--------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `strict` | off | off | off | off | off | **on** | **on** | **on** | **on** |
+| `standard` | off | off | off¹ | off | off | off | off | off | off |
+| `permissive` | **on** | off | **on** | off | **on** | off | off | off | off |
+| `full-trust` | **on** | **on** | **on** | **on** | **on** | off | off | off | off |
 
 ¹ `standard` leaves the per-session scratch directory on (the default), which is
 what most tools need — `allow_tmp_exec` (raw `/tmp` exec) stays off. `standard`
 is identical to cplt's hardcoded defaults, so omitting `--preset` behaves exactly
 like `--preset standard`.
 
-**Only `strict` enables the safety features.** It hardens the two dimensions that
-matter most — `gh_guard` (gate GitHub traffic), `git_guard` (block push/force-push),
-and `proxy.forced` (mandatory proxy, kernel egress locked to it). `standard`,
-`permissive`, and `full-trust` all leave those three at their default (off), so
-selecting them changes nothing about guards or forced egress. `strict` enables
+**Only `strict` enables the safety features — a full network lockdown.** It hardens
+the dimensions that matter most: `gh_guard` (gate GitHub traffic), `git_guard`
+(block push/force-push), `proxy.forced` (mandatory proxy, kernel egress locked to
+it), and `proxy.default_allowlist` (fail-closed domain filtering — only the agent's
+built-in allowlist plus any `allowed_domains` resolve, everything else is blocked).
+Forced egress and the domain allowlist are orthogonal and compose: the kernel pins
+egress to the proxy, and the proxy then filters domains. `standard`, `permissive`,
+and `full-trust` all leave those four at their default (off), so selecting them
+changes nothing about guards, forced egress, or the allowlist. `strict` enables
 only *safety* features, so `config set sandbox.preset strict` needs no `--force`
-(unlike `permissive`/`full-trust`, which weaken the sandbox).
+(unlike `permissive`/`full-trust`, which weaken the sandbox). Opt into strict but
+keep the network open with `--allow-all-domains` (or `proxy.default_allowlist =
+false`), which overrides just the allowlist — explicit off wins over the baseline.
 
 **Precedence — the preset is only a baseline.** An explicit individual flag or
 config value always overrides the preset, whichever source the preset came from:

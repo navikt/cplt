@@ -181,7 +181,8 @@ pub enum Preset {
 }
 
 /// The baseline a [`Preset`] establishes: the five sandbox toggles plus the
-/// three safety features (gh_guard, git_guard, forced proxy). The toggles
+/// four safety features (gh_guard, git_guard, forced proxy, default allowlist).
+/// The toggles
 /// *weaken* the sandbox (dangerous when on); the safety features *harden* it
 /// (never dangerous). Only [`enabled_dangerous_names`](Self::enabled_dangerous_names)
 /// — keyed on the five toggles — gates the `--force`/validate safeguards.
@@ -198,6 +199,11 @@ pub struct PresetBaseline {
     pub git_guard_enabled: bool,
     /// Safety feature: mandatory proxy, kernel egress locked to the proxy port.
     pub proxy_forced: bool,
+    /// Safety feature: fail-closed domain allowlist (#52). Restricts egress to
+    /// the agent's built-in default allowlist merged with any `allowed_domains`;
+    /// every other domain is blocked. Combined with `proxy_forced` this makes
+    /// `strict` a full network lockdown (forced egress + domain filtering).
+    pub default_allowlist: bool,
 }
 
 impl PresetBaseline {
@@ -255,12 +261,13 @@ impl Preset {
         self.baseline().enabled_dangerous_names()
     }
 
-    /// Map the preset to its baseline values (five sandbox toggles + three
+    /// Map the preset to its baseline values (five sandbox toggles + four
     /// safety features).
     ///
     /// `Strict` and `Standard` share the same five *toggle* values (all off),
     /// but differ on the safety features: only `Strict` turns on gh_guard,
-    /// git_guard, and forced-proxy egress — a genuine locked-down posture.
+    /// git_guard, forced-proxy egress, and the fail-closed default allowlist —
+    /// a genuine locked-down posture (full network lockdown).
     /// `Standard` is the no-op baseline (everything off), identical to cplt's
     /// hardcoded defaults. The scratch dir is not a preset-controlled toggle
     /// and stays at its default (on) for every preset.
@@ -275,6 +282,7 @@ impl Preset {
                 gh_guard_enabled: true,
                 git_guard_enabled: true,
                 proxy_forced: true,
+                default_allowlist: true,
             },
             Self::Standard => PresetBaseline {
                 allow_localhost_any: false,
@@ -285,6 +293,7 @@ impl Preset {
                 gh_guard_enabled: false,
                 git_guard_enabled: false,
                 proxy_forced: false,
+                default_allowlist: false,
             },
             Self::Permissive => PresetBaseline {
                 allow_localhost_any: true,
@@ -295,6 +304,7 @@ impl Preset {
                 gh_guard_enabled: false,
                 git_guard_enabled: false,
                 proxy_forced: false,
+                default_allowlist: false,
             },
             Self::FullTrust => PresetBaseline {
                 allow_localhost_any: true,
@@ -305,6 +315,7 @@ impl Preset {
                 gh_guard_enabled: false,
                 git_guard_enabled: false,
                 proxy_forced: false,
+                default_allowlist: false,
             },
         }
     }

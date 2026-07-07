@@ -135,13 +135,22 @@ impl Config {
         // Fail-closed networking opt-in (#52). `cli.default_allowlist` is a
         // FeatureToggle where `--default-allowlist` is the ON side and
         // `--allow-all-domains` is the OFF side (off wins), resolved against the
-        // `proxy.default_allowlist` config default (false). `--allow-all-domains`
-        // additionally forces allow-all: main.rs uses `allow_all_domains` to
-        // clear any explicit `allowed_domains` file for the run. This is opt-in
-        // and does not change the default (allow-all) behaviour.
-        let default_allowlist = cli
-            .default_allowlist
-            .resolve(self.proxy.default_allowlist.unwrap_or(false));
+        // explicit `proxy.default_allowlist` config, then the preset baseline
+        // (true only for `strict`, false otherwise). Precedence: CLI flag /
+        // `--allow-all-domains` escape hatch > config > preset > default(off) —
+        // mirrors `proxy_forced`, with the preset threaded in as the lowest
+        // layer. So `--preset strict` fails closed to the domain allowlist,
+        // while an explicit `--allow-all-domains` (OFF wins) or
+        // `proxy.default_allowlist = false` still overrides strict's baseline.
+        // `--allow-all-domains` additionally forces allow-all: main.rs uses
+        // `allow_all_domains` to clear any explicit `allowed_domains` file for
+        // the run. With no preset the baseline is Standard (false), so this
+        // resolves exactly as before — no regression.
+        let default_allowlist = cli.default_allowlist.resolve(
+            self.proxy
+                .default_allowlist
+                .unwrap_or(baseline.default_allowlist),
+        );
         let allow_all_domains = cli.allow_all_domains;
 
         // Proxy log file: CLI > config
@@ -1919,15 +1928,23 @@ validate = false
         assert!(err.to_string().contains("invalid preset"), "got: {err}");
     }
 
-    /// Snapshot of the three safety-feature values a preset can set as a
-    /// baseline: (gh_guard.enabled, git_guard.enabled, proxy_forced).
-    fn posture_snapshot(r: &Resolved) -> (bool, bool, bool) {
-        (r.gh_guard.enabled, r.git_guard.enabled, r.proxy_forced)
+    /// Snapshot of the four safety-feature values a preset can set as a
+    /// baseline: (gh_guard.enabled, git_guard.enabled, proxy_forced,
+    /// default_allowlist).
+    fn posture_snapshot(r: &Resolved) -> (bool, bool, bool, bool) {
+        (
+            r.gh_guard.enabled,
+            r.git_guard.enabled,
+            r.proxy_forced,
+            r.default_allowlist,
+        )
     }
 
     #[test]
     fn preset_strict_enables_guards_and_forced_proxy() {
         // strict is a real posture: five toggles off, but the safety features on.
+        // Full network lockdown: gh_guard + git_guard + proxy_forced +
+        // fail-closed default_allowlist all on together.
         let resolved = Config::default()
             .merge(CliFlags {
                 preset: Some(Preset::Strict),
@@ -1938,7 +1955,62 @@ validate = false
             toggle_snapshot(&resolved),
             (false, false, false, false, false)
         );
-        assert_eq!(posture_snapshot(&resolved), (true, true, true));
+        assert_eq!(posture_snapshot(&resolved), (true, true, true, true));
+        // proxy.forced (kernel egress) and default_allowlist (domain filtering)
+        // are orthogonal and compose — both apply under strict.
+        assert!(resolved.proxy_forced && resolved.default_allowlist);
+    }
+
+    #[test]
+    fn preset_strict_enables_default_allowlist() {
+        // strict's baseline flips the fail-closed domain allowlist ON — the glue
+        // that turns strict into a FULL network lockdown.
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.default_allowlist);
+    }
+
+    #[test]
+    fn explicit_config_default_allowlist_false_overrides_strict() {
+        // Explicit `proxy.default_allowlist = false` must win over strict's
+        // baseline (explicit config > preset) — opt into strict but disable the
+        // allowlist.
+        let config: Config =
+            toml::from_str("[sandbox]\npreset = \"strict\"\n[proxy]\ndefault_allowlist = false\n")
+                .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.default_allowlist,
+            "explicit config false must override strict baseline"
+        );
+        // The rest of strict's posture is untouched.
+        assert!(resolved.proxy_forced && resolved.gh_guard.enabled && resolved.git_guard.enabled);
+    }
+
+    #[test]
+    fn allow_all_domains_escape_hatch_overrides_strict() {
+        // `--preset strict --allow-all-domains`: the OFF side of the toggle wins
+        // over strict's baseline (explicit off > preset), so the allowlist is
+        // disabled while the rest of strict's lockdown stays on.
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                default_allowlist: FeatureToggle::from_pair(false, true),
+                allow_all_domains: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !resolved.default_allowlist,
+            "--allow-all-domains must override strict's baseline allowlist"
+        );
+        assert!(resolved.allow_all_domains);
+        // strict's other safety features are unaffected by the escape hatch.
+        assert!(resolved.proxy_forced && resolved.gh_guard.enabled && resolved.git_guard.enabled);
     }
 
     #[test]
@@ -1949,7 +2021,7 @@ validate = false
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(posture_snapshot(&resolved), (false, false, false));
+        assert_eq!(posture_snapshot(&resolved), (false, false, false, false));
     }
 
     #[test]
@@ -1960,7 +2032,7 @@ validate = false
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(posture_snapshot(&resolved), (false, false, false));
+        assert_eq!(posture_snapshot(&resolved), (false, false, false, false));
     }
 
     #[test]
@@ -1972,14 +2044,15 @@ validate = false
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(posture_snapshot(&resolved), (false, false, false));
+        assert_eq!(posture_snapshot(&resolved), (false, false, false, false));
     }
 
     #[test]
     fn no_preset_equals_standard_posture_defaults() {
         // The critical no-regression test: no preset must resolve EXACTLY like
         // `standard` (and today's hardcoded defaults) across every posture
-        // field — guards off, forced proxy off — not just the five toggles.
+        // field — guards off, forced proxy off, default allowlist off — not
+        // just the five toggles.
         let none = Config::default().merge(CliFlags::default()).unwrap();
         let standard = Config::default()
             .merge(CliFlags {
@@ -1987,9 +2060,11 @@ validate = false
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(posture_snapshot(&none), (false, false, false));
+        assert_eq!(posture_snapshot(&none), (false, false, false, false));
         assert_eq!(posture_snapshot(&none), posture_snapshot(&standard));
         assert_eq!(toggle_snapshot(&none), toggle_snapshot(&standard));
+        // No preset must NOT enable the fail-closed allowlist — today's behavior.
+        assert!(!none.default_allowlist);
     }
 
     #[test]
