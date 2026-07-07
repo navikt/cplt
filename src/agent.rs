@@ -8,6 +8,23 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+// ── Per-agent default allowlists ─────────────────────────────────────────────
+//
+// These lists are the fail-closed egress allowlist each agent gets under
+// `--default-allowlist` / `proxy.default_allowlist`. They should be captured
+// EMPIRICALLY, not guessed: run the agent under discovery mode and paste the
+// observed set. See the "Verifying / generating an agent's domain allowlist"
+// section in docs/proxy.md for the workflow:
+//
+//     cplt --agent <X> --observe-domains -- <do a representative task>
+//
+// Convention: when you add or refresh an agent's list, record its PROVENANCE in
+// a comment on the const — which agent + version and the date the domains were
+// observed — so a reviewer can tell whether the list is current, e.g.:
+//     // Observed with copilot 0.24.1 on 2026-01-15 via `--observe-domains`.
+// The existing lists below predate this convention and carry NO verified
+// provenance yet; do not fabricate one — capture it the next time each is run.
+
 /// Package registries that virtually every coding agent needs to fetch
 /// dependencies (npm, Yarn, Maven, Gradle, crates.io, PyPI). This is the
 /// shared base for every agent's built-in allowlist so that, when fail-closed

@@ -3,6 +3,7 @@
 //! Intercepts outbound HTTPS connections from the sandboxed agent,
 //! enforcing blocked/allowed domain lists and private IP restrictions.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -335,6 +336,60 @@ pub fn redact_upstream_url(url: &str) -> String {
     }
 }
 
+/// Verdict recorded for an observed CONNECT target: whether cplt's policy
+/// permitted the connection (`Allowed`) or refused it (`Blocked`). A DNS or
+/// transport failure on an otherwise-permitted target still counts as
+/// `Allowed` — the point of observation is what the agent was *allowed to
+/// attempt*, not whether the far end happened to answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DomainVerdict {
+    /// Policy permitted the CONNECT (CONNECTED, or an allowed attempt that then
+    /// failed DNS/transport).
+    Allowed,
+    /// Policy refused the CONNECT (any `BLOCKED*` status).
+    Blocked,
+}
+
+impl DomainVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// One host the proxy observed a CONNECT for, with its verdict and how many
+/// CONNECTs targeted it. Returned (sorted by host) from
+/// [`ProxyHandle::observed_domains`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedDomain {
+    /// Normalized host (lowercase, trailing dot stripped).
+    pub host: String,
+    /// Whether the connection was allowed or blocked by policy.
+    pub verdict: DomainVerdict,
+    /// Number of CONNECTs seen for this host this session.
+    pub count: u64,
+}
+
+/// Internal per-host accumulator behind the collector's `BTreeMap`.
+struct DomainObservation {
+    verdict: DomainVerdict,
+    count: u64,
+}
+
+/// Thread-safe map of normalized host → observation, keyed for stable sorted
+/// output. Held behind an `Arc` so the connection threads and the
+/// [`ProxyHandle`] share one collector and results can be read after the
+/// session ends.
+///
+/// This is the generic capture substrate for BOTH `--observe-domains` and audit
+/// Phase 2 network reporting — it records EVERY CONNECT verdict regardless of
+/// the stderr log level or whether a `--proxy-log` file is configured. A lock
+/// per connection is intentionally acceptable: at cplt's scale (`MAX_CONNECTIONS`
+/// = 64) the CONNECT path is not hot.
+type DomainCollector = Mutex<BTreeMap<String, DomainObservation>>;
+
 /// Shared proxy state holding cached domain lists and config paths.
 /// Wrapped in `Arc` and shared across connection threads.
 pub struct ProxyState {
@@ -385,12 +440,44 @@ pub struct ProxyState {
     // (exact + subdomain), like the other domain lists.
     upstream_no_proxy: Vec<String>,
 
+    // Observed-domains collector: records every CONNECT target host and whether
+    // policy allowed or blocked it. Shared (Arc) with the ProxyHandle so the set
+    // can be read after the session. Always present (cheap at cplt's scale);
+    // `--observe-domains` merely reads it and forces allow-all so the full set
+    // is captured. Foundation for audit Phase 2 network reporting.
+    domain_collector: Arc<DomainCollector>,
+
     // Test-only: injectable DNS resolver to simulate fake DNS responses.
     #[cfg(test)]
     resolver: Option<ResolverFn>,
 }
 
 impl ProxyState {
+    /// Record a CONNECT verdict for `host` in the observation collector.
+    ///
+    /// The host is normalized (lowercase, trailing dot stripped) before keying
+    /// so `API.Example.com`, `api.example.com`, and `api.example.com.` collapse
+    /// to a single entry. `Blocked` is sticky: once a host is seen blocked it
+    /// stays blocked even if a later attempt is allowed, so the observed list
+    /// always surfaces anything policy refused.
+    fn record_observation(&self, host: &str, verdict: DomainVerdict) {
+        let key = normalize_hostname(host);
+        if key.is_empty() {
+            return;
+        }
+        let mut map = self
+            .domain_collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = map
+            .entry(key)
+            .or_insert(DomainObservation { verdict, count: 0 });
+        entry.count = entry.count.saturating_add(1);
+        if verdict == DomainVerdict::Blocked {
+            entry.verdict = DomainVerdict::Blocked;
+        }
+    }
+
     /// Get the current blocklist, re-reading from disk if TTL expired.
     /// On read failure, keeps last-good list and resets TTL for retry.
     fn get_blocked_domains(&self) -> Vec<String> {
@@ -568,6 +655,10 @@ pub struct ProxyHandle {
     /// Actual port the proxy is listening on. With a configured port of 0,
     /// the OS assigns an ephemeral port; this field reflects the real value.
     pub port: u16,
+    /// Shared observation collector (see [`ProxyState::domain_collector`]).
+    /// Cloned from the state so the observed set can be read after the session
+    /// via [`ProxyHandle::observed_domains`].
+    domain_collector: Arc<DomainCollector>,
 }
 
 impl ProxyHandle {
@@ -576,6 +667,25 @@ impl ProxyHandle {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         // Accept loop is non-blocking with 50ms sleep, so it will notice
         // the flag within ~50ms without needing a wake-up connection.
+    }
+
+    /// Snapshot every host the proxy saw a CONNECT for this session, sorted by
+    /// host, each with its verdict (`Allowed`/`Blocked`) and CONNECT count.
+    ///
+    /// Backs `--observe-domains` (and, later, audit Phase 2 network reporting).
+    /// The `BTreeMap` yields hosts already sorted and deduplicated.
+    pub fn observed_domains(&self) -> Vec<ObservedDomain> {
+        let map = self
+            .domain_collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.iter()
+            .map(|(host, obs)| ObservedDomain {
+                host: host.clone(),
+                verdict: obs.verdict,
+                count: obs.count,
+            })
+            .collect()
     }
 }
 
@@ -678,6 +788,10 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
             .map_err(|e| format!("Cannot open proxy log file {}: {e}", log_path.display()))?;
     }
 
+    // Observation collector, shared between the connection threads (via state)
+    // and the returned handle so observed domains can be read after shutdown.
+    let domain_collector: Arc<DomainCollector> = Arc::new(Mutex::new(BTreeMap::new()));
+
     // Build shared state with initial caches
     let state = Arc::new(ProxyState {
         blocked_file: opts.blocked_file,
@@ -696,6 +810,7 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         timeout: opts.timeout,
         upstream: opts.upstream,
         upstream_no_proxy: opts.upstream_no_proxy,
+        domain_collector: domain_collector.clone(),
         #[cfg(test)]
         resolver: opts.resolver,
     });
@@ -720,6 +835,7 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
     Ok(ProxyHandle {
         shutdown_flag,
         port: actual_port,
+        domain_collector,
     })
 }
 
@@ -754,13 +870,7 @@ fn accept_loop(
         // Connection limit
         let count = active_count.load(std::sync::atomic::Ordering::SeqCst);
         if count >= MAX_CONNECTIONS {
-            log_connection(
-                "REJECT",
-                "connection limit",
-                "LIMIT",
-                state.log_file.as_deref(),
-                state.log_level,
-            );
+            log_connection(&state, "REJECT", "connection limit", "LIMIT");
             drop(stream);
             continue;
         }
@@ -777,13 +887,7 @@ fn accept_loop(
             })
         {
             active_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            log_connection(
-                "INTERNAL",
-                "thread-spawn",
-                &format!("FAIL:{e}"),
-                state.log_file.as_deref(),
-                state.log_level,
-            );
+            log_connection(&state, "INTERNAL", "thread-spawn", &format!("FAIL:{e}"));
         }
     }
 }
@@ -817,13 +921,7 @@ fn handle_connection(mut client: TcpStream, state: &ProxyState) {
     } else {
         // For non-CONNECT, send a simple error — the sandbox should force
         // CONNECT via proxy env vars for HTTPS traffic
-        log_connection(
-            method,
-            target,
-            "UNSUPPORTED",
-            state.log_file.as_deref(),
-            state.log_level,
-        );
+        log_connection(state, method, target, "UNSUPPORTED");
         let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
     }
 }
@@ -868,8 +966,6 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // Normalize hostname: lowercase, strip trailing dot (valid DNS but
     // would bypass exact-match rules otherwise).
     let host = normalize_hostname(&host);
-    let log_file = state.log_file.as_deref();
-    let log_level = state.log_level;
 
     // Compute localhost bypass before the port check: --allow-localhost <PORT> must
     // also exempt that port from the general port policy (which only lists remote ports
@@ -898,7 +994,7 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // intent with --allow-localhost <PORT> is to reach that port regardless of
     // whether it appears in the general allowed_ports list.
     if !localhost_connect_allowed && !state.allowed_ports.contains(&port) {
-        log_connection("CONNECT", target, "BLOCKED-PORT", log_file, log_level);
+        log_connection(state, "CONNECT", target, "BLOCKED-PORT");
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPort not allowed\r\n");
         return;
     }
@@ -923,7 +1019,7 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         && !allowed_domains.is_empty()
         && !is_domain_match(&host, &allowed_domains)
     {
-        log_connection("CONNECT", target, "BLOCKED-ALLOWLIST", log_file, log_level);
+        log_connection(state, "CONNECT", target, "BLOCKED-ALLOWLIST");
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist\r\n");
         return;
     }
@@ -931,14 +1027,14 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // Check blocklist (hostname-level)
     let blocked_domains = state.get_blocked_domains();
     if is_blocked_in_list(&host, &blocked_domains) {
-        log_connection("CONNECT", target, "BLOCKED", log_file, log_level);
+        log_connection(state, "CONNECT", target, "BLOCKED");
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n");
         let _ = client.shutdown(std::net::Shutdown::Both);
         return;
     }
     // Reject hostname patterns that are known private (fast path before DNS)
     if !localhost_connect_allowed && is_private_hostname(&host) {
-        log_connection("CONNECT", target, "BLOCKED-PRIVATE", log_file, log_level);
+        log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE");
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked\r\n");
         let _ = client.shutdown(std::net::Shutdown::Both);
         return;
@@ -997,13 +1093,7 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
                 localhost_opt_in,
             )
         {
-            log_connection(
-                "CONNECT",
-                target,
-                "BLOCKED-PRIVATE-RESOLVED",
-                log_file,
-                log_level,
-            );
+            log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE-RESOLVED");
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to private IP\r\n");
             let _ = client.shutdown(std::net::Shutdown::Both);
             return;
@@ -1015,7 +1105,7 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // Resolve DNS FIRST, then check the resolved IP. A local resolution failure
     // on the direct path is a hard error — there is no upstream to defer to.
     let Some(socket_addr) = resolve_locally(state, &host, port) else {
-        log_connection("CONNECT", target, "DNS-FAIL", log_file, log_level);
+        log_connection(state, "CONNECT", target, "DNS-FAIL");
         let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     };
@@ -1030,13 +1120,7 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // The earlier is_private_ip guard below only catches *private* IPs; this also
     // closes the *public* non-loopback case.
     if localhost_connect_allowed && !socket_addr.ip().is_loopback() {
-        log_connection(
-            "CONNECT",
-            target,
-            "BLOCKED-PRIVATE-RESOLVED",
-            log_file,
-            log_level,
-        );
+        log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE-RESOLVED");
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to non-loopback IP\r\n");
         let _ = client.shutdown(std::net::Shutdown::Both);
         return;
@@ -1066,13 +1150,7 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         is_domain_match(&host, &private_domains),
         localhost_opt_in,
     ) {
-        log_connection(
-            "CONNECT",
-            target,
-            "BLOCKED-PRIVATE-RESOLVED",
-            log_file,
-            log_level,
-        );
+        log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE-RESOLVED");
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to private IP\r\n");
         let _ = client.shutdown(std::net::Shutdown::Both);
         return;
@@ -1085,20 +1163,14 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
             s
         }
         Err(e) => {
-            log_connection(
-                "CONNECT",
-                target,
-                &format!("CONNECT-FAIL:{e}"),
-                log_file,
-                log_level,
-            );
+            log_connection(state, "CONNECT", target, &format!("CONNECT-FAIL:{e}"));
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
     };
 
     // Log after TCP connect succeeds — this is the audit-relevant event.
-    log_connection("CONNECT", target, "CONNECTED", log_file, log_level);
+    log_connection(state, "CONNECT", target, "CONNECTED");
 
     // Send 200 to client
     if client
@@ -1127,9 +1199,6 @@ fn connect_via_upstream(
     upstream: &UpstreamProxy,
     state: &ProxyState,
 ) {
-    let log_file = state.log_file.as_deref();
-    let log_level = state.log_level;
-
     // Connect to the upstream proxy itself (not the target).
     let upstream_addr = upstream.socket_addr();
     let Some(socket_addr) = upstream_addr
@@ -1137,13 +1206,7 @@ fn connect_via_upstream(
         .ok()
         .and_then(|mut a| a.next())
     else {
-        log_connection(
-            "CONNECT",
-            target,
-            "CONNECT-FAIL:upstream-dns",
-            log_file,
-            log_level,
-        );
+        log_connection(state, "CONNECT", target, "CONNECT-FAIL:upstream-dns");
         let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     };
@@ -1154,11 +1217,10 @@ fn connect_via_upstream(
         }
         Err(e) => {
             log_connection(
+                state,
                 "CONNECT",
                 target,
                 &format!("CONNECT-FAIL:upstream:{e}"),
-                log_file,
-                log_level,
             );
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
@@ -1170,13 +1232,7 @@ fn connect_via_upstream(
     // Ask the upstream to open a tunnel to the real target.
     let request = upstream.connect_request(host, port);
     if remote.write_all(request.as_bytes()).is_err() {
-        log_connection(
-            "CONNECT",
-            target,
-            "CONNECT-FAIL:upstream-write",
-            log_file,
-            log_level,
-        );
+        log_connection(state, "CONNECT", target, "CONNECT-FAIL:upstream-write");
         let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
         return;
     }
@@ -1186,24 +1242,12 @@ fn connect_via_upstream(
     match read_upstream_connect_status(&mut remote) {
         Ok(true) => {}
         Ok(false) => {
-            log_connection(
-                "CONNECT",
-                target,
-                "CONNECT-FAIL:upstream-refused",
-                log_file,
-                log_level,
-            );
+            log_connection(state, "CONNECT", target, "CONNECT-FAIL:upstream-refused");
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
         Err(_) => {
-            log_connection(
-                "CONNECT",
-                target,
-                "CONNECT-FAIL:upstream-read",
-                log_file,
-                log_level,
-            );
+            log_connection(state, "CONNECT", target, "CONNECT-FAIL:upstream-read");
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
             return;
         }
@@ -1212,7 +1256,7 @@ fn connect_via_upstream(
     // Log as CONNECTED — identical audit/stats semantics to a direct connect,
     // so the allowed connection is recorded the same way whether or not an
     // upstream is in use.
-    log_connection("CONNECT", target, "CONNECTED", log_file, log_level);
+    log_connection(state, "CONNECT", target, "CONNECTED");
 
     // Tell the client its tunnel is established, then splice bytes as usual.
     if client
@@ -1638,13 +1682,25 @@ fn is_v4_mapped_private(ip: &std::net::Ipv6Addr) -> bool {
     }
 }
 
-fn log_connection(
-    method: &str,
-    target: &str,
-    status: &str,
-    log_file: Option<&Path>,
-    level: ProxyLogLevel,
-) {
+fn log_connection(state: &ProxyState, method: &str, target: &str, status: &str) {
+    let log_file = state.log_file.as_deref();
+    let level = state.log_level;
+
+    // Record the observation for every CONNECT verdict, regardless of the stderr
+    // log level or whether a --proxy-log file is set. This is the single choke
+    // point every verdict flows through, so the collector sees the FULL set of
+    // hosts the agent contacted. Only CONNECT targets are hostnames; REJECT /
+    // INTERNAL / non-CONNECT-method log lines carry no host and are skipped.
+    if method.eq_ignore_ascii_case("CONNECT") {
+        let host = target.rsplit_once(':').map_or(target, |(h, _)| h);
+        let verdict = if status.starts_with("BLOCKED") {
+            DomainVerdict::Blocked
+        } else {
+            DomainVerdict::Allowed
+        };
+        state.record_observation(host, verdict);
+    }
+
     if level.should_log(status) {
         let color = match status {
             "BLOCKED" | "BLOCKED-PRIVATE" | "BLOCKED-PORT" | "BLOCKED-ALLOWLIST" | "LIMIT" => {
@@ -1928,6 +1984,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             upstream: None,
             upstream_no_proxy: Vec::new(),
+            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
             resolver: None,
         };
 
@@ -1955,6 +2012,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             upstream: None,
             upstream_no_proxy: Vec::new(),
+            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
             resolver: None,
         };
 
@@ -1987,6 +2045,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             upstream: None,
             upstream_no_proxy: Vec::new(),
+            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
             resolver: None,
         };
 
@@ -2022,6 +2081,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             upstream: None,
             upstream_no_proxy: Vec::new(),
+            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
             resolver: None,
         };
 
@@ -2063,6 +2123,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             upstream: None,
             upstream_no_proxy: Vec::new(),
+            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
             resolver: None,
         };
 
@@ -2196,6 +2257,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             upstream: None,
             upstream_no_proxy: Vec::new(),
+            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
             resolver: None,
         };
 
@@ -2241,6 +2303,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             upstream: None,
             upstream_no_proxy: Vec::new(),
+            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
             resolver: None,
         }
     }
@@ -2293,6 +2356,95 @@ mod tests {
             state.get_allowed_domains().is_empty(),
             "default off must remain allow-all"
         );
+    }
+
+    #[test]
+    fn collector_records_verdicts_dedups_and_normalizes() {
+        // The observation collector must record both allowed and blocked hosts
+        // with the right verdict, collapse case/trailing-dot variants of the
+        // same host into one entry, and count repeat CONNECTs.
+        let state = state_for_allowlist(Vec::new(), None);
+        state.record_observation("api.github.com", DomainVerdict::Allowed);
+        // Same host, different spelling: uppercase + trailing dot must normalize
+        // to the same key rather than creating a second entry.
+        state.record_observation("API.GitHub.com.", DomainVerdict::Allowed);
+        state.record_observation("evil.example", DomainVerdict::Blocked);
+
+        let map = state
+            .domain_collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            map.len(),
+            2,
+            "case/trailing-dot variants must collapse to one host"
+        );
+        let gh = map.get("api.github.com").expect("host recorded normalized");
+        assert_eq!(gh.verdict, DomainVerdict::Allowed);
+        assert_eq!(gh.count, 2, "repeat CONNECTs must increment the count");
+        assert_eq!(
+            map.get("evil.example")
+                .expect("blocked host recorded")
+                .verdict,
+            DomainVerdict::Blocked
+        );
+    }
+
+    #[test]
+    fn collector_blocked_verdict_is_sticky() {
+        // A host seen blocked once must stay Blocked in the observed set even if
+        // a later attempt is allowed, so the list always flags what policy
+        // refused.
+        let state = state_for_allowlist(Vec::new(), None);
+        state.record_observation("x.example", DomainVerdict::Allowed);
+        state.record_observation("x.example", DomainVerdict::Blocked);
+        state.record_observation("x.example", DomainVerdict::Allowed);
+
+        let map = state
+            .domain_collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = map.get("x.example").expect("host recorded");
+        assert_eq!(
+            entry.verdict,
+            DomainVerdict::Blocked,
+            "blocked verdict must be sticky"
+        );
+        assert_eq!(entry.count, 3);
+    }
+
+    #[test]
+    fn observed_domains_sorted_and_unique() {
+        // observed_domains() returns hosts sorted and deduplicated (the BTreeMap
+        // key ordering) with verdict + count, ready for a paste-able allowlist.
+        let collector: Arc<DomainCollector> = Arc::new(Mutex::new(BTreeMap::new()));
+        {
+            let mut map = collector.lock().unwrap();
+            map.insert(
+                "b.example".to_string(),
+                DomainObservation {
+                    verdict: DomainVerdict::Allowed,
+                    count: 3,
+                },
+            );
+            map.insert(
+                "a.example".to_string(),
+                DomainObservation {
+                    verdict: DomainVerdict::Blocked,
+                    count: 1,
+                },
+            );
+        }
+        let handle = ProxyHandle {
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            port: 0,
+            domain_collector: collector,
+        };
+        let observed = handle.observed_domains();
+        let hosts: Vec<&str> = observed.iter().map(|o| o.host.as_str()).collect();
+        assert_eq!(hosts, vec!["a.example", "b.example"], "must be sorted");
+        assert_eq!(observed[0].verdict, DomainVerdict::Blocked);
+        assert_eq!(observed[1].count, 3);
     }
 
     /// Skip guard for tests that make real TCP connections.
@@ -2443,6 +2595,66 @@ mod tests {
         assert_connect_allowed(proxy.port, "evil.com");
         proxy.shutdown();
         up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn observe_allow_all_records_domain_that_would_be_blocked() {
+        // The `--observe-domains` override forces the proxy into allow-all mode
+        // (main.rs passes an empty allowlist). A host that WOULD be blocked under
+        // a configured allowlist must instead be permitted AND recorded here, so
+        // the observed set is exhaustive rather than pre-filtered.
+        require_localhost_tcp!();
+        let up = spawn_fake_upstream();
+        let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{}", up.port)).unwrap();
+        // Allow-all: empty default allowlist + no file — exactly what observe forces.
+        let proxy = make_proxy_default_allowlist(Vec::new(), None, upstream);
+
+        let status = proxy_connect(proxy.port, "would-be-blocked.example:443");
+        // Let the connection thread finish recording before snapshotting.
+        std::thread::sleep(Duration::from_millis(50));
+        let observed = proxy.observed_domains();
+        proxy.shutdown();
+        up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            !status.contains("Forbidden"),
+            "allow-all (observe) must NOT block would-be-blocked.example; got {status}"
+        );
+        let rec = observed
+            .iter()
+            .find(|o| o.host == "would-be-blocked.example")
+            .expect("contacted host must be recorded even in allow-all mode");
+        assert_eq!(
+            rec.verdict,
+            DomainVerdict::Allowed,
+            "in allow-all mode the host is recorded as Allowed"
+        );
+    }
+
+    #[test]
+    fn observe_records_blocked_verdict_under_allowlist() {
+        // Complementary to the allow-all case: when a real allowlist IS in force,
+        // a refused host is still recorded — with a Blocked verdict.
+        require_localhost_tcp!();
+        let up = spawn_fake_upstream();
+        let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{}", up.port)).unwrap();
+        let proxy = make_proxy_default_allowlist(copilot_defaults(), None, upstream);
+
+        let status = proxy_connect(proxy.port, "evil.com:443");
+        std::thread::sleep(Duration::from_millis(50));
+        let observed = proxy.observed_domains();
+        proxy.shutdown();
+        up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            status.contains("403"),
+            "evil.com must be blocked under the allowlist; got {status}"
+        );
+        let rec = observed
+            .iter()
+            .find(|o| o.host == "evil.com")
+            .expect("blocked host must still be recorded");
+        assert_eq!(rec.verdict, DomainVerdict::Blocked);
     }
 
     #[test]

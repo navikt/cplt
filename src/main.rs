@@ -177,6 +177,20 @@ struct Cli {
     #[arg(long)]
     allow_all_domains: bool,
 
+    /// Discovery mode: run with the proxy in ALLOW-ALL mode (nothing is blocked)
+    /// and record every domain the agent contacts, then print the observed set
+    /// as a ready-to-paste allowlist. Use it to empirically build/verify an
+    /// agent's default allowlist. This run does NOT enforce domain filtering —
+    /// it overrides --preset strict / --default-allowlist / any configured
+    /// allowlist for the session. See docs/proxy.md.
+    #[arg(long)]
+    observe_domains: bool,
+
+    /// With --observe-domains, also write the bare observed domain list (one per
+    /// line) to this file, in addition to printing it to stderr.
+    #[arg(long, value_name = "FILE")]
+    observe_domains_out: Option<PathBuf>,
+
     /// Write proxy connection log to a file (one line per CONNECT).
     /// Useful for post-session audit. File is created if it doesn't exist.
     #[arg(long, value_name = "FILE")]
@@ -1467,6 +1481,54 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
 
 /// Start the CONNECT proxy if enabled, returning the handle for RAII ownership.
 /// Updates `resolved.proxy_port` with the actual bound port.
+/// Print the observed domain set (from `--observe-domains`) to stderr as a
+/// ready-to-paste allowlist, and optionally write the bare list to `out_file`.
+///
+/// Always prints regardless of `--quiet`: observe-domains is an explicit
+/// diagnostic whose result is the entire purpose of the run. Subdomains are NOT
+/// auto-collapsed — folding e.g. `api.githubcopilot.com` +
+/// `proxy.githubcopilot.com` to `githubcopilot.com` needs a registrable-domain
+/// (public-suffix) heuristic that would risk over-broadening the allowlist, so
+/// the raw observed hosts are emitted and the note points out that the matcher
+/// is exact-or-subdomain and a parent can be substituted by hand.
+fn emit_observed_domains(
+    agent_label: &str,
+    observed: &[proxy::ObservedDomain],
+    out_file: Option<&Path>,
+) {
+    let count = observed.len();
+    eprintln!(
+        "[cplt] observe-domains: {count} domain{} contacted by {agent_label} this session",
+        if count == 1 { "" } else { "s" }
+    );
+    eprintln!("# add to allowed_domains (or src/agent.rs default_allowed_domains):");
+    eprintln!("# bare hosts, exact-or-subdomain match; collapse subdomains to a parent by hand");
+    eprintln!("# e.g. api.githubcopilot.com + proxy.githubcopilot.com -> githubcopilot.com");
+    for o in observed {
+        // In pure observe (allow-all) mode every entry is Allowed and prints
+        // bare. A Blocked entry can only appear if an allowlist was somehow
+        // active; flag it so it is not pasted blindly.
+        match o.verdict {
+            proxy::DomainVerdict::Allowed => eprintln!("{}", o.host),
+            proxy::DomainVerdict::Blocked => eprintln!("{}  # BLOCKED this run", o.host),
+        }
+    }
+
+    if let Some(path) = out_file {
+        let body: String = observed.iter().map(|o| format!("{}\n", o.host)).collect();
+        match std::fs::write(path, body) {
+            Ok(()) => eprintln!(
+                "[cplt] observe-domains: wrote {count} domains to {}",
+                path.display()
+            ),
+            Err(e) => ui::warn(&format!(
+                "observe-domains: cannot write {}: {e}",
+                path.display()
+            )),
+        }
+    }
+}
+
 fn start_proxy_if_enabled(
     resolved: &mut config::Resolved,
     cli: &Cli,
@@ -1490,6 +1552,20 @@ fn start_proxy_if_enabled(
             );
         }
         resolved.with_proxy = true;
+    }
+
+    // Discovery mode (--observe-domains): force the proxy ON so there is a choke
+    // point to record CONNECTs, even if the user disabled it. The allow-all
+    // override (empty effective allowlist) is applied below where the allowlist
+    // is computed. Print the mandatory warning that this run does NOT enforce
+    // domain filtering.
+    if cli.observe_domains {
+        resolved.with_proxy = true;
+        ui::warn("observe-domains: proxy in allow-all mode; all traffic permitted and recorded");
+        ui::warn(
+            "observe-domains: this run does NOT enforce domain filtering \
+             (overrides --preset strict / --default-allowlist / configured allowlist)",
+        );
     }
 
     if !resolved.with_proxy || cli.print_profile {
@@ -1520,7 +1596,12 @@ fn start_proxy_if_enabled(
     // disabling BOTH the agent default allowlist and any explicit
     // allowed_domains file. `resolved.default_allowlist` was already forced off
     // in the config merge when --allow-all-domains is set.
-    let allowed_domains_file = if resolved.allow_all_domains {
+    // --observe-domains forces allow-all exactly like --allow-all-domains: no
+    // allowlist file and (below) no agent default allowlist, so nothing is
+    // blocked and the FULL contacted set is observed. This must override any
+    // configured allowlist, not combine with it (fail-closed would hide domains).
+    let observe_allow_all = cli.observe_domains;
+    let allowed_domains_file = if resolved.allow_all_domains || observe_allow_all {
         None
     } else {
         resolved.allowed_domains.clone()
@@ -1530,7 +1611,7 @@ fn start_proxy_if_enabled(
     // effective allowlist is the running agent's built-in defaults, which the
     // proxy MERGES with the user's allowed_domains file. Empty vec = feature
     // off, so the proxy keeps today's allow-all behaviour unchanged.
-    let default_allowlist: Vec<String> = if resolved.default_allowlist {
+    let default_allowlist: Vec<String> = if resolved.default_allowlist && !observe_allow_all {
         active_agent
             .default_allowed_domains()
             .iter()
@@ -2030,6 +2111,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Cleanup
     if let Some(handle) = proxy_handle {
+        // --observe-domains: read the collected set BEFORE shutdown and emit the
+        // ready-to-paste allowlist (always, even under --quiet).
+        if cli.observe_domains {
+            emit_observed_domains(
+                active_agent.display_name(),
+                &handle.observed_domains(),
+                cli.observe_domains_out.as_deref(),
+            );
+        }
         handle.shutdown();
     }
     if let Some(mut child) = denial_proc {
@@ -2492,6 +2582,15 @@ fn run_exec_command(
     });
 
     if let Some(handle) = proxy_handle {
+        // --observe-domains also works for `cplt exec -- <cmd>`: emit the
+        // observed set before shutdown (always, even under exec's default quiet).
+        if cli.observe_domains {
+            emit_observed_domains(
+                active_agent.display_name(),
+                &handle.observed_domains(),
+                cli.observe_domains_out.as_deref(),
+            );
+        }
         handle.shutdown();
     }
 
@@ -4732,6 +4831,42 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("cplt").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn observe_domains_flags_parse() {
+        let cli = parse(&["--observe-domains", "--observe-domains-out", "/tmp/obs.txt"]);
+        assert!(cli.observe_domains);
+        assert_eq!(
+            cli.observe_domains_out.as_deref(),
+            Some(Path::new("/tmp/obs.txt"))
+        );
+    }
+
+    #[test]
+    fn emit_observed_domains_writes_sorted_unique_out_file() {
+        use crate::proxy::{DomainVerdict, ObservedDomain};
+        let dir = std::env::temp_dir().join(format!("cplt-observe-emit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("domains.txt");
+        // The list is already sorted+unique (as ProxyHandle::observed_domains
+        // guarantees); the out-file must be the bare hosts, one per line.
+        let observed = vec![
+            ObservedDomain {
+                host: "a.example".into(),
+                verdict: DomainVerdict::Allowed,
+                count: 2,
+            },
+            ObservedDomain {
+                host: "b.example".into(),
+                verdict: DomainVerdict::Blocked,
+                count: 1,
+            },
+        ];
+        emit_observed_domains("Copilot", &observed, Some(&out));
+        let body = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(body, "a.example\nb.example\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

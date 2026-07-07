@@ -174,6 +174,44 @@ cplt config set proxy.default_allowlist true         # permanently
 - **Escape hatch.** `--allow-all-domains` disables the allowlist for a single run (and ignores any `--allowed-domains` file) — allow-all again, for debugging. It overrides both `--default-allowlist` and `proxy.default_allowlist`.
 - **Composes with the other proxy features.** The domain allowlist is enforced by the proxy regardless of `proxy.forced` (kernel egress restriction) or `proxy.upstream` (corporate-proxy forwarding): a no-proxy/upstream target still passes through the same allowlist check — the allowlist governs **which** domains, orthogonal to **how** they are routed.
 
+### Verifying / generating an agent's domain allowlist
+
+The per-agent default allowlists (see above) should be **empirically observed**, not guessed. `--observe-domains` runs the session with the proxy in **allow-all mode** and records every domain the agent contacts, then prints the set as a ready-to-paste allowlist. This is how you make a default allowlist *verifiable and exhaustive*.
+
+```bash
+# Capture what the agent contacts while doing a representative task.
+cplt --agent copilot --observe-domains -- -p "add tests for the parser and run them"
+```
+
+`--observe-domains`:
+
+- **Forces the proxy on and in allow-all mode for this run.** It overrides `--preset strict`, `--default-allowlist`, `proxy.default_allowlist`, and any configured `allowed_domains` — nothing is blocked, so you observe the *full* set the agent would contact. cplt prints a one-line notice and a warning that **this run does not enforce domain filtering** (do not treat an observe run as a protected session).
+- **Records every CONNECT** regardless of `--proxy-log` / `--proxy-log-level`, then emits the sorted, deduplicated host list to stderr (always, even under `--quiet`):
+
+```
+[cplt] observe-domains: 14 domains contacted by Copilot this session
+# add to allowed_domains (or src/agent.rs default_allowed_domains):
+# bare hosts, exact-or-subdomain match; collapse subdomains to a parent by hand
+# e.g. api.githubcopilot.com + proxy.githubcopilot.com -> githubcopilot.com
+api.github.com
+api.githubcopilot.com
+github.com
+registry.npmjs.org
+...
+```
+
+- **`--observe-domains-out <FILE>`** also writes the bare domain list (one per line) to `FILE` for scripting.
+- **Works for `cplt exec` too:** `cplt --agent claude --observe-domains exec -- npm test`.
+
+To make it representative, exercise the workflows you care about in one session: resume a chat, build, run tests, install a dependency, etc. The emitted hosts are the *raw* observed set; subdomains are **not** auto-collapsed (that needs a public-suffix heuristic that risks over-broadening). Because the allowlist matcher is **exact-or-subdomain**, you can fold related subdomains to a parent by hand — e.g. `api.githubcopilot.com` + `proxy.githubcopilot.com` → `githubcopilot.com`.
+
+**Updating the allowlist.** Paste the observed hosts into either:
+
+- your own `allowed_domains` file / `proxy.allowed_domains` config (per-project), or
+- an agent's built-in defaults in [`src/agent.rs`](../src/agent.rs) (`default_allowed_domains` and the `*_DOMAINS` consts) for a change shipped to everyone.
+
+When editing `src/agent.rs`, record **provenance** in a comment on the const — which agent + version and the date you captured the domains — so reviewers can tell whether the list is current (see the convention note above those consts). Do not fabricate provenance for lists you did not actually observe.
+
 ## Proxy operations
 
 ### Connection log
