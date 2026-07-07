@@ -146,7 +146,7 @@ cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
 
 By default the proxy is **allow-all**: it logs and blocks known-bad domains, but any HTTPS endpoint on the internet is reachable. Because port 443 is open at the kernel level, a compromised agent or a malicious dependency could exfiltrate source code to an arbitrary host. Network control is the only defense-in-depth layer that stops exfiltration *after* an agent is compromised (issue #52).
 
-Each agent ships with a built-in **default allowlist** — the set of domains it legitimately needs. For **Copilot** this is the GitHub Copilot infrastructure plus common package registries:
+Each agent ships with a built-in **default allowlist** — the set of domains it legitimately needs, on top of a shared package-registry base. For **Copilot** this is the GitHub Copilot infrastructure plus common package registries:
 
 ```
 # GitHub Copilot infrastructure
@@ -160,6 +160,18 @@ default.exp2.cds.s9ch.io
 registry.npmjs.org  registry.yarnpkg.com  repo.maven.apache.org
 plugins.gradle.org  crates.io  static.crates.io  pypi.org  files.pythonhosted.org
 ```
+
+**Per-agent infrastructure defaults.** Each agent adds its own endpoints on top of the shared registry base:
+
+- **Copilot** — GitHub Copilot infrastructure (above).
+- **Gemini** — Google Gemini API, Code Assist backend, and Google OAuth.
+- **Antigravity** — the same Google AI infrastructure as Gemini, plus `antigravity.google`.
+- **Claude** — the Anthropic API, console/login, and feature-flag telemetry.
+- **OpenCode** — only OpenCode's own infra (`opencode.ai`, `models.dev`). OpenCode is provider-agnostic, so **you must add your chosen model provider's domain** (e.g. `api.anthropic.com`, `api.openai.com`, or `generativelanguage.googleapis.com`) via `allowed_domains` for the model traffic to be permitted.
+- **Pi** — no infrastructure defaults yet; add its endpoints via `allowed_domains` when enabling the allowlist (contributions welcome).
+- **Shell** — registry base only (not an AI agent).
+
+These infra lists are best-effort defaults for this opt-in feature; anything missing shows up as `BLOCKED-ALLOWLIST` (see below) so you can add it.
 
 Turn it on to make the proxy **fail-closed** — only these domains (and your own additions) are allowed, everything else is blocked:
 

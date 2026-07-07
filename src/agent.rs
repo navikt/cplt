@@ -46,6 +46,48 @@ const COPILOT_INFRA_DOMAINS: &[&str] = &[
     "default.exp2.cds.s9ch.io",
 ];
 
+/// Google AI infrastructure shared by the Gemini CLI and Antigravity (both are
+/// Google products; Antigravity stores its config under `~/.gemini`). Covers
+/// the Gemini API, the Code Assist backend, and Google OAuth for login.
+///
+/// BARE domains, matched exact-or-subdomain by `crate::proxy::is_domain_match`.
+/// Do not add a leading `*.`; the matcher does not interpret glob syntax.
+///
+/// Google Gemini API + Code Assist backend + Google OAuth. High confidence.
+const GOOGLE_AI_DOMAINS: &[&str] = &[
+    "generativelanguage.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+    "oauth2.googleapis.com",
+    "accounts.google.com",
+];
+
+/// Antigravity's own endpoint, used in addition to `GOOGLE_AI_DOMAINS`.
+/// Antigravity lives at antigravity.google.
+///
+/// BARE domain — see `COPILOT_INFRA_DOMAINS` for the no-glob convention.
+const ANTIGRAVITY_DOMAINS: &[&str] = &["antigravity.google"];
+
+/// Anthropic infrastructure for Claude Code: the API, the console/login site,
+/// and feature-flag telemetry.
+///
+/// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
+///
+/// Anthropic API + console/login + feature-flag telemetry. High confidence.
+const ANTHROPIC_DOMAINS: &[&str] = &[
+    "api.anthropic.com",
+    "console.anthropic.com",
+    "claude.ai",
+    "statsig.anthropic.com",
+];
+
+/// OpenCode's OWN infrastructure only. OpenCode is provider-agnostic: it routes
+/// model traffic to a user-configured provider (Anthropic/OpenAI/Google/…), so
+/// enabling `default_allowlist` for OpenCode requires adding that provider's
+/// domain via `allowed_domains`. Only OpenCode's own infra is listed here.
+///
+/// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
+const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
+
 /// Supported AI coding agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -235,19 +277,39 @@ impl Agent {
     /// with any user-configured `allowed_domains`) and blocks everything else,
     /// so a compromised agent cannot exfiltrate to an arbitrary HTTPS endpoint.
     ///
-    /// Every agent gets the shared package-registry base; Copilot additionally
-    /// gets its GitHub Copilot infrastructure endpoints. Entries are bare
-    /// domains matched by `crate::proxy::is_domain_match` (exact or subdomain).
+    /// Every agent gets the shared package-registry base. On top of that, each
+    /// agent with documented infrastructure gets its own endpoints: Copilot the
+    /// GitHub Copilot infra (#52), Gemini/Antigravity the Google AI infra
+    /// (Antigravity additionally its own domain), Claude the Anthropic infra,
+    /// and OpenCode only its own infra (see below). Entries are bare domains
+    /// matched by `crate::proxy::is_domain_match` (exact or subdomain).
     ///
-    /// NOTE: this is opt-in and does NOT change the default behaviour. For
-    /// non-Copilot agents the base list intentionally omits that agent's own
-    /// LLM endpoint — enabling `default_allowlist` for them today requires the
-    /// user to add it via `allowed_domains`. Per-agent infra lists can be added
-    /// here as those agents are hardened.
+    /// NOTE: this is opt-in and does NOT change the default behaviour. Two gaps
+    /// remain where enabling `default_allowlist` today still needs the user to
+    /// add domains via `allowed_domains`:
+    ///   - OpenCode is provider-agnostic: its model traffic goes to a
+    ///     user-configured provider (Anthropic/OpenAI/Google/…), which is NOT
+    ///     included here — only OpenCode's own infra is.
+    ///   - Pi's infrastructure endpoints are not yet documented here.
+    ///
+    /// These are best-effort defaults for an opt-in feature: blocked domains are
+    /// logged (BLOCKED-ALLOWLIST) so users can add any that are missing.
     pub fn default_allowed_domains(&self) -> Vec<&'static str> {
+        // Per-agent infrastructure endpoints, layered on top of the shared
+        // package-registry base below. Pi and Shell get the base only: Pi's
+        // endpoints are not yet documented (contributions welcome), and Shell
+        // is not an AI agent so it has no model/auth traffic of its own.
+        let infra: &[&[&str]] = match self {
+            Agent::Copilot => &[COPILOT_INFRA_DOMAINS],
+            Agent::Gemini => &[GOOGLE_AI_DOMAINS],
+            Agent::Antigravity => &[GOOGLE_AI_DOMAINS, ANTIGRAVITY_DOMAINS],
+            Agent::Claude => &[ANTHROPIC_DOMAINS],
+            Agent::OpenCode => &[OPENCODE_DOMAINS],
+            Agent::Pi | Agent::Shell => &[],
+        };
         let mut domains: Vec<&'static str> = Vec::new();
-        if matches!(self, Agent::Copilot) {
-            domains.extend_from_slice(COPILOT_INFRA_DOMAINS);
+        for slice in infra {
+            domains.extend_from_slice(slice);
         }
         domains.extend_from_slice(PACKAGE_REGISTRY_DOMAINS);
         domains
@@ -1405,15 +1467,106 @@ mod tests {
     }
 
     #[test]
-    fn non_copilot_agents_get_registry_base_only() {
-        // Other agents share the package-registry base but not Copilot infra.
-        for agent in [Agent::OpenCode, Agent::Claude, Agent::Gemini] {
+    fn gemini_default_domains_include_google_ai_and_registry() {
+        let domains = Agent::Gemini.default_allowed_domains();
+        assert!(
+            domains.contains(&"generativelanguage.googleapis.com"),
+            "Gemini must include the Gemini API endpoint"
+        );
+        assert!(domains.contains(&"accounts.google.com"));
+        assert!(
+            domains.contains(&"registry.npmjs.org"),
+            "Gemini must include the package-registry base"
+        );
+        assert!(
+            !domains.contains(&"githubcopilot.com"),
+            "Gemini must not get Copilot infra"
+        );
+    }
+
+    #[test]
+    fn antigravity_default_domains_include_google_and_own_domain() {
+        let domains = Agent::Antigravity.default_allowed_domains();
+        // Google AI infra (shared with Gemini)...
+        assert!(domains.contains(&"generativelanguage.googleapis.com"));
+        // ...plus Antigravity's own domain.
+        assert!(
+            domains.contains(&"antigravity.google"),
+            "Antigravity must include its own domain"
+        );
+        assert!(domains.contains(&"registry.npmjs.org"));
+    }
+
+    #[test]
+    fn claude_default_domains_include_anthropic_and_registry() {
+        let domains = Agent::Claude.default_allowed_domains();
+        assert!(
+            domains.contains(&"api.anthropic.com"),
+            "Claude must include the Anthropic API endpoint"
+        );
+        assert!(domains.contains(&"claude.ai"));
+        assert!(domains.contains(&"statsig.anthropic.com"));
+        assert!(domains.contains(&"registry.npmjs.org"));
+    }
+
+    #[test]
+    fn opencode_default_domains_include_own_infra_only() {
+        let domains = Agent::OpenCode.default_allowed_domains();
+        assert!(
+            domains.contains(&"opencode.ai"),
+            "OpenCode must include its own infra"
+        );
+        assert!(domains.contains(&"models.dev"));
+        assert!(domains.contains(&"registry.npmjs.org"));
+        // OpenCode is provider-agnostic: no provider LLM domain is baked in.
+        assert!(
+            !domains.contains(&"api.anthropic.com")
+                && !domains.contains(&"generativelanguage.googleapis.com"),
+            "OpenCode must not assume a specific model provider"
+        );
+    }
+
+    #[test]
+    fn pi_and_shell_get_registry_base_only() {
+        // Pi's infra is not yet documented; Shell is not an AI agent. Both get
+        // only the shared package-registry base (8 domains).
+        for agent in [Agent::Pi, Agent::Shell] {
             let domains = agent.default_allowed_domains();
             assert_eq!(domains.len(), 8, "{agent:?} gets registry base only");
             assert!(domains.contains(&"registry.npmjs.org"));
             assert!(
                 !domains.contains(&"githubcopilot.com"),
                 "{agent:?} must not get Copilot infra"
+            );
+        }
+    }
+
+    #[test]
+    fn every_agent_default_domains_nonempty_bare_and_registry_backed() {
+        // Contract across ALL agents: non-empty, registry base present, and no
+        // glob syntax (the proxy matcher does exact/subdomain matching only).
+        for agent in [
+            Agent::Copilot,
+            Agent::OpenCode,
+            Agent::Gemini,
+            Agent::Antigravity,
+            Agent::Pi,
+            Agent::Claude,
+            Agent::Shell,
+        ] {
+            let domains = agent.default_allowed_domains();
+            assert!(!domains.is_empty(), "{agent:?} list must not be empty");
+            assert!(
+                domains.contains(&"registry.npmjs.org"),
+                "{agent:?} must include the package-registry base"
+            );
+            assert!(
+                domains.iter().all(|d| !d.starts_with("*.")),
+                "{agent:?} domains must be bare (no `*.` glob prefix)"
+            );
+            assert!(
+                domains.iter().all(|d| !d.contains('*')),
+                "{agent:?} domains must be bare (no wildcard syntax)"
             );
         }
     }
