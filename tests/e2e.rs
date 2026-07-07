@@ -4041,4 +4041,252 @@ mod e2e_tests {
             "exec --no-quiet should print sandbox summary.\nstderr: {stderr}"
         );
     }
+
+    // ============================================================
+    // `cplt check` — verify & explain sandbox enforcement (#142)
+    // ============================================================
+
+    /// A fresh, safe project directory for `check` (temp dirs are not rejected
+    /// as "too broad" the way /tmp itself is).
+    fn check_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A .git marker makes it a proper project root.
+        std::fs::create_dir_all(dir.path().join(".git")).ok();
+        dir
+    }
+
+    #[test]
+    fn e2e_check_battery_enforcing() {
+        require_sandbox!();
+        let proj = check_project();
+        // check is a diagnostic and must not require an installed agent in CI.
+        // Pin the always-available shell profile so the test is deterministic.
+        let output = cplt_cmd()
+            .args(["--agent", "shell"])
+            .arg("--project-dir")
+            .arg(proj.path())
+            .arg("check")
+            .output()
+            .expect("cplt check should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "battery should be enforcing (exit 0).\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // A working sandbox: project ALLOWED, credentials/home/exec BLOCKED.
+        assert!(stdout.contains("ENFORCING"), "verdict:\n{stdout}");
+        assert!(
+            stdout.contains("ALLOWED"),
+            "should show allowed items:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("BLOCKED"),
+            "should show blocked items:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_check_battery_json_shape() {
+        require_sandbox!();
+        let proj = check_project();
+        let output = cplt_cmd()
+            .args(["--agent", "shell"])
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args(["check", "--json"])
+            .output()
+            .expect("cplt check --json should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "json battery exit 0.\n{stdout}");
+        // Shape assertions.
+        assert!(stdout.contains("\"enforcing\": true"), "json:\n{stdout}");
+        assert!(stdout.contains("\"verified\":"), "json:\n{stdout}");
+        assert!(stdout.contains("\"items\":"), "json:\n{stdout}");
+        assert!(
+            stdout.contains("\"decision\": \"blocked\""),
+            "json should contain a blocked decision:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"decision\": \"allowed\""),
+            "json should contain an allowed decision:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_check_path_protected_blocked() {
+        require_sandbox!();
+        let proj = check_project();
+        let home = std::env::var("HOME").expect("HOME");
+        let ssh = format!("{home}/.ssh");
+        let output = cplt_cmd()
+            .args(["--agent", "shell"])
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args(["check", "path", &ssh])
+            .output()
+            .expect("cplt check path should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("BLOCKED"),
+            "~/.ssh read should be blocked:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("credential"),
+            "should explain it as a credential path:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_check_path_project_allowed() {
+        require_sandbox!();
+        let proj = check_project();
+        let output = cplt_cmd()
+            .args(["--agent", "shell"])
+            .arg("--project-dir")
+            .arg(proj.path())
+            .arg("check")
+            .arg("path")
+            .arg(proj.path())
+            .arg("--write")
+            .output()
+            .expect("cplt check path should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "targeted check exits 0:\n{stdout}");
+        assert!(
+            stdout.matches("ALLOWED").count() >= 2,
+            "project dir read+write should both be ALLOWED:\n{stdout}"
+        );
+    }
+
+    // The net/exec explain layer is static (no kernel sandbox needed), so these
+    // run in CI regardless of sandbox-exec availability.
+
+    #[test]
+    fn e2e_check_net_metadata_blocked() {
+        let proj = check_project();
+        let output = cplt_cmd()
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args([
+                "--agent",
+                "shell",
+                "check",
+                "net",
+                "169.254.169.254",
+                "--no-connect",
+            ])
+            .output()
+            .expect("cplt check net should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("BLOCKED"),
+            "metadata IP should be blocked:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("SSRF"),
+            "should explain it as an SSRF block:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_check_net_default_allowed() {
+        let proj = check_project();
+        let output = cplt_cmd()
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args([
+                "--agent",
+                "shell",
+                "check",
+                "net",
+                "githubcopilot.com",
+                "--no-connect",
+            ])
+            .output()
+            .expect("cplt check net should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("ALLOWED"),
+            "an allow-listed default domain should be allowed:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_check_net_strict_allowlist_blocks_unknown() {
+        let proj = check_project();
+        let output = cplt_cmd()
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args([
+                "--agent",
+                "shell",
+                "--preset",
+                "strict",
+                "check",
+                "net",
+                "totally-unknown.example",
+                "--no-connect",
+            ])
+            .output()
+            .expect("cplt check net should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("BLOCKED") && stdout.contains("allowlist"),
+            "strict allowlist should block an unknown domain:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_check_exec_docker_blocked() {
+        let proj = check_project();
+        let output = cplt_cmd()
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args(["--agent", "shell", "check", "exec", "docker", "ps"])
+            .output()
+            .expect("cplt check exec should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("BLOCKED"),
+            "docker should be gated off by default:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("--allow-docker"),
+            "should name the exact fix flag:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_check_exec_docker_allowed_with_flag() {
+        let proj = check_project();
+        let output = cplt_cmd()
+            .arg("--project-dir")
+            .arg(proj.path())
+            .args([
+                "--agent",
+                "shell",
+                "--allow-docker",
+                "check",
+                "exec",
+                "docker",
+                "ps",
+            ])
+            .output()
+            .expect("cplt check exec should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("ALLOWED"),
+            "docker should be allowed with --allow-docker:\n{stdout}"
+        );
+    }
 }

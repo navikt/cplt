@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod audit;
+pub mod check;
 pub mod config;
 pub mod detect;
 pub mod discover;

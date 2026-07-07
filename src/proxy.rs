@@ -565,6 +565,21 @@ impl ProxyState {
         merged.dedup();
         merged
     }
+
+    /// Snapshot the effective CONNECT policy for static classification.
+    ///
+    /// Reads the current (cache-refreshed) allowlist and blocklist so
+    /// [`classify_connect`] sees exactly what the live gates would see.
+    fn net_policy(&self) -> NetPolicy {
+        NetPolicy {
+            allowed_ports: self.allowed_ports.clone(),
+            allowed_domains: self.get_allowed_domains(),
+            blocked_domains: self.get_blocked_domains(),
+            allow_localhost_ports: self.allow_localhost_ports.clone(),
+            allow_localhost_any: self.allow_localhost_any,
+            private_domains: self.get_private_domains(),
+        }
+    }
 }
 
 /// Read cached domains, refreshing from disk if TTL has expired.
@@ -595,7 +610,15 @@ fn get_cached_domains(
 
 /// Parse a one-domain-per-line file (blocklist or allowlist format).
 /// Returns None on read failure (caller keeps last-good).
-fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
+///
+/// This is the **single** parser the live proxy feeds into its allowlist and
+/// blocklist caches ([`get_cached_domains`]). `cplt check` must build its policy
+/// snapshot through this same function (not [`parse_domain_file`], which extra-
+/// normalizes by stripping scheme/path/port) so a non-canonical allowlist entry
+/// like `github.com:443` is stored byte-identically in both — otherwise check
+/// would report ALLOWED for a host the live `handle_connect` blocks with
+/// BLOCKED-ALLOWLIST.
+pub fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e)
@@ -973,8 +996,128 @@ fn resolve_locally(state: &ProxyState, host: &str, port: u16) -> Option<std::net
             return resolver(host, port);
         }
     }
+    let _ = state;
+    resolve_socket_addr(host, port)
+}
+
+/// Resolve `host:port` to a single socket address via the system resolver.
+///
+/// This is the real DNS path the live proxy uses ([`resolve_locally`], modulo
+/// the test-injected resolver) and the exact resolver `cplt check net` reuses so
+/// the diagnostic's post-DNS SSRF guard sees the same address the live proxy
+/// would resolve — never duplicating resolution logic.
+#[must_use]
+pub fn resolve_socket_addr(host: &str, port: u16) -> Option<std::net::SocketAddr> {
     let addr_str = format!("{host}:{port}");
     addr_str.to_socket_addrs().ok().and_then(|mut a| a.next())
+}
+
+/// The verdict of the proxy's pre-DNS CONNECT policy gates.
+///
+/// This is the static portion of the CONNECT decision — the checks that depend
+/// only on the target host/port and the configured policy, not on DNS
+/// resolution. It is the single source of truth shared by the live proxy
+/// ([`handle_connect`]) and the `cplt check net` diagnostic ([`classify_connect`]).
+///
+/// [`NetVerdict::Allowed`] means "no static gate blocks this" — the live path
+/// then proceeds to DNS resolution and the resolved-IP SSRF guard, which can
+/// still block a name that resolves to a private address. The diagnostic treats
+/// `Allowed` as "cplt is not blocking this by policy".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetVerdict {
+    /// No static policy gate blocks the target (would proceed to DNS/connect).
+    Allowed,
+    /// The target port is not in the allowed-ports set.
+    BlockedPort,
+    /// A fail-closed allowlist is active and the host is not in it.
+    BlockedAllowlist,
+    /// The host matches the blocklist.
+    Blocked,
+    /// The host is a known-private/loopback/link-local target (SSRF guard).
+    BlockedPrivate,
+}
+
+impl NetVerdict {
+    /// The `BLOCKED-*` status string used in the proxy audit log for this verdict.
+    /// `Allowed` maps to `ALLOWED` (the target would be permitted by policy).
+    #[must_use]
+    pub fn status(self) -> &'static str {
+        match self {
+            NetVerdict::Allowed => "ALLOWED",
+            NetVerdict::BlockedPort => "BLOCKED-PORT",
+            NetVerdict::BlockedAllowlist => "BLOCKED-ALLOWLIST",
+            NetVerdict::Blocked => "BLOCKED",
+            NetVerdict::BlockedPrivate => "BLOCKED-PRIVATE",
+        }
+    }
+
+    /// Whether this verdict permits the connection (no static gate blocked it).
+    #[must_use]
+    pub fn is_allowed(self) -> bool {
+        matches!(self, NetVerdict::Allowed)
+    }
+}
+
+/// A snapshot of the proxy's effective CONNECT policy for static classification.
+///
+/// Built either from a live [`ProxyState`] (via [`ProxyState::net_policy`]) or
+/// directly from resolved config by the `cplt check` command. The field values
+/// mean exactly what they mean inside [`handle_connect`]: `allowed_ports`
+/// already includes 443, `allowed_domains` is the *effective* (merged) allowlist
+/// where empty means allow-all.
+#[derive(Debug, Clone, Default)]
+pub struct NetPolicy {
+    pub allowed_ports: Vec<u16>,
+    pub allowed_domains: Vec<String>,
+    pub blocked_domains: Vec<String>,
+    pub allow_localhost_ports: Vec<u16>,
+    pub allow_localhost_any: bool,
+    /// Hosts explicitly trusted to resolve to private IPs
+    /// (`allow_private_domains`). Consulted by the post-DNS resolved-IP guard
+    /// (`resolved_ip_is_blocked`), not by the pre-DNS [`classify_connect`] gates.
+    /// Mirrors `ProxyState::get_private_domains` so `cplt check net` applies the
+    /// same waiver the live proxy does.
+    pub private_domains: Vec<String>,
+}
+
+/// Classify a CONNECT target against the static (pre-DNS) proxy policy gates.
+///
+/// This is the exact gate order [`handle_connect`] enforces before it resolves
+/// DNS — port policy, fail-closed allowlist, blocklist, then the
+/// private-hostname SSRF guard — reusing the same matchers ([`is_domain_match`],
+/// [`is_blocked_in_list`], [`is_private_hostname`]). Factoring it here keeps the
+/// live path and the diagnostic from drifting apart.
+#[must_use]
+pub fn classify_connect(policy: &NetPolicy, host: &str, port: u16) -> NetVerdict {
+    let host = normalize_hostname(host);
+
+    let localhost_opt_in =
+        policy.allow_localhost_any || policy.allow_localhost_ports.contains(&port);
+    let localhost_connect_allowed = {
+        let h = host.trim_start_matches('[').trim_end_matches(']');
+        let is_loopback = h == "localhost"
+            || h.ends_with(".localhost")
+            || h.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        is_loopback && localhost_opt_in
+    };
+
+    if !localhost_connect_allowed && !policy.allowed_ports.contains(&port) {
+        return NetVerdict::BlockedPort;
+    }
+    if !localhost_connect_allowed
+        && !policy.allowed_domains.is_empty()
+        && !is_domain_match(&host, &policy.allowed_domains)
+    {
+        return NetVerdict::BlockedAllowlist;
+    }
+    if is_blocked_in_list(&host, &policy.blocked_domains) {
+        return NetVerdict::Blocked;
+    }
+    if !localhost_connect_allowed && is_private_hostname(&host) {
+        return NetVerdict::BlockedPrivate;
+    }
+    NetVerdict::Allowed
 }
 
 /// Apply the resolved-IP SSRF / DNS-rebinding guard.
@@ -1015,57 +1158,47 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         is_loopback && localhost_opt_in
     };
 
-    // Enforce port policy — only allow ports matching the sandbox network rules.
-    // Without this, the proxy would let sandboxed processes tunnel to arbitrary
-    // remote ports, bypassing the sandbox's port restrictions.
-    // Exception: explicitly-opened localhost ports bypass this check; the user's
-    // intent with --allow-localhost <PORT> is to reach that port regardless of
-    // whether it appears in the general allowed_ports list.
-    if !localhost_connect_allowed && !state.allowed_ports.contains(&port) {
-        log_connection(state, "CONNECT", target, "BLOCKED-PORT");
-        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPort not allowed\r\n");
-        return;
-    }
-
-    // Enforce domain allowlist — when configured, only listed domains pass.
-    // Fail-closed: if the allowlist is non-empty and the domain isn't in it, deny.
+    // Apply the static (pre-DNS) policy gates — port policy, fail-closed
+    // allowlist, blocklist, then the private-hostname SSRF guard — in that
+    // order. The decision logic lives in `classify_connect` so the live proxy
+    // and the `cplt check net` diagnostic can never drift apart; here we map
+    // each verdict to its audit-log status and 403 response. The `Blocked`
+    // (blocklist) and `BlockedPrivate` cases additionally half-close the socket,
+    // matching the original inline behaviour. `localhost_connect_allowed` is
+    // recomputed identically inside `classify_connect`; it is retained here
+    // because the post-DNS section below still consults it.
     //
-    // Localhost carve-out: skip the allowlist gate for an opted-in localhost
-    // target, consistent with the port-policy and private-hostname gates above
-    // (both also skip when `localhost_connect_allowed`). The agent-default
-    // allowlist never contains "localhost", so without this exemption a user
-    // combining fail-closed networking with a local dev-server carve-out
-    // (`--default-allowlist --allow-localhost 3000`) would get
-    // `CONNECT localhost:3000` blocked — a surprising break of a legitimate
-    // combo. Still safe: `localhost_connect_allowed` requires both an explicit
-    // opt-in AND a loopback-spelled host, and the resolved-IP loopback check
-    // below still enforces that the target actually resolves to a loopback IP,
-    // so this exemption cannot let a non-loopback host masquerade as localhost
-    // to bypass the allowlist.
-    let allowed_domains = state.get_allowed_domains();
-    if !localhost_connect_allowed
-        && !allowed_domains.is_empty()
-        && !is_domain_match(&host, &allowed_domains)
-    {
-        log_connection(state, "CONNECT", target, "BLOCKED-ALLOWLIST");
-        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist\r\n");
-        return;
-    }
-
-    // Check blocklist (hostname-level)
-    let blocked_domains = state.get_blocked_domains();
-    if is_blocked_in_list(&host, &blocked_domains) {
-        log_connection(state, "CONNECT", target, "BLOCKED");
-        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n");
-        let _ = client.shutdown(std::net::Shutdown::Both);
-        return;
-    }
-    // Reject hostname patterns that are known private (fast path before DNS)
-    if !localhost_connect_allowed && is_private_hostname(&host) {
-        log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE");
-        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked\r\n");
-        let _ = client.shutdown(std::net::Shutdown::Both);
-        return;
+    // Every arm routes through `log_connection(state, ...)`, which is the single
+    // choke point that also records the observation into `domain_collector`
+    // (issue #143). So the merged path yields the SAME verdict `classify_connect`
+    // computes AND records every contacted host — a blocked verdict is logged and
+    // recorded here, an `Allowed` verdict falls through to be recorded downstream
+    // when the connection reaches CONNECTED / a post-DNS block.
+    let snapshot = state.net_policy();
+    match classify_connect(&snapshot, &host, port) {
+        NetVerdict::BlockedPort => {
+            log_connection(state, "CONNECT", target, "BLOCKED-PORT");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPort not allowed\r\n");
+            return;
+        }
+        NetVerdict::BlockedAllowlist => {
+            log_connection(state, "CONNECT", target, "BLOCKED-ALLOWLIST");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nDomain not in allowlist\r\n");
+            return;
+        }
+        NetVerdict::Blocked => {
+            log_connection(state, "CONNECT", target, "BLOCKED");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nBlocked by cplt\r\n");
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        NetVerdict::BlockedPrivate => {
+            log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked\r\n");
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        NetVerdict::Allowed => {}
     }
 
     // ── Upstream (corporate) proxy chaining ──────────────────────────────
@@ -1805,6 +1938,117 @@ use std::net::ToSocketAddrs;
 mod tests {
     use super::*;
 
+    // ── classify_connect: the shared static gate order ──
+
+    fn np(allowed: &[&str], blocked: &[&str], ports: &[u16]) -> NetPolicy {
+        NetPolicy {
+            allowed_ports: ports.to_vec(),
+            allowed_domains: allowed.iter().map(|s| (*s).to_string()).collect(),
+            blocked_domains: blocked.iter().map(|s| (*s).to_string()).collect(),
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classify_gate_order_matches_live_proxy() {
+        // Port is checked first.
+        assert_eq!(
+            classify_connect(&np(&[], &[], &[443]), "github.com", 22),
+            NetVerdict::BlockedPort
+        );
+        // Then the fail-closed allowlist.
+        assert_eq!(
+            classify_connect(&np(&["github.com"], &[], &[443]), "evil.example", 443),
+            NetVerdict::BlockedAllowlist
+        );
+        // Empty allowlist = allow-all.
+        assert_eq!(
+            classify_connect(&np(&[], &[], &[443]), "anything.example", 443),
+            NetVerdict::Allowed
+        );
+        // Blocklist applies even when the allowlist would pass.
+        assert_eq!(
+            classify_connect(
+                &np(&["evil.example"], &["evil.example"], &[443]),
+                "evil.example",
+                443
+            ),
+            NetVerdict::Blocked
+        );
+        // Private/link-local SSRF guard (cloud metadata).
+        assert_eq!(
+            classify_connect(&np(&[], &[], &[443]), "169.254.169.254", 443),
+            NetVerdict::BlockedPrivate
+        );
+    }
+
+    #[test]
+    fn classify_localhost_opt_in_bypasses_gates() {
+        let mut policy = np(&["github.com"], &[], &[443]);
+        // Without opt-in, localhost:3000 fails the port gate.
+        assert_eq!(
+            classify_connect(&policy, "localhost", 3000),
+            NetVerdict::BlockedPort
+        );
+        // Opting the port in exempts it from port, allowlist, and SSRF gates.
+        policy.allow_localhost_ports = vec![3000];
+        assert_eq!(
+            classify_connect(&policy, "localhost", 3000),
+            NetVerdict::Allowed
+        );
+    }
+
+    #[test]
+    fn check_allowlist_parser_matches_live_enforcement() {
+        // FIX 1: `cplt check` must build its allowlist through the SAME parser the
+        // live cache uses (`parse_lines_file`), not `parse_domain_file`. A
+        // non-canonical entry like `github.com:443` is a divergence point:
+        //   - `parse_lines_file` (live + check now)  → stores "github.com:443"
+        //   - `parse_domain_file` (check, the bug)   → strips port to "github.com"
+        // With the port-stripping parser, check reported ALLOWED for `github.com`
+        // while the live proxy (matching the verbatim "github.com:443") returns
+        // BLOCKED-ALLOWLIST — a dangerous false ALLOWED. Prove the two parsers
+        // diverge and that the shared `parse_lines_file` path now agrees with live.
+        let dir = test_dir("allowlist-parity");
+        let path = dir.join("allowed_domains.txt");
+        std::fs::write(&path, "github.com:443\n").unwrap();
+
+        // The parser the live allowlist cache feeds (and now `build_net_policy`).
+        let live_list = parse_lines_file(&path).unwrap();
+        assert_eq!(live_list, vec!["github.com:443"]);
+        // The over-normalizing parser the check path used to use.
+        let stripped_list = parse_domain_file(&path).unwrap();
+        assert_eq!(stripped_list, vec!["github.com"]);
+
+        // Same host, same gate logic — the verdict now agrees with live: BLOCKED.
+        let live_policy = np(&["github.com:443"], &[], &[443]);
+        assert_eq!(
+            classify_connect(&live_policy, "github.com", 443),
+            NetVerdict::BlockedAllowlist,
+            "the live/check-parity allowlist blocks a host it does not verbatim match"
+        );
+        // The old stripped list would have wrongly reported ALLOWED — the bug.
+        let stripped_policy = np(&["github.com"], &[], &[443]);
+        assert_eq!(
+            classify_connect(&stripped_policy, "github.com", 443),
+            NetVerdict::Allowed,
+            "the over-normalized allowlist produced the false ALLOWED this fix removes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn net_verdict_status_strings() {
+        assert_eq!(NetVerdict::Allowed.status(), "ALLOWED");
+        assert_eq!(NetVerdict::BlockedPort.status(), "BLOCKED-PORT");
+        assert_eq!(NetVerdict::BlockedAllowlist.status(), "BLOCKED-ALLOWLIST");
+        assert_eq!(NetVerdict::Blocked.status(), "BLOCKED");
+        assert_eq!(NetVerdict::BlockedPrivate.status(), "BLOCKED-PRIVATE");
+    }
+
     /// Create a unique temp directory for test isolation.
     fn test_dir(name: &str) -> PathBuf {
         let dir =
@@ -2368,6 +2612,7 @@ mod tests {
             upstream: None,
             upstream_no_proxy: Vec::new(),
             resolver: None,
+            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
