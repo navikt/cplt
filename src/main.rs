@@ -1515,10 +1515,25 @@ fn emit_observed_domains(
     }
 
     if let Some(path) = out_file {
-        let body: String = observed.iter().map(|o| format!("{}\n", o.host)).collect();
+        // The out-file is meant to be a ready-to-use allowlist, so it must
+        // contain ONLY hosts that were actually PERMITTED. In observe mode
+        // domain filtering is off, but port policy / blocklist / private-IP
+        // guards still enforce — a host refused by those is recorded Blocked.
+        // Skip Blocked entries here so a user scripting off --observe-domains-out
+        // never pastes a policy-blocked host into their allowlist. (The stderr
+        // output above still lists Blocked hosts annotated '# BLOCKED this run'.)
+        // If every entry was Blocked the out-file is written empty, which is a
+        // valid allowlist.
+        let allowed: Vec<&str> = observed
+            .iter()
+            .filter(|o| o.verdict == proxy::DomainVerdict::Allowed)
+            .map(|o| o.host.as_str())
+            .collect();
+        let written = allowed.len();
+        let body: String = allowed.iter().map(|h| format!("{h}\n")).collect();
         match std::fs::write(path, body) {
             Ok(()) => eprintln!(
-                "[cplt] observe-domains: wrote {count} domains to {}",
+                "[cplt] observe-domains: wrote {written} domains to {}",
                 path.display()
             ),
             Err(e) => ui::warn(&format!(
@@ -1526,6 +1541,45 @@ fn emit_observed_domains(
                 path.display()
             )),
         }
+    }
+}
+
+/// The domain-allowlist resolution decision for a run.
+///
+/// Extracted as a pure function so the security-critical no-leak invariant can
+/// be unit-tested in isolation: the observe-mode allow-all override is
+/// **flag-gated** — it can only null the allowlist when `--observe-domains` is
+/// set — and it touches **only** the domain allowlist, never port/SSRF policy
+/// (which are resolved elsewhere and not visible here). A run with no override
+/// keeps its configured / default allowlist and enforcement is preserved.
+struct DomainAllowlistDecision {
+    /// Whether the explicit `allowed_domains` file is consulted this run.
+    /// `false` = allow-all (the file is dropped, no domain enforcement from it).
+    use_allowed_file: bool,
+    /// Whether the agent's built-in default allowlist contributes this run.
+    use_default_allowlist: bool,
+    /// Whether the proxy must be forced on (observe mode needs a choke point to
+    /// record CONNECTs even if the user disabled the proxy).
+    force_proxy_on: bool,
+}
+
+/// Compute the domain-allowlist decision from the two allow-all escape hatches
+/// and whether the agent default allowlist is enabled.
+///
+/// `--observe-domains` forces allow-all exactly like `--allow-all-domains`
+/// (drops both the configured file and the agent defaults so the FULL contacted
+/// set is observed) and additionally forces the proxy on. Both overrides are
+/// flag-gated: with neither flag set the configured / default allowlist stands.
+fn resolve_domain_allowlist_decision(
+    observe_domains: bool,
+    allow_all_domains: bool,
+    default_allowlist_enabled: bool,
+) -> DomainAllowlistDecision {
+    let observe_allow_all = observe_domains;
+    DomainAllowlistDecision {
+        use_allowed_file: !(allow_all_domains || observe_allow_all),
+        use_default_allowlist: default_allowlist_enabled && !observe_allow_all,
+        force_proxy_on: observe_domains,
     }
 }
 
@@ -1554,12 +1608,23 @@ fn start_proxy_if_enabled(
         resolved.with_proxy = true;
     }
 
+    // Domain-allowlist resolution (security-critical, see
+    // resolve_domain_allowlist_decision): the observe-mode allow-all override is
+    // flag-gated and touches only the domain allowlist. Computed once here and
+    // consumed both to force the proxy on (discovery choke point) and to null
+    // the effective allowlist below.
+    let allowlist_decision = resolve_domain_allowlist_decision(
+        cli.observe_domains,
+        resolved.allow_all_domains,
+        resolved.default_allowlist,
+    );
+
     // Discovery mode (--observe-domains): force the proxy ON so there is a choke
     // point to record CONNECTs, even if the user disabled it. The allow-all
     // override (empty effective allowlist) is applied below where the allowlist
     // is computed. Print the mandatory warning that this run does NOT enforce
     // domain filtering.
-    if cli.observe_domains {
+    if allowlist_decision.force_proxy_on {
         resolved.with_proxy = true;
         ui::warn("observe-domains: proxy in allow-all mode; all traffic permitted and recorded");
         ui::warn(
@@ -1600,18 +1665,17 @@ fn start_proxy_if_enabled(
     // allowlist file and (below) no agent default allowlist, so nothing is
     // blocked and the FULL contacted set is observed. This must override any
     // configured allowlist, not combine with it (fail-closed would hide domains).
-    let observe_allow_all = cli.observe_domains;
-    let allowed_domains_file = if resolved.allow_all_domains || observe_allow_all {
-        None
-    } else {
+    let allowed_domains_file = if allowlist_decision.use_allowed_file {
         resolved.allowed_domains.clone()
+    } else {
+        None
     };
 
     // Fail-closed networking (#52): when proxy.default_allowlist is on, the
     // effective allowlist is the running agent's built-in defaults, which the
     // proxy MERGES with the user's allowed_domains file. Empty vec = feature
     // off, so the proxy keeps today's allow-all behaviour unchanged.
-    let default_allowlist: Vec<String> = if resolved.default_allowlist && !observe_allow_all {
+    let default_allowlist: Vec<String> = if allowlist_decision.use_default_allowlist {
         active_agent
             .default_allowed_domains()
             .iter()
@@ -4850,7 +4914,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("domains.txt");
         // The list is already sorted+unique (as ProxyHandle::observed_domains
-        // guarantees); the out-file must be the bare hosts, one per line.
+        // guarantees). The out-file is a ready-to-use allowlist, so it must
+        // contain ONLY the Allowed (permitted) hosts, bare, one per line — the
+        // Blocked host must be excluded so it is never pasted into an allowlist.
         let observed = vec![
             ObservedDomain {
                 host: "a.example".into(),
@@ -4862,11 +4928,99 @@ mod tests {
                 verdict: DomainVerdict::Blocked,
                 count: 1,
             },
+            ObservedDomain {
+                host: "c.example".into(),
+                verdict: DomainVerdict::Allowed,
+                count: 1,
+            },
         ];
         emit_observed_domains("Copilot", &observed, Some(&out));
         let body = std::fs::read_to_string(&out).unwrap();
-        assert_eq!(body, "a.example\nb.example\n");
+        // Allowed hosts are present, in order; the Blocked host is absent.
+        assert_eq!(body, "a.example\nc.example\n");
+        assert!(
+            !body.contains("b.example"),
+            "Blocked host must not appear in the out-file allowlist"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No-leak invariant: the observe-mode allow-all override is flag-gated and
+    /// cannot weaken a normal run's domain enforcement, while an observe run
+    /// nulls the effective allowlist and forces the proxy on. Exercised at the
+    /// allowlist-resolution seam (`resolve_domain_allowlist_decision`), the
+    /// single source of truth `start_proxy_if_enabled` consumes.
+    #[test]
+    fn observe_domains_override_is_flag_gated_and_scoped_to_the_allowlist() {
+        // Sample enforcement sources. A non-empty effective allowlist means
+        // fail-closed enforcement is active; an empty one means allow-all.
+        let configured = ["configured.example".to_string()];
+        let agent_defaults = ["default.example"];
+        let effective = |d: &DomainAllowlistDecision| -> Vec<String> {
+            let mut v: Vec<String> = Vec::new();
+            if d.use_default_allowlist {
+                v.extend(agent_defaults.iter().map(|s| (*s).to_string()));
+            }
+            if d.use_allowed_file {
+                v.extend(configured.iter().cloned());
+            }
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+
+        // WITHOUT --observe-domains, default allowlist on (≈ --preset strict):
+        // enforcement preserved — effective allowlist NON-empty, proxy not forced
+        // on by observe logic, both allowlist sources honored.
+        let normal = resolve_domain_allowlist_decision(false, false, true);
+        assert!(
+            normal.use_allowed_file,
+            "normal run must honor the configured allowlist"
+        );
+        assert!(
+            normal.use_default_allowlist,
+            "normal run must keep the default allowlist"
+        );
+        assert!(
+            !normal.force_proxy_on,
+            "observe must not force the proxy on a normal run"
+        );
+        assert!(
+            !effective(&normal).is_empty(),
+            "normal run must have a NON-empty effective allowlist (enforcement preserved)"
+        );
+
+        // WITHOUT --observe-domains, only a configured allowlist file (default
+        // off): still enforced (non-empty).
+        let normal_file_only = resolve_domain_allowlist_decision(false, false, false);
+        assert!(normal_file_only.use_allowed_file);
+        assert!(!normal_file_only.force_proxy_on);
+        assert!(!effective(&normal_file_only).is_empty());
+
+        // WITH --observe-domains: the domain allowlist is nulled (allow-all) AND
+        // the proxy is forced on, regardless of a configured file or default
+        // allowlist being present.
+        let observe = resolve_domain_allowlist_decision(true, false, true);
+        assert!(
+            !observe.use_allowed_file,
+            "observe must drop the configured allowlist file"
+        );
+        assert!(
+            !observe.use_default_allowlist,
+            "observe must drop the agent default allowlist"
+        );
+        assert!(observe.force_proxy_on, "observe must force the proxy on");
+        assert!(
+            effective(&observe).is_empty(),
+            "observe must NULL the effective allowlist (allow-all)"
+        );
+
+        // The override is scoped to the domain allowlist by construction: the
+        // decision exposes only allowlist fields, so it cannot touch port/SSRF
+        // policy. And it is strictly flag-gated — the only difference between the
+        // enforced `normal` case and the allow-all `observe` case above is the
+        // observe flag; the allow_all_domains and default_allowlist inputs are
+        // identical, proving observe alone flips enforcement.
     }
 
     #[test]
