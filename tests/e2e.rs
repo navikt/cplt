@@ -4059,7 +4059,10 @@ mod e2e_tests {
     fn e2e_check_battery_enforcing() {
         require_sandbox!();
         let proj = check_project();
+        // check is a diagnostic and must not require an installed agent in CI.
+        // Pin the always-available shell profile so the test is deterministic.
         let output = cplt_cmd()
+            .args(["--agent", "shell"])
             .arg("--project-dir")
             .arg(proj.path())
             .arg("check")
@@ -4089,6 +4092,7 @@ mod e2e_tests {
         require_sandbox!();
         let proj = check_project();
         let output = cplt_cmd()
+            .args(["--agent", "shell"])
             .arg("--project-dir")
             .arg(proj.path())
             .args(["check", "--json"])
@@ -4118,6 +4122,7 @@ mod e2e_tests {
         let home = std::env::var("HOME").expect("HOME");
         let ssh = format!("{home}/.ssh");
         let output = cplt_cmd()
+            .args(["--agent", "shell"])
             .arg("--project-dir")
             .arg(proj.path())
             .args(["check", "path", &ssh])
@@ -4140,6 +4145,7 @@ mod e2e_tests {
         require_sandbox!();
         let proj = check_project();
         let output = cplt_cmd()
+            .args(["--agent", "shell"])
             .arg("--project-dir")
             .arg(proj.path())
             .arg("check")
@@ -4166,7 +4172,14 @@ mod e2e_tests {
         let output = cplt_cmd()
             .arg("--project-dir")
             .arg(proj.path())
-            .args(["check", "net", "169.254.169.254", "--no-connect"])
+            .args([
+                "--agent",
+                "shell",
+                "check",
+                "net",
+                "169.254.169.254",
+                "--no-connect",
+            ])
             .output()
             .expect("cplt check net should run");
 
@@ -4187,7 +4200,14 @@ mod e2e_tests {
         let output = cplt_cmd()
             .arg("--project-dir")
             .arg(proj.path())
-            .args(["check", "net", "githubcopilot.com", "--no-connect"])
+            .args([
+                "--agent",
+                "shell",
+                "check",
+                "net",
+                "githubcopilot.com",
+                "--no-connect",
+            ])
             .output()
             .expect("cplt check net should run");
 
@@ -4205,6 +4225,8 @@ mod e2e_tests {
             .arg("--project-dir")
             .arg(proj.path())
             .args([
+                "--agent",
+                "shell",
                 "--preset",
                 "strict",
                 "check",
@@ -4228,7 +4250,7 @@ mod e2e_tests {
         let output = cplt_cmd()
             .arg("--project-dir")
             .arg(proj.path())
-            .args(["check", "exec", "docker", "ps"])
+            .args(["--agent", "shell", "check", "exec", "docker", "ps"])
             .output()
             .expect("cplt check exec should run");
 
@@ -4249,7 +4271,15 @@ mod e2e_tests {
         let output = cplt_cmd()
             .arg("--project-dir")
             .arg(proj.path())
-            .args(["--allow-docker", "check", "exec", "docker", "ps"])
+            .args([
+                "--agent",
+                "shell",
+                "--allow-docker",
+                "check",
+                "exec",
+                "docker",
+                "ps",
+            ])
             .output()
             .expect("cplt check exec should run");
 

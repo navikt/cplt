@@ -1181,7 +1181,7 @@ struct ResolvedContext {
 }
 
 /// Load config, merge CLI flags, resolve paths, detect agent, print info messages.
-fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
+fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContext> {
     // Canonicalize CLI paths for consistency with config path handling
     let cli_allow_read = canonicalize_paths(&cli.allow_read, "--allow-read");
     let cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
@@ -1448,6 +1448,21 @@ fn resolve_context(cli: &Cli) -> anyhow::Result<ResolvedContext> {
                     // Default to Copilot so they work without anything installed.
                     if cli.print_profile || cli.doctor {
                         agent::Agent::Copilot
+                    } else if check_mode {
+                        // `cplt check` is a diagnostic: users run it precisely when
+                        // unsure what's installed, so it must not hard-require an
+                        // agent binary. With no --agent and nothing auto-detected,
+                        // fall back to the always-available Shell profile (uses
+                        // $SHELL / /bin/sh, no external binary) rather than erroring.
+                        // Printed even under check's default --quiet: it explains
+                        // which profile is being reported. Goes to stderr, so it
+                        // never contaminates --json output on stdout.
+                        ui::info(
+                            "check: no agent specified/detected — checking the 'shell' \
+                             sandbox profile (pass --agent <name> to check a specific \
+                             agent's policy)",
+                        );
+                        agent::Agent::Shell
                     } else {
                         bail!(
                             "No supported AI coding agent found in PATH. \
@@ -1884,7 +1899,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         project_dir,
         active_agent,
         unapproved_proposals: _,
-    } = resolve_context(&cli)?;
+    } = resolve_context(&cli, false)?;
 
     // Run auto-discovery to tighten the sandbox profile
     let tool_discovery = discover::discover_tools(&home_dir);
@@ -2549,7 +2564,7 @@ fn run_exec_command(
         unapproved_proposals: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
-    } = resolve_context(cli)?;
+    } = resolve_context(cli, false)?;
 
     // exec defaults to quiet+yes (scripting UX). User can override with --no-quiet / --no-yes.
     if !cli.no_quiet {
@@ -2937,7 +2952,7 @@ fn run_check_command(
         project_dir,
         active_agent,
         unapproved_proposals: _,
-    } = resolve_context(cli)?;
+    } = resolve_context(cli, true)?;
 
     // check prints its own report; never prompt.
     resolved.yes = true;
