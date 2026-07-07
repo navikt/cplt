@@ -821,6 +821,7 @@ mod tests {
             blocked_domains: blocked.iter().map(|s| (*s).to_string()).collect(),
             allow_localhost_ports: Vec::new(),
             allow_localhost_any: false,
+            ..Default::default()
         }
     }
 

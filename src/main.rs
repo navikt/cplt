@@ -2835,7 +2835,14 @@ fn build_net_policy(resolved: &config::Resolved, agent: agent::Agent) -> proxy::
     let file_domains: Vec<String> = if resolved.allow_all_domains {
         Vec::new()
     } else if let Some(ref path) = resolved.allowed_domains {
-        proxy::parse_domain_file(path).unwrap_or_default()
+        // Parse the allowed_domains file through the EXACT parser the live
+        // allowlist cache uses (`parse_lines_file` via `get_cached_domains`), NOT
+        // `parse_domain_file`. The latter extra-normalizes (strips scheme/path/
+        // port), so a non-canonical entry like `github.com:443` would be stored
+        // as `github.com` for check but kept verbatim for live enforcement —
+        // making check report ALLOWED while `handle_connect` returns
+        // BLOCKED-ALLOWLIST. Sharing one parser keeps the two byte-identical.
+        proxy::parse_lines_file(path).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -2849,8 +2856,10 @@ fn build_net_policy(resolved: &config::Resolved, agent: agent::Agent) -> proxy::
         merged
     };
 
+    // Same parser-parity requirement for the blocklist: the live cache reads it
+    // via `parse_lines_file`, so check must too (see the allowlist note above).
     let blocked_domains = default_blocklist_path(resolved)
-        .and_then(|p| proxy::parse_domain_file(&p).ok())
+        .and_then(|p| proxy::parse_lines_file(&p))
         .unwrap_or_default();
 
     proxy::NetPolicy {
@@ -2859,6 +2868,10 @@ fn build_net_policy(resolved: &config::Resolved, agent: agent::Agent) -> proxy::
         blocked_domains,
         allow_localhost_ports: resolved.allow_localhost.clone(),
         allow_localhost_any: resolved.allow_localhost_any,
+        // Mirror the live proxy's private-domain union (config + CLI, deduped),
+        // which `resolved.allow_private_domains` already holds, so check's
+        // post-DNS resolved-IP guard waives exactly the hosts the live proxy does.
+        private_domains: resolved.allow_private_domains.clone(),
     }
 }
 
@@ -3269,6 +3282,55 @@ fn mismatch_note(probe: check::Decision, model: check::Decision) -> Option<Strin
     }
 }
 
+/// Replicate the live proxy's post-DNS resolved-IP SSRF guard for `cplt check
+/// net`. `classify_connect`/`explain_domain` classify PRE-DNS only, but
+/// `handle_connect` ALSO runs `resolved_ip_is_blocked` AFTER DNS — blocking a
+/// public host whose A record points at a private/link-local IP
+/// (10.x/172.16.x/192.168.x/169.254.169.254) with BLOCKED-PRIVATE-RESOLVED.
+///
+/// Returns `Some(blocked item)` when the resolved IP is blocked (so check
+/// reports BLOCKED, matching live enforcement, and never runs the reachability
+/// probe for such a target); returns `None` when the resolved IP passes the
+/// guard OR the host does not resolve here (in which case the pre-DNS ALLOWED
+/// verdict stands and `probe_reachable` reports the resolution failure honestly,
+/// exactly as the live proxy would then hit DNS-FAIL rather than a policy block).
+///
+/// Uses the same resolver ([`proxy::resolve_socket_addr`]) and guard
+/// ([`proxy::resolved_ip_is_blocked`]) as the live path, with the same
+/// localhost-opt-in and `allow_private_domains` semantics.
+fn resolved_ip_block_item(
+    net_policy: &proxy::NetPolicy,
+    host: &str,
+    port: u16,
+) -> Option<check::CheckItem> {
+    let addr = proxy::resolve_socket_addr(host, port)?;
+    let localhost_opt_in =
+        net_policy.allow_localhost_any || net_policy.allow_localhost_ports.contains(&port);
+    let host_is_private_domain = proxy::is_domain_match(host, &net_policy.private_domains);
+    if !proxy::resolved_ip_is_blocked(&addr.ip(), host_is_private_domain, localhost_opt_in) {
+        return None;
+    }
+    Some(check::CheckItem {
+        name: "BLOCKED-PRIVATE-RESOLVED".to_string(),
+        category: "network".to_string(),
+        target: format!("{host}:{port}"),
+        decision: check::Decision::Blocked,
+        expected: None,
+        reason: format!(
+            "{host} resolves to {} — a private / loopback / link-local IP the proxy blocks \
+             AFTER DNS (BLOCKED-PRIVATE-RESOLVED) as an SSRF / DNS-rebinding safeguard \
+             (e.g. cloud metadata 169.254.169.254, internal services).",
+            addr.ip()
+        ),
+        fix: Some(
+            "for a trusted internal host use --allow-private-domains <DOMAIN>; \
+             for a local dev server use --allow-localhost <PORT>."
+                .to_string(),
+        ),
+        note: None,
+    })
+}
+
 fn build_net_check(
     net_policy: &proxy::NetPolicy,
     proxy_enabled: bool,
@@ -3279,6 +3341,18 @@ fn build_net_check(
 ) -> check::Report {
     let (host, port) = split_host_port(target);
     let expl = check::explain_domain(net_policy, &host, port, proxy_enabled);
+
+    // The live proxy applies a SECOND, post-DNS guard once the pre-DNS gates in
+    // `classify_connect` pass. Mirror it before trusting an ALLOWED verdict so
+    // check never reports ALLOWED — nor probes reachability (which cplt runs
+    // OUTSIDE the sandbox, where private IPs ARE reachable) — for a target the
+    // live proxy would block on its resolved IP.
+    if proxy_enabled
+        && expl.decision == check::Decision::Allowed
+        && let Some(item) = resolved_ip_block_item(net_policy, &host, port)
+    {
+        return check::Report::new(agent_name, preset_name, false, vec![item]);
+    }
 
     let note = if !no_connect && expl.decision == check::Decision::Allowed && proxy_enabled {
         Some(probe_reachable(&host, port))
@@ -5769,5 +5843,84 @@ mod tests {
         // A shorter prefix must not spuriously match (1.0.3 != 1.0.32).
         assert_eq!(find_complete_dir_for_version(&tmp, "1.0.3"), None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── `cplt check net` must MATCH the live proxy's verdict ──────────────
+
+    #[test]
+    fn check_net_non_canonical_allowlist_matches_live_blocked() {
+        // FIX 1: with a non-canonical allowlist entry (`github.com:443`), the live
+        // proxy stores it verbatim and returns BLOCKED-ALLOWLIST for `github.com`
+        // (it does not verbatim-match). `build_net_policy` now parses the file with
+        // the SAME `parse_lines_file` the live cache uses, so `check net github.com`
+        // reports BLOCKED — matching live — instead of the old false ALLOWED that
+        // `parse_domain_file`'s port-stripping produced.
+        let policy = proxy::NetPolicy {
+            allowed_ports: vec![443],
+            allowed_domains: vec!["github.com:443".to_string()],
+            ..Default::default()
+        };
+        let report = build_net_check(
+            &policy,
+            true,
+            "github.com",
+            true, // no_connect
+            "copilot".to_string(),
+            None,
+        );
+        let json = report.to_json();
+        assert!(
+            json.contains("BLOCKED-ALLOWLIST"),
+            "check must match the live BLOCKED-ALLOWLIST verdict, not report ALLOWED:\n{json}"
+        );
+    }
+
+    #[test]
+    fn check_net_applies_post_dns_resolved_ip_guard() {
+        // FIX 2: `cplt check net` must apply the live proxy's post-DNS
+        // `resolved_ip_is_blocked` guard, not just the pre-DNS classify_connect
+        // gates. A host that resolves to a private / link-local IP must be reported
+        // BLOCKED-PRIVATE-RESOLVED (matching live enforcement) — never the false
+        // ALLOWED + "reachable" the old check produced by probing from cplt (which
+        // runs OUTSIDE the sandbox, where private IPs are reachable).
+        let policy = proxy::NetPolicy::default();
+
+        let item = resolved_ip_block_item(&policy, "10.0.0.1", 443)
+            .expect("a private resolved IP must be reported BLOCKED");
+        assert_eq!(item.decision, check::Decision::Blocked);
+        assert_eq!(item.name, "BLOCKED-PRIVATE-RESOLVED");
+
+        // Cloud metadata endpoint (link-local) is likewise blocked post-DNS.
+        assert!(resolved_ip_block_item(&policy, "169.254.169.254", 443).is_some());
+
+        // A public resolved IP passes the guard, so the pre-DNS ALLOWED verdict
+        // stands and reachability may then be probed.
+        assert!(resolved_ip_block_item(&policy, "1.1.1.1", 443).is_none());
+    }
+
+    #[test]
+    fn check_net_resolved_ip_guard_matches_live_optin_semantics() {
+        // Same waiver semantics as the live proxy: a host trusted via
+        // allow_private_domains that resolves private is waived, and loopback is
+        // waived ONLY when localhost access was opted into for this connection.
+        let trusted = proxy::NetPolicy {
+            private_domains: vec!["10.0.0.1".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            resolved_ip_block_item(&trusted, "10.0.0.1", 443).is_none(),
+            "allow_private_domains must waive the resolved-IP block, matching live"
+        );
+
+        // Loopback without opt-in → blocked (default no-localhost posture).
+        let no_optin = proxy::NetPolicy::default();
+        assert!(resolved_ip_block_item(&no_optin, "127.0.0.1", 443).is_some());
+
+        // Loopback with opt-in → waived (matches resolved_ip_is_blocked semantics).
+        let optin = proxy::NetPolicy {
+            allow_localhost_any: true,
+            ..Default::default()
+        };
+        assert!(resolved_ip_block_item(&optin, "127.0.0.1", 443).is_none());
     }
 }

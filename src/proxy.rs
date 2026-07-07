@@ -467,6 +467,7 @@ impl ProxyState {
             blocked_domains: self.get_blocked_domains(),
             allow_localhost_ports: self.allow_localhost_ports.clone(),
             allow_localhost_any: self.allow_localhost_any,
+            private_domains: self.get_private_domains(),
         }
     }
 }
@@ -499,7 +500,15 @@ fn get_cached_domains(
 
 /// Parse a one-domain-per-line file (blocklist or allowlist format).
 /// Returns None on read failure (caller keeps last-good).
-fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
+///
+/// This is the **single** parser the live proxy feeds into its allowlist and
+/// blocklist caches ([`get_cached_domains`]). `cplt check` must build its policy
+/// snapshot through this same function (not [`parse_domain_file`], which extra-
+/// normalizes by stripping scheme/path/port) so a non-canonical allowlist entry
+/// like `github.com:443` is stored byte-identically in both — otherwise check
+/// would report ALLOWED for a host the live `handle_connect` blocks with
+/// BLOCKED-ALLOWLIST.
+pub fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e)
@@ -861,6 +870,18 @@ fn resolve_locally(state: &ProxyState, host: &str, port: u16) -> Option<std::net
             return resolver(host, port);
         }
     }
+    let _ = state;
+    resolve_socket_addr(host, port)
+}
+
+/// Resolve `host:port` to a single socket address via the system resolver.
+///
+/// This is the real DNS path the live proxy uses ([`resolve_locally`], modulo
+/// the test-injected resolver) and the exact resolver `cplt check net` reuses so
+/// the diagnostic's post-DNS SSRF guard sees the same address the live proxy
+/// would resolve — never duplicating resolution logic.
+#[must_use]
+pub fn resolve_socket_addr(host: &str, port: u16) -> Option<std::net::SocketAddr> {
     let addr_str = format!("{host}:{port}");
     addr_str.to_socket_addrs().ok().and_then(|mut a| a.next())
 }
@@ -925,6 +946,12 @@ pub struct NetPolicy {
     pub blocked_domains: Vec<String>,
     pub allow_localhost_ports: Vec<u16>,
     pub allow_localhost_any: bool,
+    /// Hosts explicitly trusted to resolve to private IPs
+    /// (`allow_private_domains`). Consulted by the post-DNS resolved-IP guard
+    /// (`resolved_ip_is_blocked`), not by the pre-DNS [`classify_connect`] gates.
+    /// Mirrors `ProxyState::get_private_domains` so `cplt check net` applies the
+    /// same waiver the live proxy does.
+    pub private_domains: Vec<String>,
 }
 
 /// Classify a CONNECT target against the static (pre-DNS) proxy policy gates.
@@ -1829,6 +1856,7 @@ mod tests {
             blocked_domains: blocked.iter().map(|s| (*s).to_string()).collect(),
             allow_localhost_ports: Vec::new(),
             allow_localhost_any: false,
+            ..Default::default()
         }
     }
 
@@ -1879,6 +1907,46 @@ mod tests {
             classify_connect(&policy, "localhost", 3000),
             NetVerdict::Allowed
         );
+    }
+
+    #[test]
+    fn check_allowlist_parser_matches_live_enforcement() {
+        // FIX 1: `cplt check` must build its allowlist through the SAME parser the
+        // live cache uses (`parse_lines_file`), not `parse_domain_file`. A
+        // non-canonical entry like `github.com:443` is a divergence point:
+        //   - `parse_lines_file` (live + check now)  → stores "github.com:443"
+        //   - `parse_domain_file` (check, the bug)   → strips port to "github.com"
+        // With the port-stripping parser, check reported ALLOWED for `github.com`
+        // while the live proxy (matching the verbatim "github.com:443") returns
+        // BLOCKED-ALLOWLIST — a dangerous false ALLOWED. Prove the two parsers
+        // diverge and that the shared `parse_lines_file` path now agrees with live.
+        let dir = test_dir("allowlist-parity");
+        let path = dir.join("allowed_domains.txt");
+        std::fs::write(&path, "github.com:443\n").unwrap();
+
+        // The parser the live allowlist cache feeds (and now `build_net_policy`).
+        let live_list = parse_lines_file(&path).unwrap();
+        assert_eq!(live_list, vec!["github.com:443"]);
+        // The over-normalizing parser the check path used to use.
+        let stripped_list = parse_domain_file(&path).unwrap();
+        assert_eq!(stripped_list, vec!["github.com"]);
+
+        // Same host, same gate logic — the verdict now agrees with live: BLOCKED.
+        let live_policy = np(&["github.com:443"], &[], &[443]);
+        assert_eq!(
+            classify_connect(&live_policy, "github.com", 443),
+            NetVerdict::BlockedAllowlist,
+            "the live/check-parity allowlist blocks a host it does not verbatim match"
+        );
+        // The old stripped list would have wrongly reported ALLOWED — the bug.
+        let stripped_policy = np(&["github.com"], &[], &[443]);
+        assert_eq!(
+            classify_connect(&stripped_policy, "github.com", 443),
+            NetVerdict::Allowed,
+            "the over-normalized allowlist produced the false ALLOWED this fix removes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
