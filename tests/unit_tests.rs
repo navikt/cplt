@@ -2464,6 +2464,11 @@ fn profile_denies_exec_from_tmp() {
         !p.contains(".java_pid"),
         "Default profile must NOT contain .java_pid socket rules — JVM attach is opt-in"
     );
+    // Must NOT contain MSBuild build server socket rules by default (opt-in via --allow-msbuild)
+    assert!(
+        !p.contains("MSBuild"),
+        "Default profile must NOT contain MSBuild socket rules — MSBuild is opt-in"
+    );
 }
 
 #[test]
@@ -2544,6 +2549,74 @@ fn profile_allows_jvm_attach_when_flag_set() {
     assert!(
         !p.contains("unix-socket (subpath \"/private/tmp\")"),
         "Profile must NOT have broad subpath unix-socket rule — exposes SSH_AUTH_SOCK"
+    );
+}
+
+#[test]
+fn profile_allows_msbuild_when_flag_set() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: true,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+    // Must allow unix socket bind+inbound+connect for the MSBuild build server (MSBuild<pid>)
+    // Three operations needed: bind (server creates socket), inbound (server accepts),
+    // outbound (client connects).
+    assert!(
+        p.contains(
+            r#"(allow network-bind (local unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#
+        ),
+        "Profile must allow unix socket bind for MSBuild build server"
+    );
+    assert!(
+        p.contains(
+            r#"(allow network-inbound (local unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#
+        ),
+        "Profile must allow unix socket inbound for MSBuild build server"
+    );
+    assert!(
+        p.contains(
+            r#"(allow network-outbound (remote unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#
+        ),
+        "Profile must allow unix socket connect for MSBuild build server"
+    );
+    // Must NOT have broad subpath unix socket rules (would expose SSH agent)
+    assert!(
+        !p.contains("unix-socket (subpath \"/private/tmp\")"),
+        "Profile must NOT have broad subpath unix-socket rule — exposes SSH_AUTH_SOCK"
+    );
+    // Must NOT enable JVM attach as a side effect
+    assert!(
+        !p.contains(".java_pid"),
+        "allow_msbuild must NOT also enable JVM Attach API socket rules"
     );
 }
 
@@ -5931,6 +6004,7 @@ fn repo_key_target_maps_sandbox_booleans_to_propose() {
 
     let propose_keys = [
         "sandbox.allow_jvm_attach",
+        "sandbox.allow_msbuild",
         "sandbox.allow_localhost_any",
         "sandbox.allow_docker",
         "sandbox.allow_tmp_exec",
@@ -6983,6 +7057,7 @@ use_bubblewrap = false
 quiet = false
 yes = false
 allow_jvm_attach = false
+allow_msbuild = false
 allow_docker = false
 allow_cache_exec = []
 allow_cache_exec_any = false
