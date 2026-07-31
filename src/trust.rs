@@ -292,6 +292,7 @@ pub fn proposal_content_hash(propose: &crate::repo_config::ProposeSection) -> St
         ("allow_jvm_attach", propose.allow_jvm_attach),
         ("allow_lifecycle_scripts", propose.allow_lifecycle_scripts),
         ("allow_localhost_any", propose.allow_localhost_any),
+        ("allow_msbuild", propose.allow_msbuild),
         ("allow_tmp_exec", propose.allow_tmp_exec),
     ];
     for (name, val) in bools {

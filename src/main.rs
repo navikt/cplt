@@ -360,6 +360,14 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
     #[arg(long)]
     allow_jvm_attach: bool,
 
+    /// Allow MSBuild build server unix sockets in /tmp.
+    /// Needed for `dotnet build`/MSBuild server mode, which keeps a
+    /// long-lived compiler process communicating over a Unix domain socket.
+    /// Only allows sockets matching /tmp/MSBuild<PID> — SSH agent and
+    /// all other unix sockets remain blocked.
+    #[arg(long)]
+    allow_msbuild: bool,
+
     /// Allow Docker/Colima/OrbStack access inside the sandbox (DANGEROUS).
     #[arg(
         long,
@@ -1267,6 +1275,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         allow_gpg_signing: cli.allow_gpg_signing,
         deny_clipboard: cli.deny_clipboard,
         allow_jvm_attach: cli.allow_jvm_attach,
+        allow_msbuild: cli.allow_msbuild,
         allow_docker: config::FeatureToggle::from_pair(cli.allow_docker, cli.no_allow_docker),
         allow_tmp_exec: config::FeatureToggle::from_pair(cli.allow_tmp_exec, cli.no_allow_tmp_exec),
         allow_cache_exec: cli.allow_cache_exec.clone(),
@@ -2329,6 +2338,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
+        allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
         electron_app_dir: electron_app_dir.as_deref(),
         agent: active_agent,
@@ -2807,6 +2817,7 @@ fn prepare_shell_sandbox(
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
+        allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
         electron_app_dir: None,
         agent: active_agent,
@@ -4074,6 +4085,7 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
         let bools: &[(&str, Option<bool>)] = &[
             ("allow_localhost_any", rc.propose.allow_localhost_any),
             ("allow_jvm_attach", rc.propose.allow_jvm_attach),
+            ("allow_msbuild", rc.propose.allow_msbuild),
             ("allow_docker", rc.propose.allow_docker),
             ("allow_tmp_exec", rc.propose.allow_tmp_exec),
             ("allow_gpg_signing", rc.propose.allow_gpg_signing),

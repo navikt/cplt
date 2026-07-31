@@ -176,6 +176,14 @@ pub fn default_config_contents() -> String {
 # Enable this if you work with Kotlin/Java projects that use inline mocking.
 # allow_jvm_attach = false
 #
+# Allow MSBuild build server unix sockets in /tmp.
+# Needed for `dotnet build`/MSBuild server mode, which keeps a long-lived
+# compiler process communicating over a Unix domain socket.
+# Only allows sockets matching /tmp/MSBuild<PID> — SSH agent and
+# all other unix sockets in /tmp remain blocked.
+# Enable this if you work with .NET/MSBuild projects.
+# allow_msbuild = false
+#
 # DANGEROUS: Allow Docker/Colima/OrbStack access inside the sandbox.
 # Exposes ~/.docker config (read-only) and Docker daemon unix sockets.
 # WARNING: Docker container volumes can mount any host path, completely

@@ -122,6 +122,8 @@ pub struct SandboxConfig<'a> {
     pub deny_clipboard: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
+    /// Allow MSBuild build server unix sockets in /tmp (MSBuild<pid> pattern only).
+    pub allow_msbuild: bool,
     /// Allow Docker/Colima/OrbStack access (daemon socket + ~/.docker read).
     pub allow_docker: bool,
     /// Electron app bundle Contents directory (macOS only, ignored on Linux).
@@ -280,6 +282,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         allow_gpg_signing: config.allow_gpg_signing,
         deny_clipboard: config.deny_clipboard,
         allow_jvm_attach: config.allow_jvm_attach,
+        allow_msbuild: config.allow_msbuild,
         allow_docker: config.allow_docker,
         electron_app_dir: config.electron_app_dir,
         agent: config.agent,

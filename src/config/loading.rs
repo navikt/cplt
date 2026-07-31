@@ -397,6 +397,13 @@ impl Config {
             self.sandbox.allow_jvm_attach.unwrap_or(false)
         };
 
+        // Allow-msbuild: CLI flag wins, then config, then false (blocked by default)
+        let allow_msbuild = if cli.allow_msbuild {
+            true
+        } else {
+            self.sandbox.allow_msbuild.unwrap_or(false)
+        };
+
         // Allow-docker: explicit CLI flag wins, then explicit config value,
         // then the preset baseline (false when no preset — blocked).
         let allow_docker = cli
@@ -575,6 +582,7 @@ impl Config {
             allow_gpg_signing,
             deny_clipboard,
             allow_jvm_attach,
+            allow_msbuild,
             allow_docker,
             allow_tmp_exec,
             allow_cache_exec,
@@ -772,6 +780,11 @@ impl Resolved {
         if self.allow_jvm_attach {
             eprintln!(
                 "{blue}[cplt]{nc}    JVM attach:    {yellow}allowed{nc}     {dim}.java_pid* sockets (--allow-jvm-attach){nc}"
+            );
+        }
+        if self.allow_msbuild {
+            eprintln!(
+                "{blue}[cplt]{nc}    MSBuild:       {yellow}allowed{nc}     {dim}MSBuild<pid> sockets (--allow-msbuild){nc}"
             );
         }
         if self.allow_browser {
@@ -1018,6 +1031,9 @@ impl Resolved {
         }
         if repo_config.propose.allow_jvm_attach == Some(true) && is_approved("allow_jvm_attach") {
             self.allow_jvm_attach = true;
+        }
+        if repo_config.propose.allow_msbuild == Some(true) && is_approved("allow_msbuild") {
+            self.allow_msbuild = true;
         }
         if repo_config.propose.allow_docker == Some(true) && is_approved("allow_docker") {
             self.allow_docker = true;

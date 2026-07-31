@@ -86,6 +86,8 @@ pub struct ProfileOptions<'a> {
     pub deny_clipboard: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
+    /// Allow MSBuild build server unix sockets in /tmp (MSBuild<pid> pattern only).
+    pub allow_msbuild: bool,
     /// Allow Docker/Colima/OrbStack daemon socket and ~/.docker read access.
     pub allow_docker: bool,
     /// Electron app bundle Contents directory (e.g., VS Code .app/Contents).
@@ -165,6 +167,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         &mut sb,
         opts.allow_tmp_exec,
         opts.allow_jvm_attach,
+        opts.allow_msbuild,
         opts.scratch_dir,
         allow_chromium_runtime,
     );
@@ -822,6 +825,7 @@ fn emit_temp_rules(
     sb: &mut String,
     allow_tmp_exec: bool,
     allow_jvm_attach: bool,
+    allow_msbuild: bool,
     scratch_dir: Option<&Path>,
     allow_chromium_runtime: bool,
 ) {
@@ -884,6 +888,29 @@ fn emit_temp_rules(
             r#"(allow network-bind (local unix-socket (regex #"^/private/var/folders/.+/T/\.java_pid")))"#,
             r#"(allow network-inbound (local unix-socket (regex #"^/private/var/folders/.+/T/\.java_pid")))"#,
             r#"(allow network-outbound (remote unix-socket (regex #"^/private/var/folders/.+/T/\.java_pid")))"#,
+        ] {
+            sbpl!(sb, "{op}");
+        }
+    }
+    if allow_msbuild {
+        // Allow Unix domain socket operations for the MSBuild/dotnet build server.
+        //
+        // `dotnet build` (VBCSCompiler / MSBuild server mode) creates a Unix
+        // domain socket at /private/tmp/MSBuild<pid> for IPC between the
+        // build client and a long-lived compiler server process.
+        //
+        // All three socket operations are required (same pattern as JVM attach):
+        //   - network-bind:    the server creates the socket
+        //   - network-inbound: the server accepts client connections
+        //   - network-outbound: the client connects to the socket
+        //
+        // SECURITY: regex is anchored with ^ and $ to the exact MSBuild<pid>
+        // filename directly under /private/tmp — this does not grant broad
+        // /private/tmp socket access (SSH_AUTH_SOCK etc. remain unaffected).
+        for op in &[
+            r#"(allow network-bind (local unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#,
+            r#"(allow network-inbound (local unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#,
+            r#"(allow network-outbound (remote unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#,
         ] {
             sbpl!(sb, "{op}");
         }
@@ -1387,6 +1414,7 @@ mod tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,
+            allow_msbuild: false,
             allow_docker: false,
             electron_app_dir: None,
             agent: crate::agent::Agent::Copilot,

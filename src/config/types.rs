@@ -592,6 +592,12 @@ pub struct SandboxConfig {
     /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
     /// all other unix sockets remain blocked.
     pub allow_jvm_attach: Option<bool>,
+    /// Allow MSBuild build server unix sockets in /tmp (default: false).
+    /// Needed for `dotnet build`/MSBuild server mode, which keeps a
+    /// long-lived compiler process communicating over a Unix domain socket.
+    /// Only allows sockets matching /tmp/MSBuild<PID> — SSH agent and
+    /// all other unix sockets remain blocked.
+    pub allow_msbuild: Option<bool>,
     /// Allow Docker/Colima/OrbStack access inside the sandbox (default: false).
     /// DANGEROUS: Docker can mount any host path via container volumes, completely
     /// bypassing sandbox filesystem restrictions. Only enable if you trust the
@@ -749,6 +755,7 @@ pub struct Resolved {
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
+    pub allow_msbuild: bool,
     pub allow_docker: bool,
     pub allow_tmp_exec: bool,
     pub allow_cache_exec: Vec<String>,
@@ -819,6 +826,7 @@ pub struct CliFlags {
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
+    pub allow_msbuild: bool,
     /// Preset-controlled toggle (see `allow_localhost_any`).
     pub allow_docker: FeatureToggle,
     /// Preset-controlled toggle (see `allow_localhost_any`).

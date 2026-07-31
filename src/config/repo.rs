@@ -27,6 +27,7 @@ pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
         // Propose booleans
         ("sandbox", "allow_localhost_any") => Some(RepoKeyTarget::ProposeBool),
         ("sandbox", "allow_jvm_attach") => Some(RepoKeyTarget::ProposeBool),
+        ("sandbox", "allow_msbuild") => Some(RepoKeyTarget::ProposeBool),
         ("sandbox", "allow_docker") => Some(RepoKeyTarget::ProposeBool),
         ("sandbox", "allow_tmp_exec") => Some(RepoKeyTarget::ProposeBool),
         ("sandbox", "allow_gpg_signing") => Some(RepoKeyTarget::ProposeBool),

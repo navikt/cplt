@@ -410,6 +410,7 @@ mod macos_tests {
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,
+            allow_msbuild: false,
             allow_docker: false,
             electron_app_dir: None,
             agent: cplt::agent::Agent::Copilot,

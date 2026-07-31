@@ -50,6 +50,7 @@ pub struct DenySection {
 pub struct ProposeSection {
     pub allow_localhost_any: Option<bool>,
     pub allow_jvm_attach: Option<bool>,
+    pub allow_msbuild: Option<bool>,
     pub allow_docker: Option<bool>,
     pub allow_tmp_exec: Option<bool>,
     pub allow_gpg_signing: Option<bool>,
@@ -256,6 +257,9 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     }
     if propose.allow_jvm_attach == Some(true) {
         keys.push("allow_jvm_attach");
+    }
+    if propose.allow_msbuild == Some(true) {
+        keys.push("allow_msbuild");
     }
     if propose.allow_docker == Some(true) {
         keys.push("allow_docker");
