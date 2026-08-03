@@ -1619,37 +1619,43 @@ fn gate_with_scope_resolver(
 
     let result = evaluate_with_policy(&cmd, policy.allow_api_write);
 
+    if policy.scope_check {
+        if cmd.command == "api"
+            && let Some(endpoint) = cmd.api_endpoint.as_deref()
+            && github_api_endpoint_path(endpoint).is_err()
+        {
+            return Err(
+                "⚠️ BLOCKED by sandbox: 'gh api' targets an endpoint outside \
+                 'https://api.github.com'.\n\
+                 This operation is restricted by the cplt sandbox environment.\n\
+                 Please make a note of this for the human operator and continue with your remaining work."
+                    .to_string(),
+            );
+        }
+
+        if let Some(hostname) = requested_hostname(args)
+            && hostname != "github.com"
+        {
+            return Err(format!(
+                "⚠️ BLOCKED by sandbox: 'gh {} {}' targets GitHub host '{hostname}', \
+                 outside the approved host 'github.com'.\n\
+                 This operation is restricted by the cplt sandbox environment.\n\
+                 Please make a note of this for the human operator and continue with your remaining work.",
+                cmd.command,
+                cmd.subcommand.as_deref().unwrap_or("")
+            ));
+        }
+    }
+
     match result.decision {
-        Decision::Allow => Ok(GateApproval::default()),
+        Decision::Allow => Ok(if policy.scope_check {
+            approval_from_scope(resolve_scope().ok())
+        } else {
+            GateApproval::default()
+        }),
         Decision::ScopeCheck => {
             if !policy.scope_check {
                 return Ok(GateApproval::default());
-            }
-
-            if cmd.command == "api"
-                && let Some(endpoint) = cmd.api_endpoint.as_deref()
-                && github_api_endpoint_path(endpoint).is_err()
-            {
-                return Err(
-                    "⚠️ BLOCKED by sandbox: 'gh api' targets an endpoint outside \
-                     'https://api.github.com'.\n\
-                     This operation is restricted by the cplt sandbox environment.\n\
-                     Please make a note of this for the human operator and continue with your remaining work."
-                        .to_string(),
-                );
-            }
-
-            if let Some(hostname) = requested_hostname(args)
-                && hostname != "github.com"
-            {
-                return Err(format!(
-                    "⚠️ BLOCKED by sandbox: 'gh {} {}' targets GitHub host '{hostname}', \
-                     outside the approved host 'github.com'.\n\
-                     This operation is restricted by the cplt sandbox environment.\n\
-                     Please make a note of this for the human operator and continue with your remaining work.",
-                    cmd.command,
-                    cmd.subcommand.as_deref().unwrap_or("")
-                ));
             }
 
             let current_repo = resolve_scope().map_err(|reason| {
@@ -1701,7 +1707,11 @@ fn gate_with_scope_resolver(
             result.reason,
         )),
         Decision::Unknown => match policy.unknown_command {
-            UnknownCommandDecision::Allow => Ok(GateApproval::default()),
+            UnknownCommandDecision::Allow => Ok(if policy.scope_check {
+                approval_from_scope(resolve_scope().ok())
+            } else {
+                GateApproval::default()
+            }),
             UnknownCommandDecision::Block => Err(format!(
                 "⚠️ BLOCKED by sandbox: 'gh {}{}' is not recognized by the policy table.\n\
                      This command may have been added in a newer gh CLI version.\n\
@@ -1714,6 +1724,12 @@ fn gate_with_scope_resolver(
                     .unwrap_or_default(),
             )),
         },
+    }
+}
+
+fn approval_from_scope(repo_scope: Option<String>) -> GateApproval {
+    GateApproval {
+        repo_scope: repo_scope.map(|repo| format!("github.com/{repo}")),
     }
 }
 

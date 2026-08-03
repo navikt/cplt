@@ -444,7 +444,9 @@ mod macos_tests {
         let opts = default_opts(&project, home.path());
         let profile = write_real_profile(&opts);
         let cmd = format!(
-            "HOME='{}' GIT_CONFIG_NOSYSTEM=1 git config --global user.name 2>&1",
+            "HOME='{}' GIT_CONFIG_GLOBAL='{}/.gitconfig' GIT_CONFIG_NOSYSTEM=1 \
+             git config --global user.name 2>&1",
+            home.path().display(),
             home.path().display()
         );
         let (output, success) = run_sandboxed(&profile, &cmd);

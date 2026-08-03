@@ -480,6 +480,39 @@ fn gh_gate_pins_verified_repo_in_gh_repo() {
 }
 
 #[test]
+fn gh_gate_pins_verified_repo_for_allow_command() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf '%s|%s\\n' \"$GH_REPO\" \"${GH_HOST-}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&fake_gh)
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["repo", "view"])
+        .env("GH_REPO", "evil-org/other")
+        .env("GH_HOST", "evil.example")
+        .output()
+        .expect("cplt gh-gate should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "github.com/navikt/cplt|"
+    );
+}
+
+#[test]
 fn gh_gate_blocks_conflicting_hostname_flag() {
     let (_, stderr, ok) = gh_gate(&[
         "api",
@@ -488,6 +521,13 @@ fn gh_gate_blocks_conflicting_hostname_flag() {
         "/repos/navikt/cplt/pulls",
     ]);
     assert!(!ok, "conflicting GitHub host must be blocked");
+    assert!(stderr.contains("outside the approved host"), "{stderr}");
+}
+
+#[test]
+fn gh_gate_blocks_conflicting_hostname_for_allow_command() {
+    let (_, stderr, ok) = gh_gate(&["--hostname", "evil.example", "repo", "view"]);
+    assert!(!ok, "allow command must not retarget the GitHub host");
     assert!(stderr.contains("outside the approved host"), "{stderr}");
 }
 
