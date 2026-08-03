@@ -4,8 +4,9 @@
 //! deliberately does not run inside a sandbox: a sandboxed agent must never be
 //! able to alter the user's policy or repository trust decisions.
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -22,11 +23,12 @@ use ratatui::{
 };
 
 use crate::config::{
-    self, ConfigKeyInfo, ConfigValueType, RepoKeyTarget, all_config_keys, append_value_in_doc,
-    get_value_from_doc, repo_key_target, security_confirmation, set_repo_value_in_doc,
-    set_value_in_doc, unset_value_in_doc, write_document_atomically,
+    self, ConfigKeyInfo, ConfigValueType, RepoKeyTarget, Resolved, all_config_keys,
+    append_value_in_doc, get_value_from_doc, repo_key_target, security_confirmation,
+    set_repo_value_in_doc, set_value_in_doc, unset_value_in_doc, validate_global_document,
+    write_document_atomically, write_repo_document_atomically,
 };
-use crate::repo_config;
+use crate::{repo_config, trust};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scope {
@@ -54,6 +56,12 @@ struct PendingChange {
     value: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct EffectiveSetting {
+    value: String,
+    source: &'static str,
+}
+
 struct SettingsApp {
     scope: Scope,
     selected: usize,
@@ -67,6 +75,8 @@ struct SettingsApp {
     global_path: PathBuf,
     repo_doc: toml_edit::DocumentMut,
     repo_path: PathBuf,
+    project_dir: PathBuf,
+    effective: HashMap<(&'static str, &'static str), EffectiveSetting>,
     dangerous_confirmation: Option<String>,
 }
 
@@ -79,6 +89,7 @@ impl SettingsApp {
             .ok_or("cannot determine project directory")?;
         let repo_path = project_dir.join(repo_config::REPO_CONFIG_FILE);
         let repo_doc = load_doc(&repo_path)?;
+        let effective = effective_snapshot(&global_doc, &project_dir)?;
         Ok(Self {
             scope: Scope::Effective,
             selected: 0,
@@ -93,6 +104,8 @@ impl SettingsApp {
             global_path,
             repo_doc,
             repo_path,
+            project_dir,
+            effective,
             dangerous_confirmation: None,
         })
     }
@@ -135,13 +148,37 @@ impl SettingsApp {
                 && change.key.key == key.key
                 && change.scope == self.scope)
         });
-        self.pending.push(PendingChange {
-            key,
-            scope: self.scope,
-            value,
-        });
+        let is_original = match self.scope {
+            Scope::Global => match value.as_deref() {
+                Some(value) if !key.value_type.is_array() => {
+                    get_value_from_doc(&self.global_doc, key)
+                        .unwrap_or_else(|| key.default_display.to_string())
+                        == value
+                }
+                None => get_value_from_doc(&self.global_doc, key).is_none(),
+                _ => false,
+            },
+            Scope::Repository => match value.as_deref() {
+                Some("true")
+                    if matches!(repo_key_target(key), Some(RepoKeyTarget::ProposeBool)) =>
+                {
+                    repo_proposal_enabled(&self.repo_doc, key)
+                }
+                None => repo_value_is_unset(&self.repo_doc, key),
+                _ => false,
+            },
+            Scope::Effective => true,
+        };
+        if !is_original {
+            self.pending.push(PendingChange {
+                key,
+                scope: self.scope,
+                value,
+            });
+        }
         self.status = format!(
-            "Staged {}.{} for {}. Ctrl+S saves {} change(s).",
+            "{} {}.{} for {}. Ctrl+S saves {} change(s).",
+            if is_original { "Reverted" } else { "Staged" },
             key.section,
             key.key,
             self.scope.label().to_ascii_lowercase(),
@@ -168,13 +205,15 @@ impl SettingsApp {
                 self.status = "Repository deny and list values are edited with Enter.".to_string();
                 return;
             };
-            if repo_proposal_enabled(&self.repo_doc, key) {
+            let preview = self.preview_repo_doc();
+            if repo_proposal_enabled(&preview, key) {
                 self.stage(key, None);
             } else {
                 self.stage(key, Some("true".to_string()));
             }
         } else {
-            let value = get_value_from_doc(&self.global_doc, key)
+            let preview = self.preview_global_doc();
+            let value = get_value_from_doc(&preview, key)
                 .unwrap_or_else(|| key.default_display.to_string());
             self.stage(
                 key,
@@ -199,16 +238,24 @@ impl SettingsApp {
             );
             return;
         }
-        self.value_input = if self.scope == Scope::Global && !key.value_type.is_array() {
-            get_value_from_doc(&self.global_doc, key).unwrap_or_default()
+        self.value_input = if is_sensitive(key) {
+            self.status = format!(
+                "Current {}.{} credentials are hidden. Enter a replacement; Esc cancels.",
+                key.section, key.key
+            );
+            String::new()
+        } else if self.scope == Scope::Global && !key.value_type.is_array() {
+            get_value_from_doc(&self.preview_global_doc(), key).unwrap_or_default()
         } else {
             String::new()
         };
         self.editing_value = true;
-        self.status = format!(
-            "Enter a value for {}.{}; Enter stages it, Esc cancels.",
-            key.section, key.key
-        );
+        if !is_sensitive(key) {
+            self.status = format!(
+                "Enter a value for {}.{}; Enter stages it, Esc cancels.",
+                key.section, key.key
+            );
+        }
     }
 
     fn submit_value(&mut self) {
@@ -283,18 +330,48 @@ impl SettingsApp {
                 .map_err(|error| format!("refusing to write invalid .cplt.toml: {error}"))?;
         }
         if write_global {
+            validate_global_document(&global)
+                .map_err(|error| format!("refusing to write invalid global config: {error}"))?;
+        }
+        if write_global {
             write_document_atomically(&self.global_path, &global)
                 .map_err(|error| error.to_string())?;
             self.global_doc = global;
         }
         if write_repo {
-            write_document_atomically(&self.repo_path, &repo).map_err(|error| error.to_string())?;
+            write_repo_document_atomically(&self.repo_path, &repo)
+                .map_err(|error| error.to_string())?;
             self.repo_doc = repo;
         }
+        self.effective = effective_snapshot(&self.global_doc, &self.project_dir)?;
         let count = self.pending.len();
         self.pending.clear();
         self.status = format!("Saved {count} change(s) atomically.");
         Ok(())
+    }
+
+    fn preview_global_doc(&self) -> toml_edit::DocumentMut {
+        let mut doc = self.global_doc.clone();
+        for change in self
+            .pending
+            .iter()
+            .filter(|change| change.scope == Scope::Global)
+        {
+            let _ = apply_global_change(&mut doc, change);
+        }
+        doc
+    }
+
+    fn preview_repo_doc(&self) -> toml_edit::DocumentMut {
+        let mut doc = self.repo_doc.clone();
+        for change in self
+            .pending
+            .iter()
+            .filter(|change| change.scope == Scope::Repository)
+        {
+            let _ = apply_repo_change(&mut doc, change);
+        }
+        doc
     }
 }
 
@@ -344,12 +421,230 @@ fn load_doc(path: &std::path::Path) -> Result<toml_edit::DocumentMut, String> {
         .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))
 }
 
+fn effective_snapshot(
+    global_doc: &toml_edit::DocumentMut,
+    project_dir: &Path,
+) -> Result<HashMap<(&'static str, &'static str), EffectiveSetting>, String> {
+    let config =
+        config::Config::parse(&global_doc.to_string()).map_err(|error| error.to_string())?;
+    let mut base = config
+        .merge_with_no_proxy_env(config::CliFlags::default(), None)
+        .map_err(|error| error.to_string())?;
+    let _ = base.reconcile_proxy_forced();
+    let base_values = resolved_values(&base, global_doc);
+
+    let mut effective = config
+        .merge_with_no_proxy_env(config::CliFlags::default(), None)
+        .map_err(|error| error.to_string())?;
+    if let Ok(Some(loaded)) = repo_config::load_repo_config(project_dir) {
+        let approved = approved_repo_keys(project_dir, &loaded.config);
+        let approved_refs: Vec<&str> = approved.iter().map(String::as_str).collect();
+        effective.apply_repo_config(&loaded.config, &approved_refs);
+    }
+    let _ = effective.reconcile_proxy_forced();
+    let effective_values = resolved_values(&effective, global_doc);
+
+    Ok(all_config_keys()
+        .iter()
+        .map(|key| {
+            let id = (key.section, key.key);
+            let value = effective_values
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| key.default_display.to_string());
+            let source = if base_values.get(&id) != Some(&value) {
+                "repository"
+            } else if get_value_from_doc(global_doc, key).is_some() {
+                "global"
+            } else if value != key.default_display {
+                "preset"
+            } else {
+                "default"
+            };
+            (id, EffectiveSetting { value, source })
+        })
+        .collect())
+}
+
+fn approved_repo_keys(project_dir: &Path, repo: &repo_config::RepoConfig) -> Vec<String> {
+    let Some(entry) = trust::load_trust(project_dir) else {
+        return Vec::new();
+    };
+    let current_hash = trust::proposal_content_hash(&repo.propose);
+    if !trust::approved_path_matches(&entry, project_dir)
+        || trust::approval_is_stale(&entry.accepted.content_hash, &current_hash)
+    {
+        return Vec::new();
+    }
+    entry.accepted.keys
+}
+
+fn resolved_values(
+    resolved: &Resolved,
+    global_doc: &toml_edit::DocumentMut,
+) -> HashMap<(&'static str, &'static str), String> {
+    all_config_keys()
+        .iter()
+        .map(|key| {
+            let fallback = || {
+                get_value_from_doc(global_doc, key)
+                    .unwrap_or_else(|| key.default_display.to_string())
+            };
+            let value = match (key.section, key.key) {
+                ("proxy", "enabled") => resolved.with_proxy.to_string(),
+                ("proxy", "forced") => resolved.proxy_forced.to_string(),
+                ("proxy", "port") => resolved.proxy_port.to_string(),
+                ("proxy", "blocked_domains") => {
+                    format_optional_path(resolved.blocked_domains.as_ref())
+                }
+                ("proxy", "allowed_domains") => {
+                    format_optional_path(resolved.allowed_domains.as_ref())
+                }
+                ("proxy", "default_allowlist") => resolved.default_allowlist.to_string(),
+                ("proxy", "log_file") => format_optional_path(resolved.proxy_log_file.as_ref()),
+                ("proxy", "log_level") => resolved.proxy_log_level.as_str().to_string(),
+                ("proxy", "timeout") => resolved.proxy_timeout.as_secs().to_string(),
+                ("proxy", "upstream_no_proxy") => format_strings(&resolved.proxy_upstream_no_proxy),
+                ("proxy", "allow_private_domains") => {
+                    format_strings(&resolved.allow_private_domains)
+                }
+                ("allow", "read") => format_paths(&resolved.allow_read),
+                ("allow", "write") => format_paths(&resolved.allow_write),
+                ("allow", "socket") => format_paths(&resolved.allow_socket),
+                ("allow", "ports") => format_values(&resolved.allow_ports),
+                ("allow", "localhost") => format_values(&resolved.allow_localhost),
+                ("deny", "paths") => format_paths(&resolved.deny_paths),
+                ("deny", "env") => format_strings(&resolved.deny_env),
+                ("sandbox", "agent") => resolved.agent.clone().unwrap_or_default(),
+                ("sandbox", "preset") => resolved
+                    .preset
+                    .map_or_else(|| "standard".to_string(), |preset| preset.to_string()),
+                ("sandbox", "validate") => (!resolved.no_validate).to_string(),
+                ("sandbox", "allow_env_files") => resolved.allow_env_files.to_string(),
+                ("sandbox", "allow_localhost_any") => resolved.allow_localhost_any.to_string(),
+                ("sandbox", "pass_env") => format_strings(&resolved.pass_env),
+                ("sandbox", "inherit_env") => resolved.inherit_env.to_string(),
+                ("sandbox", "allow_lifecycle_scripts") => {
+                    resolved.allow_lifecycle_scripts.to_string()
+                }
+                ("sandbox", "allow_gpg_signing") => resolved.allow_gpg_signing.to_string(),
+                ("sandbox", "allow_tmp_exec") => resolved.allow_tmp_exec.to_string(),
+                ("sandbox", "scratch_dir") => resolved.scratch_dir.to_string(),
+                ("sandbox", "audit") => resolved.audit.to_string(),
+                ("sandbox", "use_bubblewrap") => resolved
+                    .use_bubblewrap
+                    .map_or_else(|| "auto-detect".to_string(), |value| value.to_string()),
+                ("sandbox", "quiet") => resolved.quiet.to_string(),
+                ("sandbox", "yes") => resolved.yes.to_string(),
+                ("sandbox", "allow_jvm_attach") => resolved.allow_jvm_attach.to_string(),
+                ("sandbox", "allow_docker") => resolved.allow_docker.to_string(),
+                ("sandbox", "allow_cache_exec") => format_strings(&resolved.allow_cache_exec),
+                ("sandbox", "allow_cache_exec_any") => resolved.allow_cache_exec_any.to_string(),
+                ("sandbox", "allow_browser") => resolved.allow_browser.to_string(),
+                ("sandbox", "gh_proxy") => resolved.gh_guard.enabled.to_string(),
+                ("sandbox", "git_push_prevention") => resolved.git_guard.enabled.to_string(),
+                ("gh_guard", "enabled") => resolved.gh_guard.enabled.to_string(),
+                ("gh_guard", "mode") => resolved.gh_guard.mode.to_string(),
+                ("gh_guard", "scope_check") => resolved.gh_guard.scope_check.to_string(),
+                ("gh_guard", "block_auth_token") => resolved.gh_guard.block_auth_token.to_string(),
+                ("gh_guard", "inject_token") => resolved.gh_guard.inject_token.to_string(),
+                ("gh_guard", "unknown_command") => resolved.gh_guard.unknown_command.to_string(),
+                ("gh_guard", "allow_api_write") => resolved.gh_guard.allow_api_write.to_string(),
+                ("git_guard", "enabled") => resolved.git_guard.enabled.to_string(),
+                ("git_guard", "mode") => resolved.git_guard.mode.to_string(),
+                ("git_guard", "prevent_push") => resolved.git_guard.prevent_push.to_string(),
+                ("git_guard", "prevent_force_push") => {
+                    resolved.git_guard.prevent_force_push.to_string()
+                }
+                ("git_guard", "protect_default_branch_only") => {
+                    resolved.git_guard.protect_default_branch_only.to_string()
+                }
+                _ => fallback(),
+            };
+            ((key.section, key.key), value)
+        })
+        .collect()
+}
+
+fn format_optional_path(path: Option<&PathBuf>) -> String {
+    path.map_or_else(String::new, |path| path.display().to_string())
+}
+
+fn format_paths(paths: &[PathBuf]) -> String {
+    format!(
+        "[{}]",
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn format_strings(values: &[String]) -> String {
+    format!("[{}]", values.join(", "))
+}
+
+fn format_values<T: ToString>(values: &[T]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn repo_proposal_enabled(doc: &toml_edit::DocumentMut, key: &ConfigKeyInfo) -> bool {
     doc.get("propose")
         .and_then(toml_edit::Item::as_table)
         .and_then(|table| table.get(key.key))
         .and_then(toml_edit::Item::as_bool)
         == Some(true)
+}
+
+fn repo_value_is_unset(doc: &toml_edit::DocumentMut, key: &ConfigKeyInfo) -> bool {
+    match repo_key_target(key) {
+        Some(RepoKeyTarget::ProposeBool) => !repo_proposal_enabled(doc, key),
+        Some(RepoKeyTarget::ProposeAllow(name)) => nested_repo_value(doc, "propose", "allow", name),
+        Some(RepoKeyTarget::ProposeProxy(name)) => nested_repo_value(doc, "propose", "proxy", name),
+        Some(RepoKeyTarget::Deny(name)) => direct_repo_value(doc, "deny", name),
+        None => true,
+    }
+}
+
+fn nested_repo_value(
+    doc: &toml_edit::DocumentMut,
+    section: &str,
+    subsection: &str,
+    key: &str,
+) -> bool {
+    doc.get(section)
+        .and_then(toml_edit::Item::as_table)
+        .and_then(|table| table.get(subsection))
+        .and_then(toml_edit::Item::as_table)
+        .and_then(|table| table.get(key))
+        .is_none()
+}
+
+fn direct_repo_value(doc: &toml_edit::DocumentMut, section: &str, key: &str) -> bool {
+    doc.get(section)
+        .and_then(toml_edit::Item::as_table)
+        .and_then(|table| table.get(key))
+        .is_none()
+}
+
+fn is_sensitive(key: &ConfigKeyInfo) -> bool {
+    key.section == "proxy" && key.key == "upstream"
+}
+
+fn redact_value(key: &ConfigKeyInfo, value: String) -> String {
+    if is_sensitive(key) {
+        crate::proxy::redact_upstream_url(&value)
+    } else {
+        value
+    }
 }
 
 fn detect_project_root() -> Option<PathBuf> {
@@ -368,8 +663,23 @@ struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        Self::enter_with(
+            enable_raw_mode,
+            || execute!(io::stdout(), EnterAlternateScreen),
+            disable_raw_mode,
+        )
+    }
+
+    fn enter_with(
+        enable: impl FnOnce() -> io::Result<()>,
+        enter_alternate_screen: impl FnOnce() -> io::Result<()>,
+        rollback_raw_mode: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        enable()?;
+        if let Err(error) = enter_alternate_screen() {
+            let _ = rollback_raw_mode();
+            return Err(error);
+        }
         Ok(Self)
     }
 }
@@ -531,20 +841,28 @@ fn render(frame: &mut ratatui::Frame, app: &mut SettingsApp) {
         layout[0],
     );
     let keys = app.visible_keys();
+    let global_preview = app.preview_global_doc();
+    let repo_preview = app.preview_repo_doc();
     let rows = keys.iter().map(|key| {
+        let setting = app.effective.get(&(key.section, key.key));
         let value = match app.scope {
-            Scope::Global | Scope::Effective => get_value_from_doc(&app.global_doc, key)
+            Scope::Effective => setting.map_or_else(
+                || key.default_display.to_string(),
+                |setting| setting.value.clone(),
+            ),
+            Scope::Global => get_value_from_doc(&global_preview, key)
                 .unwrap_or_else(|| key.default_display.to_string()),
-            Scope::Repository => repo_value_label(&app.repo_doc, key),
+            Scope::Repository => repo_value_label(&repo_preview, key),
         };
+        let value = redact_value(key, value);
+        let staged = app.pending.iter().any(|change| {
+            change.scope == app.scope
+                && change.key.section == key.section
+                && change.key.key == key.key
+        });
         let source = match app.scope {
-            Scope::Effective => {
-                if get_value_from_doc(&app.global_doc, key).is_some() {
-                    "global"
-                } else {
-                    "default"
-                }
-            }
+            Scope::Effective => setting.map_or("default", |setting| setting.source),
+            Scope::Global if staged => "staged",
             Scope::Global => {
                 if get_value_from_doc(&app.global_doc, key).is_some() {
                     "set"
@@ -552,6 +870,7 @@ fn render(frame: &mut ratatui::Frame, app: &mut SettingsApp) {
                     "inherited"
                 }
             }
+            Scope::Repository if staged => "staged",
             Scope::Repository => repo_key_target(key).map_or("not supported", |_| "proposal/deny"),
         };
         Row::new(vec![
@@ -682,6 +1001,29 @@ fn centered_rect(
 mod tests {
     use super::*;
     use crate::config::lookup_key;
+    use ratatui::backend::TestBackend;
+    use std::cell::Cell;
+
+    fn test_app(global: &str) -> SettingsApp {
+        let global_doc = global.parse::<toml_edit::DocumentMut>().unwrap();
+        SettingsApp {
+            scope: Scope::Global,
+            selected: 0,
+            filter: String::new(),
+            editing_filter: false,
+            editing_value: false,
+            value_input: String::new(),
+            status: String::new(),
+            pending: Vec::new(),
+            global_doc,
+            global_path: PathBuf::from("config.toml"),
+            repo_doc: toml_edit::DocumentMut::new(),
+            repo_path: PathBuf::from(".cplt.toml"),
+            project_dir: PathBuf::from("."),
+            effective: HashMap::new(),
+            dangerous_confirmation: None,
+        }
+    }
 
     #[test]
     fn global_change_uses_config_editor_semantics() {
@@ -743,8 +1085,110 @@ mod tests {
             global_path: PathBuf::from("config.toml"),
             repo_doc: toml_edit::DocumentMut::new(),
             repo_path: PathBuf::from(".cplt.toml"),
+            project_dir: PathBuf::from("."),
+            effective: HashMap::new(),
             dangerous_confirmation: None,
         };
         assert_eq!(app.dangerous_changes().len(), 1);
+    }
+
+    #[test]
+    fn toggling_twice_reverts_the_staged_change() {
+        let mut app = test_app("");
+        app.selected = app
+            .visible_keys()
+            .iter()
+            .position(|key| key.section == "sandbox" && key.key == "quiet")
+            .unwrap();
+
+        app.toggle_selected();
+        assert_eq!(app.pending.len(), 1);
+        app.toggle_selected();
+
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn effective_snapshot_applies_strict_preset_baseline() {
+        let project = tempfile::tempdir().unwrap();
+        let doc = "[sandbox]\npreset = \"strict\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+
+        let snapshot = effective_snapshot(&doc, project.path()).unwrap();
+
+        assert_eq!(snapshot.get(&("proxy", "forced")).unwrap().value, "true");
+        assert_eq!(
+            snapshot.get(&("gh_guard", "enabled")).unwrap().value,
+            "true"
+        );
+        assert_eq!(
+            snapshot.get(&("git_guard", "enabled")).unwrap().value,
+            "true"
+        );
+        assert_eq!(
+            snapshot.get(&("gh_guard", "enabled")).unwrap().source,
+            "preset"
+        );
+    }
+
+    #[test]
+    fn invalid_global_change_is_rejected_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app("");
+        app.global_path = dir.path().join("config.toml");
+        app.project_dir = dir.path().to_path_buf();
+        app.pending.push(PendingChange {
+            key: lookup_key("sandbox.preset").unwrap(),
+            scope: Scope::Global,
+            value: Some("not-a-preset".to_string()),
+        });
+
+        let error = app.save(true).unwrap_err();
+
+        assert!(error.contains("invalid global config"));
+        assert!(!app.global_path.exists());
+    }
+
+    #[test]
+    fn rendered_settings_redact_upstream_credentials() {
+        let mut app =
+            test_app("[proxy]\nupstream = \"http://username:super-secret@proxy.example:8080\"\n");
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!rendered.contains("super-secret"));
+        assert!(rendered.contains("username:***"));
+    }
+
+    #[test]
+    fn alternate_screen_failure_rolls_back_raw_mode() {
+        let raw_enabled = Cell::new(false);
+        let raw_disabled = Cell::new(false);
+
+        let result = TerminalGuard::enter_with(
+            || {
+                raw_enabled.set(true);
+                Ok(())
+            },
+            || Err(io::Error::other("alternate screen failed")),
+            || {
+                raw_disabled.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(raw_enabled.get());
+        assert!(raw_disabled.get());
     }
 }

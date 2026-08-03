@@ -4431,7 +4431,7 @@ fn run_config_set_repo(
         ));
         return ExitCode::FAILURE;
     }
-    if let Err(e) = config::write_document_atomically(&repo_config_path, &doc) {
+    if let Err(e) = config::write_repo_document_atomically(&repo_config_path, &doc) {
         ui::error(&format!("cannot write {}: {e}", repo_config_path.display()));
         return ExitCode::FAILURE;
     }
