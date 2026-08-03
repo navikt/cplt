@@ -397,7 +397,8 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 (allow file-read/write /private/tmp)    ← Temp file access
 (deny process-exec /private/tmp)        ← But no executing from tmp!
 (allow unix-socket .java_pid*)          ← JVM Attach API only (--allow-jvm-attach, regex-restricted)
-(deny  unix-socket /tmp/*)              ← All other unix sockets blocked (SSH agent, etc.)
+(allow unix-socket MSBuild<pid>)        ← MSBuild worker-node IPC only (--allow-msbuild, regex-restricted)
+(deny  unix-socket /tmp/*)              ← All other unix sockets blocked (SSH agent, MSBuild Server, etc.)
 (deny file-* ~/.ssh, ~/.aws, ...)       ← Sensitive dirs blocked
 (deny network-outbound (remote tcp))    ← Block all outbound TCP by default
 (allow network-outbound *:443)           ← Then allow HTTPS port only (use --allow-port for extras)
@@ -407,7 +408,7 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 ;; Java IPv4-mapped issue solved by -Djava.net.preferIPv4Stack=true in JAVA_TOOL_OPTIONS
 ```
 
-> **Network note:** Outbound TCP is restricted to port 443 by default. SSH agent access (unix sockets) is blocked. JVM Attach API sockets (`/tmp/.java_pid*`) are available via `--allow-jvm-attach` (opt-in, regex-restricted to `.java_pid<PID>` only) — all other unix sockets in `/tmp` remain blocked. Localhost outbound is blocked to prevent SSRF. Use `--allow-port` for additional ports. SBPL does not support domain-based rules — filesystem isolation is the primary security control.
+> **Network note:** Outbound TCP is restricted to port 443 by default. SSH agent access (unix sockets) is blocked. JVM Attach API sockets (`/tmp/.java_pid*`) are available via `--allow-jvm-attach` (opt-in, regex-restricted to `.java_pid<PID>` only) — all other unix sockets in `/tmp` remain blocked. MSBuild worker-node IPC sockets (`/tmp/MSBuild<PID>`) are available via `--allow-msbuild` (opt-in, regex-restricted to `MSBuild<PID>` only); this does NOT allow the persistent MSBuild Server, whose socket is named `MSBuildServer-<hash>` and is never matched by the regex — cplt also unconditionally sets `DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1` so that server is never started or reused, including one started outside the sandbox. Localhost outbound is blocked to prevent SSRF. Use `--allow-port` for additional ports. SBPL does not support domain-based rules — filesystem isolation is the primary security control.
 
 **Key design decision**: Deny rules are placed AFTER allow rules. In Seatbelt's evaluation model with `(deny default)`, more-specific rules override broader ones, and later rules take precedence for equal specificity. This means our deny rules for `~/.ssh` correctly override the broader temp/system allows.
 
@@ -856,7 +857,7 @@ These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-leve
 |---|---|---|
 | File access | 5 | Project read/write, copilot config, temp write, process execution |
 | Sensitive dir blocks | 4 | `~/.ssh`, `~/.aws`, `~/.docker`, `~/.kube` blocked |
-| Network | 6 | Outbound blocked, JVM Attach socket allowed, SSH agent blocked, `/tmp` sockets blocked, localhost TCP bind on all interfaces (SBPL "localhost" doesn't match Java mapped addresses), `--allow-localhost-any` + `--allow-jvm-attach` opens all outbound TCP |
+| Network | 6 | Outbound blocked, JVM Attach socket allowed, MSBuild worker-node socket allowed (persistent MSBuild Server socket stays blocked), SSH agent blocked, `/tmp` sockets blocked, localhost TCP bind on all interfaces (SBPL "localhost" doesn't match Java mapped addresses), `--allow-localhost-any` + `--allow-jvm-attach` opens all outbound TCP |
 | Binary CLI | 4 | Version, help, root/home dir rejection |
 | Tool dir permissions | 15 | Each HOME_TOOL_DIR has correct exec/map-exec/write at kernel level |
 | GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |

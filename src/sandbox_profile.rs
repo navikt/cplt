@@ -86,7 +86,7 @@ pub struct ProfileOptions<'a> {
     pub deny_clipboard: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
-    /// Allow MSBuild build server unix sockets in /tmp (MSBuild<pid> pattern only).
+    /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
     pub allow_msbuild: bool,
     /// Allow Docker/Colima/OrbStack daemon socket and ~/.docker read access.
     pub allow_docker: bool,
@@ -893,15 +893,24 @@ fn emit_temp_rules(
         }
     }
     if allow_msbuild {
-        // Allow Unix domain socket operations for the MSBuild/dotnet build server.
+        // Allow Unix domain socket operations for MSBuild worker-node IPC.
         //
-        // `dotnet build` (VBCSCompiler / MSBuild server mode) creates a Unix
-        // domain socket at /private/tmp/MSBuild<pid> for IPC between the
-        // build client and a long-lived compiler server process.
+        // `dotnet build` forks out-of-proc worker nodes that communicate with
+        // the client over a Unix domain socket at /private/tmp/MSBuild<pid>
+        // (see NamedPipeUtil.GetPlatformSpecificPipeName in the MSBuild source).
+        //
+        // This is NOT the persistent MSBuild Server: that feature uses a
+        // differently-named socket, /private/tmp/MSBuildServer-<hash> (see
+        // MSBuild-Server.md's "pipe name convention"), which the regex below
+        // does not match and which therefore remains blocked. Reuse of a
+        // persistent server — including one started outside this sandbox — is
+        // additionally disabled by setting DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1
+        // (see sandbox_env.rs), so `dotnet build` never attempts to create or
+        // connect to that server pipe in the first place.
         //
         // All three socket operations are required (same pattern as JVM attach):
-        //   - network-bind:    the server creates the socket
-        //   - network-inbound: the server accepts client connections
+        //   - network-bind:    the worker node creates the socket
+        //   - network-inbound: the worker node accepts client connections
         //   - network-outbound: the client connects to the socket
         //
         // SECURITY: regex is anchored with ^ and $ to the exact MSBuild<pid>

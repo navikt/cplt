@@ -360,6 +360,7 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | `--allow-lifecycle-scripts` | Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run. Blocked by default. Use when `npm install` needs postinstall hooks.         |
 | `--allow-gpg-signing`       | Allow GPG commit/tag signing inside the sandbox. Grants read-only access to public keyring and GPG agent socket (private keys stay denied). See [GPG signing](docs/known-impacts.md#gpg-commit-signing). |
 | `--allow-jvm-attach`        | Allow JVM Attach API unix sockets in `/tmp`. Needed for MockK inline mocking, Mockito inline agents, ByteBuddy. See [JVM Attach API](docs/known-impacts.md#jvm-attach-api). |
+| `--allow-msbuild`           | Allow MSBuild worker-node unix sockets in `/tmp`. Needed for `dotnet build`. Does not enable the persistent MSBuild Server. See [MSBuild worker-node IPC](docs/known-impacts.md#msbuild-worker-node-ipc). |
 | `--no-scratch-dir`          | Disable the per-session scratch directory (on by default). TMPDIR will not be redirected.                                                    |
 | `--scratch-dir`             | Explicitly enable per-session scratch directory (already the default). Useful to override `scratch_dir = false` in config.                   |
 | `--allow-tmp-exec`          | ⚠️ **Dangerous.** Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer scratch dir.                             |
@@ -895,6 +896,7 @@ The sandbox blocks some workflows by design. Common issues and fixes:
 | SSH blocked | Use HTTPS remotes instead |
 | GPG signing disabled | `cplt config set sandbox.allow_gpg_signing true` |
 | JVM MockK/Mockito fails | `cplt config set sandbox.allow_jvm_attach true` |
+| `dotnet build` MSBuild worker nodes blocked | `cplt config set sandbox.allow_msbuild true` |
 | Private registry creds blocked | `cplt config set allow.read "~/.m2/settings.xml"` |
 
 📖 **Full details with tables and troubleshooting:** [docs/known-impacts.md](docs/known-impacts.md)
@@ -1266,6 +1268,30 @@ cplt config set sandbox.allow_jvm_attach true
 **How it works:** The JVM creates a socket at `/tmp/.java_pid<PID>` (hardcoded path, not affected by `java.io.tmpdir`). A helper JVM process connects to this socket to load an instrumentation agent. The sandbox rule uses a regex pattern that only allows sockets matching `.java_pid<PID>` — all other Unix sockets in `/tmp` (including SSH agent, tmux, PostgreSQL) remain blocked.
 
 **Security note:** This opens a narrow IPC channel for `.java_pid*`-named sockets only. SSH agent access (`SSH_AUTH_SOCK`) is NOT exposed — on macOS it lives at `/private/tmp/com.apple.launchd.*/Listeners` which does not match the pattern.
+
+### MSBuild worker-node IPC
+
+`dotnet build` forks out-of-proc **worker nodes** that talk back to the client over a Unix domain socket at `/tmp/MSBuild<PID>` — which the sandbox blocks by default.
+
+Enable it with `--allow-msbuild`:
+
+```bash
+cplt --allow-msbuild -- -p "run the build"
+```
+
+Or permanently in config:
+
+```bash
+cplt config set sandbox.allow_msbuild true
+```
+
+**When to enable:**
+
+- Any `dotnet build`/`dotnet test`/`dotnet run` invocation that fails to spin up MSBuild worker nodes inside the sandbox
+
+**How it works:** `--allow-msbuild` only opens the worker-node socket, named `MSBuild<PID>` (see MSBuild's `NamedPipeUtil.GetPlatformSpecificPipeName`). It does **not** enable the separate, persistent **MSBuild Server**, whose socket is named `MSBuildServer-<hash>` and is never matched by this rule. cplt also sets `DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1` unconditionally, so `dotnet build` never starts or reuses a persistent server — including one a process outside the sandbox may have already started.
+
+**Security note:** This opens a narrow IPC channel for `MSBuild<PID>`-named sockets only. SSH agent access and all other Unix sockets in `/tmp` (including the persistent MSBuild Server) remain blocked.
 
 ### Port restriction
 

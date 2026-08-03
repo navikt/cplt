@@ -360,11 +360,13 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
     #[arg(long)]
     allow_jvm_attach: bool,
 
-    /// Allow MSBuild build server unix sockets in /tmp.
-    /// Needed for `dotnet build`/MSBuild server mode, which keeps a
-    /// long-lived compiler process communicating over a Unix domain socket.
-    /// Only allows sockets matching /tmp/MSBuild<PID> — SSH agent and
-    /// all other unix sockets remain blocked.
+    /// Allow MSBuild worker-node unix sockets in /tmp.
+    /// Needed for `dotnet build`, which forks worker nodes that communicate
+    /// with the client over a Unix domain socket at /tmp/MSBuild<PID>.
+    /// This does NOT allow the persistent MSBuild Server (MSBuildServer-<hash>),
+    /// which stays blocked; reuse of that server is also disabled via
+    /// DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1. SSH agent and all other unix
+    /// sockets remain blocked.
     #[arg(long)]
     allow_msbuild: bool,
 

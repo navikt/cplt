@@ -592,11 +592,13 @@ pub struct SandboxConfig {
     /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
     /// all other unix sockets remain blocked.
     pub allow_jvm_attach: Option<bool>,
-    /// Allow MSBuild build server unix sockets in /tmp (default: false).
-    /// Needed for `dotnet build`/MSBuild server mode, which keeps a
-    /// long-lived compiler process communicating over a Unix domain socket.
-    /// Only allows sockets matching /tmp/MSBuild<PID> — SSH agent and
-    /// all other unix sockets remain blocked.
+    /// Allow MSBuild worker-node unix sockets in /tmp (default: false).
+    /// Needed for `dotnet build`, which forks worker nodes that communicate
+    /// with the client over a Unix domain socket at /tmp/MSBuild<PID>.
+    /// This does NOT allow the persistent MSBuild Server (MSBuildServer-<hash>),
+    /// which stays blocked — reuse of that server is also disabled via
+    /// DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1. SSH agent and all other unix
+    /// sockets remain blocked.
     pub allow_msbuild: Option<bool>,
     /// Allow Docker/Colima/OrbStack access inside the sandbox (default: false).
     /// DANGEROUS: Docker can mount any host path via container volumes, completely

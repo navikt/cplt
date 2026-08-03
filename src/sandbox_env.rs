@@ -198,6 +198,27 @@ pub fn build_sandbox_env(
             .push(("GRADLE_MACOS_SANDBOX".to_string(), "off".to_string()));
     }
 
+    // Disable dotnet CLI / MSBuild persistent build server reuse. Without this,
+    // `dotnet build` defaults to starting (or reusing) a long-lived MSBuild Server
+    // process listening on a Unix domain socket named MSBuildServer-<hash> — a
+    // predictable path that a sandboxed process could otherwise use to reach, or
+    // be reached by, a server instance started outside the sandbox. cplt's
+    // --allow-msbuild only ever opens the differently-named worker-node socket
+    // (MSBuild<pid>), never the server one, but this env var removes the
+    // persistent-server code path entirely rather than relying solely on the
+    // socket-path allowlist to keep it unreachable.
+    if !extra_pass_env
+        .iter()
+        .any(|v| v == "DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER")
+    {
+        env.vars
+            .retain(|(k, _)| k != "DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER");
+        env.vars.push((
+            "DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER".to_string(),
+            "1".to_string(),
+        ));
+    }
+
     // Sanitize NODE_OPTIONS: strip dangerous directives that allow preload injection.
     // NODE_OPTIONS passes through the allowlist for legitimate use (--max-old-space-size),
     // but --require/--loader/--import can inject code into all Node.js child processes.

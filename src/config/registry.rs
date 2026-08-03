@@ -330,7 +330,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Allow MSBuild build server unix sockets for `dotnet build`'s persistent compiler process.",
+        description: "Allow MSBuild worker-node unix sockets for `dotnet build` (not the persistent MSBuild Server).",
     },
     ConfigKeyInfo {
         section: "sandbox",

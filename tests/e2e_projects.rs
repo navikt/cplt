@@ -175,6 +175,31 @@ mod project_tests {
             p
         }
 
+        fn scaffold_dotnet() -> Self {
+            let p = Self::new("dotnet");
+            p.write_file(
+                "testapp.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+</Project>
+"#,
+            );
+            p.write_file(
+                "Program.cs",
+                "Console.WriteLine(\"May the Force be with you.\");\n",
+            );
+            p.write_file("README.md", "# Test .NET App\n");
+            p.write_file(".gitignore", ".env*\nbin/\nobj/\n");
+            p.git_init();
+            p.write_file(".env", "DB_HOST=localhost\nDB_PASS=secret\n");
+            p
+        }
+
         fn scaffold_python() -> Self {
             let p = Self::new("python");
             p.write_file("requirements.txt", "flask==3.0.0\nrequests==2.31.0\n");
@@ -1400,6 +1425,136 @@ esac
         // go test should be blocked: sandbox denies exec from temp dirs
         assert_result_fail(&stdout, "go_test_no_scratch");
         assert_result_ok(&stdout, "deny_signature");
+    }
+
+    // ============================================================
+    // .NET / MSBuild tests
+    // ============================================================
+
+    fn dotnet_available() -> bool {
+        Command::new("dotnet")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// `dotnet build` works end-to-end inside the sandbox with --allow-msbuild.
+    /// MSBuild forks out-of-proc worker nodes that talk to the client over a
+    /// Unix domain socket at /tmp/MSBuild<pid> — this is real MSBuild worker-node
+    /// IPC, not the synthetic socket simulation used by the profile-level tests.
+    #[test]
+    fn project_dotnet_build_works_with_allow_msbuild() {
+        require_sandbox!();
+        if !dotnet_available() {
+            eprintln!("SKIPPED: dotnet not available");
+            return;
+        }
+
+        let project = TempProject::scaffold_dotnet();
+        let script = r#"
+if BUILD_OUTPUT=$(dotnet build --nologo 2>&1); then
+    echo "RESULT:dotnet_build:OK"
+else
+    echo "DOTNET_ERROR: $BUILD_OUTPUT" >&2
+    case "$BUILD_OUTPUT" in
+        *"Operation not permitted"*|*"not permitted"*|*"Permission denied"*)
+            echo "RESULT:dotnet_build:FAIL:sandbox_deny"
+            ;;
+        *)
+            echo "RESULT:dotnet_build:OK:build_error_but_not_sandbox"
+            ;;
+    esac
+    echo "RESULT:dotnet_run:FAIL:build_failed"
+    exit 0
+fi
+
+# Prove the build actually produced a working binary, not just a green exit code.
+if RUN_OUTPUT=$(dotnet bin/Debug/net8.0/testapp.dll 2>&1); then
+    case "$RUN_OUTPUT" in
+        *"May the Force be with you."*)
+            echo "RESULT:dotnet_run:OK"
+            ;;
+        *)
+            echo "RESULT:dotnet_run:FAIL:unexpected_output:$RUN_OUTPUT"
+            ;;
+    esac
+else
+    echo "RESULT:dotnet_run:FAIL:$RUN_OUTPUT"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--allow-msbuild"]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "dotnet_build");
+        assert_result_ok(&stdout, "dotnet_run");
+    }
+
+    /// Verify DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1 is injected inside the
+    /// sandbox, so `dotnet build` never starts or reuses a persistent MSBuild
+    /// Server process (which would listen on a differently-named, unallowed
+    /// socket: MSBuildServer-<hash> rather than MSBuild<pid>).
+    #[test]
+    fn project_dotnet_do_not_use_msbuild_server_env() {
+        require_sandbox!();
+        let project = TempProject::scaffold_dotnet();
+
+        let script = r#"
+if [ "$DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER" = "1" ]; then
+    echo "RESULT:dotnet_server_disabled:OK"
+else
+    echo "RESULT:dotnet_server_disabled:FAIL:got=${DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER:-unset}"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "dotnet_server_disabled");
+    }
+
+    /// Without --allow-msbuild, a project run must not be able to open an
+    /// MSBuild worker-node socket — verified at the project/CLI layer (raw
+    /// profile coverage lives in `tests/integration.rs`).
+    #[test]
+    fn project_dotnet_blocked_msbuild_socket_without_flag() {
+        require_sandbox!();
+        let project = TempProject::scaffold_dotnet();
+        let cmd = r#"python3 -c "
+import socket, os
+SOCK = '/tmp/MSBuild77777'
+try: os.unlink(SOCK)
+except: pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.bind(SOCK)
+    print('RESULT:msbuild_socket:OK:EXPOSED')
+except PermissionError:
+    print('RESULT:msbuild_socket:OK:BLOCKED')
+except OSError as e:
+    print('RESULT:msbuild_socket:OK:BLOCKED' if e.errno == 1 else f'RESULT:msbuild_socket:FAIL:{e}')
+finally:
+    s.close()
+""#;
+        let fake_dir = create_fake_copilot(&project, cmd);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "msbuild_socket");
+        assert!(
+            stdout.contains("BLOCKED"),
+            "MSBuild socket must be blocked without --allow-msbuild, got: {stdout}"
+        );
     }
 
     // ============================================================

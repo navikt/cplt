@@ -359,6 +359,28 @@ Or for a single run: `cplt --allow-jvm-attach`
 
 **Security note:** This opens a narrow IPC channel for `.java_pid*`-named sockets only. SSH agent access (`SSH_AUTH_SOCK`) is NOT exposed — on macOS it lives at `/private/tmp/com.apple.launchd.*/Listeners` which does not match the pattern.
 
+## MSBuild worker-node IPC
+
+`dotnet build` forks out-of-proc **worker nodes** that talk back to the client over a Unix domain socket at `/tmp/MSBuild<PID>` — which the sandbox blocks by default.
+
+Enable it:
+
+```bash
+cplt config set sandbox.allow_msbuild true
+```
+
+Or for a single run: `cplt --allow-msbuild`
+
+**When to enable:**
+
+- Any `dotnet build`/`dotnet test`/`dotnet run` invocation that fails to spin up MSBuild worker nodes inside the sandbox
+
+**How it works:** MSBuild names its out-of-proc worker-node pipe `MSBuild<PID>` (`NamedPipeUtil.GetPlatformSpecificPipeName`, prefixed with `/tmp/` on Unix). The sandbox rule uses a regex pattern that only allows sockets matching this exact `MSBuild<PID>` form.
+
+This is a **different socket** from the persistent **MSBuild Server** (opt-in `dotnet build` acceleration feature that keeps a compiler process alive between builds), which names its pipe `MSBuildServer-<hash>` (see [MSBuild-Server.md](https://github.com/dotnet/msbuild/blob/main/documentation/MSBuild-Server.md#pipe-name-convention--handshake)) — a name the `--allow-msbuild` regex does not match, so it remains blocked. To close this off structurally rather than relying only on the socket-path allowlist, cplt also unconditionally sets `DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1` inside the sandbox, so `dotnet build` never attempts to start or reuse a persistent server — including one a process outside the sandbox may have already started.
+
+**Security note:** This opens a narrow IPC channel for `MSBuild<PID>`-named sockets only. SSH agent access and all other Unix sockets in `/tmp` (including the persistent MSBuild Server) remain blocked.
+
 ## Port restriction
 
 Only port 443 is allowed by default. Services on other ports need explicit configuration:

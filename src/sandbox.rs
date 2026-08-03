@@ -122,7 +122,7 @@ pub struct SandboxConfig<'a> {
     pub deny_clipboard: bool,
     /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
     pub allow_jvm_attach: bool,
-    /// Allow MSBuild build server unix sockets in /tmp (MSBuild<pid> pattern only).
+    /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
     pub allow_msbuild: bool,
     /// Allow Docker/Colima/OrbStack access (daemon socket + ~/.docker read).
     pub allow_docker: bool,

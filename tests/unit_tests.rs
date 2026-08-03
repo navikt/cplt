@@ -5200,6 +5200,54 @@ fn env_gradle_macos_sandbox_respects_pass_env() {
 }
 
 // ============================================================
+// build_sandbox_env — DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER injection
+// ============================================================
+
+#[test]
+fn env_injects_dotnet_do_not_use_msbuild_server() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+
+    let dotnet = env
+        .vars
+        .iter()
+        .find(|(k, _)| k == "DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER");
+    assert!(
+        dotnet.is_some(),
+        "DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER should always be injected to disable persistent server reuse"
+    );
+    assert_eq!(dotnet.unwrap().1, "1");
+}
+
+#[test]
+fn env_dotnet_do_not_use_msbuild_server_respects_pass_env() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER", "0"),
+    ]);
+    let extra = vec!["DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER".to_string()];
+    let env = build_sandbox_env(
+        &parent,
+        &extra,
+        false,
+        &[],
+        None,
+        cplt::agent::Agent::Copilot,
+    );
+
+    let dotnet = env
+        .vars
+        .iter()
+        .find(|(k, _)| k == "DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER");
+    assert!(dotnet.is_some());
+    assert_eq!(
+        dotnet.unwrap().1,
+        "0",
+        "--pass-env should prevent forcing DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1"
+    );
+}
+
+// ============================================================
 // NODE_OPTIONS sanitization — strip dangerous preload flags
 // ============================================================
 
