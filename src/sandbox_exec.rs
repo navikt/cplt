@@ -304,9 +304,11 @@ fn install_command_wrappers(
     // Install gh wrapper (only if gh_proxy enabled)
     if gh_guard.enabled
         && let Some(real_gh) = which_binary("gh")
+        && let Some(real_git) = which_binary("git")
     {
         let script = crate::gh_proxy::generate_wrapper_script(
             &real_gh.to_string_lossy(),
+            &real_git.to_string_lossy(),
             &cplt_str,
             gh_guard,
         );

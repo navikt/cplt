@@ -420,6 +420,46 @@ mod macos_tests {
         }
     }
 
+    #[test]
+    fn real_profile_allows_included_local_git_config() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(
+            home.path().join(".gitconfig"),
+            "[include]\npath = ~/.gitconfig.local\n",
+        )
+        .unwrap();
+        fs::write(
+            home.path().join(".gitconfig.local"),
+            "[user]\nname = cplt-test-user\n",
+        )
+        .unwrap();
+
+        let opts = default_opts(&project, home.path());
+        let profile = write_real_profile(&opts);
+        let cmd = format!(
+            "HOME='{}' GIT_CONFIG_NOSYSTEM=1 git config --global user.name 2>&1",
+            home.path().display()
+        );
+        let (output, success) = run_sandboxed(&profile, &cmd);
+        let write_cmd = format!(
+            "echo injected >> '{}' 2>&1; echo EXIT:$?",
+            home.path().join(".gitconfig.local").display()
+        );
+        let (write_output, _) = run_sandboxed(&profile, &write_cmd);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            success && output.contains("cplt-test-user"),
+            "git should read ~/.gitconfig.local through the include: {output}"
+        );
+        assert!(
+            write_output.contains("Operation not permitted") || write_output.contains("EXIT:1"),
+            "~/.gitconfig.local must remain read-only: {write_output}"
+        );
+    }
+
     // ── Git persistence prevention ────────────────────────────────
 
     #[test]

@@ -515,6 +515,10 @@ fn emit_system_access(
     sbpl!(sb, "(allow file-read* (literal \"{home}/.gitconfig\"))");
     sbpl!(
         sb,
+        "(allow file-read* (literal \"{home}/.gitconfig.local\"))"
+    );
+    sbpl!(
+        sb,
         "(allow file-read* (literal \"{home}/.config/git/config\"))"
     );
     sbpl!(sb);

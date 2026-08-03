@@ -895,6 +895,14 @@ fn profile_grants_project_access() {
         p.contains("(allow file-map-executable (subpath \"/projects/app\"))"),
         "Project dir must allow file-map-executable for native Node addons"
     );
+    assert!(
+        p.contains("(allow file-read* (literal \"/Users/test/.gitconfig.local\"))"),
+        "Included user Git config should be readable"
+    );
+    assert!(
+        !p.contains("(allow file-write* (literal \"/Users/test/.gitconfig.local\"))"),
+        "Included user Git config must remain read-only"
+    );
 }
 
 #[test]

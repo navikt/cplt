@@ -224,6 +224,7 @@ const LINUX_TOOL_DIRS: &[&str] = &[
 const LINUX_HOME_CONFIG_FILES: &[&str] = &[
     // Git configuration (includes user-config, attributes, ignore, etc.)
     ".gitconfig",
+    ".gitconfig.local",
     ".config/git",
     // GitHub CLI auth (specific files only)
     ".config/gh/hosts.yml",

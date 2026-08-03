@@ -1303,21 +1303,41 @@ fn extract_repo_from_api_path(endpoint: &str) -> Option<String> {
 
 /// Detect the current repository from the working directory.
 ///
-/// Tries `git remote get-url origin` and parses the owner/repo from it.
-/// Returns None if not in a git repo or remote URL can't be parsed.
-pub fn detect_current_repo(project_dir: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(project_dir)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
+/// Reads `remote.origin.url` from local repository config only and parses the
+/// owner/repo from it. Global/system config, includes, and inherited `GIT_*`
+/// variables are ignored because they could retarget the guard's scope.
+pub fn detect_current_repo(real_git: &Path, project_dir: &Path) -> Result<String, String> {
+    let mut command = std::process::Command::new(real_git);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
     }
 
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_repo_from_url(&url)
+    let output = command
+        .args([
+            "config",
+            "--local",
+            "--no-includes",
+            "--get",
+            "remote.origin.url",
+        ])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(project_dir)
+        .output()
+        .map_err(|e| format!("failed to run trusted git binary: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "trusted git could not read the local origin ({})",
+            output.status
+        ));
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout);
+    parse_repo_from_url(url.trim())
+        .ok_or_else(|| "local origin is not a supported GitHub repository URL".to_string())
 }
 
 /// Parse owner/repo from a git remote URL.
@@ -1394,11 +1414,13 @@ fn shell_escape(s: &str) -> String {
 /// re-read config at runtime (security: agent could edit config files).
 pub fn generate_wrapper_script(
     real_gh: &str,
+    real_git: &str,
     cplt_bin: &str,
     policy: &crate::config::GhGuardPolicy,
 ) -> String {
     let cplt_escaped = shell_escape(cplt_bin);
     let gh_escaped = shell_escape(real_gh);
+    let git_escaped = shell_escape(real_git);
     let mode_flag = match policy.mode {
         crate::config::EnforcementMode::Block => "--mode=block",
         crate::config::EnforcementMode::Warn => "--mode=warn",
@@ -1428,7 +1450,7 @@ pub fn generate_wrapper_script(
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} --real-git {git_escaped} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} -- "$@"
 "#
     )
 }
@@ -1462,6 +1484,16 @@ pub struct GatePolicy {
 pub enum UnknownCommandDecision {
     Block,
     Allow,
+}
+
+/// Information established by the guard and required when invoking `gh`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GateApproval {
+    /// Repository verified for a scope-checked command.
+    ///
+    /// The caller must set `GH_REPO` to this value before executing `gh`, pinning
+    /// the operation to the same repository the guard approved.
+    pub repo_scope: Option<String>,
 }
 
 impl Default for GatePolicy {
@@ -1506,12 +1538,30 @@ fn arg_reveals_token(arg: &str) -> bool {
 /// Evaluate a full command and return a human-friendly verdict.
 ///
 /// This is the entry point used by the `gh-gate` subcommand.
-/// Returns `Ok(())` if the command should be allowed, or `Err(message)` if blocked.
-pub fn gate(args: &[&str], project_dir: &Path, policy: &GatePolicy) -> Result<(), String> {
+/// Returns the verified repository scope when allowed, or an error when blocked.
+pub fn gate(
+    args: &[&str],
+    project_dir: &Path,
+    policy: &GatePolicy,
+) -> Result<GateApproval, String> {
+    gate_with_git(args, project_dir, policy, Path::new("git"))
+}
+
+/// Evaluate a `gh` command using a pre-resolved Git binary for repository scope.
+///
+/// The Git subprocess ignores global/system configuration, local includes, and
+/// inherited `GIT_*` variables so agent-controlled process state cannot retarget
+/// the repository used by the scope decision.
+pub fn gate_with_git(
+    args: &[&str],
+    project_dir: &Path,
+    policy: &GatePolicy,
+    real_git: &Path,
+) -> Result<GateApproval, String> {
     let Some(cmd) = parse_command(args) else {
         // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.
         // These are read-only informational invocations — always allow.
-        return Ok(());
+        return Ok(GateApproval::default());
     };
 
     // Handle token-revealing `gh auth` commands (credential exfiltration prevention).
@@ -1543,29 +1593,27 @@ pub fn gate(args: &[&str], project_dir: &Path, policy: &GatePolicy) -> Result<()
     let result = evaluate_with_policy(&cmd, policy.allow_api_write);
 
     match result.decision {
-        Decision::Allow => Ok(()),
+        Decision::Allow => Ok(GateApproval::default()),
         Decision::ScopeCheck => {
             if !policy.scope_check {
-                return Ok(());
+                return Ok(GateApproval::default());
             }
-            let current_repo = detect_current_repo(project_dir).unwrap_or_default();
 
-            if current_repo.is_empty() {
-                if cmd.repo_flag.is_some() {
-                    Err(format!(
-                        "⚠️ BLOCKED by sandbox: 'gh {} {}' cannot verify target repository scope.\n\
-                         The -R flag targets {:?} but the current repo could not be detected.\n\
-                         This operation is restricted by the cplt sandbox environment.\n\
-                        Please make a note of this for the human operator and continue with your remaining work.",
-                        cmd.command,
-                        cmd.subcommand.as_deref().unwrap_or(""),
-                        cmd.repo_flag.as_deref().unwrap_or("unknown")
-                    ))
-                } else {
-                    Ok(())
-                }
-            } else if is_repo_in_scope(&cmd, &current_repo) {
-                Ok(())
+            let current_repo = detect_current_repo(real_git, project_dir).map_err(|reason| {
+                format!(
+                    "⚠️ BLOCKED by sandbox: 'gh {} {}' cannot verify target repository scope.\n\
+                     Reason: {reason}.\n\
+                     This operation is restricted by the cplt sandbox environment.\n\
+                     Please make a note of this for the human operator and continue with your remaining work.",
+                    cmd.command,
+                    cmd.subcommand.as_deref().unwrap_or("")
+                )
+            })?;
+
+            if is_repo_in_scope(&cmd, &current_repo) {
+                Ok(GateApproval {
+                    repo_scope: Some(current_repo),
+                })
             } else {
                 Err(format!(
                     "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the current repo '{}'.\n\
@@ -1599,7 +1647,7 @@ pub fn gate(args: &[&str], project_dir: &Path, policy: &GatePolicy) -> Result<()
             result.reason,
         )),
         Decision::Unknown => match policy.unknown_command {
-            UnknownCommandDecision::Allow => Ok(()),
+            UnknownCommandDecision::Allow => Ok(GateApproval::default()),
             UnknownCommandDecision::Block => Err(format!(
                 "⚠️ BLOCKED by sandbox: 'gh {}{}' is not recognized by the policy table.\n\
                      This command may have been added in a newer gh CLI version.\n\
@@ -2811,8 +2859,14 @@ mod tests {
     #[test]
     fn wrapper_script_contains_paths() {
         let policy = crate::config::GhGuardPolicy::default();
-        let script = generate_wrapper_script("/usr/bin/gh", "/usr/local/bin/cplt", &policy);
+        let script = generate_wrapper_script(
+            "/usr/bin/gh",
+            "/usr/bin/git",
+            "/usr/local/bin/cplt",
+            &policy,
+        );
         assert!(script.contains("/usr/bin/gh"));
+        assert!(script.contains("/usr/bin/git"));
         assert!(script.contains("/usr/local/bin/cplt"));
         assert!(script.starts_with("#!/bin/sh"));
         assert!(script.contains("--mode=block"));
@@ -2828,7 +2882,12 @@ mod tests {
             allow_api_write: true,
             ..Default::default()
         };
-        let script = generate_wrapper_script("/usr/bin/gh", "/usr/local/bin/cplt", &policy);
+        let script = generate_wrapper_script(
+            "/usr/bin/gh",
+            "/usr/bin/git",
+            "/usr/local/bin/cplt",
+            &policy,
+        );
         assert!(
             script.contains("--allow-api-write"),
             "wrapper must bake in --allow-api-write when policy has allow_api_write=true"
@@ -3067,7 +3126,12 @@ mod tests {
     #[test]
     fn shell_escape_handles_quotes() {
         let policy = crate::config::GhGuardPolicy::default();
-        let script = generate_wrapper_script("/path/with'quote/gh", "/path/with\"dq/cplt", &policy);
+        let script = generate_wrapper_script(
+            "/path/with'quote/gh",
+            "/path/with'quote/git",
+            "/path/with\"dq/cplt",
+            &policy,
+        );
         assert!(script.contains("gh-gate"));
         // Should use single-quote escaping, no unescaped double quotes in paths
         assert!(!script.contains(r#""/path/with'quote/gh""#));
