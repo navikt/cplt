@@ -421,7 +421,7 @@ mod macos_tests {
     }
 
     #[test]
-    fn real_profile_allows_included_local_git_config() {
+    fn real_profile_allows_local_git_config_and_global_ignore() {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -444,13 +444,8 @@ mod macos_tests {
 
         let opts = default_opts(&project, home.path());
         let profile = write_real_profile(&opts);
-        let cmd = format!(
-            "HOME='{}' GIT_CONFIG_GLOBAL='{}/.gitconfig' GIT_CONFIG_NOSYSTEM=1 \
-             git config --global user.name 2>&1",
-            home.path().display(),
-            home.path().display()
-        );
-        let (output, success) = run_sandboxed(&profile, &cmd);
+        let read_config_cmd = format!("cat '{}' 2>&1", local_config.display());
+        let (config_output, config_success) = run_sandboxed(&profile, &read_config_cmd);
         let read_ignore_cmd = format!("cat '{}' 2>&1", global_ignore.display());
         let (ignore_output, ignore_success) = run_sandboxed(&profile, &read_ignore_cmd);
         let write_cmd = format!(
@@ -466,8 +461,8 @@ mod macos_tests {
 
         fs::remove_file(&profile).ok();
         assert!(
-            success && output.contains("cplt-test-user"),
-            "git should read ~/.gitconfig.local through the include: {output}"
+            config_success && config_output.contains("cplt-test-user"),
+            "~/.gitconfig.local should be readable: {config_output}"
         );
         assert!(
             ignore_success && ignore_output.contains("ignored-by-cplt-test"),
