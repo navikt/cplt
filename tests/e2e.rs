@@ -1910,6 +1910,25 @@ mod e2e_tests {
     }
 
     #[test]
+    fn e2e_settings_requires_interactive_terminal() {
+        let output = Command::new(binary_path())
+            .arg("settings")
+            .env_remove("__CPLT_TRUST_LOCKED")
+            .output()
+            .expect("should run");
+
+        assert!(
+            !output.status.success(),
+            "settings must not run without a controlling terminal"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal"),
+            "should explain the scriptable alternative: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn e2e_config_set_creates_file_and_sets_value() {
         let fake_home = make_config_home("set-create");
         let config_path = fake_home.join(".config/cplt/config.toml");

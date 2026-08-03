@@ -71,6 +71,9 @@ EXAMPLES:
   cplt config explain sandbox.quiet
     Learn what a config key does and how to set it
 
+  cplt settings
+    Browse and edit settings interactively
+
   cplt update
     Update cplt to the latest release from GitHub
 
@@ -638,6 +641,12 @@ QUICK START:
         #[command(subcommand)]
         action: ConfigAction,
     },
+
+    /// Browse and edit global and repository settings interactively.
+    ///
+    /// Uses the same validation and TOML persistence as `cplt config set`.
+    /// Requires an interactive terminal; use `cplt config` in scripts and CI.
+    Settings,
 
     /// Update cplt to the latest release.
     ///
@@ -2122,6 +2131,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if let Some(command) = cli.command {
         return Ok(match command {
             Command::Config { action } => run_config_command(action),
+            Command::Settings => match cplt::settings::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    ui::error(&error);
+                    ExitCode::FAILURE
+                }
+            },
             Command::Update { check, force } => run_update(check, force),
             Command::UpdateLists => run_update_lists(),
             Command::Trust { action } => run_trust_command(action),
@@ -4254,41 +4270,15 @@ fn run_config_set(
         }
     };
 
-    // Dangerous-setting safeguard. Two cases weaken the sandbox and require
-    // --force:
-    //   1. A key flagged `dangerous` in the registry set to `true`
-    //      (allow_docker, allow_tmp_exec, …) — danger is in the KEY.
-    //   2. `sandbox.preset` set to a value that enables guarded toggles
-    //      (permissive/full-trust) — danger is in the VALUE, so this must be
-    //      value-aware. strict/standard are no-op baselines and are allowed.
     if !unset
         && !force
         && let Some(val) = value
+        && let Some(reason) = config::security_confirmation(op.key_info, val, false)
     {
-        // Value-aware preset check: warn and name what the preset enables.
-        if op.key_info.section == "sandbox"
-            && op.key_info.key == "preset"
-            && let Some(preset) = config::Preset::from_name(val)
-        {
-            let enabled = preset.enabled_dangerous_names();
-            if !enabled.is_empty() {
-                ui::error(&format!(
-                    "{key} = {val} enables dangerous settings ({}) — it weakens sandbox security.\n  \
-                     Add --force to confirm: cplt config set {key} {val} --force",
-                    enabled.join(", ")
-                ));
-                return ExitCode::FAILURE;
-            }
-        }
-
-        // Key-level dangerous-bool check.
-        if op.key_info.dangerous && val == "true" {
-            ui::error(&format!(
-                "{key} is a dangerous setting — it weakens sandbox security.\n  \
-                 Add --force to confirm: cplt config set {key} true --force"
-            ));
-            return ExitCode::FAILURE;
-        }
+        ui::error(&format!(
+            "{key} = {val} {reason}.\n  Add --force to confirm: cplt config set {key} {val} --force"
+        ));
+        return ExitCode::FAILURE;
     }
 
     // Load or create document
@@ -4448,20 +4438,16 @@ fn run_config_set_repo(
         return ExitCode::FAILURE;
     }
 
-    // Write back
     let output = doc.to_string();
-    if let Err(e) = std::fs::write(&repo_config_path, &output) {
-        ui::error(&format!("cannot write {}: {e}", repo_config_path.display()));
+    if let Err(e) = repo_config::parse_and_validate(&output) {
+        ui::error(&format!(
+            "refusing to write invalid .cplt.toml: {e}\n  No changes were saved."
+        ));
         return ExitCode::FAILURE;
     }
-
-    // Validate the result parses and passes safety checks
-    if let Err(e) = repo_config::parse_and_validate(&output) {
-        eprintln!(
-            "{}[cplt] Warning: written .cplt.toml has validation issues: {e}{}\n  The file was saved but may not load correctly.",
-            ui::color(ui::YELLOW),
-            ui::color(ui::RESET)
-        );
+    if let Err(e) = config::write_repo_document_atomically(&repo_config_path, &doc) {
+        ui::error(&format!("cannot write {}: {e}", repo_config_path.display()));
+        return ExitCode::FAILURE;
     }
 
     // User feedback

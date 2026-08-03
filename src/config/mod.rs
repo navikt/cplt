@@ -20,7 +20,8 @@ mod validation;
 pub use display::{display_config, explain_all, explain_key, get_config_value};
 pub use editing::{
     ConfigSetOp, append_value_in_doc, get_value_from_doc, remove_array_element_in_doc,
-    set_value_in_doc, unset_value_in_doc,
+    security_confirmation, set_value_in_doc, unset_value_in_doc, validate_global_document,
+    write_document_atomically, write_repo_document_atomically,
 };
 pub use error::ConfigError;
 pub use path::{collapse_tilde, config_dir, config_path, default_config_contents, expand_tilde};
