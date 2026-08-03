@@ -518,6 +518,14 @@ fn emit_system_access(
     sbpl!(sb, "(allow file-read* (literal \"{home}/.gitconfig\"))");
     sbpl!(
         sb,
+        "(allow file-read* (literal \"{home}/.gitconfig.local\"))"
+    );
+    sbpl!(
+        sb,
+        "(allow file-read* (literal \"{home}/.gitignore_global\"))"
+    );
+    sbpl!(
+        sb,
         "(allow file-read* (literal \"{home}/.config/git/config\"))"
     );
     sbpl!(sb);
@@ -997,6 +1005,16 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
     // Credential files inside allowed tool dirs (overridable with --allow-read)
     for file in DENIED_HOME_SUBPATHS {
         sbpl!(sb, "(deny file-read* (literal \"{home}/{file}\"))");
+        sbpl!(sb, "(deny file-write* (literal \"{home}/{file}\"))");
+    }
+    // These files must stay read-only even when an overlapping path is writable
+    // (for example a temporary HOME under /private/var/folders).
+    for file in [
+        ".gitconfig",
+        ".gitconfig.local",
+        ".gitignore_global",
+        ".config/git/config",
+    ] {
         sbpl!(sb, "(deny file-write* (literal \"{home}/{file}\"))");
     }
     for path in extra_deny {

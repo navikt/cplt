@@ -164,7 +164,7 @@ fn configure_command(
                 cache_gh_token_to_file(scratch, agent);
             }
         }
-        install_command_wrappers(cmd, scratch, gh_guard, git_guard);
+        install_command_wrappers(cmd, scratch, project_dir, gh_guard, git_guard);
     }
 }
 
@@ -283,6 +283,7 @@ fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent) {
 fn install_command_wrappers(
     cmd: &mut Command,
     scratch_dir: &Path,
+    project_dir: &Path,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) {
@@ -305,8 +306,31 @@ fn install_command_wrappers(
     if gh_guard.enabled
         && let Some(real_gh) = which_binary("gh")
     {
+        let repo_scope = if gh_guard.scope_check {
+            if let Some(real_git) = which_binary("git") {
+                match crate::gh_proxy::detect_current_repo(&real_git, project_dir) {
+                    Ok(repo) => Some(repo),
+                    Err(reason) => {
+                        ui::warn(&format!(
+                            "gh guard could not capture repository scope: {reason}. \
+                             Scope-checked commands will be blocked."
+                        ));
+                        None
+                    }
+                }
+            } else {
+                ui::warn(
+                    "gh guard could not find Git to capture repository scope. \
+                     Scope-checked commands will be blocked.",
+                );
+                None
+            }
+        } else {
+            None
+        };
         let script = crate::gh_proxy::generate_wrapper_script(
             &real_gh.to_string_lossy(),
+            repo_scope.as_deref(),
             &cplt_str,
             gh_guard,
         );

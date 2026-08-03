@@ -421,6 +421,66 @@ mod macos_tests {
         }
     }
 
+    #[test]
+    fn real_profile_allows_local_git_config_and_global_ignore() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+        let local_config = home.join(".gitconfig.local");
+        let global_ignore = home.join(".gitignore_global");
+        fs::write(
+            home.join(".gitconfig"),
+            format!("[include]\npath = {}\n", local_config.display()),
+        )
+        .unwrap();
+        fs::write(
+            &local_config,
+            format!(
+                "[user]\nname = cplt-test-user\n[core]\nexcludesFile = {}\n",
+                global_ignore.display()
+            ),
+        )
+        .unwrap();
+        fs::write(&global_ignore, "ignored-by-cplt-test\n").unwrap();
+
+        let opts = default_opts(&project, &home);
+        let profile = write_real_profile(&opts);
+        let read_config_cmd = format!("cat '{}' 2>&1", local_config.display());
+        let (config_output, config_success) = run_sandboxed(&profile, &read_config_cmd);
+        let read_ignore_cmd = format!("cat '{}' 2>&1", global_ignore.display());
+        let (ignore_output, ignore_success) = run_sandboxed(&profile, &read_ignore_cmd);
+        let write_cmd = format!(
+            "echo injected >> '{}' 2>&1; echo EXIT:$?",
+            local_config.display()
+        );
+        let (write_output, _) = run_sandboxed(&profile, &write_cmd);
+        let write_ignore_cmd = format!(
+            "echo injected >> '{}' 2>&1; echo EXIT:$?",
+            global_ignore.display()
+        );
+        let (write_ignore_output, _) = run_sandboxed(&profile, &write_ignore_cmd);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            config_success && config_output.contains("cplt-test-user"),
+            "~/.gitconfig.local should be readable: {config_output}"
+        );
+        assert!(
+            ignore_success && ignore_output.contains("ignored-by-cplt-test"),
+            "git's conventional global ignore file should be readable: {ignore_output}"
+        );
+        assert!(
+            write_output.contains("Operation not permitted") || write_output.contains("EXIT:1"),
+            "~/.gitconfig.local must remain read-only: {write_output}"
+        );
+        assert!(
+            write_ignore_output.contains("Operation not permitted")
+                || write_ignore_output.contains("EXIT:1"),
+            "~/.gitignore_global must remain read-only: {write_ignore_output}"
+        );
+    }
+
     // ── Git persistence prevention ────────────────────────────────
 
     #[test]

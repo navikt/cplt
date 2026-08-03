@@ -787,6 +787,10 @@ NOTE:
         #[arg(long)]
         real_gh: PathBuf,
 
+        /// Repository scope captured before the sandboxed agent started.
+        #[arg(long)]
+        repo_scope: Option<String>,
+
         /// Enforcement mode: block, warn, or audit.
         #[arg(long, default_value = "block")]
         mode: String,
@@ -2137,6 +2141,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Doctor => run_doctor(),
             Command::GhGate {
                 real_gh,
+                repo_scope,
                 mode,
                 scope_check,
                 no_scope_check,
@@ -2162,7 +2167,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     },
                     allow_api_write: allow_api_write && !no_allow_api_write,
                 };
-                run_gh_gate(&real_gh, &args, &policy)
+                run_gh_gate(&real_gh, repo_scope.as_deref(), &args, &policy)
             }
             Command::GitGate {
                 real_git,
@@ -2540,7 +2545,12 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 /// Called from the wrapper script placed in the sandbox's PATH. If the command
 /// is allowed, this replaces the current process with the real gh binary.
 /// If blocked, prints an error message and exits with code 1.
-fn run_gh_gate(real_gh: &Path, args: &[String], policy: &gh_proxy::GatePolicy) -> ExitCode {
+fn run_gh_gate(
+    real_gh: &Path,
+    repo_scope: Option<&str>,
+    args: &[String],
+    policy: &gh_proxy::GatePolicy,
+) -> ExitCode {
     // Intercept `gh auth token` — serve from cached file instead of blocking.
     // This allows Copilot to authenticate without exposing the token as an env var
     // to all child processes. The token file is written to scratch dir at startup.
@@ -2548,18 +2558,10 @@ fn run_gh_gate(real_gh: &Path, args: &[String], policy: &gh_proxy::GatePolicy) -
         return serve_cached_gh_token();
     }
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match gh_proxy::gate(&arg_refs, &cwd, policy) {
-        Ok(()) => {
-            // Allowed — exec the real gh binary (replaces this process)
-            use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(real_gh).args(args).exec();
-            // exec() only returns on error
-            ui::error(&format!("Failed to exec gh: {err}"));
-            ExitCode::FAILURE
-        }
+    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope) {
+        Ok(approval) => exec_gh(real_gh, args, approval.repo_scope.as_deref()),
         Err(msg) => match policy.mode {
             config::EnforcementMode::Block => {
                 eprintln!("{msg}");
@@ -2568,21 +2570,29 @@ fn run_gh_gate(real_gh: &Path, args: &[String], policy: &gh_proxy::GatePolicy) -
             config::EnforcementMode::Warn => {
                 eprintln!("⚠️  WARNING (would block): {msg}");
                 // Allow through in warn mode
-                use std::os::unix::process::CommandExt;
-                let err = std::process::Command::new(real_gh).args(args).exec();
-                ui::error(&format!("Failed to exec gh: {err}"));
-                ExitCode::FAILURE
+                exec_gh(real_gh, args, None)
             }
             config::EnforcementMode::Audit => {
                 // Log the decision to stderr for audit trail
                 eprintln!("[audit] gh-gate: would block: {msg}");
-                use std::os::unix::process::CommandExt;
-                let err = std::process::Command::new(real_gh).args(args).exec();
-                ui::error(&format!("Failed to exec gh: {err}"));
-                ExitCode::FAILURE
+                exec_gh(real_gh, args, None)
             }
         },
     }
+}
+
+fn exec_gh(real_gh: &Path, args: &[String], repo_scope: Option<&str>) -> ExitCode {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new(real_gh);
+    command.args(args);
+    if let Some(repo) = repo_scope {
+        command.env_remove("GH_HOST");
+        command.env("GH_REPO", repo);
+    }
+    let err = command.exec();
+    ui::error(&format!("Failed to exec gh: {err}"));
+    ExitCode::FAILURE
 }
 
 /// Check if args represent a `gh auth token` invocation.
