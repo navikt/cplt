@@ -1305,7 +1305,7 @@ t.join(2)
         opts.allow_msbuild = true;
         let profile = write_real_profile(&opts);
 
-        // Simulate the MSBuild/dotnet build server: bind+connect a MSBuild<pid> socket
+        // Simulate MSBuild worker-node IPC: bind+connect a MSBuild<pid> socket
         let cmd = r#"python3 -c "
 import socket, os, threading, time
 SOCK = '/tmp/MSBuild99999'

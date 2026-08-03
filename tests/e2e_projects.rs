@@ -1431,12 +1431,29 @@ esac
     // .NET / MSBuild tests
     // ============================================================
 
-    fn dotnet_available() -> bool {
-        Command::new("dotnet")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    enum DotnetAvailability {
+        Missing,
+        /// SDK found, but its major version is below the `net8.0` the fixture targets.
+        TooOld(String),
+        Available,
+    }
+
+    fn dotnet_availability() -> DotnetAvailability {
+        let Ok(output) = Command::new("dotnet").arg("--version").output() else {
+            return DotnetAvailability::Missing;
+        };
+        if !output.status.success() {
+            return DotnetAvailability::Missing;
+        }
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let major = version
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok());
+        match major {
+            Some(m) if m >= 8 => DotnetAvailability::Available,
+            _ => DotnetAvailability::TooOld(version),
+        }
     }
 
     /// `dotnet build` works end-to-end inside the sandbox with --allow-msbuild.
@@ -1446,9 +1463,19 @@ esac
     #[test]
     fn project_dotnet_build_works_with_allow_msbuild() {
         require_sandbox!();
-        if !dotnet_available() {
-            eprintln!("SKIPPED: dotnet not available");
-            return;
+        match dotnet_availability() {
+            DotnetAvailability::Missing => {
+                eprintln!("SKIPPED: dotnet not available");
+                return;
+            }
+            DotnetAvailability::TooOld(found) => {
+                eprintln!(
+                    "SKIPPED: dotnet {found} found, but the fixture targets net8.0 \
+                     (requires SDK major version >= 8)"
+                );
+                return;
+            }
+            DotnetAvailability::Available => {}
         }
 
         let project = TempProject::scaffold_dotnet();
@@ -1457,12 +1484,20 @@ if BUILD_OUTPUT=$(dotnet build --nologo 2>&1); then
     echo "RESULT:dotnet_build:OK"
 else
     echo "DOTNET_ERROR: $BUILD_OUTPUT" >&2
+    # MSBuild's worker-node pipe is created under $TMPDIR (NamedPipeUtil.
+    # GetPlatformSpecificPipeName uses Path.GetTempPath(), which reads TMPDIR
+    # on Unix) — surface it so a sandbox_deny failure shows the actual path
+    # the sandbox needed to allow, not just the /tmp path we assume by default.
+    echo "DOTNET_TMPDIR: ${TMPDIR:-/tmp}" >&2
     case "$BUILD_OUTPUT" in
         *"Operation not permitted"*|*"not permitted"*|*"Permission denied"*)
             echo "RESULT:dotnet_build:FAIL:sandbox_deny"
             ;;
         *)
-            echo "RESULT:dotnet_build:OK:build_error_but_not_sandbox"
+            # An unrelated build failure (missing targeting pack, restore error,
+            # etc.) is still a failure — never report OK for a build that didn't
+            # succeed, or a red build could masquerade as a passing test.
+            echo "RESULT:dotnet_build:FAIL:build_error"
             ;;
     esac
     echo "RESULT:dotnet_run:FAIL:build_failed"
@@ -1490,8 +1525,17 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "dotnet_build");
-        assert_result_ok(&stdout, "dotnet_run");
+        // Include stderr (DOTNET_ERROR + DOTNET_TMPDIR) directly in the failing
+        // assertion so a CI failure shows the actual dotnet error and the
+        // observed TMPDIR/pipe location without needing a re-run.
+        assert!(
+            stdout.contains("RESULT:dotnet_build:OK"),
+            "Expected RESULT:dotnet_build:OK in output.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("RESULT:dotnet_run:OK"),
+            "Expected RESULT:dotnet_run:OK in output.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
     }
 
     /// Verify DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1 is injected inside the

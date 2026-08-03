@@ -2464,10 +2464,10 @@ fn profile_denies_exec_from_tmp() {
         !p.contains(".java_pid"),
         "Default profile must NOT contain .java_pid socket rules — JVM attach is opt-in"
     );
-    // Must NOT contain MSBuild build server socket rules by default (opt-in via --allow-msbuild)
+    // Must NOT contain MSBuild worker-node socket rules by default (opt-in via --allow-msbuild)
     assert!(
-        !p.contains("MSBuild"),
-        "Default profile must NOT contain MSBuild socket rules — MSBuild is opt-in"
+        !p.contains(r#"unix-socket (regex #"^/private/tmp/MSBuild"#),
+        "Default profile must NOT contain MSBuild worker-node socket rules — MSBuild is opt-in"
     );
 }
 
@@ -2587,26 +2587,26 @@ fn profile_allows_msbuild_when_flag_set() {
         allow_cache_exec_any: false,
         allow_browser: false,
     });
-    // Must allow unix socket bind+inbound+connect for the MSBuild build server (MSBuild<pid>)
-    // Three operations needed: bind (server creates socket), inbound (server accepts),
-    // outbound (client connects).
+    // Must allow unix socket bind+inbound+connect for the MSBuild worker-node
+    // pipe (MSBuild<pid>). Three operations needed: bind (worker node creates
+    // socket), inbound (worker node accepts), outbound (client connects).
     assert!(
         p.contains(
             r#"(allow network-bind (local unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#
         ),
-        "Profile must allow unix socket bind for MSBuild build server"
+        "Profile must allow unix socket bind for MSBuild worker-node IPC"
     );
     assert!(
         p.contains(
             r#"(allow network-inbound (local unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#
         ),
-        "Profile must allow unix socket inbound for MSBuild build server"
+        "Profile must allow unix socket inbound for MSBuild worker-node IPC"
     );
     assert!(
         p.contains(
             r#"(allow network-outbound (remote unix-socket (regex #"^/private/tmp/MSBuild[0-9]+$")))"#
         ),
-        "Profile must allow unix socket connect for MSBuild build server"
+        "Profile must allow unix socket connect for MSBuild worker-node IPC"
     );
     // Must NOT have broad subpath unix socket rules (would expose SSH agent)
     assert!(
