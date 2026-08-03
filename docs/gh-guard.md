@@ -77,11 +77,12 @@ git_push_prevention = true   # maps to [git_guard] enabled=true with defaults
 
 ### Security: Policy baked at launch
 
-The policy flags are baked into the wrapper script at sandbox launch time.
-The `gh-gate` subcommand receives `--scope-check`, `--block-auth-token`,
-`--unknown-command=block`, and `--allow-api-write`/`--no-allow-api-write` as
-CLI flags, preventing the agent from influencing policy by editing config files
-inside the sandbox.
+The policy flags, absolute path to the real `gh` binary, and verified repository
+scope are baked into the wrapper script at sandbox launch time. The `gh-gate`
+subcommand receives `--repo-scope`, `--scope-check`, `--block-auth-token`,
+`--unknown-command=block`, and `--allow-api-write`/`--no-allow-api-write` as CLI
+flags. Runtime working directories, nested repositories, Git configuration, and
+`PATH` cannot redefine the approved scope.
 
 ## How it works
 
@@ -94,7 +95,7 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 
 1. At sandbox launch (when scratch directory is enabled), cplt writes a small wrapper to `{scratch}/bin/gh`
 2. `{scratch}/bin` is prepended to PATH, shadowing the real `gh`
-3. The wrapper calls `cplt gh-gate --real-gh /path/to/gh -- <args>`
+3. The wrapper calls `cplt gh-gate --real-gh /path/to/gh --repo-scope owner/repo -- <args>`
 4. cplt evaluates the command against the policy table
 5. If allowed, `exec()` replaces the process with the real `gh` (zero overhead)
 6. If blocked, prints an error explaining why and exits non-zero
@@ -123,11 +124,12 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 When a command is classified as `ScopeCheck`, cplt verifies that the command
 targets the current repository:
 
-1. Detects the current repo from `git remote get-url origin`
-2. If the command has `-R`/`--repo` flag, compares it to current repo
-3. If `-R` matches (case-insensitive, `.git` suffix stripped) → allowed
-4. If `-R` targets a different repo → blocked
-5. If no `-R` flag → allowed (implicitly targets current repo)
+1. At sandbox startup, reads `remote.origin.url` from the project root using the trusted Git binary
+2. Ignores global/system config, config includes, and inherited `GIT_*` variables
+3. Bakes the verified `owner/repo` into the wrapper; unavailable scope remains fail-closed
+4. If the command has `-R`/`--repo`, compares it to the startup scope
+5. Rejects a conflicting `--hostname` or fully qualified non-GitHub API endpoint
+6. Sets `GH_REPO=github.com/owner/repo` and clears `GH_HOST` before executing `gh`
 
 ## Command classifications
 

@@ -459,7 +459,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             allow_api_write: ctx.gh_guard.allow_api_write,
         };
         return match crate::gh_proxy::gate(&rest, ctx.project_dir, &policy) {
-            Ok(()) => ExecExplain {
+            Ok(_) => ExecExplain {
                 decision: Decision::Allowed,
                 reason: "allowed by the gh guard.".to_string(),
                 fix: None,

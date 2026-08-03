@@ -258,7 +258,7 @@ Certain git operations are blocked to prevent persistence attacks that survive t
 | `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth token` provides credentials            |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked   | SSH agent socket denied — use HTTPS                               |
 | `git config` (local)               | ❌ Blocked   | `.git/config` is write-protected (prevents `url.*.insteadOf` hijacking) |
-| `git config --global`              | ❌ Blocked   | `~/.gitconfig` is read-only                                      |
+| `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
 | `git remote set-url`               | ❌ Blocked   | Writes to `.git/config`                                           |
 | `git submodule add`                | ❌ Blocked   | `.gitmodules` is write-protected (supply chain vector)            |
 | Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected (hooks run unsandboxed)          |

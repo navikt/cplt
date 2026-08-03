@@ -27,6 +27,17 @@ fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_cplt"))
 }
 
+fn binary_in_path(name: &str) -> PathBuf {
+    let system = PathBuf::from("/usr/bin").join(name);
+    if system.is_file() {
+        return system;
+    }
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH should be set"))
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("{name} should be available in PATH"))
+}
+
 /// Run `cplt gh-gate` with default block policy.
 /// Returns (stdout, stderr, exit_success).
 fn gh_gate(args: &[&str]) -> (String, String, bool) {
@@ -39,6 +50,8 @@ fn gh_gate_with_opts(args: &[&str], opts: &[&str]) -> (String, String, bool) {
     cmd.arg("gh-gate")
         .arg("--real-gh")
         .arg("/usr/bin/true") // if allowed, exec this harmless binary
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
         .args(opts)
         .arg("--")
         .args(args)
@@ -297,6 +310,244 @@ fn gh_gate_allows_same_repo_pr_close() {
     // navikt/cplt is the git remote of the test project dir
     let (_, _, ok) = gh_gate(&["pr", "close", "42", "-R", "navikt/cplt"]);
     assert!(ok, "same-repo pr close should be allowed");
+}
+
+#[test]
+fn gh_gate_rejects_nested_repo_retargeting() {
+    let temp = tempfile::tempdir().unwrap();
+    let git = binary_in_path("git");
+    assert!(
+        Command::new(&git)
+            .args(["init", "--quiet"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/evil-org/other.git"
+            ])
+            .current_dir(temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg("/usr/bin/true")
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["pr", "close", "42", "-R", "evil-org/other"])
+        .current_dir(temp.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    assert!(
+        !output.status.success(),
+        "nested repository must not replace startup scope: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn gh_gate_ignores_runtime_git_config_for_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let git = binary_in_path("git");
+    let run_git = |args: &[&str]| {
+        Command::new(&git)
+            .args(args)
+            .current_dir(temp.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git should run")
+    };
+
+    assert!(run_git(&["init", "--quiet"]).success());
+    assert!(
+        run_git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/navikt/cplt.git"
+        ])
+        .success()
+    );
+    assert_eq!(
+        cplt::gh_proxy::detect_current_repo(&git, temp.path()).unwrap(),
+        "navikt/cplt",
+        "startup detection must ignore local config includes"
+    );
+    let included = temp.path().join("included.gitconfig");
+    std::fs::write(
+        &included,
+        "[remote \"origin\"]\nurl = https://github.com/evil-org/other.git\n",
+    )
+    .unwrap();
+    assert!(
+        run_git(&[
+            "config",
+            "--local",
+            "include.path",
+            included.to_str().unwrap()
+        ])
+        .success()
+    );
+
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg("/usr/bin/true")
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["pr", "close", "42", "-R", "navikt/cplt"])
+        .current_dir(temp.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    assert!(
+        output.status.success(),
+        "local includes must not retarget scope: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn gh_gate_fails_closed_when_repo_scope_is_unavailable() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg("/usr/bin/true")
+        .arg("--")
+        .args(["pr", "comment", "42", "--body", "test"])
+        .current_dir(temp.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "missing repo scope must fail closed"
+    );
+    assert!(
+        stderr.contains("cannot verify target repository scope"),
+        "unexpected error: {stderr}"
+    );
+}
+
+#[test]
+fn gh_gate_pins_verified_repo_in_gh_repo() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf '%s|%s\\n' \"$GH_REPO\" \"${GH_HOST-}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&fake_gh)
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["pr", "comment", "42", "--body", "test"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("GH_REPO", "evil-org/other")
+        .env("GH_HOST", "evil.example")
+        .output()
+        .expect("cplt gh-gate should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "github.com/navikt/cplt|"
+    );
+}
+
+#[test]
+fn gh_gate_pins_verified_repo_for_allow_command() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fake_gh = temp.path().join("gh");
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf '%s|%s\\n' \"$GH_REPO\" \"${GH_HOST-}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&fake_gh)
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["repo", "view"])
+        .env("GH_REPO", "evil-org/other")
+        .env("GH_HOST", "evil.example")
+        .output()
+        .expect("cplt gh-gate should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "github.com/navikt/cplt|"
+    );
+}
+
+#[test]
+fn gh_gate_blocks_conflicting_hostname_flag() {
+    let (_, stderr, ok) = gh_gate(&[
+        "api",
+        "--hostname",
+        "evil.example",
+        "/repos/navikt/cplt/pulls",
+    ]);
+    assert!(!ok, "conflicting GitHub host must be blocked");
+    assert!(stderr.contains("outside the approved host"), "{stderr}");
+}
+
+#[test]
+fn gh_gate_blocks_conflicting_hostname_for_allow_command() {
+    let (_, stderr, ok) = gh_gate(&["--hostname", "evil.example", "repo", "view"]);
+    assert!(!ok, "allow command must not retarget the GitHub host");
+    assert!(stderr.contains("outside the approved host"), "{stderr}");
+}
+
+#[test]
+fn gh_gate_blocks_fully_qualified_external_api_endpoint() {
+    let (_, stderr, ok) = gh_gate(&["api", "https://evil.example/repos/navikt/cplt"]);
+    assert!(!ok, "external fully qualified API endpoint must be blocked");
+    assert!(
+        stderr.contains("outside 'https://api.github.com'"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn gh_gate_allows_fully_qualified_github_api_endpoint_in_scope() {
+    let (_, stderr, ok) = gh_gate(&["api", "https://api.github.com/repos/navikt/cplt"]);
+    assert!(
+        ok,
+        "official GitHub API endpoint should be allowed: {stderr}"
+    );
 }
 
 #[test]
@@ -1024,7 +1275,7 @@ mod sandbox_integration {
 
         // Create gh wrapper script (same as cplt would generate)
         let wrapper_content = format!(
-            "#!/bin/sh\nexec {cplt_str} gh-gate --real-gh /usr/bin/true --mode=block --scope-check --block-auth-token --unknown-command=block -- \"$@\"\n"
+            "#!/bin/sh\nexec {cplt_str} gh-gate --real-gh /usr/bin/true --repo-scope navikt/cplt --mode=block --scope-check --block-auth-token --unknown-command=block -- \"$@\"\n"
         );
         let bin_dir = tmp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
