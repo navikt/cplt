@@ -729,6 +729,9 @@ cplt exec -c "npm install && npm test"
 cplt is configured at two levels: **global** (developer preferences) and **per-repo** (team policy).
 
 ```bash
+# Browse and change settings interactively
+cplt settings
+
 # Set global preferences
 cplt config set sandbox.quiet true
 cplt config set proxy.blocked_domains "~/.config/cplt/blocked-domains.txt"
@@ -743,6 +746,12 @@ cplt config set --repo deny.paths "~/secrets"
 cplt config show      # show effective config (file + defaults)
 cplt config explain   # list all keys with descriptions
 ```
+
+`cplt settings` is the interactive editor: it has **Effective**, **Global**, and
+**Repository** views, search, staged changes, and an explicit confirmation before
+saving security-sensitive values. `cplt config` remains the stable non-interactive
+interface for scripts and CI. Repository proposals are still committed and approved
+separately with `cplt trust`; the editor never commits or auto-approves them.
 
 **Precedence** (highest to lowest):
 

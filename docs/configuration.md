@@ -13,7 +13,9 @@ List values are merged, so repeated `cplt config set` commands accumulate for
 
 ## Quick setup
 
-Use `cplt config set` to configure cplt without editing files:
+Use `cplt settings` to browse and change settings interactively. It stages edits,
+shows their source and security impact, and writes validated TOML atomically. Use
+`cplt config set` for scripts, CI, or a direct non-interactive edit:
 
 ```bash
 cplt config set sandbox.quiet true

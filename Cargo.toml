@@ -8,8 +8,10 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
 directories = "6.0.0"
 libc = "0.2"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = "1"
@@ -60,4 +62,3 @@ similar_names = "allow"               # domain-specific names (e.g. current/late
 manual_string_new = "allow"           # String::new() vs "".to_string() are both fine
 format_collect = "allow"              # hex formatting via map(format!).collect() is idiomatic
 unnested_or_patterns = "allow"        # explicit arms with comments are clearer for magic bytes
-
