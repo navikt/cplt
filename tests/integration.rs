@@ -432,7 +432,12 @@ mod macos_tests {
         .unwrap();
         fs::write(
             home.path().join(".gitconfig.local"),
-            "[user]\nname = cplt-test-user\n",
+            "[user]\nname = cplt-test-user\n[core]\nexcludesFile = ~/.gitignore_global\n",
+        )
+        .unwrap();
+        fs::write(
+            home.path().join(".gitignore_global"),
+            "ignored-by-cplt-test\n",
         )
         .unwrap();
 
@@ -443,11 +448,21 @@ mod macos_tests {
             home.path().display()
         );
         let (output, success) = run_sandboxed(&profile, &cmd);
+        let read_ignore_cmd = format!(
+            "cat '{}' 2>&1",
+            home.path().join(".gitignore_global").display()
+        );
+        let (ignore_output, ignore_success) = run_sandboxed(&profile, &read_ignore_cmd);
         let write_cmd = format!(
             "echo injected >> '{}' 2>&1; echo EXIT:$?",
             home.path().join(".gitconfig.local").display()
         );
         let (write_output, _) = run_sandboxed(&profile, &write_cmd);
+        let write_ignore_cmd = format!(
+            "echo injected >> '{}' 2>&1; echo EXIT:$?",
+            home.path().join(".gitignore_global").display()
+        );
+        let (write_ignore_output, _) = run_sandboxed(&profile, &write_ignore_cmd);
 
         fs::remove_file(&profile).ok();
         assert!(
@@ -455,8 +470,17 @@ mod macos_tests {
             "git should read ~/.gitconfig.local through the include: {output}"
         );
         assert!(
+            ignore_success && ignore_output.contains("ignored-by-cplt-test"),
+            "git's conventional global ignore file should be readable: {ignore_output}"
+        );
+        assert!(
             write_output.contains("Operation not permitted") || write_output.contains("EXIT:1"),
             "~/.gitconfig.local must remain read-only: {write_output}"
+        );
+        assert!(
+            write_ignore_output.contains("Operation not permitted")
+                || write_ignore_output.contains("EXIT:1"),
+            "~/.gitignore_global must remain read-only: {write_ignore_output}"
         );
     }
 

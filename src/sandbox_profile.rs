@@ -519,6 +519,10 @@ fn emit_system_access(
     );
     sbpl!(
         sb,
+        "(allow file-read* (literal \"{home}/.gitignore_global\"))"
+    );
+    sbpl!(
+        sb,
         "(allow file-read* (literal \"{home}/.config/git/config\"))"
     );
     sbpl!(sb);

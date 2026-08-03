@@ -777,9 +777,9 @@ NOTE:
         #[arg(long)]
         real_gh: PathBuf,
 
-        /// Path to the trusted git binary used for repository scope verification.
+        /// Repository scope captured before the sandboxed agent started.
         #[arg(long)]
-        real_git: PathBuf,
+        repo_scope: Option<String>,
 
         /// Enforcement mode: block, warn, or audit.
         #[arg(long, default_value = "block")]
@@ -2130,7 +2130,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::Doctor => run_doctor(),
             Command::GhGate {
                 real_gh,
-                real_git,
+                repo_scope,
                 mode,
                 scope_check,
                 no_scope_check,
@@ -2156,7 +2156,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     },
                     allow_api_write: allow_api_write && !no_allow_api_write,
                 };
-                run_gh_gate(&real_gh, &real_git, &args, &policy)
+                run_gh_gate(&real_gh, repo_scope.as_deref(), &args, &policy)
             }
             Command::GitGate {
                 real_git,
@@ -2535,7 +2535,7 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 /// If blocked, prints an error message and exits with code 1.
 fn run_gh_gate(
     real_gh: &Path,
-    real_git: &Path,
+    repo_scope: Option<&str>,
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
@@ -2546,10 +2546,9 @@ fn run_gh_gate(
         return serve_cached_gh_token();
     }
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match gh_proxy::gate_with_git(&arg_refs, &cwd, policy, real_git) {
+    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope) {
         Ok(approval) => exec_gh(real_gh, args, approval.repo_scope.as_deref()),
         Err(msg) => match policy.mode {
             config::EnforcementMode::Block => {
@@ -2576,6 +2575,7 @@ fn exec_gh(real_gh: &Path, args: &[String], repo_scope: Option<&str>) -> ExitCod
     let mut command = std::process::Command::new(real_gh);
     command.args(args);
     if let Some(repo) = repo_scope {
+        command.env_remove("GH_HOST");
         command.env("GH_REPO", repo);
     }
     let err = command.exec();

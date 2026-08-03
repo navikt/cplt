@@ -903,6 +903,14 @@ fn profile_grants_project_access() {
         !p.contains("(allow file-write* (literal \"/Users/test/.gitconfig.local\"))"),
         "Included user Git config must remain read-only"
     );
+    assert!(
+        p.contains("(allow file-read* (literal \"/Users/test/.gitignore_global\"))"),
+        "Global Git ignore file should be readable"
+    );
+    assert!(
+        !p.contains("(allow file-write* (literal \"/Users/test/.gitignore_global\"))"),
+        "Global Git ignore file must remain read-only"
+    );
 }
 
 #[test]

@@ -283,12 +283,14 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 
 - **Opt-in.** Both guards default to `enabled = false` (soft rollout). Out of the box cplt performs **no** gh/git command filtering — the fail-closed posture (block mode, default-deny unknown subcommands, scope check, `block_auth_token`, `allow_api_write=false`) only takes effect once an operator sets `gh_guard.enabled = true` / `git_guard.enabled = true` (or passes the equivalent flags). A user who assumes "cplt guards git" without opting in gets nothing.
 - **PATH-shim enforcement.** The guards work by writing `gh`/`git` shims into a scratch `bin/` dir and prepending it to `PATH`; the shim calls back into cplt for a policy decision before `exec`ing the real binary. The real `/usr/bin/git` and `/usr/bin/gh` are untouched, so any agent that invokes the binary by **absolute path** (`/usr/bin/git push`), **escapes the alias** (`\git`, `env git`), **resets `PATH`**, or **shells out from another runtime** (`subprocess.run(["/usr/bin/git", "push"])`) bypasses the guard entirely. Command classification (force-push detection, scope checks, `gh auth token` blocking, DELETE blocking) therefore only constrains a *cooperative* agent that goes through the shim — it is not a boundary against an adversarial one.
-- **Repository scope is pinned inside the shim.** Scope checks invoke the pre-resolved
-  Git binary directly and read only the local `remote.origin.url`, with config
-  includes and inherited `GIT_*` variables disabled. Successful checks set
-  `GH_REPO` before executing `gh`; failure to determine scope blocks the command.
-  This prevents a cooperative caller from retargeting the check through `PATH`,
-  `GIT_DIR`, config overrides, or a check/execute race.
+- **Repository scope is pinned at sandbox startup.** Before the agent starts, cplt
+  invokes the pre-resolved Git binary and reads only the project root's local
+  `remote.origin.url`, with config includes and inherited `GIT_*` variables disabled.
+  The verified scope is baked into the shim. Successful checks set a host-qualified
+  `GH_REPO`, clear `GH_HOST`, and reject conflicting hostname flags before executing
+  `gh`; failure to determine startup scope blocks the command. Runtime working
+  directories, nested repositories, mutable Git configuration, and environment
+  overrides therefore cannot retarget the check.
 
 The guards raise the bar against accidental and prompt-injected-but-cooperative misuse; they are not a substitute for the kernel-enforced filesystem/exec isolation that does hold against an adversarial agent. On the *network* side, proxy-forced mode (issues #53 / #117) is the kernel-backed complement: it forces all egress through the cplt proxy at the packet level rather than via tamperable `HTTPS_PROXY` env vars, so a bypassed `git push` / `gh api` write still has to traverse the proxy. Command-level intent (e.g. `GET` vs `DELETE` to `api.github.com`) remains invisible to a CONNECT proxy, so the guards and the proxy cover different layers.
 
@@ -333,13 +335,13 @@ By default, `cplt` clears the child process environment and re-adds only safe va
 
 **Deliberately blocked:** `AWS_*`, `AZURE_*`, `NPM_TOKEN`, `DATABASE_URL`, `VAULT_TOKEN`, `SSH_AUTH_SOCK`, Docker vars, CI tokens.
 
-**Git configuration:** `~/.gitconfig` and `~/.gitconfig.local` are exact
-read-only exceptions so normal Git and `gh` workflows can load conventional
-user configuration. The standard XDG Git config is also read-only (the
-`~/.config/git` directory on Linux because Landlock rules are recursive).
-Other include files remain blocked unless explicitly allowed. These files
-should not contain plaintext credentials; credential directories and SSH/GPG
-private keys remain denied.
+**Git configuration:** `~/.gitconfig`, `~/.gitconfig.local`, and
+`~/.gitignore_global` are exact read-only exceptions so normal Git and `gh`
+workflows can load conventional user configuration. The standard XDG Git config
+is also read-only (the `~/.config/git` directory on Linux because Landlock rules
+are recursive). Other include files remain blocked unless explicitly allowed.
+These files should not contain plaintext credentials; credential directories and
+SSH/GPG private keys remain denied.
 
 **Escape hatch:** `--inherit-env` disables sanitization and inherits all env vars (still strips `ENV_ALWAYS_DENY`). This is dangerous and should only be used for debugging.
 
