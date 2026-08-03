@@ -2490,7 +2490,7 @@ fn profile_denies_exec_from_tmp() {
     );
     // Must NOT contain MSBuild worker-node socket rules by default (opt-in via --allow-msbuild)
     assert!(
-        !p.contains(r#"unix-socket (regex #"^/private/tmp/MSBuild"#),
+        !p.contains("MSBuild[0-9]+$"),
         "Default profile must NOT contain MSBuild worker-node socket rules — MSBuild is opt-in"
     );
 }
