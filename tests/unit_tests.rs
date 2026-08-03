@@ -900,7 +900,7 @@ fn profile_grants_project_access() {
         "Included user Git config should be readable"
     );
     assert!(
-        !p.contains("(allow file-write* (literal \"/Users/test/.gitconfig.local\"))"),
+        p.contains("(deny file-write* (literal \"/Users/test/.gitconfig.local\"))"),
         "Included user Git config must remain read-only"
     );
     assert!(
@@ -908,8 +908,16 @@ fn profile_grants_project_access() {
         "Global Git ignore file should be readable"
     );
     assert!(
-        !p.contains("(allow file-write* (literal \"/Users/test/.gitignore_global\"))"),
+        p.contains("(deny file-write* (literal \"/Users/test/.gitignore_global\"))"),
         "Global Git ignore file must remain read-only"
+    );
+    assert!(
+        p.contains("(deny file-write* (literal \"/Users/test/.gitconfig\"))"),
+        "Global Git config must remain read-only"
+    );
+    assert!(
+        p.contains("(deny file-write* (literal \"/Users/test/.config/git/config\"))"),
+        "XDG Git config must remain read-only"
     );
 }
 

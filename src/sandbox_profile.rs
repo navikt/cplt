@@ -971,6 +971,16 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
         sbpl!(sb, "(deny file-read* (literal \"{home}/{file}\"))");
         sbpl!(sb, "(deny file-write* (literal \"{home}/{file}\"))");
     }
+    // These files must stay read-only even when an overlapping path is writable
+    // (for example a temporary HOME under /private/var/folders).
+    for file in [
+        ".gitconfig",
+        ".gitconfig.local",
+        ".gitignore_global",
+        ".config/git/config",
+    ] {
+        sbpl!(sb, "(deny file-write* (literal \"{home}/{file}\"))");
+    }
     for path in extra_deny {
         let p = path.to_string_lossy();
         sbpl!(sb, "(deny file-read* (subpath \"{p}\"))");
