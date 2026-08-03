@@ -425,21 +425,22 @@ mod macos_tests {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
         let home = tempfile::tempdir().unwrap();
+        let local_config = home.path().join(".gitconfig.local");
+        let global_ignore = home.path().join(".gitignore_global");
         fs::write(
             home.path().join(".gitconfig"),
-            "[include]\npath = ~/.gitconfig.local\n",
+            format!("[include]\npath = {}\n", local_config.display()),
         )
         .unwrap();
         fs::write(
-            home.path().join(".gitconfig.local"),
-            "[user]\nname = cplt-test-user\n[core]\nexcludesFile = ~/.gitignore_global\n",
+            &local_config,
+            format!(
+                "[user]\nname = cplt-test-user\n[core]\nexcludesFile = {}\n",
+                global_ignore.display()
+            ),
         )
         .unwrap();
-        fs::write(
-            home.path().join(".gitignore_global"),
-            "ignored-by-cplt-test\n",
-        )
-        .unwrap();
+        fs::write(&global_ignore, "ignored-by-cplt-test\n").unwrap();
 
         let opts = default_opts(&project, home.path());
         let profile = write_real_profile(&opts);
@@ -450,19 +451,16 @@ mod macos_tests {
             home.path().display()
         );
         let (output, success) = run_sandboxed(&profile, &cmd);
-        let read_ignore_cmd = format!(
-            "cat '{}' 2>&1",
-            home.path().join(".gitignore_global").display()
-        );
+        let read_ignore_cmd = format!("cat '{}' 2>&1", global_ignore.display());
         let (ignore_output, ignore_success) = run_sandboxed(&profile, &read_ignore_cmd);
         let write_cmd = format!(
             "echo injected >> '{}' 2>&1; echo EXIT:$?",
-            home.path().join(".gitconfig.local").display()
+            local_config.display()
         );
         let (write_output, _) = run_sandboxed(&profile, &write_cmd);
         let write_ignore_cmd = format!(
             "echo injected >> '{}' 2>&1; echo EXIT:$?",
-            home.path().join(".gitignore_global").display()
+            global_ignore.display()
         );
         let (write_ignore_output, _) = run_sandboxed(&profile, &write_ignore_cmd);
 
