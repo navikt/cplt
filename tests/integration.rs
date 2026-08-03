@@ -424,11 +424,12 @@ mod macos_tests {
     fn real_profile_allows_local_git_config_and_global_ignore() {
         require_sandbox!();
         let project = fs::canonicalize(".").unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let local_config = home.path().join(".gitconfig.local");
-        let global_ignore = home.path().join(".gitignore_global");
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp_home.path()).unwrap();
+        let local_config = home.join(".gitconfig.local");
+        let global_ignore = home.join(".gitignore_global");
         fs::write(
-            home.path().join(".gitconfig"),
+            home.join(".gitconfig"),
             format!("[include]\npath = {}\n", local_config.display()),
         )
         .unwrap();
@@ -442,7 +443,7 @@ mod macos_tests {
         .unwrap();
         fs::write(&global_ignore, "ignored-by-cplt-test\n").unwrap();
 
-        let opts = default_opts(&project, home.path());
+        let opts = default_opts(&project, &home);
         let profile = write_real_profile(&opts);
         let read_config_cmd = format!("cat '{}' 2>&1", local_config.display());
         let (config_output, config_success) = run_sandboxed(&profile, &read_config_cmd);
