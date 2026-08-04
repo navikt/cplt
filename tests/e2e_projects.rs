@@ -331,9 +331,17 @@ fun main() {
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            // Explicit so the test's intended fake "copilot" can't be silently
+            // overridden by a `sandbox.agent` set in the real ~/.config/cplt
+            // config.toml (CLI --agent takes precedence over config).
+            .args(["--agent", "copilot"])
             .args(extra_args)
             .args(["--", "--version"]) // fake copilot ignores this
             .env("PATH", &new_path)
+            // Point at a config file that doesn't exist so a developer's real
+            // ~/.config/cplt/config.toml (allow_docker, allow_msbuild, etc.)
+            // can never leak into these tests' sandbox behavior.
+            .env("CPLT_CONFIG", "/dev/null/nonexistent")
             .output()
             .expect("cplt should run");
 
@@ -938,8 +946,10 @@ if [ "${GIT_TERMINAL_PROMPT:-}" = "0" ]; then echo "RESULT:env_hardening_git:OK"
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--agent", "copilot"])
             .args(["--", "--version"])
             .env("PATH", &new_path)
+            .env("CPLT_CONFIG", "/dev/null/nonexistent")
             .env("AWS_SECRET_ACCESS_KEY", "FAKESECRET")
             .env("DATABASE_URL", "postgres://localhost/prod")
             .env("NPM_TOKEN", "npm_faketoken")
@@ -2148,8 +2158,10 @@ if [ -n "${CLASSPATH:-}" ]; then echo "RESULT:env_classpath:OK"; else echo "RESU
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--agent", "copilot"])
             .args(["--", "--version"])
             .env("PATH", &new_path)
+            .env("CPLT_CONFIG", "/dev/null/nonexistent")
             .env("JAVA_HOME", "/opt/java/21")
             .env("MAVEN_OPTS", "-Xmx512m -Djava.io.tmpdir=/tmp")
             .env("JAVA_TOOL_OPTIONS", "-Dfile.encoding=UTF-8")
@@ -2364,8 +2376,10 @@ esac
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
             .args(["--scratch-dir"])
+            .args(["--agent", "copilot"])
             .args(["--", "--version"])
             .env("PATH", &new_path)
+            .env("CPLT_CONFIG", "/dev/null/nonexistent")
             .env("JAVA_TOOL_OPTIONS", "-Xmx256m")
             .output()
             .expect("cplt should run");

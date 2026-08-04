@@ -2297,6 +2297,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         .filter(|p| p.is_dir())
         .filter(|p| !crate::is_unsafe_root(p, &home_dir));
 
+    // Discover DOTNET_ROOT for .NET SDK read access when installed outside
+    // TOOL_READ_DIRS (e.g. actions/setup-dotnet hostedtoolcache, or
+    // dotnet-install.sh into a custom directory under $HOME).
+    let dotnet_root_dir = std::env::var("DOTNET_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .filter(|p| !crate::is_unsafe_root(p, &home_dir));
+
     // Compute agent-specific sandbox directories
     let agent_dirs = active_agent.config_dirs(&home_dir);
 
@@ -2340,6 +2349,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         allow_tmp_exec: resolved.allow_tmp_exec,
         copilot_install_dir: copilot_install_dir.as_deref(),
         java_home: java_home_dir.as_deref(),
+        dotnet_root: dotnet_root_dir.as_deref(),
         git_hooks_path: git_hooks_path.as_deref(),
         git_common_dir: git_common_dir.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
@@ -2791,6 +2801,15 @@ fn prepare_shell_sandbox(
         .filter(|p| p.is_dir())
         .filter(|p| !crate::is_unsafe_root(p, home_dir));
 
+    // Discover DOTNET_ROOT for .NET SDK read access when installed outside
+    // TOOL_READ_DIRS (e.g. actions/setup-dotnet hostedtoolcache, or
+    // dotnet-install.sh into a custom directory under $HOME).
+    let dotnet_root_dir = std::env::var("DOTNET_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .filter(|p| !crate::is_unsafe_root(p, home_dir));
+
     let agent_dirs = active_agent.config_dirs(home_dir);
     for dir in &agent_dirs {
         if !dir.path.exists() {
@@ -2824,6 +2843,7 @@ fn prepare_shell_sandbox(
         // shell/check have no agent install dir to grant special access to
         copilot_install_dir: None,
         java_home: java_home_dir.as_deref(),
+        dotnet_root: dotnet_root_dir.as_deref(),
         git_hooks_path: git_hooks_path.as_deref(),
         git_common_dir: git_common_dir.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,

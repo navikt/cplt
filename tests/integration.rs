@@ -405,6 +405,7 @@ mod macos_tests {
             allow_tmp_exec: false,
             copilot_install_dir: None,
             java_home: None,
+            dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
             allow_gpg_signing: false,

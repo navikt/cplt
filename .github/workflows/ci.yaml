@@ -91,6 +91,19 @@ jobs:
       - name: Install Gradle (for Gradle sandbox tests)
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # ratchet:gradle/actions/setup-gradle@v6.2.0
 
+      - name: Install .NET SDK (for MSBuild sandbox tests)
+        # macos-latest is an arm64 runner. Without this, the dotnet e2e test falls
+        # back to whatever's pre-baked into the runner image at /usr/local/bin —
+        # historically an x64 build needing Rosetta translation, which a sandboxed
+        # process can't complete (`Operation not permitted` on exec, before the
+        # MSBuild worker-node socket rule is ever reached). Installing an
+        # arch-native SDK here sidesteps that. It lands under $DOTNET_ROOT in
+        # ~/hostedtoolcache, which the sandbox separately allowlists for
+        # read/dylib access (see emit_dotnet_root in sandbox_profile.rs).
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # ratchet:actions/setup-dotnet@v6.0.0
+        with:
+          dotnet-version: '8.0.x'
+
       - name: Run all tests (skips fail the job)
         # CPLT_TEST_REQUIRE_SANDBOX=1 makes require_sandbox! panic instead of skip,
         # so a missing/broken sandbox-exec (a Seatbelt regression on the runner)

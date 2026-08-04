@@ -241,7 +241,10 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "NPM_CONFIG_USERCONFIG", // path to a custom .npmrc file (not the file itself — no auth tokens)
     // .NET / dotnet CLI
     "DOTNET_CLI_HOME", // override dotnet CLI state dir (default ~/.dotnet)
-    "DOTNET_ROOT",     // override SDK install location (e.g. Homebrew /usr/local/share/dotnet)
+    // override SDK install location (e.g. Homebrew /usr/local/share/dotnet, or
+    // ~/hostedtoolcache via actions/setup-dotnet — the same path also grants
+    // sandbox read/dylib access, see sandbox_profile.rs's emit_dotnet_root).
+    "DOTNET_ROOT",
     // Locale
     "LANG",
     "LANGUAGE",

@@ -65,6 +65,11 @@ pub struct ProfileOptions<'a> {
     /// Needed when Java is installed outside TOOL_READ_DIRS (e.g. ~/hostedtoolcache,
     /// sdkman, or other version managers).
     pub java_home: Option<&'a Path>,
+    /// DOTNET_ROOT directory for SDK read + dylib loading.
+    /// Needed when the .NET SDK is installed outside TOOL_READ_DIRS (e.g.
+    /// ~/hostedtoolcache via actions/setup-dotnet, or dotnet-install.sh into
+    /// a custom directory under $HOME).
+    pub dotnet_root: Option<&'a Path>,
     /// Global git hooks directory from `core.hooksPath`.
     /// Git needs to read and execute hooks from this directory for commits.
     pub git_hooks_path: Option<&'a Path>,
@@ -161,6 +166,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     );
     emit_copilot_install(&mut sb, opts.copilot_install_dir);
     emit_java_home(&mut sb, opts.java_home);
+    emit_dotnet_root(&mut sb, opts.dotnet_root);
     emit_electron_app(&mut sb, opts.electron_app_dir);
     emit_system_files(&mut sb);
     emit_temp_rules(
@@ -789,6 +795,20 @@ fn emit_java_home(sb: &mut String, java_home: Option<&Path>) {
     if let Some(dir) = java_home {
         let p = dir.to_string_lossy();
         sbpl!(sb, ";; JAVA_HOME — JDK read + dylib loading");
+        sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
+        sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
+        sbpl!(sb);
+    }
+}
+
+/// Allow reading and loading .NET SDK libraries from DOTNET_ROOT.
+/// Needed when the SDK is installed outside TOOL_READ_DIRS — e.g.
+/// actions/setup-dotnet's ~/hostedtoolcache, or dotnet-install.sh into a
+/// custom directory under $HOME.
+fn emit_dotnet_root(sb: &mut String, dotnet_root: Option<&Path>) {
+    if let Some(dir) = dotnet_root {
+        let p = dir.to_string_lossy();
+        sbpl!(sb, ";; DOTNET_ROOT — SDK read + dylib loading");
         sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
         sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
         sbpl!(sb);
@@ -1436,6 +1456,7 @@ mod tests {
             allow_tmp_exec: false,
             copilot_install_dir: None,
             java_home: None,
+            dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
             allow_gpg_signing: false,
