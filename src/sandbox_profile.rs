@@ -801,16 +801,23 @@ fn emit_java_home(sb: &mut String, java_home: Option<&Path>) {
     }
 }
 
-/// Allow reading and loading .NET SDK libraries from DOTNET_ROOT.
+/// Allow executing the dotnet host and loading .NET SDK libraries from DOTNET_ROOT.
 /// Needed when the SDK is installed outside TOOL_READ_DIRS — e.g.
 /// actions/setup-dotnet's ~/hostedtoolcache, or dotnet-install.sh into a
 /// custom directory under $HOME.
 fn emit_dotnet_root(sb: &mut String, dotnet_root: Option<&Path>) {
     if let Some(dir) = dotnet_root {
         let p = dir.to_string_lossy();
-        sbpl!(sb, ";; DOTNET_ROOT — SDK read + dylib loading");
+        sbpl!(
+            sb,
+            ";; DOTNET_ROOT — dotnet host exec + SDK read/dylib loading"
+        );
         sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
         sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
+        // DOTNET_ROOT may be ~/.dotnet, whose writable CLI-state rule denies
+        // process execution. Re-allow only the trusted host, and keep it read-only.
+        sbpl!(sb, "(allow process-exec (literal \"{p}/dotnet\"))");
+        sbpl!(sb, "(deny file-write* (literal \"{p}/dotnet\"))");
         sbpl!(sb);
     }
 }

@@ -4245,9 +4245,9 @@ fn profile_no_copilot_install_dir_omits_section() {
 
 #[test]
 fn profile_allows_dotnet_root_when_set() {
-    // Simulates a .NET SDK installed outside TOOL_READ_DIRS, e.g.
-    // actions/setup-dotnet's ~/hostedtoolcache.
-    let dotnet_root = "/Users/test/hostedtoolcache/dotnet/8.0.100/arm64";
+    // Simulates actions/setup-dotnet installing the SDK in the writable
+    // dotnet CLI state directory, whose broad process-exec rule is denied.
+    let dotnet_root = "/Users/test/.dotnet";
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -4291,6 +4291,24 @@ fn profile_allows_dotnet_root_when_set() {
             "(allow file-map-executable (subpath \"{dotnet_root}\"))"
         )),
         "Profile must allow file-map-executable for DOTNET_ROOT (hostfxr/dylib loading)"
+    );
+    let exec_deny = p
+        .find(&format!("(deny process-exec (subpath \"{dotnet_root}\"))"))
+        .expect("writable ~/.dotnet must deny broad process execution");
+    let host_allow = p
+        .find(&format!(
+            "(allow process-exec (literal \"{dotnet_root}/dotnet\"))"
+        ))
+        .expect("DOTNET_ROOT must allow executing the dotnet host");
+    assert!(
+        host_allow > exec_deny,
+        "The narrow dotnet host allow must override the broad ~/.dotnet exec deny"
+    );
+    assert!(
+        p.contains(&format!(
+            "(deny file-write* (literal \"{dotnet_root}/dotnet\"))"
+        )),
+        "The executable dotnet host must remain read-only"
     );
 }
 
