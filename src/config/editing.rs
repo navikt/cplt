@@ -1,6 +1,9 @@
 //! TOML document manipulation for `cplt config set/unset/add`.
 
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::error::ConfigError;
 use super::path::{config_path, expand_tilde};
@@ -241,6 +244,155 @@ pub fn unset_value_in_doc(doc: &mut toml_edit::DocumentMut, key_info: &ConfigKey
     }
 }
 
+/// Returns the security confirmation required to write `value`, if any.
+///
+/// This is shared by the scriptable config command and interactive settings UI
+/// so neither can silently enable a setting that weakens the sandbox.
+pub fn security_confirmation(key_info: &ConfigKeyInfo, value: &str, unset: bool) -> Option<String> {
+    if unset {
+        return None;
+    }
+    if key_info.section == "sandbox"
+        && key_info.key == "preset"
+        && let Some(preset) = super::types::Preset::from_name(value)
+    {
+        let enabled = preset.enabled_dangerous_names();
+        if !enabled.is_empty() {
+            return Some(format!(
+                "enables dangerous settings ({})",
+                enabled.join(", ")
+            ));
+        }
+    }
+    if key_info.dangerous && value == "true" {
+        return Some("weakens sandbox security".to_string());
+    }
+    let weakens_security = matches!(
+        (key_info.section, key_info.key, value),
+        ("proxy", "enabled" | "forced" | "default_allowlist", "false")
+            | ("sandbox", "validate" | "audit", "false")
+            | ("sandbox", "use_bubblewrap", "false")
+            | (
+                "gh_guard",
+                "enabled" | "scope_check" | "block_auth_token",
+                "false"
+            )
+            | (
+                "git_guard",
+                "enabled" | "prevent_push" | "prevent_force_push",
+                "false"
+            )
+            | ("gh_guard", "inject_token" | "allow_api_write", "true")
+            | ("gh_guard", "unknown_command", "allow")
+            | ("gh_guard" | "git_guard", "mode", "warn" | "audit")
+    );
+    weakens_security.then(|| "weakens sandbox security".to_string())
+}
+
+/// Validate a global config document with the same typed parsing and runtime
+/// merge used when launching the sandbox.
+pub fn validate_global_document(doc: &toml_edit::DocumentMut) -> Result<(), ConfigError> {
+    let config = super::types::Config::parse(&doc.to_string())?;
+    config.merge_with_no_proxy_env(super::types::CliFlags::default(), None)?;
+    Ok(())
+}
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically write a private config document using a unique same-directory
+/// temp file. Existing permissions are preserved; new files default to 0600.
+pub fn write_document_atomically(
+    path: &Path,
+    doc: &toml_edit::DocumentMut,
+) -> Result<(), ConfigError> {
+    write_document_atomically_with_mode(path, doc, 0o600)
+}
+
+/// Atomically write a repository config document. Existing permissions are
+/// preserved; a new repository file defaults to 0644.
+pub fn write_repo_document_atomically(
+    path: &Path,
+    doc: &toml_edit::DocumentMut,
+) -> Result<(), ConfigError> {
+    write_document_atomically_with_mode(path, doc, 0o644)
+}
+
+fn write_document_atomically_with_mode(
+    path: &Path,
+    doc: &toml_edit::DocumentMut,
+    default_mode: u32,
+) -> Result<(), ConfigError> {
+    let output = doc.to_string();
+    if output.parse::<toml::Table>().is_err() {
+        return Err(ConfigError::InvalidOutput);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(ConfigError::CreateDir)?;
+    }
+    let mode = existing_or_default_mode(path, default_mode);
+    let (temp, mut file) = create_unique_temp_file(path, mode)?;
+    let write_result = file
+        .write_all(output.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(source) = write_result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ConfigError::Write { path: temp, source });
+    }
+    if let Err(source) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
+}
+
+fn create_unique_temp_file(
+    path: &Path,
+    mode: u32,
+) -> Result<(PathBuf, std::fs::File), ConfigError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    for _ in 0..100 {
+        let id = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), id));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        match options.open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(ConfigError::Write { path: temp, source }),
+        }
+    }
+    Err(ConfigError::Validation(format!(
+        "cannot allocate a unique temporary file for {}",
+        path.display()
+    )))
+}
+
+#[cfg(unix)]
+fn existing_or_default_mode(path: &Path, default_mode: u32) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .unwrap_or(default_mode)
+}
+
+#[cfg(not(unix))]
+fn existing_or_default_mode(_path: &Path, default_mode: u32) -> u32 {
+    default_mode
+}
+
 /// Read the current display value for a key from a toml_edit document.
 /// Returns `None` if the key is not set.
 pub fn get_value_from_doc(
@@ -303,26 +455,10 @@ impl ConfigSetOp {
         }
     }
 
-    /// Write the document back, creating parent dirs if needed.
-    /// Only verifies the result is valid TOML (not full key validation —
-    /// an existing typo elsewhere shouldn't block a valid set operation).
+    /// Validate and write the document back, creating parent dirs if needed.
     pub fn write_document(&self, doc: &toml_edit::DocumentMut) -> Result<(), ConfigError> {
-        let output = doc.to_string();
-
-        // Sanity check: the result must still be valid TOML
-        if output.parse::<toml::Table>().is_err() {
-            return Err(ConfigError::InvalidOutput);
-        }
-
-        // Create parent dirs
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(ConfigError::CreateDir)?;
-        }
-
-        std::fs::write(&self.path, output).map_err(|e| ConfigError::Write {
-            path: self.path.clone(),
-            source: e,
-        })
+        validate_global_document(doc)?;
+        write_document_atomically(&self.path, doc)
     }
 }
 
@@ -478,6 +614,107 @@ mod tests {
         unset_value_in_doc(&mut doc, info);
         let result = doc.to_string();
         assert!(result.contains("validate = true"));
+    }
+
+    #[test]
+    fn security_confirmation_covers_dangerous_key_and_preset() {
+        let docker = lookup_key("sandbox.allow_docker").unwrap();
+        assert!(security_confirmation(docker, "true", false).is_some());
+        assert!(security_confirmation(docker, "false", false).is_none());
+
+        let preset = lookup_key("sandbox.preset").unwrap();
+        assert!(security_confirmation(preset, "permissive", false).is_some());
+        assert!(security_confirmation(preset, "strict", false).is_none());
+    }
+
+    #[test]
+    fn security_confirmation_covers_disabled_protections_and_permissive_modes() {
+        for (key, value) in [
+            ("gh_guard.scope_check", "false"),
+            ("gh_guard.block_auth_token", "false"),
+            ("gh_guard.unknown_command", "allow"),
+            ("git_guard.prevent_push", "false"),
+            ("git_guard.mode", "warn"),
+        ] {
+            let info = lookup_key(key).unwrap();
+            assert!(
+                security_confirmation(info, value, false).is_some(),
+                "{key}={value} should require confirmation"
+            );
+        }
+    }
+
+    #[test]
+    fn global_validation_rejects_invalid_typed_and_runtime_values() {
+        for input in [
+            "[sandbox]\npreset = \"invalid\"\n",
+            "[proxy]\nlog_level = \"invalid\"\n",
+            "[proxy]\nupstream = \"https://wrong-scheme.example\"\n",
+        ] {
+            let doc = input.parse::<toml_edit::DocumentMut>().unwrap();
+            assert!(validate_global_document(&doc).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn atomic_write_preserves_valid_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let doc = "[sandbox]\nquiet = true\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        write_document_atomically(&path, &doc).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), doc.to_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[sandbox]\nquiet = false\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let doc = "[sandbox]\nquiet = true\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+
+        write_document_atomically(&path, &doc).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_do_not_share_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let doc = format!("[proxy]\ntimeout = {}\n", index + 1)
+                        .parse::<toml_edit::DocumentMut>()
+                        .unwrap();
+                    write_document_atomically(&path, &doc)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.parse::<toml::Table>().is_ok());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
     }
 
     #[test]
