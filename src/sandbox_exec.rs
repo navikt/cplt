@@ -97,6 +97,23 @@ fn configure_command(
         }
     }
 
+    // Default DOTNET_CLI_HOME to the already-resolved, already-validated sandbox
+    // home dir. Newer .NET SDKs no longer fall back to $HOME when resolving
+    // their CLI home directory, and their fallback (a getpwuid-based lookup)
+    // fails inside the sandbox — without DOTNET_CLI_HOME set, `dotnet build`
+    // crashes at startup with "The user's home directory could not be
+    // determined" before it ever reaches the project. Skipped when the parent
+    // env already has a DOTNET_CLI_HOME (it's in ENV_ALLOWLIST, so it would
+    // otherwise pass through unchanged) — the user's own value may legitimately
+    // differ from HOME (e.g. a relocated CLI state dir) and must not be
+    // clobbered.
+    let user_dotnet_cli_home = parent_env
+        .iter()
+        .any(|(k, v)| k == "DOTNET_CLI_HOME" && !v.is_empty());
+    if !user_dotnet_cli_home {
+        cmd.env("DOTNET_CLI_HOME", home_dir);
+    }
+
     // Tell mise to ignore config files in ancestor directories that the sandbox blocks.
     let ignored = compute_mise_ignored_paths(project_dir, home_dir);
     if !ignored.is_empty() {
