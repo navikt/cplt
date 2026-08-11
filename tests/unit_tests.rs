@@ -3345,6 +3345,25 @@ fn env_opencode_claude_config_dir_respects_user_override() {
 }
 
 #[test]
+fn env_opencode_claude_config_dir_empty_is_treated_as_unset() {
+    // An empty CLAUDE_CONFIG_DIR in parent env must not prevent injection —
+    // the plugin would resolve it to a relative "transcripts/" path and hit EACCES.
+    let parent = make_env(&[("HOME", "/home/test"), ("CLAUDE_CONFIG_DIR", "")]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+
+    let matches: Vec<_> = env
+        .vars
+        .iter()
+        .filter(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+        .collect();
+    assert_eq!(matches.len(), 1, "exactly one CLAUDE_CONFIG_DIR entry");
+    assert_eq!(
+        matches[0].1,
+        "/home/test/.local/state/opencode/claude-config"
+    );
+}
+
+#[test]
 fn env_claude_config_dir_not_injected_for_other_agents() {
     for agent in [cplt::agent::Agent::Copilot, cplt::agent::Agent::Claude] {
         let parent = make_env(&[("HOME", "/home/test"), ("PATH", "/usr/bin")]);
