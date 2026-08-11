@@ -135,6 +135,36 @@ pub fn build_sandbox_env(
         }
     }
 
+    // The oh-my-openagent OpenCode plugin implements Claude Code hooks and writes
+    // transcripts to $CLAUDE_CONFIG_DIR/transcripts (default ~/.claude), which the
+    // sandbox denies for non-Claude agents — the append fails with EACCES and the
+    // OpenCode server aborts the prompt. Redirect the plugin's config dir into the
+    // OpenCode state dir (write-allowed, auto-created at startup) so the hooks
+    // feature works inside the sandbox. A user-set CLAUDE_CONFIG_DIR is respected;
+    // they are expected to --allow-write that path themselves.
+    if agent == Agent::OpenCode {
+        // An empty CLAUDE_CONFIG_DIR is treated as unset: the plugin would resolve
+        // it to a relative "transcripts/" path inside the project and hit EACCES.
+        let user_set = extra_pass_env.iter().any(|v| v == "CLAUDE_CONFIG_DIR")
+            || parent_env
+                .iter()
+                .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && !v.is_empty());
+        if !user_set && let Some((_, home)) = parent_env.iter().find(|(k, _)| k == "HOME") {
+            // Drop any empty entry the allowlist may have passed through.
+            env.vars.retain(|(k, _)| k != "CLAUDE_CONFIG_DIR");
+            let state_base = parent_env
+                .iter()
+                .find(|(k, _)| k == "XDG_STATE_HOME")
+                .map(|(_, v)| v.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{home}/.local/state"));
+            env.vars.push((
+                "CLAUDE_CONFIG_DIR".to_string(),
+                format!("{state_base}/opencode/claude-config"),
+            ));
+        }
+    }
+
     // Redirect temp directories to scratch dir if provided.
     // --scratch-dir means "redirect TMPDIR to the scratch dir" — this overrides any
     // inherited or allowlisted TMPDIR value. The user can prevent this for a specific

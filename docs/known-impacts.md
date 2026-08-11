@@ -500,6 +500,8 @@ AI agents and their third-party packages often send usage analytics and crash re
 
 For the `oh-my-openagent` OpenCode plugin specifically, `OMO_DISABLE_POSTHOG=1` prevents PostHog from being initialised, so no network calls are made and no errors appear.
 
+> **oh-my-openagent transcripts:** the plugin's Claude Code hooks feature writes transcripts to `$CLAUDE_CONFIG_DIR/transcripts` (default `~/.claude`), which the sandbox denies for non-Claude agents — the write fails with `EACCES` and OpenCode aborts the prompt. cplt therefore injects `CLAUDE_CONFIG_DIR=<XDG_STATE_HOME>/opencode/claude-config` (falling back to `~/.local/state/opencode/claude-config` when `XDG_STATE_HOME` is unset) for OpenCode sessions, into the write-allowed OpenCode state dir. If you set `CLAUDE_CONFIG_DIR` yourself, cplt respects it — add that path to `allow.write` if it lives outside the OpenCode dirs.
+
 **If you use `allowed_domains` (allowlist mode):** The proxy blocklist is not consulted in this mode — the env var injection still suppresses telemetry silently.
 
 **Impact:** None — telemetry is non-essential and the agent functions normally without it.
