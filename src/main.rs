@@ -2811,6 +2811,14 @@ fn prepare_shell_sandbox(
         }
     }
 
+    // See the agent-path call site: guarded Gradle init script so sandboxed
+    // builds keep the preferIPv4Stack workaround where JAVA_TOOL_OPTIONS is
+    // lost in plugin-managed worker forks.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = gradle_init::ensure_init_script(home_dir);
+    }
+
     let proxy_handle = start_proxy_if_enabled(resolved, cli, config_path, active_agent)?;
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
 
