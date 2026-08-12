@@ -4310,6 +4310,27 @@ fn profile_allows_dotnet_root_when_set() {
         )),
         "The executable dotnet host must remain read-only"
     );
+    // MSBuild forks compiler workers (csc, VBCSCompiler) straight out of
+    // {DOTNET_ROOT}/sdk/<ver>/Roslyn/bincore, and copies apphost templates
+    // out of sdk/shared — both need exec re-allowed over the broad
+    // ~/.dotnet deny, same pattern as the host binary above.
+    for subdir in ["sdk", "shared"] {
+        let sub_allow = p
+            .find(&format!(
+                "(allow process-exec (subpath \"{dotnet_root}/{subdir}\"))"
+            ))
+            .unwrap_or_else(|| panic!("DOTNET_ROOT/{subdir} must allow process-exec"));
+        assert!(
+            sub_allow > exec_deny,
+            "The {subdir} exec allow must override the broad ~/.dotnet exec deny"
+        );
+        assert!(
+            p.contains(&format!(
+                "(deny file-write* (subpath \"{dotnet_root}/{subdir}\"))"
+            )),
+            "DOTNET_ROOT/{subdir} must remain read-only"
+        );
+    }
 }
 
 #[test]

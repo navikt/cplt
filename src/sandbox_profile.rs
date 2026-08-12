@@ -818,6 +818,20 @@ fn emit_dotnet_root(sb: &mut String, dotnet_root: Option<&Path>) {
         // process execution. Re-allow only the trusted host, and keep it read-only.
         sbpl!(sb, "(allow process-exec (literal \"{p}/dotnet\"))");
         sbpl!(sb, "(deny file-write* (literal \"{p}/dotnet\"))");
+        // `dotnet build` doesn't just run the top-level host — MSBuild forks
+        // out-of-proc compiler workers straight out of the SDK install, e.g.
+        // {p}/sdk/<ver>/Roslyn/bincore/csc and VBCSCompiler, plus apphost
+        // templates copied out of {p}/sdk and {p}/shared. Without exec on
+        // these subtrees, `dotnet build` gets past restore/host-launch and
+        // then fails with "Operation not permitted" the moment MSBuild tries
+        // to spawn csc. Scoped to sdk/shared (not the whole DOTNET_ROOT) so
+        // CLI state files written directly under ~/.dotnet (telemetry
+        // sentinel, tool manifests) keep their normal write access, and these
+        // install directories stay read-only like the host binary above.
+        for subdir in ["sdk", "shared"] {
+            sbpl!(sb, "(allow process-exec (subpath \"{p}/{subdir}\"))");
+            sbpl!(sb, "(deny file-write* (subpath \"{p}/{subdir}\"))");
+        }
         sbpl!(sb);
     }
 }
