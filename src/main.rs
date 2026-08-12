@@ -2,9 +2,11 @@
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "macos")]
+use cplt::gradle_init;
 use cplt::{
-    agent, audit, check, config, discover, gh_proxy, gradle_init, proxy, repo_config, sandbox,
-    scratch, subscriptions, trust, update,
+    agent, audit, check, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch,
+    subscriptions, trust, update,
 };
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
@@ -2315,12 +2317,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
 
     // macOS-only: install the guarded Gradle init script so sandboxed builds
-    // get the preferIPv4Stack workaround even where JAVA_TOOL_OPTIONS is lost
-    // (plugin-managed worker forks). Inert outside the sandbox (__CPLT_WRAPPED
-    // guard); a no-op when ~/.gradle doesn't exist.
+    // keep the preferIPv4Stack workaround for the daemon and Test/JavaExec
+    // forks (WorkerExecutor forks have no init-script hook — see gradle_init
+    // module docs). Inert outside the sandbox (__CPLT_WRAPPED guard); a no-op
+    // when ~/.gradle doesn't exist.
     #[cfg(target_os = "macos")]
-    {
-        let _ = gradle_init::ensure_init_script(&home_dir);
+    if let Err(e) = gradle_init::ensure_init_script(&home_dir) {
+        ui::warn(&format!(
+            "Could not install Gradle sandbox init script: {e}"
+        ));
     }
 
     // Start proxy (handle returned for RAII ownership)
@@ -2812,11 +2817,13 @@ fn prepare_shell_sandbox(
     }
 
     // See the agent-path call site: guarded Gradle init script so sandboxed
-    // builds keep the preferIPv4Stack workaround where JAVA_TOOL_OPTIONS is
-    // lost in plugin-managed worker forks.
+    // builds keep the preferIPv4Stack workaround for the daemon and
+    // Test/JavaExec forks.
     #[cfg(target_os = "macos")]
-    {
-        let _ = gradle_init::ensure_init_script(home_dir);
+    if let Err(e) = gradle_init::ensure_init_script(home_dir) {
+        ui::warn(&format!(
+            "Could not install Gradle sandbox init script: {e}"
+        ));
     }
 
     let proxy_handle = start_proxy_if_enabled(resolved, cli, config_path, active_agent)?;

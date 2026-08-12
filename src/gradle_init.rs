@@ -52,15 +52,30 @@ if (System.getenv(\"__CPLT_WRAPPED\") != null) {
 ";
 
 /// Path to the managed init script for a given home directory.
+/// Respects `GRADLE_USER_HOME` (allowlisted env var) — otherwise a user with a
+/// relocated Gradle home would never load the script.
 pub fn script_path(home: &Path) -> PathBuf {
-    home.join(".gradle/init.d").join(SCRIPT_NAME)
+    gradle_user_home(home).join("init.d").join(SCRIPT_NAME)
+}
+
+/// Resolve the effective Gradle user home: `GRADLE_USER_HOME` if set and
+/// non-empty, else `~/.gradle`.
+fn gradle_user_home(home: &Path) -> PathBuf {
+    std::env::var("GRADLE_USER_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| home.join(".gradle"), PathBuf::from)
 }
 
 /// Install (or refresh) the init script. Idempotent: rewrites only when the
 /// content differs. Creates `~/.gradle/init.d/` if `~/.gradle` exists.
 /// No-op when the user has no `~/.gradle` (not a Gradle user).
+///
+/// Writes are atomic (temp + rename): a crash mid-write must never leave a
+/// truncated script — Gradle evaluates every file in init.d, and a partial
+/// Groovy file would fail every build with a syntax error.
 pub fn ensure_init_script(home: &Path) -> std::io::Result<Option<PathBuf>> {
-    let gradle_dir = home.join(".gradle");
+    let gradle_dir = gradle_user_home(home);
     if !gradle_dir.is_dir() {
         return Ok(None);
     }
@@ -70,7 +85,12 @@ pub fn ensure_init_script(home: &Path) -> std::io::Result<Option<PathBuf>> {
     match std::fs::read_to_string(&path) {
         Ok(existing) if existing == SCRIPT_BODY => Ok(Some(path)),
         _ => {
-            std::fs::write(&path, SCRIPT_BODY)?;
+            // Unique temp name avoids concurrent cplt processes clobbering
+            // each other's temp file; the .tmp extension means Gradle never
+            // evaluates a leftover temp after a crash.
+            let tmp = init_d.join(format!(".{SCRIPT_NAME}.{}.tmp", std::process::id()));
+            std::fs::write(&tmp, SCRIPT_BODY)?;
+            std::fs::rename(&tmp, &path)?;
             Ok(Some(path))
         }
     }
@@ -87,28 +107,56 @@ mod tests {
     }
 
     #[test]
+    fn script_path_respects_gradle_user_home() {
+        // temp_env is used elsewhere in the repo for env-dependent tests
+        temp_env::with_var("GRADLE_USER_HOME", Some("/custom/gradle-home"), || {
+            let p = script_path(Path::new("/home/user"));
+            assert_eq!(
+                p,
+                Path::new("/custom/gradle-home/init.d/cplt-sandbox.gradle")
+            );
+        });
+        temp_env::with_var("GRADLE_USER_HOME", None::<&str>, || {
+            let p = script_path(Path::new("/home/user"));
+            assert_eq!(
+                p,
+                Path::new("/home/user/.gradle/init.d/cplt-sandbox.gradle")
+            );
+        });
+    }
+
+    #[test]
     fn ensure_init_script_noop_without_gradle_dir() {
-        let tmp = std::env::temp_dir().join(format!("cplt-gradle-noop-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let result = ensure_init_script(&tmp).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = ensure_init_script(tmp.path()).unwrap();
         assert!(result.is_none(), "no ~/.gradle → no script written");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn ensure_init_script_writes_and_is_idempotent() {
-        let tmp = std::env::temp_dir().join(format!("cplt-gradle-init-{}", std::process::id()));
-        let gradle = tmp.join(".gradle");
+        let tmp = tempfile::tempdir().unwrap();
+        let gradle = tmp.path().join(".gradle");
         std::fs::create_dir_all(&gradle).unwrap();
 
-        let first = ensure_init_script(&tmp).unwrap().expect("script written");
+        let first = ensure_init_script(tmp.path())
+            .unwrap()
+            .expect("script written");
         assert!(first.exists());
         let content = std::fs::read_to_string(&first).unwrap();
         assert_eq!(content, SCRIPT_BODY);
+        // No temp files left behind after the atomic write.
+        let leftovers: Vec<_> = std::fs::read_dir(gradle.join("init.d"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no .tmp leftovers after install");
 
         // Second call: no rewrite (mtime unchanged)
         let mtime1 = first.metadata().unwrap().modified().unwrap();
-        let second = ensure_init_script(&tmp).unwrap().expect("script present");
+        let second = ensure_init_script(tmp.path())
+            .unwrap()
+            .expect("script present");
         let mtime2 = second.metadata().unwrap().modified().unwrap();
         assert_eq!(
             mtime1, mtime2,
@@ -117,9 +165,7 @@ mod tests {
 
         // Stale content gets refreshed
         std::fs::write(&first, "// old version").unwrap();
-        ensure_init_script(&tmp).unwrap();
+        ensure_init_script(tmp.path()).unwrap();
         assert_eq!(std::fs::read_to_string(&first).unwrap(), SCRIPT_BODY);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
