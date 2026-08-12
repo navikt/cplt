@@ -127,45 +127,52 @@ mod tests {
 
     #[test]
     fn ensure_init_script_noop_without_gradle_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result = ensure_init_script(tmp.path()).unwrap();
-        assert!(result.is_none(), "no ~/.gradle → no script written");
+        // Isolate from GRADLE_USER_HOME in the ambient env (set on CI
+        // runners), which would otherwise redirect the install away from
+        // the tempdir.
+        temp_env::with_var("GRADLE_USER_HOME", None::<&str>, || {
+            let tmp = tempfile::tempdir().unwrap();
+            let result = ensure_init_script(tmp.path()).unwrap();
+            assert!(result.is_none(), "no ~/.gradle → no script written");
+        });
     }
 
     #[test]
     fn ensure_init_script_writes_and_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let gradle = tmp.path().join(".gradle");
-        std::fs::create_dir_all(&gradle).unwrap();
+        temp_env::with_var("GRADLE_USER_HOME", None::<&str>, || {
+            let tmp = tempfile::tempdir().unwrap();
+            let gradle = tmp.path().join(".gradle");
+            std::fs::create_dir_all(&gradle).unwrap();
 
-        let first = ensure_init_script(tmp.path())
-            .unwrap()
-            .expect("script written");
-        assert!(first.exists());
-        let content = std::fs::read_to_string(&first).unwrap();
-        assert_eq!(content, SCRIPT_BODY);
-        // No temp files left behind after the atomic write.
-        let leftovers: Vec<_> = std::fs::read_dir(gradle.join("init.d"))
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "no .tmp leftovers after install");
+            let first = ensure_init_script(tmp.path())
+                .unwrap()
+                .expect("script written");
+            assert!(first.exists());
+            let content = std::fs::read_to_string(&first).unwrap();
+            assert_eq!(content, SCRIPT_BODY);
+            // No temp files left behind after the atomic write.
+            let leftovers: Vec<_> = std::fs::read_dir(gradle.join("init.d"))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+                .collect();
+            assert!(leftovers.is_empty(), "no .tmp leftovers after install");
 
-        // Second call: no rewrite (mtime unchanged)
-        let mtime1 = first.metadata().unwrap().modified().unwrap();
-        let second = ensure_init_script(tmp.path())
-            .unwrap()
-            .expect("script present");
-        let mtime2 = second.metadata().unwrap().modified().unwrap();
-        assert_eq!(
-            mtime1, mtime2,
-            "idempotent: no rewrite when content matches"
-        );
+            // Second call: no rewrite (mtime unchanged)
+            let mtime1 = first.metadata().unwrap().modified().unwrap();
+            let second = ensure_init_script(tmp.path())
+                .unwrap()
+                .expect("script present");
+            let mtime2 = second.metadata().unwrap().modified().unwrap();
+            assert_eq!(
+                mtime1, mtime2,
+                "idempotent: no rewrite when content matches"
+            );
 
-        // Stale content gets refreshed
-        std::fs::write(&first, "// old version").unwrap();
-        ensure_init_script(tmp.path()).unwrap();
-        assert_eq!(std::fs::read_to_string(&first).unwrap(), SCRIPT_BODY);
+            // Stale content gets refreshed
+            std::fs::write(&first, "// old version").unwrap();
+            ensure_init_script(tmp.path()).unwrap();
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), SCRIPT_BODY);
+        });
     }
 }
