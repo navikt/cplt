@@ -9,7 +9,8 @@
 //! localhost ports fail with `ConnectException`.
 //!
 //! cplt cannot reach into plugin-managed forks, so instead it can install a
-//! Gradle init script at `~/.gradle/init.d/cplt-sandbox.gradle` — **opt-in**
+//! Gradle init script in the Gradle user home (`$GRADLE_USER_HOME/init.d/` or
+//! `~/.gradle/init.d/cplt-sandbox.gradle`) — **opt-in**
 //! via `sandbox.gradle_init = true` (cplt does not write tool config dirs by
 //! default). The script is guarded by `__CPLT_WRAPPED` — it only activates
 //! inside the sandbox and is inert in normal builds.

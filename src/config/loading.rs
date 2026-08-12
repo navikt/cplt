@@ -1025,6 +1025,9 @@ impl Resolved {
         if repo_config.propose.allow_jvm_attach == Some(true) && is_approved("allow_jvm_attach") {
             self.allow_jvm_attach = true;
         }
+        if repo_config.propose.gradle_init == Some(true) && is_approved("gradle_init") {
+            self.gradle_init = true;
+        }
         if repo_config.propose.allow_docker == Some(true) && is_approved("allow_docker") {
             self.allow_docker = true;
         }
@@ -1737,6 +1740,35 @@ validate = false
         assert!(resolved.allow_localhost_any);
         assert!(!resolved.allow_docker); // not approved
         assert_eq!(unapproved, vec!["allow_docker"]);
+    }
+
+    #[test]
+    fn apply_repo_config_gradle_init_proposal_needs_approval() {
+        let repo_config = crate::repo_config::RepoConfig {
+            propose: crate::repo_config::ProposeSection {
+                gradle_init: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Proposed key surfaces in the trust review list
+        assert_eq!(
+            crate::repo_config::proposed_keys(&repo_config.propose),
+            vec!["gradle_init"]
+        );
+
+        // Without approval: stays off
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        let unapproved = resolved.apply_repo_config(&repo_config, &[]);
+        assert!(!resolved.gradle_init);
+        assert_eq!(unapproved, vec!["gradle_init"]);
+
+        // With approval: takes effect
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        let unapproved = resolved.apply_repo_config(&repo_config, &["gradle_init"]);
+        assert!(resolved.gradle_init);
+        assert!(unapproved.is_empty());
     }
 
     #[test]

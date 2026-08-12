@@ -330,7 +330,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Install a cplt-managed Gradle init script (~/.gradle/init.d/cplt-sandbox.gradle) that applies the preferIPv4Stack workaround inside the sandbox. Inert outside sandbox builds.",
+        description: "Install a cplt-managed Gradle init script in the Gradle user home ($GRADLE_USER_HOME/init.d/ or ~/.gradle/init.d/cplt-sandbox.gradle) that applies the preferIPv4Stack workaround inside the sandbox. Inert outside sandbox builds.",
     },
     ConfigKeyInfo {
         section: "sandbox",

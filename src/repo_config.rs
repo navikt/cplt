@@ -50,6 +50,10 @@ pub struct DenySection {
 pub struct ProposeSection {
     pub allow_localhost_any: Option<bool>,
     pub allow_jvm_attach: Option<bool>,
+    /// Propose installing the cplt-managed Gradle init script (see
+    /// `sandbox.gradle_init`). Writes to the Gradle user home, so it goes
+    /// through the same trust review as other sandbox relaxations.
+    pub gradle_init: Option<bool>,
     pub allow_docker: Option<bool>,
     pub allow_tmp_exec: Option<bool>,
     pub allow_gpg_signing: Option<bool>,
@@ -256,6 +260,9 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     }
     if propose.allow_jvm_attach == Some(true) {
         keys.push("allow_jvm_attach");
+    }
+    if propose.gradle_init == Some(true) {
+        keys.push("gradle_init");
     }
     if propose.allow_docker == Some(true) {
         keys.push("allow_docker");

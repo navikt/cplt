@@ -346,7 +346,7 @@ Symptom (even with `allow_localhost_any = true`):
 org.gradle.internal.remote.internal.ConnectException: Could not connect to server [... port:NNNNN, addresses:[/127.0.0.1]]
 ```
 
-**cplt mitigation (macOS, opt-in):** set `sandbox.gradle_init = true` and cplt installs a guarded init script at `~/.gradle/init.d/cplt-sandbox.gradle` on sandbox launch. It activates only inside the sandbox (`__CPLT_WRAPPED` guard) and applies `preferIPv4Stack` to the daemon plus `Test`/`JavaExec` forks. Opt-in because cplt does not write to tool config dirs by default. `WorkerExecutor` forks have no public configuration hook — for those, the plugin must propagate the environment itself:
+**cplt mitigation (macOS, opt-in):** set `sandbox.gradle_init = true` and cplt installs a guarded init script at `$GRADLE_USER_HOME/init.d/cplt-sandbox.gradle` (or `~/.gradle/init.d/` when unset) on sandbox launch. It activates only inside the sandbox (`__CPLT_WRAPPED` guard) and applies `preferIPv4Stack` to the daemon plus `Test`/`JavaExec` forks. Opt-in because cplt does not write to tool config dirs by default. `WorkerExecutor` forks have no public configuration hook — for those, the plugin must propagate the environment itself:
 
 ```kotlin
 forkOptions {

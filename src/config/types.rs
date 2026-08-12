@@ -592,9 +592,10 @@ pub struct SandboxConfig {
     /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
     /// all other unix sockets remain blocked.
     pub allow_jvm_attach: Option<bool>,
-    /// Install a cplt-managed Gradle init script at ~/.gradle/init.d/ that
-    /// applies the preferIPv4Stack workaround inside the sandbox (default:
-    /// false). Opt-in: writes to a tool config dir, so it is off unless the
+    /// Install a cplt-managed Gradle init script in the Gradle user home
+    /// (`$GRADLE_USER_HOME/init.d/` or `~/.gradle/init.d/`) that applies the
+    /// preferIPv4Stack workaround inside the sandbox (default: false).
+    /// Opt-in: writes to a tool config dir, so it is off unless the
     /// user asks for it.
     pub gradle_init: Option<bool>,
     /// DANGEROUS: Docker can mount any host path via container volumes, completely
