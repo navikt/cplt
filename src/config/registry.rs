@@ -326,6 +326,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "gradle_init",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "Install a cplt-managed Gradle init script (~/.gradle/init.d/cplt-sandbox.gradle) that applies the preferIPv4Stack workaround inside the sandbox. Inert outside sandbox builds.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "allow_docker",
         value_type: ConfigValueType::Bool,
         dangerous: true,

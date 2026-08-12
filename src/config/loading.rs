@@ -397,6 +397,11 @@ impl Config {
             self.sandbox.allow_jvm_attach.unwrap_or(false)
         };
 
+        // Gradle init script: config-only opt-in (default false). Writes a
+        // cplt-managed file into the Gradle user home — behavior change the
+        // user must explicitly ask for.
+        let gradle_init = self.sandbox.gradle_init.unwrap_or(false);
+
         // Allow-docker: explicit CLI flag wins, then explicit config value,
         // then the preset baseline (false when no preset — blocked).
         let allow_docker = cli
@@ -575,6 +580,7 @@ impl Config {
             allow_gpg_signing,
             deny_clipboard,
             allow_jvm_attach,
+            gradle_init,
             allow_docker,
             allow_tmp_exec,
             allow_cache_exec,
@@ -1167,6 +1173,18 @@ validate = false
         assert_eq!(config.proxy.enabled, Some(true));
         assert!(config.proxy.port.is_none());
         assert!(config.allow.read.is_empty());
+    }
+
+    #[test]
+    fn gradle_init_defaults_false_and_config_enables() {
+        // Default: off (opt-in — cplt does not write tool config dirs unprompted)
+        let resolved = Config::default().merge(CliFlags::default()).unwrap();
+        assert!(!resolved.gradle_init);
+
+        // Config opt-in
+        let config: Config = toml::from_str("[sandbox]\ngradle_init = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.gradle_init);
     }
 
     #[test]

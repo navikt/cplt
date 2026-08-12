@@ -592,7 +592,11 @@ pub struct SandboxConfig {
     /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
     /// all other unix sockets remain blocked.
     pub allow_jvm_attach: Option<bool>,
-    /// Allow Docker/Colima/OrbStack access inside the sandbox (default: false).
+    /// Install a cplt-managed Gradle init script at ~/.gradle/init.d/ that
+    /// applies the preferIPv4Stack workaround inside the sandbox (default:
+    /// false). Opt-in: writes to a tool config dir, so it is off unless the
+    /// user asks for it.
+    pub gradle_init: Option<bool>,
     /// DANGEROUS: Docker can mount any host path via container volumes, completely
     /// bypassing sandbox filesystem restrictions. Only enable if you trust the
     /// agent's container usage.
@@ -749,6 +753,7 @@ pub struct Resolved {
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
+    pub gradle_init: bool,
     pub allow_docker: bool,
     pub allow_tmp_exec: bool,
     pub allow_cache_exec: Vec<String>,
@@ -819,6 +824,7 @@ pub struct CliFlags {
     pub allow_gpg_signing: bool,
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
+    pub gradle_init: bool,
     /// Preset-controlled toggle (see `allow_localhost_any`).
     pub allow_docker: FeatureToggle,
     /// Preset-controlled toggle (see `allow_localhost_any`).

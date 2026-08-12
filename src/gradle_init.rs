@@ -8,10 +8,11 @@
 //! environment — the flag is lost and their daemon connections on ephemeral
 //! localhost ports fail with `ConnectException`.
 //!
-//! cplt cannot reach into plugin-managed forks, so instead it installs a
-//! Gradle init script at `~/.gradle/init.d/cplt-sandbox.gradle`. The script
-//! is guarded by `__CPLT_WRAPPED` — it only activates inside the sandbox and
-//! is inert in normal builds.
+//! cplt cannot reach into plugin-managed forks, so instead it can install a
+//! Gradle init script at `~/.gradle/init.d/cplt-sandbox.gradle` — **opt-in**
+//! via `sandbox.gradle_init = true` (cplt does not write tool config dirs by
+//! default). The script is guarded by `__CPLT_WRAPPED` — it only activates
+//! inside the sandbox and is inert in normal builds.
 //!
 //! Scope: the script covers the daemon itself plus `Test`/`JavaExec` forks.
 //! `WorkerExecutor` process-isolation forks have no public configuration

@@ -7010,6 +7010,7 @@ use_bubblewrap = false
 quiet = false
 yes = false
 allow_jvm_attach = false
+gradle_init = false
 allow_docker = false
 allow_cache_exec = []
 allow_cache_exec_any = false
