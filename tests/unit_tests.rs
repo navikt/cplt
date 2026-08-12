@@ -3446,6 +3446,84 @@ fn env_claude_injects_autoupdater_and_suppresses_copilot_vars() {
 }
 
 #[test]
+fn env_opencode_redirects_claude_config_dir() {
+    // oh-my-openagent writes transcripts to $CLAUDE_CONFIG_DIR/transcripts
+    // (default ~/.claude), which the sandbox denies for OpenCode — cplt must
+    // redirect it into the write-allowed OpenCode state dir.
+    let parent = make_env(&[("HOME", "/home/test"), ("PATH", "/usr/bin")]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+
+    let found = env.vars.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR");
+    assert!(
+        found.is_some(),
+        "should inject CLAUDE_CONFIG_DIR for OpenCode"
+    );
+    assert_eq!(
+        found.unwrap().1,
+        "/home/test/.local/state/opencode/claude-config"
+    );
+}
+
+#[test]
+fn env_opencode_claude_config_dir_respects_xdg_state_home() {
+    let parent = make_env(&[("HOME", "/home/test"), ("XDG_STATE_HOME", "/xdg/state")]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+
+    let found = env.vars.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR");
+    assert_eq!(found.unwrap().1, "/xdg/state/opencode/claude-config");
+}
+
+#[test]
+fn env_opencode_claude_config_dir_respects_user_override() {
+    // User-set CLAUDE_CONFIG_DIR passes through untouched (allowlisted) —
+    // cplt must not clobber it with the redirect.
+    let parent = make_env(&[
+        ("HOME", "/home/test"),
+        ("CLAUDE_CONFIG_DIR", "/custom/claude"),
+    ]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+
+    let matches: Vec<_> = env
+        .vars
+        .iter()
+        .filter(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+        .collect();
+    assert_eq!(matches.len(), 1, "exactly one CLAUDE_CONFIG_DIR entry");
+    assert_eq!(matches[0].1, "/custom/claude");
+}
+
+#[test]
+fn env_opencode_claude_config_dir_empty_is_treated_as_unset() {
+    // An empty CLAUDE_CONFIG_DIR in parent env must not prevent injection —
+    // the plugin would resolve it to a relative "transcripts/" path and hit EACCES.
+    let parent = make_env(&[("HOME", "/home/test"), ("CLAUDE_CONFIG_DIR", "")]);
+    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+
+    let matches: Vec<_> = env
+        .vars
+        .iter()
+        .filter(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+        .collect();
+    assert_eq!(matches.len(), 1, "exactly one CLAUDE_CONFIG_DIR entry");
+    assert_eq!(
+        matches[0].1,
+        "/home/test/.local/state/opencode/claude-config"
+    );
+}
+
+#[test]
+fn env_claude_config_dir_not_injected_for_other_agents() {
+    for agent in [cplt::agent::Agent::Copilot, cplt::agent::Agent::Claude] {
+        let parent = make_env(&[("HOME", "/home/test"), ("PATH", "/usr/bin")]);
+        let env = build_sandbox_env(&parent, &[], false, &[], None, agent);
+        assert!(
+            !env.vars.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
+            "CLAUDE_CONFIG_DIR redirect must not be injected for {agent:?}"
+        );
+    }
+}
+
+#[test]
 fn env_sanitized_injects_telemetry_opt_out_vars() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
     let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
