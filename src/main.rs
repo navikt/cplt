@@ -3,8 +3,8 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use cplt::{
-    agent, audit, check, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch,
-    subscriptions, trust, update,
+    agent, audit, check, config, discover, gh_proxy, gradle_init, proxy, repo_config, sandbox,
+    scratch, subscriptions, trust, update,
 };
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
@@ -2312,6 +2312,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         if !dir.path.exists() {
             let _ = std::fs::create_dir_all(&dir.path);
         }
+    }
+
+    // macOS-only: install the guarded Gradle init script so sandboxed builds
+    // get the preferIPv4Stack workaround even where JAVA_TOOL_OPTIONS is lost
+    // (plugin-managed worker forks). Inert outside the sandbox (__CPLT_WRAPPED
+    // guard); a no-op when ~/.gradle doesn't exist.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = gradle_init::ensure_init_script(&home_dir);
     }
 
     // Start proxy (handle returned for RAII ownership)

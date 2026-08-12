@@ -11,6 +11,7 @@ pub mod config;
 pub mod detect;
 pub mod discover;
 pub mod gh_proxy;
+pub mod gradle_init;
 pub mod init;
 pub mod proxy;
 pub mod repo_config;
