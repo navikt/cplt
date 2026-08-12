@@ -336,6 +336,26 @@ If all of that works, `cplt --allow-gpg-signing` will work too. The `gpg-agent` 
 - **`--deny-path` wins.** If you specify `--deny-path ~/.gnupg` alongside `--allow-gpg-signing`, the deny takes precedence — all GPG allows are suppressed.
 - **`GNUPGHOME`** is not supported yet — only the default `~/.gnupg` location is allowed.
 
+## Gradle plugin workers and `JAVA_TOOL_OPTIONS`
+
+cplt injects `-Djava.net.preferIPv4Stack=true` via `JAVA_TOOL_OPTIONS` (see the JVM note above) so JVM localhost connections match the sandbox's `localhost:*` rules. Most JVM children read `JAVA_TOOL_OPTIONS` at startup, but **Gradle worker processes spawned by plugins do not inherit the environment** — plugins build them with explicit `forkOptions {}` and must propagate env vars themselves.
+
+If a Gradle plugin forks a worker that connects to the daemon over an ephemeral localhost port and you see:
+
+```
+org.gradle.internal.remote.internal.ConnectException: Could not connect to server [... port:NNNNN, addresses:[/127.0.0.1]]
+```
+
+the worker is running without `-Djava.net.preferIPv4Stack=true`, and its dual-stack socket produced an IPv4-mapped address (`::ffff:127.0.0.1`) that SBPL cannot match. This is a plugin bug — the plugin must pass the environment through:
+
+```kotlin
+forkOptions {
+    environment("JAVA_TOOL_OPTIONS", System.getenv("JAVA_TOOL_OPTIONS") ?: "")
+}
+```
+
+Known affected: `ktlint-gradle` ([JLLeitschuh/ktlint-gradle#1110](https://github.com/JLLeitschuh/ktlint-gradle/issues/1110)). The fix belongs upstream; cplt cannot force env propagation into plugin-managed forks. Note that SBPL itself cannot be fixed either — macOS sandbox profiles have no primitive for matching IPv4-mapped IPv6 addresses, which is why cplt uses the `preferIPv4Stack` workaround in the first place.
+
 ## JVM Attach API
 
 JVM testing frameworks like **MockK** (inline mocking), **Mockito** (inline agents), and **ByteBuddy** use the JVM Attach API for runtime class instrumentation. This API creates a Unix domain socket at `/tmp/.java_pid<PID>` — which the sandbox blocks by default.
