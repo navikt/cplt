@@ -336,6 +336,26 @@ If all of that works, `cplt --allow-gpg-signing` will work too. The `gpg-agent` 
 - **`--deny-path` wins.** If you specify `--deny-path ~/.gnupg` alongside `--allow-gpg-signing`, the deny takes precedence — all GPG allows are suppressed.
 - **`GNUPGHOME`** is not supported yet — only the default `~/.gnupg` location is allowed.
 
+## Gradle plugin workers and `JAVA_TOOL_OPTIONS`
+
+cplt injects `-Djava.net.preferIPv4Stack=true` via `JAVA_TOOL_OPTIONS` (see the JVM note above) so JVM localhost connections match the sandbox's `localhost:*` rules. Most JVM children read `JAVA_TOOL_OPTIONS` at startup, but **Gradle plugin workers** (WorkerExecutor process isolation, e.g. ktlint-gradle) fork JVMs with explicit `forkOptions {}` and do not reliably propagate the environment — the flag is lost, their dual-stack sockets produce IPv4-mapped `::ffff:127.0.0.1` addresses, and SBPL cannot match them.
+
+Symptom (even with `allow_localhost_any = true`):
+
+```
+org.gradle.internal.remote.internal.ConnectException: Could not connect to server [... port:NNNNN, addresses:[/127.0.0.1]]
+```
+
+**cplt mitigation (macOS):** cplt installs a guarded init script at `~/.gradle/init.d/cplt-sandbox.gradle` on sandbox launch. It activates only inside the sandbox (`__CPLT_WRAPPED` guard) and applies `preferIPv4Stack` to the daemon plus `Test`/`JavaExec` forks. `WorkerExecutor` forks have no public configuration hook — for those, the plugin must propagate the environment itself:
+
+```kotlin
+forkOptions {
+    environment("JAVA_TOOL_OPTIONS", System.getenv("JAVA_TOOL_OPTIONS") ?: "")
+}
+```
+
+Known affected: `ktlint-gradle` ([JLLeitschuh/ktlint-gradle#1110](https://github.com/JLLeitschuh/ktlint-gradle/issues/1110)). SBPL itself cannot be fixed — macOS sandbox profiles have no primitive for IPv4-mapped addresses, which is why cplt uses the `preferIPv4Stack` workaround at all.
+
 ## JVM Attach API
 
 JVM testing frameworks like **MockK** (inline mocking), **Mockito** (inline agents), and **ByteBuddy** use the JVM Attach API for runtime class instrumentation. This API creates a Unix domain socket at `/tmp/.java_pid<PID>` — which the sandbox blocks by default.
