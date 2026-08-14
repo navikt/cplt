@@ -600,6 +600,12 @@ pub struct SandboxConfig {
     /// DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1. SSH agent and all other unix
     /// sockets remain blocked.
     pub allow_msbuild: Option<bool>,
+    /// Install a cplt-managed Gradle init script in the Gradle user home
+    /// (`$GRADLE_USER_HOME/init.d/` or `~/.gradle/init.d/`) that applies the
+    /// preferIPv4Stack workaround inside the sandbox (default: false).
+    /// Opt-in: writes to a tool config dir, so it is off unless the
+    /// user asks for it.
+    pub gradle_init: Option<bool>,
     /// Allow Docker/Colima/OrbStack access inside the sandbox (default: false).
     /// DANGEROUS: Docker can mount any host path via container volumes, completely
     /// bypassing sandbox filesystem restrictions. Only enable if you trust the
@@ -758,6 +764,7 @@ pub struct Resolved {
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
     pub allow_msbuild: bool,
+    pub gradle_init: bool,
     pub allow_docker: bool,
     pub allow_tmp_exec: bool,
     pub allow_cache_exec: Vec<String>,
@@ -829,6 +836,7 @@ pub struct CliFlags {
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
     pub allow_msbuild: bool,
+    pub gradle_init: bool,
     /// Preset-controlled toggle (see `allow_localhost_any`).
     pub allow_docker: FeatureToggle,
     /// Preset-controlled toggle (see `allow_localhost_any`).

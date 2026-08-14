@@ -404,6 +404,11 @@ impl Config {
             self.sandbox.allow_msbuild.unwrap_or(false)
         };
 
+        // Gradle init script: config-only opt-in (default false). Writes a
+        // cplt-managed file into the Gradle user home — behavior change the
+        // user must explicitly ask for.
+        let gradle_init = self.sandbox.gradle_init.unwrap_or(false);
+
         // Allow-docker: explicit CLI flag wins, then explicit config value,
         // then the preset baseline (false when no preset — blocked).
         let allow_docker = cli
@@ -583,6 +588,7 @@ impl Config {
             deny_clipboard,
             allow_jvm_attach,
             allow_msbuild,
+            gradle_init,
             allow_docker,
             allow_tmp_exec,
             allow_cache_exec,
@@ -1035,6 +1041,9 @@ impl Resolved {
         if repo_config.propose.allow_msbuild == Some(true) && is_approved("allow_msbuild") {
             self.allow_msbuild = true;
         }
+        if repo_config.propose.gradle_init == Some(true) && is_approved("gradle_init") {
+            self.gradle_init = true;
+        }
         if repo_config.propose.allow_docker == Some(true) && is_approved("allow_docker") {
             self.allow_docker = true;
         }
@@ -1183,6 +1192,18 @@ validate = false
         assert_eq!(config.proxy.enabled, Some(true));
         assert!(config.proxy.port.is_none());
         assert!(config.allow.read.is_empty());
+    }
+
+    #[test]
+    fn gradle_init_defaults_false_and_config_enables() {
+        // Default: off (opt-in — cplt does not write tool config dirs unprompted)
+        let resolved = Config::default().merge(CliFlags::default()).unwrap();
+        assert!(!resolved.gradle_init);
+
+        // Config opt-in
+        let config: Config = toml::from_str("[sandbox]\ngradle_init = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.gradle_init);
     }
 
     #[test]
@@ -1735,6 +1756,35 @@ validate = false
         assert!(resolved.allow_localhost_any);
         assert!(!resolved.allow_docker); // not approved
         assert_eq!(unapproved, vec!["allow_docker"]);
+    }
+
+    #[test]
+    fn apply_repo_config_gradle_init_proposal_needs_approval() {
+        let repo_config = crate::repo_config::RepoConfig {
+            propose: crate::repo_config::ProposeSection {
+                gradle_init: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Proposed key surfaces in the trust review list
+        assert_eq!(
+            crate::repo_config::proposed_keys(&repo_config.propose),
+            vec!["gradle_init"]
+        );
+
+        // Without approval: stays off
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        let unapproved = resolved.apply_repo_config(&repo_config, &[]);
+        assert!(!resolved.gradle_init);
+        assert_eq!(unapproved, vec!["gradle_init"]);
+
+        // With approval: takes effect
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        let unapproved = resolved.apply_repo_config(&repo_config, &["gradle_init"]);
+        assert!(resolved.gradle_init);
+        assert!(unapproved.is_empty());
     }
 
     #[test]

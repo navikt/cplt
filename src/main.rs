@@ -2,6 +2,8 @@
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "macos")]
+use cplt::gradle_init;
 use cplt::{
     agent, audit, check, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch,
     subscriptions, trust, update,
@@ -1291,6 +1293,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         deny_clipboard: cli.deny_clipboard,
         allow_jvm_attach: cli.allow_jvm_attach,
         allow_msbuild: cli.allow_msbuild,
+        // Config-only opt-in; no CLI flag.
+        gradle_init: false,
         allow_docker: config::FeatureToggle::from_pair(cli.allow_docker, cli.no_allow_docker),
         allow_tmp_exec: config::FeatureToggle::from_pair(cli.allow_tmp_exec, cli.no_allow_tmp_exec),
         allow_cache_exec: cli.allow_cache_exec.clone(),
@@ -2334,6 +2338,20 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         }
     }
 
+    // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
+    // init script so sandboxed builds keep the preferIPv4Stack workaround for
+    // the daemon and Test/JavaExec forks (WorkerExecutor forks have no
+    // init-script hook — see gradle_init module docs). Inert outside the
+    // sandbox (__CPLT_WRAPPED guard); a no-op when ~/.gradle doesn't exist.
+    #[cfg(target_os = "macos")]
+    if resolved.gradle_init
+        && let Err(e) = gradle_init::ensure_init_script(&home_dir)
+    {
+        ui::warn(&format!(
+            "Could not install Gradle sandbox init script: {e}"
+        ));
+    }
+
     // Start proxy (handle returned for RAII ownership)
     let proxy_handle =
         start_proxy_if_enabled(&mut resolved, &cli, config_path.as_ref(), active_agent)?;
@@ -2831,6 +2849,18 @@ fn prepare_shell_sandbox(
         if !dir.path.exists() {
             let _ = std::fs::create_dir_all(&dir.path);
         }
+    }
+
+    // See the agent-path call site: guarded Gradle init script (opt-in via
+    // sandbox.gradle_init) so sandboxed builds keep the preferIPv4Stack
+    // workaround for the daemon and Test/JavaExec forks.
+    #[cfg(target_os = "macos")]
+    if resolved.gradle_init
+        && let Err(e) = gradle_init::ensure_init_script(home_dir)
+    {
+        ui::warn(&format!(
+            "Could not install Gradle sandbox init script: {e}"
+        ));
     }
 
     let proxy_handle = start_proxy_if_enabled(resolved, cli, config_path, active_agent)?;
