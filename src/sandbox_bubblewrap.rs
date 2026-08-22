@@ -1059,14 +1059,19 @@ mod tests {
 
     // Deny masks are skipped under /tmp, so their tests need a base outside it.
     fn non_tmp_tempdir() -> tempfile::TempDir {
-        let base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-            || Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
-            PathBuf::from,
-        );
+        // A CARGO_TARGET_DIR under /tmp (a common build-speed setup) falls
+        // back to the manifest's target/ — a /tmp base would void these tests.
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .filter(|d| {
+                std::fs::create_dir_all(d).is_ok()
+                    && d.canonicalize().is_ok_and(|c| !c.starts_with("/tmp"))
+            })
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
         std::fs::create_dir_all(&base).expect("create tempdir base");
         assert!(
             !base.canonicalize().expect("canonicalize base").starts_with("/tmp"),
-            "test premise: the target dir must not live under /tmp"
+            "test premise: no usable target dir outside /tmp"
         );
         tempfile::tempdir_in(base).expect("tempdir in target dir")
     }

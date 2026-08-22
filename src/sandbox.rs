@@ -359,8 +359,8 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied
-    // files read as EACCES, denied dirs read as empty — restoring the macOS
-    // parity for --deny-path / deny.paths.
+    // files read as EACCES, denied dirs read as empty (macOS gives EACCES for
+    // both; the content is unreachable either way).
     let deny_masks = bubblewrap::build_deny_masks(config.extra_deny, config.scratch_dir);
 
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.

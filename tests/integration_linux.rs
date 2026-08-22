@@ -1606,18 +1606,24 @@ else:
     /// Returns a `TempDir` guard so the tree is removed on Drop even when the
     /// test panics mid-assert.
     fn create_deny_project() -> tempfile::TempDir {
-        let base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
-            PathBuf::from,
-        );
+        // A CARGO_TARGET_DIR under /tmp (a common build-speed setup) falls
+        // back to the manifest's target/ — deny masks skip /tmp, so a /tmp
+        // base would void these tests.
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .filter(|d| {
+                fs::create_dir_all(d).is_ok()
+                    && d.canonicalize().is_ok_and(|c| !c.starts_with("/tmp"))
+            })
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
         fs::create_dir_all(&base).expect("create project base");
         assert!(
             !base
                 .canonicalize()
                 .expect("canonicalize base")
                 .starts_with("/tmp"),
-            "test premise: the target dir must not live under /tmp, or the \
-             deny mask is skipped and these tests prove nothing"
+            "test premise: no usable target dir outside /tmp — the deny mask \
+             skips /tmp, so these tests would prove nothing there"
         );
         let dir = tempfile::tempdir_in(base).expect("tempdir in target dir");
         fs::create_dir_all(dir.path().join("secrets")).expect("create project dirs");
