@@ -645,6 +645,15 @@ pub fn exec(
             BwrapOutcome::Ran(code) => return code,
             BwrapOutcome::Fallback => {
                 ui::warn("Bubblewrap could not start; using Landlock + seccomp only.");
+                if wrapper.deny_mask_count > 0 {
+                    // prepare() already announced these as enforced.
+                    ui::warn(&format!(
+                        "{} deny path(s) are NOT enforced in this run: the mount masks \
+                         went with Bubblewrap, and Landlock cannot deny subpaths within \
+                         allowed directories.",
+                        wrapper.deny_mask_count
+                    ));
+                }
                 // fall through to the direct path
             }
         }

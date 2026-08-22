@@ -1596,37 +1596,51 @@ else:
     // Landlock cannot deny subpaths within allowed directories, so
     // --deny-path targets inside the project tree are shadowed at the mount
     // level when bwrap is active (an empty tmpfs for dirs, an unreadable
-    // placeholder bind for files). Projects here live under the REAL HOME,
-    // not tempfile::tempdir(): deny targets under /tmp are deliberately
+    // placeholder bind for files). Projects here live under the cargo target
+    // dir, not tempfile::tempdir(): deny targets under /tmp are deliberately
     // skipped by build_deny_masks (host /tmp is already invisible behind the
     // private tmpfs), so a /tmp-based project cannot demonstrate the mask.
 
-    /// Create a project under real HOME with a secret dir and file inside.
-    fn create_home_project(tag: &str) -> PathBuf {
-        let dir = home_dir().join(format!("cplt-test-denymask-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("secrets")).expect("create project dirs");
-        fs::write(dir.join("secrets/pw.txt"), "TOP-SECRET-DIR").expect("write");
-        fs::write(dir.join("token.txt"), "TOP-SECRET-FILE").expect("write");
-        fs::write(dir.join("README.md"), "hello").expect("write");
+    /// Create a project with a secret dir and file inside, outside `/tmp`.
+    ///
+    /// Returns a `TempDir` guard so the tree is removed on Drop even when the
+    /// test panics mid-assert.
+    fn create_deny_project() -> tempfile::TempDir {
+        let base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+            PathBuf::from,
+        );
+        fs::create_dir_all(&base).expect("create project base");
+        assert!(
+            !base
+                .canonicalize()
+                .expect("canonicalize base")
+                .starts_with("/tmp"),
+            "test premise: the target dir must not live under /tmp, or the \
+             deny mask is skipped and these tests prove nothing"
+        );
+        let dir = tempfile::tempdir_in(base).expect("tempdir in target dir");
+        fs::create_dir_all(dir.path().join("secrets")).expect("create project dirs");
+        fs::write(dir.path().join("secrets/pw.txt"), "TOP-SECRET-DIR").expect("write");
+        fs::write(dir.path().join("token.txt"), "TOP-SECRET-FILE").expect("write");
+        fs::write(dir.path().join("README.md"), "hello").expect("write");
         dir
     }
 
     #[test]
     fn bwrap_deny_path_dir_content_is_hidden() {
         require_bwrap!();
-        let project = create_home_project("dir");
-        let deny = project.join("secrets");
+        let project = create_deny_project();
+        let deny = project.path().join("secrets");
         let script = format!(
             "cat '{}/pw.txt' 2>&1 && echo READ_OK || echo READ_DENIED",
             deny.display()
         );
         let (code, stdout, stderr) = run_sandboxed_with_flags(
-            &project,
+            project.path(),
             &["--use-bubblewrap", "--deny-path", &deny.to_string_lossy()],
             &script,
         );
-        let _ = fs::remove_dir_all(&project);
         assert!(
             stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
             "content under a --deny-path dir inside the project must be hidden under bwrap — code: {code}, stdout: {stdout}, stderr: {stderr}"
@@ -1636,18 +1650,17 @@ else:
     #[test]
     fn bwrap_deny_path_file_is_unreadable() {
         require_bwrap!();
-        let project = create_home_project("file");
-        let deny = project.join("token.txt");
+        let project = create_deny_project();
+        let deny = project.path().join("token.txt");
         let script = format!(
             "cat '{}' 2>&1 && echo READ_OK || echo READ_DENIED",
             deny.display()
         );
         let (code, stdout, stderr) = run_sandboxed_with_flags(
-            &project,
+            project.path(),
             &["--use-bubblewrap", "--deny-path", &deny.to_string_lossy()],
             &script,
         );
-        let _ = fs::remove_dir_all(&project);
         assert!(
             stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
             "a --deny-path file inside the project must be unreadable under bwrap — code: {code}, stdout: {stdout}, stderr: {stderr}"
@@ -1660,19 +1673,18 @@ else:
         // self ro-bind must make chmod through that path fail, or the agent
         // could flip it readable and defeat the file mask.
         require_bwrap!();
-        let project = create_home_project("ph");
-        let deny = project.join("token.txt");
+        let project = create_deny_project();
+        let deny = project.path().join("token.txt");
         let script = format!(
             "chmod 644 \"$TMPDIR/deny-mask\" 2>&1 && echo CHMOD_OK || echo CHMOD_DENIED; \
              cat '{}' 2>&1 && echo READ_OK || echo READ_DENIED",
             deny.display()
         );
         let (code, stdout, stderr) = run_sandboxed_with_flags(
-            &project,
+            project.path(),
             &["--use-bubblewrap", "--deny-path", &deny.to_string_lossy()],
             &script,
         );
-        let _ = fs::remove_dir_all(&project);
         assert!(
             stdout.contains("CHMOD_DENIED"),
             "the placeholder must not be chmod-able from inside the sandbox — code: {code}, stdout: {stdout}, stderr: {stderr}"
@@ -1688,18 +1700,17 @@ else:
         // Degradation contract: without bwrap the mask cannot exist, the file
         // stays readable (Landlock cannot sub-deny), and the user is told so.
         require_landlock!();
-        let project = create_home_project("nobwrap");
-        let deny = project.join("secrets");
+        let project = create_deny_project();
+        let deny = project.path().join("secrets");
         let script = format!(
             "cat '{}/pw.txt' 2>&1 && echo READ_OK || echo READ_DENIED",
             deny.display()
         );
         let (code, stdout, stderr) = run_sandboxed_with_flags(
-            &project,
+            project.path(),
             &["--no-bubblewrap", "--deny-path", &deny.to_string_lossy()],
             &script,
         );
-        let _ = fs::remove_dir_all(&project);
         assert!(
             stdout.contains("READ_OK"),
             "without bwrap the deny path stays readable — code: {code}, stdout: {stdout}"

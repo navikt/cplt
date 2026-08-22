@@ -358,8 +358,9 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     let ro_protect = bubblewrap::git_persistence_paths(config.project_dir, config.git_common_dir);
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
-    // directories, but Bubblewrap can shadow them at the mount level (EACCES),
-    // restoring macOS parity for --deny-path / deny.paths.
+    // directories, but Bubblewrap can shadow them at the mount level — denied
+    // files read as EACCES, denied dirs read as empty — restoring the macOS
+    // parity for --deny-path / deny.paths.
     let deny_masks = bubblewrap::build_deny_masks(config.extra_deny, config.scratch_dir);
 
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
@@ -391,10 +392,13 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 ui::warn(&format!(
-                    "{} deny path(s) not mount-masked (under a bwrap-managed \
-                     mount or /tmp, or no longer resolvable): {list}",
+                    "{} deny path(s) could not be mount-masked and are NOT \
+                     enforced: {list}",
                     skipped.len()
                 ));
+                if let Some(reason) = deny_masks.placeholder_error() {
+                    ui::warn(&format!("File deny paths were skipped: {reason}."));
+                }
             }
         } else {
             ui::warn(

@@ -106,6 +106,11 @@ pub(crate) struct BubblewrapWrapper {
     /// `use_bubblewrap = true`). A spawn-time failure is then a hard error;
     /// on auto-detect it degrades gracefully to Landlock-only.
     pub strict: bool,
+    /// How many deny paths these args mask. Enforcement is announced at
+    /// prepare time, but bwrap can still fail to start (auto-detect then
+    /// falls back to Landlock-only), which silently un-enforces them — so
+    /// the fallback warning needs this to say what was lost.
+    pub deny_mask_count: usize,
 }
 
 /// Check if bubblewrap is available on this system.
@@ -307,9 +312,14 @@ pub(crate) struct DenyMasks {
     /// the per-session scratch dir. `None` when `files` is empty.
     placeholder: Option<PathBuf>,
     /// Deny targets that could not be mount-masked (under a bwrap-managed
-    /// mount or `/tmp`, or no longer resolvable). The caller warns about
-    /// these when the wrapper is active.
+    /// mount or `/tmp`, no longer resolvable, or file masks with no usable
+    /// placeholder). The caller warns about these when the wrapper is active.
     skipped: Vec<PathBuf>,
+    /// Why the placeholder could not be created, when that is what forced
+    /// file masks into `skipped`. Reported by the caller rather than warned
+    /// about here: this runs before we know whether bwrap will be used at
+    /// all, and under `--no-bubblewrap` the warning would be noise.
+    placeholder_error: Option<String>,
 }
 
 impl DenyMasks {
@@ -319,6 +329,10 @@ impl DenyMasks {
 
     pub(crate) fn skipped(&self) -> &[PathBuf] {
         &self.skipped
+    }
+
+    pub(crate) fn placeholder_error(&self) -> Option<&str> {
+        self.placeholder_error.as_deref()
     }
 }
 
@@ -381,22 +395,22 @@ pub(crate) fn build_deny_masks(extra_deny: &[PathBuf], scratch_dir: Option<&Path
     files.sort();
     files.dedup();
 
+    // A file mask needs the placeholder as its bind source; without one those
+    // deny paths are unenforced, so they move to `skipped` with the reason.
+    let mut placeholder_error = None;
     let placeholder = if files.is_empty() {
         None
     } else {
         match scratch_dir.map(create_mask_placeholder) {
             Some(Ok(path)) => Some(path),
             Some(Err(e)) => {
-                crate::ui::warn(&format!(
-                    "Cannot create deny-mask placeholder: {e}. \
-                     File deny paths will not be masked."
-                ));
-                files.clear();
+                placeholder_error = Some(format!("cannot create deny-mask placeholder: {e}"));
+                skipped.append(&mut files);
                 None
             }
             None => {
-                crate::ui::warn("No scratch dir available; file deny paths will not be masked.");
-                files.clear();
+                placeholder_error = Some("no scratch dir available".to_string());
+                skipped.append(&mut files);
                 None
             }
         }
@@ -407,6 +421,7 @@ pub(crate) fn build_deny_masks(extra_deny: &[PathBuf], scratch_dir: Option<&Path
         files,
         placeholder,
         skipped,
+        placeholder_error,
     }
 }
 
@@ -552,6 +567,7 @@ fn build_wrapper(
         net_rules: net_rules.to_vec(),
         restrict_net_connect,
         strict,
+        deny_mask_count: deny_masks.mask_count(),
     })
 }
 
@@ -1043,9 +1059,10 @@ mod tests {
 
     // Deny masks are skipped under /tmp, so their tests need a base outside it.
     fn non_tmp_tempdir() -> tempfile::TempDir {
-        let base = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+        let base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+            PathBuf::from,
+        );
         std::fs::create_dir_all(&base).expect("create tempdir base");
         assert!(
             !base.canonicalize().expect("canonicalize base").starts_with("/tmp"),
@@ -1143,9 +1160,14 @@ mod tests {
         let base = non_tmp_tempdir();
         let secret = base.path().join("token.txt");
         std::fs::write(&secret, "s").expect("write");
-        let masks = build_deny_masks(&[secret], None);
+        let masks = build_deny_masks(std::slice::from_ref(&secret), None);
         assert_eq!(masks.mask_count(), 0, "no scratch dir → no file mask");
         assert!(masks.placeholder.is_none());
+        // The unmaskable file is reported rather than silently dropped, and
+        // the reason travels with it for the caller to warn about — this runs
+        // before we know whether bwrap will be used at all.
+        assert_eq!(masks.skipped(), [secret.canonicalize().unwrap()]);
+        assert_eq!(masks.placeholder_error(), Some("no scratch dir available"));
     }
 
     #[test]
