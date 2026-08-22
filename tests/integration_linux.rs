@@ -1591,6 +1591,96 @@ else:
         );
     }
 
+    // ── Deny-path mount masks ─────────────────────────────────────
+    //
+    // Landlock cannot deny subpaths within allowed directories, so
+    // --deny-path targets inside the project tree are shadowed at the mount
+    // level when bwrap is active (--perms 000 --tmpfs for dirs, an unreadable
+    // placeholder bind for files). Projects here live under the REAL HOME,
+    // not tempfile::tempdir(): deny targets under /tmp are deliberately
+    // skipped by build_deny_masks (host /tmp is already invisible behind the
+    // private tmpfs), so a /tmp-based project cannot demonstrate the mask.
+
+    /// Create a project under real HOME with a secret dir and file inside.
+    fn create_home_project(tag: &str) -> PathBuf {
+        let dir = home_dir().join(format!("cplt-test-denymask-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("secrets")).expect("create project dirs");
+        fs::write(dir.join("secrets/pw.txt"), "TOP-SECRET-DIR").expect("write");
+        fs::write(dir.join("token.txt"), "TOP-SECRET-FILE").expect("write");
+        fs::write(dir.join("README.md"), "hello").expect("write");
+        dir
+    }
+
+    #[test]
+    fn bwrap_deny_path_dir_is_unreadable() {
+        require_bwrap!();
+        let project = create_home_project("dir");
+        let deny = project.join("secrets");
+        let script = format!(
+            "cat '{}/pw.txt' 2>&1 && echo READ_OK || echo READ_DENIED",
+            deny.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            &project,
+            &["--use-bubblewrap", "--deny-path", &deny.to_string_lossy()],
+            &script,
+        );
+        let _ = fs::remove_dir_all(&project);
+        assert!(
+            stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
+            "a --deny-path dir inside the project must be unreadable under bwrap — code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn bwrap_deny_path_file_is_unreadable() {
+        require_bwrap!();
+        let project = create_home_project("file");
+        let deny = project.join("token.txt");
+        let script = format!(
+            "cat '{}' 2>&1 && echo READ_OK || echo READ_DENIED",
+            deny.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            &project,
+            &["--use-bubblewrap", "--deny-path", &deny.to_string_lossy()],
+            &script,
+        );
+        let _ = fs::remove_dir_all(&project);
+        assert!(
+            stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
+            "a --deny-path file inside the project must be unreadable under bwrap — code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn deny_path_without_bwrap_warns_and_stays_readable() {
+        // Degradation contract: without bwrap the mask cannot exist, the file
+        // stays readable (Landlock cannot sub-deny), and the user is told so.
+        require_landlock!();
+        let project = create_home_project("nobwrap");
+        let deny = project.join("secrets");
+        let script = format!(
+            "cat '{}/pw.txt' 2>&1 && echo READ_OK || echo READ_DENIED",
+            deny.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            &project,
+            &["--no-bubblewrap", "--deny-path", &deny.to_string_lossy()],
+            &script,
+        );
+        let _ = fs::remove_dir_all(&project);
+        assert!(
+            stdout.contains("READ_OK"),
+            "without bwrap the deny path stays readable — code: {code}, stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("NOT enforced"),
+            "the unenforced deny must be loudly warned about — stderr: {stderr}"
+        );
+    }
+
     // ── Proxy-forced networking (#53) ─────────────────────────────
     //
     // `--proxy-forced` makes the CONNECT proxy mandatory and restricts kernel

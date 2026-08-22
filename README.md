@@ -1323,8 +1323,8 @@ Or for a single run: `cplt --allow-read ~/.m2/settings.xml`
 
 - **Kernel 5.13+ required** — Landlock LSM must be enabled
 - **TCP port filtering requires kernel 6.7+** — older kernels get filesystem-only enforcement
-- **Landlock cannot deny subpaths within allowed paths** — `.env` read/write/delete and `.git/hooks` writes inside the project dir are not kernel-enforced
-- **`--deny-path` has no effect** — Landlock is allowlist-only
+- **Landlock cannot deny subpaths within allowed paths** — `.env` read/write/delete inside the project dir is not kernel-enforced (`.git/hooks` writes are blocked when Bubblewrap is active)
+- **`--deny-path` requires Bubblewrap** — enforced via mount masks when bwrap is active; without it, Landlock is allowlist-only and the deny is warned about instead
 
 📖 **Full details:** [docs/security.md](docs/security.md#limitations)
 
