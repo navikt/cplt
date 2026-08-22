@@ -108,7 +108,7 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | PID namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
 | Mount namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
 | User namespace (unprivileged) | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
-| --deny-path / deny.paths | ✅ Kernel deny | ❌ No effect (warned) | ✅ Mount-masked (EACCES; dirs via unreadable tmpfs, files via unreadable placeholder bind) |
+| --deny-path / deny.paths | ✅ Kernel deny | ❌ No effect (warned) | ✅ Mount-masked (files read as EACCES, dirs appear empty; the real content is unreachable) |
 
 Legend: ✅ = kernel-enforced, ⚠️ = defense-in-depth (proxy/env), ❌ = not available
 

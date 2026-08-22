@@ -198,7 +198,12 @@ pub(crate) fn test_functionality(
 ///    masks first (`--ro-bind <placeholder> <file>` — bind sources resolve
 ///    against the mount tree built so far, so they must precede any tmpfs
 ///    that could hide a source or mount point), then directory masks
-///    (`--perms 000 --tmpfs <dir>`). See [`build_deny_masks`].
+///    (`--tmpfs <dir>`; `--perms 000` is deliberately not used — it requires
+///    bwrap >= 0.5.0 and the empty tmpfs already hides the content). The
+///    placeholder is ro-bound over its own path before any file mask: it
+///    lives inside the writable scratch bind, and without the self-mask the
+///    agent (who owns the inode) could chmod it readable and write to it
+///    through the scratch path. See [`build_deny_masks`].
 pub(crate) fn build_bwrap_args(
     fs_rules: &[FsRule],
     ro_protect: &[PathBuf],
@@ -263,6 +268,11 @@ pub(crate) fn build_bwrap_args(
     // ── Deny-path masks — emitted last so they shadow every earlier bind ──
     if let Some(placeholder) = &deny_masks.placeholder {
         let ph = placeholder.to_string_lossy().into_owned();
+        // Self-mask first: the placeholder lives inside the writable scratch
+        // bind, so without this the agent (who owns the inode) could chmod it
+        // readable and write to it through the scratch path. The ro-bind over
+        // its own path makes every route to the inode read-only (EROFS).
+        args.extend(["--ro-bind".to_string(), ph.clone(), ph.clone()]);
         for file in &deny_masks.files {
             let file_str = file.to_string_lossy().into_owned();
             args.extend(["--ro-bind".to_string(), ph.clone(), file_str]);
@@ -270,12 +280,7 @@ pub(crate) fn build_bwrap_args(
     }
     for dir in &deny_masks.dirs {
         let dir_str = dir.to_string_lossy().into_owned();
-        args.extend([
-            "--perms".to_string(),
-            "000".to_string(),
-            "--tmpfs".to_string(),
-            dir_str,
-        ]);
+        args.extend(["--tmpfs".to_string(), dir_str]);
     }
 
     args
@@ -286,12 +291,12 @@ pub(crate) fn build_bwrap_args(
 /// Landlock is grant-only — it cannot carve a deny out of an allowed subtree,
 /// so deny paths inside granted roots (most commonly the project dir) were
 /// previously warning-only on Linux. When Bubblewrap is active, each deny
-/// target is shadowed at the mount level instead: directories get an
-/// unreadable tmpfs (`--perms 000 --tmpfs`), files a read-only bind of an
-/// unreadable placeholder. Any access fails with EACCES, matching the macOS
-/// SBPL `(deny file-read* ...)` behavior. Masks cannot be removed from inside
-/// the sandbox: `mount`, `umount2`, `unshare`, and `pivot_root` are all
-/// seccomp-denied.
+/// target is shadowed at the mount level instead: directories get an empty
+/// tmpfs, files a read-only bind of an unreadable (mode 000) placeholder.
+/// The real content is unreachable either way: reads of a masked file fail
+/// with EACCES; a masked dir merely reads as empty (macOS SBPL denies both
+/// with EACCES). Masks cannot be removed from inside the sandbox: `mount`,
+/// `umount2`, `unshare`, and `pivot_root` are all seccomp-denied.
 #[derive(Debug, Default)]
 pub(crate) struct DenyMasks {
     /// Canonicalized deny targets that are directories.
@@ -301,39 +306,53 @@ pub(crate) struct DenyMasks {
     /// Mode-000 empty source file bound over each entry in `files`; lives in
     /// the per-session scratch dir. `None` when `files` is empty.
     placeholder: Option<PathBuf>,
+    /// Deny targets that could not be mount-masked (under a bwrap-managed
+    /// mount or `/tmp`, or no longer resolvable). The caller warns about
+    /// these when the wrapper is active.
+    skipped: Vec<PathBuf>,
 }
 
 impl DenyMasks {
     pub(crate) fn mask_count(&self) -> usize {
         self.dirs.len() + self.files.len()
     }
+
+    pub(crate) fn skipped(&self) -> &[PathBuf] {
+        &self.skipped
+    }
 }
 
 /// Build mount masks from the user's deny paths.
 ///
-/// Entries are canonicalized first, so a symlinked deny path masks the
-/// resolved target rather than the link. Skipped entries (each protects
-/// nothing, or is already covered):
+/// Inputs arrive canonicalized — the CLI (`canonicalize_deny_paths`) and the
+/// config loader (`resolve_config_path`) both hard-fail on paths that do not
+/// resolve — so a symlinked deny path already names the resolved target. The
+/// absolute check and re-canonicalization here are defense against races (a
+/// path deleted since startup). Entries that cannot be masked are recorded in
+/// `skipped` for the caller to warn about:
 ///
-/// - relative paths — they have no defined base here; the macOS profile
-///   interpolates them literally into SBPL where they match nothing either
-/// - paths that fail to canonicalize (typically: absent on this machine)
+/// - paths that fail to canonicalize (vanished since startup) or are relative
 /// - paths under bwrap-managed mounts (`/proc`, `/dev`, `/sys`) and under
 ///   `/tmp` — host `/tmp` is already invisible behind the private tmpfs.
 ///   This deliberately leaves a deny subpath *inside a project dir that
 ///   itself lives under `/tmp`* unmasked: its mount point may not exist in
 ///   the private tmpfs and a failing mount would sink the whole wrapper
-/// - dirs nested under another masked dir, and files under any masked dir —
-///   the ancestor tmpfs already hides them, and their mount points vanish
-///   once it is mounted (bwrap would otherwise error and sink the wrapper)
+///
+/// Dropped but *not* recorded as skipped (the ancestor mask already covers
+/// them): dirs nested under another masked dir, and files under any masked
+/// dir — their mount points vanish once the ancestor tmpfs is mounted (bwrap
+/// would otherwise error and sink the wrapper).
 pub(crate) fn build_deny_masks(extra_deny: &[PathBuf], scratch_dir: Option<&Path>) -> DenyMasks {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<PathBuf> = Vec::new();
     for path in extra_deny {
         if !path.is_absolute() {
+            skipped.push(path.clone());
             continue;
         }
         let Ok(canon) = path.canonicalize() else {
+            skipped.push(path.clone());
             continue;
         };
         if canon.starts_with("/proc")
@@ -341,6 +360,7 @@ pub(crate) fn build_deny_masks(extra_deny: &[PathBuf], scratch_dir: Option<&Path
             || canon.starts_with("/sys")
             || canon.starts_with("/tmp")
         {
+            skipped.push(canon);
             continue;
         }
         if canon.is_dir() {
@@ -386,6 +406,7 @@ pub(crate) fn build_deny_masks(extra_deny: &[PathBuf], scratch_dir: Option<&Path
         dirs: kept_dirs,
         files,
         placeholder,
+        skipped,
     }
 }
 
@@ -1022,12 +1043,19 @@ mod tests {
 
     // Deny masks are skipped under /tmp, so their tests need a base outside it.
     fn non_tmp_tempdir() -> tempfile::TempDir {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-        tempfile::tempdir_in(base).expect("tempdir in target/")
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+        std::fs::create_dir_all(&base).expect("create tempdir base");
+        assert!(
+            !base.canonicalize().expect("canonicalize base").starts_with("/tmp"),
+            "test premise: the target dir must not live under /tmp"
+        );
+        tempfile::tempdir_in(base).expect("tempdir in target dir")
     }
 
     #[test]
-    fn deny_mask_dir_is_unreadable_tmpfs_after_everything_else() {
+    fn deny_mask_dir_is_empty_tmpfs_after_everything_else() {
         let base = non_tmp_tempdir();
         let secret = base.path().join("secrets");
         std::fs::create_dir(&secret).expect("create secrets");
@@ -1046,10 +1074,15 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        // Plain --tmpfs, deliberately without --perms (needs bwrap >= 0.5.0).
         let tmpfs_pos = args
-            .windows(4)
-            .position(|w| w[0] == "--perms" && w[1] == "000" && w[2] == "--tmpfs" && w[3] == canon)
-            .expect("dir mask must be emitted as --perms 000 --tmpfs");
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == canon)
+            .expect("dir mask must be emitted as --tmpfs over the target");
+        assert!(
+            !args.iter().any(|a| a == "--perms"),
+            "--perms must not be emitted — it requires bwrap >= 0.5.0"
+        );
         let last_bind_pos = args
             .iter()
             .rposition(|a| a == "--bind" || a == "--ro-bind")
@@ -1090,6 +1123,19 @@ mod tests {
                 .any(|w| w[0] == "--ro-bind" && w[1] == ph && w[2] == target),
             "file mask must bind the placeholder over the target"
         );
+
+        // Self-mask: the placeholder sits in the writable scratch bind, so it
+        // must be ro-bound over its own path (before any file mask) or the
+        // agent could chmod/write its inode through the scratch path.
+        let self_mask = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == ph && w[2] == ph)
+            .expect("placeholder must be ro-bound over itself");
+        let target_mask = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == ph && w[2] == target)
+            .expect("target mask present");
+        assert!(self_mask < target_mask, "self-mask must precede file masks");
     }
 
     #[test]
@@ -1104,7 +1150,9 @@ mod tests {
 
     #[test]
     fn deny_mask_skips_relative_missing_and_tmp_paths() {
-        let under_tmp = tempfile::tempdir().expect("tempdir"); // lives under /tmp
+        // Deliberately under the REAL /tmp — tempfile::tempdir() honors
+        // TMPDIR, which may point elsewhere (e.g. a cplt scratch dir).
+        let under_tmp = tempfile::tempdir_in("/tmp").expect("tempdir in /tmp");
         let masks = build_deny_masks(
             &[
                 PathBuf::from("relative/secrets"),
@@ -1114,6 +1162,11 @@ mod tests {
             None,
         );
         assert_eq!(masks.mask_count(), 0);
+        assert_eq!(
+            masks.skipped().len(),
+            3,
+            "unmaskable deny paths must be recorded for the caller's warning"
+        );
     }
 
     #[test]
@@ -1148,6 +1201,10 @@ mod tests {
             masks.files.is_empty(),
             "file under masked dir must be dropped"
         );
+        assert!(
+            masks.skipped().is_empty(),
+            "coalesced entries are covered, not skipped"
+        );
     }
 
     #[test]
@@ -1162,12 +1219,14 @@ mod tests {
         let scratch = base.path().join("scratch");
         std::fs::create_dir(&scratch).expect("scratch");
 
-        let masks = build_deny_masks(&[dir, file], Some(&scratch));
+        let masks = build_deny_masks(&[dir.clone(), file], Some(&scratch));
         let args = build_bwrap_args(&[], &[], &masks);
         let file_pos = args.iter().position(|a| a.ends_with("f.txt")).unwrap();
-        // `--perms` is only ever emitted by dir masks (the base /tmp mount is a
-        // plain `--tmpfs`), so it uniquely marks the dir-mask block.
-        let dir_pos = args.iter().position(|a| a == "--perms").unwrap();
+        let dir_canon = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+        let dir_pos = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == dir_canon)
+            .unwrap();
         assert!(file_pos < dir_pos, "file masks must precede dir masks");
     }
 }

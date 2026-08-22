@@ -383,6 +383,19 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
                     "Deny paths enforced via Bubblewrap mount masks ({masked} masked)."
                 ));
             }
+            let skipped = deny_masks.skipped();
+            if !skipped.is_empty() {
+                let list = skipped
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui::warn(&format!(
+                    "{} deny path(s) not mount-masked (under a bwrap-managed \
+                     mount or /tmp, or no longer resolvable): {list}",
+                    skipped.len()
+                ));
+            }
         } else {
             ui::warn(
                 "Deny paths are NOT enforced without Bubblewrap: Landlock cannot \

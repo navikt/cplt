@@ -1595,7 +1595,7 @@ else:
     //
     // Landlock cannot deny subpaths within allowed directories, so
     // --deny-path targets inside the project tree are shadowed at the mount
-    // level when bwrap is active (--perms 000 --tmpfs for dirs, an unreadable
+    // level when bwrap is active (an empty tmpfs for dirs, an unreadable
     // placeholder bind for files). Projects here live under the REAL HOME,
     // not tempfile::tempdir(): deny targets under /tmp are deliberately
     // skipped by build_deny_masks (host /tmp is already invisible behind the
@@ -1613,7 +1613,7 @@ else:
     }
 
     #[test]
-    fn bwrap_deny_path_dir_is_unreadable() {
+    fn bwrap_deny_path_dir_content_is_hidden() {
         require_bwrap!();
         let project = create_home_project("dir");
         let deny = project.join("secrets");
@@ -1629,7 +1629,7 @@ else:
         let _ = fs::remove_dir_all(&project);
         assert!(
             stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
-            "a --deny-path dir inside the project must be unreadable under bwrap — code: {code}, stdout: {stdout}, stderr: {stderr}"
+            "content under a --deny-path dir inside the project must be hidden under bwrap — code: {code}, stdout: {stdout}, stderr: {stderr}"
         );
     }
 
@@ -1651,6 +1651,35 @@ else:
         assert!(
             stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
             "a --deny-path file inside the project must be unreadable under bwrap — code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn bwrap_deny_mask_placeholder_cannot_be_softened() {
+        // The placeholder lives inside the writable scratch bind (TMPDIR); a
+        // self ro-bind must make chmod through that path fail, or the agent
+        // could flip it readable and defeat the file mask.
+        require_bwrap!();
+        let project = create_home_project("ph");
+        let deny = project.join("token.txt");
+        let script = format!(
+            "chmod 644 \"$TMPDIR/deny-mask\" 2>&1 && echo CHMOD_OK || echo CHMOD_DENIED; \
+             cat '{}' 2>&1 && echo READ_OK || echo READ_DENIED",
+            deny.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            &project,
+            &["--use-bubblewrap", "--deny-path", &deny.to_string_lossy()],
+            &script,
+        );
+        let _ = fs::remove_dir_all(&project);
+        assert!(
+            stdout.contains("CHMOD_DENIED"),
+            "the placeholder must not be chmod-able from inside the sandbox — code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
+            "the file mask must hold — code: {code}, stdout: {stdout}, stderr: {stderr}"
         );
     }
 
