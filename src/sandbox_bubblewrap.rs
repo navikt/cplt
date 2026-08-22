@@ -338,12 +338,14 @@ impl DenyMasks {
 
 /// Build mount masks from the user's deny paths.
 ///
-/// Inputs arrive canonicalized — the CLI (`canonicalize_deny_paths`) and the
-/// config loader (`resolve_config_path`) both hard-fail on paths that do not
-/// resolve — so a symlinked deny path already names the resolved target. The
-/// absolute check and re-canonicalization here are defense against races (a
-/// path deleted since startup). Entries that cannot be masked are recorded in
-/// `skipped` for the caller to warn about:
+/// CLI and global-config inputs arrive canonicalized (`canonicalize_deny_paths`
+/// and `resolve_config_path` both hard-fail on paths that do not resolve), so
+/// for those the checks here only guard against races (a path deleted since
+/// startup). Repo `.cplt.toml` paths do NOT: they are merely `~`-expanded
+/// (navikt/cplt#179), so relative and unresolvable entries reach this function
+/// and the absolute check and re-canonicalization are real filtering for them.
+/// Entries that cannot be masked are recorded in `skipped` for the caller to
+/// warn about:
 ///
 /// - paths that fail to canonicalize (vanished since startup) or are relative
 /// - paths under bwrap-managed mounts (`/proc`, `/dev`, `/sys`) and under
