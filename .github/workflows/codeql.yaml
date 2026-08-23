@@ -54,14 +54,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Neither extractor compiles anything: `actions` parses workflow YAML,
-          # and the Rust extractor works from source. No build step needed.
+          # `actions` just parses workflow YAML — nothing to build.
           - language: actions
             build-mode: none
+          # Rust needs a real build. Measured on this repo with build-mode
+          # none: 35 of 41 files extracted *with errors*, 6 clean — the
+          # extractor can't resolve types across crate boundaries without the
+          # dependency graph, so the analysis would have been near-worthless
+          # while still gating merges. autobuild runs cargo, which populates it.
           - language: rust
-            build-mode: none
+            build-mode: autobuild
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v7.0.0
+
+      # Same cache as ci.yaml, so autobuild reuses those artifacts instead of
+      # compiling the dependency tree from scratch on every run.
+      - name: Cache cargo registry and build
+        if: matrix.language == 'rust'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # ratchet:actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # ratchet:github/codeql-action/init@v4.37.8
