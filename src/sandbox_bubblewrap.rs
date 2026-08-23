@@ -1072,7 +1072,10 @@ mod tests {
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
         std::fs::create_dir_all(&base).expect("create tempdir base");
         assert!(
-            !base.canonicalize().expect("canonicalize base").starts_with("/tmp"),
+            !base
+                .canonicalize()
+                .expect("canonicalize base")
+                .starts_with("/tmp"),
             "test premise: no usable target dir outside /tmp"
         );
         tempfile::tempdir_in(base).expect("tempdir in target dir")
