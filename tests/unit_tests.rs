@@ -4420,6 +4420,79 @@ fn profile_no_dotnet_root_omits_section() {
     );
 }
 
+/// `$DOTNET_ROOT/{sdk,shared}` are the only trees where cplt re-grants
+/// `process-exec` inside an otherwise-writable area, so they must stay
+/// read-only even when the user's own `allow.write` covers them — otherwise
+/// the agent can drop a binary there and execute it, bypassing
+/// `allow_tmp_exec` / `allow_cache_exec`. SBPL is last-match-wins, so this is
+/// purely a question of emission order.
+#[test]
+fn profile_dotnet_exec_paths_stay_readonly_under_user_allow_write() {
+    let dotnet_root = "/Users/test/.dotnet";
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        // The user allows writes to the whole dotnet root (or any parent).
+        extra_write: &[std::path::PathBuf::from(dotnet_root)],
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: Some(std::path::Path::new(dotnet_root)),
+        git_hooks_path: None,
+        git_common_dir: None,
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+
+    let user_write = p
+        .find(&format!("(allow file-write* (subpath \"{dotnet_root}\"))"))
+        .expect("user allow.write must be emitted");
+
+    for subdir in ["sdk", "shared"] {
+        let write_deny = p
+            .find(&format!(
+                "(deny file-write* (subpath \"{dotnet_root}/{subdir}\"))"
+            ))
+            .unwrap_or_else(|| panic!("DOTNET_ROOT/{subdir} must deny writes"));
+        assert!(
+            write_deny > user_write,
+            "the {subdir} write-deny must come AFTER the user's allow.write, \
+             or exec-allowed SDK dirs become writable (write-then-exec)"
+        );
+    }
+
+    let host_deny = p
+        .find(&format!(
+            "(deny file-write* (literal \"{dotnet_root}/dotnet\"))"
+        ))
+        .expect("dotnet host must deny writes");
+    assert!(
+        host_deny > user_write,
+        "the dotnet host write-deny must come AFTER the user's allow.write"
+    );
+}
+
 #[test]
 fn profile_allows_electron_app_bundle() {
     let electron_dir = "/Applications/Visual Studio Code.app/Contents";

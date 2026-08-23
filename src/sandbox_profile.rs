@@ -197,6 +197,9 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     // SBPL uses last-match-wins, so a user allow like `allow.read = ["~/Repos"]`
     // would override the .env deny if emitted before it.
     emit_sensitive_project_denies(&mut sb, &project, opts.allow_env_files);
+    // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
+    // when a user allow.write covers them (write-then-exec).
+    emit_dotnet_exec_denies(&mut sb, opts.dotnet_root);
 
     sb
 }
@@ -815,9 +818,9 @@ fn emit_dotnet_root(sb: &mut String, dotnet_root: Option<&Path>) {
         sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
         sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
         // DOTNET_ROOT may be ~/.dotnet, whose writable CLI-state rule denies
-        // process execution. Re-allow only the trusted host, and keep it read-only.
+        // process execution. Re-allow only the trusted host; the matching
+        // write-deny is emitted later, by `emit_dotnet_exec_denies`.
         sbpl!(sb, "(allow process-exec (literal \"{p}/dotnet\"))");
-        sbpl!(sb, "(deny file-write* (literal \"{p}/dotnet\"))");
         // `dotnet build` doesn't just run the top-level host — MSBuild forks
         // out-of-proc compiler workers straight out of the SDK install, e.g.
         // {p}/sdk/<ver>/Roslyn/bincore/csc and VBCSCompiler, plus apphost
@@ -826,10 +829,32 @@ fn emit_dotnet_root(sb: &mut String, dotnet_root: Option<&Path>) {
         // then fails with "Operation not permitted" the moment MSBuild tries
         // to spawn csc. Scoped to sdk/shared (not the whole DOTNET_ROOT) so
         // CLI state files written directly under ~/.dotnet (telemetry
-        // sentinel, tool manifests) keep their normal write access, and these
-        // install directories stay read-only like the host binary above.
+        // sentinel, tool manifests) keep their normal write access.
         for subdir in ["sdk", "shared"] {
             sbpl!(sb, "(allow process-exec (subpath \"{p}/{subdir}\"))");
+        }
+        sbpl!(sb);
+    }
+}
+
+/// Keep every exec-allowed DOTNET_ROOT subtree read-only.
+///
+/// These paths are the only ones where cplt re-grants `process-exec` inside a
+/// tree that is otherwise writable, so write access to them is a
+/// write-then-exec primitive: drop a binary into `$DOTNET_ROOT/sdk` and run
+/// it, bypassing the `allow_tmp_exec` / `allow_cache_exec` gates entirely.
+///
+/// Emitted AFTER `emit_user_allows` because SBPL is last-match-wins: a user
+/// `allow.write` covering DOTNET_ROOT (e.g. `allow.write = ["~/.dotnet"]`, or
+/// any parent of it) would otherwise override a write-deny emitted alongside
+/// the exec allows and silently reopen the hole. Same rationale as
+/// `emit_sensitive_project_denies`.
+fn emit_dotnet_exec_denies(sb: &mut String, dotnet_root: Option<&Path>) {
+    if let Some(dir) = dotnet_root {
+        let p = dir.to_string_lossy();
+        sbpl!(sb, ";; DOTNET_ROOT — exec-allowed paths stay read-only");
+        sbpl!(sb, "(deny file-write* (literal \"{p}/dotnet\"))");
+        for subdir in ["sdk", "shared"] {
             sbpl!(sb, "(deny file-write* (subpath \"{p}/{subdir}\"))");
         }
         sbpl!(sb);
