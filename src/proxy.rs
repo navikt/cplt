@@ -3198,6 +3198,32 @@ mod tests {
         panic!("{host} must complete a 200 tunnel once allowed");
     }
 
+    /// Block until `host` appears in the proxy's observed set, then return it.
+    ///
+    /// The connection thread records the host *after* the client's CONNECT has
+    /// already returned, so snapshotting straight after `proxy_connect` races
+    /// it. A fixed `sleep(50ms)` hid that race until a loaded CI runner ran
+    /// past the window and failed the run for #158. Polling to a deadline is
+    /// both faster in the common case and reliable under load — same reasoning
+    /// as `assert_connect_allowed`'s retry loop above.
+    fn await_observed(proxy: &ProxyHandle, host: &str) -> ObservedDomain {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(rec) = proxy
+                .observed_domains()
+                .into_iter()
+                .find(|o| o.host == host)
+            {
+                return rec;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{host} was never recorded in the observed set"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn proxy_default_allowlist_blocks_unknown_domain() {
         require_localhost_tcp!();
@@ -3287,9 +3313,7 @@ mod tests {
         let proxy = make_proxy_default_allowlist(Vec::new(), None, upstream);
 
         let status = proxy_connect(proxy.port, "would-be-blocked.example:443");
-        // Let the connection thread finish recording before snapshotting.
-        std::thread::sleep(Duration::from_millis(50));
-        let observed = proxy.observed_domains();
+        let rec = await_observed(&proxy, "would-be-blocked.example");
         proxy.shutdown();
         up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -3297,10 +3321,6 @@ mod tests {
             !status.contains("Forbidden"),
             "allow-all (observe) must NOT block would-be-blocked.example; got {status}"
         );
-        let rec = observed
-            .iter()
-            .find(|o| o.host == "would-be-blocked.example")
-            .expect("contacted host must be recorded even in allow-all mode");
         assert_eq!(
             rec.verdict,
             DomainVerdict::Allowed,
@@ -3318,8 +3338,7 @@ mod tests {
         let proxy = make_proxy_default_allowlist(copilot_defaults(), None, upstream);
 
         let status = proxy_connect(proxy.port, "evil.com:443");
-        std::thread::sleep(Duration::from_millis(50));
-        let observed = proxy.observed_domains();
+        let rec = await_observed(&proxy, "evil.com");
         proxy.shutdown();
         up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -3327,10 +3346,6 @@ mod tests {
             status.contains("403"),
             "evil.com must be blocked under the allowlist; got {status}"
         );
-        let rec = observed
-            .iter()
-            .find(|o| o.host == "evil.com")
-            .expect("blocked host must still be recorded");
         assert_eq!(rec.verdict, DomainVerdict::Blocked);
     }
 
