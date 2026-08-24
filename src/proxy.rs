@@ -4338,11 +4338,9 @@ mod tests {
             Some(resolver),
         );
 
-        let status = proxy_connect(proxy.port, "intranet.corp.example:443");
-        assert!(
-            status.contains("200"),
-            "allow_private_domains host must be forwarded to upstream; got: {status}"
-        );
+        // Retry transport flakes: `assert_connect_allowed` still fails fast on a
+        // real `403 Forbidden`, so the policy assertion keeps its teeth.
+        assert_connect_allowed(proxy.port, "intranet.corp.example");
 
         std::thread::sleep(Duration::from_millis(100));
         assert!(
@@ -4542,11 +4540,7 @@ mod tests {
         );
 
         // 1. No-proxy host → DIRECT path: 200, direct origin reached, upstream not.
-        let status = proxy_connect(proxy.port, "internal.corp.example:443");
-        assert!(
-            status.contains("200"),
-            "no-proxy host should connect directly; got: {status}"
-        );
+        assert_connect_allowed(proxy.port, "internal.corp.example");
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             direct.contacted.load(std::sync::atomic::Ordering::SeqCst),
@@ -4560,11 +4554,7 @@ mod tests {
         );
 
         // 2. A host NOT in the no-proxy list is still forwarded to the upstream.
-        let status = proxy_connect(proxy.port, "external.example.net:443");
-        assert!(
-            status.contains("200"),
-            "non-no-proxy host should be forwarded via upstream; got: {status}"
-        );
+        assert_connect_allowed(proxy.port, "external.example.net");
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             upstream_srv
