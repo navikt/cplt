@@ -59,32 +59,15 @@ jobs:
             build-mode: none
           # `none` is the only build mode the Rust extractor accepts —
           # `autobuild` is rejected outright ("Rust does not support the
-          # autobuild build mode"). Buildless extraction still resolves types
-          # across crates as long as the dependency sources are on disk, which
-          # is what the `cargo fetch` step below is for.
+          # autobuild build mode"). It extracts 35 of 41 files with errors,
+          # which is exactly what the repository's default setup produces
+          # today, so this is not a regression — but treat Rust findings as
+          # best-effort until the extractor improves. Pre-fetching crate
+          # sources (`cargo fetch`) was measured and changed nothing.
           - language: rust
             build-mode: none
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v7.0.0
-
-      # Same registry cache as ci.yaml. No `target/` here — buildless
-      # extraction never compiles, it only needs the dependency *sources*.
-      - name: Cache cargo registry
-        if: matrix.language == 'rust'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # ratchet:actions/cache@v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      # Puts every dependency's source under ~/.cargo/registry/src before the
-      # extractor runs. Without it the buildless extractor has no crate sources
-      # to resolve names against and most files extract with errors.
-      - name: Fetch cargo dependencies
-        if: matrix.language == 'rust'
-        run: cargo fetch --locked
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # ratchet:github/codeql-action/init@v4.37.8
