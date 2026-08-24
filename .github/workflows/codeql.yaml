@@ -1,0 +1,84 @@
+name: CodeQL
+
+# Advanced CodeQL setup, replacing the repository's *default* setup.
+#
+# Why: the branch ruleset has a `code_scanning` rule requiring results from the
+# CodeQL tool, but default setup never runs for pull requests from forks. Every
+# fork PR therefore sat forever on "Code scanning is waiting for results from
+# CodeQL", with no run to approve and no result ever arriving — see #177 and
+# #158. An advanced workflow runs in the `pull_request` context like any other
+# workflow, so fork PRs get analyzed once a maintainer approves the run.
+#
+# Second reason: default setup was configured for `actions` only, so CodeQL had
+# never looked at a line of the Rust. This adds `rust` alongside it.
+#
+# IMPORTANT: default setup must be disabled (Settings → Code security → CodeQL
+# analysis → default setup) before this workflow can upload. While it is still
+# enabled, the analyze step fails because GitHub refuses advanced-configuration
+# results for a repo using default setup.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # The ruleset gates merges on code scanning, so the analysis has to report in
+  # the merge queue's temporary ref too — otherwise queued entries wait out the
+  # 60-minute timeout and fail to merge. Same reasoning as ci.yaml.
+  merge_group:
+  # Keeps the weekly cadence the default setup had, so main is still rescanned
+  # when new queries ship rather than only when someone opens a PR.
+  schedule:
+    - cron: "27 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Uploading the SARIF results.
+      security-events: write
+      # The `actions` extractor reads workflow definitions and run metadata.
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `actions` just parses workflow YAML — nothing to build.
+          - language: actions
+            build-mode: none
+          # `none` is the only build mode the Rust extractor accepts —
+          # `autobuild` is rejected outright ("Rust does not support the
+          # autobuild build mode"). It extracts 35 of 41 files with errors,
+          # which is exactly what the repository's default setup produces
+          # today, so this is not a regression — but treat Rust findings as
+          # best-effort until the extractor improves. Pre-fetching crate
+          # sources (`cargo fetch`) was measured and changed nothing.
+          - language: rust
+            build-mode: none
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v7.0.0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # ratchet:github/codeql-action/init@v4.37.8
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Matches the `extended` query suite the default setup used, so this
+          # swap does not quietly narrow what gets flagged.
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # ratchet:github/codeql-action/analyze@v4.37.8
+        with:
+          category: "/language:${{ matrix.language }}"
