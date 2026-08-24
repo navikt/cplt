@@ -849,6 +849,28 @@ pub struct AgentDir {
     pub write_files: Vec<&'static str>,
 }
 
+/// Resolve each agent dir to its real path, in place.
+///
+/// Both backends match on the *resolved* path — Seatbelt resolves symlinks
+/// before matching a `subpath` rule, and Landlock rules attach to the inode —
+/// so a rule emitted for a symlinked config dir never matches. Dotfile managers
+/// symlink these constantly (`~/.config/opencode -> ~/dotfiles/opencode`), and
+/// the result is a hard startup crash: the agent cannot read its own config,
+/// and it fails before initializing its logger, so the log the TUI points the
+/// user at stays empty (#171).
+///
+/// User-supplied `allow.read`/`allow.write` paths already canonicalize; this
+/// brings the built-in agent dirs in line. Paths that cannot be resolved (a dir
+/// the caller has not created yet, a dangling link) are left as-is so the
+/// caller still emits a rule for the literal path rather than dropping it.
+pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
+    for dir in dirs {
+        if let Ok(resolved) = std::fs::canonicalize(&dir.path) {
+            dir.path = resolved;
+        }
+    }
+}
+
 /// Check if a copilot binary is a VS Code/Cursor/editor shim script.
 fn is_editor_shim(path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
@@ -957,6 +979,59 @@ impl std::fmt::Display for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent_dir(path: PathBuf) -> AgentDir {
+        AgentDir {
+            path,
+            write: true,
+            map_exec: false,
+            process_exec: false,
+            write_files: vec![],
+        }
+    }
+
+    /// Dotfile managers routinely symlink `~/.config/<agent>` elsewhere. Both
+    /// sandbox backends match on the resolved path, so emitting a rule for the
+    /// link is a silent no-op and the agent cannot read its own config (#171).
+    #[test]
+    #[cfg(unix)]
+    fn canonicalize_agent_dirs_resolves_symlinked_config_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("dotfiles-opencode");
+        std::fs::create_dir(&real).expect("create real dir");
+        let link = tmp.path().join("config-opencode");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let mut dirs = vec![agent_dir(link)];
+        canonicalize_agent_dirs(&mut dirs);
+
+        assert_eq!(
+            dirs[0].path,
+            real.canonicalize().expect("canonicalize real dir"),
+            "a symlinked agent dir must be emitted as its resolved target"
+        );
+    }
+
+    /// A dir that does not resolve (never created, or a dangling link) keeps
+    /// its literal path — dropping it would silently remove the grant instead.
+    #[test]
+    fn canonicalize_agent_dirs_keeps_unresolvable_paths() {
+        let missing = PathBuf::from("/definitely/not/a/real/path/cplt-xyzzy");
+        let mut dirs = vec![agent_dir(missing.clone())];
+        canonicalize_agent_dirs(&mut dirs);
+        assert_eq!(dirs[0].path, missing);
+    }
+
+    /// Non-symlinked dirs must survive untouched apart from `..`/`.` cleanup.
+    #[test]
+    fn canonicalize_agent_dirs_leaves_real_dirs_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("plain");
+        std::fs::create_dir(&real).expect("create");
+        let mut dirs = vec![agent_dir(real.clone())];
+        canonicalize_agent_dirs(&mut dirs);
+        assert_eq!(dirs[0].path, real.canonicalize().expect("canonicalize"));
+    }
 
     #[test]
     fn parse_agent_names() {

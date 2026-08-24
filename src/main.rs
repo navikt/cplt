@@ -2327,7 +2327,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         .filter(|p| !crate::is_unsafe_root(p, &home_dir));
 
     // Compute agent-specific sandbox directories
-    let agent_dirs = active_agent.config_dirs(&home_dir);
+    let mut agent_dirs = active_agent.config_dirs(&home_dir);
 
     // Pre-create agent directories before entering sandbox.
     // Agents like OpenCode crash if their data/config dirs don't exist,
@@ -2337,6 +2337,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             let _ = std::fs::create_dir_all(&dir.path);
         }
     }
+    // After pre-creation, so a dir we just made resolves too. See #171.
+    agent::canonicalize_agent_dirs(&mut agent_dirs);
 
     // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
     // init script so sandboxed builds keep the preferIPv4Stack workaround for
@@ -2844,12 +2846,14 @@ fn prepare_shell_sandbox(
         .filter(|p| p.is_dir())
         .filter(|p| !crate::is_unsafe_root(p, home_dir));
 
-    let agent_dirs = active_agent.config_dirs(home_dir);
+    let mut agent_dirs = active_agent.config_dirs(home_dir);
     for dir in &agent_dirs {
         if !dir.path.exists() {
             let _ = std::fs::create_dir_all(&dir.path);
         }
     }
+    // See the agent-path call site: resolve symlinked agent dirs (#171).
+    agent::canonicalize_agent_dirs(&mut agent_dirs);
 
     // See the agent-path call site: guarded Gradle init script (opt-in via
     // sandbox.gradle_init) so sandboxed builds keep the preferIPv4Stack

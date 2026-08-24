@@ -108,7 +108,7 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | PID namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
 | Mount namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
 | User namespace (unprivileged) | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
-| --deny-path | ✅ Kernel deny | ❌ No effect (warned) | ❌ No effect (warned) |
+| --deny-path / deny.paths | ✅ Kernel deny | ❌ No effect (warned) | ✅ Mount-masked (files read as EACCES, dirs appear empty; the real content is unreachable) |
 
 Legend: ✅ = kernel-enforced, ⚠️ = defense-in-depth (proxy/env), ❌ = not available
 
@@ -179,7 +179,7 @@ sudo pacman -S bubblewrap
 - **Kernel exploits** — we rely on Apple's Seatbelt (macOS) and Landlock/seccomp (Linux) enforcement being correct
 - **Keychain isolation** (macOS) — Copilot requires Keychain access for auth; this is an accepted trade-off. `mach-lookup` is blanket because Node.js needs it for DNS, Security framework, and system services. The **clipboard** (`com.apple.pasteboard`) is reachable via the same blanket allow; use `--deny-clipboard` to add a targeted deny that blocks only the pasteboard service while leaving all others intact.
 - **sandbox-exec deprecation** (macOS) — Apple marks it deprecated but has not removed it; Chromium and VS Code still use it
-- **Landlock subpath limitations** (Linux) — Landlock cannot deny access to subpaths within allowed directories. If a parent directory is allowed, all children are allowed. This means certain fine-grained macOS rules (e.g., deny `.config/gh/extensions` while allowing `.config/gh/hosts.yml`) cannot be replicated on Linux.
+- **Landlock subpath limitations** (Linux) — Landlock cannot deny access to subpaths within allowed directories. If a parent directory is allowed, all children are allowed. This means certain fine-grained macOS rules (e.g., deny `.config/gh/extensions` while allowing `.config/gh/hosts.yml`) cannot be replicated on Linux. When Bubblewrap is active, user deny paths (`--deny-path` / `deny.paths`) ARE enforced despite this, via mount masks (see the platform comparison table); the built-in fine-grained rules remain macOS-only.
 - **Code quality** — the sandbox cannot judge whether code written by Copilot contains backdoors; that's a code review problem
 - **`~/.config/gh/hosts.yml` token** — contains the user's GitHub OAuth token. Copilot needs *a* GitHub token to function (via env var or this file). The token is readable inside the sandbox. If this is a concern, set `GH_TOKEN` env var (passes through allowlist) and add `--deny-path ~/.config/gh` to block the file.
 - **Interpreter-based temp execution** — the sandbox blocks *direct* exec from `/tmp` (Mach-O/ELF binaries, dlopen), but cannot block `bash /tmp/evil.sh` or `node /tmp/evil.js` because the exec target is the interpreter (`/bin/bash`, `/usr/bin/node`), not the script file. Sandboxing interpreters would break Copilot.

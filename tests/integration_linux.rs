@@ -1591,6 +1591,142 @@ else:
         );
     }
 
+    // ── Deny-path mount masks ─────────────────────────────────────
+    //
+    // Landlock cannot deny subpaths within allowed directories, so
+    // --deny-path targets inside the project tree are shadowed at the mount
+    // level when bwrap is active (an empty tmpfs for dirs, an unreadable
+    // placeholder bind for files). Projects here live under the cargo target
+    // dir, not tempfile::tempdir(): deny targets under /tmp are deliberately
+    // skipped by build_deny_masks (host /tmp is already invisible behind the
+    // private tmpfs), so a /tmp-based project cannot demonstrate the mask.
+
+    /// Create a project with a secret dir and file inside, outside `/tmp`.
+    ///
+    /// Returns a `TempDir` guard so the tree is removed on Drop even when the
+    /// test panics mid-assert.
+    fn create_deny_project() -> tempfile::TempDir {
+        // A CARGO_TARGET_DIR under /tmp (a common build-speed setup) falls
+        // back to the manifest's target/ — deny masks skip /tmp, so a /tmp
+        // base would void these tests.
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .filter(|d| {
+                fs::create_dir_all(d).is_ok()
+                    && d.canonicalize().is_ok_and(|c| !c.starts_with("/tmp"))
+            })
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+        fs::create_dir_all(&base).expect("create project base");
+        assert!(
+            !base
+                .canonicalize()
+                .expect("canonicalize base")
+                .starts_with("/tmp"),
+            "test premise: no usable target dir outside /tmp — the deny mask \
+             skips /tmp, so these tests would prove nothing there"
+        );
+        let dir = tempfile::tempdir_in(base).expect("tempdir in target dir");
+        fs::create_dir_all(dir.path().join("secrets")).expect("create project dirs");
+        fs::write(dir.path().join("secrets/pw.txt"), "TOP-SECRET-DIR").expect("write");
+        fs::write(dir.path().join("token.txt"), "TOP-SECRET-FILE").expect("write");
+        fs::write(dir.path().join("README.md"), "hello").expect("write");
+        dir
+    }
+
+    #[test]
+    fn bwrap_deny_path_dir_content_is_hidden() {
+        require_bwrap!();
+        let project = create_deny_project();
+        let deny = project.path().join("secrets");
+        let script = format!(
+            "cat '{}/pw.txt' 2>&1 && echo READ_OK || echo READ_DENIED",
+            deny.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--use-bubblewrap", "--deny-path", &deny.to_string_lossy()],
+            &script,
+        );
+        assert!(
+            stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
+            "content under a --deny-path dir inside the project must be hidden under bwrap — code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn bwrap_deny_path_file_is_unreadable() {
+        require_bwrap!();
+        let project = create_deny_project();
+        let deny = project.path().join("token.txt");
+        let script = format!(
+            "cat '{}' 2>&1 && echo READ_OK || echo READ_DENIED",
+            deny.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--use-bubblewrap", "--deny-path", &deny.to_string_lossy()],
+            &script,
+        );
+        assert!(
+            stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
+            "a --deny-path file inside the project must be unreadable under bwrap — code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn bwrap_deny_mask_placeholder_cannot_be_softened() {
+        // The placeholder lives inside the writable scratch bind (TMPDIR); a
+        // self ro-bind must make chmod through that path fail, or the agent
+        // could flip it readable and defeat the file mask.
+        require_bwrap!();
+        let project = create_deny_project();
+        let deny = project.path().join("token.txt");
+        let script = format!(
+            "chmod 644 \"$TMPDIR/deny-mask\" 2>&1 && echo CHMOD_OK || echo CHMOD_DENIED; \
+             cat '{}' 2>&1 && echo READ_OK || echo READ_DENIED",
+            deny.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--use-bubblewrap", "--deny-path", &deny.to_string_lossy()],
+            &script,
+        );
+        assert!(
+            stdout.contains("CHMOD_DENIED"),
+            "the placeholder must not be chmod-able from inside the sandbox — code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("READ_DENIED") && !stdout.contains("TOP-SECRET"),
+            "the file mask must hold — code: {code}, stdout: {stdout}, stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn deny_path_without_bwrap_warns_and_stays_readable() {
+        // Degradation contract: without bwrap the mask cannot exist, the file
+        // stays readable (Landlock cannot sub-deny), and the user is told so.
+        require_landlock!();
+        let project = create_deny_project();
+        let deny = project.path().join("secrets");
+        let script = format!(
+            "cat '{}/pw.txt' 2>&1 && echo READ_OK || echo READ_DENIED",
+            deny.display()
+        );
+        let (code, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--no-bubblewrap", "--deny-path", &deny.to_string_lossy()],
+            &script,
+        );
+        assert!(
+            stdout.contains("READ_OK"),
+            "without bwrap the deny path stays readable — code: {code}, stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("NOT enforced"),
+            "the unenforced deny must be loudly warned about — stderr: {stderr}"
+        );
+    }
+
     // ── Proxy-forced networking (#53) ─────────────────────────────
     //
     // `--proxy-forced` makes the CONNECT proxy mandatory and restricts kernel

@@ -310,13 +310,8 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 #[cfg(target_os = "linux")]
 fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     // Warn about config options that Linux cannot enforce at kernel level.
-    if !config.extra_deny.is_empty() {
-        ui::warn(
-            "--deny-path has no effect on Linux: \
-             Landlock cannot deny subpaths within allowed directories. \
-             Proxy and env hardening provide defense-in-depth.",
-        );
-    }
+    // (Deny paths are handled after bwrap resolution below — with Bubblewrap
+    // they ARE enforced, via mount masks.)
     if !config.allow_env_files {
         ui::warn(
             "allow_env_files=false is not fully enforceable on Linux: \
@@ -368,6 +363,12 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     // the sandbox grants write access to), so pass it through to cover them too.
     let ro_protect = bubblewrap::git_persistence_paths(config.project_dir, config.git_common_dir);
 
+    // Deny-path masks: Landlock cannot deny subpaths within allowed
+    // directories, but Bubblewrap can shadow them at the mount level — denied
+    // files read as EACCES, denied dirs read as empty (macOS gives EACCES for
+    // both; the content is unreachable either way).
+    let deny_masks = bubblewrap::build_deny_masks(config.extra_deny, config.scratch_dir);
+
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
     // build a wrapper (explicit-on, or auto-detect with bwrap available) — the
@@ -378,7 +379,41 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         &policy.net_rules,
         policy.restrict_net_connect,
         &ro_protect,
+        &deny_masks,
     )?;
+
+    if !config.extra_deny.is_empty() {
+        if bwrap_wrapper.is_some() {
+            let masked = deny_masks.mask_count();
+            if masked > 0 {
+                ui::info(&format!(
+                    "Deny paths enforced via Bubblewrap mount masks ({masked} masked)."
+                ));
+            }
+            let skipped = deny_masks.skipped();
+            if !skipped.is_empty() {
+                let list = skipped
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui::warn(&format!(
+                    "{} deny path(s) could not be mount-masked and are NOT \
+                     enforced: {list}",
+                    skipped.len()
+                ));
+                if let Some(reason) = deny_masks.placeholder_error() {
+                    ui::warn(&format!("File deny paths were skipped: {reason}."));
+                }
+            }
+        } else {
+            ui::warn(
+                "Deny paths are NOT enforced without Bubblewrap: Landlock cannot \
+                 deny subpaths within allowed directories. Proxy and env hardening \
+                 provide defense-in-depth.",
+            );
+        }
+    }
 
     // Pre-compute everything in the parent process.
     // ABI check, BPF construction, and all allocation happens here.
