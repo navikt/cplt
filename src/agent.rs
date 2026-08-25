@@ -1,7 +1,7 @@
 //! Agent abstraction for different AI coding tools.
 //!
 //! cplt can sandbox multiple AI coding agents — currently GitHub Copilot CLI,
-//! OpenCode, Google Gemini CLI, Antigravity, Pi, and Claude Code. Each agent has
+//! OpenCode, Google Gemini CLI, Antigravity, Pi, Claude Code, and goose. Each agent has
 //! different binary names, config directories, and runtime requirements, but
 //! shares the same core sandbox infrastructure.
 
@@ -107,6 +107,16 @@ const ANTHROPIC_DOMAINS: &[&str] = &[
 /// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
 const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 
+/// goose's OWN infrastructure only. goose (github.com/block/goose) is an
+/// open-source, provider-agnostic AI agent: model traffic goes to a
+/// user-configured provider (Anthropic/OpenAI/Google/Databricks/OpenRouter/…),
+/// so enabling `default_allowlist` for goose requires adding that provider's
+/// domain via `allowed_domains`. Only goose's own infra/docs/update endpoints
+/// are listed here.
+///
+/// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
+const GOOSE_DOMAINS: &[&str] = &["block.github.io"];
+
 /// Supported AI coding agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -123,6 +133,8 @@ pub enum Agent {
     Pi,
     /// Claude Code (Anthropic's `claude` CLI).
     Claude,
+    /// goose — open-source AI agent (github.com/block/goose).
+    Goose,
     /// Plain sandboxed shell — no AI agent, just a secure shell session.
     Shell,
 }
@@ -137,6 +149,7 @@ impl Agent {
             Agent::Antigravity => "antigravity",
             Agent::Pi => "pi",
             Agent::Claude => "claude",
+            Agent::Goose => "goose",
             Agent::Shell => "shell",
         }
     }
@@ -150,6 +163,7 @@ impl Agent {
             Agent::Antigravity => "Antigravity",
             Agent::Pi => "Pi",
             Agent::Claude => "Claude Code",
+            Agent::Goose => "goose",
             Agent::Shell => "Shell",
         }
     }
@@ -171,6 +185,7 @@ impl Agent {
             | Agent::Antigravity
             | Agent::Pi
             | Agent::Claude
+            | Agent::Goose
             | Agent::Shell => &[],
         }
     }
@@ -263,6 +278,26 @@ impl Agent {
                 }
                 // --remote and --name have no claude equivalent; dropped.
             }
+            Agent::Goose => {
+                // goose: `--resume` continues the latest session; `--name NAME`
+                // (with `--resume`) resumes a named session. goose has no
+                // separate "continue" flag distinct from `--resume`, and no
+                // remote equivalent.
+                if let Some(session) = resume {
+                    args.push("--resume".to_string());
+                    if !session.is_empty() {
+                        args.push("--name".to_string());
+                        args.push(session.to_string());
+                    }
+                } else if continue_session {
+                    args.push("--resume".to_string());
+                }
+                if let Some(name) = session_name {
+                    args.push("--name".to_string());
+                    args.push(name.to_string());
+                }
+                // --remote has no goose equivalent; dropped.
+            }
             // Gemini still receives auto-resume handling in main.rs; Pi and Shell
             // have no recognized session flags. None get explicit translation here.
             Agent::Gemini | Agent::Pi | Agent::Shell => {}
@@ -277,10 +312,12 @@ impl Agent {
     /// ("Claude Code-credentials"); on Linux it uses ~/.claude/.credentials.json.
     /// OpenCode authenticates via the `/connect` device flow by default;
     /// third-party providers use API keys from env vars or config files.
+    /// goose stores provider API keys in the OS keyring by default (the macOS
+    /// login Keychain).
     pub fn needs_keychain(&self) -> bool {
         matches!(
             self,
-            Agent::Copilot | Agent::Gemini | Agent::Antigravity | Agent::Claude
+            Agent::Copilot | Agent::Gemini | Agent::Antigravity | Agent::Claude | Agent::Goose
         )
     }
 
@@ -399,6 +436,7 @@ impl Agent {
             Agent::Antigravity => &[GOOGLE_AI_DOMAINS, ANTIGRAVITY_DOMAINS],
             Agent::Claude => &[ANTHROPIC_DOMAINS],
             Agent::OpenCode => &[OPENCODE_DOMAINS],
+            Agent::Goose => &[GOOSE_DOMAINS],
             Agent::Pi | Agent::Shell => &[],
         };
         let mut domains: Vec<&'static str> = Vec::new();
@@ -618,6 +656,56 @@ impl Agent {
                     },
                 ]
             }
+            Agent::Goose => {
+                // goose keeps its config under XDG dirs (github.com/block/goose):
+                //   ~/.config/goose        — config.yaml, recipes, sessions index
+                //   ~/.local/share/goose   — session data, logs, memory
+                //   ~/.local/state/goose   — runtime state
+                //   ~/.cache/goose         — cached downloads / temporary data
+                // All respect the XDG_* overrides, mirroring OpenCode.
+                let config_base = std::env::var("XDG_CONFIG_HOME")
+                    .ok()
+                    .map_or_else(|| home.join(".config"), PathBuf::from);
+                let data_base = std::env::var("XDG_DATA_HOME")
+                    .ok()
+                    .map_or_else(|| home.join(".local/share"), PathBuf::from);
+                let state_base = std::env::var("XDG_STATE_HOME")
+                    .ok()
+                    .map_or_else(|| home.join(".local/state"), PathBuf::from);
+                let cache_base = std::env::var("XDG_CACHE_HOME")
+                    .ok()
+                    .map_or_else(|| home.join(".cache"), PathBuf::from);
+                vec![
+                    AgentDir {
+                        path: config_base.join("goose"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                    AgentDir {
+                        path: data_base.join("goose"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                    AgentDir {
+                        path: state_base.join("goose"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                    AgentDir {
+                        path: cache_base.join("goose"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                ]
+            }
         }
     }
 
@@ -827,6 +915,28 @@ impl Agent {
                 "ANTHROPIC_VERTEX_PROJECT_ID",
                 "GOOGLE_CLOUD_PROJECT",
             ],
+            // goose is provider-agnostic (github.com/block/goose): it reads the
+            // active provider's API key from the environment or its keyring.
+            // These cover the common providers goose supports out of the box.
+            Agent::Goose => &[
+                // Anthropic
+                "ANTHROPIC_API_KEY",
+                // OpenAI + Azure OpenAI
+                "OPENAI_API_KEY",
+                "AZURE_OPENAI_API_KEY",
+                // Google
+                "GOOGLE_API_KEY",
+                "GEMINI_API_KEY",
+                // Databricks (a first-class goose provider)
+                "DATABRICKS_HOST",
+                "DATABRICKS_TOKEN",
+                // Popular API providers
+                "GROQ_API_KEY",
+                "OPENROUTER_API_KEY",
+                "XAI_API_KEY",
+                // AWS Bedrock (bearer token auth)
+                "AWS_BEARER_TOKEN_BEDROCK",
+            ],
             Agent::Shell => &[],
         }
     }
@@ -948,6 +1058,10 @@ impl Agent {
                 "Install Antigravity CLI: see https://antigravity.google/docs/cli-getting-started"
             }
             Agent::Pi => "Install Pi: npm i -g @earendil-works/pi-coding-agent",
+            Agent::Goose => {
+                "Install goose: brew install block-goose-cli, or see \
+                 https://block.github.io/goose/docs/getting-started/installation"
+            }
             Agent::Claude => {
                 "Install Claude Code: npm i -g @anthropic-ai/claude-code, \
                  or see https://docs.anthropic.com/en/docs/claude-code"
@@ -1071,9 +1185,10 @@ impl FromStr for Agent {
             "antigravity" | "agy" | "agi" => Ok(Agent::Antigravity),
             "pi" => Ok(Agent::Pi),
             "claude" | "cc" | "claude-code" => Ok(Agent::Claude),
+            "goose" => Ok(Agent::Goose),
             "shell" | "sh" | "bash" | "zsh" => Ok(Agent::Shell),
             _ => Err(format!(
-                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, shell"
+                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, shell"
             )),
         }
     }
@@ -1459,6 +1574,8 @@ mod tests {
         assert_eq!(Agent::from_str("antigravity").unwrap(), Agent::Antigravity);
         assert_eq!(Agent::from_str("agi").unwrap(), Agent::Antigravity);
         assert_eq!(Agent::from_str("agy").unwrap(), Agent::Antigravity);
+        assert_eq!(Agent::from_str("goose").unwrap(), Agent::Goose);
+        assert_eq!(Agent::from_str("Goose").unwrap(), Agent::Goose);
         assert!(Agent::from_str("unknown").is_err());
     }
 
@@ -1610,6 +1727,7 @@ mod tests {
         assert!(Agent::Copilot.needs_keychain());
         assert!(Agent::Gemini.needs_keychain());
         assert!(Agent::Antigravity.needs_keychain());
+        assert!(Agent::Goose.needs_keychain());
         assert!(!Agent::OpenCode.needs_keychain());
     }
 
@@ -1998,6 +2116,7 @@ mod tests {
         );
         assert!(err.contains("pi"), "error should mention pi: {err}");
         assert!(err.contains("claude"), "error should mention claude: {err}");
+        assert!(err.contains("goose"), "error should mention goose: {err}");
     }
 
     #[test]
@@ -2095,6 +2214,103 @@ mod tests {
         // (We can't easily fake PATH here, but the detection loop has no
         // claude branch — this guards against a regression in intent.)
         assert_ne!(Agent::auto_detect(), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn parse_goose_agent() {
+        assert_eq!(Agent::from_str("goose").unwrap(), Agent::Goose);
+        assert_eq!(Agent::from_str("Goose").unwrap(), Agent::Goose);
+        assert_eq!(Agent::from_str("GOOSE").unwrap(), Agent::Goose);
+    }
+
+    #[test]
+    fn goose_binary_and_display_name() {
+        assert_eq!(Agent::Goose.binary_name(), "goose");
+        assert_eq!(format!("{}", Agent::Goose), "goose");
+    }
+
+    #[test]
+    fn goose_no_sea_extraction_or_extra_args() {
+        assert!(!Agent::Goose.needs_sea_extraction());
+        assert!(Agent::Goose.extra_args().is_empty());
+    }
+
+    #[test]
+    fn goose_needs_keychain() {
+        // goose stores provider secrets in the login Keychain by default.
+        assert!(Agent::Goose.needs_keychain());
+    }
+
+    #[test]
+    fn goose_no_copilot_dir() {
+        assert!(!Agent::Goose.needs_copilot_dir());
+    }
+
+    #[test]
+    fn goose_not_auto_detected() {
+        // goose is explicit-only; auto_detect must never return it.
+        assert_ne!(Agent::auto_detect(), Some(Agent::Goose));
+    }
+
+    #[test]
+    fn goose_config_dirs_xdg_default() {
+        let home = Path::new("/Users/test");
+        let dirs = Agent::Goose.config_dirs(home);
+        assert_eq!(dirs.len(), 4, "config + data + state + cache");
+        let config_dir = dirs
+            .iter()
+            .find(|d| d.path == home.join(".config/goose"))
+            .expect("~/.config/goose");
+        let data_dir = dirs
+            .iter()
+            .find(|d| d.path == home.join(".local/share/goose"))
+            .expect("~/.local/share/goose");
+        let state_dir = dirs
+            .iter()
+            .find(|d| d.path == home.join(".local/state/goose"))
+            .expect("~/.local/state/goose");
+        let cache_dir = dirs
+            .iter()
+            .find(|d| d.path == home.join(".cache/goose"))
+            .expect("~/.cache/goose");
+        for d in [config_dir, data_dir, state_dir, cache_dir] {
+            assert!(d.write, "{:?} should be writable", d.path);
+            assert!(!d.process_exec && !d.map_exec);
+        }
+    }
+
+    #[test]
+    fn goose_auth_env_hints() {
+        let hints = Agent::Goose.auth_env_hint();
+        assert!(hints.contains(&"ANTHROPIC_API_KEY"));
+        assert!(hints.contains(&"OPENAI_API_KEY"));
+        assert!(hints.contains(&"DATABRICKS_HOST"));
+        assert!(hints.contains(&"DATABRICKS_TOKEN"));
+        assert!(hints.contains(&"OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn session_args_goose() {
+        // --resume=ID maps to `--resume --name ID`.
+        assert_eq!(
+            Agent::Goose.session_args(Some("sess1"), false, None, false),
+            vec!["--resume", "--name", "sess1"]
+        );
+        // Bare --resume maps to `--resume`.
+        assert_eq!(
+            Agent::Goose.session_args(Some(""), false, None, false),
+            vec!["--resume"]
+        );
+        // --continue maps to `--resume`.
+        assert_eq!(
+            Agent::Goose.session_args(None, true, None, false),
+            vec!["--resume"]
+        );
+        // --remote is dropped (no goose equivalent).
+        assert_eq!(
+            Agent::Goose.session_args(None, false, Some("x"), true),
+            vec!["--name", "x"]
+        );
     }
 
     #[test]
@@ -2216,6 +2432,22 @@ mod tests {
     }
 
     #[test]
+    fn goose_default_domains_include_own_infra_and_registry() {
+        let domains = Agent::Goose.default_allowed_domains();
+        assert!(
+            domains.contains(&"block.github.io"),
+            "goose must include its own docs/infra domain"
+        );
+        assert!(domains.contains(&"registry.npmjs.org"));
+        // goose is provider-agnostic: no provider LLM domain is baked in.
+        assert!(
+            !domains.contains(&"api.anthropic.com")
+                && !domains.contains(&"generativelanguage.googleapis.com"),
+            "goose must not assume a specific model provider"
+        );
+    }
+
+    #[test]
     fn pi_and_shell_get_registry_base_only() {
         // Pi's infra is not yet documented; Shell is not an AI agent. Both get
         // only the shared package-registry base (8 domains).
@@ -2241,6 +2473,7 @@ mod tests {
             Agent::Antigravity,
             Agent::Pi,
             Agent::Claude,
+            Agent::Goose,
             Agent::Shell,
         ] {
             let domains = agent.default_allowed_domains();
