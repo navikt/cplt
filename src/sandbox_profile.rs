@@ -165,6 +165,7 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         opts.allow_cache_exec_any,
     );
     emit_copilot_install(&mut sb, opts.copilot_install_dir);
+    emit_gradle_toolchain_exec(&mut sb, &home);
     emit_java_home(&mut sb, opts.java_home);
     emit_dotnet_root(&mut sb, opts.dotnet_root);
     emit_electron_app(&mut sb, opts.electron_app_dir);
@@ -200,6 +201,9 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
     // when a user allow.write covers them (write-then-exec).
     emit_dotnet_exec_denies(&mut sb, opts.dotnet_root);
+    // Same reason: keeps the exec-allowed Gradle toolchain dir non-writable
+    // even when a user allow.write covers ~/.gradle (write-then-exec).
+    emit_gradle_toolchain_write_deny(&mut sb, &home);
 
     sb
 }
@@ -802,6 +806,50 @@ fn emit_java_home(sb: &mut String, java_home: Option<&Path>) {
         sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
         sbpl!(sb);
     }
+}
+
+/// Allow executing JDKs that Gradle auto-provisions into `~/.gradle/jdks`.
+///
+/// `~/.gradle` is a dependency store in `HOME_TOOL_DIRS` (write + map-exec, no
+/// process-exec), so `emit_tool_dirs` emits an explicit
+/// `(deny process-exec (subpath "~/.gradle"))` to beat the blanket
+/// `(allow process-exec)`. That is right for dependency JARs, but Gradle's
+/// toolchain support drops provisioned JDKs under `~/.gradle/jdks` — inside the
+/// denied subtree. Forking a toolchain `javac` or test JVM then fails with
+/// "Operation not permitted", and no config key could grant it (`allow.read`
+/// emits `file-read*` only, and there is no `allow.exec`). Re-allow exec for
+/// just that subtree; the matching write-deny is emitted later, by
+/// `emit_gradle_toolchain_write_deny`.
+///
+/// Emitted AFTER `emit_tool_dirs` because SBPL is last-match-wins.
+fn emit_gradle_toolchain_exec(sb: &mut String, home: &str) {
+    sbpl!(sb, ";; Gradle toolchain JDKs — exec auto-provisioned JDKs");
+    sbpl!(sb, "(allow process-exec (subpath \"{home}/.gradle/jdks\"))");
+    sbpl!(sb);
+}
+
+/// Keep the exec-allowed Gradle toolchain directory read-only.
+///
+/// `~/.gradle` is agent-writable, so exec inside it without a write-deny is a
+/// write-then-exec primitive: drop a binary into `~/.gradle/jdks` and run it,
+/// bypassing the `allow_tmp_exec` / `allow_cache_exec` gates entirely. Gradle
+/// provisions toolchains outside the sandbox, so this costs nothing in normal
+/// use. The trade: with `auto-download=true`, a toolchain not already on disk
+/// now fails at provisioning time with a write error instead of at exec time
+/// with EPERM. Provision it outside cplt, or point
+/// `org.gradle.java.installations.paths` at a JDK outside `~/.gradle`.
+///
+/// Emitted AFTER `emit_user_allows` because SBPL is last-match-wins: a user
+/// `allow.write` covering `~/.gradle` (or any parent) would otherwise override
+/// a write-deny emitted alongside the exec allow and silently reopen the hole.
+/// Same rationale as `emit_dotnet_exec_denies`.
+fn emit_gradle_toolchain_write_deny(sb: &mut String, home: &str) {
+    sbpl!(
+        sb,
+        ";; Gradle toolchain JDKs — exec-allowed path stays read-only"
+    );
+    sbpl!(sb, "(deny file-write* (subpath \"{home}/.gradle/jdks\"))");
+    sbpl!(sb);
 }
 
 /// Allow executing the dotnet host and loading .NET SDK libraries from DOTNET_ROOT.
@@ -1603,6 +1651,48 @@ mod tests {
         assert_deny_after_allow(
             r#"(allow file-read* (subpath "/Users/test/.gradle"))"#,
             r#"(deny file-read* (literal "/Users/test/.gradle/gradle.properties"))"#,
+        );
+    }
+
+    /// #191: Gradle auto-provisions toolchain JDKs into `~/.gradle/jdks`, which
+    /// sits inside the `(deny process-exec (subpath "~/.gradle"))` that
+    /// `emit_tool_dirs` emits for dependency stores — `java`/`javac` from a
+    /// toolchain JDK got EPERM. The carve-out only works if it is emitted AFTER
+    /// that deny (last-match-wins), and the paired write-deny only closes the
+    /// write-then-exec hole if it is emitted after every write allow, including
+    /// a user `allow.write`. Byte offsets, not `contains`, because ordering is
+    /// the whole point.
+    #[test]
+    fn gradle_toolchain_exec_allow_comes_after_the_gradle_exec_deny() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        // Worst case for the write-deny: the user has opened up all of ~/.gradle.
+        let extra_write = [std::path::PathBuf::from("/Users/test/.gradle")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts);
+
+        let at = |rule: &str| {
+            p.find(rule)
+                .unwrap_or_else(|| panic!("rule missing from profile: {rule}"))
+        };
+
+        let exec_deny = at(r#"(deny process-exec (subpath "/Users/test/.gradle"))"#);
+        let exec_allow = at(r#"(allow process-exec (subpath "/Users/test/.gradle/jdks"))"#);
+        assert!(
+            exec_deny < exec_allow,
+            "toolchain exec allow @ {exec_allow} must come AFTER the .gradle exec deny @ {exec_deny}"
+        );
+
+        let write_allow = at(r#"(allow file-write* (subpath "/Users/test/.gradle"))"#);
+        let user_write_allow = p
+            .rfind(r#"(allow file-write* (subpath "/Users/test/.gradle"))"#)
+            .expect("user allow.write rule missing");
+        let write_deny = at(r#"(deny file-write* (subpath "/Users/test/.gradle/jdks"))"#);
+        assert!(
+            write_allow < write_deny && user_write_allow < write_deny,
+            "toolchain write deny @ {write_deny} must come AFTER every .gradle write allow \
+             (tool dir @ {write_allow}, user allow.write @ {user_write_allow})"
         );
     }
 
