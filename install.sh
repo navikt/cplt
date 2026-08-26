@@ -44,7 +44,7 @@ done
 
 # ─── Homebrew install (macOS) ────────────────────────────────────────────────
 
-if [[ "$NO_BREW" == false && -z "$VERSION" && -z "$INSTALL_DIR" ]] && command -v brew &>/dev/null; then
+if [[ "$(uname -s)" == "Darwin" && "$NO_BREW" == false && -z "$VERSION" && -z "$INSTALL_DIR" ]] && command -v brew &>/dev/null; then
   echo "→ Installing via Homebrew..."
   brew install navikt/tap/cplt
   echo ""
