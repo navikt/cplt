@@ -142,7 +142,10 @@ fi
 
 echo "→ Verifying checksum..."
 if curl -fsSL -o "${TMP_DIR}/SHA256SUMS" "$CHECKSUM_URL" 2>/dev/null; then
-  EXPECTED=$(grep -F "${ASSET}" "${TMP_DIR}/SHA256SUMS" | awk '{print $1}')
+  # `|| true`: under `set -euo pipefail` a non-matching grep exits 1, pipefail
+  # propagates it, and the assignment trips `set -e` — killing the script with a
+  # bare `exit 1` and making the empty-EXPECTED branch below unreachable.
+  EXPECTED=$(grep -F "${ASSET}" "${TMP_DIR}/SHA256SUMS" | awk '{print $1}' || true)
   if [[ -z "$EXPECTED" ]]; then
     echo "  ⚠ No checksum entry found for ${ASSET} (skipping verification)"
   else
