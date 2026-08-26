@@ -1156,14 +1156,14 @@ mod tests {
     fn global_cache_exec_generates_sandbox_section() {
         let report = GlobalDetectionReport {
             detections: vec![GlobalDetection {
-                name: "Gradle wrapper",
-                reason: "~/.gradle/wrapper/dists/ exists".to_string(),
-                suggestions: vec![GlobalSuggestion::CacheExec("gradle".to_string())],
+                name: "Playwright browsers",
+                reason: "ms-playwright cache directory exists".to_string(),
+                suggestions: vec![GlobalSuggestion::CacheExec("ms-playwright".to_string())],
             }],
         };
         let toml = generate_global_toml(&report);
         assert!(toml.contains("[sandbox]"));
-        assert!(toml.contains("allow_cache_exec = [\"gradle\"]"));
+        assert!(toml.contains("allow_cache_exec = [\"ms-playwright\"]"));
     }
 
     #[test]
@@ -1213,9 +1213,9 @@ mod tests {
         let report = GlobalDetectionReport {
             detections: vec![
                 GlobalDetection {
-                    name: "Gradle wrapper",
+                    name: "pnpm dlx",
                     reason: "exists".to_string(),
-                    suggestions: vec![GlobalSuggestion::CacheExec("gradle".to_string())],
+                    suggestions: vec![GlobalSuggestion::CacheExec("pnpm/dlx".to_string())],
                 },
                 GlobalDetection {
                     name: "Playwright browsers",
@@ -1233,7 +1233,7 @@ mod tests {
         assert!(toml.contains("[sandbox]"));
         assert!(toml.contains("allow_gpg_signing = true"));
         // Both cache_exec entries merged into one array
-        assert!(toml.contains("\"gradle\""));
+        assert!(toml.contains("\"pnpm/dlx\""));
         assert!(toml.contains("\"ms-playwright\""));
     }
 
@@ -1242,10 +1242,10 @@ mod tests {
         let report = GlobalDetectionReport {
             detections: vec![
                 GlobalDetection {
-                    name: "Gradle",
+                    name: "Playwright",
                     reason: "test".to_string(),
                     suggestions: vec![
-                        GlobalSuggestion::CacheExec("gradle".to_string()),
+                        GlobalSuggestion::CacheExec("ms-playwright".to_string()),
                         GlobalSuggestion::AllowRead("~/.gradle/gradle.properties".to_string()),
                     ],
                 },

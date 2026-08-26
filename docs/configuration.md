@@ -359,7 +359,6 @@ cplt init --global --write  # Write to ~/.config/cplt/config.toml
 Detects:
 | Tool | Probes | Suggests |
 |------|--------|----------|
-| Gradle wrapper | `~/.gradle/wrapper/dists/` | `allow_cache_exec = ["gradle"]` |
 | Playwright browsers | `~/Library/Caches/ms-playwright/` | `allow_cache_exec = ["ms-playwright"]` |
 | GPG signing | `~/.gnupg/` + git config | `allow_gpg_signing = true` |
 | Gradle registry | `~/.gradle/gradle.properties` | `allow.read` for credentials file |

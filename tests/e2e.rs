@@ -3594,8 +3594,9 @@ mod e2e_tests {
     #[test]
     fn e2e_init_global_outputs_config() {
         let home = tempfile::tempdir().unwrap();
-        // Create gradle wrapper dir so detection triggers
-        std::fs::create_dir_all(home.path().join(".gradle/wrapper/dists/gradle-8.5")).unwrap();
+        // Create the Playwright browser cache so cache-exec detection triggers
+        std::fs::create_dir_all(home.path().join("Library/Caches/ms-playwright")).unwrap();
+        std::fs::create_dir_all(home.path().join(".cache/ms-playwright")).unwrap();
 
         let output = Command::new(binary_path())
             .args(["init", "--global"])
@@ -3610,14 +3611,18 @@ mod e2e_tests {
             stdout.contains("allow_cache_exec"),
             "should suggest cache_exec: {stdout}"
         );
-        assert!(stdout.contains("gradle"), "should detect gradle: {stdout}");
+        assert!(
+            stdout.contains("ms-playwright"),
+            "should detect Playwright: {stdout}"
+        );
     }
 
     #[test]
     fn e2e_init_global_write() {
         let home = tempfile::tempdir().unwrap();
-        // Create gradle wrapper to trigger detection
-        std::fs::create_dir_all(home.path().join(".gradle/wrapper/dists/gradle-8.5")).unwrap();
+        // Create the Playwright browser cache to trigger detection
+        std::fs::create_dir_all(home.path().join("Library/Caches/ms-playwright")).unwrap();
+        std::fs::create_dir_all(home.path().join(".cache/ms-playwright")).unwrap();
         let config_path = home.path().join("cplt/config.toml");
 
         let output = Command::new(binary_path())

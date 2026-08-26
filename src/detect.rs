@@ -1875,11 +1875,6 @@ pub struct GlobalDetectionReport {
 pub fn detect_global(home: &Path) -> GlobalDetectionReport {
     let mut detections = Vec::new();
 
-    // Gradle cache exec (for wrapper downloads)
-    if let Some(d) = detect_global_gradle(home) {
-        detections.push(d);
-    }
-
     // Playwright browser cache
     if let Some(d) = detect_global_playwright(home) {
         detections.push(d);
@@ -1911,19 +1906,6 @@ pub fn detect_global(home: &Path) -> GlobalDetectionReport {
     }
 
     GlobalDetectionReport { detections }
-}
-
-fn detect_global_gradle(home: &Path) -> Option<GlobalDetection> {
-    // Gradle wrapper downloads executables to ~/.gradle/wrapper/dists/
-    let wrapper_dir = home.join(".gradle/wrapper/dists");
-    if !wrapper_dir.is_dir() {
-        return None;
-    }
-    Some(GlobalDetection {
-        name: "Gradle wrapper",
-        reason: "~/.gradle/wrapper/dists/ exists (Gradle wrapper executables)".to_string(),
-        suggestions: vec![GlobalSuggestion::CacheExec("gradle".to_string())],
-    })
 }
 
 fn detect_global_playwright(home: &Path) -> Option<GlobalDetection> {
@@ -2894,28 +2876,24 @@ services:
     // ── Global detector tests ────────────────────────────────────────
 
     #[test]
-    fn global_detect_gradle_wrapper() {
+    fn global_gradle_wrapper_suggests_nothing() {
+        // The Gradle wrapper runs `java -jar gradle-wrapper.jar` and starts Gradle
+        // in-process from the unpacked distribution's JARs — nothing is exec'd out of
+        // ~/.gradle/wrapper/dists/, and allow_cache_exec can only reach
+        // ~/Library/Caches anyway. See issue #192.
         let home = tempfile::tempdir().unwrap();
         let dists = home.path().join(".gradle/wrapper/dists");
         std::fs::create_dir_all(&dists).unwrap();
         std::fs::write(dists.join("gradle-8.5-bin"), "").unwrap();
 
         let report = detect_global(home.path());
-        assert!(report.detections.iter().any(|d| d.name == "Gradle wrapper"));
         assert!(
-            report
+            !report
                 .detections
                 .iter()
                 .flat_map(|d| &d.suggestions)
                 .any(|s| matches!(s, GlobalSuggestion::CacheExec(v) if v == "gradle"))
         );
-    }
-
-    #[test]
-    fn global_detect_gradle_missing() {
-        let home = tempfile::tempdir().unwrap();
-        let report = detect_global(home.path());
-        assert!(!report.detections.iter().any(|d| d.name == "Gradle wrapper"));
     }
 
     #[test]

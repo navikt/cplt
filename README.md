@@ -811,7 +811,7 @@ cplt init --global    # generate personal ~/.config/cplt/config.toml
 
 Supported ecosystems: JVM (Gradle/Maven), Node.js, Docker, Python, Rust, Go, Playwright, Spring Boot, Ktor, TestContainers, Next.js, Vite, Flyway, Cypress, and environment secrets (`.env.example`). Dangerous permissions include risk warnings in the generated TOML.
 
-`--global` detects machine-level tools (Gradle wrapper, Playwright browsers, GPG signing, alternative agents) and generates your personal config.
+`--global` detects machine-level tools (Playwright browsers, GPG signing, registry credentials, alternative agents) and generates your personal config.
 
 Use `cplt config set --repo` to manage without editing TOML by hand:
 
