@@ -1694,6 +1694,19 @@ mod tests {
             "toolchain write deny @ {write_deny} must come AFTER every .gradle write allow \
              (tool dir @ {write_allow}, user allow.write @ {user_write_allow})"
         );
+
+        // Stronger than the two known allows above: nothing emitted later may
+        // re-grant write over the exec-allowed subtree. Guards against a future
+        // emit_* being appended after emit_gradle_toolchain_write_deny.
+        let last_write_allow = p
+            .rfind("(allow file-write*")
+            .expect("profile has no write allows at all");
+        assert!(
+            last_write_allow < write_deny,
+            "the toolchain write deny @ {write_deny} must be the LAST rule \
+             touching write on this subtree; a later (allow file-write*) @ \
+             {last_write_allow} would reopen write-then-exec"
+        );
     }
 
     #[test]

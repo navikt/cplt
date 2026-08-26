@@ -368,6 +368,10 @@ org.gradle.java.installations.auto-download=false
 org.gradle.java.installations.paths=/Library/Java/JavaVirtualMachines/temurin-25.jdk/Contents/Home
 ```
 
+Note that the provisioning failure surfaces as `foojay (Unable to download toolchain ..., due to: java.io.IOException: Operation not permitted)`, which reads like a network problem. It is the write being denied, not the download — check the proxy only after ruling this out.
+
+Two limits worth knowing. Both rules match the *resolved* path, so if `~/.gradle/jdks` is a symlink to another volume they silently do not apply; the agent cannot create that symlink itself (the same rules deny writing or `mkdir` at that path), so it takes a pre-existing relocation. And a relocated `GRADLE_USER_HOME` misses the rules entirely — but that is pre-existing, since the whole `~/.gradle` grant is keyed to the default location.
+
 **Linux:** unaffected. Landlock has a single `EXECUTE` right covering both `execve` and executable mappings, so the map-exec grant on `~/.gradle` already implies exec there — the carve-out is macOS-only, and the read-only pairing cannot be expressed on Linux for the same reason [`DENIED_HOME_SUBPATHS`](#private-registries) cannot.
 
 ## JVM Attach API
