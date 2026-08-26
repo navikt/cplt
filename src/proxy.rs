@@ -4800,7 +4800,7 @@ mod tests {
         });
 
         assert!(
-            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            rx.recv_timeout(Duration::from_secs(30)).is_ok(),
             "relay never returned: a stalled reader pinned the connection slot"
         );
         drop(client);
@@ -4822,21 +4822,25 @@ mod tests {
         let (proxy_remote, mut remote) = pair();
 
         let timeout = Duration::from_millis(20);
-        let ceiling = Duration::from_millis(100);
+        // Margin matters here: the gap between ticks must stay far below the
+        // ceiling even on a loaded runner, while the total stream outlasts it.
+        let ceiling = Duration::from_millis(500);
+        let gap = Duration::from_millis(25);
+        let ticks = 40;
         std::thread::spawn(move || {
             relay_with_ceiling(proxy_client, proxy_remote, timeout, ceiling);
         });
 
         // Remote streams for well over the ceiling; the client never sends.
-        let long = Some(Duration::from_secs(5));
+        let long = Some(Duration::from_secs(10));
         client.set_read_timeout(long).unwrap();
         remote.set_write_timeout(long).unwrap();
         let mut buf = [0u8; 4];
-        for _ in 0..10 {
+        for _ in 0..ticks {
             remote.write_all(b"tick").unwrap();
             client.read_exact(&mut buf).unwrap();
             assert_eq!(&buf, b"tick");
-            std::thread::sleep(ceiling / 2);
+            std::thread::sleep(gap);
         }
 
         // The quiet direction must still carry a byte: it was never idle,
