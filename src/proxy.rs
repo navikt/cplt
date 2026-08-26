@@ -1557,10 +1557,14 @@ fn relay_with_ceiling(client: TcpStream, remote: TcpStream, timeout: Duration, c
     };
     client_read.set_read_timeout(Some(poll)).ok();
     remote_read.set_read_timeout(Some(poll)).ok();
-    // Writes must not be interrupted: a timeout mid-`write_all` leaves a
-    // partial frame in the tunnel, which corrupts the TLS stream.
-    client_write.set_write_timeout(None).ok();
-    remote_write.set_write_timeout(None).ok();
+    // Writes poll at the same interval, so a peer that stops reading is bounded
+    // by `ceiling` too — otherwise a pump parked in a write would never reach
+    // the ceiling check and would pin its connection slot forever. `write_all`
+    // cannot be used with a write timeout (it reports the error without saying
+    // how much it wrote, silently truncating a TLS record); `write_bounded`
+    // tracks the offset itself, so a timeout costs a retry, not a frame.
+    client_write.set_write_timeout(Some(poll)).ok();
+    remote_write.set_write_timeout(Some(poll)).ok();
 
     // One clock for the whole tunnel, not one per direction. A long download
     // or SSE stream leaves the request direction idle from its first byte;
@@ -1588,19 +1592,13 @@ fn pump(mut from: TcpStream, mut to: TcpStream, last_activity: &Mutex<Instant>, 
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if let Ok(mut t) = last_activity.lock() {
-                    *t = Instant::now();
-                }
-                if to.write_all(&buf[..n]).is_err() {
+                touch(last_activity);
+                if !write_bounded(&mut to, &buf[..n], last_activity, ceiling) {
                     break;
                 }
             }
             Err(e) if is_timeout(&e) => {
-                let idle = last_activity
-                    .lock()
-                    .map(|t| t.elapsed())
-                    .unwrap_or(Duration::ZERO);
-                if idle >= ceiling {
+                if idle_for(last_activity) >= ceiling {
                     break;
                 }
             }
@@ -1608,6 +1606,53 @@ fn pump(mut from: TcpStream, mut to: TcpStream, last_activity: &Mutex<Instant>, 
         }
     }
     to.shutdown(std::net::Shutdown::Write).ok();
+}
+
+/// Write every byte of `buf`, retrying on write timeouts until the tunnel has
+/// been idle for `ceiling`. Returns false when the write cannot complete.
+///
+/// This exists instead of `write_all` because the tunnel sockets carry a write
+/// timeout. `write_all` returns a timeout error without reporting how many
+/// bytes it managed to write, so the caller cannot resume — the remainder is
+/// dropped and the TLS record is truncated. Tracking the offset here makes a
+/// timeout a retry rather than data loss. A partial `write` is reported as
+/// `Ok(n)`, so no byte is lost on the boundary either.
+fn write_bounded(
+    to: &mut TcpStream,
+    buf: &[u8],
+    last_activity: &Mutex<Instant>,
+    ceiling: Duration,
+) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        match to.write(&buf[off..]) {
+            Ok(0) => return false,
+            Ok(n) => {
+                off += n;
+                touch(last_activity);
+            }
+            Err(e) if is_timeout(&e) => {
+                if idle_for(last_activity) >= ceiling {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn touch(last_activity: &Mutex<Instant>) {
+    if let Ok(mut t) = last_activity.lock() {
+        *t = Instant::now();
+    }
+}
+
+fn idle_for(last_activity: &Mutex<Instant>) -> Duration {
+    last_activity
+        .lock()
+        .map(|t| t.elapsed())
+        .unwrap_or(Duration::ZERO)
 }
 
 /// Errors that mean "nothing to read right now", not "this tunnel is dead".
@@ -4718,6 +4763,47 @@ mod tests {
         upstream_srv
             .shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A peer that completes CONNECT and then stops reading must not pin the
+    /// tunnel forever. The pump parks in a write, not a read, so the ceiling
+    /// has to be evaluated on the write path too — otherwise the connection
+    /// slot (MAX_CONNECTIONS is 64) is never released.
+    #[test]
+    fn stalled_reader_is_bounded_by_the_ceiling() {
+        fn pair() -> (TcpStream, TcpStream) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (b, _) = listener.accept().unwrap();
+            (a, b)
+        }
+        let (client, proxy_client) = pair();
+        let (proxy_remote, mut remote) = pair();
+
+        let timeout = Duration::from_millis(20);
+        let ceiling = Duration::from_millis(100);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            relay_with_ceiling(proxy_client, proxy_remote, timeout, ceiling);
+            tx.send(()).ok();
+        });
+
+        // Remote floods; the client never reads, so both socket buffers fill
+        // and the remote->client pump blocks in write.
+        std::thread::spawn(move || {
+            let blob = vec![0u8; 1 << 20];
+            for _ in 0..8 {
+                if remote.write_all(&blob).is_err() {
+                    break;
+                }
+            }
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "relay never returned: a stalled reader pinned the connection slot"
+        );
+        drop(client);
     }
 
     /// A tunnel streaming in ONE direction is not idle. The request direction
