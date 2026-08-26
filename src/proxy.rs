@@ -90,6 +90,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // ponytail: fixed ceiling, make it configurable if anyone needs longer.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// Fallback read-poll interval when `proxy.timeout` is 0, which the OS rejects.
+const DEFAULT_PROXY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How often file-backed domain lists are re-read from disk.
 /// Within the TTL window, cached values are returned without I/O.
 const RELOAD_TTL: Duration = Duration::from_secs(5);
@@ -1531,6 +1534,10 @@ fn consume_until_header_end(remote: &mut TcpStream) -> std::io::Result<()> {
 }
 
 fn relay(client: TcpStream, remote: TcpStream, timeout: Duration) {
+    relay_with_ceiling(client, remote, timeout, RELAY_IDLE_TIMEOUT);
+}
+
+fn relay_with_ceiling(client: TcpStream, remote: TcpStream, timeout: Duration, ceiling: Duration) {
     let Ok(client_read) = client.try_clone() else {
         return;
     };
@@ -1540,16 +1547,30 @@ fn relay(client: TcpStream, remote: TcpStream, timeout: Duration) {
     let remote_read = remote;
     let client_write = client;
 
-    // Reads poll at `timeout`; idleness is bounded by RELAY_IDLE_TIMEOUT.
-    client_read.set_read_timeout(Some(timeout)).ok();
-    remote_read.set_read_timeout(Some(timeout)).ok();
+    // Reads poll at `timeout`; idleness is bounded by `ceiling`. A zero
+    // timeout is rejected by the OS, which would leave the socket fully
+    // blocking and the ceiling never evaluated — substitute the default.
+    let poll = if timeout.is_zero() {
+        DEFAULT_PROXY_TIMEOUT
+    } else {
+        timeout
+    };
+    client_read.set_read_timeout(Some(poll)).ok();
+    remote_read.set_read_timeout(Some(poll)).ok();
     // Writes must not be interrupted: a timeout mid-`write_all` leaves a
     // partial frame in the tunnel, which corrupts the TLS stream.
     client_write.set_write_timeout(None).ok();
     remote_write.set_write_timeout(None).ok();
 
-    let t1 = std::thread::spawn(move || pump(client_read, remote_write));
-    let t2 = std::thread::spawn(move || pump(remote_read, client_write));
+    // One clock for the whole tunnel, not one per direction. A long download
+    // or SSE stream leaves the request direction idle from its first byte;
+    // per-direction clocks would half-close that pump mid-stream and send a
+    // FIN into a live connection.
+    let last_activity = Arc::new(Mutex::new(Instant::now()));
+    let a = Arc::clone(&last_activity);
+
+    let t1 = std::thread::spawn(move || pump(client_read, remote_write, &a, ceiling));
+    let t2 = std::thread::spawn(move || pump(remote_read, client_write, &last_activity, ceiling));
 
     t1.join().ok();
     t2.join().ok();
@@ -1561,20 +1582,25 @@ fn relay(client: TcpStream, remote: TcpStream, timeout: Duration) {
 /// shutdown (TCP half-close) so the other direction can finish delivering
 /// in-flight data; shutdown(Both) would kill the read half of the shared
 /// socket, breaking the other relay thread.
-fn pump(mut from: TcpStream, mut to: TcpStream) {
+fn pump(mut from: TcpStream, mut to: TcpStream, last_activity: &Mutex<Instant>, ceiling: Duration) {
     let mut buf = [0u8; 8192];
-    let mut idle_since = Instant::now();
     loop {
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                idle_since = Instant::now();
+                if let Ok(mut t) = last_activity.lock() {
+                    *t = Instant::now();
+                }
                 if to.write_all(&buf[..n]).is_err() {
                     break;
                 }
             }
             Err(e) if is_timeout(&e) => {
-                if idle_since.elapsed() >= RELAY_IDLE_TIMEOUT {
+                let idle = last_activity
+                    .lock()
+                    .map(|t| t.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                if idle >= ceiling {
                     break;
                 }
             }
@@ -1584,10 +1610,17 @@ fn pump(mut from: TcpStream, mut to: TcpStream) {
     to.shutdown(std::net::Shutdown::Write).ok();
 }
 
+/// Errors that mean "nothing to read right now", not "this tunnel is dead".
+///
+/// `WouldBlock` / `TimedOut` are the read-timeout expiring. `Interrupted`
+/// (EINTR) is a signal arriving mid-read — std does not retry it for
+/// `TcpStream::read`, and treating it as fatal would kill a live tunnel.
 fn is_timeout(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
     )
 }
 
@@ -4685,6 +4718,47 @@ mod tests {
         upstream_srv
             .shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A tunnel streaming in ONE direction is not idle. The request direction
+    /// of a long download or SSE stream goes quiet after its first byte; a
+    /// per-direction idle clock would half-close that pump mid-stream and send
+    /// a FIN into a live connection. Regression guard for the shared clock.
+    #[test]
+    fn one_way_traffic_keeps_the_quiet_direction_alive() {
+        fn pair() -> (TcpStream, TcpStream) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (b, _) = listener.accept().unwrap();
+            (a, b)
+        }
+        let (mut client, proxy_client) = pair();
+        let (proxy_remote, mut remote) = pair();
+
+        let timeout = Duration::from_millis(20);
+        let ceiling = Duration::from_millis(100);
+        std::thread::spawn(move || {
+            relay_with_ceiling(proxy_client, proxy_remote, timeout, ceiling);
+        });
+
+        // Remote streams for well over the ceiling; the client never sends.
+        let long = Some(Duration::from_secs(5));
+        client.set_read_timeout(long).unwrap();
+        remote.set_write_timeout(long).unwrap();
+        let mut buf = [0u8; 4];
+        for _ in 0..10 {
+            remote.write_all(b"tick").unwrap();
+            client.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"tick");
+            std::thread::sleep(ceiling / 2);
+        }
+
+        // The quiet direction must still carry a byte: it was never idle,
+        // because the tunnel as a whole was not.
+        remote.set_read_timeout(long).unwrap();
+        client.write_all(b"ping").unwrap();
+        remote.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping", "quiet direction was closed mid-stream");
     }
 
     /// A CONNECT tunnel that sits idle longer than `proxy.timeout` must stay
