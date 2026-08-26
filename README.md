@@ -438,7 +438,7 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 | `--allowed-domains <FILE>`  | Domains to allow — only listed domains can connect. Validated at startup (fail-closed); re-read every 5s.  |
 | `--proxy-log <FILE>`        | Append a line per connection to this file for post-session audit.                                |
 | `--proxy-log-level <LEVEL>` | Stderr verbosity: `none` (default/silent), `error`, `blocked`, or `all`. The audit log file always records everything. |
-| `--proxy-timeout <SECONDS>` | Proxy read/write timeout in seconds (default: 60). Increase for long-running requests. |
+| `--proxy-timeout <SECONDS>` | Timeout in seconds for proxy request/header reads (default: 60). Established CONNECT tunnels are not torn down by this — they may idle up to 1h. |
 | `--allow-private-domain <DOMAIN>` | Allow connections to this domain even if it resolves to a private/internal IP. Use for corporate intranet services (e.g. internal MCP servers). Suffix matching: `intern.nav.no` covers all subdomains. Can be repeated. |
 
 </details>

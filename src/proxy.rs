@@ -79,6 +79,17 @@ fn is_blocked_status(status: &str) -> bool {
 const MAX_CONNECTIONS: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Idle ceiling for an established CONNECT tunnel.
+///
+/// `proxy.timeout` bounds the request/header phase, where a stalled peer is a
+/// real failure. Inside a tunnel it is only a liveness poll: a tunnel is
+/// legitimately idle for long stretches — a streaming API response with long
+/// server think-time, a pooled keep-alive connection between requests — and
+/// tearing it down at `proxy.timeout` drops live sessions (Claude Code shows
+/// this as a request timeout). Only this ceiling closes an idle tunnel.
+// ponytail: fixed ceiling, make it configurable if anyone needs longer.
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+
 /// How often file-backed domain lists are re-read from disk.
 /// Within the TTL window, cached values are returned without I/O.
 const RELOAD_TTL: Duration = Duration::from_secs(5);
@@ -1520,54 +1531,64 @@ fn consume_until_header_end(remote: &mut TcpStream) -> std::io::Result<()> {
 }
 
 fn relay(client: TcpStream, remote: TcpStream, timeout: Duration) {
-    let Ok(mut client_read) = client.try_clone() else {
+    let Ok(client_read) = client.try_clone() else {
         return;
     };
-    let Ok(mut remote_write) = remote.try_clone() else {
+    let Ok(remote_write) = remote.try_clone() else {
         return;
     };
-    let mut remote_read = remote;
-    let mut client_write = client;
+    let remote_read = remote;
+    let client_write = client;
 
-    // Set timeouts for relay
+    // Reads poll at `timeout`; idleness is bounded by RELAY_IDLE_TIMEOUT.
     client_read.set_read_timeout(Some(timeout)).ok();
     remote_read.set_read_timeout(Some(timeout)).ok();
+    // Writes must not be interrupted: a timeout mid-`write_all` leaves a
+    // partial frame in the tunnel, which corrupts the TLS stream.
+    client_write.set_write_timeout(None).ok();
+    remote_write.set_write_timeout(None).ok();
 
-    // Use Write shutdown (TCP half-close) so the other direction can
-    // finish delivering in-flight data. shutdown(Both) would kill the
-    // read half of the shared socket, breaking the other relay thread.
-    let t1 = std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            match client_read.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if remote_write.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        remote_write.shutdown(std::net::Shutdown::Write).ok();
-    });
-
-    let t2 = std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            match remote_read.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if client_write.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        client_write.shutdown(std::net::Shutdown::Write).ok();
-    });
+    let t1 = std::thread::spawn(move || pump(client_read, remote_write));
+    let t2 = std::thread::spawn(move || pump(remote_read, client_write));
 
     t1.join().ok();
     t2.join().ok();
+}
+
+/// Copy one direction of a tunnel until EOF, error, or RELAY_IDLE_TIMEOUT.
+///
+/// Read timeouts are not fatal — they only mark elapsed idle time. Uses Write
+/// shutdown (TCP half-close) so the other direction can finish delivering
+/// in-flight data; shutdown(Both) would kill the read half of the shared
+/// socket, breaking the other relay thread.
+fn pump(mut from: TcpStream, mut to: TcpStream) {
+    let mut buf = [0u8; 8192];
+    let mut idle_since = Instant::now();
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                idle_since = Instant::now();
+                if to.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(e) if is_timeout(&e) => {
+                if idle_since.elapsed() >= RELAY_IDLE_TIMEOUT {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    to.shutdown(std::net::Shutdown::Write).ok();
+}
+
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// Check if a hostname matches any entry in a pre-parsed blocklist.
@@ -4664,5 +4685,37 @@ mod tests {
         upstream_srv
             .shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A CONNECT tunnel that sits idle longer than `proxy.timeout` must stay
+    /// open — read timeouts are a liveness poll, not a teardown. Regression
+    /// guard for agent sessions dropped mid-stream on long server think-time.
+    #[test]
+    fn relay_survives_idle_longer_than_timeout() {
+        fn pair() -> (TcpStream, TcpStream) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (b, _) = listener.accept().unwrap();
+            (a, b)
+        }
+        let (mut client, proxy_client) = pair();
+        let (proxy_remote, mut remote) = pair();
+
+        let timeout = Duration::from_millis(50);
+        std::thread::spawn(move || relay(proxy_client, proxy_remote, timeout));
+        std::thread::sleep(timeout * 5);
+
+        let long = Some(Duration::from_secs(5));
+        client.set_read_timeout(long).unwrap();
+        remote.set_read_timeout(long).unwrap();
+        let mut buf = [0u8; 4];
+
+        client.write_all(b"ping").unwrap();
+        remote.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping", "tunnel must survive idle > proxy.timeout");
+
+        remote.write_all(b"pong").unwrap();
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
     }
 }

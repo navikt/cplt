@@ -111,7 +111,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::U64,
         dangerous: false,
         default_display: "60",
-        description: "Proxy read/write timeout in seconds. Increase for slow upstream connections.",
+        description: "Timeout in seconds for proxy request/header reads. Established tunnels may idle up to 1h.",
     },
     ConfigKeyInfo {
         section: "proxy",
