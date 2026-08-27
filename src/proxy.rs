@@ -3478,7 +3478,19 @@ mod tests {
             // The METHOD is agent-controlled too and is logged (UNSUPPORTED).
             "GE\x1bT http://evil.example/ HTTP/1.1",
         ];
-        for line in attacks {
+        // Legitimate targets that must pass through the escaping VERBATIM. The
+        // guard is only acceptable because it is lossless for real hostnames:
+        // swapping `escape_debug` for `escape_default` would mangle the IDN
+        // into "m\u{fc}nchen.de" in the terminal, in the audit file, and in
+        // the --observe-domains-out allowlist, where it silently stops
+        // matching anything. Punycode and the trailing dot are the other two
+        // spellings a user can legitimately see.
+        let legit = [
+            "CONNECT münchen.de:443 HTTP/1.1",
+            "CONNECT xn--mnchen-3ya.de:443 HTTP/1.1",
+            "CONNECT example.com.:443 HTTP/1.1",
+        ];
+        for line in attacks.iter().chain(legit.iter()) {
             let mut conn =
                 std::net::TcpStream::connect(format!("127.0.0.1:{}", proxy.port)).unwrap();
             let _ = write!(conn, "{line}\r\nHost: x\r\n\r\n");
@@ -3493,7 +3505,7 @@ mod tests {
         let text = String::from_utf8(bytes.clone()).expect("audit log must stay UTF-8");
         assert_eq!(
             text.lines().count(),
-            attacks.len(),
+            attacks.len() + legit.len(),
             "one audit line per request: {text:?}"
         );
         let raw: Vec<u8> = bytes
@@ -3523,6 +3535,28 @@ mod tests {
             observed.iter().any(|o| o.host.contains("\\u{1b}")),
             "the hostile targets must still be recorded, escaped: {observed:?}"
         );
+
+        // Lossless for legitimate hostnames: UTF-8 IDN, punycode and the
+        // trailing-dot form all survive both sinks byte-for-byte (the observed
+        // set additionally lowercases and strips the trailing dot, which is
+        // `normalize_hostname`'s long-standing job, not the escaping's).
+        for host in [
+            "münchen.de:443",
+            "xn--mnchen-3ya.de:443",
+            "example.com.:443",
+        ] {
+            assert!(
+                text.contains(host),
+                "escaping must not touch a legitimate hostname: {host:?} missing from {text:?}"
+            );
+        }
+        for host in ["münchen.de", "xn--mnchen-3ya.de", "example.com"] {
+            assert!(
+                observed.iter().any(|o| o.host == host),
+                "escaping must not mangle a legitimate hostname in the \
+                 --observe-domains-out set: {host:?} missing from {observed:?}"
+            );
+        }
     }
 
     fn make_proxy(allow_localhost_ports: Vec<u16>, allow_localhost_any: bool) -> ProxyHandle {
