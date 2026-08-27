@@ -482,6 +482,27 @@ If you would rather not hand `~/.npmrc` to the agent at all, see [`NPM_CONFIG_US
 
 > **Linux limitation:** The denials for files *inside an allowed tool dir* are only enforced on macOS (via SBPL literal deny rules). On Linux, Landlock cannot deny individual files within an allowed directory — the parent dirs (`.m2`, `.gradle`, `.cargo`) remain fully readable for dependency resolution. `~/.npmrc` is the exception: it sits at the top of `$HOME`, which is never granted, so it is withheld on both platforms.
 
+## Repo-local git content filters (LFS, git-crypt)
+
+If a repository's **own** `.git/config` defines a content filter — `filter.<name>.clean` or `filter.<name>.process` — cplt refuses the git queries that read working-tree content. Two things change:
+
+```
+[cplt] audit: incomplete
+[cplt] .cplt.toml differs from the version committed in git HEAD.
+```
+
+The audit reports `incomplete` instead of listing changes, and the one-time `cplt trust accept` fails, because it approves only a `Committed` state and the drift check could not run.
+
+**This does not affect most LFS users.** `git lfs install` writes to your `--global` config by default, and a filter there is your choice, not the repository's — it does not trigger the refusal. Only a filter defined in the repo's `.git/config` or a worktree config does.
+
+**A committed `.cplt.toml` still applies.** It is read from the object store with `git cat-file`, which cannot reach a filter and is never refused. Permissions you have already approved keep working; it is the one-time accept that is blocked.
+
+**Why it works this way.** Git runs a content filter's program when it reads working-tree files — and cplt runs `git` in the parent process, *outside* the sandbox. `.git/config` stays writable to the agent on both platforms, so a repository could otherwise choose a program that cplt executes unsandboxed ([#210](https://github.com/navikt/cplt/issues/210)). Unlike the other executable config keys, filters are named by an arbitrary subsection, so no fixed `-c` override can neutralise them. The only alternatives are to run the filter — which is the escape — or to refuse and say so. An `incomplete` audit is a loud "could not verify", not a clean session cplt never checked.
+
+A consequence worth knowing: an agent can deliberately force the audit to `incomplete` by writing `.git/config`. That is inherent to failing closed.
+
+**Fix:** move the filter to your global config if it belongs there (`git config --global filter.lfs.clean …`), or accept the `incomplete` audit for that repository. If you need `cplt trust accept` to work, remove the repo-local filter for the one invocation.
+
 ## yarn 1 and unreadable home rc files
 
 `yarn install` fails outright under the default policy when an `~/.npmrc` exists on the host — nothing is resolved and no `node_modules` is written:
