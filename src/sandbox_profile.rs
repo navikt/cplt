@@ -404,7 +404,8 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
     sbpl!(sb);
 
     // macOS Keychain access — Copilot stores auth tokens here.
-    // OpenCode uses API keys from env/config files, no Keychain needed.
+    // OpenCode stores its /connect credentials in its own data dir, and
+    // third-party providers use env/config files — no Keychain needed.
     if agent.needs_keychain() {
         sbpl!(sb, ";; macOS Keychain (Copilot auth tokens)");
         sbpl!(

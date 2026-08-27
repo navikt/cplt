@@ -1573,6 +1573,21 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             ));
         }
 
+        // Suppressing the API-key hint for OAuth-first agents leaves the
+        // browser-flow ones with no signal at all: Google's login opens a
+        // browser, and --allow-browser is off by default, so a first-time user
+        // hits a dead end. Point at the flag rather than the key.
+        if active_agent.oauth_first()
+            && active_agent.oauth_needs_browser()
+            && !resolved.allow_browser
+        {
+            ui::warn(&format!(
+                "{} signs in through a browser on first run — add --allow-browser \
+                 if you have not authenticated yet.",
+                active_agent.display_name()
+            ));
+        }
+
         // Warn if Copilot-only flags are used with a non-Copilot agent
         let copilot_flags_used: Vec<&str> = [
             cli.resume.as_ref().map(|_| "--resume"),

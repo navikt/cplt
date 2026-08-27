@@ -273,7 +273,8 @@ impl Agent {
     /// Gemini uses Keychain for extension integrity verification.
     /// Claude Code stores its OAuth token in the login Keychain on macOS
     /// ("Claude Code-credentials"); on Linux it uses ~/.claude/.credentials.json.
-    /// OpenCode uses API keys from env vars or config files.
+    /// OpenCode authenticates via the `/connect` device flow by default;
+    /// third-party providers use API keys from env vars or config files.
     pub fn needs_keychain(&self) -> bool {
         matches!(
             self,
@@ -573,6 +574,26 @@ impl Agent {
             Agent::Pi => false,
             // Not an AI agent: no auth of its own.
             Agent::Shell => false,
+        }
+    }
+
+    /// Whether this agent's OAuth login needs a browser cplt blocks by default.
+    ///
+    /// Device-flow agents (Copilot, OpenCode, Claude Code) print a code and a
+    /// URL, so a blocked browser costs nothing. Google's flow opens a browser
+    /// instead, and `--allow-browser` is off by default — so a first-time user
+    /// hits a dead end with no explanation once the API-key hint is suppressed
+    /// for OAuth-first agents (#187).
+    ///
+    /// Exhaustive match for the same reason as `oauth_first`.
+    pub fn oauth_needs_browser(&self) -> bool {
+        match self {
+            // Google OAuth browser flow on first run.
+            Agent::Gemini | Agent::Antigravity => true,
+            // Device flow: a code and a URL, no browser required from here.
+            Agent::Copilot | Agent::OpenCode | Agent::Claude => false,
+            // Not OAuth-first at all.
+            Agent::Pi | Agent::Shell => false,
         }
     }
 
@@ -1366,6 +1387,15 @@ mod tests {
                 "{agent:?} auth model changed — update the docs and the startup \
                  auth hint in main.rs deliberately"
             );
+            // Only OAuth-first agents can need the browser hint; a
+            // non-OAuth-first agent claiming to need one would print a
+            // login pointer to a login flow it does not have.
+            if !expected {
+                assert!(
+                    !agent.oauth_needs_browser(),
+                    "{agent:?} is not OAuth-first, so it cannot need a browser login"
+                );
+            }
             // The startup warning only fires for a non-OAuth-first agent, and
             // it prints `hints[0]` — so such an agent needs a hint to offer
             // (Shell excepted: it has no auth at all).
