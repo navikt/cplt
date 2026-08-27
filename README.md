@@ -1336,7 +1336,7 @@ cplt config set allow.read "~/.npmrc"
 
 Or for a single run: `cplt --allow-read ~/.m2/settings.xml`
 
-> **Note:** these are the *overridable* credential denials. A second list — `~/.netrc`, `~/.pypirc`, `~/.gem/credentials`, `~/.vault-token` — is meant to be hard-denied, and on macOS no `allow.read` can reach it. On Linux that guarantee does not currently hold: those files are withheld by omission rather than by a deny rule, and `allow.read` paths are not checked against the list, so a deliberate `allow.read "~/.netrc"` still grants the read. Known gap, tracked separately.
+> **Note:** these are the *overridable* credential denials. A second list — `~/.netrc`, `~/.pypirc`, `~/.gem/credentials`, `~/.vault-token` — is meant to be hard-denied, and on macOS no `allow.read` can reach it. On Linux that guarantee does not currently hold: those files are withheld by omission rather than by a deny rule, and `allow.read` paths are not checked against the list, so a deliberate `allow.read "~/.netrc"` still grants the read. Known gap, tracked in #207.
 
 > **yarn 1:** `yarn install` aborts with `EACCES`/`EPERM` whenever an `~/.npmrc` (or `~/.yarnrc`) exists but is unreadable, where npm, pnpm and bun all carry on. Usually fixed without handing over the token, via `NPM_CONFIG_USERCONFIG`. See [yarn 1 and unreadable home rc files](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files).
 
