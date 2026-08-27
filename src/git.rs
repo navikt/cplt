@@ -175,7 +175,20 @@ pub const CONFIG_OVERRIDES: &[(&str, &str, &str)] = &[
 /// cheaper and more fail-closed than teaching the parser to consume values.
 /// `-c` is refused for the same reason plus a second one: config overrides
 /// belong in [`CONFIG_OVERRIDES`], where they are reviewed, not at call sites.
-const VALUE_TAKING_GLOBALS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
+const VALUE_TAKING_GLOBALS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    // Both take a separate-token value in git 2.55. `--attr-source evil diff`
+    // would make `subcommand()` return "evil", silently skipping the diff-flag
+    // insertion — the exact mis-parse this refusal exists to prevent. And
+    // `--config-env` can override CONFIG_OVERRIDES, since later config
+    // parameters win.
+    "--config-env",
+    "--attr-source",
+];
 
 /// Subcommands that provably never read working-tree file **content**, and so
 /// can never reach a `.gitattributes` filter or diff driver.
@@ -471,6 +484,10 @@ mod tests {
         assert!(command(dir.path(), &["-C", "/tmp", "diff"]).is_none());
         assert!(command(dir.path(), &["-c", "core.fsmonitor=evil", "status"]).is_none());
         assert!(command(dir.path(), &["--git-dir", "/tmp", "rev-parse"]).is_none());
+        // Found by adversarial review: both take a separate-token value in git
+        // 2.55, so `--attr-source evil diff` makes `subcommand()` return "evil".
+        assert!(command(dir.path(), &["--attr-source", "evil", "diff"]).is_none());
+        assert!(command(dir.path(), &["--config-env", "x=Y", "status"]).is_none());
         // The single-token forms parse correctly and stay allowed.
         assert!(command(dir.path(), &["--git-dir=/tmp", "rev-parse"]).is_some());
         // Position-sensitive: `--git-dir` AFTER the subcommand is a rev-parse
