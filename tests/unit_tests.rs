@@ -8068,3 +8068,143 @@ fn audit_reports_incomplete_when_baseline_commit_pruned() {
         other => panic!("expected Incomplete after prune, got {other:?}"),
     }
 }
+
+// ── .cplt.toml diagnosis: working tree vs git HEAD (issue #183) ───────────────
+//
+// cplt reads `.cplt.toml` from git HEAD, never the working tree, so the agent
+// cannot grant itself permissions mid-session. That makes "not found" ambiguous:
+// the file may be sitting right there, just not committed. These tests pin the
+// distinction each message is supposed to make.
+
+use cplt::repo_config::{RepoConfigState, repo_config_state};
+
+/// A git repo with one commit, so HEAD exists.
+fn repo_with_commit() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    git_in(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README"), "x\n").unwrap();
+    git_in(tmp.path(), &["add", "."]);
+    git_in(
+        tmp.path(),
+        &["-c", "commit.gpgSign=false", "commit", "-q", "-m", "init"],
+    );
+    tmp
+}
+
+fn commit_all(dir: &std::path::Path) {
+    git_in(dir, &["add", "-A"]);
+    git_in(
+        dir,
+        &["-c", "commit.gpgSign=false", "commit", "-q", "-m", "cfg"],
+    );
+}
+
+const PROPOSE: &str = "[propose]\nallow_docker = true\n";
+
+#[test]
+fn repo_config_state_missing_when_no_file_anywhere() {
+    let tmp = repo_with_commit();
+    let state = repo_config_state(tmp.path());
+    assert_eq!(state, RepoConfigState::Missing);
+    assert_eq!(
+        state.explain().unwrap(),
+        "No .cplt.toml found in this repository."
+    );
+}
+
+#[test]
+fn repo_config_state_uncommitted_when_untracked() {
+    let tmp = repo_with_commit();
+    std::fs::write(tmp.path().join(".cplt.toml"), PROPOSE).unwrap();
+    let state = repo_config_state(tmp.path());
+    assert_eq!(state, RepoConfigState::Uncommitted);
+    let msg = state.explain().unwrap();
+    assert!(
+        msg.contains("working tree but not in git HEAD"),
+        "must name the real problem, got: {msg}"
+    );
+    assert!(
+        msg.contains("git commit"),
+        "must tell the user to commit it, got: {msg}"
+    );
+}
+
+#[test]
+fn repo_config_state_uncommitted_when_staged_but_not_committed() {
+    let tmp = repo_with_commit();
+    std::fs::write(tmp.path().join(".cplt.toml"), PROPOSE).unwrap();
+    git_in(tmp.path(), &["add", ".cplt.toml"]);
+    assert_eq!(repo_config_state(tmp.path()), RepoConfigState::Uncommitted);
+}
+
+/// The reported case (#183): `.cplt.toml` in `.gitignore`, never committed.
+/// `git status --porcelain -- .cplt.toml` stays SILENT for an ignored file, so a
+/// status-based check calls this clean; only comparing against the HEAD blob
+/// catches it.
+#[test]
+fn repo_config_state_uncommitted_when_gitignored() {
+    let tmp = repo_with_commit();
+    std::fs::write(tmp.path().join(".gitignore"), ".cplt.toml\n").unwrap();
+    commit_all(tmp.path());
+    std::fs::write(tmp.path().join(".cplt.toml"), PROPOSE).unwrap();
+
+    // Precondition: git status really does report nothing here.
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--", ".cplt.toml"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "precondition: an ignored .cplt.toml is invisible to git status"
+    );
+
+    assert_eq!(repo_config_state(tmp.path()), RepoConfigState::Uncommitted);
+}
+
+#[test]
+fn repo_config_state_committed_has_nothing_to_explain() {
+    let tmp = repo_with_commit();
+    std::fs::write(tmp.path().join(".cplt.toml"), PROPOSE).unwrap();
+    commit_all(tmp.path());
+    let state = repo_config_state(tmp.path());
+    assert_eq!(state, RepoConfigState::Committed);
+    assert_eq!(state.explain(), None);
+}
+
+#[test]
+fn repo_config_state_drifted_when_working_tree_edited_after_commit() {
+    let tmp = repo_with_commit();
+    std::fs::write(tmp.path().join(".cplt.toml"), PROPOSE).unwrap();
+    commit_all(tmp.path());
+    std::fs::write(
+        tmp.path().join(".cplt.toml"),
+        format!("{PROPOSE}allow_browser = true\n"),
+    )
+    .unwrap();
+
+    let state = repo_config_state(tmp.path());
+    assert_eq!(state, RepoConfigState::Drifted);
+    let msg = state.explain().unwrap();
+    assert!(
+        msg.contains("differs from the version committed"),
+        "drift must be named, got: {msg}"
+    );
+}
+
+#[test]
+fn repo_config_state_not_a_git_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(
+        repo_config_state(tmp.path()),
+        RepoConfigState::NotAGitRepo { has_file: false }
+    );
+
+    std::fs::write(tmp.path().join(".cplt.toml"), PROPOSE).unwrap();
+    let state = repo_config_state(tmp.path());
+    assert_eq!(state, RepoConfigState::NotAGitRepo { has_file: true });
+    assert!(
+        state.explain().unwrap().contains("not a git repository"),
+        "must say it is not a git repo"
+    );
+}
