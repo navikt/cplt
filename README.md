@@ -10,7 +10,7 @@
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
 - **Linux**: Landlock LSM + seccomp-BPF + optional Bubblewrap namespace isolation (kernel 5.13+; full network filtering on 6.7+)
-- **Windows**: no native support — there is no Windows sandbox backend. Run cplt inside WSL2, where it is an ordinary Linux install: [Windows (WSL2) setup](#windows-wsl2)
+- **Windows**: no native support — there is no Windows sandbox backend. Run cplt inside WSL2, where it is an ordinary Linux install and the Microsoft kernel ships Landlock: [Windows (WSL2) setup](#windows-wsl2)
 
 ![cplt banner](./assets/cplt.png)
 
@@ -262,22 +262,26 @@ Alternatively, run `/usr/local/bin/cplt` explicitly to bypass PATH resolution.
 
 ### Windows (WSL2)
 
-cplt has no Windows sandbox backend — the enforcement is Apple Seatbelt on macOS and Landlock LSM on Linux, so there is nothing to run natively on Windows. The supported route is [WSL2](https://learn.microsoft.com/windows/wsl/install): inside the distro, cplt is a normal Linux install.
+cplt has no Windows sandbox backend — the enforcement is Apple Seatbelt on macOS and Landlock LSM on Linux, so there is nothing to run natively on Windows. The supported route is [WSL2](https://learn.microsoft.com/windows/wsl/install), where cplt is an ordinary Linux install and the sandbox is kernel-enforced: every Microsoft kernel branch builds `CONFIG_SECURITY_LANDLOCK=y` and lists `landlock` first in `CONFIG_LSM` ([`config-wsl`](https://github.com/microsoft/WSL2-Linux-Kernel/blob/master/arch/x86/configs/config-wsl)), shipped since kernel 5.15.57.1, and WSL's default kernel command line sets no `lsm=` override.
 
 In PowerShell, once:
 
 ```powershell
-wsl --install     # installs WSL2 + Ubuntu, then reboot
-wsl --update      # WSL2 ships its own Microsoft-maintained kernel; keep it current
+wsl --install                    # WSL2 + the default distro (now Ubuntu 26.04 LTS), then reboot
+wsl --install -d Ubuntu-24.04    # …or pin an older release
+wsl --update                     # keep the Microsoft kernel current — see the ABI note below
 ```
 
 Everything below runs **inside the distro** (`wsl`, or the Ubuntu profile in Windows Terminal) — not in PowerShell:
 
 ```bash
-# 1. Node — Copilot CLI is a Node package
+# 1. Node — Copilot CLI requires Node 22+
+#    Ubuntu 26.04 ships 22.x, so apt is enough:
 sudo apt update && sudo apt install -y nodejs npm
+#    Ubuntu 24.04 ships Node 18 — too old. Use nvm, fnm, or NodeSource there instead.
 
-# 2. GitHub CLI, and log in — if apt has no 'gh', add GitHub's apt repo first:
+# 2. GitHub CLI, and log in. Ubuntu's universe package works but lags
+#    (2.45 on 24.04); add GitHub's apt repo if you want a current gh:
 #    https://github.com/cli/cli/blob/trunk/docs/install_linux.md
 sudo apt install -y gh
 gh auth login
@@ -293,15 +297,19 @@ curl -fsSL https://raw.githubusercontent.com/navikt/cplt/main/install.sh | bash
 cplt doctor
 ```
 
-If `copilot` complains about the Node version, Ubuntu's packaged Node is older than it wants — install a newer one *inside the distro* (nvm, NodeSource, or mise) and re-run step 3.
+**Do not install Copilot CLI on the Windows side.** With interop on (the default), the Windows `PATH` is appended to the distro's, so a Windows-side `npm install -g @github/copilot` turns up inside the distro as `/mnt/c/Users/<user>/AppData/Roaming/npm/copilot`. That is a Windows install reached through interop: it cannot run in the Linux sandbox, and the npm shim execs a `node` that the distro will not have unless you installed one there too. The symptom used to be an unrelated runtime-extraction error; cplt now names the cause when it resolves an agent under `/mnt/<drive>/` *and* it is running under WSL, and `cplt doctor` reports it as a failing check instead of passing ([#188](https://github.com/navikt/cplt/issues/188)). WSL is detected from kernel-owned state — `/run/WSL`, or the kernel name in `/proc/sys/kernel/osrelease` / `/proc/version` — not from `WSL_DISTRO_NAME`, which is absent under `sudo` and in systemd units and which any process can set. On a plain Linux box `/mnt/c` is left alone: it is an ordinary mount point there.
 
-**Do not install Copilot CLI on the Windows side.** WSL appends the Windows `PATH` to the distro's, so a Windows-side `npm install -g @github/copilot` turns up inside the distro as `/mnt/c/Users/<user>/AppData/Roaming/npm/copilot`. That is a Windows install reached through interop: it cannot run in the Linux sandbox, and the npm shim execs a `node` the distro does not have. The symptom used to be an unrelated runtime-extraction error; cplt now names the cause when it resolves an agent under `/mnt/<drive>/` *and* it detects it is running under WSL (`WSL_DISTRO_NAME`, `WSL_INTEROP`, or a Microsoft kernel in `/proc/version`), and `cplt doctor` reports it as a failing check instead of passing ([#188](https://github.com/navikt/cplt/issues/188)). On a plain Linux box `/mnt/c` is left alone — it is an ordinary mount point there.
+Two limits of that check, both by choice: it keys on the *default* automount root, so if you have relocated it (`[automount] root` in `/etc/wsl.conf`) the Windows-side install is not recognised and you get the old, less helpful failure with the path in it; and turning interop off stops the Windows `PATH` from leaking in but does **not** unmount `/mnt/c`.
 
-**Kernel requirement.** Landlock needs kernel 5.13+, and TCP port filtering needs 6.7+ (see [Honest gaps](#honest-gaps)). `cplt doctor` prints the kernel version and the Landlock ABI it found — that is the check that matters on your machine. If it reports Landlock as unavailable, `wsl --update` in PowerShell and `cat /sys/kernel/security/lsm` inside the distro are the first two things to look at.
+**Kernel and Landlock ABI.** Current WSL (2.7.x and later) ships Linux 6.18, which gives Landlock ABI 7 — everything cplt uses. An install still on the 6.6 kernel line gets ABI 3: filesystem rules are enforced, but TCP port rules (ABI 4), ioctl restriction (ABI 5) and signal/abstract-socket scoping (ABI 6) are not available, and network filtering falls back to the CONNECT proxy. `wsl --update` moves you forward. `cplt doctor` prints the kernel version and the ABI it found — that is the check that matters on your machine.
 
-**Keep the project in the Linux filesystem.** Work in `~/src/...` inside the distro rather than `/mnt/c/Users/...`. Microsoft's own guidance is that cross-OS file access through `/mnt/c` is markedly slower; and while cplt applies the same sandbox rules wherever the project lives (nothing in cplt special-cases `/mnt`), we have not confirmed that Landlock enforces those rules the same way on the 9p/drvfs mount that backs `/mnt/c` as it does on ext4. Until someone verifies that, treat a project under `/mnt/c` as unproven rather than supported.
+> **Do not disable Landlock in `.wslconfig`.** A `[wsl2] kernelCommandLine` with an `lsm=` list that omits `landlock`, or a custom `[wsl2] kernel=` built without `CONFIG_SECURITY_LANDLOCK`, removes the kernel enforcement cplt depends on — `cplt doctor` will report Landlock as unavailable.
 
-> **Not yet verified on a real WSL2 install.** What is verified from this repo: the `/mnt/<drive>/` detection and its error text, that `cplt doctor` fails on such an agent and prints kernel + Landlock ABI, that Landlock requires 5.13+ (6.7+ for port filtering), and that `install.sh` installs the Linux release binary. What is *not* verified by anyone here: that the WSL2 kernel you get has Landlock enabled, that your WSL session really exports `WSL_DISTRO_NAME`/`WSL_INTEROP` or reports a Microsoft kernel (that is what switches the interop check on), the exact `apt` package names and Node versions on your distro release, and Landlock's behaviour on `/mnt/c`. If you run this sequence, please report what actually happened in [#189](https://github.com/navikt/cplt/issues/189).
+**Keep the project in the Linux filesystem.** Work in `~/src/...` inside the distro rather than `/mnt/c/Users/...`. Microsoft's own guidance is that cross-OS file access is markedly slower, and `/mnt/c` is served over 9p by default as of WSL 2.9.x (virtiofs is opt-in via `[wsl2] virtiofs=true`). More to the point: we have not verified how Landlock enforces rules on that mount. The kernel documents no exclusion for network- or FUSE-backed filesystems — only pipes, sockets and nsfs — and Landlock's own test suite exercises 9p and FUSE, so we expect it to work; nobody here has confirmed it. Treat a project under `/mnt/c` as unproven rather than supported.
+
+**Bubblewrap.** Ubuntu 23.10+ blocks unprivileged user namespaces through `kernel.apparmor_restrict_unprivileged_userns`, which breaks `bwrap`. That sysctl comes from an Ubuntu kernel patch that is absent from the Microsoft kernel, so the optional Bubblewrap layer is expected to work on Ubuntu-under-WSL2 — but that is inference from the kernel source, not something we have run. If `bwrap` fails there, please say so in [#189](https://github.com/navikt/cplt/issues/189). (cplt's own seccomp filter is a plain `PR_SET_SECCOMP` BPF program, which stacks on top of the filter WSL installs in every process.)
+
+> **Not yet verified on a real WSL2 install.** Verified from source: Landlock is compiled in and first in `CONFIG_LSM` on the Microsoft kernel; the `/mnt/<drive>/` detection, the WSL signals it uses, and their error text; that `cplt doctor` fails on such an agent and prints kernel + Landlock ABI; the 5.13+/6.7+ requirements; and that `install.sh` installs the Linux release binary. Still unverified by anyone here: how Landlock behaves on `/mnt/c`, whether Bubblewrap works under WSL2, the exact package versions your distro release ships, and the sequence above end to end. If you run it, please report what actually happened in [#189](https://github.com/navikt/cplt/issues/189).
 
 ### Shell setup (recommended)
 
