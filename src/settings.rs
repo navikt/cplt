@@ -648,8 +648,9 @@ fn redact_value(key: &ConfigKeyInfo, value: String) -> String {
 }
 
 fn detect_project_root() -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+    // Resolves the repo containing the process cwd — no project dir is known
+    // at this point. Hardened all the same: cwd may be inside a hostile repo.
+    let output = crate::git::command(std::path::Path::new("."), &["rev-parse", "--show-toplevel"])?
         .output()
         .ok()?;
     output.status.success().then(|| {

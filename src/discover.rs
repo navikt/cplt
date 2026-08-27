@@ -318,13 +318,14 @@ pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
     // macOS-only: Keychain and Security framework database.
     let keychains_dir_exists = probe_keychains_dir(home_dir);
 
-    let is_git_repo = std::process::Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(project_dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let is_git_repo = crate::git::command(project_dir, &["rev-parse", "--git-dir"])
+        .and_then(|mut c| {
+            c.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+        })
+        .is_some_and(|s| s.success());
 
     let security_db_exists = probe_security_db();
 
@@ -906,8 +907,11 @@ fn is_copilot_package(pkg_json: &Path) -> bool {
 /// - the path is too shallow under `$HOME` (must be ≥3 components deep,
 ///   e.g. `~/.config/git/hooks` OK, `~/hooks` rejected as too broad)
 pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["config", "--global", "core.hooksPath"])
+    // `Path::new(".")` — this query is about the USER's global config, not any
+    // particular repository, so it intentionally runs in the process cwd.
+    // `crate::git::command` does not blank global config (see its `harden`
+    // docs); doing so would break exactly this detection.
+    let output = crate::git::command(Path::new("."), &["config", "--global", "core.hooksPath"])?
         .output()
         .ok()?;
     if !output.status.success() {
@@ -956,9 +960,7 @@ pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
 /// - The common dir resolves to an unsafe root
 /// - The common dir is not under `$HOME`
 pub fn git_common_dir(home_dir: &Path, project_dir: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .current_dir(project_dir)
+    let output = crate::git::command(project_dir, &["rev-parse", "--git-common-dir"])?
         .output()
         .ok()?;
     if !output.status.success() {

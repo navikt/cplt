@@ -10,7 +10,6 @@
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The filename we look for in the project root.
 pub const REPO_CONFIG_FILE: &str = ".cplt.toml";
@@ -182,9 +181,7 @@ fn canonical(path: PathBuf) -> PathBuf {
 /// The git toplevel for `project_dir` — the directory `HEAD:.cplt.toml`
 /// resolves against. `None` when git cannot answer (not a repo, git missing).
 fn git_toplevel(project_dir: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(project_dir)
+    let output = crate::git::command(project_dir, &["rev-parse", "--show-toplevel"])?
         .output()
         .ok()?;
     if !output.status.success() {
@@ -203,11 +200,12 @@ fn git_toplevel(project_dir: &Path) -> Option<PathBuf> {
 /// Uses `git cat-file blob HEAD:.cplt.toml` which reads from the object store,
 /// not the working tree. This prevents mid-session tampering by the agent.
 fn read_from_git_head(project_dir: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["cat-file", "blob", &format!("HEAD:{REPO_CONFIG_FILE}")])
-        .current_dir(project_dir)
-        .output()
-        .ok()?;
+    let output = crate::git::command(
+        project_dir,
+        &["cat-file", "blob", &format!("HEAD:{REPO_CONFIG_FILE}")],
+    )?
+    .output()
+    .ok()?;
 
     if output.status.success() {
         String::from_utf8(output.stdout).ok()
@@ -324,12 +322,19 @@ pub fn repo_config_state(project_dir: &Path) -> RepoConfigState {
     }
 }
 
+/// Run a hardened `git` in `project_dir` and report whether it exited 0.
+///
+/// Returns `false` when [`crate::git::command`] refuses the invocation — the
+/// repository defines a content filter git would execute in the parent (#210).
+/// For the `diff --quiet` caller that means `Drifted` is reported without the
+/// working tree having been compared. Note this does NOT stop the config being
+/// applied: [`load_repo_config`] reads it from the object store with
+/// `cat-file`, which cannot reach a filter and is never refused. What it does
+/// block is `cplt trust accept`, which approves only `Committed`.
 fn git_succeeds(project_dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .args(args)
-        .current_dir(project_dir)
-        .output()
-        .is_ok_and(|o| o.status.success())
+    crate::git::command(project_dir, args)
+        .and_then(|mut c| c.output().ok())
+        .is_some_and(|o| o.status.success())
 }
 
 /// Parse and validate a `.cplt.toml` content string.

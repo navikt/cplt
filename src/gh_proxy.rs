@@ -1309,6 +1309,13 @@ fn extract_repo_from_api_path(endpoint: &str) -> Option<String> {
 /// Reads `remote.origin.url` from local repository config only and parses the
 /// owner/repo from it. Global/system config, includes, and inherited `GIT_*`
 /// variables are ignored because they could retarget the guard's scope.
+///
+/// Deliberately does **not** route through [`crate::git::command`] (#210).
+/// That builder resolves `git` through `PATH`; this one must use the
+/// caller-validated `real_git` binary, and it needs `--local --no-includes`,
+/// which is stricter than the shared path. `git config` executes nothing, so
+/// the shared `-c` overrides would add no security here. If this ever grows a
+/// subcommand that reads working-tree content, move it onto the shared path.
 pub fn detect_current_repo(real_git: &Path, project_dir: &Path) -> Result<String, String> {
     let mut command = std::process::Command::new(real_git);
     for (key, _) in std::env::vars_os() {

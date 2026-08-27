@@ -1929,11 +1929,12 @@ fn detect_global_gpg(home: &Path) -> Option<GlobalDetection> {
         return None;
     }
     // Enhance reason with git config info when available
-    let git_signing = std::process::Command::new("git")
-        .args(["config", "--global", "commit.gpgsign"])
-        .output()
-        .ok()
-        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+    // Global config on purpose (the user's signing preference), so it runs in
+    // the process cwd rather than a project directory.
+    let git_signing =
+        crate::git::command(Path::new("."), &["config", "--global", "commit.gpgsign"])
+            .and_then(|mut c| c.output().ok())
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
 
     let reason = if git_signing {
         "~/.gnupg/ exists and git commit.gpgsign=true"

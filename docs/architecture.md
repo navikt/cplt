@@ -62,6 +62,7 @@ src/
   scratch.rs           Per-session scratch directory, TMPDIR redirect.
   trust.rs             Trust store: accept/revoke repo config proposals.
   repo_config.rs       Per-repo .cplt.toml parsing and application.
+  git.rs               Hardened parent-side git invocation (single choke point).
   update.rs            Self-update check and download.
 ```
 

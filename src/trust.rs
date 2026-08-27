@@ -83,9 +83,7 @@ pub fn repo_fingerprint(project_dir: &Path) -> String {
 ///
 /// Normalizes: strips `.git` suffix, lowercases host, converts SSH to HTTPS style.
 fn canonical_remote(project_dir: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(project_dir)
+    let output = crate::git::command(project_dir, &["remote", "get-url", "origin"])?
         .output()
         .ok()?;
 

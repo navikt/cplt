@@ -26,7 +26,7 @@ use crate::ui;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Upper bound on any single git invocation. The audit runs on EVERY sandboxed
@@ -538,18 +538,20 @@ fn human_duration(d: Duration) -> String {
 /// failure (git missing, non-zero exit, timeout, non-UTF8). Never panics — git
 /// absence or a hang must degrade cleanly.
 ///
-/// `--no-optional-locks` is prepended so read-only queries (`status`) never take
-/// the index lock — avoiding contention with a concurrent git and needless disk
-/// writes. The call is bounded by [`GIT_TIMEOUT`]: the child is spawned, its
-/// stdout drained on a helper thread (so a large diff can't fill the pipe buffer
-/// and deadlock while we poll), and on timeout the child is killed and reaped
-/// (no zombie) before returning `None`.
+/// The command comes from [`crate::git::command`], which is what keeps a
+/// repository from choosing a program this — *unsandboxed, parent-side* —
+/// process executes (issue #210). `GIT_OPTIONAL_LOCKS=0` comes from there too,
+/// so read-only queries (`status`) never take the index lock. When that builder
+/// refuses (the repo defines a content filter git would run) this returns
+/// `None`, which the report turns into an honest `Incomplete` rather than a
+/// false "clean session".
+///
+/// The call is bounded by [`GIT_TIMEOUT`]: the child is spawned, its stdout
+/// drained on a helper thread (so a large diff can't fill the pipe buffer and
+/// deadlock while we poll), and on timeout the child is killed and reaped (no
+/// zombie) before returning `None`.
 fn git_output(project_dir: &Path, args: &[&str]) -> Option<String> {
-    let mut child = Command::new("git")
-        .arg("--no-optional-locks")
-        .args(args)
-        .current_dir(project_dir)
-        .stdin(Stdio::null())
+    let mut child = crate::git::command(project_dir, args)?
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -615,6 +617,7 @@ pub fn run<F: FnOnce() -> u8>(project_dir: &Path, enabled: bool, exec: F) -> u8 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(ToString::to_string).collect()

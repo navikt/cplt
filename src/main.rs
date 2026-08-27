@@ -1063,8 +1063,9 @@ fn source_label(source: repo_config::RepoConfigSource) -> &'static str {
 }
 
 fn detect_project_root() -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+    // Resolves the repo containing the process cwd — no project dir is known
+    // at this point. Hardened all the same: cwd may be inside a hostile repo.
+    let output = cplt::git::command(std::path::Path::new("."), &["rev-parse", "--show-toplevel"])?
         .output()
         .ok()?;
     if output.status.success() {
@@ -5083,10 +5084,8 @@ fn trust_accept(
     // Set identity
     entry.repo.path = project_dir.to_string_lossy().into_owned();
     if entry.repo.remote.is_empty()
-        && let Ok(output) = std::process::Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .current_dir(project_dir)
-            .output()
+        && let Some(output) = cplt::git::command(project_dir, &["remote", "get-url", "origin"])
+            .and_then(|mut c| c.output().ok())
         && output.status.success()
         && let Ok(url) = String::from_utf8(output.stdout)
     {
