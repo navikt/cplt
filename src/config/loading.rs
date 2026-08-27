@@ -257,9 +257,21 @@ impl Config {
         // Validates that entries are non-empty (empty string would bypass private IP
         // check for all domains that match is_domain_match("", _), which is none — but
         // reject it anyway for clarity).
-        let mut allow_private_domains =
-            self.proxy.allow_private_domains.clone().unwrap_or_default();
-        allow_private_domains.extend(cli.allow_private_domains);
+        // Normalized (lowercase, no trailing dot) at ingest: `is_domain_match`
+        // normalizes the hostname but compares it against the raw pattern, so an
+        // un-normalized entry like "Intern.NAV.no" or "a.nav.no." would never
+        // match anything — contradicting the documented case-insensitive,
+        // trailing-dot-stripped matching. File-sourced lists are already
+        // normalized by `parse_lines_file`; this is the config/CLI path.
+        let mut allow_private_domains: Vec<String> = self
+            .proxy
+            .allow_private_domains
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .chain(cli.allow_private_domains)
+            .map(|d| crate::proxy::normalize_hostname(&d))
+            .collect();
         allow_private_domains.sort_unstable();
         allow_private_domains.dedup();
         for domain in &allow_private_domains {
@@ -559,6 +571,7 @@ impl Config {
 
         Ok(Resolved {
             with_proxy,
+            repo_private_domains: Vec::new(),
             proxy_forced,
             proxy_port,
             blocked_domains,
@@ -1122,12 +1135,16 @@ impl Resolved {
         // Proxy proposals
         if is_approved("proxy.allow_private_domains") {
             for domain in &repo_config.propose.proxy.allow_private_domains {
-                if !self.allow_private_domains.contains(domain) {
+                let domain = crate::proxy::normalize_hostname(domain);
+                if !self.allow_private_domains.contains(&domain) {
                     self.allow_private_domains.push(domain.clone());
                 }
+                self.repo_private_domains.push(domain);
             }
             self.allow_private_domains.sort_unstable();
             self.allow_private_domains.dedup();
+            self.repo_private_domains.sort_unstable();
+            self.repo_private_domains.dedup();
         }
 
         // Return unapproved keys for display

@@ -1890,12 +1890,18 @@ fn start_proxy_if_enabled(
         allowed_domains_initial: Vec::new(),
         default_allowlist,
         cli_private_domains: cli.allow_private_domains.clone(),
+        // Reloadable portion: what the config file itself supplied. The two
+        // once-read sources go in as their own fields so the file's 5-second
+        // reload cannot drop them (#186).
         config_private_domains: resolved
             .allow_private_domains
             .iter()
-            .filter(|d| !cli.allow_private_domains.contains(d))
+            .filter(|d| {
+                !cli.allow_private_domains.contains(d) && !resolved.repo_private_domains.contains(d)
+            })
             .cloned()
             .collect(),
+        repo_private_domains: resolved.repo_private_domains.clone(),
         config_file: config_path.cloned(),
         log_file: resolved.proxy_log_file.clone(),
         log_level: resolved.proxy_log_level,

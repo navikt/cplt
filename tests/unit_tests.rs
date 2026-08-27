@@ -353,6 +353,38 @@ fn allow_private_domains_merge_cli_and_toml() {
     );
 }
 
+/// `is_domain_match` normalizes the hostname but compares it against the raw
+/// pattern, so config/CLI entries must be normalized at ingest — otherwise the
+/// case-insensitive, trailing-dot-stripped matching promised in docs/proxy.md
+/// silently never fires and the waiver does nothing.
+#[test]
+fn allow_private_domains_are_normalized_and_actually_match() {
+    use cplt::config::{CliFlags, Config};
+    use cplt::proxy::is_domain_match;
+    let toml = "[proxy]\nallow_private_domains = [\"Intern.NAV.no\", \"a.nav.no.\"]\n";
+    let cli = CliFlags {
+        allow_private_domains: vec!["DEV.corp.example.com".to_string()],
+        ..Default::default()
+    };
+    let resolved = Config::parse(toml).unwrap().merge(cli).unwrap();
+
+    for host in [
+        "intern.nav.no",
+        "sub.Intern.nav.no",
+        "a.nav.no",
+        "x.a.nav.no",
+    ] {
+        assert!(
+            is_domain_match(host, &resolved.allow_private_domains),
+            "{host} should match the configured private-domain waiver"
+        );
+    }
+    assert!(is_domain_match(
+        "dev.corp.example.com",
+        &resolved.allow_private_domains
+    ));
+}
+
 #[test]
 fn allow_private_domains_deduplicates() {
     use cplt::config::{CliFlags, Config};

@@ -748,6 +748,11 @@ pub struct Resolved {
     /// UNIONed into the effective blocklist. GLOBAL-only, tighten-only, fail-open.
     pub proxy_subscriptions: crate::subscriptions::SubscriptionSet,
     pub allow_private_domains: Vec<String>,
+    /// The subset of `allow_private_domains` that came from a trust-approved
+    /// `[propose.proxy] allow_private_domains` in the repo `.cplt.toml`.
+    /// Tracked separately because nothing re-reads that source mid-session, so
+    /// the proxy must not put these under its 5-second config reload (#186).
+    pub repo_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
     pub allow_socket: Vec<PathBuf>,
