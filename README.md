@@ -10,6 +10,7 @@
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
 - **Linux**: Landlock LSM + seccomp-BPF + optional Bubblewrap namespace isolation (kernel 5.13+; full network filtering on 6.7+)
+- **Windows**: no native support — there is no Windows sandbox backend. Run cplt inside WSL2, where it is an ordinary Linux install: [Windows (WSL2) setup](#windows-wsl2)
 
 ![cplt banner](./assets/cplt.png)
 
@@ -258,6 +259,48 @@ export PATH="/usr/local/bin:$PATH"
 ```
 
 Alternatively, run `/usr/local/bin/cplt` explicitly to bypass PATH resolution.
+
+### Windows (WSL2)
+
+cplt has no Windows sandbox backend — the enforcement is Apple Seatbelt on macOS and Landlock LSM on Linux, so there is nothing to run natively on Windows. The supported route is [WSL2](https://learn.microsoft.com/windows/wsl/install): inside the distro, cplt is a normal Linux install.
+
+In PowerShell, once:
+
+```powershell
+wsl --install     # installs WSL2 + Ubuntu, then reboot
+wsl --update      # WSL2 ships its own Microsoft-maintained kernel; keep it current
+```
+
+Everything below runs **inside the distro** (`wsl`, or the Ubuntu profile in Windows Terminal) — not in PowerShell:
+
+```bash
+# 1. Node — Copilot CLI is a Node package
+sudo apt update && sudo apt install -y nodejs npm
+
+# 2. GitHub CLI, and log in
+sudo apt install -y gh
+gh auth login
+
+# 3. The agent — installed in the distro, never on the Windows side
+npm install -g @github/copilot
+
+# 4. cplt
+curl -fsSL https://raw.githubusercontent.com/navikt/cplt/main/install.sh | bash
+# (or: brew install navikt/tap/cplt, if you use Homebrew on Linux)
+
+# 5. Check the result
+cplt doctor
+```
+
+If `copilot` complains about the Node version, Ubuntu's packaged Node is older than it wants — install a newer one *inside the distro* (nvm, NodeSource, or mise) and re-run step 3.
+
+**Do not install Copilot CLI on the Windows side.** WSL appends the Windows `PATH` to the distro's, so a Windows-side `npm install -g @github/copilot` turns up inside the distro as `/mnt/c/Users/<user>/AppData/Roaming/npm/copilot`. That is a Windows install reached through interop: it cannot run in the Linux sandbox, and the npm shim execs a `node` the distro does not have. The symptom used to be an unrelated runtime-extraction error; cplt now names the cause when it resolves an agent under `/mnt/<drive>/`, and `cplt doctor` reports it as a failing check instead of passing ([#188](https://github.com/navikt/cplt/issues/188)).
+
+**Kernel requirement.** Landlock needs kernel 5.13+, and TCP port filtering needs 6.7+ (see [Honest gaps](#honest-gaps)). `cplt doctor` prints the kernel version and the Landlock ABI it found — that is the check that matters on your machine. If it reports Landlock as unavailable, `wsl --update` in PowerShell and `cat /sys/kernel/security/lsm` inside the distro are the first two things to look at.
+
+**Keep the project in the Linux filesystem.** Work in `~/src/...` inside the distro rather than `/mnt/c/Users/...`. Microsoft's own guidance is that cross-OS file access through `/mnt/c` is markedly slower; and while cplt applies the same sandbox rules wherever the project lives (nothing in cplt special-cases `/mnt`), we have not confirmed that Landlock enforces those rules the same way on the 9p/drvfs mount that backs `/mnt/c` as it does on ext4. Until someone verifies that, treat a project under `/mnt/c` as unproven rather than supported.
+
+> **Not yet verified on a real WSL2 install.** What is verified from this repo: the `/mnt/<drive>/` detection and its error text, that `cplt doctor` fails on such an agent and prints kernel + Landlock ABI, that Landlock requires 5.13+ (6.7+ for port filtering), and that `install.sh` installs the Linux release binary. What is *not* verified by anyone here: that the WSL2 kernel you get has Landlock enabled, the exact `apt` package names and Node versions on your distro release, and Landlock's behaviour on `/mnt/c`. If you run this sequence, please report what actually happened in [#189](https://github.com/navikt/cplt/issues/189).
 
 ### Shell setup (recommended)
 
