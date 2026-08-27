@@ -4795,6 +4795,17 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
     println!("{blue}[cplt]{nc}  Source: {}", source_label(loaded.source));
     println!();
 
+    // Anything but the committed copy is refused by the accept guard. Say so
+    // here, and below never advertise a `cplt trust accept` that would exit 1.
+    let blocked = match repo_config::repo_config_state(project_dir) {
+        repo_config::RepoConfigState::Committed => None,
+        state => state.explain(),
+    };
+    if let Some(msg) = &blocked {
+        ui::warn(msg);
+        println!();
+    }
+
     // Deny section
     if !loaded.config.deny.paths.is_empty() || !loaded.config.deny.env.is_empty() {
         println!("{blue}[cplt]{nc}  {green}[deny]{nc} {LABEL_DENY_APPLIED}");
@@ -4860,7 +4871,11 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
 
         if hash_mismatch {
             println!("{blue}[cplt]{nc}  {red}⚠ Permissions have changed since last approval!{nc}");
-            println!("{blue}[cplt]{nc}  {red}  Run `cplt trust accept --all` to re-approve.{nc}");
+            if blocked.is_none() {
+                println!(
+                    "{blue}[cplt]{nc}  {red}  Run `cplt trust accept --all` to re-approve.{nc}"
+                );
+            }
         }
 
         // Finding 4: approval is bound to the local checkout path. If this repo's
@@ -4875,11 +4890,13 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
                     &entry.repo.path
                 }
             );
-            println!(
-                "{blue}[cplt]{nc}  {red}  Run `cplt trust accept` to approve at this path.{nc}"
-            );
+            if blocked.is_none() {
+                println!(
+                    "{blue}[cplt]{nc}  {red}  Run `cplt trust accept` to approve at this path.{nc}"
+                );
+            }
         }
-    } else if has_pending {
+    } else if has_pending && blocked.is_none() {
         println!();
         println!("{blue}[cplt]{nc}  {yellow}To approve all pending permissions:{nc}");
         println!("{blue}[cplt]{nc}    cplt trust accept --all");
@@ -4920,16 +4937,13 @@ fn trust_accept(
         return ExitCode::SUCCESS;
     }
 
-    // Guard: refuse to approve a .cplt.toml that is not the committed one.
-    // This ensures approved configs are auditable in git history and prevents
-    // a malicious process from injecting permissions and immediately accepting them.
-    // Compared against the HEAD blob rather than `git status`, which stays silent
-    // for a gitignored .cplt.toml (#183).
+    // Guard: approve ONLY the committed config, so every granted permission is
+    // auditable in git history and no process can inject permissions and
+    // immediately accept them. Stated as "anything but Committed" on purpose —
+    // enumerating the bad states is how the not-a-git-repo case slipped through,
+    // and `git status` cannot see a gitignored .cplt.toml at all (#183).
     let state = repo_config::repo_config_state(project_dir);
-    if matches!(
-        state,
-        repo_config::RepoConfigState::Uncommitted | repo_config::RepoConfigState::Drifted
-    ) {
+    if state != repo_config::RepoConfigState::Committed {
         ui::error(&state.explain().unwrap_or_default());
         return ExitCode::FAILURE;
     }

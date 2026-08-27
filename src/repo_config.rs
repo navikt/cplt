@@ -195,9 +195,22 @@ pub enum RepoConfigState {
     Missing,
 }
 
+/// What an uncommitted `.cplt.toml` actually does — which differs by platform,
+/// so the message must too. Linux skips the working-tree fallback entirely; on
+/// macOS the file IS loaded (see [`load_repo_config`]), it just can never be
+/// approved. Claiming it is inert on macOS would be wrong in the permissive
+/// direction.
+const UNCOMMITTED_EFFECT: &str = if cfg!(target_os = "linux") {
+    "Until then cplt ignores it entirely."
+} else {
+    "Until then cplt loads it from the working tree — unaudited, so its [deny] keys \
+     apply but its [propose] keys cannot be approved."
+};
+
 impl RepoConfigState {
-    /// A user-facing explanation of why cplt is not using the `.cplt.toml` the
-    /// user is looking at. `None` when there is nothing to explain.
+    /// A user-facing explanation of why cplt is not treating the `.cplt.toml`
+    /// the user is looking at as trustworthy. `None` when there is nothing to
+    /// explain.
     #[must_use]
     pub fn explain(self) -> Option<String> {
         match self {
@@ -208,16 +221,18 @@ impl RepoConfigState {
             )),
             Self::Uncommitted => Some(format!(
                 "{REPO_CONFIG_FILE} exists in the working tree but not in git HEAD.\n  \
-                 cplt reads it from git HEAD, so a sandboxed agent cannot grant itself \
-                 permissions mid-session — the file must be committed first:\n    \
+                 cplt trusts only the committed copy, so permissions stay auditable in git \
+                 history and a sandboxed agent cannot grant itself more mid-session.\n  \
+                 {UNCOMMITTED_EFFECT}\n  \
+                 Commit it first:\n    \
                  git add {REPO_CONFIG_FILE} && git commit -m \"chore: add cplt sandbox config\"\n  \
                  (if {REPO_CONFIG_FILE} is listed in .gitignore, un-ignore it — an ignored \
                  file can never reach HEAD)"
             )),
             Self::NotAGitRepo { has_file: true } => Some(format!(
                 "{REPO_CONFIG_FILE} exists here, but this is not a git repository.\n  \
-                 cplt reads it from git HEAD, so it takes effect only once the directory \
-                 is a git repo and the file is committed."
+                 cplt trusts only a copy committed to git, so its permissions are auditable.\n  \
+                 {UNCOMMITTED_EFFECT}"
             )),
             Self::NotAGitRepo { has_file: false } => Some(format!(
                 "No {REPO_CONFIG_FILE} found, and this is not a git repository."
@@ -233,32 +248,42 @@ impl RepoConfigState {
 /// [`load_repo_config`] decides what is applied.
 #[must_use]
 pub fn repo_config_state(project_dir: &Path) -> RepoConfigState {
-    let head = read_from_git_head(project_dir);
-    let working = std::fs::read_to_string(project_dir.join(REPO_CONFIG_FILE)).ok();
+    let in_working_tree = project_dir.join(REPO_CONFIG_FILE).is_file();
 
-    match (head, working) {
-        (Some(head), Some(working)) if head != working => RepoConfigState::Drifted,
-        // Present in HEAD (whether or not it is checked out) — HEAD is what cplt reads.
-        (Some(_), _) => RepoConfigState::Committed,
-        (None, working) => {
-            if is_git_repo(project_dir) {
-                if working.is_some() {
-                    RepoConfigState::Uncommitted
-                } else {
-                    RepoConfigState::Missing
-                }
-            } else {
-                RepoConfigState::NotAGitRepo {
-                    has_file: working.is_some(),
-                }
-            }
+    // Existence in HEAD is what closes the gitignore hole: `git status` says
+    // nothing at all about an ignored file, so it cannot answer this.
+    if read_from_git_head(project_dir).is_some() {
+        // Whether the checkout still MATCHES HEAD is git's question to answer.
+        // Byte-comparing the raw blob against the file on disk would call every
+        // .gitattributes filter (eol=crlf, LFS, git-crypt, ident) permanent
+        // drift and make a correctly committed config ungrantable.
+        if !in_working_tree
+            || git_succeeds(
+                project_dir,
+                &["diff", "--quiet", "HEAD", "--", REPO_CONFIG_FILE],
+            )
+        {
+            return RepoConfigState::Committed;
+        }
+        return RepoConfigState::Drifted;
+    }
+
+    if git_succeeds(project_dir, &["rev-parse", "--git-dir"]) {
+        if in_working_tree {
+            RepoConfigState::Uncommitted
+        } else {
+            RepoConfigState::Missing
+        }
+    } else {
+        RepoConfigState::NotAGitRepo {
+            has_file: in_working_tree,
         }
     }
 }
 
-fn is_git_repo(project_dir: &Path) -> bool {
+fn git_succeeds(project_dir: &Path, args: &[&str]) -> bool {
     Command::new("git")
-        .args(["rev-parse", "--git-dir"])
+        .args(args)
         .current_dir(project_dir)
         .output()
         .is_ok_and(|o| o.status.success())

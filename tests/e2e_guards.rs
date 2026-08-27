@@ -1476,3 +1476,160 @@ fi
         );
     }
 }
+
+// ── `cplt trust accept` commit guard (issue #183) ─────────────────────────────
+//
+// cplt trusts only the `.cplt.toml` committed to git HEAD, so every granted
+// permission is auditable. These tests drive the real binary, because the guard
+// — not the state machine behind it — is what decides whether an unauditable
+// config can be approved. Asserting only on the state enum is how the
+// not-a-git-repo case slipped through review.
+mod trust_accept_guard {
+    use super::binary_path;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e.x")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e.x")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git should run");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    fn commit_all(dir: &Path) {
+        git(dir, &["add", "-A"]);
+        git(
+            dir,
+            &["-c", "commit.gpgSign=false", "commit", "-q", "-m", "cfg"],
+        );
+    }
+
+    const PROPOSE: &str = "[propose]\nallow_docker = true\n";
+
+    /// `cplt trust accept --all` in `dir`, with the trust store redirected out
+    /// of the developer's real `~/.config/cplt`. Returns (combined output, ok).
+    fn trust_accept_all(dir: &Path, store: &Path) -> (String, bool) {
+        let out = Command::new(binary_path())
+            .args(["trust", "accept", "--all"])
+            .current_dir(dir)
+            .env("CPLT_CONFIG", store.join("config.toml"))
+            .output()
+            .expect("cplt should run");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (combined, out.status.success())
+    }
+
+    /// A repo with one commit (so HEAD exists) plus an isolated trust store.
+    fn repo() -> (tempfile::TempDir, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("README"), "x\n").unwrap();
+        commit_all(dir.path());
+        (dir, store)
+    }
+
+    fn assert_refused(out: &str, ok: bool, expect: &str) {
+        assert!(!ok, "trust accept must exit non-zero.\n{out}");
+        assert!(!out.contains("Approved"), "nothing may be approved.\n{out}");
+        assert!(
+            out.contains(expect),
+            "message must contain {expect:?}.\n{out}"
+        );
+    }
+
+    #[test]
+    fn refuses_untracked_config() {
+        let (dir, store) = repo();
+        std::fs::write(dir.path().join(".cplt.toml"), PROPOSE).unwrap();
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert_refused(&out, ok, "not in git HEAD");
+    }
+
+    /// The reported setup (#183): `.cplt.toml` in `.gitignore`. `git status`
+    /// reports nothing for an ignored file, so a status-based guard let this
+    /// through and approved a config that can never be audited.
+    #[test]
+    fn refuses_gitignored_config() {
+        let (dir, store) = repo();
+        std::fs::write(dir.path().join(".gitignore"), ".cplt.toml\n").unwrap();
+        commit_all(dir.path());
+        std::fs::write(dir.path().join(".cplt.toml"), PROPOSE).unwrap();
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert_refused(&out, ok, "not in git HEAD");
+    }
+
+    #[test]
+    fn refuses_config_edited_since_commit() {
+        let (dir, store) = repo();
+        std::fs::write(dir.path().join(".cplt.toml"), PROPOSE).unwrap();
+        commit_all(dir.path());
+        std::fs::write(
+            dir.path().join(".cplt.toml"),
+            format!("{PROPOSE}allow_browser = true\n"),
+        )
+        .unwrap();
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert_refused(&out, ok, "differs from the version committed");
+    }
+
+    /// Outside a git repo nothing can be audited, and on macOS the working-tree
+    /// fallback would still apply whatever got approved — the trust entry falls
+    /// back to the canonicalized path, so it persists.
+    #[test]
+    fn refuses_config_outside_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".cplt.toml"), PROPOSE).unwrap();
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert_refused(&out, ok, "not a git repository");
+    }
+
+    #[test]
+    fn accepts_committed_config() {
+        let (dir, store) = repo();
+        std::fs::write(dir.path().join(".cplt.toml"), PROPOSE).unwrap();
+        commit_all(dir.path());
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert!(ok, "a committed config must be approvable.\n{out}");
+        assert!(out.contains("allow_docker"), "{out}");
+    }
+
+    /// A `.gitattributes` filter (eol, LFS, git-crypt, ident) makes the checked
+    /// out bytes differ from the raw HEAD blob. Comparing the two directly would
+    /// call this permanent drift and leave the permission ungrantable forever,
+    /// with no workaround short of dropping the gitattribute.
+    #[test]
+    fn accepts_committed_config_behind_a_gitattributes_filter() {
+        let (dir, store) = repo();
+        std::fs::write(dir.path().join(".gitattributes"), "*.toml text eol=crlf\n").unwrap();
+        std::fs::write(dir.path().join(".cplt.toml"), PROPOSE).unwrap();
+        commit_all(dir.path());
+        // Re-checkout so the working tree holds the smudged (CRLF) bytes.
+        std::fs::remove_file(dir.path().join(".cplt.toml")).unwrap();
+        git(dir.path(), &["checkout", "-q", "--", ".cplt.toml"]);
+        assert!(
+            std::fs::read(dir.path().join(".cplt.toml"))
+                .unwrap()
+                .windows(2)
+                .any(|w| w == b"\r\n"),
+            "precondition: the checkout must differ from the blob"
+        );
+
+        let (out, ok) = trust_accept_all(dir.path(), store.path());
+        assert!(ok, "a committed config must stay approvable.\n{out}");
+        assert!(out.contains("allow_docker"), "{out}");
+    }
+}
