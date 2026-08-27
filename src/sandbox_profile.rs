@@ -284,8 +284,17 @@ fn emit_project_access(sb: &mut String, project: &str) {
 ///
 /// Emitting the `{root}/.git/…` rules unconditionally (rather than only for
 /// paths that are git repos today) is deliberate: it costs nothing for a
-/// non-repo grant, and it also covers a repo the agent creates *during* the
-/// session with `git init`.
+/// non-repo grant, and it covers a repo the agent creates mid-session with
+/// `git init` **at the grant root itself**.
+///
+/// KNOWN GAP — only the root is ever covered, never a subdirectory of it.
+/// `--allow-write ~/work` denies `~/work/.git/hooks`, but
+/// `~/work/proj/.git/hooks` stays writable, whether `proj` was already a repo
+/// at launch or the agent creates one there during the session. This is the
+/// same shape as granting a directory that merely *contains* repos (#212's
+/// third scope bullet) and is not closed here: it needs either a repo walk at
+/// launch or a global path regex, and the regex is macOS-only — it would give
+/// Landlock nothing and widen the platform divergence. Deferred to #165.
 fn writable_roots(project: &str, extra_write: &[PathBuf]) -> Vec<String> {
     let mut roots = vec![project.to_string()];
     for p in extra_write {

@@ -2143,6 +2143,108 @@ fn profile_env_deny_comes_after_user_allows() {
     );
 }
 
+/// #212: a granted repo whose real `.git` is NOT `<root>/.git` — a worktree
+/// (shared `.git` in the main repo), a bare repo (hooks at `<root>/hooks`), a
+/// submodule (gitlink into `.git/modules/<name>`) — is reachable only through
+/// the resolved dirs in `extra_git_dirs`. The path-shaped `<root>/.git/...`
+/// rules cannot see any of them.
+///
+/// This is host-independent on purpose: the end-to-end proof lives behind
+/// `require_sandbox!`, which never runs on Linux CI, so without this test
+/// deleting the whole `extra_git_dirs` loop leaves the suite green.
+#[test]
+fn profile_denies_resolved_git_dirs_of_granted_repos() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        // A granted worktree and a granted bare repo.
+        extra_write: &[
+            std::path::PathBuf::from("/work/wt"),
+            std::path::PathBuf::from("/work/bare.git"),
+        ],
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        // What `discover::git_dir_of` resolves them to: the worktree's shared
+        // `.git` lives in the main repo, the bare repo IS its own git dir.
+        extra_git_dirs: &[
+            std::path::PathBuf::from("/work/main/.git"),
+            std::path::PathBuf::from("/work/bare.git"),
+        ],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+
+    // The last user write allow in the profile — every deny below must follow
+    // it, or SBPL last-match-wins hands the grant back.
+    let user_write_allow = p
+        .find("(allow file-write* (subpath \"/work/bare.git\"))")
+        .expect("granted bare repo must get a user write allow");
+
+    for (label, deny) in [
+        // The plain `<root>/.git/...` rules, emitted for every writable root.
+        // Same reason this test exists at all: the end-to-end proof is behind
+        // `require_sandbox!`, so without these two `writable_roots` could be
+        // reduced to the project alone with the host-independent suite green.
+        (
+            "granted root hooks",
+            "(deny file-write* (subpath \"/work/wt/.git/hooks\"))",
+        ),
+        (
+            "granted root config",
+            "(deny file-write* (literal \"/work/wt/.git/config\"))",
+        ),
+        (
+            "worktree shared hooks",
+            "(deny file-write* (subpath \"/work/main/.git/hooks\"))",
+        ),
+        (
+            "worktree shared config",
+            "(deny file-write* (literal \"/work/main/.git/config\"))",
+        ),
+        (
+            "bare repo hooks",
+            "(deny file-write* (subpath \"/work/bare.git/hooks\"))",
+        ),
+        (
+            "bare repo config",
+            "(deny file-write* (literal \"/work/bare.git/config\"))",
+        ),
+    ] {
+        let at = p
+            .find(deny)
+            .unwrap_or_else(|| panic!("{label} must be denied — missing {deny}\n{p}"));
+        assert!(
+            at > user_write_allow,
+            "{label} deny must come AFTER the user write allow for SBPL last-match-wins"
+        );
+    }
+}
+
 // ============================================================
 // Allow-localhost-any
 // ============================================================
