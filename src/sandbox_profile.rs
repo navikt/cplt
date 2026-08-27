@@ -294,7 +294,9 @@ fn emit_project_access(sb: &mut String, project: &str) {
 /// same shape as granting a directory that merely *contains* repos (#212's
 /// third scope bullet) and is not closed here: it needs either a repo walk at
 /// launch or a global path regex, and the regex is macOS-only — it would give
-/// Landlock nothing and widen the platform divergence. Deferred to #165.
+/// Landlock nothing and widen the platform divergence. There is no dedicated
+/// issue for it: it is tracked as a checklist item under the multi-repo work in
+/// #165, alongside the same gap for a `--project-dir` that contains repos.
 fn writable_roots(project: &str, extra_write: &[PathBuf]) -> Vec<String> {
     let mut roots = vec![project.to_string()];
     for p in extra_write {
