@@ -442,17 +442,20 @@ impl Discovery {
             );
             critical_ok = false;
         } else {
+            let wsl = cfg!(target_os = "linux") && crate::agent::is_wsl();
             for agent in &self.agents {
                 // A Windows-side install reached through WSL interop cannot run
                 // in the Linux sandbox, so reporting it as present is what let
                 // doctor say "all critical checks passed" for a setup that
-                // cannot start (#188). WSL appends the Windows PATH after the
-                // distro's, so `which` only lands here when no Linux-side
-                // install exists.
-                if cfg!(target_os = "linux") && crate::agent::is_windows_interop_path(&agent.path) {
+                // cannot start (#188). Gated on an actual WSL signal: on a plain
+                // Linux box /mnt/c is an ordinary mount and an agent there is
+                // fine. WSL appends the Windows PATH after the distro's, so
+                // `which` only lands here when no Linux-side install exists.
+                if crate::agent::is_wsl_interop_binary(&agent.path, wsl) {
                     println!(
-                        "  {}✗{} {} ({}): {} — Windows install via WSL interop, cannot run in the \
-                         Linux sandbox. Install Node and {} inside the WSL distro.",
+                        "  {}✗{} {} ({}): {} — Windows install reached through WSL interop, \
+                         cannot run in the Linux sandbox. Install Node and {} inside the WSL \
+                         distro.",
                         ui::stdout_color(ui::RED),
                         ui::stdout_color(ui::RESET),
                         agent.name,

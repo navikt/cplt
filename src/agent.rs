@@ -5,6 +5,7 @@
 //! different binary names, config directories, and runtime requirements, but
 //! shares the same core sandbox infrastructure.
 
+use crate::ui;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -722,25 +723,13 @@ impl Agent {
         // Windows-side installs reached through WSL interop, tracked only so the
         // failure can name the cause instead of "not found in PATH".
         let mut windows_interop: Option<PathBuf> = None;
+        let wsl = cfg!(target_os = "linux") && is_wsl();
 
         for binary_name in binary_names {
             for dir in path_var.split(':') {
                 let candidate = PathBuf::from(dir).join(binary_name);
 
                 if !candidate.is_file() {
-                    continue;
-                }
-
-                // WSL inherits the Windows PATH, so an agent installed on the
-                // Windows side shows up here as /mnt/c/.../<binary>. It is a
-                // Windows executable (or an npm shim that execs a Windows-side
-                // `node`), so it cannot run in the Linux sandbox. Skip it and
-                // keep looking — WSL appends the Windows PATH after the Linux
-                // one, so a distro-side install normally wins anyway (#188).
-                if cfg!(target_os = "linux") && is_windows_interop_path(&candidate) {
-                    if windows_interop.is_none() {
-                        windows_interop = Some(candidate);
-                    }
                     continue;
                 }
 
@@ -763,6 +752,25 @@ impl Agent {
                     std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
                 if self_exe.as_ref() == Some(&resolved) {
                     continue; // skip cplt aliased as this binary
+                }
+
+                // Under WSL the Windows PATH is appended to the distro's, so an
+                // agent installed on the Windows side turns up here as
+                // /mnt/c/.../<binary>: a Windows executable, or the npm shim
+                // that execs `node`. Neither runs in the Linux sandbox. Skip it
+                // and keep looking — a distro-side install normally comes first
+                // in PATH anyway (#188). Checked after canonicalization so a
+                // distro-side symlink into /mnt is caught too, matching what
+                // `cplt doctor` reports.
+                if is_wsl_interop_binary(&resolved, wsl) {
+                    if windows_interop.is_none() {
+                        ui::warn(&format!(
+                            "Ignoring {} — Windows install reached through WSL interop",
+                            resolved.display()
+                        ));
+                        windows_interop = Some(resolved);
+                    }
+                    continue;
                 }
 
                 // Copilot-specific: prefer standalone over editor shims
@@ -807,9 +815,10 @@ impl Agent {
             return Err(format!(
                 "{} resolves to a Windows install reached through WSL interop:\n  \
                  {}\n  \
-                 Paths under /mnt/<drive>/ are the Windows filesystem: that binary is a Windows \
+                 Under WSL, /mnt/<drive>/ is the Windows filesystem: that binary is a Windows \
                  executable (npm installs it as a shim that execs `node`), so it cannot run in \
-                 the Linux sandbox — and the distro has no `node` for the shim to exec.\n  \
+                 the Linux sandbox — and unless you installed Node in the distro too, the shim \
+                 has no `node` to exec.\n  \
                  Fix: install Node and the agent inside the WSL distro. {install_hint}",
                 self.display_name(),
                 win.display()
@@ -834,6 +843,13 @@ impl Agent {
             .ok()
             .and_then(|p| std::fs::canonicalize(&p).ok());
 
+        // Same WSL interop rule as `resolve_binary`: a Windows-side copilot must
+        // not win auto-detection over a working distro-side agent (#188).
+        let wsl = cfg!(target_os = "linux") && is_wsl();
+        let usable = |resolved: &PathBuf| {
+            self_exe.as_ref() != Some(resolved) && !is_wsl_interop_binary(resolved, wsl)
+        };
+
         let mut found_copilot = false;
         let mut found_opencode = false;
         let mut found_gemini = false;
@@ -845,7 +861,7 @@ impl Agent {
                 if candidate.is_file() {
                     let resolved =
                         std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-                    if self_exe.as_ref() != Some(&resolved) {
+                    if usable(&resolved) {
                         found_copilot = true;
                     }
                 }
@@ -855,7 +871,7 @@ impl Agent {
                 if candidate.is_file() {
                     let resolved =
                         std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-                    if self_exe.as_ref() != Some(&resolved) {
+                    if usable(&resolved) {
                         found_opencode = true;
                     }
                 }
@@ -865,7 +881,7 @@ impl Agent {
                 if candidate.is_file() {
                     let resolved =
                         std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-                    if self_exe.as_ref() != Some(&resolved) {
+                    if usable(&resolved) {
                         found_gemini = true;
                     }
                 }
@@ -877,7 +893,7 @@ impl Agent {
                     if candidate.is_file() {
                         let resolved =
                             std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone());
-                        if self_exe.as_ref() != Some(&resolved) {
+                        if usable(&resolved) {
                             found_antigravity = true;
                             break;
                         }
@@ -953,6 +969,35 @@ pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
     }
 }
 
+/// Are we running inside WSL?
+///
+/// `WSL_DISTRO_NAME` and `WSL_INTEROP` are set by WSL in every distro session,
+/// and WSL2's `/proc/version` names the Microsoft-built kernel. Either signal
+/// is enough; both are absent on ordinary Linux, where `/mnt/c` is just a
+/// mount point somebody chose and must be left alone.
+pub fn is_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some()
+        || std::fs::read_to_string("/proc/version").is_ok_and(|v| is_wsl_proc_version(&v))
+}
+
+/// Does this `/proc/version` string come from a WSL kernel?
+///
+/// WSL1 and WSL2 both name Microsoft in it ("… Microsoft@Microsoft.com …",
+/// "…-microsoft-standard-WSL2 …"); a stock distro kernel does not.
+fn is_wsl_proc_version(version: &str) -> bool {
+    version.to_ascii_lowercase().contains("microsoft")
+}
+
+/// Must this resolved agent binary be refused as a Windows interop install?
+///
+/// The path shape alone is not enough — see [`is_windows_interop_path`] — so
+/// callers pass the WSL signal from [`is_wsl`] and this is the only place the
+/// two are combined.
+pub fn is_wsl_interop_binary(path: &Path, wsl: bool) -> bool {
+    wsl && is_windows_interop_path(path)
+}
+
 /// Is this path on a Windows drive exposed to WSL as `/mnt/<drive>/…`?
 ///
 /// WSL2 mounts the Windows drives under `/mnt/c`, `/mnt/d`, … and (with
@@ -963,8 +1008,10 @@ pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
 /// the Linux sandbox (#188).
 ///
 /// The single-letter component is what separates a drive mount from an
-/// ordinary `/mnt/data`-style mount point. This is a heuristic on the path
-/// alone: it needs no WSL detection, and it is only consulted on Linux.
+/// ordinary `/mnt/data`-style mount point — but `/mnt/c` is also a perfectly
+/// ordinary mount on a non-WSL machine (a NAS, a second disk), so callers must
+/// gate this on [`is_wsl`]. On a Linux box that is not WSL, a real agent under
+/// `/mnt/d` has to keep working.
 pub fn is_windows_interop_path(path: &Path) -> bool {
     let mut parts = path.components();
     matches!(parts.next(), Some(std::path::Component::RootDir))
@@ -1098,8 +1145,9 @@ mod tests {
     /// The exact path from the #188 report: Copilot CLI installed on the
     /// Windows side, resolved inside the distro through WSL interop.
     ///
-    /// Pure path logic, so it runs on every platform (the call site in
-    /// `resolve_binary` is Linux-gated, that part is not covered here).
+    /// Pure path logic, so it runs on every platform. What is *not* covered
+    /// here: the `is_wsl() && …` gating at the three call sites, which needs a
+    /// real WSL environment (or process-wide env mutation) to exercise.
     #[test]
     fn windows_interop_path_detects_npm_shim_on_c_drive() {
         assert!(is_windows_interop_path(Path::new(
@@ -1115,6 +1163,8 @@ mod tests {
         // Multi-character component: an ordinary mount point, not a drive.
         assert!(!is_windows_interop_path(Path::new("/mnt/data/bin/copilot")));
         assert!(!is_windows_interop_path(Path::new("/mnt/c1/bin/copilot")));
+        // A single component that is not a drive letter.
+        assert!(!is_windows_interop_path(Path::new("/mnt/1/bin/copilot")));
         assert!(!is_windows_interop_path(Path::new(
             "/usr/local/bin/copilot"
         )));
@@ -1127,6 +1177,47 @@ mod tests {
         assert!(!is_windows_interop_path(Path::new("sub/mnt/c/copilot")));
         // "mnt" must be the first component, not any component.
         assert!(!is_windows_interop_path(Path::new("/opt/mnt/c/copilot")));
+    }
+
+    /// The gate itself: `/mnt/c` on a plain Linux box is a NAS, a second disk,
+    /// an encrypted volume — an agent there is real and must keep working.
+    #[test]
+    fn wsl_interop_binary_only_fires_under_wsl() {
+        let win = Path::new("/mnt/c/Users/someone/AppData/Roaming/npm/copilot");
+        assert!(is_wsl_interop_binary(win, true));
+        assert!(!is_wsl_interop_binary(win, false));
+        assert!(!is_wsl_interop_binary(
+            Path::new("/usr/local/bin/copilot"),
+            true
+        ));
+    }
+
+    /// `/mnt/c` is an ordinary mount point on plenty of non-WSL Linux boxes, so
+    /// the interop rule hangs entirely off this signal. Real `/proc/version`
+    /// strings, WSL2 and WSL1 vs a stock distro kernel.
+    #[test]
+    fn wsl_proc_version_distinguishes_wsl_from_stock_kernels() {
+        assert!(is_wsl_proc_version(
+            "Linux version 5.15.167.4-microsoft-standard-WSL2 \
+             (root@941d701f84f1) (gcc (GCC) 11.2.0, GNU ld (GNU Binutils) 2.37) #1 SMP"
+        ));
+        assert!(is_wsl_proc_version(
+            "Linux version 4.4.0-19041-Microsoft \
+             (Microsoft@Microsoft.com) (gcc version 5.4.0 (GCC) ) #1237-Microsoft"
+        ));
+        assert!(!is_wsl_proc_version(
+            "Linux version 6.8.0-45-generic (buildd@lcy02-amd64-091) \
+             (x86_64-linux-gnu-gcc-13 (Ubuntu 13.2.0-23ubuntu4) 13.2.0) #45-Ubuntu SMP"
+        ));
+        assert!(!is_wsl_proc_version(""));
+    }
+
+    /// Nothing on macOS may be treated as WSL — `/proc/version` does not exist
+    /// there, and the call sites are `cfg!(target_os = "linux")`-gated anyway.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn is_wsl_is_false_on_macos() {
+        assert!(!is_wsl());
     }
 
     /// Dotfile managers routinely symlink `~/.config/<agent>` elsewhere. Both
