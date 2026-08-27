@@ -1995,6 +1995,32 @@ fn log_connection(state: &ProxyState, method: &str, target: &str, status: &str) 
     let log_file = state.log_file.as_deref();
     let level = state.log_level;
 
+    // SECURITY: `method` and `target` are agent-controlled. Both are sliced
+    // straight out of the CONNECT request line in `handle_connection`, and this
+    // function is the ONE sink they reach: the stderr verdict line below, the
+    // `--proxy-log` audit file, and — via `record_observation` — the observed
+    // host set that `--observe-domains-out` writes as a ready-to-paste
+    // allowlist. Escaping here therefore covers all three.
+    //
+    // `lines()` + `split_whitespace()` upstream already make CR/LF (and every
+    // other whitespace class, incl. VT/FF/NEL/U+2028) unforgeable, so the
+    // space-delimited audit format cannot be forged. ESC (0x1b) is NOT
+    // whitespace and survived untouched: a target of "\x1b[2K\r" let the agent
+    // ERASE or overwrite the very BLOCKED lines the user is watching, and
+    // landed raw in the audit file for `cat` to re-emit.
+    //
+    // Escape rather than strip: the audit log must show that something odd was
+    // attempted, not silently swallow it. `escape_debug` leaves printable
+    // Unicode alone (IDN hostnames, punycode and UTF-8 alike) while covering
+    // C0/C1, DEL, bidi overrides and zero-width formatters — a wider net than
+    // "strip C0 controls" for one stdlib call, and lossless.
+    let (method, target, status) = (
+        method.escape_debug().to_string(),
+        target.escape_debug().to_string(),
+        status.escape_debug().to_string(),
+    );
+    let (method, target, status) = (method.as_str(), target.as_str(), status.as_str());
+
     // Record the observation for every CONNECT verdict, regardless of the stderr
     // log level or whether a --proxy-log file is set. This is the single choke
     // point every verdict flows through, so the collector sees the FULL set of
@@ -3392,6 +3418,111 @@ mod tests {
             }
             Err(e) => format!("ERROR: {e}"),
         }
+    }
+
+    /// A control character in the agent's request line must never reach a log
+    /// sink verbatim.
+    ///
+    /// Drives the REAL path — raw request lines over TCP into a live proxy —
+    /// and inspects both sinks `log_connection` feeds: the `--proxy-log` audit
+    /// file and the observed-host set behind `--observe-domains-out`. The
+    /// stderr verdict line is formatted from the same two escaped locals, so
+    /// the file assertion covers it too.
+    ///
+    /// Without the escaping, `\x1b[2K\r` in a CONNECT target reaches the
+    /// user's terminal intact and erases the BLOCKED lines they are watching —
+    /// including the one this very request produces.
+    #[test]
+    fn proxy_log_sinks_escape_control_characters() {
+        require_localhost_tcp!();
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("proxy.log");
+
+        // Resolution always fails: the verdict is deterministic (still logged
+        // AND recorded) and no lookup for a control-character host leaves the
+        // machine.
+        let resolver: ResolverFn = Arc::new(|_h: &str, _p: u16| None);
+        let proxy = start(ProxyOptions {
+            port: 0,
+            blocked_file: PathBuf::from("/dev/null"),
+            allowed_ports: vec![443, 80],
+            allow_localhost_ports: Vec::new(),
+            allow_localhost_any: false,
+            allowed_domains_file: None,
+            allowed_domains_initial: Vec::new(),
+            default_allowlist: Vec::new(),
+            subscription_blocklist: Vec::new(),
+            cli_private_domains: Vec::new(),
+            config_private_domains: Vec::new(),
+            repo_private_domains: Vec::new(),
+            config_file: None,
+            log_file: Some(log.clone()),
+            log_level: ProxyLogLevel::All,
+            timeout: Duration::from_secs(5),
+            upstream: None,
+            upstream_no_proxy: Vec::new(),
+            resolver: Some(resolver),
+        })
+        .expect("proxy start failed");
+
+        // Raw request lines, exactly as a hostile agent would send them.
+        let attacks = [
+            // ESC and BEL inside the hostname — neither is whitespace, so both
+            // survive `lines()` and `split_whitespace()` into `target`.
+            "CONNECT evil\x1b[2K\x07.example:443 HTTP/1.1",
+            // Line-erase payload: `split_whitespace()` leaves "\x1b[2K" as the
+            // target and drops the rest of the line.
+            "CONNECT \x1b[2K\rEVIL.example:443 HTTP/1.1",
+            // The METHOD is agent-controlled too and is logged (UNSUPPORTED).
+            "GE\x1bT http://evil.example/ HTTP/1.1",
+        ];
+        for line in attacks {
+            let mut conn =
+                std::net::TcpStream::connect(format!("127.0.0.1:{}", proxy.port)).unwrap();
+            let _ = write!(conn, "{line}\r\nHost: x\r\n\r\n");
+            let mut drain = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut conn, &mut drain);
+        }
+
+        let observed = proxy.observed_domains();
+        proxy.shutdown();
+
+        let bytes = std::fs::read(&log).expect("audit log must exist");
+        let text = String::from_utf8(bytes.clone()).expect("audit log must stay UTF-8");
+        assert_eq!(
+            text.lines().count(),
+            attacks.len(),
+            "one audit line per request: {text:?}"
+        );
+        let raw: Vec<u8> = bytes
+            .iter()
+            .copied()
+            .filter(|b| (*b < 0x20 && *b != b'\n') || *b == 0x7f)
+            .collect();
+        assert!(
+            raw.is_empty(),
+            "control characters reached the --proxy-log audit file: {raw:?} in {text:?}"
+        );
+        assert!(
+            text.contains("\\u{1b}"),
+            "the escape attempt must survive in the log as evidence, \
+             not be silently stripped: {text:?}"
+        );
+
+        for o in &observed {
+            assert!(
+                !o.host.chars().any(char::is_control),
+                "control characters reached the observed-domain set that \
+                 --observe-domains-out writes as an allowlist: {:?}",
+                o.host
+            );
+        }
+        assert!(
+            observed.iter().any(|o| o.host.contains("\\u{1b}")),
+            "the hostile targets must still be recorded, escaped: {observed:?}"
+        );
     }
 
     fn make_proxy(allow_localhost_ports: Vec<u16>, allow_localhost_any: bool) -> ProxyHandle {
