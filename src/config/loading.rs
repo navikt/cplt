@@ -1136,6 +1136,12 @@ impl Resolved {
         if is_approved("proxy.allow_private_domains") {
             for domain in &repo_config.propose.proxy.allow_private_domains {
                 let domain = crate::proxy::normalize_hostname(domain);
+                // The config/CLI path rejects empty entries above; `.cplt.toml`
+                // validation rejects "" but not "." or " ", which normalize to
+                // the same nothing. Skip them here so the two paths agree.
+                if domain.is_empty() {
+                    continue;
+                }
                 if !self.allow_private_domains.contains(&domain) {
                     self.allow_private_domains.push(domain.clone());
                 }
@@ -1836,13 +1842,22 @@ validate = false
 
     #[test]
     fn apply_repo_config_proxy_proposals() {
-        let config = Config::default();
+        // The global config already allows one of the proposed domains, so the
+        // overlap case is the one under test: it must still be recorded as
+        // repo-approved, or the proxy leaves it in the TTL cache and the first
+        // config reload wipes it (#186).
+        let config = Config::parse("[proxy]\nallow_private_domains = [\"intern.nav.no\"]\n")
+            .expect("config parses");
         let mut resolved = config.merge(CliFlags::default()).unwrap();
 
         let repo_config = crate::repo_config::RepoConfig {
             propose: crate::repo_config::ProposeSection {
                 proxy: crate::repo_config::ProposeProxySection {
-                    allow_private_domains: vec!["intern.nav.no".to_string()],
+                    allow_private_domains: vec![
+                        "Intern.NAV.no".to_string(),
+                        "mimir.nav.cloud.nais.io.".to_string(),
+                        ".".to_string(),
+                    ],
                 },
                 ..Default::default()
             },
@@ -1851,10 +1866,21 @@ validate = false
 
         let unapproved = resolved.apply_repo_config(&repo_config, &["proxy.allow_private_domains"]);
         assert!(unapproved.is_empty());
-        assert!(
-            resolved
-                .allow_private_domains
-                .contains(&"intern.nav.no".to_string())
+        assert_eq!(
+            resolved.allow_private_domains,
+            vec![
+                "intern.nav.no".to_string(),
+                "mimir.nav.cloud.nais.io".to_string()
+            ]
+        );
+        assert_eq!(
+            resolved.repo_private_domains,
+            vec![
+                "intern.nav.no".to_string(),
+                "mimir.nav.cloud.nais.io".to_string()
+            ],
+            "every approved proposal is repo-approved, including one the global \
+             config already allowed"
         );
     }
 

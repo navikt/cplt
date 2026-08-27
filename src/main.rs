@@ -1897,7 +1897,11 @@ fn start_proxy_if_enabled(
             .allow_private_domains
             .iter()
             .filter(|d| {
-                !cli.allow_private_domains.contains(d) && !resolved.repo_private_domains.contains(d)
+                // `cli.allow_private_domains` holds raw argv, `d` is normalized.
+                !cli.allow_private_domains
+                    .iter()
+                    .any(|c| proxy::normalize_hostname(c) == **d)
+                    && !resolved.repo_private_domains.contains(d)
             })
             .cloned()
             .collect(),

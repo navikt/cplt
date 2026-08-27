@@ -1751,10 +1751,11 @@ pub fn is_blocked_in_content(hostname: &str, contents: &str) -> bool {
 }
 
 /// Normalize a hostname (or a domain *pattern*) for consistent matching:
-/// lowercase, strip trailing dot. Patterns must be normalized at ingest —
-/// [`is_domain_match`] normalizes only the hostname side.
-pub(crate) fn normalize_hostname(host: &str) -> String {
-    host.to_lowercase().trim_end_matches('.').to_string()
+/// trim, lowercase, strip trailing dot — the same rule `parse_lines_file`
+/// applies to file-sourced lists. Patterns must be normalized at ingest,
+/// because [`is_domain_match`] normalizes only the hostname side.
+pub fn normalize_hostname(host: &str) -> String {
+    host.trim().to_lowercase().trim_end_matches('.').to_string()
 }
 
 /// Check if a hostname matches any entry in a domain list.
@@ -2620,6 +2621,34 @@ mod tests {
         )
         .unwrap();
 
+        // Built the way main.rs builds it: the resolved set (CLI + config file +
+        // trust-approved repo proposal) minus the two once-read sources, which
+        // it passes as their own fields. Hand-writing the reloadable list would
+        // test a shape the real wiring never produces.
+        let cli_private_domains = vec!["cli.nav.no".to_string()];
+        let repo_private_domains = vec!["mimir.nav.cloud.nais.io".to_string()];
+        let resolved_private_domains = [
+            "cli.nav.no",
+            "global-a.nav.no",
+            "global-b.nav.no",
+            "mimir.nav.cloud.nais.io",
+        ];
+        let config_private_domains: Vec<String> = resolved_private_domains
+            .iter()
+            .map(|d| (*d).to_string())
+            .filter(|d| {
+                !cli_private_domains
+                    .iter()
+                    .any(|c| normalize_hostname(c) == *d)
+                    && !repo_private_domains.contains(d)
+            })
+            .collect();
+        assert_eq!(
+            config_private_domains,
+            vec!["global-a.nav.no", "global-b.nav.no"],
+            "only the config file's own entries are reloadable"
+        );
+
         let handle = start(ProxyOptions {
             port: 0,
             blocked_file: blocked,
@@ -2630,15 +2659,9 @@ mod tests {
             allowed_domains_initial: Vec::new(),
             default_allowlist: Vec::new(),
             subscription_blocklist: Vec::new(),
-            cli_private_domains: vec!["cli.nav.no".to_string()],
-            // What main.rs passes: the whole resolved set (config file entries
-            // and the trust-approved repo proposal) minus the CLI ones.
-            config_private_domains: vec![
-                "global-a.nav.no".to_string(),
-                "global-b.nav.no".to_string(),
-                "mimir.nav.cloud.nais.io".to_string(),
-            ],
-            repo_private_domains: vec!["mimir.nav.cloud.nais.io".to_string()],
+            cli_private_domains,
+            config_private_domains,
+            repo_private_domains,
             config_file: Some(config_path.clone()),
             log_file: None,
             log_level: ProxyLogLevel::None,

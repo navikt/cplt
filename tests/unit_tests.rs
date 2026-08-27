@@ -361,7 +361,8 @@ fn allow_private_domains_merge_cli_and_toml() {
 fn allow_private_domains_are_normalized_and_actually_match() {
     use cplt::config::{CliFlags, Config};
     use cplt::proxy::is_domain_match;
-    let toml = "[proxy]\nallow_private_domains = [\"Intern.NAV.no\", \"a.nav.no.\"]\n";
+    let toml =
+        "[proxy]\nallow_private_domains = [\"Intern.NAV.no\", \"a.nav.no.\", \" pad.nav.no \"]\n";
     let cli = CliFlags {
         allow_private_domains: vec!["DEV.corp.example.com".to_string()],
         ..Default::default()
@@ -373,6 +374,7 @@ fn allow_private_domains_are_normalized_and_actually_match() {
         "sub.Intern.nav.no",
         "a.nav.no",
         "x.a.nav.no",
+        "pad.nav.no",
     ] {
         assert!(
             is_domain_match(host, &resolved.allow_private_domains),
