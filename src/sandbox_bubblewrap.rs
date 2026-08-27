@@ -1181,6 +1181,36 @@ mod tests {
     }
 
     #[test]
+    fn resolved_repo_deny_path_is_masked_not_skipped() {
+        // Issue #179, Linux half: a relative `.cplt.toml` deny path used to
+        // arrive here verbatim and land in `skipped` (see the test below).
+        // apply_repo_config now anchors it to the repo root, so it masks.
+        let base = non_tmp_tempdir();
+        let secret = base.path().join("secrets");
+        std::fs::create_dir(&secret).expect("create secrets");
+
+        let mut resolved = crate::config::Config::default()
+            .merge(crate::config::CliFlags::default())
+            .expect("merge");
+        let repo_config = crate::repo_config::RepoConfig {
+            deny: crate::repo_config::DenySection {
+                paths: vec!["secrets".to_string()],
+                env: vec![],
+            },
+            ..Default::default()
+        };
+        resolved.apply_repo_config(&repo_config, base.path(), &[]);
+
+        let masks = build_deny_masks(&resolved.deny_paths, None);
+        assert!(
+            masks.skipped().is_empty(),
+            "an anchored repo deny path must not be skipped: {:?}",
+            masks.skipped()
+        );
+        assert_eq!(masks.mask_count(), 1);
+    }
+
+    #[test]
     fn deny_mask_skips_relative_missing_and_tmp_paths() {
         // Deliberately under the REAL /tmp — tempfile::tempdir() honors
         // TMPDIR, which may point elsewhere (e.g. a cplt scratch dir).

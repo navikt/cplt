@@ -1568,6 +1568,41 @@ mod tests {
     }
 
     #[test]
+    fn relative_repo_deny_path_is_emitted_absolute() {
+        // Issue #179, macOS half: a relative `.cplt.toml` deny path used to be
+        // interpolated verbatim as `(deny file-read* (subpath "secrets"))`.
+        // Seatbelt accepts that without a compile error and the rule matches
+        // nothing — a silent fail-open. apply_repo_config now anchors it.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+
+        let mut resolved = crate::config::Config::default()
+            .merge(crate::config::CliFlags::default())
+            .expect("merge");
+        let repo_config = crate::repo_config::RepoConfig {
+            deny: crate::repo_config::DenySection {
+                paths: vec!["secrets".to_string()],
+                env: vec![],
+            },
+            ..Default::default()
+        };
+        resolved.apply_repo_config(&repo_config, project, &[]);
+
+        let mut opts = test_options(project, home);
+        opts.extra_deny = &resolved.deny_paths;
+        let p = generate_profile(&opts);
+
+        assert!(
+            p.contains(r#"(deny file-read* (subpath "/projects/app/secrets"))"#),
+            "repo deny path must reach SBPL as an absolute subpath"
+        );
+        assert!(
+            !p.contains(r#"(subpath "secrets")"#),
+            "a bare relative subpath compiles but never matches — fail-open"
+        );
+    }
+
+    #[test]
     fn default_path_allows_wildcard_443() {
         // Regression guard: with proxy_forced=false the broad `*:443` allowance
         // must remain exactly as before #53.

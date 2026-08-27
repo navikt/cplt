@@ -295,6 +295,8 @@ Commit a `.cplt.toml` file to your repository for project-specific sandbox setti
 - Write to `.cplt.toml` is kernel-denied inside the sandbox
 - Trust approvals are content-pinned — if requested values change, approvals are invalidated
 
+**Path expansion:** Paths in `[deny]` and `[propose.allow]` support `~/` expansion. A relative path is resolved against the repository root (the directory holding `.cplt.toml`), so `paths = ["secrets"]` denies `<repo>/secrets` on every clone. Unlike the global config, repo paths are *not* canonicalized: a path that does not exist yet is kept (macOS starts enforcing the deny once it appears; Linux warns that it cannot mask it), so one committed typo cannot brick cplt for everyone who clones the repo. `..` components are rejected outright.
+
 ### Example `.cplt.toml`
 
 ```toml

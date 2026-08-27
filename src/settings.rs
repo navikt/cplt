@@ -439,7 +439,7 @@ fn effective_snapshot(
     if let Ok(Some(loaded)) = repo_config::load_repo_config(project_dir) {
         let approved = approved_repo_keys(project_dir, &loaded.config);
         let approved_refs: Vec<&str> = approved.iter().map(String::as_str).collect();
-        effective.apply_repo_config(&loaded.config, &approved_refs);
+        effective.apply_repo_config(&loaded.config, project_dir, &approved_refs);
     }
     let _ = effective.reconcile_proxy_forced();
     let effective_values = resolved_values(&effective, global_doc);

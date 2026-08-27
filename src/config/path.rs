@@ -1,6 +1,6 @@
 //! Config file path resolution.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::error::ConfigError;
 use super::types::{CONFIG_DIR, CONFIG_FILE};
@@ -324,6 +324,29 @@ pub fn collapse_tilde(path: &str) -> String {
     }
 }
 
+/// Resolve a path from a repo `.cplt.toml`: expand a leading `~/`, then anchor
+/// any still-relative path to the repo root (the directory holding the config).
+///
+/// A relative path must never reach the sandbox backends. Seatbelt accepts
+/// `(deny file-read* (subpath "secrets"))` without a compile error and the rule
+/// then matches nothing — a silent fail-open. Landlock/bwrap drop it. Anchoring
+/// here is also what the global config already promises for its own relative
+/// entries ("Relative paths are resolved from this config file's directory").
+///
+/// Deliberately does NOT canonicalize, unlike `resolve_config_path`. Repo config
+/// is the only source that can deny a path that does not exist yet (macOS starts
+/// enforcing once it appears), and hard-failing would let one committed typo
+/// brick cplt for everyone who clones the repo. Joining always succeeds, so no
+/// entry can be dropped.
+pub(super) fn resolve_repo_path(path: &str, project_dir: &Path) -> PathBuf {
+    let expanded = expand_tilde(path);
+    if expanded.is_relative() {
+        project_dir.join(expanded)
+    } else {
+        expanded
+    }
+}
+
 /// Expand tilde, resolve relative paths against config dir, and canonicalize.
 pub(super) fn resolve_config_path(
     path: &str,
@@ -387,6 +410,44 @@ mod tests {
         let contents = default_config_contents();
         let config: Config = toml::from_str(&contents).unwrap();
         assert!(config.proxy.enabled.is_none());
+    }
+
+    #[test]
+    fn resolve_repo_path_anchors_relative_to_repo_root() {
+        // Issue #179: a relative repo-config path used to reach the sandbox
+        // verbatim. Seatbelt compiles `(subpath "secrets")` and matches
+        // nothing; Landlock/bwrap drop it. Both are silent fail-open.
+        assert_eq!(
+            resolve_repo_path("secrets", Path::new("/repo")),
+            PathBuf::from("/repo/secrets")
+        );
+        assert_eq!(
+            resolve_repo_path("a/b/c.txt", Path::new("/repo")),
+            PathBuf::from("/repo/a/b/c.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_repo_path_leaves_absolute_and_tilde_alone() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            resolve_repo_path("/etc/shadow", Path::new("/repo")),
+            PathBuf::from("/etc/shadow")
+        );
+        assert_eq!(
+            resolve_repo_path("~/secrets", Path::new("/repo")),
+            PathBuf::from(format!("{home}/secrets"))
+        );
+    }
+
+    #[test]
+    fn resolve_repo_path_keeps_paths_that_do_not_exist_yet() {
+        // Unlike resolve_config_path, no canonicalize: repo config is the only
+        // source that can deny a not-yet-created path, and a committed typo
+        // must not brick cplt for everyone who clones.
+        let resolved = resolve_repo_path("not/created/yet", Path::new("/repo"));
+        assert_eq!(resolved, PathBuf::from("/repo/not/created/yet"));
+        assert!(resolved.is_absolute());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use super::error::ConfigError;
-use super::path::{config_dir, config_path, expand_tilde, resolve_config_path};
+use super::path::{config_dir, config_path, expand_tilde, resolve_config_path, resolve_repo_path};
 use super::types::{
     CliFlags, Config, EnforcementMode, GhGuardPolicy, GitGuardPolicy, LoadedConfig, Preset,
     Resolved, ResolvedPushRule, UnknownCommandPolicy,
@@ -1005,15 +1005,21 @@ impl Resolved {
     /// never override an explicit `true` back to `false`. Path/port proposals extend
     /// the existing lists.
     ///
+    /// Path values (`deny.paths`, `propose.allow.read/write/socket`) are
+    /// resolved against `project_dir` — the directory holding `.cplt.toml` —
+    /// so a relative entry can never reach the sandbox unenforced. See
+    /// `resolve_repo_path`.
+    ///
     /// Returns a list of unapproved proposal keys (for display to the user).
     pub fn apply_repo_config(
         &mut self,
         repo_config: &crate::repo_config::RepoConfig,
+        project_dir: &std::path::Path,
         approved_keys: &[&str],
     ) -> Vec<String> {
         // ── Deny section: applied automatically ──────────────────────────
         for path_str in &repo_config.deny.paths {
-            let path = expand_tilde(path_str);
+            let path = resolve_repo_path(path_str, project_dir);
             if !self.deny_paths.contains(&path) {
                 self.deny_paths.push(path);
             }
@@ -1076,7 +1082,7 @@ impl Resolved {
         // Path proposals
         if is_approved("allow.read") {
             for path_str in &repo_config.propose.allow.read {
-                let path = expand_tilde(path_str);
+                let path = resolve_repo_path(path_str, project_dir);
                 if !self.allow_read.contains(&path) {
                     self.allow_read.push(path);
                 }
@@ -1084,7 +1090,7 @@ impl Resolved {
         }
         if is_approved("allow.write") {
             for path_str in &repo_config.propose.allow.write {
-                let path = expand_tilde(path_str);
+                let path = resolve_repo_path(path_str, project_dir);
                 if !self.allow_write.contains(&path) {
                     self.allow_write.push(path);
                 }
@@ -1092,7 +1098,7 @@ impl Resolved {
         }
         if is_approved("allow.socket") {
             for path_str in &repo_config.propose.allow.socket {
-                let path = expand_tilde(path_str);
+                let path = resolve_repo_path(path_str, project_dir);
                 if !self.allow_socket.contains(&path) {
                     self.allow_socket.push(path);
                 }
@@ -1358,7 +1364,11 @@ validate = false
             },
             ..Default::default()
         };
-        resolved.apply_repo_config(&repo_config, &["allow_localhost_any"]);
+        resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/repo"),
+            &["allow_localhost_any"],
+        );
         assert!(resolved.allow_localhost_any);
         assert!(resolved.reconcile_proxy_forced());
         assert!(!resolved.allow_localhost_any);
@@ -1686,6 +1696,68 @@ validate = false
     }
 
     #[test]
+    fn apply_repo_config_anchors_relative_paths_to_the_repo() {
+        // Issue #179: relative repo-config paths were only tilde-expanded, so
+        // they reached the sandbox backends unusable and unenforced —
+        // `(deny file-read* (subpath "secrets"))` on macOS (compiles, matches
+        // nothing) and a silent drop on Linux (`!path.is_absolute()` in
+        // build_deny_masks). Every path must now come out absolute.
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        let repo_config = crate::repo_config::RepoConfig {
+            deny: crate::repo_config::DenySection {
+                paths: vec!["secrets".to_string()],
+                env: vec![],
+            },
+            propose: crate::repo_config::ProposeSection {
+                allow: crate::repo_config::ProposeAllowSection {
+                    read: vec!["docs/ref".to_string()],
+                    write: vec!["build/out".to_string()],
+                    socket: vec!["run/app.sock".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+
+        resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/repo"),
+            &["allow.read", "allow.write", "allow.socket"],
+        );
+
+        assert!(
+            resolved
+                .deny_paths
+                .contains(&PathBuf::from("/repo/secrets"))
+        );
+        assert!(
+            resolved
+                .allow_read
+                .contains(&PathBuf::from("/repo/docs/ref"))
+        );
+        assert!(
+            resolved
+                .allow_write
+                .contains(&PathBuf::from("/repo/build/out"))
+        );
+        assert!(
+            resolved
+                .allow_socket
+                .contains(&PathBuf::from("/repo/run/app.sock"))
+        );
+        // Nothing may be dropped, and nothing may stay relative.
+        for path in resolved
+            .deny_paths
+            .iter()
+            .chain(&resolved.allow_read)
+            .chain(&resolved.allow_write)
+            .chain(&resolved.allow_socket)
+        {
+            assert!(path.is_absolute(), "{} is not absolute", path.display());
+        }
+    }
+
+    #[test]
     fn apply_repo_config_deny_always_applied() {
         let config = Config::default();
         let mut resolved = config.merge(CliFlags::default()).unwrap();
@@ -1699,7 +1771,8 @@ validate = false
         };
 
         // Apply with NO approved keys — deny should still work
-        let unapproved = resolved.apply_repo_config(&repo_config, &[]);
+        let unapproved =
+            resolved.apply_repo_config(&repo_config, std::path::Path::new("/repo"), &[]);
         assert!(unapproved.is_empty()); // no proposals, so nothing unapproved
         assert!(
             resolved
@@ -1726,7 +1799,8 @@ validate = false
         };
 
         // No keys approved
-        let unapproved = resolved.apply_repo_config(&repo_config, &[]);
+        let unapproved =
+            resolved.apply_repo_config(&repo_config, std::path::Path::new("/repo"), &[]);
         assert!(!resolved.allow_jvm_attach);
         assert!(!resolved.allow_docker);
         assert_eq!(unapproved.len(), 2);
@@ -1750,8 +1824,11 @@ validate = false
         };
 
         // Only approve jvm_attach and localhost_any
-        let unapproved =
-            resolved.apply_repo_config(&repo_config, &["allow_jvm_attach", "allow_localhost_any"]);
+        let unapproved = resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/repo"),
+            &["allow_jvm_attach", "allow_localhost_any"],
+        );
         assert!(resolved.allow_jvm_attach);
         assert!(resolved.allow_localhost_any);
         assert!(!resolved.allow_docker); // not approved
@@ -1776,13 +1853,18 @@ validate = false
 
         // Without approval: stays off
         let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
-        let unapproved = resolved.apply_repo_config(&repo_config, &[]);
+        let unapproved =
+            resolved.apply_repo_config(&repo_config, std::path::Path::new("/repo"), &[]);
         assert!(!resolved.gradle_init);
         assert_eq!(unapproved, vec!["gradle_init"]);
 
         // With approval: takes effect
         let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
-        let unapproved = resolved.apply_repo_config(&repo_config, &["gradle_init"]);
+        let unapproved = resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/repo"),
+            &["gradle_init"],
+        );
         assert!(resolved.gradle_init);
         assert!(unapproved.is_empty());
     }
@@ -1805,7 +1887,11 @@ validate = false
         };
 
         // Approve read and ports
-        let unapproved = resolved.apply_repo_config(&repo_config, &["allow.read", "allow.ports"]);
+        let unapproved = resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/repo"),
+            &["allow.read", "allow.ports"],
+        );
         assert!(unapproved.is_empty());
         assert!(
             resolved
@@ -1832,7 +1918,11 @@ validate = false
             ..Default::default()
         };
 
-        let unapproved = resolved.apply_repo_config(&repo_config, &["proxy.allow_private_domains"]);
+        let unapproved = resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/repo"),
+            &["proxy.allow_private_domains"],
+        );
         assert!(unapproved.is_empty());
         assert!(
             resolved
