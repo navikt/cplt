@@ -277,7 +277,8 @@ Everything below runs **inside the distro** (`wsl`, or the Ubuntu profile in Win
 # 1. Node — Copilot CLI is a Node package
 sudo apt update && sudo apt install -y nodejs npm
 
-# 2. GitHub CLI, and log in
+# 2. GitHub CLI, and log in — if apt has no 'gh', add GitHub's apt repo first:
+#    https://github.com/cli/cli/blob/trunk/docs/install_linux.md
 sudo apt install -y gh
 gh auth login
 
@@ -294,13 +295,13 @@ cplt doctor
 
 If `copilot` complains about the Node version, Ubuntu's packaged Node is older than it wants — install a newer one *inside the distro* (nvm, NodeSource, or mise) and re-run step 3.
 
-**Do not install Copilot CLI on the Windows side.** WSL appends the Windows `PATH` to the distro's, so a Windows-side `npm install -g @github/copilot` turns up inside the distro as `/mnt/c/Users/<user>/AppData/Roaming/npm/copilot`. That is a Windows install reached through interop: it cannot run in the Linux sandbox, and the npm shim execs a `node` the distro does not have. The symptom used to be an unrelated runtime-extraction error; cplt now names the cause when it resolves an agent under `/mnt/<drive>/`, and `cplt doctor` reports it as a failing check instead of passing ([#188](https://github.com/navikt/cplt/issues/188)).
+**Do not install Copilot CLI on the Windows side.** WSL appends the Windows `PATH` to the distro's, so a Windows-side `npm install -g @github/copilot` turns up inside the distro as `/mnt/c/Users/<user>/AppData/Roaming/npm/copilot`. That is a Windows install reached through interop: it cannot run in the Linux sandbox, and the npm shim execs a `node` the distro does not have. The symptom used to be an unrelated runtime-extraction error; cplt now names the cause when it resolves an agent under `/mnt/<drive>/` *and* it detects it is running under WSL (`WSL_DISTRO_NAME`, `WSL_INTEROP`, or a Microsoft kernel in `/proc/version`), and `cplt doctor` reports it as a failing check instead of passing ([#188](https://github.com/navikt/cplt/issues/188)). On a plain Linux box `/mnt/c` is left alone — it is an ordinary mount point there.
 
 **Kernel requirement.** Landlock needs kernel 5.13+, and TCP port filtering needs 6.7+ (see [Honest gaps](#honest-gaps)). `cplt doctor` prints the kernel version and the Landlock ABI it found — that is the check that matters on your machine. If it reports Landlock as unavailable, `wsl --update` in PowerShell and `cat /sys/kernel/security/lsm` inside the distro are the first two things to look at.
 
 **Keep the project in the Linux filesystem.** Work in `~/src/...` inside the distro rather than `/mnt/c/Users/...`. Microsoft's own guidance is that cross-OS file access through `/mnt/c` is markedly slower; and while cplt applies the same sandbox rules wherever the project lives (nothing in cplt special-cases `/mnt`), we have not confirmed that Landlock enforces those rules the same way on the 9p/drvfs mount that backs `/mnt/c` as it does on ext4. Until someone verifies that, treat a project under `/mnt/c` as unproven rather than supported.
 
-> **Not yet verified on a real WSL2 install.** What is verified from this repo: the `/mnt/<drive>/` detection and its error text, that `cplt doctor` fails on such an agent and prints kernel + Landlock ABI, that Landlock requires 5.13+ (6.7+ for port filtering), and that `install.sh` installs the Linux release binary. What is *not* verified by anyone here: that the WSL2 kernel you get has Landlock enabled, the exact `apt` package names and Node versions on your distro release, and Landlock's behaviour on `/mnt/c`. If you run this sequence, please report what actually happened in [#189](https://github.com/navikt/cplt/issues/189).
+> **Not yet verified on a real WSL2 install.** What is verified from this repo: the `/mnt/<drive>/` detection and its error text, that `cplt doctor` fails on such an agent and prints kernel + Landlock ABI, that Landlock requires 5.13+ (6.7+ for port filtering), and that `install.sh` installs the Linux release binary. What is *not* verified by anyone here: that the WSL2 kernel you get has Landlock enabled, that your WSL session really exports `WSL_DISTRO_NAME`/`WSL_INTEROP` or reports a Microsoft kernel (that is what switches the interop check on), the exact `apt` package names and Node versions on your distro release, and Landlock's behaviour on `/mnt/c`. If you run this sequence, please report what actually happened in [#189](https://github.com/navikt/cplt/issues/189).
 
 ### Shell setup (recommended)
 
