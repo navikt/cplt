@@ -8,6 +8,7 @@
 use crate::ui;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 // ── Per-agent default allowlists ─────────────────────────────────────────────
 //
@@ -969,24 +970,40 @@ pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
     }
 }
 
-/// Are we running inside WSL?
+/// Are we running inside WSL? Cached — it cannot change within a process.
 ///
-/// `WSL_DISTRO_NAME` and `WSL_INTEROP` are set by WSL in every distro session,
-/// and WSL2's `/proc/version` names the Microsoft-built kernel. Either signal
-/// is enough; both are absent on ordinary Linux, where `/mnt/c` is just a
-/// mount point somebody chose and must be left alone.
+/// Two independent signals, both cheap reads of kernel-owned state:
+///
+/// - `/run/WSL` exists. WSL's own init creates it; this is snapd's primary
+///   signal, and it survives a custom `[wsl2] kernel=` whose
+///   `CONFIG_LOCALVERSION` drops the marker below.
+/// - the kernel name in `/proc/sys/kernel/osrelease` (what systemd reads) or
+///   `/proc/version` names WSL. They cover the reverse case: snapd notes that
+///   `/run/WSL` can be missing under undocumented circumstances.
+///
+/// Deliberately *not* used: `WSL_DISTRO_NAME` and `WSL_INTEROP`. Both are
+/// absent under `sudo`, in systemd units and in cron (microsoft/WSL#5914,
+/// #9719) — and any user can export them, which disqualifies them from a
+/// decision that refuses to run an agent.
 pub fn is_wsl() -> bool {
-    std::env::var_os("WSL_DISTRO_NAME").is_some()
-        || std::env::var_os("WSL_INTEROP").is_some()
-        || std::fs::read_to_string("/proc/version").is_ok_and(|v| is_wsl_proc_version(&v))
+    static WSL: OnceLock<bool> = OnceLock::new();
+    *WSL.get_or_init(|| {
+        Path::new("/run/WSL").exists()
+            || ["/proc/sys/kernel/osrelease", "/proc/version"]
+                .iter()
+                .any(|f| std::fs::read_to_string(f).is_ok_and(|s| names_wsl_kernel(&s)))
+    })
 }
 
-/// Does this `/proc/version` string come from a WSL kernel?
+/// Does this kernel release or version string come from a WSL kernel?
 ///
-/// WSL1 and WSL2 both name Microsoft in it ("… Microsoft@Microsoft.com …",
-/// "…-microsoft-standard-WSL2 …"); a stock distro kernel does not.
-fn is_wsl_proc_version(version: &str) -> bool {
-    version.to_ascii_lowercase().contains("microsoft")
+/// Case-insensitive on purpose: WSL2 writes `-microsoft-standard-WSL2` with a
+/// lowercase m, WSL1 wrote `4.4.0-19041-Microsoft` with a capital one, so a
+/// case-sensitive match for either spelling misses the other. `wsl` is matched
+/// too, as systemd does, for kernels that carry only that marker.
+fn names_wsl_kernel(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
+    s.contains("microsoft") || s.contains("wsl")
 }
 
 /// Must this resolved agent binary be refused as a Windows interop install?
@@ -1008,10 +1025,21 @@ pub fn is_wsl_interop_binary(path: &Path, wsl: bool) -> bool {
 /// the Linux sandbox (#188).
 ///
 /// The single-letter component is what separates a drive mount from an
-/// ordinary `/mnt/data`-style mount point — but `/mnt/c` is also a perfectly
-/// ordinary mount on a non-WSL machine (a NAS, a second disk), so callers must
-/// gate this on [`is_wsl`]. On a Linux box that is not WSL, a real agent under
-/// `/mnt/d` has to keep working.
+/// ordinary `/mnt/data`-style mount point — and, deliberately, from `/mnt/wsl`
+/// and `/mnt/wslg`, which are WSL's own tmpfs and WSLg, not Windows paths.
+/// `/mnt/c` is also a perfectly ordinary mount on a non-WSL machine (a NAS, a
+/// second disk), so callers must gate this on [`is_wsl`]: on a Linux box that
+/// is not WSL, a real agent under `/mnt/d` has to keep working.
+///
+/// Known ceiling: `/mnt` is only the *default* automount root. `[automount]
+/// root` in `/etc/wsl.conf` relocates it (Microsoft's own example is
+/// `/windir/c`), automount can be switched off, and drives can be mounted
+/// anywhere with `mount -t drvfs`. Such a setup is simply not detected — the
+/// agent then fails later with its path in the message, which is the failure
+/// mode we prefer over refusing a working install. The exact answer is the
+/// longest-matching mount for the path in `/proc/self/mountinfo` having fstype
+/// `9p` with `aname=drvfs`, `virtiofs`, `virtio-plan9`, or `drvfs`; worth
+/// parsing if relocated automount roots ever show up in a bug report.
 pub fn is_windows_interop_path(path: &Path) -> bool {
     let mut parts = path.components();
     matches!(parts.next(), Some(std::path::Component::RootDir))
@@ -1171,6 +1199,10 @@ mod tests {
         assert!(!is_windows_interop_path(Path::new(
             "/home/user/.local/bin/copilot"
         )));
+        // WSL's own mounts: /mnt/wsl is its tmpfs, /mnt/wslg is WSLg. Neither
+        // is a Windows path, and both must stay usable.
+        assert!(!is_windows_interop_path(Path::new("/mnt/wsl/bin/copilot")));
+        assert!(!is_windows_interop_path(Path::new("/mnt/wslg/bin/copilot")));
         // A drive root is not a binary, and only absolute paths are mounts.
         assert!(!is_windows_interop_path(Path::new("/mnt/c")));
         assert!(!is_windows_interop_path(Path::new("mnt/c/bin/copilot")));
@@ -1193,27 +1225,36 @@ mod tests {
     }
 
     /// `/mnt/c` is an ordinary mount point on plenty of non-WSL Linux boxes, so
-    /// the interop rule hangs entirely off this signal. Real `/proc/version`
-    /// strings, WSL2 and WSL1 vs a stock distro kernel.
+    /// the interop rule hangs entirely off this signal. Real strings from
+    /// `/proc/sys/kernel/osrelease` and `/proc/version`, WSL2 and WSL1 against
+    /// a stock distro kernel.
     #[test]
-    fn wsl_proc_version_distinguishes_wsl_from_stock_kernels() {
-        assert!(is_wsl_proc_version(
+    fn wsl_kernel_names_distinguish_wsl_from_stock_kernels() {
+        // osrelease, one short line — what systemd reads.
+        assert!(names_wsl_kernel("5.15.167.4-microsoft-standard-WSL2"));
+        assert!(names_wsl_kernel("6.6.87.2-microsoft-standard-WSL2+"));
+        // WSL1 spelled it with a capital M, WSL2 with a lowercase one: a
+        // case-sensitive match for either spelling misses the other.
+        assert!(names_wsl_kernel("4.4.0-19041-Microsoft"));
+        // /proc/version, the long form.
+        assert!(names_wsl_kernel(
             "Linux version 5.15.167.4-microsoft-standard-WSL2 \
              (root@941d701f84f1) (gcc (GCC) 11.2.0, GNU ld (GNU Binutils) 2.37) #1 SMP"
         ));
-        assert!(is_wsl_proc_version(
-            "Linux version 4.4.0-19041-Microsoft \
-             (Microsoft@Microsoft.com) (gcc version 5.4.0 (GCC) ) #1237-Microsoft"
-        ));
-        assert!(!is_wsl_proc_version(
+        // A kernel carrying only the WSL marker, which systemd also matches.
+        assert!(names_wsl_kernel("6.18.0-wsl-custom"));
+
+        assert!(!names_wsl_kernel("6.8.0-45-generic"));
+        assert!(!names_wsl_kernel(
             "Linux version 6.8.0-45-generic (buildd@lcy02-amd64-091) \
              (x86_64-linux-gnu-gcc-13 (Ubuntu 13.2.0-23ubuntu4) 13.2.0) #45-Ubuntu SMP"
         ));
-        assert!(!is_wsl_proc_version(""));
+        assert!(!names_wsl_kernel(""));
     }
 
-    /// Nothing on macOS may be treated as WSL — `/proc/version` does not exist
-    /// there, and the call sites are `cfg!(target_os = "linux")`-gated anyway.
+    /// Nothing on macOS may be treated as WSL — neither `/run/WSL` nor the
+    /// `/proc` files exist there, and the call sites are
+    /// `cfg!(target_os = "linux")`-gated anyway.
     #[test]
     #[cfg(target_os = "macos")]
     fn is_wsl_is_false_on_macos() {
