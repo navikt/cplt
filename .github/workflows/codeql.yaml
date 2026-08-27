@@ -77,6 +77,20 @@ jobs:
           # Matches the `extended` query suite the default setup used, so this
           # swap does not quietly narrow what gets flagged.
           queries: security-extended
+          # Deliberately no `config-file:`. The recurring false positives are
+          # 30 `rust/log-injection` alerts whose source AND sink both sit inside
+          # the `#[cfg(test)] mod tests` at the bottom of src/proxy.rs (a
+          # TcpStream the test opened to a listener it spawned in-process,
+          # reported at an `assert!` message), plus one `rust/cleartext-logging`
+          # for the scratch session id, reported at src/ui.rs:96 — the shared
+          # `ui::info` eprintln. `paths-ignore` filters whole FILES, never a
+          # module inside one, so the only patterns that would silence these are
+          # `src/proxy.rs` and `src/ui.rs` — which would blind CodeQL to the
+          # CONNECT proxy and to every output helper, exactly the code worth
+          # scanning. `query-filters` is no better: it drops a query repo-wide,
+          # and rust/log-injection has already earned its keep here (a real
+          # ESC-injection sink in `log_connection`). Test-code alerts are
+          # dismissed as "used in tests" in the security tab instead.
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # ratchet:github/codeql-action/analyze@v4.37.8
