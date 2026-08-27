@@ -83,7 +83,7 @@ jobs:
           # TcpStream the test opened to a listener it spawned in-process,
           # reported at an `assert!` message), plus one `rust/cleartext-logging`
           # for the scratch session id, reported at src/ui.rs:96 — the shared
-          # `ui::info` eprintln. `paths-ignore` filters whole FILES, never a
+          # `ui::ok` eprintln. `paths-ignore` filters whole FILES, never a
           # module inside one, so the only patterns that would silence these are
           # `src/proxy.rs` and `src/ui.rs` — which would blind CodeQL to the
           # CONNECT proxy and to every output helper, exactly the code worth
