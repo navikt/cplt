@@ -173,7 +173,7 @@ cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
 
 > **Note:** Both the allowlist and blocklist are re-read from disk every ~5 seconds (TTL-cached), so you can edit them live mid-session. Changes take effect within seconds without restarting cplt. If a file becomes unreadable at runtime, the last-known-good list is kept (fail-safe). At startup, an unreadable allowlist causes cplt to exit with an error (fail-closed).
 >
-> The `allow_private_domains` list in `config.toml` is also re-read every ~5 seconds. Domains added via `--allow-private-domain` CLI flags are always preserved regardless of config changes.
+> The `allow_private_domains` list in `config.toml` is also re-read every ~5 seconds. Domains that do not come from that file — `--allow-private-domain` CLI flags and trust-approved `[propose.proxy] allow_private_domains` entries from a repo `.cplt.toml` — are preserved for the whole session regardless of config changes.
 
 ### Default allowlist (fail-closed networking)
 
