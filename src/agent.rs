@@ -544,6 +544,38 @@ impl Agent {
         }
     }
 
+    /// Whether this agent authenticates OAuth-first: after an interactive
+    /// login its credentials live on disk in a granted config/data dir (or the
+    /// macOS Keychain), so the default path needs no environment variable.
+    ///
+    /// Used to suppress the "No API keys passed" hint, which otherwise fires
+    /// for a correctly configured user and reads like a startup failure (#187).
+    /// `auth_env_hint` still lists the vars for people who deliberately route
+    /// via an API key or an enterprise endpoint.
+    ///
+    /// Exhaustive match on purpose: a new agent must declare its auth model
+    /// instead of silently inheriting the wrong default.
+    pub fn oauth_first(&self) -> bool {
+        match self {
+            // GitHub device flow; token in the Keychain / ~/.copilot.
+            Agent::Copilot => true,
+            // `/connect` device flow against a GitHub Copilot subscription;
+            // credentials stored in ~/.local/share/opencode/auth.json.
+            Agent::OpenCode => true,
+            // Google OAuth browser flow by default; credentials in ~/.gemini/.
+            Agent::Gemini => true,
+            // Google OAuth with keychain/session storage.
+            Agent::Antigravity => true,
+            // Subscription OAuth token in ~/.claude (.credentials.json on
+            // Linux) or the macOS login Keychain.
+            Agent::Claude => true,
+            // Provider API keys only — no interactive login flow.
+            Agent::Pi => false,
+            // Not an AI agent: no auth of its own.
+            Agent::Shell => false,
+        }
+    }
+
     /// Environment variable names this agent may need for authentication.
     /// These are NOT added to the default allowlist — they must be
     /// explicitly passed via --pass-env or agent config.
@@ -1310,6 +1342,40 @@ mod tests {
         let hints = Agent::Gemini.auth_env_hint();
         assert!(hints.contains(&"GEMINI_API_KEY"));
         assert!(hints.contains(&"GOOGLE_CLOUD_PROJECT"));
+    }
+
+    #[test]
+    fn every_agent_declares_its_auth_model() {
+        // Pinned per agent so a new one has to make a deliberate choice: the
+        // exhaustive match in `oauth_first` forces the decision at compile
+        // time, this pins the answer. OAuth-first agents get no "No API keys
+        // passed" warning (#187) — their credentials land on disk or in the
+        // Keychain after an interactive login.
+        for (agent, expected) in [
+            (Agent::Copilot, true),     // GitHub device flow + Keychain
+            (Agent::OpenCode, true),    // /connect device flow -> auth.json
+            (Agent::Gemini, true),      // Google OAuth browser flow
+            (Agent::Antigravity, true), // Google OAuth + keychain
+            (Agent::Claude, true),      // subscription OAuth token
+            (Agent::Pi, false),         // provider API keys only
+            (Agent::Shell, false),      // not an AI agent, no auth
+        ] {
+            assert_eq!(
+                agent.oauth_first(),
+                expected,
+                "{agent:?} auth model changed — update the docs and the startup \
+                 auth hint in main.rs deliberately"
+            );
+            // The startup warning only fires for a non-OAuth-first agent, and
+            // it prints `hints[0]` — so such an agent needs a hint to offer
+            // (Shell excepted: it has no auth at all).
+            if !expected && agent != Agent::Shell {
+                assert!(
+                    !agent.auth_env_hint().is_empty(),
+                    "{agent:?} is not OAuth-first, so it needs an env hint to suggest"
+                );
+            }
+        }
     }
 
     #[test]

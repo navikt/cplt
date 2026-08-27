@@ -1545,15 +1545,18 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         let has_api_key = hints.iter().any(|key| {
             parent_env.iter().any(|(k, _)| k == *key) && resolved.pass_env.iter().any(|v| v == *key)
         });
-        // Claude Code is OAuth-first: its subscription token lives in the granted
-        // config dir (or macOS Keychain), so it authenticates with no env var —
-        // same as Copilot. Don't nag about API keys; Claude prompts for login
-        // itself when unauthenticated. The hints stay for users who deliberately
-        // route via API/Bedrock/Vertex (documented in the README).
-        let oauth_first = active_agent == agent::Agent::Claude;
-        if !has_api_key && !resolved.inherit_env && !hints.is_empty() && !oauth_first {
+        // OAuth-first agents (Copilot, OpenCode, Gemini, Antigravity, Claude
+        // Code) keep their credentials on disk in a granted config dir or the
+        // macOS Keychain after an interactive login, so they authenticate with
+        // no env var. Don't nag them about API keys: they prompt for login
+        // themselves when unauthenticated, and the warning otherwise fires for
+        // a correctly configured user and reads like a startup failure (#187).
+        // The hints stay for users who deliberately route via an API key or an
+        // enterprise endpoint (documented in the README).
+        if !has_api_key && !resolved.inherit_env && !hints.is_empty() && !active_agent.oauth_first()
+        {
             ui::warn(&format!(
-                "No API keys passed. {} needs auth — either:",
+                "No API keys passed. {} needs a provider API key:",
                 active_agent.display_name()
             ));
             // Prefer showing a hint for a key that's already in the parent env
@@ -1568,11 +1571,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 active_agent.binary_name(),
                 hint_to_show
             ));
-            if active_agent == agent::Agent::OpenCode {
-                ui::warn("  or use /connect in OpenCode with your GitHub Copilot subscription");
-            } else if active_agent == agent::Agent::Gemini {
-                ui::warn("  or sign in with Google (OAuth flow on first run)");
-            }
         }
 
         // Warn if Copilot-only flags are used with a non-Copilot agent

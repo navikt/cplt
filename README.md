@@ -508,7 +508,7 @@ cplt --agent opencode --pass-env ANTHROPIC_API_KEY
 ```
 
 **Security notes for OpenCode:**
-- **Copilot provider**: auth is handled via `/connect` device flow, stored in `~/.local/share/opencode/auth.json` — no env vars needed
+- **Copilot provider**: auth is handled via `/connect` device flow, stored in `~/.local/share/opencode/auth.json` — no env vars needed, and cplt does not nag about API keys
 - **Third-party providers**: API keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.) are **not** passed through by default — use `--pass-env`:
 
 ```bash
