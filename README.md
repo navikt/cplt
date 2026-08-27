@@ -101,13 +101,13 @@ The sandbox blocks access to credentials and secrets at the kernel level. Comman
 | Localhost outbound                                                               | 🔒 Kernel-blocked                         | Prevents local service access; inbound still works for proxy                            |
 | SSH agent (unix socket)                                                          | 🔒 Kernel-blocked                         | Prevents signing git operations or SSH to hosts                                         |
 | Developer tools (`~/.cargo`, `~/.gradle`, `~/.m2`, `~/.sdkman`, `~/.jenv`, `~/.pyenv`, `~/.konan`, etc.) | ✅ Allowed (read+write for caches)        | Only dirs that exist on disk; tightened at runtime via `--doctor`                       |
-| Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked (macOS)                 | Override with `--allow-read`; see [Private registries](docs/known-impacts.md#private-registries) |
+| Registry credential files (`~/.npmrc`, `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked (macOS)                 | Override with `--allow-read`; see [Private registries](docs/known-impacts.md#private-registries) |
 | Go source code (`~/go/src`)                                                      | 🔒 Kernel-blocked                         | Only `~/go/bin` and `~/go/pkg` are readable                                             |
 | Read `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`                                  | 🔒 Kernel-blocked                         |                                                                                         |
 | Read `~/.kube`, `~/.docker`, `~/.nais`                                           | 🔒 Kernel-blocked                         |                                                                                         |
 | Read `~/.password-store`, `~/.terraform.d`                                       | 🔒 Kernel-blocked                         |                                                                                         |
 | Read `~/.config/gcloud`, `~/.config/op`                                          | 🔒 Kernel-blocked                         | Individual files overridable with `--allow-read`; see [Cloud credentials](docs/known-impacts.md#cloud-credential-directories) |
-| Read `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.vault-token`                       | 🔒 Kernel-blocked                         |                                                                                         |
+| Read `~/.netrc`, `~/.pypirc`, `~/.vault-token`                                   | 🔒 Kernel-blocked                         | Hard deny — not overridable                                                             |
 | Read `~/.gem/credentials`                                                        | 🔒 Kernel-blocked                         |                                                                                         |
 | `gh` CLI destructive operations (merge, delete, release)                         | 🔒 Command-gated (opt-in)                 | `--gh-guard`; see [gh & git guard](docs/gh-guard.md)                                    |
 | `git push` to remote                                                             | 🔒 Command-gated (opt-in)                 | `--git-guard`; protects default branch or blocks all pushes                             |
@@ -1316,27 +1316,30 @@ Registry credential files are **blocked by default** because they typically cont
 
 | File | Purpose |
 |------|---------|
-| `~/.npmrc` | npm registry auth (hard deny — not overridable) |
+| `~/.npmrc` | npm registry auth |
 | `~/.m2/settings.xml` | Maven repository credentials |
 | `~/.m2/settings-security.xml` | Maven master password |
 | `~/.gradle/gradle.properties` | Gradle/Nexus/Artifactory credentials |
 | `~/.cargo/credentials` | Cargo crate registry tokens |
 | `~/.cargo/credentials.toml` | Cargo crate registry tokens (TOML format) |
 
-For Maven, Gradle, and Cargo files, you can override this with `--allow-read`:
+All of these can be overridden with `--allow-read`:
 
 **Fix:**
 
 ```bash
 cplt config set allow.read "~/.m2/settings.xml"
 cplt config set allow.read "~/.gradle/gradle.properties"
+cplt config set allow.read "~/.npmrc"
 ```
 
 Or for a single run: `cplt --allow-read ~/.m2/settings.xml`
 
-> **Note:** `.npmrc` cannot be overridden — it is in the hard-deny list alongside `.netrc` and `.pypirc`. If you need npm private registry access, consider using project-level `.npmrc` (which is readable as part of the project directory) with a token injected via environment variable.
+> **Note:** these are the *overridable* credential denials. The hard-deny list — `~/.netrc`, `~/.pypirc`, `~/.gem/credentials`, `~/.vault-token` — is not overridable at all.
 
-> **Linux limitation:** These file-level denials are only enforced on macOS (via SBPL literal deny rules). On Linux, Landlock cannot deny individual files within an allowed directory — the parent dirs (`.m2`, `.gradle`, `.cargo`) remain fully readable for dependency resolution.
+> **yarn 1:** `yarn install` aborts with `EACCES`/`EPERM` whenever an `~/.npmrc` (or `~/.yarnrc`) exists but is unreadable, where npm, pnpm and bun all carry on. See [yarn 1 and unreadable home rc files](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files).
+
+> **Linux limitation:** The denials for files *inside an allowed tool dir* are only enforced on macOS (via SBPL literal deny rules). On Linux, Landlock cannot deny individual files within an allowed directory — the parent dirs (`.m2`, `.gradle`, `.cargo`) remain fully readable for dependency resolution. `~/.npmrc` is the exception: it sits at the top of `$HOME`, which is never granted, so it is withheld on both platforms.
 
 ## Limitations
 

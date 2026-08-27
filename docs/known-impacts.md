@@ -437,27 +437,75 @@ Registry credential files are **blocked by default** because they typically cont
 
 | File | Purpose |
 |------|---------|
-| `~/.npmrc` | npm registry auth (hard deny — not overridable) |
+| `~/.npmrc` | npm registry auth |
 | `~/.m2/settings.xml` | Maven repository credentials |
 | `~/.m2/settings-security.xml` | Maven master password |
 | `~/.gradle/gradle.properties` | Gradle/Nexus/Artifactory credentials |
 | `~/.cargo/credentials` | Cargo crate registry tokens |
 | `~/.cargo/credentials.toml` | Cargo crate registry tokens (TOML format) |
 
-For Maven, Gradle, and Cargo files, you can override this with `--allow-read`:
+All of these can be overridden with `--allow-read`:
 
 **Fix:**
 
 ```bash
 cplt config set allow.read "~/.m2/settings.xml"
 cplt config set allow.read "~/.gradle/gradle.properties"
+cplt config set allow.read "~/.npmrc"
 ```
 
 Or for a single run: `cplt --allow-read ~/.m2/settings.xml`
 
-> **Note:** `.npmrc` cannot be overridden — it is in the hard-deny list alongside `.netrc` and `.pypirc`. If you need npm private registry access, consider using project-level `.npmrc` (which is readable as part of the project directory) with a token injected via environment variable.
+> **Note:** these are the *overridable* credential denials (`DENIED_HOME_SUBPATHS`). The hard-deny list — `~/.netrc`, `~/.pypirc`, `~/.gem/credentials`, `~/.vault-token` — is not overridable at all. If you would rather not hand `~/.npmrc` to the agent, a project-level `.npmrc` is readable as part of the project directory and can take its token from an environment variable.
 
-> **Linux limitation:** These file-level denials are only enforced on macOS (via SBPL literal deny rules). On Linux, Landlock cannot deny individual files within an allowed directory — the parent dirs (`.m2`, `.gradle`, `.cargo`) remain fully readable for dependency resolution.
+> **Linux limitation:** The denials for files *inside an allowed tool dir* are only enforced on macOS (via SBPL literal deny rules). On Linux, Landlock cannot deny individual files within an allowed directory — the parent dirs (`.m2`, `.gradle`, `.cargo`) remain fully readable for dependency resolution. `~/.npmrc` is the exception: it sits at the top of `$HOME`, which is never granted, so it is withheld on both platforms.
+
+## yarn 1 and unreadable home rc files
+
+`yarn install` fails outright under the default policy when an `~/.npmrc` exists on the host — nothing is resolved and no `node_modules` is written:
+
+```
+yarn install v1.22.22
+error Error: EACCES: permission denied, open '/home/you/.npmrc'
+```
+
+macOS reports the same failure as `EPERM: operation not permitted`. The errno differs by backend; the outcome does not.
+
+**Fix:**
+
+```bash
+cplt config set allow.read "~/.npmrc"
+```
+
+Or for a single run: `cplt --allow-read ~/.npmrc`. Deleting an `~/.npmrc` you do not use works just as well — see below.
+
+**Why only yarn 1.** `~/.npmrc` is denied by default because it commonly holds a registry token. Every package manager reads it; only yarn 1 treats an *unreadable* one as fatal. Its rc reader tolerates a *missing* file and rethrows everything else:
+
+```js
+} catch (error) {
+  if (error.code === 'ENOENT' || error.code === 'EISDIR') {
+    return {};
+  } else {
+    throw error;      // EACCES / EPERM reaches here
+  }
+}
+```
+
+npm, pnpm and bun all continue past a denied `~/.npmrc` and install normally from the public registry ([navikt/cplt#180](https://github.com/navikt/cplt/issues/180) measured npm 10.9.8, pnpm 11.22.0 and bun 1.4.0). The trigger is therefore the file's *existence*, not its contents: an `~/.npmrc` holding nothing but `save-exact=true` breaks yarn 1 exactly as a token-bearing one does.
+
+**It is not only `~/.npmrc`.** yarn 1 runs the same reader over every entry in its rc scan, so `~/.yarnrc` fails identically when it exists:
+
+```
+error Error: EPERM: operation not permitted, open '/Users/you/.yarnrc'
+```
+
+`~/.yarnrc` is not in any deny list — like most home dotfiles it is simply never granted, since the sandbox enumerates the specific `$HOME` config files tools need rather than granting `$HOME` wholesale. Allow it the same way (`cplt config set allow.read "~/.yarnrc"`) if you keep one.
+
+Relocating yarn's config does not help. yarn 1's rc scan builds its own path list with hardcoded `~/.npmrc` and `~/.yarnrc` entries, and it runs before the XDG-aware `getConfigDir()` is consulted — so neither `XDG_CONFIG_HOME` nor `XDG_DATA_HOME` removes those paths from the list. yarn 2+ (berry) uses a different config loader and is unaffected.
+
+**Why cplt does not make the denial look like ENOENT.** The tempting accommodation is to report these files as *absent* rather than *denied*, which every package manager tolerates. macOS can express that — SBPL accepts `(deny file-read* (literal …) (with errno 2))`, and the read then fails with `No such file or directory`. Linux cannot: Landlock is grant-only with no control over the errno a denied `open` returns, and on Linux `~/.npmrc` is not denied by a rule at all — it is simply never granted. Shipping the macOS half would fix macOS, leave Linux (where this was reported) untouched, and split the two backends' denial semantics for every tool, not just yarn. One line of config is the better trade. Bubblewrap could mask the file with an empty `/dev/null` bind, but it is opt-in, applies only where the wrapper is active, and inverts the convention the existing deny-path masks follow, which deliberately use an unreadable placeholder so a masked read fails loudly rather than silently reading as empty.
+
+Adding `~/.npmrc` to the default read grant is not an option either: that hands the npm token to the sandboxed agent, which is the one thing the denial exists to prevent.
 
 ## Cloud credential directories
 
