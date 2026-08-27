@@ -5603,7 +5603,14 @@ fn ensure_copilot_extracted(
     for pass in 0..2 {
         // Snapshot existing extraction dirs so we can detect the new one.
         let dirs_before = extraction_dirs(&pkg_base);
-        let attempt = run_extraction_attempt(copilot_bin, &pkg_base, &dirs_before);
+        let attempt =
+            run_extraction_attempt(copilot_bin, &pkg_base, &dirs_before).map_err(|e| {
+                format!(
+                    "Failed to spawn copilot for extraction: {e}\n  \
+                     Try running '{} --version' manually to trigger extraction",
+                    copilot_bin.display(),
+                )
+            })?;
         let outcome = resolve_extraction(copilot_bin, &pkg_base, &dirs_before, &attempt);
         if attempt.version.is_some() {
             reported_version = attempt.version;
@@ -5669,26 +5676,23 @@ struct ExtractionAttempt {
 /// may hang waiting for input in newer versions). stdout is piped so we can read
 /// the reported version, used by the caller to verify the CURRENT version — not
 /// a stale one — is what ended up on disk.
+///
+/// A spawn failure is returned as `Err`, never folded into a failed attempt: if
+/// copilot never ran, the reported version is unknowable, and the caller's
+/// version-less fallback would accept any stale directory as proof — then cache
+/// that false positive against the binary's identity.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_extraction_attempt(
     copilot_bin: &Path,
     pkg_base: &Path,
     dirs_before: &std::collections::HashSet<String>,
-) -> ExtractionAttempt {
-    let child = std::process::Command::new(copilot_bin)
+) -> Result<ExtractionAttempt, std::io::Error> {
+    let mut child = std::process::Command::new(copilot_bin)
         .args(["--no-auto-update", "--version"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .spawn();
-
-    let Ok(mut child) = child else {
-        return ExtractionAttempt {
-            dir: None,
-            version: None,
-            exit_ok: false,
-        };
-    };
+        .spawn()?;
     let mut child_stdout = child.stdout.take();
 
     // Poll for extraction completion. We check for both:
@@ -5763,11 +5767,11 @@ fn run_extraction_attempt(
         extracted_dir_name = find_new_extracted_dir(pkg_base, dirs_before);
     }
 
-    ExtractionAttempt {
+    Ok(ExtractionAttempt {
         dir: extracted_dir_name,
         version,
         exit_ok: child_exit_ok,
-    }
+    })
 }
 
 /// The verdict on one extraction attempt.
@@ -6586,8 +6590,11 @@ mod copilot_extraction_tests {
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\nPKG=\"{}\"\n{script}\n",
-                pkg.to_string_lossy().replace('"', "\\\"")
+                "#!/bin/sh\nPKG=\"{}\"\nCOUNT=\"{}\"\n{script}\n",
+                pkg.to_string_lossy().replace('"', "\\\""),
+                root.join("version-calls")
+                    .to_string_lossy()
+                    .replace('"', "\\\""),
             ),
         )
         .unwrap();
@@ -6613,6 +6620,24 @@ mod copilot_extraction_tests {
 
         fn partial_dir(&self, name: &str) {
             std::fs::create_dir_all(self.pkg.join(name).join("node_modules")).unwrap();
+        }
+
+        /// How many times the fake copilot was invoked with `--version`.
+        fn version_calls(&self) -> usize {
+            std::fs::read_to_string(self.root.join("version-calls"))
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        }
+
+        /// Path of cplt's fast-path marker for this fixture.
+        fn cache_file(&self) -> PathBuf {
+            let arch = match std::env::consts::ARCH {
+                "aarch64" => "arm64",
+                _ => "x64",
+            };
+            copilot_cache_dirs(&self.home, arch)
+                .1
+                .join("copilot-extracted")
         }
 
         fn entries(&self) -> Vec<String> {
@@ -6722,6 +6747,38 @@ mod copilot_extraction_tests {
         let err = f.run().unwrap_err();
         assert!(err.contains("(empty)"), "{err}");
         assert!(err.contains("--version"), "{err}");
+    }
+
+    /// A copilot that cannot be spawned must be a hard error. It never ran, so
+    /// its version is unknowable, and the version-less fallback would otherwise
+    /// accept any stale directory as proof — and then cache that false positive
+    /// against the binary's identity, skipping the preflight from then on.
+    #[test]
+    fn a_binary_that_cannot_be_spawned_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture("nospawn", NEVER_EXTRACTS);
+        f.complete_dir("0.0.1");
+        std::fs::set_permissions(&f.bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = f.run().unwrap_err();
+        assert!(err.contains("Failed to spawn copilot"), "{err}");
+        // The spawn error itself must survive — "Permission denied" is the answer.
+        assert!(err.contains("ermission denied"), "{err}");
+        // No false positive was cached against this binary.
+        assert!(!f.cache_file().exists());
+    }
+
+    /// The second pass runs only when the purge actually removed something.
+    /// That guard is what keeps the worst-case wall time bounded, so it needs a
+    /// test of its own: with nothing to remove, copilot is run exactly once.
+    #[test]
+    fn no_retry_when_there_is_nothing_to_purge() {
+        let f = fixture(
+            "no-retry",
+            "case \"$*\" in *--version*) echo x >> \"$COUNT\" ;; esac\necho 'GitHub Copilot CLI 1.0.63.'\nexit 1",
+        );
+        assert!(f.run().is_err());
+        assert_eq!(f.version_calls(), 1, "empty purge must not trigger a retry");
     }
 
     #[test]
