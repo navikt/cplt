@@ -101,14 +101,15 @@ The sandbox blocks access to credentials and secrets at the kernel level. Comman
 | Localhost outbound                                                               | 🔒 Kernel-blocked                         | Prevents local service access; inbound still works for proxy                            |
 | SSH agent (unix socket)                                                          | 🔒 Kernel-blocked                         | Prevents signing git operations or SSH to hosts                                         |
 | Developer tools (`~/.cargo`, `~/.gradle`, `~/.m2`, `~/.sdkman`, `~/.jenv`, `~/.pyenv`, `~/.konan`, etc.) | ✅ Allowed (read+write for caches)        | Only dirs that exist on disk; tightened at runtime via `--doctor`                       |
-| Registry credential files (`~/.npmrc`, `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked (macOS)                 | Override with `--allow-read`; see [Private registries](docs/known-impacts.md#private-registries) |
+| Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked (macOS; on Linux the parent tool dir stays readable) | Override with `--allow-read`; see [Private registries](docs/known-impacts.md#private-registries) |
+| Read `~/.npmrc`                                                                  | 🔒 Kernel-blocked (both platforms)        | Override with `--allow-read`; breaks yarn 1, see [yarn 1](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files) |
 | Go source code (`~/go/src`)                                                      | 🔒 Kernel-blocked                         | Only `~/go/bin` and `~/go/pkg` are readable                                             |
 | Read `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`                                  | 🔒 Kernel-blocked                         |                                                                                         |
 | Read `~/.kube`, `~/.docker`, `~/.nais`                                           | 🔒 Kernel-blocked                         |                                                                                         |
 | Read `~/.password-store`, `~/.terraform.d`                                       | 🔒 Kernel-blocked                         |                                                                                         |
 | Read `~/.config/gcloud`, `~/.config/op`                                          | 🔒 Kernel-blocked                         | Individual files overridable with `--allow-read`; see [Cloud credentials](docs/known-impacts.md#cloud-credential-directories) |
-| Read `~/.netrc`, `~/.pypirc`, `~/.vault-token`                                   | 🔒 Kernel-blocked                         | Hard deny — not overridable                                                             |
-| Read `~/.gem/credentials`                                                        | 🔒 Kernel-blocked                         |                                                                                         |
+| Read `~/.netrc`, `~/.pypirc`, `~/.vault-token`                                   | 🔒 Kernel-blocked                         | Un-overridable on macOS; on Linux `allow.read` currently still grants these             |
+| Read `~/.gem/credentials`                                                        | 🔒 Kernel-blocked                         | Un-overridable on macOS; on Linux `allow.read` currently still grants these             |
 | `gh` CLI destructive operations (merge, delete, release)                         | 🔒 Command-gated (opt-in)                 | `--gh-guard`; see [gh & git guard](docs/gh-guard.md)                                    |
 | `git push` to remote                                                             | 🔒 Command-gated (opt-in)                 | `--git-guard`; protects default branch or blocks all pushes                             |
 | Child process inheritance                                                        | ✅ All restrictions apply to subprocesses |                                                                                         |
@@ -1335,9 +1336,9 @@ cplt config set allow.read "~/.npmrc"
 
 Or for a single run: `cplt --allow-read ~/.m2/settings.xml`
 
-> **Note:** these are the *overridable* credential denials. The hard-deny list — `~/.netrc`, `~/.pypirc`, `~/.gem/credentials`, `~/.vault-token` — is not overridable at all.
+> **Note:** these are the *overridable* credential denials. A second list — `~/.netrc`, `~/.pypirc`, `~/.gem/credentials`, `~/.vault-token` — is meant to be hard-denied, and on macOS no `allow.read` can reach it. On Linux that guarantee does not currently hold: those files are withheld by omission rather than by a deny rule, and `allow.read` paths are not checked against the list, so a deliberate `allow.read "~/.netrc"` still grants the read. Known gap, tracked separately.
 
-> **yarn 1:** `yarn install` aborts with `EACCES`/`EPERM` whenever an `~/.npmrc` (or `~/.yarnrc`) exists but is unreadable, where npm, pnpm and bun all carry on. See [yarn 1 and unreadable home rc files](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files).
+> **yarn 1:** `yarn install` aborts with `EACCES`/`EPERM` whenever an `~/.npmrc` (or `~/.yarnrc`) exists but is unreadable, where npm, pnpm and bun all carry on. Usually fixed without handing over the token, via `NPM_CONFIG_USERCONFIG`. See [yarn 1 and unreadable home rc files](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files).
 
 > **Linux limitation:** The denials for files *inside an allowed tool dir* are only enforced on macOS (via SBPL literal deny rules). On Linux, Landlock cannot deny individual files within an allowed directory — the parent dirs (`.m2`, `.gradle`, `.cargo`) remain fully readable for dependency resolution. `~/.npmrc` is the exception: it sits at the top of `$HOME`, which is never granted, so it is withheld on both platforms.
 
