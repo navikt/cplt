@@ -408,6 +408,7 @@ mod macos_tests {
             dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
+            extra_git_dirs: &[],
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,

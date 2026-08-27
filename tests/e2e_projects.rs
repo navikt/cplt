@@ -956,6 +956,95 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
         );
     }
 
+    /// #212: a repo granted via `--allow-write` is a second writable root, and
+    /// before the fix its `.git/hooks` was fully writable — a hook planted there
+    /// runs OUTSIDE the sandbox on the user's next git operation in that repo.
+    ///
+    /// The `write_control` result is what keeps this test honest: it proves the
+    /// grant really is writable, so a FAIL on the hook write means the deny
+    /// fired, not that the whole sibling was unreachable.
+    #[test]
+    fn granted_sibling_repo_git_hooks_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let sibling = TempProject::new("sibling");
+        sibling.write_file("README.md", "# sibling\n");
+        sibling.git_init();
+        fs::create_dir_all(sibling.path().join(".git/hooks")).ok();
+        fs::write(sibling.path().join(".gitmodules"), "").ok();
+
+        let sibling_path = sibling.canonical_path().to_string_lossy().to_string();
+        let mut script = script_git_persistence(&sibling_path);
+        write!(
+            script,
+            r#"
+if echo ok > "{sibling_path}/scratch.txt" 2>/dev/null; then
+    echo "RESULT:write_control:OK"
+else
+    echo "RESULT:write_control:FAIL"
+fi
+"#
+        )
+        .unwrap();
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--allow-write", &sibling_path]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The grant is real: ordinary files in the sibling ARE writable.
+        assert_result_ok(&stdout, "write_control");
+        // ...but its git-persistence paths are not.
+        assert_result_fail(&stdout, "git_hook_write");
+        assert_result_fail(&stdout, "git_config_write");
+        assert_result_fail(&stdout, "gitmodules_write");
+    }
+
+    /// #212, the resolver half: a **bare** repo keeps its hooks at `<root>/hooks`,
+    /// not `<root>/.git/hooks`, so the path-shaped denies cannot see them — only
+    /// `discover::git_dir_of` can. The same resolution covers a granted worktree,
+    /// whose real hooks live in the main repo's shared `.git`.
+    #[test]
+    fn granted_bare_repo_hooks_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let bare = TempProject::new("bare");
+        let status = Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(status.success(), "git init --bare should succeed");
+
+        let bare_path = bare.canonical_path().to_string_lossy().to_string();
+        let script = format!(
+            r#"
+if echo '#!/bin/sh' > "{bare_path}/hooks/post-receive" 2>/dev/null; then
+    echo "RESULT:bare_hook_write:OK"
+else
+    echo "RESULT:bare_hook_write:FAIL"
+fi
+if echo ok > "{bare_path}/scratch.txt" 2>/dev/null; then
+    echo "RESULT:write_control:OK"
+else
+    echo "RESULT:write_control:FAIL"
+fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--allow-write", &bare_path]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "write_control");
+        assert_result_fail(&stdout, "bare_hook_write");
+    }
+
     // ============================================================
     // Mode combination tests
     // ============================================================

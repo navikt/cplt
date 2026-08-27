@@ -199,7 +199,37 @@ impl PreparedSandbox {
 /// - A path contains characters that could cause profile injection (macOS)
 /// - The platform does not support sandboxing
 pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
-    prepare_impl(config)
+    prepare_impl(config, &extra_git_dirs(config))
+}
+
+/// Resolve the real `.git` directory of every writable granted path whose repo
+/// data does NOT live at `<path>/.git` — a worktree, a bare repo, or a grant
+/// that points *inside* a repo (#212).
+///
+/// The `<path>/.git/...` denies the backends emit unconditionally already cover
+/// the ordinary case, so anything resolving to `<path>/.git` is dropped here.
+/// A path that is not a repository at all resolves to `None` and is skipped —
+/// a no-op, never an error.
+///
+/// This spawns `git rev-parse --git-common-dir` once per granted path, in the
+/// PARENT process, with the granted repo's config in scope — so it routes
+/// through the hardened invoker (`git::command`, #211) like every other
+/// parent-side git invocation.
+fn extra_git_dirs(config: &SandboxConfig) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = config
+        .extra_write
+        .iter()
+        .filter_map(|root| {
+            let dir = crate::discover::git_dir_of(root)?;
+            // Ordinary repo — already covered by the `<root>/.git` denies.
+            (dir != root.join(".git")).then_some(dir)
+        })
+        .collect();
+    // The same repo can be granted twice, and two grants can share one `.git`
+    // (two worktrees of one repo); duplicate denies are harmless but noisy.
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// Human-readable representation of the sandbox policy.
@@ -257,8 +287,15 @@ pub fn exec_sandboxed(
 // ── Platform-specific prepare implementations ─────────────────
 
 #[cfg(target_os = "macos")]
-fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
+fn prepare_impl(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+) -> Result<PreparedSandbox, String> {
     validate_config_paths(config)?;
+    // Interpolated into the profile like every other path — same injection check.
+    for p in extra_git_dirs {
+        policy::validate_sbpl_path(p).map_err(|e| format!("Granted repo .git dir: {e}"))?;
+    }
 
     let profile_text = profile::generate_profile(&profile::ProfileOptions {
         project_dir: config.project_dir,
@@ -282,6 +319,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         dotnet_root: config.dotnet_root,
         git_hooks_path: config.git_hooks_path,
         git_common_dir: config.git_common_dir,
+        extra_git_dirs,
         allow_gpg_signing: config.allow_gpg_signing,
         deny_clipboard: config.deny_clipboard,
         allow_jvm_attach: config.allow_jvm_attach,
@@ -308,7 +346,10 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
+fn prepare_impl(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+) -> Result<PreparedSandbox, String> {
     // Warn about config options that Linux cannot enforce at kernel level.
     // (Deny paths are handled after bwrap resolution below — with Bubblewrap
     // they ARE enforced, via mount masks.)
@@ -361,7 +402,14 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     // re-bind those pre-existing paths read-only to restore macOS parity. In a
     // git worktree the real hooks live under the shared git_common_dir (which
     // the sandbox grants write access to), so pass it through to cover them too.
-    let ro_protect = bubblewrap::git_persistence_paths(config.project_dir, config.git_common_dir);
+    //
+    // #212: every writable granted path is a candidate too — a sibling repo's
+    // .git/hooks was fully writable before, and hooks run unsandboxed.
+    let mut write_roots: Vec<&Path> = vec![config.project_dir];
+    write_roots.extend(config.extra_write.iter().map(PathBuf::as_path));
+    let mut git_dirs: Vec<&Path> = config.git_common_dir.into_iter().collect();
+    git_dirs.extend(extra_git_dirs.iter().map(PathBuf::as_path));
+    let ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied
