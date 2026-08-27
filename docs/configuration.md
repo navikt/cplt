@@ -295,7 +295,11 @@ Commit a `.cplt.toml` file to your repository for project-specific sandbox setti
 - Write to `.cplt.toml` is kernel-denied inside the sandbox
 - Trust approvals are content-pinned — if requested values change, approvals are invalidated
 
-**Path expansion:** Paths in `[deny]` and `[propose.allow]` support `~/` expansion. A relative path is resolved against the repository root (the directory holding `.cplt.toml`), so `paths = ["secrets"]` denies `<repo>/secrets` on every clone. Unlike the global config, repo paths are *not* canonicalized: a path that does not exist yet is kept (macOS starts enforcing the deny once it appears; Linux warns that it cannot mask it), so one committed typo cannot brick cplt for everyone who clones the repo. `..` components are rejected outright.
+**Path expansion:** Paths in `[deny]` and `[propose.allow]` support `~/` expansion. A relative path is resolved against the **repository root** — the directory the `.cplt.toml` came from, which under `--project-dir <subdir>` is still the git root, not the subdir. So `paths = ["secrets"]` denies `<repo>/secrets` on every clone.
+
+`./secrets`, `secrets/.`, `secrets/`, and `a//b` all normalize to the same path, and a path naming a symlink is resolved to its target — the sandbox matches resolved paths, so the un-normalized spellings would compile into the profile and silently match nothing. `..` components are rejected outright.
+
+Unlike the global config, a repo path that does **not exist yet** is kept rather than being an error: macOS starts enforcing the deny once the directory appears, and one committed typo cannot brick cplt for everyone who clones the repo. On Linux such a path cannot be masked and cplt warns.
 
 ### Example `.cplt.toml`
 

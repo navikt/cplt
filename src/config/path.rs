@@ -1,6 +1,6 @@
 //! Config file path resolution.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::error::ConfigError;
 use super::types::{CONFIG_DIR, CONFIG_FILE};
@@ -324,27 +324,51 @@ pub fn collapse_tilde(path: &str) -> String {
     }
 }
 
-/// Resolve a path from a repo `.cplt.toml`: expand a leading `~/`, then anchor
-/// any still-relative path to the repo root (the directory holding the config).
+/// Resolve a path from a repo `.cplt.toml` into one the sandbox backends can
+/// actually enforce: expand a leading `~/`, normalize lexically, anchor a
+/// still-relative path to `config_dir` (the directory the `.cplt.toml` came
+/// from), then canonicalize if the target exists.
 ///
-/// A relative path must never reach the sandbox backends. Seatbelt accepts
-/// `(deny file-read* (subpath "secrets"))` without a compile error and the rule
-/// then matches nothing — a silent fail-open. Landlock/bwrap drop it. Anchoring
-/// here is also what the global config already promises for its own relative
-/// entries ("Relative paths are resolved from this config file's directory").
+/// Every step closes a fail-open. Seatbelt silently accepts a rule it cannot
+/// match, so an unenforceable path looks enforced in `--print-profile`:
 ///
-/// Deliberately does NOT canonicalize, unlike `resolve_config_path`. Repo config
-/// is the only source that can deny a path that does not exist yet (macOS starts
-/// enforcing once it appears), and hard-failing would let one committed typo
-/// brick cplt for everyone who clones the repo. Joining always succeeds, so no
-/// entry can be dropped.
-pub(super) fn resolve_repo_path(path: &str, project_dir: &Path) -> PathBuf {
+/// | spelling      | emitted verbatim | enforced by Seatbelt |
+/// |---------------|------------------|----------------------|
+/// | `secrets`     | relative         | no                   |
+/// | `./secrets`   | `/repo/./secrets`| no                   |
+/// | `secrets/.`   | `/repo/secrets/.`| no                   |
+/// | `a//b`        | `/repo/a//b`     | no                   |
+/// | a symlink     | the link path    | no (SBPL matches the resolved path) |
+///
+/// Anchoring relative paths is also what the global config already promises for
+/// its own entries ("Relative paths are resolved from this config file's
+/// directory").
+///
+/// Normalization is lexical *before* canonicalization, not instead of it, and
+/// that ordering is the point: `canonicalize` fails on a path that does not
+/// exist yet, and repo config is the only source that can deny a not-yet-created
+/// path (macOS starts enforcing once it appears). Lexical normalization cannot
+/// fail and needs nothing on disk, so `./not-created-yet` is enforceable by
+/// construction; canonicalize then adds symlink resolution wherever the target
+/// is already there. Nothing can be dropped, so nothing can be silently
+/// unenforced.
+///
+/// `..` never reaches here — `repo_config::reject_path_traversal` rejects it at
+/// parse time — so no `ParentDir` handling is needed.
+pub(super) fn resolve_repo_path(path: &str, config_dir: &Path) -> PathBuf {
     let expanded = expand_tilde(path);
-    if expanded.is_relative() {
-        project_dir.join(expanded)
+    // `Path::components` already collapses `a//b` and a trailing `/`, and drops
+    // interior `.`; a *leading* `./` is the one it deliberately preserves.
+    let normalized: PathBuf = expanded
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect();
+    let full = if normalized.is_relative() {
+        config_dir.join(normalized)
     } else {
-        expanded
-    }
+        normalized
+    };
+    full.canonicalize().unwrap_or(full)
 }
 
 /// Expand tilde, resolve relative paths against config dir, and canonicalize.
@@ -418,36 +442,84 @@ mod tests {
         // verbatim. Seatbelt compiles `(subpath "secrets")` and matches
         // nothing; Landlock/bwrap drop it. Both are silent fail-open.
         assert_eq!(
-            resolve_repo_path("secrets", Path::new("/repo")),
-            PathBuf::from("/repo/secrets")
+            resolve_repo_path("secrets", Path::new("/nonexistent-repo")),
+            PathBuf::from("/nonexistent-repo/secrets")
         );
         assert_eq!(
-            resolve_repo_path("a/b/c.txt", Path::new("/repo")),
-            PathBuf::from("/repo/a/b/c.txt")
+            resolve_repo_path("a/b/c.txt", Path::new("/nonexistent-repo")),
+            PathBuf::from("/nonexistent-repo/a/b/c.txt")
         );
+    }
+
+    #[test]
+    fn resolve_repo_path_normalizes_every_inert_spelling() {
+        // Verified against the kernel: `(subpath "<d>/./x")`, `"<d>/x/."` and
+        // `"<d>//x"` are all accepted by Seatbelt and match nothing, so each
+        // must collapse to the one form that is actually enforced. These use a
+        // non-existent root deliberately — canonicalize cannot run, so this
+        // pins the lexical pass on its own.
+        let root = Path::new("/nonexistent-repo");
+        let want = PathBuf::from("/nonexistent-repo/secrets");
+        for spelling in [
+            "secrets",
+            "./secrets",
+            "secrets/.",
+            "secrets/",
+            "./secrets/",
+        ] {
+            assert_eq!(
+                resolve_repo_path(spelling, root),
+                want,
+                "{spelling:?} must normalize to the enforceable form"
+            );
+        }
+        assert_eq!(
+            resolve_repo_path("a//b", root),
+            PathBuf::from("/nonexistent-repo/a/b")
+        );
+        // A bare `.` means the repo root itself, not a stray relative fragment.
+        assert_eq!(resolve_repo_path("./", root), root);
+    }
+
+    #[test]
+    fn resolve_repo_path_canonicalizes_when_the_target_exists() {
+        // SBPL matches resolved paths, so a deny naming a symlink protects
+        // nothing. Canonicalize closes that wherever the target is already on
+        // disk — the half of the job the lexical pass cannot do.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("link")).unwrap();
+
+        assert_eq!(resolve_repo_path("link", &root), root.join("real"));
+        assert_eq!(resolve_repo_path("./link/", &root), root.join("real"));
     }
 
     #[test]
     fn resolve_repo_path_leaves_absolute_and_tilde_alone() {
         let home = std::env::var("HOME").unwrap();
         assert_eq!(
-            resolve_repo_path("/etc/shadow", Path::new("/repo")),
-            PathBuf::from("/etc/shadow")
+            resolve_repo_path("/nonexistent-abs/shadow", Path::new("/nonexistent-repo")),
+            PathBuf::from("/nonexistent-abs/shadow")
         );
         assert_eq!(
-            resolve_repo_path("~/secrets", Path::new("/repo")),
-            PathBuf::from(format!("{home}/secrets"))
+            resolve_repo_path("~/nonexistent-secrets", Path::new("/nonexistent-repo")),
+            PathBuf::from(format!("{home}/nonexistent-secrets"))
         );
     }
 
     #[test]
     fn resolve_repo_path_keeps_paths_that_do_not_exist_yet() {
-        // Unlike resolve_config_path, no canonicalize: repo config is the only
-        // source that can deny a not-yet-created path, and a committed typo
-        // must not brick cplt for everyone who clones.
-        let resolved = resolve_repo_path("not/created/yet", Path::new("/repo"));
-        assert_eq!(resolved, PathBuf::from("/repo/not/created/yet"));
-        assert!(resolved.is_absolute());
+        // canonicalize FAILS on a path that is not there yet, and repo config is
+        // the only source that can deny one (macOS starts enforcing once it
+        // appears). So the lexical pass runs first and unconditionally: falling
+        // back to the raw join on a canonicalize failure would leave `./x`
+        // inert for exactly the not-yet-created case this supports.
+        for spelling in ["not/created/yet", "./not/created/yet", "not//created/yet/."] {
+            let resolved = resolve_repo_path(spelling, Path::new("/nonexistent-repo"));
+            assert_eq!(resolved, PathBuf::from("/nonexistent-repo/not/created/yet"));
+            assert!(resolved.is_absolute(), "{spelling:?} must be absolute");
+        }
     }
 
     #[test]

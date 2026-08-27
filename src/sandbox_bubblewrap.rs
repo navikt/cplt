@@ -338,12 +338,14 @@ impl DenyMasks {
 
 /// Build mount masks from the user's deny paths.
 ///
-/// CLI and global-config inputs arrive canonicalized (`canonicalize_deny_paths`
-/// and `resolve_config_path` both hard-fail on paths that do not resolve), so
-/// for those the checks here only guard against races (a path deleted since
-/// startup). Repo `.cplt.toml` paths do NOT: they are merely `~`-expanded
-/// (navikt/cplt#179), so relative and unresolvable entries reach this function
-/// and the absolute check and re-canonicalization are real filtering for them.
+/// Every input now arrives absolute: CLI and global-config paths are
+/// canonicalized up front (`canonicalize_deny_paths` and `resolve_config_path`
+/// both hard-fail on paths that do not resolve), and repo `.cplt.toml` paths
+/// are anchored and canonicalize-if-present by `resolve_repo_path`
+/// (navikt/cplt#179). So the absolute check below is a backstop, not routine
+/// filtering, and re-canonicalization mainly guards races (a path deleted since
+/// startup). The one case still expected here is a repo deny path naming a
+/// directory that does not exist yet — enforceable on macOS, unmaskable here.
 /// Entries that cannot be masked are recorded in `skipped` for the caller to
 /// warn about:
 ///
@@ -1060,6 +1062,11 @@ mod tests {
     }
 
     // Deny masks are skipped under /tmp, so their tests need a base outside it.
+    //
+    // Only CARGO_TARGET_DIR is guarded; the CARGO_MANIFEST_DIR fallback is not.
+    // A CI checkout under /tmp would put the fallback base under /tmp too and
+    // silently void every test using this helper (they would assert on paths
+    // the /tmp skip removes). Not worth a guard until a runner does that.
     fn non_tmp_tempdir() -> tempfile::TempDir {
         // A CARGO_TARGET_DIR under /tmp (a common build-speed setup) falls
         // back to the manifest's target/ — a /tmp base would void these tests.

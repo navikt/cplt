@@ -2292,6 +2292,230 @@ mod e2e_tests {
         dir
     }
 
+    // ============================================================
+    // Repo config (.cplt.toml) path resolution — navikt/cplt#179
+    // ============================================================
+
+    /// Build a git repo with a committed `.cplt.toml`, so `--print-profile`
+    /// exercises the tamper-proof `git cat-file blob HEAD:.cplt.toml` path
+    /// rather than the working-tree fallback.
+    fn repo_with_committed_cplt_toml(label: &str, toml: &str) -> PathBuf {
+        let repo = make_repo_dir(label);
+        std::fs::write(repo.join(".cplt.toml"), toml).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-m",
+            "init",
+        ]);
+        repo
+    }
+
+    #[test]
+    fn e2e_repo_deny_path_spellings_all_emit_enforcing_rules() {
+        // navikt/cplt#179 follow-up. Seatbelt accepts a rule it cannot match and
+        // says nothing, so an unenforceable spelling looks enforced in the
+        // profile. Verified against the kernel: `(subpath "<dir>/./secrets")`,
+        // `"<dir>/secrets/."` and `"<dir>//secrets"` all read the file fine,
+        // while `"<dir>/secrets"` gives EPERM. Every spelling a user might
+        // reasonably write must therefore normalize to the enforcing form.
+        //
+        // Each spelling is tested twice: against a directory that exists (where
+        // canonicalize does the work) and one that does not (where only the
+        // lexical pass can, and where canonicalize necessarily fails). The
+        // not-yet-created case is the one repo config uniquely supports.
+        let repo = repo_with_committed_cplt_toml(
+            "deny-spellings",
+            r#"
+[deny]
+paths = [
+  "plain", "./dotslash", "dotend/.", "double//slash", "trailing/",
+  "nx-plain", "./nx-dotslash", "nx-dotend/.", "nx-double//slash", "nx-trailing/",
+]
+"#,
+        );
+        for existing in ["plain", "dotslash", "dotend", "double/slash", "trailing"] {
+            std::fs::create_dir_all(repo.join(existing)).unwrap();
+        }
+        let root = std::fs::canonicalize(&repo).unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "--project-dir",
+                &repo.to_string_lossy(),
+                "--agent",
+                "shell",
+                "--print-profile",
+            ])
+            .output()
+            .expect("binary should run");
+        assert!(output.status.success(), "should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        for name in [
+            "plain",
+            "dotslash",
+            "dotend",
+            "double/slash",
+            "trailing",
+            "nx-plain",
+            "nx-dotslash",
+            "nx-dotend",
+            "nx-double/slash",
+            "nx-trailing",
+        ] {
+            let want = root.join(name);
+            let want = want.to_string_lossy();
+            assert!(
+                stdout.contains(&format!("(deny file-read* (subpath \"{want}\"))")),
+                "{name}: expected an enforcing deny rule for {want}\nstdout: {stdout}"
+            );
+        }
+        // The inert spellings must not survive anywhere in the profile.
+        for inert in ["/./", "//", "/.\"", "\"plain\"", "\"nx-plain\""] {
+            assert!(
+                !stdout.contains(inert),
+                "profile still contains the unenforceable form {inert:?}\nstdout: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_repo_deny_path_symlink_resolves_to_target() {
+        // SBPL matches the *resolved* path, so a deny naming a symlink protects
+        // nothing — reading through the link is denied, reading the real path is
+        // not. Canonicalizing when the target exists closes that.
+        let repo = repo_with_committed_cplt_toml(
+            "deny-symlink",
+            "[deny]\npaths = [\"link-to-secrets\"]\n",
+        );
+        std::fs::create_dir_all(repo.join("real-secrets")).unwrap();
+        std::os::unix::fs::symlink("real-secrets", repo.join("link-to-secrets")).unwrap();
+        let root = std::fs::canonicalize(&repo).unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "--project-dir",
+                &repo.to_string_lossy(),
+                "--agent",
+                "shell",
+                "--print-profile",
+            ])
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let target = root.join("real-secrets");
+        let target = target.to_string_lossy();
+        assert!(
+            stdout.contains(&format!("(deny file-read* (subpath \"{target}\"))")),
+            "deny must name the symlink target, which is what SBPL matches\nstdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("link-to-secrets"),
+            "the symlink path alone would protect nothing\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_repo_deny_path_anchors_to_git_root_under_project_dir_subdir() {
+        // `git cat-file blob HEAD:.cplt.toml` resolves repo-root-relative
+        // regardless of cwd, so `--project-dir <subdir>` still reads the ROOT's
+        // config. Anchoring its relative paths to the subdir would emit
+        // `<root>/sub/secrets` — a confident-looking absolute deny rule
+        // protecting a directory the repo never named, while `<root>/secrets`
+        // stays readable. Worse than the original bug, which was merely inert.
+        let repo =
+            repo_with_committed_cplt_toml("deny-anchor-subdir", "[deny]\npaths = [\"secrets\"]\n");
+        std::fs::create_dir_all(repo.join("secrets")).unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        let root = std::fs::canonicalize(&repo).unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "--project-dir",
+                &repo.join("sub").to_string_lossy(),
+                "--agent",
+                "shell",
+                "--print-profile",
+            ])
+            .output()
+            .expect("binary should run");
+        assert!(output.status.success(), "should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let want = root.join("secrets");
+        let want = want.to_string_lossy();
+        assert!(
+            stdout.contains(&format!("(deny file-read* (subpath \"{want}\"))")),
+            "repo-root config must anchor to the git root\nstdout: {stdout}"
+        );
+        let wrong = root.join("sub/secrets");
+        let wrong = wrong.to_string_lossy();
+        assert!(
+            !stdout.contains(wrong.as_ref()),
+            "must not deny {wrong} — the repo never named it\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_repo_deny_relative_path_is_kernel_enforced() {
+        // The property the whole change exists for, checked against the kernel
+        // rather than the profile string: a relative deny path in a committed
+        // `.cplt.toml`, written the way people actually write one, blocks the
+        // read. Pre-fix this printed the file contents.
+        if !sandbox_exec_available() {
+            assert!(
+                !require_sandbox_enforced(),
+                "CPLT_TEST_REQUIRE_SANDBOX=1 but sandbox-exec is unavailable"
+            );
+            return;
+        }
+        let repo =
+            repo_with_committed_cplt_toml("deny-kernel", "[deny]\npaths = [\"./secrets\"]\n");
+        std::fs::create_dir_all(repo.join("secrets")).unwrap();
+        std::fs::write(repo.join("secrets/pw.txt"), "hunter2").unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "--project-dir",
+                &repo.to_string_lossy(),
+                "--agent",
+                "shell",
+                "--quiet",
+                "--no-proxy",
+                "--yes",
+                "--",
+                "-c",
+                "cat secrets/pw.txt",
+            ])
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("hunter2"),
+            "a committed relative deny path must be enforced\nstdout: {stdout}"
+        );
+    }
+
     #[test]
     fn e2e_config_set_repo_creates_cplt_toml_with_propose() {
         let repo = make_repo_dir("set-repo-create");

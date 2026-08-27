@@ -113,6 +113,14 @@ pub enum RepoConfigSource {
 pub struct LoadedRepoConfig {
     pub config: RepoConfig,
     pub source: RepoConfigSource,
+    /// The directory the `.cplt.toml` was read from — the anchor for its
+    /// relative paths. This is NOT always `project_dir`: `git cat-file blob
+    /// HEAD:.cplt.toml` resolves repo-root-relative regardless of cwd, so a
+    /// `--project-dir <subdir>` run reads the *root's* config and its paths
+    /// must anchor to the root. Anchoring to the subdir instead would emit a
+    /// deny rule for a directory the repo never named — a plausible-looking
+    /// absolute rule protecting the wrong place.
+    pub dir: PathBuf,
 }
 
 /// Read `.cplt.toml` from the project directory.
@@ -130,6 +138,7 @@ pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, 
         return Ok(Some(LoadedRepoConfig {
             config,
             source: RepoConfigSource::GitHead,
+            dir: git_toplevel(project_dir).unwrap_or_else(|| project_dir.to_path_buf()),
         }));
     }
 
@@ -149,10 +158,32 @@ pub fn load_repo_config(project_dir: &Path) -> Result<Option<LoadedRepoConfig>, 
         return Ok(Some(LoadedRepoConfig {
             config,
             source: RepoConfigSource::WorkingTree,
+            // The working-tree fallback reads `<project_dir>/.cplt.toml`
+            // literally, so here the project dir *is* the config's directory.
+            dir: project_dir.to_path_buf(),
         }));
     }
 
     Ok(None)
+}
+
+/// The git toplevel for `project_dir` — the directory `HEAD:.cplt.toml`
+/// resolves against. `None` when git cannot answer (not a repo, git missing).
+fn git_toplevel(project_dir: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(project_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(root))
 }
 
 /// Read `.cplt.toml` from git HEAD (the latest committed version).

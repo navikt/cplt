@@ -1438,7 +1438,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 .map(std::string::String::as_str)
                 .collect();
             unapproved_proposals =
-                resolved.apply_repo_config(&loaded.config, &project_dir, &approved_refs);
+                resolved.apply_repo_config(&loaded.config, &loaded.dir, &approved_refs);
         }
         Ok(None) => {} // No .cplt.toml — nothing to do
         Err(e) => {

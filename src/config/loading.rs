@@ -1006,20 +1006,25 @@ impl Resolved {
     /// the existing lists.
     ///
     /// Path values (`deny.paths`, `propose.allow.read/write/socket`) are
-    /// resolved against `project_dir` — the directory holding `.cplt.toml` —
-    /// so a relative entry can never reach the sandbox unenforced. See
-    /// `resolve_repo_path`.
+    /// resolved against `config_dir` so a relative entry can never reach the
+    /// sandbox unenforced. See `resolve_repo_path`.
+    ///
+    /// `config_dir` must be `LoadedRepoConfig::dir` — the directory the
+    /// `.cplt.toml` was actually read from — NOT the project dir. Under
+    /// `--project-dir <subdir>` the two differ: the config comes from the git
+    /// root, so anchoring to the subdir would emit deny rules for directories
+    /// the repo never named while looking perfectly enforced.
     ///
     /// Returns a list of unapproved proposal keys (for display to the user).
     pub fn apply_repo_config(
         &mut self,
         repo_config: &crate::repo_config::RepoConfig,
-        project_dir: &std::path::Path,
+        config_dir: &std::path::Path,
         approved_keys: &[&str],
     ) -> Vec<String> {
         // ── Deny section: applied automatically ──────────────────────────
         for path_str in &repo_config.deny.paths {
-            let path = resolve_repo_path(path_str, project_dir);
+            let path = resolve_repo_path(path_str, config_dir);
             if !self.deny_paths.contains(&path) {
                 self.deny_paths.push(path);
             }
@@ -1082,7 +1087,7 @@ impl Resolved {
         // Path proposals
         if is_approved("allow.read") {
             for path_str in &repo_config.propose.allow.read {
-                let path = resolve_repo_path(path_str, project_dir);
+                let path = resolve_repo_path(path_str, config_dir);
                 if !self.allow_read.contains(&path) {
                     self.allow_read.push(path);
                 }
@@ -1090,7 +1095,7 @@ impl Resolved {
         }
         if is_approved("allow.write") {
             for path_str in &repo_config.propose.allow.write {
-                let path = resolve_repo_path(path_str, project_dir);
+                let path = resolve_repo_path(path_str, config_dir);
                 if !self.allow_write.contains(&path) {
                     self.allow_write.push(path);
                 }
@@ -1098,7 +1103,7 @@ impl Resolved {
         }
         if is_approved("allow.socket") {
             for path_str in &repo_config.propose.allow.socket {
-                let path = resolve_repo_path(path_str, project_dir);
+                let path = resolve_repo_path(path_str, config_dir);
                 if !self.allow_socket.contains(&path) {
                     self.allow_socket.push(path);
                 }
@@ -1366,7 +1371,7 @@ validate = false
         };
         resolved.apply_repo_config(
             &repo_config,
-            std::path::Path::new("/repo"),
+            std::path::Path::new("/nonexistent-repo"),
             &["allow_localhost_any"],
         );
         assert!(resolved.allow_localhost_any);
@@ -1721,29 +1726,29 @@ validate = false
 
         resolved.apply_repo_config(
             &repo_config,
-            std::path::Path::new("/repo"),
+            std::path::Path::new("/nonexistent-repo"),
             &["allow.read", "allow.write", "allow.socket"],
         );
 
         assert!(
             resolved
                 .deny_paths
-                .contains(&PathBuf::from("/repo/secrets"))
+                .contains(&PathBuf::from("/nonexistent-repo/secrets"))
         );
         assert!(
             resolved
                 .allow_read
-                .contains(&PathBuf::from("/repo/docs/ref"))
+                .contains(&PathBuf::from("/nonexistent-repo/docs/ref"))
         );
         assert!(
             resolved
                 .allow_write
-                .contains(&PathBuf::from("/repo/build/out"))
+                .contains(&PathBuf::from("/nonexistent-repo/build/out"))
         );
         assert!(
             resolved
                 .allow_socket
-                .contains(&PathBuf::from("/repo/run/app.sock"))
+                .contains(&PathBuf::from("/nonexistent-repo/run/app.sock"))
         );
         // Nothing may be dropped, and nothing may stay relative.
         for path in resolved
@@ -1771,8 +1776,11 @@ validate = false
         };
 
         // Apply with NO approved keys — deny should still work
-        let unapproved =
-            resolved.apply_repo_config(&repo_config, std::path::Path::new("/repo"), &[]);
+        let unapproved = resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/nonexistent-repo"),
+            &[],
+        );
         assert!(unapproved.is_empty()); // no proposals, so nothing unapproved
         assert!(
             resolved
@@ -1799,8 +1807,11 @@ validate = false
         };
 
         // No keys approved
-        let unapproved =
-            resolved.apply_repo_config(&repo_config, std::path::Path::new("/repo"), &[]);
+        let unapproved = resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/nonexistent-repo"),
+            &[],
+        );
         assert!(!resolved.allow_jvm_attach);
         assert!(!resolved.allow_docker);
         assert_eq!(unapproved.len(), 2);
@@ -1826,7 +1837,7 @@ validate = false
         // Only approve jvm_attach and localhost_any
         let unapproved = resolved.apply_repo_config(
             &repo_config,
-            std::path::Path::new("/repo"),
+            std::path::Path::new("/nonexistent-repo"),
             &["allow_jvm_attach", "allow_localhost_any"],
         );
         assert!(resolved.allow_jvm_attach);
@@ -1853,8 +1864,11 @@ validate = false
 
         // Without approval: stays off
         let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
-        let unapproved =
-            resolved.apply_repo_config(&repo_config, std::path::Path::new("/repo"), &[]);
+        let unapproved = resolved.apply_repo_config(
+            &repo_config,
+            std::path::Path::new("/nonexistent-repo"),
+            &[],
+        );
         assert!(!resolved.gradle_init);
         assert_eq!(unapproved, vec!["gradle_init"]);
 
@@ -1862,7 +1876,7 @@ validate = false
         let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
         let unapproved = resolved.apply_repo_config(
             &repo_config,
-            std::path::Path::new("/repo"),
+            std::path::Path::new("/nonexistent-repo"),
             &["gradle_init"],
         );
         assert!(resolved.gradle_init);
@@ -1889,7 +1903,7 @@ validate = false
         // Approve read and ports
         let unapproved = resolved.apply_repo_config(
             &repo_config,
-            std::path::Path::new("/repo"),
+            std::path::Path::new("/nonexistent-repo"),
             &["allow.read", "allow.ports"],
         );
         assert!(unapproved.is_empty());
@@ -1920,7 +1934,7 @@ validate = false
 
         let unapproved = resolved.apply_repo_config(
             &repo_config,
-            std::path::Path::new("/repo"),
+            std::path::Path::new("/nonexistent-repo"),
             &["proxy.allow_private_domains"],
         );
         assert!(unapproved.is_empty());

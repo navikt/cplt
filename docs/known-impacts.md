@@ -31,6 +31,26 @@ Or set it permanently:
 cplt config set sandbox.allow_env_files true
 ```
 
+## Relative paths in `.cplt.toml` now bite (behaviour change)
+
+A relative path in a repo `.cplt.toml` — `deny.paths = ["target"]`, `propose.allow.read = ["vendor"]` — used to be **silently unenforced**: macOS compiled it into the profile as a rule that matched nothing, and Linux dropped it. It is now resolved against the repository root and enforced for real.
+
+If your repo already ships one, it starts working on upgrade, and a deny entry that was previously inert will now block a directory that actually exists:
+
+| Entry that was inert                | What it does now                       |
+| ----------------------------------- | -------------------------------------- |
+| `deny.paths = ["target"]`           | blocks the Rust build dir — builds fail |
+| `deny.paths = [".git"]`             | blocks git entirely                     |
+| `deny.paths = ["node_modules"]`     | blocks installs and `node` resolution   |
+
+**Check before upgrading:**
+
+```bash
+cplt --print-profile | grep 'deny file-read'
+```
+
+**Fix:** remove the entry from `.cplt.toml`, or narrow it to the path you actually meant. Paths that do not exist yet are kept (macOS enforces them once created), so an entry naming a future directory is not an error.
+
 ## Lifecycle scripts (postinstall hooks)
 
 npm/yarn/pnpm lifecycle scripts are **blocked by default** via `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false`. This prevents supply chain attacks through postinstall hooks, but may break packages that require post-install steps:
