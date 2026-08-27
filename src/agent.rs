@@ -719,12 +719,28 @@ impl Agent {
 
         // For Copilot, track editor shims as fallback
         let mut editor_shim: Option<PathBuf> = None;
+        // Windows-side installs reached through WSL interop, tracked only so the
+        // failure can name the cause instead of "not found in PATH".
+        let mut windows_interop: Option<PathBuf> = None;
 
         for binary_name in binary_names {
             for dir in path_var.split(':') {
                 let candidate = PathBuf::from(dir).join(binary_name);
 
                 if !candidate.is_file() {
+                    continue;
+                }
+
+                // WSL inherits the Windows PATH, so an agent installed on the
+                // Windows side shows up here as /mnt/c/.../<binary>. It is a
+                // Windows executable (or an npm shim that execs a Windows-side
+                // `node`), so it cannot run in the Linux sandbox. Skip it and
+                // keep looking — WSL appends the Windows PATH after the Linux
+                // one, so a distro-side install normally wins anyway (#188).
+                if cfg!(target_os = "linux") && is_windows_interop_path(&candidate) {
+                    if windows_interop.is_none() {
+                        windows_interop = Some(candidate);
+                    }
                     continue;
                 }
 
@@ -786,6 +802,19 @@ impl Agent {
             }
             Agent::Shell => unreachable!("Shell is resolved via $SHELL above"),
         };
+
+        if let Some(win) = windows_interop {
+            return Err(format!(
+                "{} resolves to a Windows install reached through WSL interop:\n  \
+                 {}\n  \
+                 Paths under /mnt/<drive>/ are the Windows filesystem: that binary is a Windows \
+                 executable (npm installs it as a shim that execs `node`), so it cannot run in \
+                 the Linux sandbox — and the distro has no `node` for the shim to exec.\n  \
+                 Fix: install Node and the agent inside the WSL distro. {install_hint}",
+                self.display_name(),
+                win.display()
+            ));
+        }
 
         Err(format!(
             "{} not found in PATH. {install_hint}",
@@ -924,6 +953,29 @@ pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
     }
 }
 
+/// Is this path on a Windows drive exposed to WSL as `/mnt/<drive>/…`?
+///
+/// WSL2 mounts the Windows drives under `/mnt/c`, `/mnt/d`, … and (with
+/// interop enabled, the default) appends the Windows `PATH` to the distro's
+/// `PATH`. A tool installed on the Windows side therefore resolves inside the
+/// distro to `/mnt/c/Users/<user>/AppData/Roaming/npm/<name>` — a Windows
+/// executable, or the npm-generated shim that execs `node`. Neither runs in
+/// the Linux sandbox (#188).
+///
+/// The single-letter component is what separates a drive mount from an
+/// ordinary `/mnt/data`-style mount point. This is a heuristic on the path
+/// alone: it needs no WSL detection, and it is only consulted on Linux.
+pub fn is_windows_interop_path(path: &Path) -> bool {
+    let mut parts = path.components();
+    matches!(parts.next(), Some(std::path::Component::RootDir))
+        && parts.next().is_some_and(|c| c.as_os_str() == "mnt")
+        && parts.next().is_some_and(|c| {
+            let drive = c.as_os_str().as_encoded_bytes();
+            drive.len() == 1 && drive[0].is_ascii_alphabetic()
+        })
+        && parts.next().is_some()
+}
+
 /// Check if a copilot binary is a VS Code/Cursor/editor shim script.
 fn is_editor_shim(path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
@@ -1041,6 +1093,40 @@ mod tests {
             process_exec: false,
             write_files: vec![],
         }
+    }
+
+    /// The exact path from the #188 report: Copilot CLI installed on the
+    /// Windows side, resolved inside the distro through WSL interop.
+    ///
+    /// Pure path logic, so it runs on every platform (the call site in
+    /// `resolve_binary` is Linux-gated, that part is not covered here).
+    #[test]
+    fn windows_interop_path_detects_npm_shim_on_c_drive() {
+        assert!(is_windows_interop_path(Path::new(
+            "/mnt/c/Users/someone/AppData/Roaming/npm/copilot"
+        )));
+        assert!(is_windows_interop_path(Path::new("/mnt/d/tools/copilot")));
+        // Drive letters are lowercase by default but casing is configurable.
+        assert!(is_windows_interop_path(Path::new("/mnt/C/tools/copilot")));
+    }
+
+    #[test]
+    fn windows_interop_path_ignores_ordinary_mounts_and_linux_paths() {
+        // Multi-character component: an ordinary mount point, not a drive.
+        assert!(!is_windows_interop_path(Path::new("/mnt/data/bin/copilot")));
+        assert!(!is_windows_interop_path(Path::new("/mnt/c1/bin/copilot")));
+        assert!(!is_windows_interop_path(Path::new(
+            "/usr/local/bin/copilot"
+        )));
+        assert!(!is_windows_interop_path(Path::new(
+            "/home/user/.local/bin/copilot"
+        )));
+        // A drive root is not a binary, and only absolute paths are mounts.
+        assert!(!is_windows_interop_path(Path::new("/mnt/c")));
+        assert!(!is_windows_interop_path(Path::new("mnt/c/bin/copilot")));
+        assert!(!is_windows_interop_path(Path::new("sub/mnt/c/copilot")));
+        // "mnt" must be the first component, not any component.
+        assert!(!is_windows_interop_path(Path::new("/opt/mnt/c/copilot")));
     }
 
     /// Dotfile managers routinely symlink `~/.config/<agent>` elsewhere. Both

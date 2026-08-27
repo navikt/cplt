@@ -5664,12 +5664,16 @@ fn ensure_copilot_extracted(
         }
         Ok(())
     } else {
-        Err(
+        Err(format!(
             "Copilot runtime extraction failed. The sandbox blocks writes to copilot/pkg,\n  \
              so extraction must succeed before entering the sandbox.\n  \
-             Fix: run 'copilot --version' manually, then retry cplt."
-                .to_string(),
-        )
+             Binary: {}\n  \
+             Version reported: {}\n  \
+             Fix: run '{} --version' manually and read its output, then retry cplt.",
+            copilot_bin.display(),
+            reported_version.as_deref().unwrap_or("could not parse"),
+            copilot_bin.display(),
+        ))
     }
 }
 
@@ -5857,12 +5861,16 @@ fn ensure_copilot_extracted_linux(
         }
         Ok(())
     } else {
-        Err(
+        Err(format!(
             "Copilot runtime extraction failed. The sandbox blocks writes to copilot cache,\n  \
              so extraction must succeed before entering the sandbox.\n  \
-             Fix: run 'copilot --version' manually, then retry cplt."
-                .to_string(),
-        )
+             Binary: {}\n  \
+             Version reported: {}\n  \
+             Fix: run '{} --version' manually and read its output, then retry cplt.",
+            copilot_bin.display(),
+            reported_version.as_deref().unwrap_or("could not parse"),
+            copilot_bin.display(),
+        ))
     }
 }
 
