@@ -2517,7 +2517,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // baseline is captured just before exec and the report printed just after,
     // both in the parent (outside the sandbox) — see audit::run.
     let audit_enabled = resolved.audit && !resolved.quiet;
-    let exit_code = audit::run(&project_dir, audit_enabled, || {
+    let exit_code = audit::run(&project_dir, &resolved.allow_write, audit_enabled, || {
         sandbox::exec_sandboxed(
             &prepared,
             &agent_bin,
@@ -3073,7 +3073,7 @@ fn run_exec_command(
     // In exec mode quiet defaults on (scripting UX), so the audit is off unless
     // the user passes --no-quiet.
     let audit_enabled = resolved.audit && !resolved.quiet;
-    let exit_code = audit::run(&project_dir, audit_enabled, || {
+    let exit_code = audit::run(&project_dir, &resolved.allow_write, audit_enabled, || {
         sandbox::exec_sandboxed(
             &prepared,
             &exec_bin,

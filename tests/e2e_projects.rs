@@ -1045,6 +1045,54 @@ fi
         assert_result_fail(&stdout, "bare_hook_write");
     }
 
+    /// #214: the post-session audit runs git in `project_dir` only. A session
+    /// that rewrote a repo granted via `allow.write` still printed "no project
+    /// file changes" — an absence of information rendered as a clean bill of
+    /// health. The report must now name what it did not look at.
+    #[test]
+    fn audit_names_writable_roots_it_did_not_audit() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let sibling = TempProject::new("audit-sibling");
+        sibling.write_file("README.md", "# sibling\n");
+        sibling.git_init();
+
+        let sibling_path = sibling.canonical_path().to_string_lossy().to_string();
+        // The agent touches ONLY the granted repo — the exact false-clean case.
+        let script = format!(
+            r#"
+if echo tampered > "{sibling_path}/README.md" 2>/dev/null; then
+    echo "RESULT:sibling_write:OK"
+else
+    echo "RESULT:sibling_write:FAIL"
+fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--allow-write", &sibling_path]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "sibling_write");
+        // The project itself really is unchanged — this is the report that used
+        // to stand alone and read as "nothing happened".
+        assert!(
+            stderr.contains("no project file changes"),
+            "test premise: the project must be reported clean.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("NOT audited"),
+            "the audit must say it did not cover every writable root.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(&sibling_path),
+            "the unaudited root must be named.\nstderr: {stderr}"
+        );
+    }
+
     // ============================================================
     // Mode combination tests
     // ============================================================

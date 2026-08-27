@@ -598,19 +598,63 @@ fn git_output(project_dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Writable roots the audit does NOT measure: every `allow.write` grant that
+/// falls outside `project_dir`.
+///
+/// The audit runs git in `project_dir` alone, so a session that only touched a
+/// granted repository is reported as "no project file changes" — an absence of
+/// information rendered as a clean bill of health (#214). Naming the roots
+/// removes the false assurance; auditing them properly needs a per-root report
+/// format and belongs with the multi-repo work in #165.
+///
+/// Paths *inside* `project_dir` are omitted: the project's own `git status`
+/// already covers them. (A grant pointing at a git-ignored subdirectory is a
+/// residual — git does not report those either, and this function cannot tell.)
+fn unaudited_roots<'a>(project_dir: &Path, allow_write: &'a [PathBuf]) -> Vec<&'a Path> {
+    allow_write
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|p| !p.starts_with(project_dir))
+        .collect()
+}
+
 /// Wrap a sandboxed exec with the audit lifecycle: capture the baseline just
 /// before the closure runs the agent, then generate and print the report after
 /// it exits. Both `main.rs` exec sites call this so the wiring cannot diverge.
 ///
+/// `allow_write` is the resolved set of writable grants; any of them outside
+/// `project_dir` is named after the report so the session is never presented as
+/// clean on the strength of a measurement that never looked there (#214).
+///
 /// When `enabled` is false (`--no-audit`, `--quiet`, or config `audit = false`)
 /// the closure runs with no measurement or output at all.
-pub fn run<F: FnOnce() -> u8>(project_dir: &Path, enabled: bool, exec: F) -> u8 {
+pub fn run<F: FnOnce() -> u8>(
+    project_dir: &Path,
+    allow_write: &[PathBuf],
+    enabled: bool,
+    exec: F,
+) -> u8 {
     if !enabled {
         return exec();
     }
     let baseline = Baseline::capture(project_dir);
     let exit_code = exec();
     baseline.finish(exit_code).print();
+    let unaudited = unaudited_roots(project_dir, allow_write);
+    if !unaudited.is_empty() {
+        let list = unaudited
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui::warn(&format!(
+            "audit covers {} only — {} writable path{} outside it {} NOT audited: {list}",
+            project_dir.display(),
+            unaudited.len(),
+            if unaudited.len() == 1 { "" } else { "s" },
+            if unaudited.len() == 1 { "was" } else { "were" },
+        ));
+    }
     exit_code
 }
 
@@ -621,6 +665,32 @@ mod tests {
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn unaudited_roots_names_grants_outside_the_project() {
+        let project = PathBuf::from("/w/app");
+        // Inside the project: the project's own git status already covers it.
+        assert!(
+            unaudited_roots(
+                &project,
+                &[PathBuf::from("/w/app/vendor"), PathBuf::from("/w/app")]
+            )
+            .is_empty()
+        );
+        // Outside: must be named, including a sibling that merely shares a prefix.
+        assert_eq!(
+            unaudited_roots(
+                &project,
+                &[
+                    PathBuf::from("/w/app/vendor"),
+                    PathBuf::from("/w/lib"),
+                    PathBuf::from("/w/app-tools"),
+                ]
+            ),
+            vec![Path::new("/w/lib"), Path::new("/w/app-tools")]
+        );
+        assert!(unaudited_roots(&project, &[]).is_empty());
     }
 
     #[test]
