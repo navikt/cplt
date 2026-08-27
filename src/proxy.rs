@@ -1617,6 +1617,16 @@ fn pump(mut from: TcpStream, mut to: TcpStream, last_activity: &Mutex<Instant>, 
 /// dropped and the TLS record is truncated. Tracking the offset here makes a
 /// timeout a retry rather than data loss. A partial `write` is reported as
 /// `Ok(n)`, so no byte is lost on the boundary either.
+///
+/// The ceiling is measured against the tunnel-wide clock, not this
+/// direction's, so a pump stalled in a write is not reaped while the opposite
+/// direction keeps the tunnel busy — a peer that stops reading but keeps
+/// sending holds its slot. That is the deliberate cost of the shared clock:
+/// a per-direction clock reaps this case but half-closes any one-directional
+/// stream mid-flight, which is the worse failure and the one this module was
+/// changed to remove.
+// ponytail: narrow enough to live with; needs a real watchdog to close, not a
+// second clock.
 fn write_bounded(
     to: &mut TcpStream,
     buf: &[u8],
