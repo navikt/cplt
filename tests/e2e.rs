@@ -2476,6 +2476,104 @@ paths = [
     }
 
     #[test]
+    fn e2e_repo_deny_path_resolves_symlink_above_an_absent_leaf() {
+        // The not-yet-created case is only sound when the lexical location is
+        // where the file will actually land. `link/secret` with `link -> real`
+        // and no `secret` yet breaks that: canonicalize fails on the whole path,
+        // and the emitted rule names the link. Verified against the kernel —
+        // that rule blocks reads of NEITHER `link/secret` nor `real/secret`,
+        // while a rule naming `real/secret` blocks both.
+        let repo = repo_with_committed_cplt_toml(
+            "deny-mid-symlink",
+            "[deny]\npaths = [\"link/secret\"]\n",
+        );
+        std::fs::create_dir_all(repo.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", repo.join("link")).unwrap();
+        // `secret` deliberately does NOT exist when the profile is generated.
+        let root = std::fs::canonicalize(&repo).unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "--project-dir",
+                &repo.to_string_lossy(),
+                "--agent",
+                "shell",
+                "--print-profile",
+            ])
+            .output()
+            .expect("binary should run");
+        assert!(output.status.success(), "should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let want = root.join("real/secret");
+        let want = want.to_string_lossy();
+        assert!(
+            stdout.contains(&format!("(deny file-read* (subpath \"{want}\"))")),
+            "the rule must name the resolved path, which is where the file lands\nstdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("/link/secret"),
+            "a rule naming the symlink matches nothing\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_repo_allow_path_repointed_outside_the_repo_is_refused() {
+        // The trust store pins a hash of the `.cplt.toml` BYTES, so an approval
+        // only vouches for what those bytes name. Here the repo gets
+        // `allow.read = ["data"]` approved while `data -> safe`, then repoints
+        // `data -> /` in a later commit. `.cplt.toml` never changes, so the
+        // pinned hash still matches and the approval stays live — the grant must
+        // be refused on resolution instead, and said out loud.
+        let repo =
+            repo_with_committed_cplt_toml("allow-escape", "[propose.allow]\nread = [\"data\"]\n");
+        std::fs::create_dir_all(repo.join("safe")).unwrap();
+        std::os::unix::fs::symlink("safe", repo.join("data")).unwrap();
+        let root = std::fs::canonicalize(&repo).unwrap();
+
+        let profile = |repo: &Path| {
+            let out = cplt_cmd()
+                .args([
+                    "--project-dir",
+                    &repo.to_string_lossy(),
+                    "--agent",
+                    "shell",
+                    "--accept-repo-config",
+                    "--print-profile",
+                ])
+                .output()
+                .expect("binary should run");
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+
+        // Baseline: an in-repo symlink target is granted normally.
+        let (stdout, _) = profile(&repo);
+        let safe = root.join("safe");
+        let safe = safe.to_string_lossy();
+        assert!(
+            stdout.contains(&format!("(allow file-read* (subpath \"{safe}\"))")),
+            "an in-repo symlink target should be granted\nstdout: {stdout}"
+        );
+
+        // Repoint outside the repo, leaving `.cplt.toml` untouched.
+        std::fs::remove_file(repo.join("data")).unwrap();
+        std::os::unix::fs::symlink("/", repo.join("data")).unwrap();
+
+        let (stdout, stderr) = profile(&repo);
+        assert!(
+            !stdout.contains("(allow file-read* (subpath \"/\"))"),
+            "a repointed symlink must not grant read of / on a stale approval\nstdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("resolves outside the repository"),
+            "the refusal must be reported, not silent\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
     fn e2e_repo_deny_relative_path_is_kernel_enforced() {
         // The property the whole change exists for, checked against the kernel
         // rather than the profile string: a relative deny path in a committed

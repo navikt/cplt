@@ -297,7 +297,11 @@ Commit a `.cplt.toml` file to your repository for project-specific sandbox setti
 
 **Path expansion:** Paths in `[deny]` and `[propose.allow]` support `~/` expansion. A relative path is resolved against the **repository root** — the directory the `.cplt.toml` came from, which under `--project-dir <subdir>` is still the git root, not the subdir. So `paths = ["secrets"]` denies `<repo>/secrets` on every clone.
 
-`./secrets`, `secrets/.`, `secrets/`, and `a//b` all normalize to the same path, and a path naming a symlink is resolved to its target — the sandbox matches resolved paths, so the un-normalized spellings would compile into the profile and silently match nothing. `..` components are rejected outright.
+`./secrets`, `secrets/.`, `secrets/`, and `a//b` all normalize to the same path, and symlinks are resolved to their target — the sandbox matches resolved paths, so the un-normalized spellings would compile into the profile and silently match nothing. Resolution walks up to the deepest part of the path that exists, so a symlink is still resolved when the leaf below it has not been created yet (`link/secret` with `link -> real` becomes `<repo>/real/secret`).
+
+`..` components are rejected, as are entries naming a whole tree root — `""`, `"."`, `"./"` (the repo root) and `"/"` (the filesystem root). As a deny entry any of those would block read *and* write of the entire checkout, so a committed one would brick the repo for everyone who clones it.
+
+**Approved `[propose.allow]` paths must stay inside the repo.** A trust approval pins a hash of the `.cplt.toml` bytes, so it only vouches for what those bytes name. A relative entry names a location in the repo; if a symlink resolves it somewhere outside, the entry is refused with a warning rather than granted. Otherwise a repo could get `read = ["data"]` approved while `data -> ./safe` and then repoint `data -> /` in a later commit — `.cplt.toml` unchanged, hash unchanged, approval still live. Absolute and `~/` entries are exempt: they are written literally in the file, so the pinned hash does cover them. `[deny]` has no such restriction — it needs no approval and can only tighten.
 
 Unlike the global config, a repo path that does **not exist yet** is kept rather than being an error: macOS starts enforcing the deny once the directory appears, and one committed typo cannot brick cplt for everyone who clones the repo. On Linux such a path cannot be masked and cplt warns.
 

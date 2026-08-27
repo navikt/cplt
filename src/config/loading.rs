@@ -1,6 +1,6 @@
 //! Config file loading, parsing, and CLI-flag merging.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::error::ConfigError;
 use super::path::{config_dir, config_path, expand_tilde, resolve_config_path, resolve_repo_path};
@@ -1087,7 +1087,11 @@ impl Resolved {
         // Path proposals
         if is_approved("allow.read") {
             for path_str in &repo_config.propose.allow.read {
-                let path = resolve_repo_path(path_str, config_dir);
+                let Some(path) =
+                    resolve_repo_allow_path(path_str, config_dir, "propose.allow.read")
+                else {
+                    continue;
+                };
                 if !self.allow_read.contains(&path) {
                     self.allow_read.push(path);
                 }
@@ -1095,7 +1099,11 @@ impl Resolved {
         }
         if is_approved("allow.write") {
             for path_str in &repo_config.propose.allow.write {
-                let path = resolve_repo_path(path_str, config_dir);
+                let Some(path) =
+                    resolve_repo_allow_path(path_str, config_dir, "propose.allow.write")
+                else {
+                    continue;
+                };
                 if !self.allow_write.contains(&path) {
                     self.allow_write.push(path);
                 }
@@ -1103,7 +1111,11 @@ impl Resolved {
         }
         if is_approved("allow.socket") {
             for path_str in &repo_config.propose.allow.socket {
-                let path = resolve_repo_path(path_str, config_dir);
+                let Some(path) =
+                    resolve_repo_allow_path(path_str, config_dir, "propose.allow.socket")
+                else {
+                    continue;
+                };
                 if !self.allow_socket.contains(&path) {
                     self.allow_socket.push(path);
                 }
@@ -1148,6 +1160,39 @@ impl Resolved {
             .map(std::string::ToString::to_string)
             .collect()
     }
+}
+
+/// Resolve an approved `propose.allow.*` path, refusing one that leaves the repo.
+///
+/// The trust store pins a hash of the `.cplt.toml` *bytes*
+/// (`trust::proposal_content_hash`), so an approval only ever vouches for what
+/// those bytes name. A relative entry names a location inside the repo. Once
+/// paths are resolved, a committed symlink can make that entry point anywhere —
+/// `allow.read = ["data"]` with `data -> ./safe` gets approved, a later commit
+/// repoints `data -> /`, and the hash is unchanged because `.cplt.toml` is
+/// unchanged. The stale approval would then grant read of `/` with no re-prompt.
+///
+/// So: a repo-anchored allow entry may only resolve to somewhere inside the
+/// repo. Escaping is refused and reported, never silently applied.
+///
+/// Absolute and `~/` entries are exempt: they are written literally in
+/// `.cplt.toml`, so the pinned hash does cover what they name.
+///
+/// Deny paths deliberately get no such check — `[deny]` needs no approval and
+/// can only tighten, so a repointed deny symlink cannot escalate.
+fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Option<PathBuf> {
+    let resolved = resolve_repo_path(path_str, config_dir);
+    if expand_tilde(path_str).is_relative() && !resolved.starts_with(config_dir) {
+        ui::warn(&format!(
+            "{key} entry {path_str:?} resolves outside the repository ({}) — ignoring it.\n  \
+             A symlink target is not covered by the trust approval, so a later commit could \
+             repoint it without re-approval. Name the target directly in .cplt.toml if you \
+             mean to grant it.",
+            resolved.display()
+        ));
+        return None;
+    }
+    Some(resolved)
 }
 
 #[cfg(test)]
@@ -1760,6 +1805,81 @@ validate = false
         {
             assert!(path.is_absolute(), "{} is not absolute", path.display());
         }
+    }
+
+    #[test]
+    fn approved_allow_path_escaping_the_repo_is_refused() {
+        // The trust store pins a hash of the `.cplt.toml` bytes, so an approval
+        // only vouches for what those bytes name. A repo can commit
+        // `allow.read = ["data"]` with `data -> ./safe`, get it approved, then
+        // repoint `data -> /` in a later commit: `.cplt.toml` is untouched, the
+        // hash still matches, and the stale approval would grant read of `/`.
+        // A repo-anchored allow entry may therefore only resolve inside the repo.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(root.join("safe")).unwrap();
+        std::os::unix::fs::symlink("safe", root.join("inside")).unwrap();
+        std::os::unix::fs::symlink("/", root.join("escaped")).unwrap();
+
+        let apply = |entry: &str| {
+            let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+            let repo_config = crate::repo_config::RepoConfig {
+                propose: crate::repo_config::ProposeSection {
+                    allow: crate::repo_config::ProposeAllowSection {
+                        read: vec![entry.to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            resolved.apply_repo_config(&repo_config, &root, &["allow.read"]);
+            resolved.allow_read
+        };
+
+        // A symlink that stays inside the repo is fine — the pinned bytes do
+        // name a location in the repo, and that is where it lands.
+        assert!(
+            apply("inside").contains(&root.join("safe")),
+            "an in-repo symlink target must still be granted"
+        );
+        // One that leaves the repo is refused outright, not silently narrowed.
+        let escaped = apply("escaped");
+        assert!(
+            !escaped.iter().any(|p| p == std::path::Path::new("/")),
+            "must not grant read of / : {escaped:?}"
+        );
+        assert!(
+            escaped.iter().all(|p| p.starts_with(&root)),
+            "no granted path may sit outside the repo: {escaped:?}"
+        );
+    }
+
+    #[test]
+    fn approved_allow_path_named_literally_is_not_repo_confined() {
+        // Absolute and `~/` entries are written literally in `.cplt.toml`, so
+        // the pinned hash does cover them — they are exempt from the
+        // containment rule and must keep working outside the repo.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let outside = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        let repo_config = crate::repo_config::RepoConfig {
+            propose: crate::repo_config::ProposeSection {
+                allow: crate::repo_config::ProposeAllowSection {
+                    read: vec![outside.to_string_lossy().into_owned()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        resolved.apply_repo_config(&repo_config, &root, &["allow.read"]);
+        assert!(
+            resolved.allow_read.contains(&outside),
+            "a literally-named absolute path must still be granted"
+        );
     }
 
     #[test]

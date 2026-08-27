@@ -24,6 +24,7 @@ pub use editing::{
     write_document_atomically, write_repo_document_atomically,
 };
 pub use error::ConfigError;
+pub(crate) use path::lexically_normalized;
 pub use path::{collapse_tilde, config_dir, config_path, default_config_contents, expand_tilde};
 pub use registry::{ConfigKeyInfo, ConfigValueType, all_config_keys, lookup_key};
 pub use repo::{RepoKeyTarget, repo_key_rejection_reason, repo_key_target, set_repo_value_in_doc};

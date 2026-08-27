@@ -324,51 +324,90 @@ pub fn collapse_tilde(path: &str) -> String {
     }
 }
 
+/// Drop `CurDir` components and collapse separators. Purely lexical: it cannot
+/// fail and touches nothing on disk.
+///
+/// `..` never reaches here — `repo_config::reject_path_traversal` rejects it at
+/// parse time — so no `ParentDir` handling is needed. `Path::components` already
+/// collapses `a//b` and a trailing `/`, and drops interior `.`; a *leading* `./`
+/// is the one it deliberately preserves, hence the filter.
+pub(crate) fn lexically_normalized(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect()
+}
+
+/// Canonicalize as much of `path` as exists, then re-append the rest.
+///
+/// `Path::canonicalize` is all-or-nothing: one absent component and it fails for
+/// the whole path. Falling back to the unresolved path is unsound the moment a
+/// symlink sits *above* the absent part — `link/secret` with `link -> real` and
+/// no `secret` yet emits a rule naming `link/secret`, which Seatbelt matches
+/// against nothing (verified: it blocks reads of neither `link/secret` nor
+/// `real/secret`, while a rule naming `real/secret` blocks both).
+///
+/// Walking up to the deepest existing ancestor resolves that symlink while
+/// keeping the not-yet-created tail, so the rule names where the file will
+/// actually land. This also covers a canonicalize failure that is not ENOENT —
+/// a permission-denied ancestor, or ELOOP — where the unresolved fallback would
+/// likewise name a path the kernel never matches.
+fn canonicalize_deepest(path: &Path) -> PathBuf {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(base) = cur.canonicalize() {
+            return tail.iter().rev().fold(base, |acc, part| acc.join(part));
+        }
+        // Nothing along the whole path resolved (only reachable if even `/`
+        // fails to canonicalize) — keep the lexical form rather than drop it.
+        let (Some(parent), Some(name)) = (cur.parent(), cur.file_name()) else {
+            return path.to_path_buf();
+        };
+        tail.push(name);
+        cur = parent;
+    }
+}
+
 /// Resolve a path from a repo `.cplt.toml` into one the sandbox backends can
 /// actually enforce: expand a leading `~/`, normalize lexically, anchor a
 /// still-relative path to `config_dir` (the directory the `.cplt.toml` came
-/// from), then canonicalize if the target exists.
+/// from), then canonicalize as deep as the path exists.
 ///
 /// Every step closes a fail-open. Seatbelt silently accepts a rule it cannot
 /// match, so an unenforceable path looks enforced in `--print-profile`:
 ///
-/// | spelling      | emitted verbatim | enforced by Seatbelt |
-/// |---------------|------------------|----------------------|
-/// | `secrets`     | relative         | no                   |
-/// | `./secrets`   | `/repo/./secrets`| no                   |
-/// | `secrets/.`   | `/repo/secrets/.`| no                   |
-/// | `a//b`        | `/repo/a//b`     | no                   |
-/// | a symlink     | the link path    | no (SBPL matches the resolved path) |
+/// | spelling        | emitted verbatim   | enforced by Seatbelt |
+/// |-----------------|--------------------|----------------------|
+/// | `secrets`       | relative           | no                   |
+/// | `./secrets`     | `/repo/./secrets`  | no                   |
+/// | `secrets/.`     | `/repo/secrets/.`  | no                   |
+/// | `a//b`          | `/repo/a//b`       | no                   |
+/// | a symlink       | the link path      | no (SBPL matches the resolved path) |
+/// | `link/secret`   | the link path      | no, even though the leaf is absent   |
 ///
 /// Anchoring relative paths is also what the global config already promises for
 /// its own entries ("Relative paths are resolved from this config file's
 /// directory").
 ///
-/// Normalization is lexical *before* canonicalization, not instead of it, and
-/// that ordering is the point: `canonicalize` fails on a path that does not
-/// exist yet, and repo config is the only source that can deny a not-yet-created
-/// path (macOS starts enforcing once it appears). Lexical normalization cannot
-/// fail and needs nothing on disk, so `./not-created-yet` is enforceable by
-/// construction; canonicalize then adds symlink resolution wherever the target
-/// is already there. Nothing can be dropped, so nothing can be silently
+/// Repo config is the only source that can deny a path that does not exist yet
+/// (macOS starts enforcing once it appears), so neither step may fail the entry:
+/// the lexical pass needs nothing on disk, and `canonicalize_deepest` resolves
+/// as much as is there. Nothing can be dropped, so nothing can be silently
 /// unenforced.
 ///
-/// `..` never reaches here — `repo_config::reject_path_traversal` rejects it at
-/// parse time — so no `ParentDir` handling is needed.
+/// The lexical pass is belt-and-braces here — `canonicalize_deepest` walks by
+/// `parent()`/`file_name()`, which are component-based and would drop `.` and
+/// `//` on their own. It is kept so the invariant holds without depending on
+/// that, and it is load-bearing in `repo_config::reject_root_path`, which needs
+/// to spot a root-equal entry before anything touches the disk.
 pub(super) fn resolve_repo_path(path: &str, config_dir: &Path) -> PathBuf {
-    let expanded = expand_tilde(path);
-    // `Path::components` already collapses `a//b` and a trailing `/`, and drops
-    // interior `.`; a *leading* `./` is the one it deliberately preserves.
-    let normalized: PathBuf = expanded
-        .components()
-        .filter(|c| !matches!(c, Component::CurDir))
-        .collect();
+    let normalized = lexically_normalized(&expand_tilde(path));
     let full = if normalized.is_relative() {
         config_dir.join(normalized)
     } else {
         normalized
     };
-    full.canonicalize().unwrap_or(full)
+    canonicalize_deepest(&full)
 }
 
 /// Expand tilde, resolve relative paths against config dir, and canonicalize.
@@ -493,6 +532,38 @@ mod tests {
 
         assert_eq!(resolve_repo_path("link", &root), root.join("real"));
         assert_eq!(resolve_repo_path("./link/", &root), root.join("real"));
+    }
+
+    #[test]
+    fn resolve_repo_path_resolves_a_symlink_above_an_absent_leaf() {
+        // The not-yet-created case is only sound when the lexical location
+        // equals the future resolved location. A symlink ABOVE the absent leaf
+        // breaks that: `canonicalize` fails on the whole path, and naming
+        // `link/secret` gives a rule Seatbelt matches against nothing —
+        // verified: it blocks reads of neither `link/secret` nor `real/secret`,
+        // while naming `real/secret` blocks both. So resolve the deepest
+        // existing ancestor and re-append the tail.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("link")).unwrap();
+
+        // `secret` does not exist yet — the leaf must survive, the link must not.
+        assert_eq!(
+            resolve_repo_path("link/secret", &root),
+            root.join("real/secret")
+        );
+        // Several absent levels below the symlink.
+        assert_eq!(
+            resolve_repo_path("./link/a/b/c", &root),
+            root.join("real/a/b/c")
+        );
+        // And once the leaf exists, the answer does not move.
+        std::fs::create_dir(root.join("real/secret")).unwrap();
+        assert_eq!(
+            resolve_repo_path("link/secret", &root),
+            root.join("real/secret")
+        );
     }
 
     #[test]
