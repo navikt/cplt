@@ -26,31 +26,34 @@
 
 ## Module responsibilities
 
+The significant modules, not an exhaustive listing. `src/lib.rs` has the full set.
+
 ```
 src/
   main.rs              CLI entry point, orchestration.
-    main()             → parse CLI, call run(), format errors (10 lines)
-    run()              → orchestrate: early exits → resolve → proxy → sandbox → execute (~250 lines)
-    resolve_context()  → config loading, path resolution, agent detection (~240 lines)
-    start_proxy_if_enabled() → proxy startup, domain file resolution/validation (~90 lines)
-    run_doctor()       → --doctor subflow
+    main()             → parse CLI, call run(), format errors
+    run()              → orchestrate: early exits → resolve → proxy → sandbox → execute
+    resolve_context()  → config loading, path resolution, agent detection
+    start_proxy_if_enabled() → proxy startup, domain file resolution/validation
+    run_doctor()       → `cplt doctor` subflow
     run_config_command()  → config subcommand dispatch
     run_trust_command()   → trust subcommand dispatch
     run_update()          → update subcommand dispatch
   lib.rs               Module declarations + is_unsafe_root(). The crate's public API.
   ui.rs                All terminal output: colors, prefixed helpers, NO_COLOR/TTY.
-  config/              Config module (9 submodules, ~3770 lines total)
-    mod.rs             Re-exports only (32 lines)
+  config/              Config module
+    mod.rs             Re-exports only
     types.rs           Config, Resolved, CliFlags, FeatureToggle, LoadedConfig structs
     error.rs           ConfigError enum (thiserror)
     loading.rs         load_file(), parse(), merge(), print_summary()
-    path.rs            config_path(), expand_tilde(), resolve helpers
+    path.rs            config_path(), expand_tilde(), resolve helpers, `config init` template
     validation.rs      Unknown key detection, diagnostics, Levenshtein suggestions
     registry.rs        ConfigKeyInfo, CONFIG_KEYS metadata, lookup_key()
     editing.rs         TOML document manipulation (set/append/remove/unset)
     display.rs         explain_key(), display_config(), get_config_value()
     repo.rs            Per-repo config set support, RepoKeyTarget
-  agent.rs             Agent abstraction: binary discovery, config dirs, auth hints.
+  agent.rs             Agent abstraction: binary discovery, config dirs, session flag
+                       translation, default domain allowlists, auth hints.
   sandbox.rs           Module root: re-exports + SandboxConfig, prepare(), exec_sandboxed().
   sandbox_policy.rs    Constants, deny lists, env allowlists, validation.
   sandbox_profile.rs   SBPL profile generation (macOS Seatbelt).
@@ -58,12 +61,20 @@ src/
   sandbox_exec.rs      Process execution, signal forwarding.
   sandbox_landlock.rs  Landlock LSM + seccomp-BPF (Linux).
   sandbox_bubblewrap.rs Optional Bubblewrap namespace layer + in-namespace re-entry helper (Linux).
-  discover.rs          Runtime probing (--doctor), tool/auth discovery.
-  proxy.rs + proxy/    CONNECT proxy, domain blocking, audit log.
+  discover.rs          Runtime probing (`cplt doctor`), tool/auth discovery.
+  detect.rs            Project and machine ecosystem detectors behind `cplt init`.
+  proxy.rs             CONNECT proxy, domain blocking, audit log.
+  gh_proxy.rs          gh and git command guards: policy tables, gates, wrapper scripts.
   scratch.rs           Per-session scratch directory, TMPDIR redirect.
   trust.rs             Trust store: accept/revoke repo config proposals.
   repo_config.rs       Per-repo .cplt.toml parsing and application.
   git.rs               Hardened parent-side git invocation (single choke point).
+  audit.rs             Post-session project-change report.
+  check.rs             Startup sandbox self-check.
+  init.rs              `cplt init` output generation.
+  gradle_init.rs       cplt-managed Gradle init script.
+  settings.rs          Interactive settings TUI.
+  subscriptions.rs     Blocklist subscription fetch, cache, and verification.
   update.rs            Self-update check and download.
 ```
 
