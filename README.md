@@ -84,7 +84,7 @@ The sandbox blocks access to credentials and secrets at the kernel level. Comman
 | -------------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------- |
 | Read/write project directory                                                     | ✅ Allowed                                |                                                                                         |
 | Read/write/delete `.env*`, `.pem`, `.key` in project                             | 🔒 Kernel-blocked                         | Prevents secret exfiltration and destruction; `--allow-env-files` to override           |
-| Write `.git/hooks`, `.git/config`, `.gitmodules`                                 | 🔒 Kernel-blocked                         | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking             |
+| Write `.git/hooks`, `.git/config`, `.gitmodules`                                 | 🔒 Kernel-blocked                         | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking. Applies to **every** writable root — the project and each `allow.write` grant — including a granted worktree or bare repo, whose real hooks live outside `<root>/.git` |
 | Execute from `/tmp`, `/var/folders`                                              | 🔒 Kernel-blocked                         | Prevents write-then-exec; scratch dir redirects TMPDIR to safe location (on by default) |
 | Execute from `~/Library/Caches`                                                  | 🔒 Kernel-blocked by default              | Prevents binary-drop staging; Copilot native modules exempted via carve-out; `--allow-cache-exec <SUBDIR>` to add targeted exemptions (e.g. `ms-playwright`) |
 | Modify `.vscode/tasks.json`, `launch.json`                                       | ⚠️ Allowed — known risk                   | IDE trust boundary; see SECURITY.md for mitigations                                     |
@@ -1229,7 +1229,7 @@ Certain git operations are blocked to prevent persistence attacks that survive t
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
 | `git remote set-url`               | ❌ Blocked   | Writes to `.git/config`                                           |
 | `git submodule add`                | ❌ Blocked   | `.gitmodules` is write-protected (supply chain vector)            |
-| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected (hooks run unsandboxed)          |
+| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project **and** in every `allow.write` grant (hooks run unsandboxed) |
 | Signed commits/tags                | ❌ Disabled  | `commit.gpgsign` and `tag.gpgsign` overridden to `false` via env; use `--allow-gpg-signing` to enable |
 
 **Global git hooks**: If `core.hooksPath` is set in `~/.gitconfig`, cplt auto-detects the hooks directory and allows reading it so git operations succeed. Write access is explicitly denied to prevent persistence attacks. The hooks path must be under `$HOME` with at least 3 path components (e.g. `~/.config/git/hooks`) to prevent overly broad read access.

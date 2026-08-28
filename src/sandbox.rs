@@ -215,7 +215,36 @@ impl PreparedSandbox {
 /// - A path contains characters that could cause profile injection (macOS)
 /// - The platform does not support sandboxing
 pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
-    prepare_impl(config)
+    prepare_impl(config, &extra_git_dirs(config.extra_write))
+}
+
+/// Resolve the real `.git` directory of every writable granted path whose repo
+/// data does NOT live at `<path>/.git` — a worktree, a bare repo, or a grant
+/// that points *inside* a repo (#212).
+///
+/// The `<path>/.git/...` denies the backends emit unconditionally already cover
+/// the ordinary case, so anything resolving to `<path>/.git` is dropped here.
+/// A path that is not a repository at all resolves to `None` and is skipped —
+/// a no-op, never an error.
+///
+/// This spawns `git rev-parse --git-common-dir` once per granted path, in the
+/// PARENT process, with the granted repo's config in scope — so it routes
+/// through the hardened invoker (`git::command`, #211) like every other
+/// parent-side git invocation.
+fn extra_git_dirs(extra_write: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = extra_write
+        .iter()
+        .filter_map(|root| {
+            let dir = crate::discover::git_dir_of(root)?;
+            // Ordinary repo — already covered by the `<root>/.git` denies.
+            (dir != root.join(".git")).then_some(dir)
+        })
+        .collect();
+    // The same repo can be granted twice, and two grants can share one `.git`
+    // (two worktrees of one repo); duplicate denies are harmless but noisy.
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// Human-readable representation of the sandbox policy.
@@ -279,8 +308,15 @@ pub fn exec_sandboxed(
 // ── Platform-specific prepare implementations ─────────────────
 
 #[cfg(target_os = "macos")]
-fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
+fn prepare_impl(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+) -> Result<PreparedSandbox, String> {
     validate_config_paths(config)?;
+    // Interpolated into the profile like every other path — same injection check.
+    for p in extra_git_dirs {
+        policy::validate_sbpl_path(p).map_err(|e| format!("Granted repo .git dir: {e}"))?;
+    }
 
     // allow_keychain is derived from the effective sandbox environment by the
     // caller (see SandboxConfig::allow_keychain doc). We trust the field here.
@@ -308,6 +344,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         dotnet_root: config.dotnet_root,
         git_hooks_path: config.git_hooks_path,
         git_common_dir: config.git_common_dir,
+        extra_git_dirs,
         allow_gpg_signing: config.allow_gpg_signing,
         deny_clipboard: config.deny_clipboard,
         allow_jvm_attach: config.allow_jvm_attach,
@@ -335,7 +372,10 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
+fn prepare_impl(
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
+) -> Result<PreparedSandbox, String> {
     // Warn about config options that Linux cannot enforce at kernel level.
     // (Deny paths are handled after bwrap resolution below — with Bubblewrap
     // they ARE enforced, via mount masks.)
@@ -388,7 +428,14 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     // re-bind those pre-existing paths read-only to restore macOS parity. In a
     // git worktree the real hooks live under the shared git_common_dir (which
     // the sandbox grants write access to), so pass it through to cover them too.
-    let ro_protect = bubblewrap::git_persistence_paths(config.project_dir, config.git_common_dir);
+    //
+    // #212: every writable granted path is a candidate too — a sibling repo's
+    // .git/hooks was fully writable before, and hooks run unsandboxed.
+    let mut write_roots: Vec<&Path> = vec![config.project_dir];
+    write_roots.extend(config.extra_write.iter().map(PathBuf::as_path));
+    let mut git_dirs: Vec<&Path> = config.git_common_dir.into_iter().collect();
+    git_dirs.extend(extra_git_dirs.iter().map(PathBuf::as_path));
+    let ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied
@@ -539,4 +586,96 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `extra_git_dirs` is the wiring between `prepare()` and the profile: the
+    /// emitter test proves the denies get written, this proves the right
+    /// directories reach it. Without it, making this function return an empty
+    /// Vec kills the whole #212 fix with every host-independent suite green —
+    /// only the seatbelt-gated e2e tests catch that, and they never run on
+    /// Linux CI.
+    ///
+    /// Same shape as `discover::git_dir_of_resolves_every_repo_shape`, one
+    /// layer up.
+    #[test]
+    fn extra_git_dirs_resolves_only_the_roots_that_need_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Canonicalized the way `main.rs` canonicalizes every granted path: the
+        // `dir != root.join(".git")` filter compares against the RESOLVED dir,
+        // so an uncanonicalized root would slip past it (a harmless duplicate
+        // deny, but the filter itself would go untested).
+        let base = std::fs::canonicalize(tmp.path()).expect("canonicalize base");
+        let git = |args: &[&str], cwd: &Path| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .expect("run git")
+                .status
+                .success();
+            assert!(ok, "git {args:?} should succeed");
+        };
+
+        let repo = base.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&["init", "--quiet"], &repo);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "x"], &repo);
+        let repo_git = repo.join(".git");
+
+        let wt = base.join("wt");
+        git(
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "b2",
+                wt.to_str().unwrap(),
+            ],
+            &repo,
+        );
+
+        let bare = base.join("bare.git");
+        std::fs::create_dir(&bare).unwrap();
+        git(&["init", "--bare", "--quiet"], &bare);
+
+        let plain = base.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        // An ordinary repo root resolves to <root>/.git, which the path-shaped
+        // denies already cover — filtered out, not emitted twice.
+        assert!(
+            extra_git_dirs(std::slice::from_ref(&repo)).is_empty(),
+            "an ordinary repo root must be dropped by dir != root.join(\".git\")"
+        );
+        // A non-repo grant is a no-op, never an error. (Guarded: a tempdir
+        // inside a checkout would make git walk up and find that repo.)
+        if crate::discover::git_dir_of(&base).is_none() {
+            assert!(
+                extra_git_dirs(&[plain.clone(), base.join("gone")]).is_empty(),
+                "a non-repo and a missing path must contribute nothing"
+            );
+        }
+        // A worktree needs the MAIN repo's .git; a bare repo needs itself.
+        // Neither is reachable through the <root>/.git rules.
+        assert_eq!(
+            extra_git_dirs(&[wt.clone(), bare.clone()]),
+            vec![bare.clone(), repo_git.clone()],
+            "worktree must resolve to the main repo's .git, bare repo to itself (sorted)"
+        );
+        // Every shape at once, with the worktree granted twice: deduplicated.
+        assert_eq!(
+            extra_git_dirs(&[wt.clone(), repo, plain, bare.clone(), wt]),
+            vec![bare, repo_git],
+            "overlapping and repeated grants must not emit duplicate denies"
+        );
+    }
 }

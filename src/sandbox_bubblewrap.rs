@@ -464,38 +464,54 @@ fn create_mask_placeholder(scratch: &Path) -> Result<PathBuf, String> {
 /// blocks the user's *next* out-of-sandbox git. This also matches the git
 /// command guard, which explicitly allows `git config user.name`.
 ///
+/// This trade was made for the *project's own* repository, so it is worth
+/// asking whether it still holds for a `git_common_dir` the agent had a hand in
+/// choosing. It does, now: `commondir` inside a gitdir is agent-writable and
+/// git reads it for any gitdir, so a planted one used to make
+/// `git rev-parse --git-common-dir` name a different repository — and this ro-
+/// protect set follows `git_common_dir`, so on Linux that yielded a writable
+/// `.git/config` in a repo the user will later `git pull`, i.e. `core.hooksPath`
+/// in someone else's repo. `discover::git_common_dir` now rejects a steered
+/// value, so the only common dir that reaches here is the main repo of a real
+/// worktree of the user's own project — exactly the case the trade above is
+/// about, where `git config user.email` is a normal thing for an agent to do.
+/// The set is therefore left as it is. Were the source-level check ever
+/// removed, `config` would have to be added here.
+///
 /// RESIDUAL: because `.git/config` stays writable, an agent can still set
 /// `core.hooksPath` to redirect hooks to a writable directory. The read-only
 /// `.git/hooks` bind therefore only mitigates the *direct* persistence vector
 /// (planting a hook file); it is not a complete closure of git-hook
 /// persistence. See SECURITY.md for the full residual discussion.
 ///
-/// # Worktrees
+/// # Every writable root, not just the project
 ///
-/// In a git **worktree**, `<project>/.git` is a *file* (a gitdir pointer), so
-/// `<project>/.git/hooks` does not exist and the real hooks live under the
-/// shared common dir (`<git_common_dir>/hooks`) — which the sandbox grants
-/// write access to. Protecting only the project's `.git/hooks` would therefore
-/// miss the actual persistence vector for worktrees. When `git_common_dir` is
-/// known (worktree case) and differs from `<project>/.git`, we ALSO protect
-/// `<git_common_dir>/hooks`. Non-existent paths are skipped downstream (see
-/// [`build_bwrap_args`]).
-pub(crate) fn git_persistence_paths(
-    project_dir: &Path,
-    git_common_dir: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut paths = vec![
-        project_dir.join(".git/hooks"),
-        project_dir.join(".cplt.toml"),
-    ];
-    // Worktree: the shared common dir holds the real hooks. `git_common_dir` is
-    // only `Some` for a worktree (see `discover::git_common_dir`), but guard on
-    // it differing from `<project>/.git` so a regular repo never double-binds.
-    if let Some(common) = git_common_dir
-        && common != project_dir.join(".git")
-    {
-        paths.push(common.join("hooks"));
+/// `write_roots` is the project directory **plus every `allow.write` grant**.
+/// Before #212 only the project was protected, so a sibling repo granted with
+/// `--allow-write` had a fully writable `.git/hooks` — and a hook planted there
+/// runs *unsandboxed* on the user's next git operation in that repo.
+///
+/// # Worktrees, bare repos
+///
+/// In a git **worktree**, `<root>/.git` is a *file* (a gitdir pointer), so
+/// `<root>/.git/hooks` does not exist and the real hooks live under the shared
+/// common dir; in a **bare** repo they live at `<root>/hooks`. `git_dirs`
+/// carries those resolved `.git` directories (the project's `git_common_dir`
+/// plus one per granted path that needs it — see `discover::git_dir_of`), and
+/// each contributes a `hooks` protection. Non-existent paths are skipped
+/// downstream (see [`build_bwrap_args`]), and the result is deduplicated, so
+/// overlapping roots never double-bind.
+pub(crate) fn git_persistence_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(write_roots.len() * 2 + git_dirs.len());
+    for root in write_roots {
+        paths.push(root.join(".git/hooks"));
+        paths.push(root.join(".cplt.toml"));
     }
+    for dir in git_dirs {
+        paths.push(dir.join("hooks"));
+    }
+    paths.sort();
+    paths.dedup();
     paths
 }
 
@@ -940,7 +956,7 @@ mod tests {
         let hooks_str = hooks.to_string_lossy().into_owned();
 
         let rules = vec![writable_rule(&proj_str)];
-        let ro = git_persistence_paths(proj.path(), None);
+        let ro = git_persistence_paths(&[proj.path()], &[]);
         let args = build_bwrap_args(&rules, &ro, &DenyMasks::default());
 
         let proj_bind_idx = args
@@ -971,7 +987,7 @@ mod tests {
 
         let proj_str = proj.path().to_string_lossy().into_owned();
         let rules = vec![writable_rule(&proj_str)];
-        let ro = git_persistence_paths(proj.path(), None);
+        let ro = git_persistence_paths(&[proj.path()], &[]);
         let args = build_bwrap_args(&rules, &ro, &DenyMasks::default());
 
         // .git/hooks and .cplt.toml are re-bound read-only.
@@ -1006,7 +1022,7 @@ mod tests {
         // probe) and cannot protect a not-yet-created file anyway — skip it.
         let proj = tempfile::tempdir().expect("tempdir");
         // No .git/hooks or .cplt.toml created.
-        let ro = git_persistence_paths(proj.path(), None);
+        let ro = git_persistence_paths(&[proj.path()], &[]);
         let args = build_bwrap_args(&[], &ro, &DenyMasks::default());
         assert!(
             !args
@@ -1028,7 +1044,7 @@ mod tests {
         std::fs::create_dir_all(&common_hooks).expect("create common hooks");
 
         let proj = tempfile::tempdir().expect("tempdir"); // worktree checkout
-        let ro = git_persistence_paths(proj.path(), Some(common.path()));
+        let ro = git_persistence_paths(&[proj.path()], &[common.path()]);
 
         assert!(
             ro.contains(&common_hooks),
@@ -1052,12 +1068,50 @@ mod tests {
         // (a non-worktree), it must NOT be added a second time — the standard
         // <project>/.git/hooks entry already covers it.
         let proj = tempfile::tempdir().expect("tempdir");
-        let ro = git_persistence_paths(proj.path(), Some(&proj.path().join(".git")));
+        let git_dir = proj.path().join(".git");
+        let ro = git_persistence_paths(&[proj.path()], &[&git_dir]);
         let hooks = proj.path().join(".git/hooks");
         assert_eq!(
             ro.iter().filter(|p| **p == hooks).count(),
             1,
             "the project's .git/hooks must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn granted_sibling_repo_hooks_are_protected() {
+        // #212: a repo granted via `allow.write` is a second writable root. Its
+        // .git/hooks must be re-bound read-only too — a hook planted there runs
+        // OUTSIDE the sandbox on the user's next git operation in that repo.
+        let proj = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(proj.path().join(".git/hooks")).expect("project hooks");
+        let sibling = tempfile::tempdir().expect("tempdir");
+        let sibling_hooks = sibling.path().join(".git/hooks");
+        std::fs::create_dir_all(&sibling_hooks).expect("sibling hooks");
+
+        let ro = git_persistence_paths(&[proj.path(), sibling.path()], &[]);
+        assert!(
+            ro.contains(&sibling_hooks),
+            "a granted repo's .git/hooks must be in the ro_protect set"
+        );
+
+        let rules = vec![
+            writable_rule(&proj.path().to_string_lossy()),
+            writable_rule(&sibling.path().to_string_lossy()),
+        ];
+        let args = build_bwrap_args(&rules, &ro, &DenyMasks::default());
+        let hooks_str = sibling_hooks.to_string_lossy().into_owned();
+        let sibling_bind_idx = args
+            .windows(2)
+            .position(|w| w[0] == "--bind" && w[1] == sibling.path().to_string_lossy())
+            .expect("granted sibling must be bound writable");
+        let hooks_ro_idx = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == hooks_str && w[2] == hooks_str)
+            .expect("granted repo hooks must be re-bound read-only");
+        assert!(
+            hooks_ro_idx > sibling_bind_idx,
+            "the read-only hooks bind must come AFTER the writable grant"
         );
     }
 
@@ -1100,7 +1154,7 @@ mod tests {
         assert_eq!(masks.mask_count(), 1);
 
         let rules = [writable_rule(&base.path().to_string_lossy())];
-        let ro = git_persistence_paths(&hooks_proj, None);
+        let ro = git_persistence_paths(&[&hooks_proj], &[]);
         let args = build_bwrap_args(&rules, &ro, &masks);
 
         let canon = secret

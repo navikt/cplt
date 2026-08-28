@@ -77,6 +77,12 @@ pub struct ProfileOptions<'a> {
     /// When the project is a worktree, git needs read+write access to the main
     /// repo's .git directory (objects, refs, packed-refs, etc.).
     pub git_common_dir: Option<&'a Path>,
+    /// Resolved `.git` directories of writable granted paths (`extra_write`)
+    /// whose real `.git` is not `<path>/.git` — a worktree, a bare repo, or a
+    /// grant pointing inside a repo. Deny-only: the profile never *grants*
+    /// access to these, it only places the hooks/config write denies there so a
+    /// sibling repo cannot be used for hook persistence (#212).
+    pub extra_git_dirs: &'a [PathBuf],
     /// Allow GPG commit/tag signing. When true, grants read-only access to
     /// the public keyring and GPG agent socket. Private keys stay denied.
     pub allow_gpg_signing: bool,
@@ -213,7 +219,17 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     // Sensitive project file denies MUST come after all user-configured allows.
     // SBPL uses last-match-wins, so a user allow like `allow.read = ["~/Repos"]`
     // would override the .env deny if emitted before it.
-    emit_sensitive_project_denies(&mut sb, &project, opts.allow_env_files);
+    emit_sensitive_project_denies(&mut sb, &project, opts.extra_write, opts.allow_env_files);
+    // Same reason, and one more: the worktree common-dir allow is emitted early
+    // (so DENIED_DOTFILES still wins over it), which would leave its denies
+    // reopenable by any later allow if they were emitted alongside it.
+    emit_git_persistence_denies(
+        &mut sb,
+        &project,
+        opts.extra_write,
+        opts.git_common_dir,
+        opts.extra_git_dirs,
+    );
     // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
     // when a user allow.write covers them (write-then-exec).
     emit_dotnet_exec_denies(&mut sb, opts.dotnet_root);
@@ -275,28 +291,72 @@ fn emit_project_access(sb: &mut String, project: &str) {
     sbpl!(sb);
 }
 
-fn emit_sensitive_project_denies(sb: &mut String, project: &str, allow_env_files: bool) {
+/// Writable roots whose git-persistence paths must be denied: the project plus
+/// every `--allow-write` / `allow.write` grant, deduplicated, in that order.
+///
+/// #212: the denies used to carry a literal `{project}` prefix, so a sibling
+/// repo granted via `allow.write` had a fully writable `.git/hooks` — and hooks
+/// run *outside* the sandbox on the user's next git operation there.
+///
+/// Emitting the `{root}/.git/…` rules unconditionally (rather than only for
+/// paths that are git repos today) is deliberate: it costs nothing for a
+/// non-repo grant, and it covers a repo the agent creates mid-session with
+/// `git init` **at the grant root itself**.
+///
+/// KNOWN GAP — only the root is ever covered, never a subdirectory of it.
+/// `--allow-write ~/work` denies `~/work/.git/hooks`, but
+/// `~/work/proj/.git/hooks` stays writable, whether `proj` was already a repo
+/// at launch or the agent creates one there during the session. This is the
+/// same shape as granting a directory that merely *contains* repos (#212's
+/// third scope bullet) and is not closed here: it needs either a repo walk at
+/// launch or a global path regex, and the regex is macOS-only — it would give
+/// Landlock nothing and widen the platform divergence. There is no dedicated
+/// issue for it: it is tracked as a checklist item under the multi-repo work in
+/// #165, alongside the same gap for a `--project-dir` that contains repos.
+fn writable_roots(project: &str, extra_write: &[PathBuf]) -> Vec<String> {
+    let mut roots = vec![project.to_string()];
+    for p in extra_write {
+        let s = p.to_string_lossy().into_owned();
+        if !roots.contains(&s) {
+            roots.push(s);
+        }
+    }
+    roots
+}
+
+fn emit_sensitive_project_denies(
+    sb: &mut String,
+    project: &str,
+    extra_write: &[PathBuf],
+    allow_env_files: bool,
+) {
     // All security-critical project denies are emitted LAST in the profile.
     // SBPL uses last-match-wins, so these must come after all user-configured
     // allows (e.g. `allow.write = ["~/Repos"]`) to guarantee they cannot be
     // overridden by broad parent-path allows.
 
-    // Git persistence prevention — deny writes to files that execute outside the sandbox.
-    // .git/hooks/ — post-checkout, pre-push etc. run outside sandbox on next git operation
-    // .git/config — core.hooksPath can redirect hooks to /tmp, bypassing the hooks deny;
-    //               url.*.insteadOf can hijack git remotes; include.path loads arbitrary config
-    // .gitmodules — submodule URLs are a supply chain vector (git submodule update clones them)
-    sbpl!(sb, ";; Git persistence prevention");
-    sbpl!(sb, "(deny file-write* (subpath \"{project}/.git/hooks\"))");
-    sbpl!(sb, "(deny file-write* (literal \"{project}/.git/config\"))");
-    sbpl!(sb, "(deny file-write* (literal \"{project}/.gitmodules\"))");
+    let roots = writable_roots(project, extra_write);
+
+    // .gitmodules — submodule URLs are a supply chain vector (git submodule update clones them).
+    // The rules naming paths inside a git directory live in `emit_gitdir_denies`,
+    // which runs for the project's `.git`, for a worktree's shared common dir,
+    // and — since #212 — for every other writable root and its resolved gitdir.
+    //
+    // Emitted for EVERY writable root, not just the project (#212).
+    sbpl!(sb, ";; Git submodule config");
+    for root in &roots {
+        sbpl!(sb, "(deny file-write* (literal \"{root}/.gitmodules\"))");
+    }
     sbpl!(sb);
 
     // Repo config tamper prevention — agent cannot modify its own sandbox config.
     // The agent has project write access, but .cplt.toml controls sandbox relaxation.
     // Writing it would let the agent prepare malicious config for the next session.
+    // A granted sibling repo is a future `--project-dir`, so it needs this too.
     sbpl!(sb, ";; Repo config — deny write to prevent tampering");
-    sbpl!(sb, "(deny file-write* (literal \"{project}/.cplt.toml\"))");
+    for root in &roots {
+        sbpl!(sb, "(deny file-write* (literal \"{root}/.cplt.toml\"))");
+    }
     sbpl!(sb);
 
     // Sensitive project files — deny read AND write of .env*, .pem, .key etc.
@@ -595,18 +655,143 @@ fn emit_git_hooks(sb: &mut String, git_hooks_path: Option<&Path>) {
 
 /// Grant access to the shared .git directory for git worktrees.
 /// Git worktrees share objects, refs, and packed-refs with the main repo.
-/// Security denies (hooks, config) are applied to the common dir too.
+///
+/// Only the *allows* live here. The matching denies are emitted at the very end
+/// of the profile by [`emit_git_persistence_denies`]: SBPL is last-match-wins,
+/// so denies placed here could be re-opened by a later user allow (a broad
+/// `allow.write = ["~/Repos"]` covering the main repo would have done exactly
+/// that).
 fn emit_git_worktree(sb: &mut String, git_common_dir: Option<&Path>) {
     if let Some(common) = git_common_dir {
         let p = common.to_string_lossy();
         sbpl!(sb, ";; Git worktree shared directory");
         sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
         sbpl!(sb, "(allow file-write* (subpath \"{p}\"))");
-        // Apply the same security denies as the project .git directory
-        sbpl!(sb, "(deny file-write* (subpath \"{p}/hooks\"))");
-        sbpl!(sb, "(deny file-write* (literal \"{p}/config\"))");
         sbpl!(sb);
     }
+}
+
+/// Deny every path inside a git directory that names content git will later
+/// execute or trust, for the project's own `.git` and for a worktree's shared
+/// common dir.
+///
+/// Emitted LAST in the profile (last-match-wins), so no user allow can reopen it.
+///
+/// # Why the gitdir itself is denied
+///
+/// Every other rule here is a path *literal* or *subpath*. Path-shaped rules
+/// only hold while the path keeps denoting the object it protects, and the
+/// agent had write access to the gitdir's parent, so it could rename the whole
+/// directory out from under them:
+///
+/// ```text
+/// mv .git .gitbak                     # no rule names `.git` itself
+/// > .gitbak/hooks/post-checkout       # no rule names `.gitbak/...`
+/// >> .gitbak/config                   # core.hooksPath = /tmp/evilhooks
+/// mv .gitbak .git                     # both files are now live
+/// ```
+///
+/// `file-write-unlink` on the gitdir is what closes that: Seatbelt checks it on
+/// the *source* of a rename and on unlink/rmdir, so the directory can no longer
+/// be moved or removed, and the rules below keep meaning what they say. It does
+/// not restrict writes *inside* the directory, so the index, refs, objects and
+/// lock files all stay writable (verified with `sandbox-exec`).
+///
+/// `file-write-data` covers the worktree shape, where `<project>/.git` is a
+/// gitdir *pointer file* rather than a directory: rewriting its contents would
+/// aim the user's next git at an attacker-supplied gitdir. Directories are not
+/// written through `write()`, so this rule is inert for a normal repo, and it
+/// is not `file-write-create` — that would break `git init` in a project that
+/// has no repo yet.
+fn emit_gitdir_denies(sb: &mut String, gitdir: &str) {
+    sbpl!(sb, ";; Git persistence prevention — {gitdir}");
+    // Pins the name to the directory: no rename, no rmdir (see fn docs).
+    sbpl!(sb, "(deny file-write-unlink (literal \"{gitdir}\"))");
+    sbpl!(sb, "(deny file-write-data (literal \"{gitdir}\"))");
+    // hooks/ — post-checkout, pre-push etc. run outside the sandbox on the
+    // user's next git operation.
+    sbpl!(sb, "(deny file-write* (subpath \"{gitdir}/hooks\"))");
+    // config — core.hooksPath redirects hooks to a writable directory,
+    // url.*.insteadOf hijacks remotes, include.path loads arbitrary config.
+    sbpl!(sb, "(deny file-write* (literal \"{gitdir}/config\"))");
+    // commondir — git reads it for ANY gitdir, not just worktrees, and its
+    // contents become `git rev-parse --git-common-dir`. cplt feeds that value
+    // into the profile as a read+write grant, so a planted commondir is an
+    // input to cplt's own policy: it points the next run's grant at another
+    // repository. `discover::git_common_dir` rejects a steered value at the
+    // source; this stops it being planted in the first place.
+    sbpl!(sb, "(deny file-write* (literal \"{gitdir}/commondir\"))");
+    // modules/<name>/ is a full gitdir per submodule, with the same hooks and
+    // config vectors one level down — `<gitdir>/modules/sub/hooks/post-checkout`
+    // and `<gitdir>/modules/sub/config` were both writable. The whole subtree is
+    // denied rather than those two names: submodule gitdirs nest arbitrarily
+    // deep (`modules/a/modules/b/...`) and SBPL subpaths have no wildcard.
+    // Nothing is lost by being broad — `git submodule add` and
+    // `update --init` already fail inside the sandbox, because both write
+    // `<gitdir>/config`, which has been denied since long before this change.
+    sbpl!(sb, "(deny file-write* (subpath \"{gitdir}/modules\"))");
+    sbpl!(sb);
+}
+
+/// All git-directory denies, emitted last so no earlier allow can reopen them.
+///
+/// #212: emitted for the project's `.git` **and** for every `allow.write`
+/// grant's `.git`, plus the resolved gitdir of any root whose repo data does
+/// not live at `<root>/.git` — a worktree, a bare repo, or a grant pointing
+/// inside a repo (see `discover::git_dir_of`). A granted sibling repo is as
+/// much a persistence vector as the project: hooks planted there run outside
+/// the sandbox on the user's next git operation in that repo.
+///
+/// `<root>/.git` is emitted for every writable root unconditionally, even one
+/// that is not a repo today, so a repo the agent creates mid-session with
+/// `git init` at the grant root is covered too.
+fn emit_git_persistence_denies(
+    sb: &mut String,
+    project: &str,
+    extra_write: &[PathBuf],
+    git_common_dir: Option<&Path>,
+    extra_git_dirs: &[PathBuf],
+) {
+    let mut gitdirs: Vec<String> = writable_roots(project, extra_write)
+        .iter()
+        .map(|root| format!("{root}/.git"))
+        .collect();
+    for dir in git_common_dir
+        .map(|c| c.to_string_lossy().into_owned())
+        .into_iter()
+        .chain(
+            extra_git_dirs
+                .iter()
+                .map(|d| d.to_string_lossy().into_owned()),
+        )
+    {
+        if !gitdirs.contains(&dir) {
+            gitdirs.push(dir);
+        }
+    }
+    for gitdir in &gitdirs {
+        emit_gitdir_denies(sb, gitdir);
+    }
+    // `<gitdir>/worktrees/<name>/config.worktree` is read as repository config
+    // when `extensions.worktreeConfig` is set, so it is another core.hooksPath
+    // vector — one per worktree. `<name>` is unknown when the profile is
+    // generated and SBPL subpaths have no wildcard, so this matches by suffix
+    // instead. Denying `worktrees/` wholesale is not an option: `git worktree
+    // add` and every operation inside a worktree write HEAD, index and logs
+    // there. Nothing legitimate writes this file from inside the sandbox —
+    // `git config --worktree` first needs `extensions.worktreeConfig`, which is
+    // a denied `<gitdir>/config` write.
+    //
+    // `<gitdir>/worktrees/<name>/commondir` is NOT denied, deliberately. It is
+    // the same steering primitive as the top-level `commondir` above, but `git
+    // worktree add` writes exactly this file (containing `../..`) for every
+    // worktree it creates, so denying it would break a command that has to keep
+    // working. `discover::git_common_dir` rejects a steered value, which closes
+    // the escalation without costing that; the top-level `commondir` deny is
+    // free only because nothing legitimate ever writes it.
+    sbpl!(sb, ";; Per-worktree git config (core.hooksPath vector)");
+    sbpl!(sb, "(deny file-write* (regex #\"/config\\.worktree$\"))");
+    sbpl!(sb);
 }
 
 fn emit_tool_dirs(
@@ -1579,6 +1764,7 @@ mod tests {
             dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
+            extra_git_dirs: &[],
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,
@@ -1713,6 +1899,61 @@ mod tests {
         assert_deny_after_allow(
             r#"(allow file-read* (subpath "/Users/test/.gradle"))"#,
             r#"(deny file-read* (literal "/Users/test/.gradle/gradle.properties"))"#,
+        );
+
+        // The worktree block is only emitted when there IS a common dir, and
+        // `test_options` has none — so re-generate with one. Without this the
+        // two orderings below are never exercised at all.
+        let common = std::path::Path::new("/Users/test/main/.git");
+        let mut opts = test_options(project, home);
+        opts.git_common_dir = Some(common);
+        // A user allow broad enough to cover the main repo: the worktree denies
+        // used to sit next to the worktree allow, where this would reopen them.
+        let extra_write = [std::path::PathBuf::from("/Users/test")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts);
+
+        let assert_deny_after_allow = |allow: &str, deny: &str| {
+            let a = p
+                .find(allow)
+                .unwrap_or_else(|| panic!("expected allow rule missing from profile: {allow}"));
+            let d = p
+                .find(deny)
+                .unwrap_or_else(|| panic!("expected deny rule missing from profile: {deny}"));
+            assert!(
+                a < d,
+                "SBPL last-match-wins violated: deny must come AFTER its allow.\n  \
+                 allow @ {a}: {allow}\n  deny  @ {d}: {deny}"
+            );
+        };
+
+        // The worktree grant hands out read+write on the main repo's .git, which
+        // can sit anywhere under $HOME — including inside a DENIED_DOTFILES
+        // directory. Those denies beat it only because `emit_deny_rules` runs
+        // after `emit_git_worktree`, which nothing asserted before now.
+        assert_deny_after_allow(
+            r#"(allow file-read* (subpath "/Users/test/main/.git"))"#,
+            r#"(deny file-read* (subpath "/Users/test/.ssh"))"#,
+        );
+        assert_deny_after_allow(
+            r#"(allow file-write* (subpath "/Users/test/main/.git"))"#,
+            r#"(deny file-write* (subpath "/Users/test/.ssh"))"#,
+        );
+
+        // And the worktree's own persistence denies must outlast every allow,
+        // the user's included — which is why they are emitted at the end of the
+        // profile rather than beside the grant they qualify.
+        assert_deny_after_allow(
+            r#"(allow file-write* (subpath "/Users/test"))"#,
+            r#"(deny file-write* (subpath "/Users/test/main/.git/hooks"))"#,
+        );
+        assert_deny_after_allow(
+            r#"(allow file-write* (subpath "/Users/test"))"#,
+            r#"(deny file-write* (literal "/Users/test/main/.git/config"))"#,
+        );
+        assert_deny_after_allow(
+            r#"(allow file-write* (subpath "/Users/test"))"#,
+            r#"(deny file-write-unlink (literal "/Users/test/main/.git"))"#,
         );
     }
 

@@ -489,6 +489,138 @@ fi
         )
     }
 
+    /// Script that walks the git-persistence denies around by renaming the
+    /// gitdir. Every deny in the profile names a path *inside* `.git`, so if
+    /// `.git` itself can be renamed the writes land under a name no rule
+    /// mentions — and renaming it back makes them live.
+    fn script_gitdir_rename_bypass(project_path: &str) -> String {
+        format!(
+            r#"
+if mv "{project_path}/.git" "{project_path}/.gitbak" 2>/dev/null; then
+    echo "RESULT:gitdir_rename_away:OK"
+else
+    echo "RESULT:gitdir_rename_away:FAIL"
+fi
+
+# These only reach the filesystem if the rename above succeeded.
+if echo '#!/bin/sh' > "{project_path}/.gitbak/hooks/post-checkout" 2>/dev/null; then
+    echo "RESULT:renamed_hook_write:OK"
+else
+    echo "RESULT:renamed_hook_write:FAIL"
+fi
+
+if printf '[core]\n\thooksPath = /tmp/evilhooks\n' >> "{project_path}/.gitbak/config" 2>/dev/null; then
+    echo "RESULT:renamed_config_write:OK"
+else
+    echo "RESULT:renamed_config_write:FAIL"
+fi
+
+if mv "{project_path}/.gitbak" "{project_path}/.git" 2>/dev/null; then
+    echo "RESULT:gitdir_rename_back:OK"
+else
+    echo "RESULT:gitdir_rename_back:FAIL"
+fi
+
+# Removing the gitdir outright is the same primitive without the restore.
+if rm -rf "{project_path}/.git" 2>/dev/null; then
+    echo "RESULT:gitdir_remove:OK"
+else
+    echo "RESULT:gitdir_remove:FAIL"
+fi
+"#
+        )
+    }
+
+    /// Script that goes after the gitdirs *nested* inside `.git`, which the
+    /// top-level `hooks`/`config` denies never named.
+    fn script_nested_gitdir_persistence(project_path: &str) -> String {
+        format!(
+            r#"
+# Submodule gitdirs are full gitdirs one level down.
+if mkdir -p "{project_path}/.git/modules/sub/hooks" 2>/dev/null \
+   && echo '#!/bin/sh' > "{project_path}/.git/modules/sub/hooks/post-checkout" 2>/dev/null; then
+    echo "RESULT:submodule_hook_write:OK"
+else
+    echo "RESULT:submodule_hook_write:FAIL"
+fi
+
+if mkdir -p "{project_path}/.git/modules/sub" 2>/dev/null \
+   && printf '[core]\n\thooksPath = /tmp/evilhooks\n' > "{project_path}/.git/modules/sub/config" 2>/dev/null; then
+    echo "RESULT:submodule_config_write:OK"
+else
+    echo "RESULT:submodule_config_write:FAIL"
+fi
+
+# Per-worktree config, read as repo config when extensions.worktreeConfig is set.
+if mkdir -p "{project_path}/.git/worktrees/wt" 2>/dev/null \
+   && printf '[core]\n\thooksPath = /tmp/evilhooks\n' > "{project_path}/.git/worktrees/wt/config.worktree" 2>/dev/null; then
+    echo "RESULT:worktree_config_write:OK"
+else
+    echo "RESULT:worktree_config_write:FAIL"
+fi
+
+# commondir steers `git rev-parse --git-common-dir`, i.e. cplt's own grant.
+if printf '/tmp/elsewhere' > "{project_path}/.git/commondir" 2>/dev/null; then
+    echo "RESULT:commondir_write:OK"
+else
+    echo "RESULT:commondir_write:FAIL"
+fi
+"#
+        )
+    }
+
+    /// Script running the git operations that must keep working. The gitdir
+    /// denies are only acceptable because none of these touch them: the index,
+    /// refs, objects and lock files all live inside `.git`, and only the
+    /// directory *entry* is pinned, not its contents.
+    fn script_git_legit_ops(project_path: &str) -> String {
+        format!(
+            r#"
+cd "{project_path}"
+if git status --porcelain >/dev/null 2>&1; then echo "RESULT:git_status:OK"; else echo "RESULT:git_status:FAIL"; fi
+
+echo change >> README.md
+if git add -A >/dev/null 2>&1 && git commit -qm second >/dev/null 2>&1; then
+    echo "RESULT:git_commit:OK"
+else
+    echo "RESULT:git_commit:FAIL"
+fi
+
+if git checkout -q -b side >/dev/null 2>&1 && git checkout -q - >/dev/null 2>&1; then
+    echo "RESULT:git_checkout:OK"
+else
+    echo "RESULT:git_checkout:FAIL"
+fi
+
+echo more >> README.md
+if git stash -q >/dev/null 2>&1 && git stash pop -q >/dev/null 2>&1; then
+    echo "RESULT:git_stash:OK"
+else
+    echo "RESULT:git_stash:FAIL"
+fi
+
+if git checkout -q side >/dev/null 2>&1 \
+   && echo r >> README.md && git add -A >/dev/null 2>&1 \
+   && git commit -qm onside >/dev/null 2>&1 \
+   && git rebase -q main >/dev/null 2>&1; then
+    echo "RESULT:git_rebase:OK"
+else
+    echo "RESULT:git_rebase:FAIL"
+fi
+
+# Destination must be inside the project dir — nothing outside it is writable.
+if git worktree add -q -b wtbranch "{project_path}/wt" >/dev/null 2>&1; then
+    echo "RESULT:git_worktree_add:OK"
+else
+    echo "RESULT:git_worktree_add:FAIL"
+fi
+
+if git gc -q >/dev/null 2>&1; then echo "RESULT:git_gc:OK"; else echo "RESULT:git_gc:FAIL"; fi
+if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESULT:git_reflog:FAIL"; fi
+"#
+        )
+    }
+
     // ============================================================
     // Per-language happy-path tests
     // ============================================================
@@ -699,6 +831,274 @@ fi
         assert_result_fail(&stdout, "git_hook_write");
         assert_result_fail(&stdout, "git_config_write");
         assert_result_fail(&stdout, "gitmodules_write");
+    }
+
+    /// The gitdir denies must not cost any git operation an agent actually needs.
+    ///
+    /// Denying `.git` as a subpath would stop the rename bypass just as well and
+    /// break all of these, since index, refs and objects all live there. This is
+    /// the test that says the narrower rule was the right one.
+    #[test]
+    fn project_legit_git_operations_still_work() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+
+        let project_path = project.canonical_path().to_string_lossy().to_string();
+        let script = script_git_legit_ops(&project_path);
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        for op in [
+            "git_status",
+            "git_commit",
+            "git_checkout",
+            "git_stash",
+            "git_rebase",
+            "git_worktree_add",
+            "git_gc",
+            "git_reflog",
+        ] {
+            assert_result_ok(&stdout, op);
+        }
+    }
+
+    /// The persistence denies must reach the gitdirs nested inside `.git`.
+    ///
+    /// `hooks` and `config` were denied only at the top level, so a submodule's
+    /// own gitdir under `.git/modules/<name>/` had both wide open, as did
+    /// `.git/worktrees/<name>/config.worktree`.
+    #[test]
+    fn project_nested_gitdir_persistence_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+
+        let project_path = project.canonical_path().to_string_lossy().to_string();
+        let script = script_nested_gitdir_persistence(&project_path);
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_fail(&stdout, "submodule_hook_write");
+        assert_result_fail(&stdout, "submodule_config_write");
+        assert_result_fail(&stdout, "worktree_config_write");
+        assert_result_fail(&stdout, "commondir_write");
+
+        // Filesystem truth, not just the sandboxed shell's own view.
+        let git_dir = project.path().join(".git");
+        for planted in [
+            "modules/sub/hooks/post-checkout",
+            "modules/sub/config",
+            "worktrees/wt/config.worktree",
+            "commondir",
+        ] {
+            assert!(
+                !git_dir.join(planted).exists(),
+                ".git/{planted} was planted despite the deny"
+            );
+        }
+    }
+
+    /// The git-persistence denies must survive a rename of the gitdir.
+    ///
+    /// Denying `.git/hooks` and `.git/config` by path is only worth anything
+    /// while those paths keep denoting the files they protect. The agent has
+    /// write access to the whole project tree, so before this was fixed it
+    /// could `mv .git .gitbak`, write both protected files under the new name,
+    /// and `mv .gitbak .git` back — the hook then runs unsandboxed on the
+    /// user's next `git checkout`.
+    ///
+    /// The assertions are filesystem facts after the run, not just the
+    /// sandboxed shell's own view: a bypass that somehow reported FAIL while
+    /// still landing the files would fail this test.
+    #[test]
+    fn project_gitdir_rename_bypass_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+
+        let project_path = project.canonical_path().to_string_lossy().to_string();
+        let script = script_gitdir_rename_bypass(&project_path);
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The rename is the primitive — it must be refused outright.
+        assert_result_fail(&stdout, "gitdir_rename_away");
+        assert_result_fail(&stdout, "gitdir_remove");
+        assert_result_fail(&stdout, "renamed_hook_write");
+        assert_result_fail(&stdout, "renamed_config_write");
+
+        // Filesystem truth: the gitdir is still where it was, and neither
+        // payload landed.
+        let git_dir = project.path().join(".git");
+        assert!(
+            git_dir.is_dir(),
+            "the gitdir must still be a directory at .git after the run"
+        );
+        assert!(
+            !project.path().join(".gitbak").exists(),
+            ".gitbak must not exist — the gitdir was never renamed away"
+        );
+        assert!(
+            !git_dir.join("hooks/post-checkout").exists(),
+            "a post-checkout hook was planted — it would run unsandboxed on the \
+             user's next git checkout"
+        );
+        let config = fs::read_to_string(git_dir.join("config")).unwrap_or_default();
+        assert!(
+            !config.contains("hooksPath"),
+            "core.hooksPath was injected into .git/config, redirecting hooks \
+             outside the sandbox.\nconfig: {config}"
+        );
+    }
+
+    /// #212: a repo granted via `--allow-write` is a second writable root, and
+    /// before the fix its `.git/hooks` was fully writable — a hook planted there
+    /// runs OUTSIDE the sandbox on the user's next git operation in that repo.
+    ///
+    /// The `write_control` result is what keeps this test honest: it proves the
+    /// grant really is writable, so a FAIL on the hook write means the deny
+    /// fired, not that the whole sibling was unreachable.
+    #[test]
+    fn granted_sibling_repo_git_hooks_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let sibling = TempProject::new("sibling");
+        sibling.write_file("README.md", "# sibling\n");
+        sibling.git_init();
+        fs::create_dir_all(sibling.path().join(".git/hooks")).ok();
+        fs::write(sibling.path().join(".gitmodules"), "").ok();
+
+        let sibling_path = sibling.canonical_path().to_string_lossy().to_string();
+        let mut script = script_git_persistence(&sibling_path);
+        write!(
+            script,
+            r#"
+if echo ok > "{sibling_path}/scratch.txt" 2>/dev/null; then
+    echo "RESULT:write_control:OK"
+else
+    echo "RESULT:write_control:FAIL"
+fi
+"#
+        )
+        .unwrap();
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--allow-write", &sibling_path]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The grant is real: ordinary files in the sibling ARE writable.
+        assert_result_ok(&stdout, "write_control");
+        // ...but its git-persistence paths are not.
+        assert_result_fail(&stdout, "git_hook_write");
+        assert_result_fail(&stdout, "git_config_write");
+        assert_result_fail(&stdout, "gitmodules_write");
+    }
+
+    /// #212, the resolver half: a **bare** repo keeps its hooks at `<root>/hooks`,
+    /// not `<root>/.git/hooks`, so the path-shaped denies cannot see them — only
+    /// `discover::git_dir_of` can. The same resolution covers a granted worktree,
+    /// whose real hooks live in the main repo's shared `.git`.
+    #[test]
+    fn granted_bare_repo_hooks_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let bare = TempProject::new("bare");
+        let status = Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(status.success(), "git init --bare should succeed");
+
+        let bare_path = bare.canonical_path().to_string_lossy().to_string();
+        let script = format!(
+            r#"
+if echo '#!/bin/sh' > "{bare_path}/hooks/post-receive" 2>/dev/null; then
+    echo "RESULT:bare_hook_write:OK"
+else
+    echo "RESULT:bare_hook_write:FAIL"
+fi
+if echo ok > "{bare_path}/scratch.txt" 2>/dev/null; then
+    echo "RESULT:write_control:OK"
+else
+    echo "RESULT:write_control:FAIL"
+fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--allow-write", &bare_path]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "write_control");
+        assert_result_fail(&stdout, "bare_hook_write");
+    }
+
+    /// #214: the post-session audit runs git in `project_dir` only. A session
+    /// that rewrote a repo granted via `allow.write` still printed "no project
+    /// file changes" — an absence of information rendered as a clean bill of
+    /// health. The report must now name what it did not look at.
+    #[test]
+    fn audit_names_writable_roots_it_did_not_audit() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let sibling = TempProject::new("audit-sibling");
+        sibling.write_file("README.md", "# sibling\n");
+        sibling.git_init();
+
+        let sibling_path = sibling.canonical_path().to_string_lossy().to_string();
+        // The agent touches ONLY the granted repo — the exact false-clean case.
+        let script = format!(
+            r#"
+if echo tampered > "{sibling_path}/README.md" 2>/dev/null; then
+    echo "RESULT:sibling_write:OK"
+else
+    echo "RESULT:sibling_write:FAIL"
+fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--allow-write", &sibling_path]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "sibling_write");
+        // The project itself really is unchanged — this is the report that used
+        // to stand alone and read as "nothing happened".
+        assert!(
+            stderr.contains("no project file changes"),
+            "test premise: the project must be reported clean.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("NOT audited"),
+            "the audit must say it did not cover every writable root.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(&sibling_path),
+            "the unaudited root must be named.\nstderr: {stderr}"
+        );
     }
 
     // ============================================================
