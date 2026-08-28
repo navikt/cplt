@@ -1,42 +1,43 @@
-# cplt Architecture Guide
+# cplt architecture guide
 
 > Guiding principles for code quality, structure, and evolution.
 > Read this before contributing. Update it when conventions change.
 
----
-
-## Core Tenets
+## Core tenets
 
 1. **Security is the product.** Every design decision must consider whether it
    weakens the sandbox. When in doubt, deny.
 
 2. **Types over conventions.** Use the type system to make invalid states
-   unrepresentable. A compile error is better than a runtime check.
+   unrepresentable. A compile error beats a runtime check.
 
-3. **Small functions, clear names.** If you can't describe what a function does
+3. **Small functions, clear names.** If you cannot describe what a function does
    in one sentence without "and", split it.
 
 4. **Errors are UX.** Error messages answer "what happened", "why", and "what
    to do next". Never show raw internal errors to the user.
 
-5. **One source of truth.** Constants, color codes, format strings — define
-   once, reference everywhere.
+5. **One source of truth.** Define constants, color codes, and format strings
+   once, then reference them everywhere.
 
-6. **Honest about gaps.** Never overstate protection. Name what's kernel-enforced
-   vs. best-effort. Document known limitations in SECURITY.md.
+6. **Honest about gaps.** Never overstate protection. Name what is
+   kernel-enforced and what is best-effort. Document known limitations in
+   SECURITY.md.
 
----
-
-## Module Responsibilities
+## Module responsibilities
 
 ```
 src/
   main.rs              CLI entry point, orchestration.
     main()             → parse CLI, call run(), format errors (10 lines)
-    run()              → orchestrate: resolve → proxy → sandbox → execute (~250 lines)
+    run()              → orchestrate: early exits → resolve → proxy → sandbox → execute (~250 lines)
     resolve_context()  → config loading, path resolution, agent detection (~240 lines)
-    start_proxy_if_enabled() → proxy startup, domain file resolution (~90 lines)
-  lib.rs               Module declarations + is_unsafe_root(). Public API surface.
+    start_proxy_if_enabled() → proxy startup, domain file resolution/validation (~90 lines)
+    run_doctor()       → --doctor subflow
+    run_config_command()  → config subcommand dispatch
+    run_trust_command()   → trust subcommand dispatch
+    run_update()          → update subcommand dispatch
+  lib.rs               Module declarations + is_unsafe_root(). The crate's public API.
   ui.rs                All terminal output: colors, prefixed helpers, NO_COLOR/TTY.
   config/              Config module (9 submodules, ~3770 lines total)
     mod.rs             Re-exports only (32 lines)
@@ -66,18 +67,16 @@ src/
   update.rs            Self-update check and download.
 ```
 
-**Rule:** Each file has one clear responsibility. If a file exceeds ~1000 lines,
-look for a natural seam to split. If two files are always changed together,
-consider merging them.
+**Rule:** each file has one clear responsibility. If a file exceeds ~1000 lines,
+look for a natural seam to split. If two files always change together, consider
+merging them.
 
----
-
-## Error Handling
+## Error handling
 
 ### Application boundary (main.rs)
 
 Use `anyhow` for error propagation in `run()` and other orchestration code.
-Handle `BrokenPipe` errors silently per Unix convention:
+Handle `BrokenPipe` silently, per Unix convention:
 
 ```rust
 fn main() -> ExitCode {
@@ -85,7 +84,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
-            // Broken pipe (e.g. `cplt config show | head`) — exit silently.
+            // Broken pipe (e.g. `cplt config show | head`): exit silently.
             for cause in e.chain() {
                 if let Some(io) = cause.downcast_ref::<std::io::Error>()
                     && io.kind() == std::io::ErrorKind::BrokenPipe
@@ -117,32 +116,29 @@ pub enum ConfigError {
 }
 ```
 
-Completed migrations: `UpdateError` (update.rs), `ConfigError` (config/).
-Remaining `Result<T, String>`: sandbox_policy.rs, proxy.rs, trust.rs, agent.rs
-— migrate as modules are touched.
+`UpdateError` (update.rs) and `ConfigError` (config/) are migrated already.
+`Result<T, String>` still remains in sandbox_policy.rs, proxy.rs, trust.rs, and
+agent.rs; migrate those as you touch the modules.
 
-**Never** use `Result<T, String>` in new code. For quick prototyping, use
+Never use `Result<T, String>` in new code. For quick prototyping, use
 `anyhow::Result<T>` and refine later.
 
 ### Unwrap and expect
 
-- `unwrap()` is acceptable only when the operation is provably infallible
-  (e.g., `writeln!` to a `String`). Use `expect("reason")` to document the
-  invariant.
-- In application/orchestration code, use `?` or `bail!()`.
+- `unwrap()` is acceptable only when the operation is provably infallible, such
+  as `writeln!` to a `String`. Use `expect("reason")` to document the invariant.
+- In application and orchestration code, use `?` or `bail!()`.
 - In security-critical paths, prefer explicit error handling over `?`.
-- SBPL profile generation uses the `sbpl!` macro (wraps `writeln!` with
-  `.expect("write to String")`) to reduce noise while preserving the invariant.
+- SBPL profile generation uses the `sbpl!` macro, which wraps `writeln!` with
+  `.expect("write to String")` to cut noise while preserving the invariant.
 
----
+## Output and color
 
-## Output & Color
-
-All terminal styling goes through `src/ui.rs`. This module:
-- Defines ANSI constants (`GREEN`, `RED`, `YELLOW`, `BLUE`, `DIM`, `BOLD`, `RESET`)
-- Provides `use_color()` — checks `NO_COLOR` env + stderr TTY detection
-- Provides `color(code)` — returns the escape code or `""` when color is disabled
-- Provides prefixed helpers: `info()`, `warn()`, `error()`, `ok()`
+All terminal styling goes through `src/ui.rs`, which defines the ANSI constants
+(`GREEN`, `RED`, `YELLOW`, `BLUE`, `DIM`, `BOLD`, `RESET`), `use_color()`
+(checks the `NO_COLOR` env var and stderr TTY detection), `color(code)` (returns
+the escape code, or `""` when color is disabled, so it is safe to embed in any
+format string), and the prefixed helpers `info()`, `warn()`, `error()`, `ok()`.
 
 ```rust
 use crate::ui;
@@ -160,9 +156,6 @@ eprintln!("  {}✓{} passed", ui::color(ui::GREEN), ui::color(ui::RESET));
 **Rules:**
 - Never write raw `\x1b[` escape sequences. Use `ui::color()`.
 - Data goes to stdout (`println!`). Diagnostics go to stderr (`eprintln!`).
-- `ui::color()` returns `""` when color is disabled — safe to embed in format strings.
-
----
 
 ## Lints
 
@@ -179,15 +172,13 @@ missing_errors_doc = "allow"
 **Rules:**
 - All new code must pass `cargo clippy -- -D warnings` with zero warnings.
 - When adding an allow, document _why_ in the comment.
-- Prefer fixing the lint over allowing it unless it's genuinely noise.
-- Use `let...else` for early-return destructuring (not `match` with one arm).
+- Prefer fixing the lint over allowing it unless it is genuinely noise.
+- Use `let...else` for early-return destructuring, not `match` with one arm.
 
----
+## Module documentation
 
-## Module Documentation
-
-Every module has a `//!` doc comment explaining its purpose. Keep these
-brief (1–3 lines). Example:
+Every module has a `//!` doc comment explaining its purpose. Keep these brief,
+one to three lines:
 
 ```rust
 //! HTTP CONNECT proxy with domain filtering.
@@ -196,13 +187,9 @@ brief (1–3 lines). Example:
 //! enforcing blocked/allowed domain lists and private IP restrictions.
 ```
 
----
+## Public enums: `#[non_exhaustive]`
 
-## API Design
-
-### #[non_exhaustive]
-
-All public enums use `#[non_exhaustive]`. This allows adding variants without
+All public enums use `#[non_exhaustive]`, so variants can be added without
 breaking downstream code. Match expressions must include a wildcard arm `_`.
 
 ```rust
@@ -214,25 +201,20 @@ pub enum VersionStatus {
 }
 ```
 
----
-
 ## Visibility
 
-Use the narrowest visibility that works:
+Use the narrowest visibility that works. Everything starts private and widens
+only when something outside its module needs it: `pub(crate)` when sibling
+modules use it, `pub` when tests or external consumers do.
 
 | Visibility | When to use |
 |------------|-------------|
 | `pub` | Intentional public API (used by integration tests or external consumers) |
 | `pub(crate)` | Shared between modules but not part of the public API |
-| `pub(super)` | Shared within a module tree (e.g., sandbox submodules) |
-| private | Default. Everything starts private. |
+| `pub(super)` | Shared within a module tree, for example the sandbox submodules |
+| private | The default |
 
-**Rule of thumb:** If it's not used outside its module, it's private. If it's used
-by sibling modules but not tests, it's `pub(crate)`. If tests need it, it's `pub`.
-
----
-
-## Type Design
+## Type design
 
 ### Prefer enums over boolean pairs
 
@@ -248,31 +230,30 @@ pub enum FeatureToggle {
 ```
 
 Clap keeps two boolean flags. `FeatureToggle::from_pair(on, off)` converts them
-at the merge boundary. `resolve(config_default)` produces the final `bool`.
+at the merge boundary, and `resolve(config_default)` produces the final `bool`.
 
 ### Use newtypes for domain concepts
 
-When a `String` or `PathBuf` has semantic meaning, consider a newtype:
+When a `String` or `PathBuf` carries semantic meaning, consider a newtype:
 
 ```rust
-pub struct ProjectDir(PathBuf);  // Not just any path — a validated project root
-pub struct TrustHash(String);    // Not just any string — a content hash
+pub struct ProjectDir(PathBuf);  // A validated project root, not just any path
+pub struct TrustHash(String);    // A content hash, not just any string
 ```
 
 ### Structs with many fields
 
-For structs with >8 fields (like `ProfileOptions`), document field groups with
-comments. If the struct is constructed in many places, consider a builder.
-Keep fields private and expose through methods when validation matters.
+For structs with more than 8 fields, like `ProfileOptions`, document field
+groups with comments. If the struct is constructed in many places, consider a
+builder. Keep fields private and expose them through methods when validation
+matters.
 
----
-
-## Security Patterns
+## Security patterns
 
 ### Deny by default
 
-Every sandbox rule starts as denied. Code that adds allows must justify the
-allow in a comment:
+Every sandbox rule starts as denied. Code that adds an allow must justify it in
+a comment:
 
 ```rust
 // Allow read access to Git hooks so `git commit` works inside the sandbox.
@@ -285,21 +266,20 @@ emit_git_hooks(&mut sb, opts.git_hooks_path);
 If a security check cannot run, the result is "deny":
 
 ```rust
-// ✗ Fail open — silent security degradation
+// ✗ Fail open: silent security degradation
 let paths = canonicalize_paths(&deny_paths).unwrap_or_default();
 
-// ✓ Fail closed — abort on unresolvable deny paths
+// ✓ Fail closed: abort on unresolvable deny paths
 let paths = canonicalize_deny_paths(&deny_paths)?;
 ```
 
 ### DANGEROUS flag convention
 
 Flags that significantly weaken the sandbox must:
+
 1. Be marked `dangerous: true` in the config key definition
 2. Include `[DANGEROUS]` in their `--help` text
 3. Require `--force` when set via `cplt config set`
-
----
 
 ## Testing
 
@@ -325,27 +305,10 @@ fn config_merge_cli_overrides_file() { ... }    // module + scenario
 
 ### Test helpers
 
-Shared test utilities go in `tests/` helper modules, not duplicated across test
-files. Use `tempfile::TempDir` for filesystem tests.
+Shared test utilities go in `tests/` helper modules rather than being
+duplicated across test files. Use `tempfile::TempDir` for filesystem tests.
 
----
-
-## Function Design
-
-### main.rs structure
-
-```
-main()                     → parse CLI, call run(), format errors (10 lines)
-run()                      → orchestrate: early exits → resolve → proxy → sandbox (~250 lines)
-resolve_context()          → config loading, path resolution, agent detection
-start_proxy_if_enabled()   → proxy startup, domain file validation
-run_doctor()               → --doctor subflow
-run_config_command()       → config subcommand dispatch
-run_trust_command()        → trust subcommand dispatch
-run_update()               → update subcommand dispatch
-```
-
-### Naming conventions
+## Naming conventions
 
 | Pattern | Convention | Example |
 |---------|-----------|---------|
@@ -355,23 +318,17 @@ run_update()               → update subcommand dispatch
 | Boolean queries | `is_*/has_*` | `is_unsafe_root()`, `has_api_key()` |
 | Fallible ops | Return `Result` | `fn load_file() -> Result<...>` |
 
----
+## Git conventions
 
-## Git Conventions
-
-- Do **not** add `Co-authored-by` trailers
-- GPG signing may be unavailable in sandbox; use `git -c commit.gpgSign=false commit`
+- Do not add `Co-authored-by` trailers
+- GPG signing may be unavailable in the sandbox; use `git -c commit.gpgSign=false commit`
 - Run `mise run check` before pushing (fmt + clippy + unit + lib tests)
 
----
-
-## What Not To Do
+## What not to do
 
 - **Don't add dependencies lightly.** Each dependency is attack surface. Justify
   new crates in the PR description.
-- **Don't `pub` by default.** Start private, widen when needed.
-- **Don't use `Result<T, String>` in new code.** Use `anyhow` or `thiserror`.
-- **Don't scatter constants.** Colors in `ui.rs`, policy constants in
+- **Don't scatter constants.** Colors live in `ui.rs`, policy constants in
   `sandbox_policy.rs`, config keys in `config/registry.rs`.
 - **Don't comment what, comment why.** `// Create a new vector` is noise.
   `// SBPL uses last-match-wins, so denies must come after allows` is valuable.
