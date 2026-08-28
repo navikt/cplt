@@ -33,7 +33,7 @@ If your repo already ships one, it starts working on upgrade, and a deny entry t
 
 | Entry that was inert                | What it does now                       |
 | ----------------------------------- | -------------------------------------- |
-| `deny.paths = ["target"]`           | blocks the Rust build dir, builds fail  |
+| `deny.paths = ["target"]`           | blocks the Rust build dir, so builds fail |
 | `deny.paths = [".git"]`             | blocks git entirely                     |
 | `deny.paths = ["node_modules"]`     | blocks installs and `node` resolution   |
 
@@ -83,7 +83,7 @@ Tools that compile then execute from `$TMPDIR` are **blocked by default**, becau
 
 **Fix:** the scratch dir is **on by default**. cplt creates `~/Library/Caches/cplt/tmp/{session-id}/` with `rwx` permissions, redirects `TMPDIR`, `TMP`, `TEMP`, and `GOTMPDIR` there, and cleans up on exit. Stale directories older than 24 hours are garbage-collected on startup.
 
-**JVM note:** on macOS the JVM ignores `TMPDIR`. It reads `java.io.tmpdir` from `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which always returns `/var/folders/...`. So cplt injects `-Djava.io.tmpdir=<scratch> -Djansi.tmpdir=<scratch> -Djava.rmi.server.hostname=localhost -Djava.net.preferIPv4Stack=true` via `JAVA_TOOL_OPTIONS`, which puts Maven Surefire forks, the Kotlin compiler daemon, and Jansi native lib extraction on the scratch dir. The RMI hostname flag keeps the Kotlin daemon's Java RMI traffic on `localhost`. The `preferIPv4Stack` flag forces pure IPv4 sockets, because Java's dual-stack IPv6 sockets produce IPv4-mapped addresses that SBPL cannot match, which breaks the sandbox's localhost filtering. Override with `--pass-env JAVA_TOOL_OPTIONS` if you need custom JVM flags. For inline mocking (MockK, Mockito, ByteBuddy), also add `--allow-jvm-attach`, see [JVM Attach API](#jvm-attach-api).
+**JVM note:** on macOS the JVM ignores `TMPDIR`. It reads `java.io.tmpdir` from `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which always returns `/var/folders/...`. So cplt injects `-Djava.io.tmpdir=<scratch> -Djansi.tmpdir=<scratch> -Djava.rmi.server.hostname=localhost -Djava.net.preferIPv4Stack=true` via `JAVA_TOOL_OPTIONS`, which puts Maven Surefire forks, the Kotlin compiler daemon, and Jansi native lib extraction on the scratch dir. The RMI hostname flag keeps the Kotlin daemon's Java RMI traffic on `localhost`. The `preferIPv4Stack` flag forces pure IPv4 sockets, because Java's dual-stack IPv6 sockets produce IPv4-mapped addresses that SBPL cannot match, which breaks the sandbox's localhost filtering. Override with `--pass-env JAVA_TOOL_OPTIONS` if you need custom JVM flags. For inline mocking (MockK, Mockito, ByteBuddy), also add `--allow-jvm-attach`. See [JVM Attach API](#jvm-attach-api).
 
 **Gradle/JVM still failing?** Some JVM native libraries, `libjli.dylib` and JNI libs among them, call `dlopen` on the system temp dir *before* `JAVA_TOOL_OPTIONS` takes effect. If you see "Operation not permitted" during JVM startup itself rather than during the Gradle build, add `--allow-tmp-exec`:
 
@@ -187,7 +187,7 @@ cplt --allow-docker
 
 SSH agent access is blocked (unix socket denied), which means:
 
-- `git clone` over SSH fails, use HTTPS clones instead
+- `git clone` over SSH fails. Use HTTPS clones instead
 - `ssh` commands spawned by the agent fail
 - `gh` CLI uses HTTPS by default and is unaffected
 
@@ -208,7 +208,7 @@ macOS TCC (Transparency, Consent, and Control) protects certain folders at the k
 2. Enable your terminal app (Terminal.app, iTerm2, Ghostty, etc.)
 3. **Restart the terminal.** TCC grants only take effect for new processes
 
-This lifts TCC restrictions for all child processes, while the cplt sandbox keeps enforcing its own deny-by-default rules (write protection, network filtering, dotfile access, and the rest).
+This lifts TCC restrictions for all child processes, while the cplt sandbox keeps enforcing its own deny-by-default rules (write protection, network filtering, dotfile access, etc.).
 
 **Alternatives** (if you prefer not to grant FDA):
 
@@ -390,7 +390,7 @@ So the only rule that would match these workers is `*:*`, which allows every out
 
 `~/.gradle` is a dependency store. The sandbox grants read, write, and `file-map-executable` there (for JNI libs) but **not** `process-exec`, so a rogue agent cannot drop a binary into the dependency cache and run it. Gradle's toolchain support auto-provisions JDKs into `~/.gradle/jdks`, inside that non-executable tree, so forking a toolchain `javac` or test JVM failed with `Operation not permitted` and no config key could grant exec.
 
-cplt now carves `~/.gradle/jdks` back out as executable, and makes it **read-only** to keep the write-then-exec hole closed. That has a consequence. With `org.gradle.java.installations.auto-download=true`, a toolchain that is not already on disk fails at provisioning time with a write error instead of at exec time. Provision it once outside cplt, or use a JDK outside `~/.gradle`:
+cplt now carves `~/.gradle/jdks` back out as executable, and makes it **read-only** to keep the write-then-exec hole closed. Consequence: with `org.gradle.java.installations.auto-download=true`, a toolchain that is not already on disk fails at provisioning time with a write error instead of at exec time. Provision it once outside cplt, or use a JDK outside `~/.gradle`:
 
 ```properties
 # ~/.gradle/gradle.properties
@@ -505,9 +505,9 @@ The audit reports `incomplete` instead of listing changes, and the one-time `cpl
 
 **A committed `.cplt.toml` still applies.** cplt reads it from the object store with `git cat-file`, which cannot reach a filter and is never refused. Permissions you have already approved keep working. It is the one-time accept that is blocked.
 
-**Why it works this way.** Git runs a content filter's program when it reads working-tree files, and cplt runs `git` in the parent process, *outside* the sandbox. `.git/config` stays writable to the agent on both platforms, so a repository could otherwise pick a program that cplt executes unsandboxed ([#210](https://github.com/navikt/cplt/issues/210)). Unlike the other executable config keys, filters are named by an arbitrary subsection, so no fixed `-c` override can neutralise them. That leaves two options, run the filter, which is the escape, or refuse and say so. An `incomplete` audit is a loud "could not verify", not a clean session cplt never checked.
+**Why it works this way.** Git runs a content filter's program when it reads working-tree files, and cplt runs `git` in the parent process, *outside* the sandbox. `.git/config` stays writable to the agent on both platforms, so a repository could otherwise pick a program that cplt executes unsandboxed ([#210](https://github.com/navikt/cplt/issues/210)). Unlike the other executable config keys, filters are named by an arbitrary subsection, so no fixed `-c` override can neutralise them. That leaves two options. Run the filter, which is the escape. Or refuse, and say so. An `incomplete` audit is a loud "could not verify", not a clean session cplt never checked.
 
-One consequence is worth knowing. An agent can deliberately force the audit to `incomplete` by writing `.git/config`. That is inherent to failing closed.
+One consequence is worth knowing: an agent can deliberately force the audit to `incomplete` by writing `.git/config`. That is inherent to failing closed.
 
 **Fix:** move the filter to your global config if it belongs there (`git config --global filter.lfs.clean …`), or accept the `incomplete` audit for that repository. If you need `cplt trust accept` to work, remove the repo-local filter for the one invocation.
 
@@ -535,7 +535,7 @@ If you do need the registry auth in `~/.npmrc`, allow it instead:
 cplt config set allow.read "~/.npmrc"
 ```
 
-Or for a single run: `cplt --allow-read ~/.npmrc`. Deleting an `~/.npmrc` you do not use works just as well. If you also keep a `~/.yarnrc`, neither fix covers it on its own, see below.
+Or for a single run: `cplt --allow-read ~/.npmrc`. Deleting an `~/.npmrc` you do not use works just as well. If you also keep a `~/.yarnrc`, neither fix covers it on its own. See below.
 
 **Why only yarn 1.** `~/.npmrc` is denied by default because it commonly holds a registry token. Every package manager reads it; only yarn 1 treats an *unreadable* one as fatal. Both of its config loaders, `NpmRegistry.getPossibleConfigLocations` (which is what reaches `~/.npmrc`) and `parseRcPaths` (which reads the `.yarnrc` family), tolerate a *missing* file and rethrow everything else:
 
@@ -565,7 +565,7 @@ The XDG variables, by contrast, do not help. yarn 1's `.yarnrc` scan builds its 
 
 One footgun with `allow.read`: the path must **exist** when cplt starts. A missing path is warned about and dropped, so `allow.read "~/.npmrc"` on a machine without one is silently inert. That is fine here, since yarn only fails when the file exists in the first place.
 
-**Why cplt does not make the denial look like ENOENT.** The tempting accommodation is to report these files as *absent* rather than *denied*, which every package manager tolerates. macOS can express that. SBPL accepts `(deny file-read* (literal …) (with errno 2))`, so the read fails with `No such file or directory`. Linux cannot. Landlock is grant-only with no control over the errno a denied `open` returns, and on Linux `~/.npmrc` is not denied by a rule at all, it is simply never granted. Shipping the macOS half would fix macOS, leave Linux (where this was reported) untouched, and split the two backends' denial semantics for every tool, not just yarn. One line of config is the better trade. Bubblewrap could mask the file with an empty `/dev/null` bind, but it is opt-in, applies only where the wrapper is active, and inverts the existing deny-path masks, which deliberately use an unreadable placeholder so a masked read fails loudly instead of reading as empty.
+**Why cplt does not make the denial look like ENOENT.** The tempting accommodation is to report these files as *absent* rather than *denied*, which every package manager tolerates. macOS can express that. SBPL accepts `(deny file-read* (literal …) (with errno 2))`, so the read fails with `No such file or directory`. Linux cannot. Landlock is grant-only with no control over the errno a denied `open` returns, and on Linux `~/.npmrc` is not denied by a rule at all. It is simply never granted. Shipping the macOS half would fix macOS, leave Linux (where this was reported) untouched, and split the two backends' denial semantics for every tool, not just yarn. One line of config is the better trade. Bubblewrap could mask the file with an empty `/dev/null` bind, but it is opt-in, applies only where the wrapper is active, and inverts the existing deny-path masks, which deliberately use an unreadable placeholder so a masked read fails loudly instead of reading as empty.
 
 Adding `~/.npmrc` to the default read grant is not an option either. That hands the npm token to the sandboxed agent, which is the one thing the denial exists to prevent.
 
