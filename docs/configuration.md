@@ -1,21 +1,28 @@
 # Configuration
 
-## How cplt config works
+## Precedence
 
-cplt reads config in this order:
+cplt resolves each setting in this order, highest first:
 
-1. CLI flags for the current run
-2. `~/.config/cplt/config.toml` (or `CPLT_CONFIG`)
-3. built-in defaults
+1. CLI flags for the current run (`--with-proxy`, `--no-proxy`, `--proxy-port`, and so on)
+2. The config file, `~/.config/cplt/config.toml`, or whatever `CPLT_CONFIG` points at
+3. Built-in defaults
 
-List values are merged, so repeated `cplt config set` commands accumulate for
-`allow.read`, `allow.write`, `allow.ports`, `allow.localhost`, and `deny.paths`.
+Per-repo config (`.cplt.toml`) sits outside that hierarchy, as a separate layer with its own rules. See [Per-repo configuration](#per-repo-configuration-cplttoml).
+
+List values merge instead of replacing, so repeated `cplt config set` commands accumulate for `allow.read`, `allow.write`, `allow.ports`, `allow.localhost`, and `deny.paths`.
+
+Point `CPLT_CONFIG` at another file to use it instead of the default location:
+
+```bash
+CPLT_CONFIG=/path/to/custom.toml cplt -- --version
+```
+
+Paths in `[allow]` and `[deny]` support `~/` expansion and resolve relative to the config file's directory. `proxy.blocked_domains` supports `~/` expansion only.
 
 ## Quick setup
 
-Use `cplt settings` to browse and change settings interactively. It stages edits,
-shows their source and security impact, and writes validated TOML atomically. Use
-`cplt config set` for scripts, CI, or a direct non-interactive edit:
+`cplt settings` browses and changes settings interactively. It stages edits, shows their source and security impact, and writes validated TOML atomically. For scripts, CI, or a direct non-interactive edit, use `cplt config set`:
 
 ```bash
 cplt config set sandbox.quiet true
@@ -26,39 +33,28 @@ cplt config set gh_guard.enabled true
 cplt config set git_guard.enabled true
 ```
 
-If your startup command is getting long, move repeated flags into config.
-For your personal machine setup, use global config (no `--repo`):
+When your startup command gets long, move the repeated flags into config. Your personal machine setup belongs in global config, so leave off `--repo`:
 
 ```bash
-cplt config set sandbox.allow_localhost_any true
-cplt config set sandbox.allow_docker true
-cplt config set sandbox.allow_jvm_attach true
-cplt config set allow.read ~/.gitconfig
+cplt config set sandbox.allow_localhost_any true  # tools that grab random localhost ports
+cplt config set sandbox.allow_docker true         # Gradle, Testcontainers, Docker
+cplt config set sandbox.allow_jvm_attach true     # Gradle daemon, MockK, Mockito inline mocking
+cplt config set allow.read ~/.gitconfig           # host files the agent should always read
 cplt config set allow.read ~/code/work/.gitconfig-nav
 ```
 
-That translates a one-off command like:
+That saves you from typing this every time:
 
 ```bash
 cplt --allow-localhost-any --allow-docker --allow-jvm-attach \
   --allow-read ~/.gitconfig --allow-read ~/code/work/.gitconfig-nav
 ```
 
-into saved config:
-
-- `sandbox.allow_localhost_any` for tools that spin up random localhost ports
-- `sandbox.allow_docker` for Gradle/Testcontainers/Docker access
-- `sandbox.allow_jvm_attach` for Gradle daemon, MockK, and Mockito inline mocking
-- `allow.read` for host files the agent should always be able to inspect
-
-Use `cplt config explain` to see what a key does and how to set it.
+`cplt config explain` tells you what a key does and how to set it.
 
 ## Policy presets
 
-Instead of toggling individual flags, pick a named **preset** — a security
-*posture* that sets a baseline for the five sandbox toggles **and** the safety
-features (`gh_guard`, `git_guard`, forced-proxy egress, fail-closed domain
-allowlist) with one flag or key:
+A preset is a named security posture. One flag or key sets a baseline for the five sandbox toggles and for the safety features (`gh_guard`, `git_guard`, forced-proxy egress, fail-closed domain allowlist):
 
 ```bash
 cplt --preset strict       # full lockdown: toggles off + guards + forced proxy + domain allowlist on
@@ -81,27 +77,15 @@ preset = "standard"
 | `permissive` | **on** | off | **on** | off | **on** | off | off | off | off |
 | `full-trust` | **on** | **on** | **on** | **on** | **on** | off | off | off | off |
 
-¹ `standard` leaves the per-session scratch directory on (the default), which is
-what most tools need — `allow_tmp_exec` (raw `/tmp` exec) stays off. `standard`
-is identical to cplt's hardcoded defaults, so omitting `--preset` behaves exactly
-like `--preset standard`.
+¹ `standard` leaves the per-session scratch directory on, which is the default and what most tools need. `allow_tmp_exec` (raw `/tmp` exec) stays off. `standard` is identical to cplt's hardcoded defaults, so omitting `--preset` behaves exactly like `--preset standard`.
 
-**Only `strict` enables the safety features — a full network lockdown.** It hardens
-the dimensions that matter most: `gh_guard` (gate GitHub traffic), `git_guard`
-(block push/force-push), `proxy.forced` (mandatory proxy, kernel egress locked to
-it), and `proxy.default_allowlist` (fail-closed domain filtering — only the agent's
-built-in allowlist plus any `allowed_domains` resolve, everything else is blocked).
-Forced egress and the domain allowlist are orthogonal and compose: the kernel pins
-egress to the proxy, and the proxy then filters domains. `standard`, `permissive`,
-and `full-trust` all leave those four at their default (off), so selecting them
-changes nothing about guards, forced egress, or the allowlist. `strict` enables
-only *safety* features, so `config set sandbox.preset strict` needs no `--force`
-(unlike `permissive`/`full-trust`, which weaken the sandbox). Opt into strict but
-keep the network open with `--allow-all-domains` (or `proxy.default_allowlist =
-false`), which overrides just the allowlist — explicit off wins over the baseline.
+Only `strict` turns the safety features on, giving you a full network lockdown. It enables `gh_guard` (gate GitHub traffic), `git_guard` (block push and force-push), `proxy.forced` (mandatory proxy, kernel egress locked to it), and `proxy.default_allowlist` (fail-closed domain filtering, where only the agent's built-in allowlist plus any `allowed_domains` resolve and everything else is blocked). The last two are orthogonal and compose: the kernel pins egress to the proxy, then the proxy filters domains. `standard`, `permissive`, and `full-trust` leave all four off, so picking one of them changes nothing about guards, forced egress, or the allowlist.
 
-**Precedence — the preset is only a baseline.** An explicit individual flag or
-config value always overrides the preset, whichever source the preset came from:
+Because `strict` only enables safety features, `config set sandbox.preset strict` needs no `--force`, unlike `permissive` and `full-trust`, which weaken the sandbox. To take the strict baseline but keep the network open, add `--allow-all-domains` (or `proxy.default_allowlist = false`). That overrides just the allowlist, since an explicit off beats the baseline.
+
+### Preset precedence
+
+A preset is only a baseline. An explicit flag or config value always overrides it, whichever source the preset came from:
 
 ```bash
 # permissive baseline, but keep tmp exec blocked:
@@ -111,34 +95,17 @@ cplt --preset permissive --no-allow-tmp-exec
 cplt --preset strict --allow-docker
 ```
 
-The resolution order for each toggle is: **explicit CLI flag → explicit config
-value → preset baseline → hardcoded default (off)**. The preset itself resolves
-CLI (`--preset`) over config (`[sandbox] preset`). Each preset-controlled flag has
-a matching `--no-…` form (`--no-allow-localhost-any`, `--no-allow-env-files`,
-`--no-allow-tmp-exec`, `--no-allow-docker`, `--no-allow-lifecycle-scripts`) so you
-can opt a single toggle out of a permissive/full-trust baseline.
+Each toggle resolves in this order: explicit CLI flag, then explicit config value, then preset baseline, then the hardcoded default (off). The preset itself resolves CLI (`--preset`) over config (`[sandbox] preset`). Every preset-controlled toggle has a matching `--no-…` form (`--no-allow-localhost-any`, `--no-allow-env-files`, `--no-allow-tmp-exec`, `--no-allow-docker`, `--no-allow-lifecycle-scripts`), so you can opt a single toggle out of a permissive or full-trust baseline.
 
-Presets are **global-only** — they cannot be requested from a repo `.cplt.toml`,
-because a single preset would silently pull in several dangerous permissions and
-defeat per-key trust review. A repo must propose individual keys instead.
+## Global-only settings
 
-Use **repo config + trust** for project-specific sandbox permissions that
-belong to the repository, and **global config** for machine-specific paths:
+Project-specific sandbox permissions belong in `.cplt.toml`, approved with `cplt trust`. That covers `sandbox.allow_jvm_attach`, `sandbox.allow_msbuild`, `sandbox.allow_docker`, `sandbox.allow_localhost_any`, and `allow.ports`. Machine-specific paths such as `allow.read ~/.gitconfig` go in `~/.config/cplt/config.toml`.
 
-- `.cplt.toml` + `cplt trust` for `sandbox.allow_jvm_attach`, `sandbox.allow_msbuild`,
-  `sandbox.allow_docker`, `sandbox.allow_localhost_any`, `allow.ports`
-- `~/.config/cplt/config.toml` for `allow.read ~/.gitconfig` and other
-  host-specific file paths
-
-### Global-only settings
-
-These settings are **not supported in `.cplt.toml`** because they are machine-
-specific or local CLI preferences. `cplt config set --repo <key>` rejects them
-with an explanation — set them in `~/.config/cplt/config.toml` instead:
+The settings below are machine-specific or local CLI preferences, so `.cplt.toml` does not support them at all. `cplt config set --repo <key>` rejects each one with an explanation. Set them globally instead.
 
 | Key | Why |
 |---|---|
-| `sandbox.preset` | composes several dangerous permissions into one baseline — a repo must request individual keys so each is reviewed and trusted separately |
+| `sandbox.preset` | composes several dangerous permissions into one baseline, so a repo must request individual keys and get each reviewed and trusted separately |
 | `sandbox.agent` | preferred agent depends on what's installed locally |
 | `sandbox.quiet` | local output preference |
 | `sandbox.yes` | local prompt-skip preference |
@@ -159,17 +126,9 @@ with an explanation — set them in `~/.config/cplt/config.toml` instead:
 | `proxy.allowed_domains` | local path to an allowlist file |
 | all `[gh_guard]` keys | guard policy is configured globally, not per-repo |
 | all `[git_guard]` keys | guard policy is configured globally, not per-repo |
-| all `[audit]` keys | audit destination/level is a local concern |
+| all `[audit]` keys | audit destination and level are a local concern |
 
-For project-specific settings (committed to `.cplt.toml`):
-
-```bash
-cplt config set --repo sandbox.allow_jvm_attach true
-cplt config set --repo allow.ports 8080
-cplt config set --repo deny.paths "~/secrets"
-```
-
-**Removing values:**
+### Removing values
 
 ```bash
 cplt config set allow.read ~/Desktop --unset     # remove one element
@@ -177,7 +136,7 @@ cplt config set allow.read --unset               # remove entire key
 cplt config set sandbox.quiet --unset            # revert to default
 ```
 
-**Inspecting config:**
+### Inspecting config
 
 ```bash
 cplt config show                          # show effective config (file + defaults)
@@ -189,17 +148,11 @@ cplt config validate                      # check for syntax errors and unknown 
 
 ## Configuration file
 
-The config file lives at `~/.config/cplt/config.toml`. You can create a starter template with:
-
-```bash
-cplt config init
-```
-
-This creates a commented template at `~/.config/cplt/config.toml`:
+The config file lives at `~/.config/cplt/config.toml`. `cplt config init` creates a commented starter template there:
 
 ```toml
 [proxy]
-# enabled = true             # Default: true — disable with --no-proxy or set false
+# enabled = true             # Default: true. Disable with --no-proxy or set false
 # forced = false             # Default: false (opt-in). Force ALL egress through the proxy:
 #                            # restrict kernel egress to the proxy port (no direct *:443),
 #                            # closing the raw-socket / env-unset bypass. Fails closed if the
@@ -222,10 +175,10 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 # allow_msbuild = false        # Allow MSBuild worker-node unix sockets (dotnet build)
 # allow_localhost_any = false
 # scratch_dir = true           # On by default; set false to disable
-# allow_tmp_exec = false       # Dangerous — prefer scratch_dir
+# allow_tmp_exec = false       # Dangerous, prefer scratch_dir
 # allow_cache_exec = []        # Allow exec from specific ~/Library/Caches subdirs, e.g. ["ms-playwright", "pnpm/dlx"]
-# allow_cache_exec_any = false # Dangerous — allow exec from all of ~/Library/Caches
-# inherit_env = false          # Dangerous — exposes all env vars
+# allow_cache_exec_any = false # Dangerous, allows exec from all of ~/Library/Caches
+# inherit_env = false          # Dangerous, exposes all env vars
 # pass_env = ["MY_CUSTOM_VAR"]
 
 [allow]
@@ -238,31 +191,11 @@ This creates a commented template at `~/.config/cplt/config.toml`:
 # paths = ["~/extra/secret"]
 ```
 
-**Precedence** (highest to lowest):
+For arrays of objects, multi-line values, and other complex configuration, edit the file directly and run `cplt config validate` afterwards.
 
-1. CLI flags (`--with-proxy`, `--no-proxy`, `--proxy-port`, etc.)
-2. Config file (`~/.config/cplt/config.toml`)
-3. Built-in defaults
+## Per-repo configuration (`.cplt.toml`)
 
-Per-repo config (`.cplt.toml`) operates independently: the `[deny]` section tightens the sandbox unconditionally (no approval needed), and approved `[propose]` permissions are **additive** — they can enable features (e.g., `allow_docker = true`) but cannot disable anything set by CLI or global config.
-
-**Environment variable override:**
-
-Set `CPLT_CONFIG` to use a config file at a custom location:
-
-```bash
-CPLT_CONFIG=/path/to/custom.toml cplt -- --version
-```
-
-**Path expansion:** Paths in `[allow]` and `[deny]` support `~/` expansion and are resolved relative to the config file directory. `proxy.blocked_domains` supports `~/` expansion only.
-
-### Advanced: editing TOML directly
-
-For complex configuration (arrays of objects, multi-line values), you can edit `~/.config/cplt/config.toml` directly. Use `cplt config validate` to check for errors after editing.
-
-**Repo-local config (`--repo`):**
-
-Use `--repo` to write project-specific settings to `.cplt.toml` instead of global config:
+Commit a `.cplt.toml` to your repository for project-specific sandbox settings, so every developer does not have to configure the same CLI flags or global config. Global config stays the default, so pass `--repo` explicitly for project settings:
 
 ```bash
 # Request sandbox permissions (requires approval via `cplt trust accept`)
@@ -271,7 +204,7 @@ cplt config set --repo sandbox.allow_localhost_any true
 cplt config set --repo allow.read "~/.gradle/gradle.properties"
 cplt config set --repo allow.ports 8080
 
-# Deny section — tightens security, applied immediately without approval
+# Deny section: tightens security, applied immediately without approval
 cplt config set --repo deny.paths "~/secrets"
 cplt config set --repo deny.env "VAULT_TOKEN"
 
@@ -279,41 +212,35 @@ cplt config set --repo deny.env "VAULT_TOKEN"
 cplt config set --repo sandbox.allow_jvm_attach --unset
 ```
 
-Settings are mapped automatically: permission requests go under `[propose]`, restrictions under `[deny]`. Keys that are machine-specific (like `sandbox.quiet`, `proxy.port`) are rejected with a clear explanation.
-
-> **Note:** Global config remains the default. Use `--repo` explicitly for project settings.
-
-## Per-repo configuration (`.cplt.toml`)
-
-Commit a `.cplt.toml` file to your repository for project-specific sandbox settings. This eliminates the need for every developer to configure the same CLI flags or global config.
+Settings map to sections automatically. Permission requests go under `[propose]`, restrictions under `[deny]`. Machine-specific keys such as `sandbox.quiet` and `proxy.port` are rejected with a clear explanation.
 
 ### Security model
 
-- **`[deny]`** — applied automatically (can only tighten the sandbox, no approval needed)
-- **`[propose]`** — requested permissions, requires explicit user approval via `cplt trust accept`
-- Read from `git HEAD` (committed state) — the agent cannot tamper with its own config mid-session
-- Write to `.cplt.toml` is kernel-denied inside the sandbox
-- Trust approvals are content-pinned — if requested values change, approvals are invalidated
+- `[deny]` applies automatically and needs no approval, because it can only tighten the sandbox.
+- `[propose]` holds requested permissions and requires explicit approval via `cplt trust accept`. Approvals are additive: they can enable a feature such as `allow_docker = true`, never disable something CLI or global config set.
+- cplt reads the file from `git HEAD`, the committed state, so the agent cannot tamper with its own config mid-session.
+- Writing `.cplt.toml` is kernel-denied inside the sandbox.
+- Trust approvals are content-pinned. If the requested values change, the approvals are invalidated.
 
-**Path expansion:** Paths in `[deny]` and `[propose.allow]` support `~/` expansion. A relative path is resolved against the **repository root** — the directory the `.cplt.toml` came from, which under `--project-dir <subdir>` is still the git root, not the subdir. So `paths = ["secrets"]` denies `<repo>/secrets` on every clone.
+Paths in `[deny]` and `[propose.allow]` support `~/` expansion. A relative path resolves against the repository root, the directory the `.cplt.toml` came from, which under `--project-dir <subdir>` is still the git root rather than the subdir. So `paths = ["secrets"]` denies `<repo>/secrets` on every clone.
 
-`./secrets`, `secrets/.`, `secrets/`, and `a//b` all normalize to the same path, and symlinks are resolved to their target — the sandbox matches resolved paths, so the un-normalized spellings would compile into the profile and silently match nothing. Resolution walks up to the deepest part of the path that exists, so a symlink is still resolved when the leaf below it has not been created yet (`link/secret` with `link -> real` becomes `<repo>/real/secret`).
+`./secrets`, `secrets/.`, `secrets/`, and `a//b` all normalize to the same path, and symlinks resolve to their target. The sandbox matches resolved paths, so the un-normalized spellings would compile into the profile and silently match nothing. Resolution walks up to the deepest part of the path that exists, so a symlink still resolves when the leaf below it does not exist yet: `link/secret` with `link -> real` becomes `<repo>/real/secret`.
 
-`..` components are rejected, as are entries naming a whole tree root — `""`, `"."`, `"./"` (the repo root) and `"/"` (the filesystem root). As a deny entry any of those would block read *and* write of the entire checkout, so a committed one would brick the repo for everyone who clones it.
+`..` components are rejected, as are entries naming a whole tree root: `""`, `"."`, `"./"` (the repo root) and `"/"` (the filesystem root). As a deny entry, any of those would block read and write of the entire checkout, so a committed one would brick the repo for everyone who clones it.
 
-**Approved `[propose.allow]` paths must stay inside the repo.** A trust approval pins a hash of the `.cplt.toml` bytes, so it only vouches for what those bytes name. A relative entry names a location in the repo; if a symlink resolves it somewhere outside, the entry is refused with a warning rather than granted. Otherwise a repo could get `read = ["data"]` approved while `data -> ./safe` and then repoint `data -> /` in a later commit — `.cplt.toml` unchanged, hash unchanged, approval still live. Absolute and `~/` entries are exempt: they are written literally in the file, so the pinned hash does cover them. `[deny]` has no such restriction — it needs no approval and can only tighten.
+Approved `[propose.allow]` paths must stay inside the repo. A trust approval pins a hash of the `.cplt.toml` bytes, so it only vouches for what those bytes name. A relative entry names a location in the repo. If a symlink resolves it somewhere outside, the entry is refused with a warning rather than granted. Otherwise a repo could get `read = ["data"]` approved while `data -> ./safe`, then repoint `data -> /` in a later commit with `.cplt.toml` unchanged, hash unchanged, and the approval still live. Absolute and `~/` entries are exempt, because they are written literally in the file and the pinned hash does cover them. `[deny]` has no such restriction, since it needs no approval and can only tighten.
 
-Unlike the global config, a repo path that does **not exist yet** is kept rather than being an error: macOS starts enforcing the deny once the directory appears, and one committed typo cannot brick cplt for everyone who clones the repo. On Linux such a path cannot be masked and cplt warns.
+Unlike global config, a repo path that does not exist yet is kept rather than treated as an error. macOS starts enforcing the deny once the directory appears, and one committed typo cannot brick cplt for everyone who clones the repo. On Linux such a path cannot be masked, and cplt warns.
 
 ### Example `.cplt.toml`
 
 ```toml
-# Deny section — applied automatically, no approval needed
+# Deny section: applied automatically, no approval needed
 [deny]
 paths = ["~/secrets", "~/.vault"]
 env = ["VAULT_TOKEN", "MY_SECRET"]
 
-# Requested permissions — requires approval via `cplt trust accept`
+# Requested permissions: requires approval via `cplt trust accept`
 [propose]
 allow_jvm_attach = true          # For MockK/Mockito tests
 allow_docker = true              # Container access
@@ -338,9 +265,9 @@ cplt trust revoke allow_docker            # Revoke a specific key
 cplt trust revoke --all                   # Revoke all trust for this repo
 ```
 
-Trust decisions are stored in `~/.config/cplt/trust/` (protected from the sandbox).
+Trust decisions live in `~/.config/cplt/trust/`, protected from the sandbox.
 
-**For CI/scripts** where interactive approval isn't possible:
+In CI and scripts, where interactive approval is not possible:
 
 ```bash
 cplt --accept-repo-config -- -p "run tests"
@@ -348,7 +275,7 @@ cplt --accept-repo-config -- -p "run tests"
 
 ### Auto-generate with `cplt init`
 
-Instead of writing `.cplt.toml` by hand, detect your project's ecosystem:
+Instead of writing `.cplt.toml` by hand, let cplt detect your project's ecosystem:
 
 ```bash
 cplt init                   # Preview detected permissions
@@ -356,6 +283,30 @@ cplt init --write           # Write .cplt.toml to disk
 cplt init --write --force   # Overwrite existing file
 cplt init --quiet           # Output only TOML (pipe-friendly)
 ```
+
+Supported ecosystems:
+
+| Ecosystem | Detected via | Suggests |
+|-----------|-------------|----------|
+| JVM (Gradle/Maven) | `build.gradle*`, `pom.xml` | `allow_jvm_attach`, read gradle properties |
+| Node.js | `package.json` | localhost ports, `allow_localhost_any` (for Next.js/Vite) |
+| Docker | `Dockerfile`, `compose.yml` | `allow_docker` (dangerous), exposed ports |
+| Python | `pyproject.toml`, `requirements.txt` | localhost ports (for Django/FastAPI) |
+| Rust | `Cargo.toml` | (works with defaults) |
+| Go | `go.mod` | (works with defaults) |
+| Playwright | `@playwright/test` in package.json | `allow_cache_exec` (personal config hint) |
+| Environment secrets | `.env.example` | `deny.env` for sensitive variables |
+| Spring Boot | `application.yml` + Spring in Gradle | localhost 8080, PostgreSQL port |
+| Ktor | `application.conf` + Ktor in Gradle | localhost 8080 |
+| TestContainers | `testcontainers` in Gradle deps | `allow_docker` (dangerous), `allow_localhost_any` |
+| Next.js | `next.config.ts/js` | localhost 3000, `allow_localhost_any` |
+| Vite | `vite.config.ts/js` | localhost 5173, `allow_localhost_any` |
+| Flyway | `db/migration(s)` directories | PostgreSQL port 5432 |
+| Cypress | `cypress.config.ts` + `cypress/` dir | `allow_browser`, `allow_localhost_any` |
+
+Machine-specific suggestions such as `allow_cache_exec` or home-relative read paths come out as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
+
+Permissions marked dangerous above get risk warnings in the generated TOML. `allow_lifecycle_scripts` is never auto-suggested. If lifecycle scripts are detected it only shows up as a diagnostic, because it allows arbitrary code execution on `npm install`.
 
 #### Personal config with `cplt init --global`
 
@@ -366,44 +317,11 @@ cplt init --global          # Preview personal config suggestions
 cplt init --global --write  # Write to ~/.config/cplt/config.toml
 ```
 
-Detects:
+It detects:
+
 | Tool | Probes | Suggests |
 |------|--------|----------|
 | Playwright browsers | `~/Library/Caches/ms-playwright/` | `allow_cache_exec = ["ms-playwright"]` |
 | GPG signing | `~/.gnupg/` + git config | `allow_gpg_signing = true` |
 | Gradle registry | `~/.gradle/gradle.properties` | `allow.read` for credentials file |
 | Alternative agents | `opencode`/`aider` in PATH | `agent = "..."` |
-
-**Supported ecosystems:**
-
-| Ecosystem | Detected via | Suggests |
-|-----------|-------------|----------|
-| JVM (Gradle/Maven) | `build.gradle*`, `pom.xml` | `allow_jvm_attach`, read gradle properties |
-| Node.js | `package.json` | localhost ports, `allow_localhost_any` (for Next.js/Vite) |
-| Docker | `Dockerfile`, `compose.yml` | `allow_docker` ⚠️, exposed ports |
-| Python | `pyproject.toml`, `requirements.txt` | localhost ports (for Django/FastAPI) |
-| Rust | `Cargo.toml` | (works with defaults) |
-| Go | `go.mod` | (works with defaults) |
-| Playwright | `@playwright/test` in package.json | `allow_cache_exec` (personal config hint) |
-| Environment secrets | `.env.example` | `deny.env` for sensitive variables |
-| Spring Boot | `application.yml` + Spring in Gradle | localhost 8080, PostgreSQL port |
-| Ktor | `application.conf` + Ktor in Gradle | localhost 8080 |
-| TestContainers | `testcontainers` in Gradle deps | `allow_docker` ⚠️, `allow_localhost_any` |
-| Next.js | `next.config.ts/js` | localhost 3000, `allow_localhost_any` |
-| Vite | `vite.config.ts/js` | localhost 5173, `allow_localhost_any` |
-| Flyway | `db/migration(s)` directories | PostgreSQL port 5432 |
-| Cypress | `cypress.config.ts` + `cypress/` dir | `allow_browser`, `allow_localhost_any` |
-
-**Machine-specific suggestions** (like `allow_cache_exec` or home-relative read paths) are emitted as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
-
-**Dangerous permissions** (⚠️ in the table) include risk warnings in the generated TOML. `allow_lifecycle_scripts` is never auto-suggested — it's only shown as a diagnostic if lifecycle scripts are detected, since it allows arbitrary code execution on `npm install`.
-
-### Precedence
-
-1. CLI flags (highest)
-2. Global config (`~/.config/cplt/config.toml`)
-3. Built-in defaults
-
-Repo config is **not in this hierarchy** — it operates as a separate layer:
-- `[deny]` always tightens the sandbox (no approval needed)
-- Approved `[propose]` permissions are additive (can enable, never disable)
