@@ -1,67 +1,49 @@
-# Security Model
+# Security model
 
-This document describes the security architecture of cplt, the threat model it addresses, the defense layers it implements, and how they are validated through automated testing.
+This is the security architecture of cplt: the threat model it addresses, the defense layers it implements, and how automated tests validate them.
 
-## Supported Agents
+## Supported agents
 
-cplt sandboxes AI coding agents — currently **GitHub Copilot CLI**, **[OpenCode](https://opencode.ai/)**, **Google Gemini CLI**, **[Antigravity CLI](https://github.com/google-antigravity/antigravity-cli)**, **[Pi](https://github.com/earendil-works/pi)**, and **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**. All share the same core sandbox infrastructure (deny-default Seatbelt/Landlock profile, env sanitization, scratch dir), with agent-specific adaptations:
+cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **[OpenCode](https://opencode.ai/)**, **Google Gemini CLI**, **[Antigravity CLI](https://github.com/google-antigravity/antigravity-cli)**, **[Pi](https://github.com/earendil-works/pi)**, and **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**. All share the same core sandbox (deny-default Seatbelt/Landlock profile, env sanitization, scratch dir), with per-agent adaptations:
 
 | Property        | Copilot                             | OpenCode                                                            | Gemini                                    | Antigravity                                 | Pi                                          | Claude Code                                  |
 |-----------------|-------------------------------------|---------------------------------------------------------------------|-------------------------------------------|----------------------------------------------|---------------------------------------------|----------------------------------------------|
-| Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow → `auth.json`, or API keys                   | Google OAuth (browser) or API key         | Google OAuth (browser / keyring session)     | API keys (Anthropic, OpenAI, Gemini, etc.)  | OAuth token (Keychain / `~/.claude`) or API key |
+| Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow to `auth.json`, or API keys                  | Google OAuth (browser) or API key         | Google OAuth (browser / keyring session)     | API keys (Anthropic, OpenAI, Gemini, etc.)  | OAuth token (Keychain / `~/.claude`) or API key |
 | Auth in sandbox | Token served via one-time file read (gh guard) or Keychain | Copilot auth stored in data dir; third-party keys need `--pass-env` | OAuth stored in `~/.gemini/`; key needs `--pass-env` | OAuth/session data stored in `~/.gemini/*` | Keys need `--pass-env`             | OAuth stored in `~/.claude`/Keychain; keys need `--pass-env` |
 | Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini` (read/write)                  | `~/.gemini/config` (read/write)              | `~/.pi` (read/write)                       | `~/.claude` + `~/.claude.json` (read/write)  |
 | Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          | N/A (in config dir)                       | `~/.gemini/antigravity-cli` (read/write)     | `~/.pi/agent/bin` (read + exec)             | N/A (in config dir)                          |
 | State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          | N/A                                       | N/A                                          | N/A                                          | N/A                                          |
 | Keychain access | Yes (required for token storage)    | No                                                                  | Yes (extension integrity)                 | Yes (OAuth/keyring flow)                     | No                                          | Yes (macOS OAuth token storage)              |
 | SEA extraction  | Yes (pre-sandbox)                   | No                                                                  | No                                        | No                                           | No                                          | No                                           |
-| Env isolation   | `GH_TOKEN` not injected (one-time file); `COPILOT_*` passed | `GH_TOKEN`, `COPILOT_*` suppressed                                  | `GH_TOKEN`, `COPILOT_*` suppressed        | `GH_TOKEN`, `COPILOT_*` suppressed           | `GH_TOKEN`, `COPILOT_*` suppressed          | `GH_TOKEN`, `COPILOT_*` suppressed; `DISABLE_AUTOUPDATER=1` injected |
-| Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                          | Yes (priority 4)                             | No (explicit only — name collision risk)    | No (explicit only)                           |
+| Env isolation   | `GH_TOKEN` not injected (one-time file); `COPILOT_*` passed | suppressed (see below)                          | suppressed (see below)        | suppressed (see below)           | suppressed (see below)          | suppressed (see below); `DISABLE_AUTOUPDATER=1` injected |
+| Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                          | Yes (priority 4)                             | No (explicit only, name collision risk)     | No (explicit only)                           |
 
-### OpenCode-specific security notes
+### Rules that apply to every non-Copilot agent
 
-- **Copilot provider support**: OpenCode can authenticate with your GitHub Copilot subscription via `/connect` device flow. The token is stored in `~/.local/share/opencode/auth.json` — no environment variables needed. This works out of the box in the sandbox.
-- **Third-party API keys are opt-in**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and other provider keys are never passed through by default. Users must explicitly use `--pass-env` for each key. This prevents accidental exposure of credentials to a sandboxed process.
-- **Data dir is write+no-exec**: `~/.local/share/opencode/` (sessions, auth, SQLite DB) is writable but has both `(deny process-exec)` and `(deny file-map-executable)` to prevent write+exec persistence attacks.
-- **State data dir is write+no-exec**: `~/.local/state/opencode/` (locks, history, statistics) is writable but has both `(deny process-exec)` and `(deny file-map-executable)` to prevent write+exec persistence attacks.
-- **Config dir is read-only**: `~/.config/opencode/opencode.json` and related config are readable but not writable, preventing config tampering across unsandboxed runs.
-- **Copilot env vars isolated**: `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, and all `COPILOT_*` env vars are suppressed for non-Copilot agents. OpenCode's Copilot provider uses its own auth file instead.
+- **Copilot env vars are suppressed.** `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, and every `COPILOT_*` variable are stripped for OpenCode, Gemini, Antigravity, Pi, and Claude Code. OpenCode's Copilot provider uses its own auth file instead.
+- **Third-party API keys are opt-in.** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), and the Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`) are never passed through by default. You have to name each one with `--pass-env`. That keeps credentials from reaching a sandboxed process by accident.
 
-### Gemini-specific security notes
+### Agent notes beyond the table
 
-- **OAuth browser flow**: Gemini uses Google OAuth by default, requiring `--allow-browser` for first-time login. Auth tokens are stored in `~/.gemini/`.
-- **API key alternative**: `GEMINI_API_KEY` or `GOOGLE_CLOUD_PROJECT` can be used instead of OAuth — must be passed via `--pass-env`.
-- **Keychain access enabled**: Gemini uses macOS Keychain for extension integrity verification.
-- **Config dir is read/write**: `~/.gemini/` stores auth, settings, sessions, and agents.
+**OpenCode.** The data dir (`~/.local/share/opencode/`: sessions, auth, SQLite DB) and the state dir (`~/.local/state/opencode/`: locks, history, statistics) both carry `(deny process-exec)` and `(deny file-map-executable)` alongside their write permission, so neither can be used for write-then-exec persistence. The config dir (`~/.config/opencode/opencode.json` and friends) is read-only, so the agent cannot tamper with settings that apply to unsandboxed runs.
 
-### Antigravity-specific security notes
+**Gemini.** First-time OAuth login needs `--allow-browser`. `~/.gemini/` holds auth, settings, sessions, and agents.
 
-- **OAuth browser flow**: Antigravity uses Google OAuth for login.
-- **Keychain access enabled**: Antigravity relies on macOS keyring/Keychain integration as an authentication trade-off, similar to other OAuth-based agents.
-- **Config/data dirs are read/write**: `~/.gemini/config/` and `~/.gemini/antigravity-cli/`.
+**Antigravity.** macOS keyring/Keychain integration is the authentication trade-off here, the same one the other OAuth agents make.
 
-### Pi-specific security notes
+**Pi.** Not auto-detected: the `pi` binary name is generic and may collide with other tools, so select it explicitly with `--agent pi` or `sandbox.agent = "pi"`. `~/.pi/` holds settings, auth, sessions, and themes. The managed binary dir `~/.pi/agent/bin/` (bundled `fd`, `rg`) has process-exec plus an explicit write deny, so write+exec persistence is blocked even though the parent `~/.pi/` is writable.
 
-- **Not auto-detected**: the `pi` binary name is generic and may collide with other tools. Pi must be explicitly selected via `--agent pi` or `sandbox.agent = "pi"` in config.
-- **API keys are opt-in**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` are never passed through by default. Users must explicitly use `--pass-env` for each key.
-- **Config dir is read/write**: `~/.pi/` stores settings, auth, sessions, and themes.
-- **Managed binaries have exec**: `~/.pi/agent/bin/` (bundled `fd`, `rg`) has process-exec permission with an explicit write deny (prevents write+exec persistence even though the parent `~/.pi/` is writable).
-- **Copilot env vars isolated**: `GH_TOKEN`, `GITHUB_TOKEN`, and `COPILOT_*` are suppressed for Pi.
+**Claude Code.** Not auto-detected either; select it with `--agent claude` (aliases `cc`, `claude-code`) or `sandbox.agent = "claude"`.
 
-### Claude Code-specific security notes
+- **Subscription auth works out of the box.** The OAuth token lives in `~/.claude/.credentials.json` (Linux) or the macOS login Keychain ("Claude Code-credentials"). Both are exposed to the sandbox, so the subscription flow needs no env var. That hands the sandboxed agent its own credentials, an inherent trade-off, the same one Copilot's Keychain access makes. Because subscription OAuth needs no env var, cplt does not emit the "needs auth" warning for Claude Code.
+- **Config dirs are read/write.** `~/.claude/` (sessions, projects, history, settings, credentials) and the top-level `~/.claude.json`.
+- **Host-persistence guard.** Inside that writable config dir, `statusline.sh` and `plugins/` are explicitly write-denied. Both auto-execute the next time `claude` runs *outside* the sandbox, so a compromised agent could otherwise plant code that escapes via the next launch. `settings.json`, `commands/`, `agents/`, and `skills/` stay writable, because Claude legitimately authors them and they require explicit user invocation rather than auto-firing. This is **macOS-only**. Like `DENIED_HOME_SUBPATHS`, Landlock cannot deny a subpath inside an allowed directory, so on Linux these stay writable, and the residual `mcpServers` risk in `~/.claude.json` is unenforceable there too. Treat write access to a relocated `CLAUDE_CONFIG_DIR` the same way.
+- **`CLAUDE_CONFIG_DIR` is supported.** It sits on the env allowlist, and when set, `Agent::Claude.config_dirs()` grants that directory in place of `~/.claude`. Both halves are required. Granting the path without passing the variable, or the reverse, breaks auth and config inside the sandbox.
+- **Auto-update disabled.** cplt injects `DISABLE_AUTOUPDATER=1`. Claude Code has no `--no-auto-update` flag, and a self-update inside the sandbox is a persistence vector that would also fail against read-only install paths.
 
-- **Not auto-detected**: select explicitly via `--agent claude` (aliases `cc`, `claude-code`) or `sandbox.agent = "claude"` in config.
-- **Subscription auth works out of the box**: the OAuth token lives in `~/.claude/.credentials.json` (Linux) or the macOS login Keychain ("Claude Code-credentials"). Both are exposed to the sandbox, so the subscription flow needs no env var. This grants the sandboxed agent its own credentials — an inherent trade-off, same as Copilot's Keychain access.
-- **API keys are opt-in**: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), and Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`) are never passed by default — use `--pass-env`. Because subscription OAuth works without any env var, cplt does **not** emit the "needs auth" warning for Claude Code.
-- **Config dirs are read/write**: `~/.claude/` (sessions, projects, history, settings, credentials) and the top-level `~/.claude.json`.
-- **Host-persistence guard**: within the writable config dir, `statusline.sh` and `plugins/` are explicitly write-denied. These auto-execute the next time `claude` runs *outside* the sandbox, so a compromised agent could otherwise plant code that escapes the sandbox via the next launch. `settings.json`, `commands/`, `agents/`, and `skills/` stay writable — Claude legitimately authors them and they require explicit user invocation rather than auto-firing. **macOS-only**: like `DENIED_HOME_SUBPATHS`, Landlock cannot deny a subpath inside an allowed directory, so on Linux these remain writable (the residual `mcpServers` risk in `~/.claude.json` is also unenforceable there). Treat write access to a relocated `CLAUDE_CONFIG_DIR` the same way.
-- **`CLAUDE_CONFIG_DIR` is supported**: it is on the env allowlist and, when set, `Agent::Claude.config_dirs()` grants that directory in place of `~/.claude`. Both halves are required — granting the path without passing the variable (or vice versa) would break auth/config inside the sandbox.
-- **Auto-update disabled**: `DISABLE_AUTOUPDATER=1` is injected. Claude Code has no `--no-auto-update` flag, and a self-update inside the sandbox is a persistence vector that would also fail against read-only install paths.
-- **Copilot env vars isolated**: `GH_TOKEN`, `GITHUB_TOKEN`, and `COPILOT_*` are suppressed for Claude Code.
+## Threat model
 
-## Threat Model
-
-cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code suggestions on your machine. The threat model covers:
+cplt assumes the sandboxed agent is **untrusted**, because it executes arbitrary code suggestions on your machine. The threat model covers:
 
 | Threat | Example | Defense layer |
 |---|---|---|
@@ -70,24 +52,24 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | **Secret file access** | Read `~/.netrc`, `~/.npmrc`, `~/.vault-token` | Seatbelt deny rules (macOS) / Landlock deny (Linux) |
 | **Destructive GitHub ops** | `gh repo delete`, `gh pr merge`, `gh release create` | gh guard command interception (opt-in) |
 | **Unreviewed code push** | `git push origin main` | git guard command interception (opt-in) |
-| **Git alias push bypass** | `git -c alias.p=push p origin main` | git guard blocks `-c alias.*` + denies unknown subcommands |
-| **Git subtree push bypass** | `git subtree push --prefix=lib origin main` | `subtree` in explicit block list + deny-unknown policy |
-| **Multi-refspec bypass** | `git push origin feature main` | git guard checks ALL refspecs, not just first |
-| **Token exfiltration via CLI** | `gh auth token` prints raw token | gh guard serves cached token once at startup, deletes file — subprocesses get nothing |
+| **Git alias push bypass** | `git -c alias.p=push p origin main` | git guard blocks `-c alias.*` and denies unknown subcommands |
+| **Git subtree push bypass** | `git subtree push --prefix=lib origin main` | `subtree` in explicit block list, plus deny-unknown policy |
+| **Multi-refspec bypass** | `git push origin feature main` | git guard checks ALL refspecs, not just the first |
+| **Token exfiltration via CLI** | `gh auth token` prints raw token | gh guard serves the cached token once at startup and deletes the file, so subprocesses get nothing |
 | **Cross-repo operations** | `gh pr close -R other-org/other-repo` | gh guard scope checking against current repo |
 | **Org/user data enumeration** | `gh api /orgs/.../audit-log` leaks PII | gh guard restricts API to `/repos/{current-repo}/...` endpoints only |
 | **DNS rebinding SSRF** | Domain resolves to `127.0.0.1` after check | Post-DNS-resolution IP validation; `--allow-private-domain` opt-in bypass for explicitly trusted internal domains |
 | **Sandbox profile injection** | Path with `\n(allow file-read* (subpath "/"))` | SBPL path character validation (macOS) |
-| **Temp file symlink attack** | Symlink at predictable `/tmp/cplt.sb` | Unique filename + `O_CREAT\|O_EXCL` |
-| **Write-then-exec in /tmp** | Drop binary in `/tmp`, execute it | Seatbelt deny (macOS) / Landlock deny (Linux); `--scratch-dir` provides safe alternative |
-| **Cloud metadata access** | Fetch `169.254.169.254` or CGNAT range | Comprehensive private IP blocklist |
+| **Temp file symlink attack** | Symlink at predictable `/tmp/cplt.sb` | Unique filename plus `O_CREAT\|O_EXCL` |
+| **Write-then-exec in /tmp** | Drop binary in `/tmp`, execute it | Seatbelt deny (macOS) / Landlock deny (Linux); `--scratch-dir` provides a safe alternative |
+| **Cloud metadata access** | Fetch `169.254.169.254` or CGNAT range | Private IP blocklist covering all reserved ranges |
 | **Cross-project access** | Read files outside project directory | Seatbelt subpath (macOS) / Landlock ruleset (Linux) |
 | **Process-group escape** | Kill parent, children continue unsandboxed | Signal forwarding (SIGTERM, SIGHUP) |
-| **Env var credential theft** | Read `AWS_SECRET_ACCESS_KEY` from env | `env_clear()` + safe allowlist |
+| **Env var credential theft** | Read `AWS_SECRET_ACCESS_KEY` from env | `env_clear()` plus safe allowlist |
 | **Persistence via native modules** | Replace `keytar.node` with malware | Deny writes to `~/.copilot/pkg` |
-| **Git hook injection** | Write post-checkout hook that runs outside sandbox | Seatbelt write-deny (macOS); **Landlock leaves project `.git/hooks` writable** — env hardening does NOT stop a planted hook running unsandboxed on the next `git` run; the *direct* file-planting vector is mitigated when Bubblewrap re-binds `.git/hooks` read-only (Linux). **Residual:** `.git/config` stays writable, so `core.hooksPath` can still redirect hooks to a writable dir — a partial, not complete, mitigation |
-| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Seatbelt write-deny (macOS); **Linux leaves `.git/config` writable** — Bubblewrap deliberately does NOT re-bind it read-only (that would break legit `git config user.email/name`, `git remote add`, `git push -u`, and risk a stale `.git/config.lock` blocking the user's next out-of-sandbox git). The injected `GIT_CONFIG_*` overrides constrain config resolution for in-sandbox git runs, and the proxy blocks redirected fetches (Linux) |
-| **Submodule supply chain** | Modify `.gitmodules` to point to malicious repo | Seatbelt write-deny (macOS); **Linux leaves `.gitmodules` writable** — Bubblewrap deliberately does NOT re-bind it read-only (`git submodule add` writes it); proxy domain filtering limits reachable clone targets (Linux) |
+| **Git hook injection** | Write post-checkout hook that runs outside sandbox | Seatbelt write-deny (macOS). **Landlock leaves project `.git/hooks` writable**, and env hardening does NOT stop a planted hook running unsandboxed on the next `git` run. Bubblewrap re-binds `.git/hooks` read-only, which mitigates the *direct* file-planting vector on Linux. **Residual:** `.git/config` stays writable, so `core.hooksPath` can still redirect hooks to a writable dir. See [Linux namespace isolation](#linux-namespace-isolation-bubblewrap) |
+| **Git config hijacking** | Set `core.hooksPath=/tmp/evil` or URL redirect | Seatbelt write-deny (macOS). **Linux leaves `.git/config` writable** and Bubblewrap deliberately keeps it that way, for the reasons in [Linux namespace isolation](#linux-namespace-isolation-bubblewrap). The injected `GIT_CONFIG_*` overrides constrain config resolution for in-sandbox git runs, and the proxy blocks redirected fetches (Linux) |
+| **Submodule supply chain** | Modify `.gitmodules` to point to malicious repo | Seatbelt write-deny (macOS). **Linux leaves `.gitmodules` writable**, deliberately, because `git submodule add` writes it; proxy domain filtering limits reachable clone targets (Linux) |
 | **Syscall abuse** | `ptrace`, `mount`, `kexec_load` | seccomp-BPF filter (Linux) |
 
 ### Platform enforcement comparison
@@ -97,7 +79,7 @@ cplt assumes the sandboxed agent is **untrusted** — executing arbitrary code s
 | Credential files (~/.ssh, ~/.aws) | ✅ Kernel deny | ✅ Not in ruleset (deny-by-default) | ✅ Landlock (deny-by-default) |
 | Project .env file read/write/delete | ✅ Kernel deny | ⚠️ Proxy blocks exfiltration | ⚠️ Proxy blocks exfiltration |
 | .git/hooks write in project | ✅ Kernel deny | ❌ Writable (Landlock can't sub-deny; env hardening does NOT block hook planting) | ⚠️ Re-bound read-only (blocks direct file planting; `core.hooksPath` via writable `.git/config` is a residual) |
-| .git/config write in project | ✅ Kernel deny | ❌ Writable (env hardening constrains in-sandbox config resolution only) | ❌ Deliberately writable (read-only would break git config/remote ops + risk stale `.git/config.lock`) |
+| .git/config write in project | ✅ Kernel deny | ❌ Writable (env hardening constrains in-sandbox config resolution only) | ❌ Deliberately writable (read-only would break git config/remote ops and risk a stale `.git/config.lock`) |
 | .gitmodules write in project | ✅ Kernel deny | ❌ Writable (Landlock can't sub-deny) | ❌ Deliberately writable (`git submodule add` writes it) |
 | .cplt.toml write in project | ✅ Kernel deny | ❌ Writable (Landlock can't sub-deny) | ✅ Re-bound read-only if present |
 | Network: outbound port filtering | ✅ Kernel (all versions) | ✅ Kernel (6.7+) / ⚠️ Proxy only (<6.7) | ✅ Same as Landlock (no net namespace) |
@@ -114,22 +96,30 @@ Legend: ✅ = kernel-enforced, ⚠️ = defense-in-depth (proxy/env), ❌ = not 
 
 ### Linux namespace isolation (Bubblewrap)
 
-On Linux, cplt can optionally layer **Bubblewrap** (`bwrap`) on top of Landlock + seccomp-BPF. Bubblewrap is used by Flatpak and provides battle-tested, unprivileged namespace setup. It is **defense-in-depth for the Landlock/seccomp layer, not a replacement for it** — Landlock (filesystem/network access control) and seccomp (syscall filtering) remain the enforcing boundary; bwrap adds process, IPC, and hostname isolation plus a private `/tmp` around them.
+On Linux, cplt can optionally layer **Bubblewrap** (`bwrap`) on top of Landlock + seccomp-BPF. Bubblewrap is what Flatpak uses, and it gives us battle-tested unprivileged namespace setup. It is defense-in-depth for the Landlock/seccomp layer, not a replacement for it. Landlock (filesystem and network access control) and seccomp (syscall filtering) remain the enforcing boundary; bwrap adds process, IPC, and hostname isolation plus a private `/tmp` around them.
 
 **What bwrap adds:**
 
-1. **PID namespace** — the agent cannot see or signal host processes. `ps` shows only the agent's own process tree, preventing process enumeration attacks.
-2. **IPC / UTS / cgroup namespaces** — no shared SysV IPC, an isolated hostname, and an isolated cgroup view.
-3. **Mount namespace** — the whole host filesystem is bind-mounted **read-only** (`--ro-bind / /`); write access is granted only at the specific paths carrying a writable Landlock rule (re-bound writable at their real locations). The host root is therefore *enumerable* inside the namespace — the mount namespace only changes the mount topology, it does **not** hide arbitrary files. Confidentiality is Landlock's job (deny-by-default): a path with no read rule is denied by Landlock even though it appears in the mount table.
-4. **Private `/tmp`** — `/tmp` is a fresh, empty `tmpfs` that carries no exec-bearing Landlock rule, so the "no exec from `/tmp`" guarantee holds. The scratch dir (write+exec) is kept at its real path and is never overlaid on `/tmp`; a writable path that legitimately lives under `/tmp` (e.g. a `--project-dir` in `/tmp`) is re-bound *after* the tmpfs so it stays usable.
-5. **User namespace** — unprivileged operation, no root required. The agent maps to the **invoking host UID** (there is no UID-0 mapping) and holds no real capabilities on the host.
-6. **Git-persistence read-only re-bind** — the project's `.git/hooks` and `.cplt.toml` live *inside* the writable project tree, which Landlock cannot carve a sub-deny out of, so on the Landlock-only path they stay writable (a persistence-escape gap vs macOS). When bwrap is active these two pre-existing paths are re-bound **read-only** (`--ro-bind`, emitted after the writable project bind so it shadows it): an agent can no longer plant a `.git/hooks/post-commit` that runs unsandboxed on the next `git` run, nor drop a `.cplt.toml` that relaxes the next session's sandbox. In a git **worktree** the project's `.git` is a gitdir *pointer file* (so `<project>/.git/hooks` does not exist) and the real hooks live under the shared common dir that the sandbox grants write access to, so `<git_common_dir>/hooks` is re-bound **read-only** too — otherwise the worktree persistence vector would be missed. The set is **deliberately narrow**. `.git/config` and `.gitmodules` are **left writable on purpose** — read-only binding them would break common, legitimate in-sandbox git operations (`git config user.email/user.name` identity setup, without which the next `git commit` fails "Please tell me who you are"; plus `git remote add`, `git push -u` upstream tracking, and `git submodule add`, which writes `.gitmodules`) and, because git rewrites config via a `.git/config.lock` + rename, a denied write could leave a **stale `.git/config.lock`** that blocks the user's next out-of-sandbox git. This also matches the git command guard, which explicitly allows `git config user.name`. **Residuals:** (a) because `.git/config` stays writable, an agent can still set `core.hooksPath` to redirect hooks into a writable directory — the `.git/hooks` read-only bind mitigates the *direct* file-planting vector only, not all git-hook persistence; (b) a read-only bind only protects paths that *already exist* at launch (bwrap cannot bind a nonexistent source), so a not-yet-created `.cplt.toml` can still be created; (c) submodule hooks (`.git/modules/<name>/hooks`) are not covered; and (d) this mitigation requires bwrap — the Landlock-only path remains exposed.
+1. **PID namespace.** The agent cannot see or signal host processes. `ps` shows only the agent's own process tree, which stops process enumeration.
+2. **IPC / UTS / cgroup namespaces.** No shared SysV IPC, an isolated hostname, an isolated cgroup view.
+3. **Mount namespace.** The whole host filesystem is bind-mounted **read-only** (`--ro-bind / /`); write access is granted only at the specific paths carrying a writable Landlock rule, re-bound writable at their real locations. The host root is therefore still *enumerable* inside the namespace. The mount namespace only changes the mount topology, it does not hide arbitrary files. Confidentiality is Landlock's job (deny-by-default): a path with no read rule is denied by Landlock even though it appears in the mount table.
+4. **Private `/tmp`.** `/tmp` is a fresh, empty `tmpfs` that carries no exec-bearing Landlock rule, so the "no exec from `/tmp`" guarantee holds. The scratch dir (write+exec) stays at its real path and is never overlaid on `/tmp`. A writable path that legitimately lives under `/tmp` (say a `--project-dir` in `/tmp`) is re-bound *after* the tmpfs so it stays usable.
+5. **User namespace.** Unprivileged operation, no root required. The agent maps to the **invoking host UID**, there is no UID-0 mapping, and it holds no real capabilities on the host.
+6. **Git-persistence read-only re-bind.** See below.
 
-Bubblewrap **deliberately does not** create a network namespace (see limitations below), so it is **not a network or confidentiality boundary**.
+#### The git-persistence re-bind
 
-**Layering — how Landlock + seccomp stay enforced (fail-closed):**
+The project's `.git/hooks` and `.cplt.toml` live *inside* the writable project tree, and Landlock cannot carve a sub-deny out of it, so on the Landlock-only path they stay writable. That is a persistence-escape gap against macOS. When bwrap is active, those two pre-existing paths are re-bound **read-only** (`--ro-bind`, emitted after the writable project bind so it shadows it), so an agent can no longer plant a `.git/hooks/post-commit` that runs unsandboxed on the next `git` run, nor drop a `.cplt.toml` that relaxes the next session's sandbox. In a git **worktree** the project's `.git` is a gitdir *pointer file*, so `<project>/.git/hooks` does not exist and the real hooks live under the shared common dir that the sandbox grants write access to; `<git_common_dir>/hooks` is therefore re-bound read-only too, otherwise the worktree persistence vector would be missed.
 
-`bwrap` needs `unshare`/`mount`/`pivot_root` to build the namespaces — exactly the syscalls our seccomp filter `EPERM`s, and the bind-mount sources are what a restrictive Landlock domain would block. So Landlock and seccomp are **not** applied to the `bwrap` process; they are applied to the **agent**, inside the namespaces, after bwrap finishes setup:
+The set is deliberately narrow. `.git/config` and `.gitmodules` are left writable on purpose, because read-only binding them would break legitimate in-sandbox git operations: `git config user.email` / `user.name` identity setup, without which the next `git commit` fails with "Please tell me who you are", plus `git remote add`, `git push -u` upstream tracking, and `git submodule add`, which writes `.gitmodules`. There is a second reason. Git rewrites config via a `.git/config.lock` plus rename, so a denied write could leave a **stale `.git/config.lock`** that blocks the user's next out-of-sandbox git. This matches the git command guard, which explicitly allows `git config user.name`.
+
+Four residuals come with this. Because `.git/config` stays writable, an agent can still set `core.hooksPath` to redirect hooks into a writable directory, so the `.git/hooks` bind mitigates the *direct* file-planting vector only, not all git-hook persistence. A read-only bind protects only paths that *already exist* at launch, since bwrap cannot bind a nonexistent source, so a not-yet-created `.cplt.toml` can still be created. Submodule hooks (`.git/modules/<name>/hooks`) are not covered. And the whole mitigation requires bwrap; the Landlock-only path stays exposed.
+
+Bubblewrap deliberately does not create a network namespace (see the limitations below), so it is not a network or confidentiality boundary.
+
+**How Landlock and seccomp stay enforced (fail-closed):**
+
+`bwrap` needs `unshare`/`mount`/`pivot_root` to build the namespaces, exactly the syscalls our seccomp filter `EPERM`s, and the bind-mount sources are what a restrictive Landlock domain would block. So Landlock and seccomp are **not** applied to the `bwrap` process. They are applied to the **agent**, inside the namespaces, after bwrap finishes setup:
 
 ```text
 cplt ──exec──▶ bwrap (creates namespaces, unrestricted)
@@ -139,26 +129,27 @@ cplt ──exec──▶ bwrap (creates namespaces, unrestricted)
                              └─execve──▶ agent (Landlock + seccomp enforced)
 ```
 
-The re-entry helper is this same cplt binary, dispatched by an `.init_array` constructor keyed on the `__CPLT_BWRAP_POLICY_FD` environment variable; the Landlock policy and agent argv arrive over an **inherited pipe** (nothing is written to disk, so the fresh `--tmpfs /tmp` cannot hide it). Because the helper opens its Landlock rule paths *inside* the namespaces, the effective policy is identical to the non-bwrap path. If any step of the helper fails it `_exit(126)`s **before** the agent runs — the agent is never executed unsandboxed. A one-byte confirm pipe lets the parent detect that the inner sandbox was applied; on auto-detect a missing confirmation degrades gracefully to the direct Landlock+seccomp path, while explicit `--use-bubblewrap` treats it as a hard error.
+The re-entry helper is this same cplt binary, dispatched by an `.init_array` constructor keyed on the `__CPLT_BWRAP_POLICY_FD` environment variable. The Landlock policy and agent argv arrive over an **inherited pipe**, so nothing is written to disk and the fresh `--tmpfs /tmp` cannot hide it. Because the helper opens its Landlock rule paths *inside* the namespaces, the effective policy is identical to the non-bwrap path. If any step of the helper fails it `_exit(126)`s **before** the agent runs, so the agent is never executed unsandboxed. A one-byte confirm pipe lets the parent detect that the inner sandbox was applied. On auto-detect, a missing confirmation degrades gracefully to the direct Landlock+seccomp path; explicit `--use-bubblewrap` treats it as a hard error.
 
 **Activation:**
 
-- **Auto-detect (default):** if `bwrap` is in PATH and can actually create the namespaces (probed by running the real `build_bwrap_args` output against `/bin/true`), it is used automatically. Falls back to Landlock+seccomp otherwise.
-- **Explicit enable:** `--use-bubblewrap` or `sandbox.use_bubblewrap = true` — hard-fails if bwrap is unavailable rather than silently falling back.
-- **Explicit disable:** `--no-bubblewrap` or `sandbox.use_bubblewrap = false` — uses Landlock+seccomp only. If both are given, off wins.
+- **Auto-detect (default):** if `bwrap` is in PATH and can actually create the namespaces (probed by running the real `build_bwrap_args` output against `/bin/true`), cplt uses it. Otherwise it falls back to Landlock+seccomp.
+- **Explicit enable:** `--use-bubblewrap` or `sandbox.use_bubblewrap = true`, which hard-fails if bwrap is unavailable rather than silently falling back.
+- **Explicit disable:** `--no-bubblewrap` or `sandbox.use_bubblewrap = false`, which uses Landlock+seccomp only. If both are given, off wins.
 
-**Graceful degradation:** Bubblewrap requires a kernel with unprivileged user namespaces enabled. On systems without bwrap or namespace support, cplt falls back to Landlock + seccomp-BPF (still providing the full filesystem and syscall isolation — bwrap changes the process/mount topology, not the access-control policy).
+**Graceful degradation:** Bubblewrap requires a kernel with unprivileged user namespaces enabled. Without bwrap or namespace support, cplt falls back to Landlock + seccomp-BPF, which still provides the full filesystem and syscall isolation. bwrap changes the process and mount topology, not the access-control policy.
 
 **What bwrap does NOT provide:**
 
-- **No network isolation.** There is no network namespace: the host network is shared **by design** so the sandboxed agent can reach cplt's CONNECT proxy on `127.0.0.1`. Outbound control stays with Landlock TCP port rules (ABI v4+) and the proxy — exactly as on the non-bwrap path. Kernel-level network isolation (a private netns with the proxy bridged in) is future work tracked in [issue #114](https://github.com/navikt/cplt/issues/114).
-- **No filesystem confidentiality from the mount namespace.** The full host filesystem is enumerable read-only; Landlock, not the mount namespace, is what denies reads.
-- **No UID remapping.** The host UID is visible inside the user namespace (asserted by an integration test); there is no root/UID-0 illusion.
+- **No network isolation.** There is no network namespace. The host network is shared **by design**, so the sandboxed agent can reach cplt's CONNECT proxy on `127.0.0.1`. Outbound control stays with Landlock TCP port rules (ABI v4+) and the proxy, exactly as on the non-bwrap path. Kernel-level network isolation (a private netns with the proxy bridged in) is future work tracked in [issue #114](https://github.com/navikt/cplt/issues/114).
+- **No filesystem confidentiality from the mount namespace.** The full host filesystem is enumerable read-only. Landlock, not the mount namespace, is what denies reads.
+- **No UID remapping.** The host UID is visible inside the user namespace (an integration test asserts this). There is no root/UID-0 illusion.
 
-**Security model summary:** the layers, honestly attributed —
-- Filesystem: **Landlock** (deny-by-default) is the access control; the mount namespace only makes the host root read-only and provides a private `/tmp`.
-- Network: **proxy** (domain filtering) + **Landlock** port filtering (6.7+). Bubblewrap adds nothing here.
-- Syscalls: **seccomp-BPF** (ptrace, mount, kexec_load, unshare, … blocked), applied to the agent inside the namespaces.
+**The layers, honestly attributed:**
+
+- Filesystem: **Landlock** (deny-by-default) is the access control. The mount namespace only makes the host root read-only and provides a private `/tmp`.
+- Network: **proxy** (domain filtering) plus **Landlock** port filtering (6.7+). Bubblewrap adds nothing here.
+- Syscalls: **seccomp-BPF** (ptrace, mount, kexec_load, unshare, and more), applied to the agent inside the namespaces.
 - Processes: **PID namespace** (host process tree invisible), plus IPC/UTS/cgroup isolation.
 
 **Installation:**
@@ -175,24 +166,32 @@ sudo pacman -S bubblewrap
 
 ### Out of scope
 
-- **TLS interception** — the proxy sees CONNECT targets (hostname:port) but not request bodies or responses
-- **Kernel exploits** — we rely on Apple's Seatbelt (macOS) and Landlock/seccomp (Linux) enforcement being correct
-- **Keychain isolation** (macOS) — Copilot requires Keychain access for auth; this is an accepted trade-off. `mach-lookup` is blanket because Node.js needs it for DNS, Security framework, and system services. The **clipboard** (`com.apple.pasteboard`) is reachable via the same blanket allow; use `--deny-clipboard` to add a targeted deny that blocks only the pasteboard service while leaving all others intact.
-- **sandbox-exec deprecation** (macOS) — Apple marks it deprecated but has not removed it; Chromium and VS Code still use it
-- **Landlock subpath limitations** (Linux) — Landlock cannot deny access to subpaths within allowed directories. If a parent directory is allowed, all children are allowed. This means certain fine-grained macOS rules (e.g., deny `.config/gh/extensions` while allowing `.config/gh/hosts.yml`) cannot be replicated on Linux. When Bubblewrap is active, user deny paths (`--deny-path` / `deny.paths`) ARE enforced despite this, via mount masks (see the platform comparison table); the built-in fine-grained rules remain macOS-only.
-- **Code quality** — the sandbox cannot judge whether code written by Copilot contains backdoors; that's a code review problem
-- **`~/.config/gh/hosts.yml` token** — contains the user's GitHub OAuth token. Copilot needs *a* GitHub token to function (via env var or this file). The token is readable inside the sandbox. If this is a concern, set `GH_TOKEN` env var (passes through allowlist) and add `--deny-path ~/.config/gh` to block the file.
-- **Interpreter-based temp execution** — the sandbox blocks *direct* exec from `/tmp` (Mach-O/ELF binaries, dlopen), but cannot block `bash /tmp/evil.sh` or `node /tmp/evil.js` because the exec target is the interpreter (`/bin/bash`, `/usr/bin/node`), not the script file. Sandboxing interpreters would break Copilot.
-- **`.vscode/` project configs** — the agent can write `.vscode/tasks.json`, `launch.json`, and `settings.json` which VS Code may auto-execute outside the sandbox. This is an IDE trust boundary issue, not a sandbox scope issue. Mitigation: review `.vscode/` changes in `git diff` before committing; set `"task.autoRunTasks": "off"` in VS Code.
-- **Write+exec in home cache dirs** — `~/.gradle`, `~/.m2`, `~/Library/pnpm` (macOS) / `~/.local/share/pnpm` (Linux) have both write and exec permissions. Build tools need write for dependency downloads and exec for build plugins. A rogue agent could write a malicious JAR to `~/.m2` or a Gradle plugin to `~/.gradle`, but the executed code would still be sandboxed. `~/Library/Caches` (macOS) is broadly allowed for dev tool caches (go-build, Homebrew, pip, etc.), but browser and app caches (Chrome, Firefox, Discord, etc.) are denied via regex prefix rules — no allowlist maintenance needed for new dev tools. `--allow-cache-exec <SUBDIR>` opts into the same write+exec trade-off for the named subdir (e.g. `ms-playwright`, `pnpm/dlx`) under `~/Library/Caches` (macOS) or `~/.cache` (Linux): a rogue agent could write a binary there and execute it, but execution remains sandboxed. On Linux the subdir is validated to be a traversal-free relative path before a Landlock execute rule is granted, so a crafted value like `../../bin` cannot escape the cache dir. Prefer `--allow-cache-exec <SUBDIR>` over `--allow-cache-exec-any`, which opens the entire cache tree.
-- **Playwright Chromium runtime** (macOS, `allow_cache_exec = ["ms-playwright"]`) — when browser testing is enabled, the sandbox grants elevated system permissions beyond the normal `process-exec` and `file-map-executable` rules: `(allow syscall*)` (all syscalls including Mach traps — Chromium uses undocumented traps that vary by macOS version and cannot be individually enumerated in a stable allowlist), `(allow system-socket (socket-domain AF_UNIX))` (Unix domain sockets for IPC between browser, renderer, and GPU processes), `(allow iokit-open-user-client)` (GPU capability probing — unscoped because IOKit class names are hardware-dependent), and `(allow mach-register)` scoped to `^org\.chromium\..+$` (Crashpad and inter-process IPC — anchored with `$` and requires at least one character after the prefix). Unix socket operations for Chrome's `SingletonSocket` use `[^/]+/[^/]+` for the `var/folders` path segments to prevent matching across directory boundaries. All filesystem, network, and credential denies remain enforced independently. These rules activate when `allow_cache_exec` contains `"ms-playwright"` or any subpath like `"ms-playwright/chromium-1217"` (first path component match) — `allow_cache_exec_any` does not trigger them. Without these rules, `chrome-headless-shell` segfaults (`SEGV_ACCERR`) during browser initialization. **Linux:** `--allow-cache-exec ms-playwright` now grants Landlock execute on `~/.cache/ms-playwright` (the XDG equivalent), so the browser binary can run. The macOS Seatbelt/Mach permissions above have no Linux analogue. The remaining difference is Chromium's *own* sandbox: on Linux it builds a setuid-less sandbox using user namespaces (`unshare`/`setns`/`clone` with `CLONE_NEW*`), but cplt's seccomp-bpf filter denies `unshare`/`setns` with `EPERM` (user-namespace creation is a sandbox-escape primitive — see "Defense layers"). cplt deliberately does **not** relax the seccomp filter for browser testing. Instead, run Chromium with its own sandbox disabled (`--no-sandbox`, or Playwright `chromiumSandbox: false`): cplt's Landlock + seccomp is the enforcing boundary, so Chromium's nested sandbox is redundant inside it. `/dev/shm` is already allowed, so `--disable-dev-shm-usage` is not required.
-- **Project build scripts** — the agent can modify `Makefile`, `package.json` scripts, `build.gradle`, `.github/workflows/`, etc. These are legitimate Copilot targets and cannot be blocked. The risk is mitigated by code review (git diff) before running builds or committing.
-- **POSIX shared memory** (macOS) — `ipc-posix-shm-*` is allowed because Node.js needs it for DNS and system queries. An agent could theoretically use SHM as an IPC channel to processes outside the sandbox, but this requires a cooperating process already running on the machine.
-- **DNS tunneling** — DNS queries are unrestricted on both platforms. Bandwidth is ~15 KB/s max, requires attacker-controlled authoritative DNS, and is detectable with network monitoring.
+- **TLS interception.** The proxy sees CONNECT targets (hostname:port), not request bodies or responses.
+- **Kernel exploits.** We rely on Apple's Seatbelt (macOS) and Landlock/seccomp (Linux) enforcement being correct.
+- **Keychain isolation** (macOS). Copilot requires Keychain access for auth, an accepted trade-off. `mach-lookup` is blanket because Node.js needs it for DNS, the Security framework, and system services. The **clipboard** (`com.apple.pasteboard`) is reachable through that same blanket allow; `--deny-clipboard` adds a targeted deny that blocks only the pasteboard service and leaves all others intact.
+- **sandbox-exec deprecation** (macOS). Apple marks it deprecated but has not removed it, and Chromium and VS Code still use it.
+- **Landlock subpath limitations** (Linux). Landlock cannot deny access to subpaths within allowed directories. If a parent directory is allowed, all children are allowed. Certain fine-grained macOS rules therefore cannot be replicated on Linux, for example denying `.config/gh/extensions` while allowing `.config/gh/hosts.yml`. When Bubblewrap is active, user deny paths (`--deny-path` / `deny.paths`) ARE enforced despite this, via mount masks (see the platform comparison table). The built-in fine-grained rules stay macOS-only.
+- **Code quality.** The sandbox cannot judge whether code written by Copilot contains backdoors. That is a code review problem.
+- **`~/.config/gh/hosts.yml` token.** It contains the user's GitHub OAuth token and stays readable inside the sandbox. Copilot needs *a* GitHub token to function, via env var or this file. If that concerns you, set the `GH_TOKEN` env var (it passes the allowlist) and add `--deny-path ~/.config/gh` to block the file. See [Honest gaps](#honest-gaps) for the full analysis.
+- **Interpreter-based temp execution.** The sandbox blocks *direct* exec from `/tmp` (Mach-O/ELF binaries, dlopen), but it cannot block `bash /tmp/evil.sh` or `node /tmp/evil.js`, because the exec target is the interpreter (`/bin/bash`, `/usr/bin/node`), not the script file. Sandboxing interpreters would break Copilot.
+- **`.vscode/` project configs.** The agent can write `.vscode/tasks.json`, `launch.json`, and `settings.json`, which VS Code may auto-execute outside the sandbox. This is an IDE trust boundary issue, not a sandbox scope issue. Mitigation: review `.vscode/` changes in `git diff` before committing, and set `"task.autoRunTasks": "off"` in VS Code.
+- **Write+exec in home cache dirs.** `~/.gradle`, `~/.m2`, and `~/Library/pnpm` (macOS) / `~/.local/share/pnpm` (Linux) have both write and exec, because build tools need write for dependency downloads and exec for build plugins. A rogue agent could write a malicious JAR to `~/.m2` or a Gradle plugin to `~/.gradle`, but the executed code stays sandboxed. `~/Library/Caches` (macOS) is broadly allowed for dev tool caches (go-build, Homebrew, pip), while browser and app caches (Chrome, Firefox, Discord) are denied via regex prefix rules, so new dev tools need no allowlist maintenance. `--allow-cache-exec <SUBDIR>` opts into the same write+exec trade-off for one named subdir such as `ms-playwright` or `pnpm/dlx`, under `~/Library/Caches` (macOS) or `~/.cache` (Linux). A rogue agent could write a binary there and execute it, but execution stays sandboxed. On Linux the subdir is validated as a traversal-free relative path before a Landlock execute rule is granted, so `../../bin` cannot escape the cache dir. Prefer it over `--allow-cache-exec-any`, which opens the entire cache tree.
+- **Playwright Chromium runtime** (macOS, `allow_cache_exec = ["ms-playwright"]`). Enabling browser testing grants system permissions well beyond the normal `process-exec` and `file-map-executable` rules:
+  - `(allow syscall*)`, meaning all syscalls including Mach traps. Chromium uses undocumented traps that vary by macOS version and cannot be enumerated in a stable allowlist.
+  - `(allow system-socket (socket-domain AF_UNIX))` for IPC between the browser, renderer, and GPU processes.
+  - `(allow iokit-open-user-client)` for GPU capability probing, unscoped because IOKit class names are hardware-dependent.
+  - `(allow mach-register)` scoped to `^org\.chromium\..+$` for Crashpad and inter-process IPC, anchored with `$` and requiring at least one character after the prefix.
 
-## Real-World Attack Landscape (2025–2026)
+  Unix socket operations for Chrome's `SingletonSocket` use `[^/]+/[^/]+` for the `var/folders` path segments, so a match cannot cross directory boundaries. All filesystem, network, and credential denies stay enforced independently. These rules activate when `allow_cache_exec` contains `"ms-playwright"` or any subpath like `"ms-playwright/chromium-1217"` (first path component match); `allow_cache_exec_any` does not trigger them. Without them, `chrome-headless-shell` segfaults (`SEGV_ACCERR`) during browser initialization.
 
-This section documents the attack vectors and infrastructure observed in real supply chain attacks. cplt is designed to mitigate these specific threats.
+  **Linux:** `--allow-cache-exec ms-playwright` grants Landlock execute on `~/.cache/ms-playwright` (the XDG equivalent), so the browser binary runs. The macOS Seatbelt/Mach permissions above have no Linux analogue. The remaining difference is Chromium's *own* sandbox: on Linux it builds a setuid-less sandbox from user namespaces (`unshare`/`setns`/`clone` with `CLONE_NEW*`), and cplt's seccomp-bpf filter denies `unshare`/`setns` with `EPERM`, because user-namespace creation is a sandbox-escape tool (see "Defense layers"). cplt deliberately does **not** relax the filter for browser testing. Run Chromium with its own sandbox disabled instead (`--no-sandbox`, or Playwright `chromiumSandbox: false`). cplt's Landlock + seccomp is the enforcing boundary, so Chromium's nested sandbox is redundant inside it. `/dev/shm` is already allowed, so `--disable-dev-shm-usage` is not required.
+- **Project build scripts.** The agent can modify `Makefile`, `package.json` scripts, `build.gradle`, `.github/workflows/`, and the like. These are legitimate Copilot targets and cannot be blocked. Code review (git diff) before running builds or committing is the mitigation.
+- **POSIX shared memory** (macOS). `ipc-posix-shm-*` is allowed because Node.js needs it for DNS and system queries. An agent could in theory use SHM as an IPC channel to processes outside the sandbox, but that requires a cooperating process already running on the machine.
+- **DNS tunneling.** DNS queries are unrestricted on both platforms. See [Honest gaps](#honest-gaps) for why we accept this.
+
+## Real-world attack landscape (2025-2026)
+
+These are the attack vectors and infrastructure seen in real supply chain attacks. cplt is designed to mitigate them.
 
 ### Attack kill chain
 
@@ -208,12 +207,12 @@ or patched file       env vars, OS info        .env, npm tokens        or DNS tu
 
 | Incident | Year | Vector | Impact |
 |---|---|---|---|
-| **Shai-Hulud** | 2025 | Compromised npm maintainer accounts | Self-replicating worm hit 700+ packages, stole npm tokens + AWS keys |
+| **Shai-Hulud** | 2025 | Compromised npm maintainer accounts | Self-replicating worm hit 700+ packages, stole npm tokens and AWS keys |
 | **CamoLeak** | 2025 | Prompt injection in PR comments | Copilot Chat exfiltrated private code via GitHub image proxy (CVE-2025-59145, CVSS 9.6) |
 | **RoguePilot** | 2026 | Prompt injection in GitHub issues | GITHUB_TOKEN leaked from Codespaces, enabling full repo takeover |
-| **YOLO Mode** | 2025 | Agent writes to .vscode/settings.json | Auto-approved all commands → RCE (CVE-2025-53773) |
+| **YOLO Mode** | 2025 | Agent writes to .vscode/settings.json | Auto-approved all commands, giving RCE (CVE-2025-53773) |
 | **MCP Poisoning** | 2026 | Hidden instructions in npm metadata | AI agents extracted SSH keys from dev machines, invisible to user |
-| **axios RAT** | 2026 | Trojanized npm package by STARDUST CHOLLIMA | Hidden RAT deployed to any system where AI agent ran `npm install` |
+| **axios RAT** | 2026 | Trojanized npm package by STARDUST CHOLLIMA | Hidden RAT deployed to any system where an AI agent ran `npm install` |
 
 ### Exfiltration infrastructure (observed in the wild)
 
@@ -224,21 +223,21 @@ or patched file       env vars, OS info        .env, npm tokens        or DNS tu
 | **Tunneling** | `ngrok.io`, `localtunnel.me`, `serveo.net` | Reverse shells through NAT/firewall boundaries |
 | **Paste sites** | `pastebin.com`, `paste.ee`, `hastebin.com` | Credential dump staging for later retrieval |
 | **File sharing** | `transfer.sh`, `file.io`, `0x0.st`, `catbox.moe` | Exfiltration of SSH keys and .env files |
-| **Telegram** | `api.telegram.org` | Bot API as write-only C2 channel |
+| **Telegram** | `api.telegram.org` | Bot API as a write-only C2 channel |
 | **IP recon** | `ipinfo.io`, `ifconfig.me`, `checkip.amazonaws.com` | Victim network fingerprinting |
 | **Cloudflare Workers** | `*.workers.dev` | Free hosting for C2 relays, resistant to takedown |
-| **Ethereum dead-drop** | Smart contract → Cloudflare-fronted domains | C2 URL rotation without code changes, impossible to take down |
+| **Ethereum dead-drop** | Smart contract to Cloudflare-fronted domains | C2 URL rotation without code changes, impossible to take down |
 
-A curated blocklist of these domains is included in [`blocked-domains.txt`](blocked-domains.txt).
+A curated blocklist of these domains ships in [`blocked-domains.txt`](blocked-domains.txt).
 
 ### What gets stolen (in order of attacker priority)
 
-1. **npm/pip tokens** — enables worm propagation (Shai-Hulud: 700+ packages from stolen tokens)
-2. **CI/CD tokens** — GITHUB_TOKEN, AWS keys from environment variables
-3. **SSH keys** — `~/.ssh/id_*`
-4. **Cloud credentials** — `~/.aws/credentials`, `~/.config/gcloud`
-5. **Environment files** — `.env`, `.env.local` (API keys, database URLs)
-6. **Network topology** — internal IPs, DNS servers, hostnames (recon for lateral movement)
+1. **npm/pip tokens.** Enables worm propagation (Shai-Hulud took 700+ packages using stolen tokens).
+2. **CI/CD tokens.** GITHUB_TOKEN, AWS keys from environment variables.
+3. **SSH keys.** `~/.ssh/id_*`
+4. **Cloud credentials.** `~/.aws/credentials`, `~/.config/gcloud`
+5. **Environment files.** `.env`, `.env.local` (API keys, database URLs).
+6. **Network topology.** Internal IPs, DNS servers, hostnames, all recon for lateral movement.
 
 ### How cplt defends against each step
 
@@ -247,80 +246,69 @@ A curated blocklist of these domains is included in [`blocked-domains.txt`](bloc
 | **1. Infection** | `postinstall` hook runs code | **Blocked by default.** Hardening injects `npm_config_ignore_scripts=true` and `YARN_ENABLE_SCRIPTS=false` | ✅ **Stopped** |
 | **2. Recon** | Read hostname, IP, env vars | Can read process env vars (needed for Copilot), hostname | ⚠️ Partial leak possible |
 | **3. Credential harvest** | Read ~/.ssh, ~/.aws, .env | **Kernel-blocked.** macOS Seatbelt denies the read syscall. | ✅ **Stopped** |
-| **4a. HTTP exfil** | POST to discord/webhook/C2 | **Partially mitigated.** Only port 443 allowed (HTTPS); localhost blocked; SSH agent blocked. Credentials are unreadable, limiting blast radius. Proxy blocklist helps if enabled. | ⚠️ **Partially mitigated** |
-| **4b. DNS tunneling** | Encode data in DNS queries | Not inspected — DNS bypasses the proxy | ❌ **Not stopped** |
+| **4a. HTTP exfil** | POST to discord/webhook/C2 | Only port 443 allowed; localhost and SSH agent blocked; credentials unreadable, so the blast radius is small. The proxy blocklist helps if enabled. | ⚠️ **Partially mitigated** |
+| **4b. DNS tunneling** | Encode data in DNS queries | Not inspected; DNS bypasses the proxy | ❌ **Not stopped** |
 | **4c. Reverse shell** | Connect back via ngrok | Non-standard ports blocked; `ngrok.io` blocked when proxy enabled; localhost blocked | ⚠️ **Partially mitigated** |
-| **5. Binary staging** | Drop RAT into cache dir and execute | **Kernel-blocked by default.** `~/Library/Caches` has no `process-exec` or `file-map-executable`; `/tmp` exec also denied. `--allow-cache-exec <SUBDIR>` grants exec to a specific subdir (e.g. `ms-playwright`) — write+exec risk applies to that subdir. | ✅ **Stopped** (⚠️ opt-in exemption available) |
+| **5. Binary staging** | Drop RAT into cache dir and execute | **Kernel-blocked by default.** `~/Library/Caches` has no `process-exec` or `file-map-executable`, and `/tmp` exec is denied. `--allow-cache-exec <SUBDIR>` grants exec to one named subdir, and the write+exec risk applies there. | ✅ **Stopped** (⚠️ opt-in exemption available) |
 | **Worm propagation** | Republish infected packages | Can't read npm tokens (in ~/.npmrc, kernel-blocked) | ✅ **Stopped** |
 
 ### Honest gaps
 
-**Network is port-restricted, with optional domain filtering.** SBPL (Seatbelt Profile Language) does not support domain-based filtering at the kernel level. Copilot CLI connects to CDN-backed endpoints (`api.business.githubcopilot.com`) with changing IPs that cannot be enumerated. We allow outbound TCP on port 443 only (use `--allow-port` for extras, e.g. `--allow-port 80` for HTTP). SSH agent access and localhost outbound are blocked at the kernel level. This means:
+**Network is port-restricted, with optional domain filtering.** SBPL (Seatbelt Profile Language) has no domain-based filtering at the kernel level, and Copilot CLI connects to CDN-backed endpoints (`api.business.githubcopilot.com`) whose IPs change and cannot be enumerated. So we allow outbound TCP on port 443 only, with `--allow-port` for extras such as `--allow-port 80`. SSH agent access and localhost outbound are blocked at the kernel level. That leaves:
 
 - A compromised agent CAN make HTTPS requests to attacker-controlled servers on port 443
-- A compromised agent CANNOT exfiltrate cloud credentials from env vars (env is sanitized; only safe allowlist passes through)
+- A compromised agent CANNOT exfiltrate cloud credentials from env vars (env is sanitized; only the safe allowlist passes through)
 - A compromised agent CAN exfiltrate project source code and Copilot auth tokens
-- A compromised agent CANNOT connect to local services (localhost is blocked on macOS; on Linux, use `--with-proxy` — see [Linux-specific limitations](#linux-specific-limitations))
-- A compromised agent CANNOT use loaded SSH keys (unix socket is blocked)
-- A compromised agent CANNOT connect on non-standard ports (e.g., 8080, 3000) unless `--allow-port` is used
+- A compromised agent CANNOT connect to local services (localhost is blocked on macOS; on Linux use `--with-proxy`, see [Linux-specific limitations](#linux-specific-limitations))
+- A compromised agent CANNOT use loaded SSH keys (the unix socket is blocked)
+- A compromised agent CANNOT connect on non-standard ports such as 8080 or 3000 unless `--allow-port` is used
 - A compromised agent CANNOT exfiltrate SSH keys, cloud credentials, or npm tokens (kernel-blocked from reading them)
 - A compromised agent CAN request GPG signatures (if `--allow-gpg-signing` is enabled) but CANNOT exfiltrate private keys
-- The proxy logs and filters all outbound connections by default, including Copilot CLI traffic (via `NODE_USE_ENV_PROXY=1`). The proxy also enforces port restrictions matching the sandbox policy. Use `--no-proxy` to disable.
+- The proxy logs and filters all outbound connections by default, including Copilot CLI traffic (via `NODE_USE_ENV_PROXY=1`), and enforces port restrictions matching the sandbox policy. Use `--no-proxy` to disable.
 
-**JVM IPv4 stack forcing.** macOS SBPL `"localhost"` filters do not match Java NIO's IPv4-mapped addresses (`::ffff:127.0.0.1`) because SBPL only accepts `*` or `localhost` as the host part (literal IPs are rejected). cplt solves this by injecting `-Djava.net.preferIPv4Stack=true` via `JAVA_TOOL_OPTIONS`, which forces the JVM to use pure AF_INET4 sockets. This means connections to `127.0.0.1` stay as IPv4 and `"localhost:PORT"` rules match correctly. As a result, `--allow-localhost <PORT>` now works for Java — the old `"*:*"` nuclear option is no longer needed. If a user overrides JAVA_TOOL_OPTIONS via `--pass-env`, they lose this protection and should use `--allow-localhost-any` as fallback. On Linux (Landlock), this flag is not injected as the kernel handles addresses differently.
+*Mitigation:* `--allowed-domains allowed-domains.txt` restricts traffic to known Copilot endpoints, `--blocked-domains blocked-domains.txt` blocks known exfiltration infrastructure, and `--proxy-log proxy.log` gives a post-session audit trail. All traffic, Copilot's own Node.js connections included, routes through the proxy.
 
-*Mitigation:* Use `--allowed-domains allowed-domains.txt` to restrict traffic to known Copilot endpoints only. Use `--blocked-domains blocked-domains.txt` to block known exfiltration infrastructure. Use `--proxy-log proxy.log` for post-session audit. All traffic, including Copilot's own Node.js connections, routes through the proxy.
+**JVM IPv4 stack forcing.** macOS SBPL `"localhost"` filters do not match Java NIO's IPv4-mapped addresses (`::ffff:127.0.0.1`), because SBPL accepts only `*` or `localhost` as the host part and rejects literal IPs. cplt injects `-Djava.net.preferIPv4Stack=true` via `JAVA_TOOL_OPTIONS`, forcing the JVM onto pure AF_INET4 sockets, so connections to `127.0.0.1` stay IPv4 and `"localhost:PORT"` rules match. `--allow-localhost <PORT>` therefore works for Java, and the old `"*:*"` nuclear option is gone. Overriding `JAVA_TOOL_OPTIONS` via `--pass-env` loses this protection; fall back to `--allow-localhost-any`. On Linux (Landlock) the flag is not injected, as the kernel handles addresses differently.
 
-**`--allow-private-domain` weakens DNS rebinding protection for named domains.** When a domain is listed in `proxy.allow_private_domains` (or `--allow-private-domain`), the proxy skips the post-DNS private IP check for that domain. This is intentional for corporate intranet services (e.g. `intern.nav.no`) that legitimately resolve to RFC 1918 addresses. The accepted risk: if DNS for a listed domain is poisoned or hijacked, a compromised agent could reach arbitrary private hosts on your internal network — not just the intended service. All other proxy checks (port, allowlist, blocklist) still apply. Only list domains you control and whose DNS you trust.
+**`--allow-private-domain` weakens DNS rebinding protection for named domains.** For a domain listed in `proxy.allow_private_domains` (or `--allow-private-domain`), the proxy skips the post-DNS private IP check. That is intentional for corporate intranet services such as `intern.nav.no` that legitimately resolve to RFC 1918 addresses. The accepted risk: if DNS for a listed domain is poisoned or hijacked, a compromised agent could reach arbitrary private hosts on your internal network, not just the intended service. All other proxy checks (port, allowlist, blocklist) still apply. Only list domains you control and whose DNS you trust.
 
-**`~/.config/gh/hosts.yml` is readable.** When gh guard is enabled, Copilot gets its token via a one-time cached file (deleted after first read). When gh guard is disabled, `gh auth token` is available inside the sandbox. This file contains a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable (not the entire `.config/gh` directory). With outbound port 443 allowed, a compromised agent could theoretically exfiltrate this token. However, the token grants access to GitHub — which Copilot is already connected to. Users who want to mitigate this can use `--deny-path ~/.config/gh` (Copilot will fall back to Keychain auth).
+**`~/.config/gh/hosts.yml` is readable.** With gh guard enabled, Copilot gets its token through a one-time cached file that is deleted after the first read; with gh guard disabled, `gh auth token` works inside the sandbox. The file holds a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable, not the whole `.config/gh` directory. With outbound port 443 open, a compromised agent could exfiltrate this token, though the token grants access to GitHub, which Copilot is already connected to. To mitigate, use `--deny-path ~/.config/gh`; Copilot falls back to Keychain auth.
 
-**`block_auth_token` is best-effort, not a same-UID boundary.** When gh guard is enabled with `block_auth_token` (opt-in), cplt withholds `GH_TOKEN` from the environment and instead caches the token to `$SCRATCH/.gh-token` (mode `0600`), serving it once via the `gh` wrapper's `gh auth token` callback and deleting the file after the first read. This genuinely prevents the token from appearing as an inherited env var in every child's `/proc/*/environ`, and the one-time deletion narrows the file's exposure window. It does **not** make the token confidential against an adversarial agent: the scratch dir *is* the agent's `TMPDIR`, and the `gh` wrapper runs as the agent's own UID inside the sandbox, so anything the wrapper can read the agent can read at the same UID. A same-UID `deny` rule is therefore illusory (and would break the legitimate wrapper read, which happens inside the sandbox), so cplt does not add one. A determined agent that `cat`s `$TMPDIR/.gh-token` before the legitimate consumer still obtains the token. Treat `block_auth_token` as reducing accidental/env-based leakage, not as a boundary against a hostile agent — the token grants access to GitHub, which Copilot is connected to anyway.
+**`block_auth_token` is best-effort, not a same-UID boundary.** With gh guard enabled and `block_auth_token` set (opt-in), cplt withholds `GH_TOKEN` from the environment, caches the token to `$SCRATCH/.gh-token` (mode `0600`), serves it once via the `gh` wrapper's `gh auth token` callback, and deletes the file after the first read. That keeps the token out of every child's `/proc/*/environ`, and the deletion narrows the exposure window. It does **not** make the token confidential against an adversarial agent. The scratch dir *is* the agent's `TMPDIR`, and the `gh` wrapper runs as the agent's own UID inside the sandbox, so anything the wrapper can read, the agent can read. A same-UID `deny` rule would be illusory and would break the legitimate wrapper read, so cplt does not add one. An agent that `cat`s `$TMPDIR/.gh-token` before the legitimate consumer still gets the token. Treat `block_auth_token` as reducing accidental and env-based leakage, not as a boundary against a hostile agent.
 
-*Possible mitigation:* A repo-scoped MCP proxy or fine-grained PAT that limits token scope to the current repository only. See issue #4 for investigation.
+*Possible mitigation:* a repo-scoped MCP proxy or a fine-grained PAT that limits token scope to the current repository. See issue #4.
 
-**The gh/git guards are a best-effort command filter, not a kernel boundary.** The "gh guard" and "git guard" rows in the threat-model table above describe command-level interception, and three properties bound what they can promise:
+**The gh/git guards are a best-effort command filter, not a kernel boundary.** The "gh guard" and "git guard" rows in the threat-model table describe command-level interception. Three properties bound what they can promise.
 
-- **Opt-in.** Both guards default to `enabled = false` (soft rollout). Out of the box cplt performs **no** gh/git command filtering — the fail-closed posture (block mode, default-deny unknown subcommands, scope check, `block_auth_token`, `allow_api_write=false`) only takes effect once an operator sets `gh_guard.enabled = true` / `git_guard.enabled = true` (or passes the equivalent flags). A user who assumes "cplt guards git" without opting in gets nothing.
-- **PATH-shim enforcement.** The guards work by writing `gh`/`git` shims into a scratch `bin/` dir and prepending it to `PATH`; the shim calls back into cplt for a policy decision before `exec`ing the real binary. The real `/usr/bin/git` and `/usr/bin/gh` are untouched, so any agent that invokes the binary by **absolute path** (`/usr/bin/git push`), **escapes the alias** (`\git`, `env git`), **resets `PATH`**, or **shells out from another runtime** (`subprocess.run(["/usr/bin/git", "push"])`) bypasses the guard entirely. Command classification (force-push detection, scope checks, `gh auth token` blocking, DELETE blocking) therefore only constrains a *cooperative* agent that goes through the shim — it is not a boundary against an adversarial one.
-- **Repository scope is pinned at sandbox startup.** Before the agent starts, cplt
-  invokes the pre-resolved Git binary and reads only the project root's local
-  `remote.origin.url`, with config includes and inherited `GIT_*` variables disabled.
-  The verified scope is baked into the shim. Successful checks set a host-qualified
-  `GH_REPO`, clear `GH_HOST`, and reject conflicting hostname flags before executing
-  `gh`; failure to determine startup scope blocks the command. Runtime working
-  directories, nested repositories, mutable Git configuration, and environment
-  overrides therefore cannot retarget the check.
+- **Opt-in.** Both guards default to `enabled = false` (soft rollout), so out of the box cplt performs **no** gh/git command filtering. The fail-closed posture (block mode, default-deny unknown subcommands, scope check, `block_auth_token`, `allow_api_write=false`) takes effect only once an operator sets `gh_guard.enabled = true` / `git_guard.enabled = true` or passes the equivalent flags. A user who assumes "cplt guards git" without opting in gets nothing.
+- **PATH-shim enforcement.** The guards write `gh`/`git` shims into a scratch `bin/` dir and prepend it to `PATH`; the shim calls back into cplt for a policy decision before `exec`ing the real binary. The real `/usr/bin/git` and `/usr/bin/gh` are untouched, so any agent that invokes the binary by **absolute path** (`/usr/bin/git push`), **escapes the alias** (`\git`, `env git`), **resets `PATH`**, or **shells out from another runtime** (`subprocess.run(["/usr/bin/git", "push"])`) bypasses the guard entirely. Command classification (force-push detection, scope checks, `gh auth token` blocking, DELETE blocking) therefore only constrains a *cooperative* agent, not an adversarial one.
+- **Repository scope is pinned at sandbox startup.** Before the agent starts, cplt invokes the pre-resolved Git binary and reads only the project root's local `remote.origin.url`, with config includes and inherited `GIT_*` variables disabled. That verified scope is baked into the shim. A successful check sets a host-qualified `GH_REPO`, clears `GH_HOST`, and rejects conflicting hostname flags before executing `gh`; failing to determine startup scope blocks the command. Runtime working directories, nested repositories, mutable Git configuration, and environment overrides cannot retarget the check.
 
-The guards raise the bar against accidental and prompt-injected-but-cooperative misuse; they are not a substitute for the kernel-enforced filesystem/exec isolation that does hold against an adversarial agent. On the *network* side, proxy-forced mode (issues #53 / #117) is the kernel-backed complement: it forces all egress through the cplt proxy at the packet level rather than via tamperable `HTTPS_PROXY` env vars, so a bypassed `git push` / `gh api` write still has to traverse the proxy. Command-level intent (e.g. `GET` vs `DELETE` to `api.github.com`) remains invisible to a CONNECT proxy, so the guards and the proxy cover different layers.
+The guards raise the bar against accidental and prompt-injected-but-cooperative misuse. They do not substitute for the kernel-enforced filesystem and exec isolation that holds against an adversarial agent. On the *network* side, proxy-forced mode (issues #53 and #117) is the kernel-backed complement: it forces all egress through the cplt proxy at the packet level rather than via tamperable `HTTPS_PROXY` env vars, so a bypassed `git push` or `gh api` write still has to traverse the proxy. Command-level intent (`GET` vs `DELETE` to `api.github.com`) stays invisible to a CONNECT proxy, so the guards and the proxy cover different layers.
 
-**DNS tunneling** is the one channel we cannot inspect. However:
-- Bandwidth is ~15 KB/s at best (encoding overhead in subdomain labels)
-- Requires attacker-controlled authoritative DNS server
-- The most valuable targets (credentials, tokens, keys) are kernel-blocked from being read
-- Detectable with DNS monitoring (high-entropy subdomain queries to unusual domains)
+**DNS tunneling is the one channel we cannot inspect.** DNS queries are unrestricted on both platforms. What limits the damage: bandwidth is ~15 KB/s at best given the encoding overhead in subdomain labels, it needs an attacker-controlled authoritative DNS server, the most valuable targets (credentials, tokens, keys) are kernel-blocked from being read, and DNS monitoring detects it by the high-entropy subdomain queries to unusual domains.
 
-*Possible mitigation:* Route DNS through a local resolver that logs and rate-limits queries, or block DNS entirely and use a pre-configured resolver for known domains. Practical impact is low given that credentials are already inaccessible.
+*Possible mitigation:* route DNS through a local resolver that logs and rate-limits queries, or block DNS entirely and use a pre-configured resolver for known domains. Practical impact is low, since credentials are already inaccessible.
 
-**Reconnaissance leaks basic host info.** Hostname, IP address, OS version, and the sanitized subset of env vars are readable by any code running inside the sandbox. This is unavoidable — Copilot itself needs this information to function.
+**Reconnaissance leaks basic host info.** Hostname, IP address, OS version, and the sanitized subset of env vars are readable by any code inside the sandbox. This is unavoidable, because Copilot itself needs the information.
 
-*Possible mitigation:* A future hardening category could mask hostname and inject synthetic env values, but this risks breaking tools that depend on accurate system info. Low priority given that recon without credential access has minimal value.
+*Possible mitigation:* a future hardening category could mask the hostname and inject synthetic env values, at the risk of breaking tools that depend on accurate system info. Low priority, since recon without credential access has little value.
 
-**Project source code is readable and writable.** The agent needs read/write access to the project directory — that's its job. A compromised agent could exfiltrate source code via HTTPS on port 443.
+**Project source code is readable and writable.** The agent needs read/write access to the project directory. That is its job. A compromised agent could exfiltrate source over HTTPS on port 443.
 
-*Possible mitigation:* A read-only project mode (`--read-only-project`) for review-only workflows where the agent should not modify files. Outbound bandwidth tracking could detect bulk exfiltration (large POSTs relative to Copilot's normal API pattern), but would require deep packet inspection.
+*Possible mitigation:* a read-only project mode (`--read-only-project`) for review-only workflows. Outbound bandwidth tracking could flag bulk exfiltration, meaning large POSTs relative to Copilot's normal API pattern, but that needs deep packet inspection.
 
-**`~/.copilot/` session history is broadly accessible.** The sandbox grants read/write to all of `~/.copilot/`, which includes the session store database (`session-store.db`) containing all past conversation history, and `session-state/` with per-session artifacts. Copilot's runtime manages these files from inside the sandbox and requires access to function. A compromised agent could read all past conversations to extract business logic, architecture decisions, or referenced credentials.
+**`~/.copilot/` session history is broadly accessible.** The sandbox grants read/write to all of `~/.copilot/`, including the session store database (`session-store.db`) holding every past conversation and `session-state/` with per-session artifacts. Copilot's runtime manages these from inside the sandbox and needs the access. A compromised agent could read past conversations to extract business logic, architecture decisions, or referenced credentials.
 
-*Possible mitigation:* Users concerned about session history exposure can use `--deny-path ~/.copilot/session-state` to block access to other sessions' artifacts (accepting loss of cross-session features). Scoping session store access to the current session only would require changes to Copilot's runtime (the session store database is a single SQLite file).
+*Possible mitigation:* `--deny-path ~/.copilot/session-state` blocks access to other sessions' artifacts, at the cost of cross-session features. Scoping the session store to the current session would require changes to Copilot's runtime, since it is a single SQLite file.
 
-Since credentials are inaccessible inside the sandbox (both at filesystem and environment level), network-based exfiltration can only leak project source code and `~/.config/gh` tokens — a much smaller blast radius than full credential theft.
+Because credentials are inaccessible at both the filesystem and environment level, network-based exfiltration can only leak project source code and `~/.config/gh` tokens. That is a much smaller blast radius than full credential theft.
 
-## Defense Layers
+## Defense layers
 
-### Layer 0: Environment Variable Sanitization
+### Layer 0: Environment variable sanitization
 
-By default, `cplt` clears the child process environment and re-adds only safe variables from an allowlist. This prevents credential leakage through inherited env vars.
+By default `cplt` clears the child process environment and re-adds only safe variables from an allowlist, so credentials cannot leak through inherited env vars.
 
 **How it works:**
 1. `cmd.env_clear()` removes all environment variables
@@ -329,29 +317,23 @@ By default, `cplt` clears the child process environment and re-adds only safe va
 4. `--pass-env VAR` adds explicit vars (repeatable)
 5. `ENV_ALWAYS_DENY` vars (`NO_COLOR`, `FORCE_COLOR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`) are always stripped
 
-**Deliberately allowed:** `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` — Copilot needs a GitHub token to function. This is an accepted trade-off.
+**Deliberately allowed:** `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`. Copilot needs a GitHub token to function, and this is an accepted trade-off.
 
-**OpenTelemetry (`OTEL_*`):** OTel configuration vars (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`) are allowed via the `OTEL_` prefix. `OTEL_EXPORTER_OTLP_HEADERS` may carry opt-in auth headers (e.g. `Authorization=Bearer <token>`) — this is an accepted trade-off in the same class as `GH_TOKEN`, only present when the user has configured an exporter. The `is_secret_suffix` deny-list still strips any `OTEL_*_TOKEN` / `_AUTH` / `_SECRET` / `_KEY` / `_PASSWORD` / `_CREDENTIALS` vars.
+**OpenTelemetry (`OTEL_*`):** OTel configuration vars such as `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, and `OTEL_RESOURCE_ATTRIBUTES` pass through via the `OTEL_` prefix. `OTEL_EXPORTER_OTLP_HEADERS` may carry opt-in auth headers such as `Authorization=Bearer <token>`, an accepted trade-off in the same class as `GH_TOKEN`, and only present when the user has configured an exporter. The `is_secret_suffix` deny-list still strips any `OTEL_*_TOKEN`, `_AUTH`, `_SECRET`, `_KEY`, `_PASSWORD`, or `_CREDENTIALS` var.
 
 **Deliberately blocked:** `AWS_*`, `AZURE_*`, `NPM_TOKEN`, `DATABASE_URL`, `VAULT_TOKEN`, `SSH_AUTH_SOCK`, Docker vars, CI tokens.
 
-**Git configuration:** `~/.gitconfig`, `~/.gitconfig.local`, and
-`~/.gitignore_global` are exact read-only exceptions so normal Git and `gh`
-workflows can load conventional user configuration. The standard XDG Git config
-is also read-only (the `~/.config/git` directory on Linux because Landlock rules
-are recursive). Other include files remain blocked unless explicitly allowed.
-These files should not contain plaintext credentials; credential directories and
-SSH/GPG private keys remain denied.
+**Git configuration:** `~/.gitconfig`, `~/.gitconfig.local`, and `~/.gitignore_global` are exact read-only exceptions, so normal Git and `gh` workflows can load conventional user configuration. The standard XDG Git config is read-only too (the whole `~/.config/git` directory on Linux, because Landlock rules are recursive). Other include files stay blocked unless explicitly allowed. These files should not contain plaintext credentials; credential directories and SSH/GPG private keys remain denied.
 
-**Escape hatch:** `--inherit-env` disables sanitization and inherits all env vars (still strips `ENV_ALWAYS_DENY`). This is dangerous and should only be used for debugging.
+**Escape hatch:** `--inherit-env` disables sanitization and inherits all env vars, still stripping `ENV_ALWAYS_DENY`. This is dangerous. Use it only for debugging.
 
-### Layer 0.25: Security Environment Hardening
+### Layer 0.25: Security environment hardening
 
-Beyond sanitization, `cplt` injects hardening environment variables that disable dangerous tool behaviors inside the sandbox. This is a declarative, category-based system designed for extensibility.
+Beyond sanitization, `cplt` injects hardening environment variables that disable dangerous tool behaviors inside the sandbox. The system is declarative and category-based so new categories are easy to add.
 
 **How it works:**
 1. `HARDENING_ENV_VARS` is a compile-time list of `(name, value, category)` tuples
-2. Each variable belongs to a `HardeningCategory` (e.g., `LifecycleScripts`, `GitHardening`)
+2. Each variable belongs to a `HardeningCategory`, for example `LifecycleScripts` or `GitHardening`
 3. Variables are injected unless their category has been opted out via CLI flag
 4. If a user explicitly passes a variable via `--pass-env`, their value is preserved
 
@@ -368,34 +350,34 @@ Beyond sanitization, `cplt` injects hardening environment variables that disable
 | `GIT_CONFIG_KEY_1` | `tag.gpgsign` | GitSigning | Override tag signing config |
 | `GIT_CONFIG_VALUE_1` | `false` | GitSigning | Disable tag signing (private keys inaccessible) |
 
-**Why this matters:** Supply chain attacks (e.g., axios March 2026) use `postinstall` hooks to execute malicious payloads. Blocking lifecycle scripts eliminates this attack class — `npm install` still downloads packages, but no arbitrary code runs. Explicit commands like `npm run build` still work normally. Git signing is disabled because `~/.ssh` and `~/.gnupg` are denied by the sandbox — attempting to sign would fail with EPERM. Disabling via env var gives a clean error-free experience.
+**Why this matters:** Supply chain attacks such as axios in March 2026 use `postinstall` hooks to execute malicious payloads. Blocking lifecycle scripts eliminates that whole attack class. `npm install` still downloads packages, no arbitrary code runs, and explicit commands like `npm run build` still work normally. Git signing is disabled because `~/.ssh` and `~/.gnupg` are denied by the sandbox, so attempting to sign would fail with EPERM. Disabling it via env var gives a clean, error-free experience.
 
 **Escape hatches:**
-- `--allow-lifecycle-scripts` disables the `LifecycleScripts` category. Use when `npm install` requires postinstall hooks (e.g., native module compilation).
-- `--allow-gpg-signing` disables the `GitSigning` category and adds targeted SBPL rules for GPG access. See GPG signing risk analysis below.
+- `--allow-lifecycle-scripts` disables the `LifecycleScripts` category. Use it when `npm install` requires postinstall hooks, for example native module compilation.
+- `--allow-gpg-signing` disables the `GitSigning` category and adds targeted SBPL rules for GPG access. See the GPG signing risk analysis below.
 
-### Layer 0.5: Native Module Write Protection
+### Layer 0.5: Native module write protection
 
-The sandbox denies writes to `~/.copilot/pkg/` (where Copilot's native modules like `keytar.node` live). This prevents a persistence attack where a rogue agent replaces a native module with malware that executes *unsandboxed* next time Copilot runs outside `cplt`.
+The sandbox denies writes to `~/.copilot/pkg/`, where Copilot's native modules such as `keytar.node` live. This blocks a persistence attack where a rogue agent replaces a native module with malware that executes *unsandboxed* the next time Copilot runs outside `cplt`.
 
-### Layer 0.6: Copilot Install Directory Auto-Detection
+### Layer 0.6: Copilot install directory auto-detection
 
-When Copilot CLI is installed via a non-standard Node version manager (e.g. `n` at `~/n/`, Volta at `~/.volta/`, custom npm prefix), its package directory falls outside the static `TOOL_READ_DIRS`. At startup, cplt resolves the copilot binary path, walks up at most 4 ancestors looking for a `package.json` with `"name": "@github/copilot"`, and adds the directory to the sandbox read allowlist. Safety checks:
-- **Package identity**: parsed via `serde_json` — only the real Copilot package is accepted
-- **Unsafe root rejection**: `/`, `$HOME`, `/tmp`, etc. are rejected
-- **SBPL injection validation**: path characters validated before profile interpolation
+When Copilot CLI is installed via a non-standard Node version manager (`n` at `~/n/`, Volta at `~/.volta/`, a custom npm prefix), its package directory falls outside the static `TOOL_READ_DIRS`. At startup, cplt resolves the copilot binary path, walks up at most 4 ancestors looking for a `package.json` with `"name": "@github/copilot"`, and adds that directory to the sandbox read allowlist. Safety checks:
+- **Package identity:** parsed via `serde_json`, so only the real Copilot package is accepted
+- **Unsafe root rejection:** `/`, `$HOME`, `/tmp`, and similar are rejected
+- **SBPL injection validation:** path characters are validated before profile interpolation
 
-### Layer 0.7: Global Git Hooks Protection
+### Layer 0.7: Global git hooks protection
 
-Git's `core.hooksPath` points to a directory of user-configured hooks that run on commit, push, etc. If not allowed, the sandbox causes git to fail with EPERM (instead of ENOENT for missing hooks). cplt auto-detects the hooks path and allows reading it. Safety checks:
-- **Write denied**: `(deny file-write*)` explicitly blocks writes to the hooks directory, preventing persistence attacks even if the path overlaps a writable sandbox directory
-- **Under `$HOME`**: paths outside the home directory are rejected (prevents arbitrary filesystem reads)
-- **Depth ≥ 3**: the path must have at least 3 components under `$HOME` (e.g. `~/.config/git/hooks` is OK, `~/hooks` is too broad)
-- **Unsafe root rejection**: `/`, `$HOME`, `/tmp`, etc. are rejected
+Git's `core.hooksPath` points to a directory of user-configured hooks that run on commit, push, and so on. If it is not allowed, the sandbox makes git fail with EPERM instead of the ENOENT it gives for missing hooks. cplt auto-detects the hooks path and allows reading it. Safety checks:
+- **Write denied:** `(deny file-write*)` explicitly blocks writes to the hooks directory, preventing persistence attacks even if the path overlaps a writable sandbox directory
+- **Under `$HOME`:** paths outside the home directory are rejected, which prevents arbitrary filesystem reads
+- **Depth >= 3:** the path must have at least 3 components under `$HOME`, so `~/.config/git/hooks` is fine and `~/hooks` is too broad
+- **Unsafe root rejection:** `/`, `$HOME`, `/tmp`, and similar are rejected
 
-### Layer 1: Seatbelt Kernel Sandbox (sandbox-exec)
+### Layer 1: Seatbelt kernel sandbox (sandbox-exec)
 
-The primary defense is Apple's mandatory access control framework, enforced in the XNU kernel. All restrictions apply to the sandboxed process **and all its children** — there is no way to shed the sandbox after `sandbox_init()`.
+The primary defense is Apple's mandatory access control framework, enforced in the XNU kernel. All restrictions apply to the sandboxed process **and all its children**, and there is no way to shed the sandbox after `sandbox_init()`.
 
 #### Profile structure
 
@@ -424,108 +406,162 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 ;; Java IPv4-mapped issue solved by -Djava.net.preferIPv4Stack=true in JAVA_TOOL_OPTIONS
 ```
 
-> **Network note:** Outbound TCP is restricted to port 443 by default. SSH agent access (unix sockets) is blocked. JVM Attach API sockets (`/tmp/.java_pid*`) are available via `--allow-jvm-attach` (opt-in, regex-restricted to `.java_pid<PID>` only) — all other unix sockets in `/tmp` remain blocked. MSBuild worker-node IPC sockets (`/tmp/MSBuild<PID>`) are available via `--allow-msbuild` (opt-in, regex-restricted to `MSBuild<PID>` only); this does NOT allow the persistent MSBuild Server, whose socket is named `MSBuildServer-<hash>` and is never matched by the regex — cplt also unconditionally sets `DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1` so that server is never started or reused, including one started outside the sandbox. Localhost outbound is blocked to prevent SSRF. Use `--allow-port` for additional ports. SBPL does not support domain-based rules — filesystem isolation is the primary security control.
+> **Socket note:** SSH agent access (unix sockets) is blocked. JVM Attach API sockets (`/tmp/.java_pid*`) are available via `--allow-jvm-attach`, opt-in and regex-restricted to `.java_pid<PID>` only; all other unix sockets in `/tmp` stay blocked. MSBuild worker-node IPC sockets (`/tmp/MSBuild<PID>`) are available via `--allow-msbuild`, opt-in and regex-restricted to `MSBuild<PID>` only. That does NOT allow the persistent MSBuild Server, whose socket is named `MSBuildServer-<hash>` and never matches the regex; cplt also unconditionally sets `DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1`, so that server is never started or reused, including one started outside the sandbox. SBPL supports no domain-based rules, so filesystem isolation is the primary security control.
 
-**Key design decision**: Deny rules are placed AFTER allow rules. In Seatbelt's evaluation model with `(deny default)`, more-specific rules override broader ones, and later rules take precedence for equal specificity. This means our deny rules for `~/.ssh` correctly override the broader temp/system allows.
+**Key design decision:** Deny rules are placed AFTER allow rules. In Seatbelt's evaluation model with `(deny default)`, more-specific rules override broader ones, and later rules take precedence at equal specificity. Our deny rules for `~/.ssh` therefore correctly override the broader temp and system allows.
 
 #### Protected paths
 
-Directories always denied (read + write):
+Directories always denied (read and write):
 
-- `~/.ssh`, `~/.gnupg` — cryptographic keys
-- `~/.aws`, `~/.azure` — cloud credentials
-- `~/.kube`, `~/.docker` — infrastructure access
-- `~/.nais` — Nav platform credentials
-- `~/.password-store` — pass password manager
-- `~/.config/gcloud` — Google Cloud credentials
-- `~/.config/op` — 1Password CLI
-- `~/.terraform.d` — Terraform credentials
+- `~/.ssh`, `~/.gnupg` (cryptographic keys)
+- `~/.aws`, `~/.azure` (cloud credentials)
+- `~/.kube`, `~/.docker` (infrastructure access)
+- `~/.nais` (Nav platform credentials)
+- `~/.password-store` (pass password manager)
+- `~/.config/gcloud` (Google Cloud credentials)
+- `~/.config/op` (1Password CLI)
+- `~/.terraform.d` (Terraform credentials)
 
 Directories explicitly allowed (read-only):
 
-- `~/.config/gh` — GitHub CLI credentials (Copilot spawns `gh auth token`; see [Honest gaps](#honest-gaps))
+- `~/.config/gh` (GitHub CLI credentials; Copilot spawns `gh auth token`, see [Honest gaps](#honest-gaps))
 
 Files always denied (hard blocks):
 
-- `~/.netrc` — HTTP credentials
-- `~/.pypirc` — PyPI credentials
-- `~/.gem/credentials` — RubyGems credentials
-- `~/.vault-token` — HashiCorp Vault
+- `~/.netrc` (HTTP credentials)
+- `~/.pypirc` (PyPI credentials)
+- `~/.gem/credentials` (RubyGems credentials)
+- `~/.vault-token` (HashiCorp Vault)
 
-Files denied by default (overridable via `--allow-read` for private registries):
+Files denied by default, overridable via `--allow-read` for private registries:
 
-- `~/.npmrc` — npm registry configuration
+- `~/.npmrc` (npm registry configuration)
 
 #### Symlink attack protection
-SBPL (macOS Seatbelt) resolves symlink targets at the kernel VFS layer during path evaluation. To verify this behavior, cplt includes integration tests demonstrating that attempts to read a denied file (such as `.env`) via a symlink with an innocuous name are successfully blocked by the kernel.
+
+SBPL resolves symlink targets at the kernel VFS layer during path evaluation. cplt includes integration tests that demonstrate this: reading a denied file such as `.env` through a symlink with an innocuous name is blocked by the kernel.
 
 #### Tool directory permissions
 
-Home tool directories (`~/.cargo`, `~/.nvm`, etc.) use a per-directory permission model (`HomeToolDir`) with granular `process_exec`, `map_exec`, and `write` flags:
+Home tool directories (`~/.cargo`, `~/.nvm`, and friends) use a per-directory permission model (`HomeToolDir`) with granular `process_exec`, `map_exec`, and `write` flags:
 
 | Directory                                                                                     | process-exec | file-map-executable | file-write | Rationale |
 |-----------------------------------------------------------------------------------------------|---|---|---|---|
 | `.local/bin`, `.mise`, `.nvm`, `.pyenv`, `.cargo`, `.rustup`, `.sdkman`, `go/bin`, `Library/pnpm` | ✅ | ✅ | varies | Contain executable binaries and shims |
 | `.gradle`, `.m2`, `.konan`, `go/pkg`                                                          | ❌ | ✅ | varies | JNI/cgo/Kotlin native libs loaded via dlopen, no direct executables |
-| `.yarn`                                                                                       | ❌ | ❌ | ✅ | Yarn Berry global cache — JavaScript packages only, no native binaries |
-| `Library/Caches`                                                                              | ❌ | ❌* | ✅ | Broad allow for dev tool caches; browser/app caches denied via regex prefix rules (com.apple.*, com.google.*, org.mozilla.*, etc.) — Xcode dev tools (com.apple.dt.*) re-allowed |
+| `.yarn`                                                                                       | ❌ | ❌ | ✅ | Yarn Berry global cache, JavaScript packages only, no native binaries |
+| `Library/Caches`                                                                              | ❌ | ❌* | ✅ | Broad allow for dev tool caches; browser/app caches denied via regex prefix rules (com.apple.*, com.google.*, org.mozilla.*, etc.), with Xcode dev tools (com.apple.dt.*) re-allowed |
 
-\* Exception: `~/Library/Caches/copilot/pkg/` has `file-map-executable` and `process-exec` for Copilot's native modules and helper binaries (`pty.node`, `spawn-helper`, `rg`). A `file-write*` deny prevents write-then-exec attacks. These carve-outs are placed after the broader deny rules (SBPL last-match-wins).
+\* Exception: `~/Library/Caches/copilot/pkg/` has `file-map-executable` and `process-exec` for Copilot's native modules and helper binaries (`pty.node`, `spawn-helper`, `rg`). A `file-write*` deny prevents write-then-exec attacks. These carve-outs sit after the broader deny rules, since SBPL is last-match-wins.
 
-**Security principle:** Every writable+executable directory is a potential binary-drop staging path. By denying both `process-exec` and `file-map-executable` on `~/Library/Caches`, this vector is eliminated at the kernel level. Non-dev caches (browsers, system apps, communication tools) are denied via `DENIED_CACHE_PREFIXES` regex rules in the SBPL profile — new dev tools auto-work without code changes because their cache dirs don't use these prefixes.
+**Security principle:** every writable and executable directory is a potential binary-drop staging path. Denying both `process-exec` and `file-map-executable` on `~/Library/Caches` eliminates that at the kernel level. Non-dev caches (browsers, system apps, communication tools) are denied via `DENIED_CACHE_PREFIXES` regex rules in the SBPL profile, so new dev tools work without code changes, because their cache dirs do not use these prefixes.
 
 #### Scratch directory
 
-When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Library/Caches/cplt/tmp/{session-id}/` with full `read/write/exec/map-exec` permissions. This is a controlled exception to the TMPDIR exec deny:
+When `--scratch-dir` is enabled, cplt creates a per-session directory at `~/Library/Caches/cplt/tmp/{session-id}/` with full `read/write/exec/map-exec` permissions. This is a controlled exception to the TMPDIR exec deny.
 
-- **Why it exists:** `go test`, `mise` inline tasks, and `node-gyp` compile to `$TMPDIR` then execute. The sandbox blocks this, breaking these tools. On macOS, JVM processes also need this because `java.io.tmpdir` defaults to `/var/folders/...` (ignoring `TMPDIR` env var); cplt injects `-Djava.io.tmpdir`, `-Djansi.tmpdir`, and `-Djava.rmi.server.hostname=localhost` via `JAVA_TOOL_OPTIONS` to redirect JVM temp usage to the scratch dir and keep RMI communication on localhost.
-- **Security model:** The scratch dir has both write+exec — this is the accepted trade-off. Mitigations:
-  - **Scoped path:** Only the specific session subpath has exec, not all of `~/Library/Caches/cplt/`
-  - **0700 permissions:** Owner-only access, verified at creation
-  - **Symlink rejection:** Base path is validated as a real directory, not a symlink
+- **Why it exists:** `go test`, `mise` inline tasks, and `node-gyp` compile to `$TMPDIR` and then execute. The sandbox blocks that, which breaks those tools. On macOS, JVM processes need it too, because `java.io.tmpdir` defaults to `/var/folders/...` and ignores the `TMPDIR` env var; cplt injects `-Djava.io.tmpdir`, `-Djansi.tmpdir`, and `-Djava.rmi.server.hostname=localhost` via `JAVA_TOOL_OPTIONS` to redirect JVM temp usage to the scratch dir and keep RMI communication on localhost.
+- **Security model:** the scratch dir has both write and exec, which is the accepted trade-off. Mitigations:
+  - **Scoped path:** only the specific session subpath has exec, not all of `~/Library/Caches/cplt/`
+  - **0700 permissions:** owner-only access, verified at creation
+  - **Symlink rejection:** the base path is validated as a real directory, not a symlink
   - **Owner check:** `stat()` verifies the directory owner matches the current uid
-  - **SBPL injection guard:** Path validated against metacharacters before interpolation
-  - **Ephemeral:** Cleaned up on exit via RAII Drop; stale dirs GC'd after 24h on startup
-- **On by default:** Enabled by default. Disable with `--no-scratch-dir` or `sandbox.scratch_dir = false` in config.
+  - **SBPL injection guard:** the path is validated against metacharacters before interpolation
+  - **Ephemeral:** cleaned up on exit via RAII Drop, and stale dirs are GC'd after 24h on startup
+- **On by default:** disable with `--no-scratch-dir` or `sandbox.scratch_dir = false` in config.
 
-### Layer 2: CONNECT Proxy (Logging and Domain Filtering)
+### Layer 2: CONNECT proxy (logging and domain filtering)
 
-A localhost CONNECT proxy intercepts all outbound traffic by default. `HTTP_PROXY`/`HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1` are injected into the sandbox environment, routing traffic from Copilot CLI (Node.js), `gh` (Go), `curl`, and any other tool through the proxy. Use `--no-proxy` to disable.
+A localhost CONNECT proxy intercepts all outbound traffic by default. cplt injects `HTTP_PROXY`, `HTTPS_PROXY`, and `NODE_USE_ENV_PROXY=1` into the sandbox environment, which routes traffic from Copilot CLI (Node.js), `gh` (Go), `curl`, and any other tool through the proxy. Use `--no-proxy` to disable.
+
+Copilot CLI bundles Node.js v24.11.1, which supports `NODE_USE_ENV_PROXY=1` (added in Node.js v24.5.0). With that variable set, Node.js natively honors `HTTP_PROXY`/`HTTPS_PROXY`.
+
+| Component | Language | Routes through proxy? |
+|---|---|---|
+| Copilot CLI | Node.js | ✅ Yes (via `NODE_USE_ENV_PROXY=1`) |
+| `gh` CLI | Go | ✅ Yes (via `net/http.ProxyFromEnvironment()`) |
+| `curl` | C | ✅ Yes |
+
+**Historical context:** earlier versions of Copilot CLI used a Node.js runtime that did not support proxy env vars, and injecting them broke the auth flow. That stopped being true as of Copilot CLI 1.0.24+ with bundled Node.js v24.11.1.
+
+**Design decision:** the proxy is enabled by default and listens on an OS-assigned ephemeral port (port 0), so there are no fixed-port conflicts. Use `--no-proxy` to disable for a single run, or set `proxy.enabled = false` in config to disable permanently.
+
+The proxy provides:
+
+1. **Connection logging.** Every CONNECT target is logged with timestamp and status.
+2. **Domain blocklist.** A configurable file-based blocklist with subdomain matching.
+3. **Port enforcement.** Only port 443 and `--allow-port` values are permitted, matching the sandbox policy.
+4. **DNS rebinding protection** and **private IP blocking**, both covered below.
 
 #### Proxy implementation safety
 
-The proxy handles CONNECT tunnels only (non-CONNECT returns 405). Each TCP connection processes exactly one request — no HTTP keep-alive or request pipelining. This eliminates HTTP request smuggling by design.
+The proxy handles CONNECT tunnels only, and returns 405 for anything else. Each TCP connection processes exactly one request, with no HTTP keep-alive and no request pipelining, which eliminates HTTP request smuggling by design.
 
-- **Buffer:** Fixed 8192 bytes, single read — no allocation amplification
-- **Connection limit:** 64 concurrent connections max (excess dropped)
-- **Binding:** `127.0.0.1` only — not reachable from the network
-- **Invalid UTF-8:** Replaced with U+FFFD via `from_utf8_lossy`, which won't match any domain — fail-safe
-- **Relay timeout:** 60-second read timeout on both directions prevents idle connection resource exhaustion
+- **Buffer:** fixed 8192 bytes, single read, no allocation amplification
+- **Connection limit:** 64 concurrent connections max, excess dropped
+- **Binding:** `127.0.0.1` only, not reachable from the network
+- **Invalid UTF-8:** replaced with U+FFFD via `from_utf8_lossy`, which matches no domain, so it fails safe
+- **Relay timeout:** 60-second read timeout on both directions, preventing idle connection resource exhaustion
+
+#### DNS rebinding defense
+
+A naive proxy checks the hostname string ("api.github.com") against a blocklist before connecting. An attacker can register a domain that resolves to `127.0.0.1`, so the hostname check passes but the connection reaches localhost.
+
+Our defense follows [OWASP SSRF Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html) guidance:
+
+```
+1. Check hostname against blocklist           → block known-bad domains
+2. Check hostname patterns (localhost, .local) → fast-path reject
+3. DNS resolve hostname → IP address           → get actual target
+4. Check RESOLVED IP against private ranges    → catch rebinding
+5. Connect to the resolved IP (not hostname)   → pin the address, prevent TOCTOU
+```
+
+Step 5 is the critical one. We connect to the `SocketAddr` from step 3 rather than re-resolving, which prevents time-of-check-to-time-of-use attacks where the DNS response changes between validation and connection.
+
+#### IP ranges blocked
+
+| Range | RFC | Purpose |
+|---|---|---|
+| `127.0.0.0/8` | RFC 1122 | Loopback |
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | RFC 1918 | Private networks |
+| `169.254.0.0/16` | RFC 3927 | Link-local |
+| `100.64.0.0/10` | RFC 6598 | CGNAT (Tailscale, WireGuard) |
+| `198.18.0.0/15` | RFC 2544 | Benchmarking |
+| `240.0.0.0/4` | RFC 1112 | Reserved/future |
+| `192.0.0.0/24` | RFC 6890 | IETF protocol assignments |
+| `0.0.0.0` | N/A | Unspecified |
+| `255.255.255.255` | N/A | Broadcast |
+| `::1` | RFC 4291 | IPv6 loopback |
+| `fc00::/7` | RFC 4193 | IPv6 ULA (private) |
+| `fe80::/10` | RFC 4291 | IPv6 link-local |
+| `::ffff:A.B.C.D` (private v4) | RFC 4291 | IPv4-mapped IPv6 |
 
 #### Proxy-forced mode (#53)
 
-By default the proxy is **advisory at the kernel level**: the sandbox allows outbound TCP to `*:443`, and traffic reaches the proxy only because cplt injects `HTTP_PROXY`/`HTTPS_PROXY`/`NODE_USE_ENV_PROXY=1`. A raw socket, or an agent that runs `env -u HTTPS_PROXY -u HTTP_PROXY …`, can still reach any host on `:443` **without** traversing the proxy — bypassing all domain filtering.
+By default the proxy is **advisory at the kernel level**. The sandbox allows outbound TCP to `*:443`, and traffic reaches the proxy only because cplt injects `HTTP_PROXY`/`HTTPS_PROXY`/`NODE_USE_ENV_PROXY=1`. A raw socket, or an agent that runs `env -u HTTPS_PROXY -u HTTP_PROXY …`, can still reach any host on `:443` **without** traversing the proxy, bypassing all domain filtering.
 
-Proxy-forced mode restricts **kernel-level egress to the proxy port only**, so the proxy becomes the sole sanctioned path off the machine. It is **opt-in and off by default** (flipping it to the default is tracked in [#71](https://github.com/navikt/cplt/issues/71)). When enabled:
+Proxy-forced mode restricts **kernel-level egress to the proxy port only**, making the proxy the sole sanctioned path off the machine. It is opt-in and off by default; flipping it to the default is tracked in [#71](https://github.com/navikt/cplt/issues/71). When enabled:
 
-- **The proxy is mandatory.** It is forced on. If it was explicitly disabled (`--no-proxy` / `proxy.enabled = false`) the launch is a conflict and cplt **errors out** rather than silently choosing a side.
-- **Fail-closed:** if the mandatory proxy cannot bind/start, cplt **refuses to launch the agent** — it never falls back to open networking.
-- **Domain filtering is unchanged.** Proxy-forced only changes which port the kernel permits; the proxy still enforces `allowed_domains` / `blocked_domains` on everything it carries. Pairing proxy-forced with an allowlist gives "only these domains, with no way around the proxy" (a default per-agent allowlist is tracked in [#52](https://github.com/navikt/cplt/issues/52)).
+- **The proxy is mandatory.** It is forced on. If it was explicitly disabled (`--no-proxy` / `proxy.enabled = false`), the launch is a conflict and cplt **errors out** rather than silently choosing a side.
+- **Fail-closed.** If the mandatory proxy cannot bind or start, cplt **refuses to launch the agent**. It never falls back to open networking.
+- **Domain filtering is unchanged.** Proxy-forced only changes which port the kernel permits; the proxy still enforces `allowed_domains` / `blocked_domains` on everything it carries. Pairing proxy-forced with an allowlist gives "only these domains, with no way around the proxy". A default per-agent allowlist is tracked in [#52](https://github.com/navikt/cplt/issues/52).
 
-**Platform asymmetry — enforcement is not equal:**
+**Enforcement is not equal across platforms:**
 
-- **macOS (Seatbelt):** the SBPL profile replaces the `*:443` allow with `localhost:<proxy_port>` only. Seatbelt *can* pin to localhost, so there is **no residual** — no direct-network path exists and the `env -u HTTPS_PROXY` / raw-socket bypass is fully closed.
-- **Linux (Landlock):** Landlock drops the `:443` rule and allows only the proxy port. This blocks direct `:443` to any host and forces HTTPS through the proxy — but Landlock is **port-based and cannot pin to localhost**, so a narrow `evil.com:<proxy_port>` channel remains reachable if a remote host answers on that exact port. This is "no direct `:443` bypass," **not** "no egress except the proxy." Closing the residual requires a network namespace and is tracked in [#114](https://github.com/navikt/cplt/issues/114).
+- **macOS (Seatbelt):** the SBPL profile replaces the `*:443` allow with `localhost:<proxy_port>` only. Seatbelt *can* pin to localhost, so there is **no residual**. No direct-network path exists and the `env -u HTTPS_PROXY` and raw-socket bypasses are fully closed.
+- **Linux (Landlock):** Landlock drops the `:443` rule and allows only the proxy port. This blocks direct `:443` to any host and forces HTTPS through the proxy. But Landlock is **port-based and cannot pin to localhost**, so a narrow `evil.com:<proxy_port>` channel stays reachable if a remote host answers on that exact port. This is "no direct `:443` bypass", **not** "no egress except the proxy". Closing the residual requires a network namespace, tracked in [#114](https://github.com/navikt/cplt/issues/114).
 
-> **Escape-hatch caveat:** `--allow-port <PORT>` still opens a **direct** kernel egress channel on that port that does not pass through the proxy (on both platforms). Using it under proxy-forced reopens exactly the kind of unfiltered bypass this mode exists to close.
+> **Escape-hatch caveat:** `--allow-port <PORT>` still opens a **direct** kernel egress channel on that port that does not pass through the proxy, on both platforms. Using it under proxy-forced reopens exactly the kind of unfiltered bypass this mode exists to close.
 
-### Layer 1L: Landlock + seccomp Kernel Sandbox (Linux)
+### Layer 1L: Landlock + seccomp kernel sandbox (Linux)
 
-On Linux, kernel-level enforcement uses two complementary mechanisms:
+On Linux, kernel-level enforcement uses two complementary mechanisms.
 
 #### Landlock LSM (filesystem + network)
 
-[Landlock](https://docs.kernel.org/userspace-api/landlock.html) is a stacking LSM that provides unprivileged, process-level access control. Rules are additive within a ruleset — access not explicitly granted is denied.
+[Landlock](https://docs.kernel.org/userspace-api/landlock.html) is a stacking LSM that provides unprivileged, process-level access control. Rules are additive within a ruleset, so access that is not explicitly granted is denied.
 
 **ABI version support:**
 
@@ -537,7 +573,7 @@ On Linux, kernel-level enforcement uses two complementary mechanisms:
 | v4  | 6.7+   | + TCP port filtering (bind + connect) |
 | v5  | 6.10+  | + ioctl on character devices |
 
-cplt requires ABI v1 minimum. On ABI < v4, network security relies on the CONNECT proxy only (Landlock cannot filter TCP ports). On ABI v4+, Landlock denies all TCP connections except to explicitly allowed ports.
+cplt requires ABI v1 minimum. On ABI < v4, network security relies on the CONNECT proxy alone, because Landlock cannot filter TCP ports. On ABI v4+, Landlock denies all TCP connections except to explicitly allowed ports.
 
 **Key differences from Seatbelt:**
 
@@ -550,7 +586,7 @@ cplt requires ABI v1 minimum. On ABI < v4, network security relies on the CONNEC
 | Audit logs | Full Seatbelt violation log | None (no audit mode) |
 | Privilege | Requires `sandbox-exec` (deprecated) | Unprivileged (any user) |
 
-**Pre-exec safety:** The proxy thread makes the process multi-threaded before `fork`. Landlock rules are pre-computed in the parent process (`PrecomputedSandbox`), and the seccomp filter is installed via raw syscall. The Landlock crate performs small heap allocations in `pre_exec` which is technically not async-signal-safe, but works reliably in practice (the proxy thread is blocked in I/O syscalls during fork, minimizing allocator contention).
+**Pre-exec safety:** the proxy thread makes the process multi-threaded before `fork`. Landlock rules are pre-computed in the parent process (`PrecomputedSandbox`), and the seccomp filter is installed via raw syscall. The Landlock crate performs small heap allocations in `pre_exec`, which is technically not async-signal-safe but works reliably in practice, because the proxy thread is blocked in I/O syscalls during fork, which minimizes allocator contention.
 
 #### seccomp-BPF (syscall filtering)
 
@@ -577,15 +613,11 @@ A BPF filter blocks dangerous syscalls that could be used to escape the sandbox 
 | `iopl`, `ioperm` | Prevents I/O port access (x86_64 only) |
 | `modify_ldt` | Prevents LDT modification (x86_64 only) |
 
-The filter uses `SECCOMP_RET_ERRNO` (returns EPERM) rather than `SECCOMP_RET_KILL` to avoid crashing on legitimate probes.
+The filter uses `SECCOMP_RET_ERRNO` (returns EPERM) rather than `SECCOMP_RET_KILL`, so legitimate probes do not crash.
 
 #### Protected paths (Linux)
 
-The same credential directories are denied as on macOS:
-
-- `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.nais`
-- `~/.password-store`, `~/.config/gcloud`, `~/.config/op`, `~/.terraform.d`
-- `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.gem/credentials`, `~/.vault-token`
+The same credential directories and files are denied as on macOS: see [Protected paths](#protected-paths).
 
 Linux-specific tool directories use XDG-style paths:
 
@@ -598,57 +630,15 @@ Linux-specific tool directories use XDG-style paths:
 
 #### Linux-specific limitations
 
-1. **No `--show-denials`**: Landlock has no audit logging. Use `strace` for debugging.
-2. **No subpath deny**: Cannot deny `~/.config/gh/extensions` while allowing `~/.config/gh/hosts.yml` — the entire directory must be allowed or denied.
-3. **No auth integration**: Linux v1 supports env token + `gh auth` only (no D-Bus/Secret Service).
-4. **No localhost isolation at kernel level**: Landlock network rules are port-based only — they cannot distinguish `localhost:443` from `remote:443`. On macOS, Seatbelt blocks localhost outbound separately. On Linux, use `--with-proxy` for localhost SSRF protection (the proxy resolves DNS and blocks private IPs).
-5. **`--allow-localhost-any` disables ALL kernel network restriction on Linux**: because Landlock is port-based and cannot express "any localhost port but no remote host", opening all localhost ports requires dropping *every* Landlock TCP-connect rule. The result is unrestricted outbound TCP at the kernel level — an agent can raw-socket to any remote `host:port` and exfiltrate directly, not just reach localhost. macOS (Seatbelt) still pins `localhost:*` and is unaffected. cplt emits a prominent warning when this flag is set on Linux. **Prefer `--proxy-forced`** (which supersedes `allow_localhost_any` — see [Proxy-forced mode](#proxy-forced-mode-53)) or scope to specific ports with `--allow-localhost <PORT>`, which keeps kernel connect-restriction on.
+1. **No `--show-denials`.** Landlock has no audit logging. Use `strace` for debugging.
+2. **No subpath deny.** The entire directory must be allowed or denied. See [Out of scope](#out-of-scope).
+3. **No auth integration.** Linux v1 supports env token and `gh auth` only, with no D-Bus/Secret Service.
+4. **No localhost isolation at kernel level.** Landlock network rules are port-based only and cannot distinguish `localhost:443` from `remote:443`. On macOS, Seatbelt blocks localhost outbound separately. On Linux, use `--with-proxy` for localhost SSRF protection, since the proxy resolves DNS and blocks private IPs.
+5. **`--allow-localhost-any` disables ALL kernel network restriction on Linux.** Landlock is port-based and cannot express "any localhost port but no remote host", so opening all localhost ports means dropping *every* Landlock TCP-connect rule. The result is unrestricted outbound TCP at the kernel level: an agent can raw-socket to any remote `host:port` and exfiltrate directly, not just reach localhost. macOS (Seatbelt) still pins `localhost:*` and is unaffected. cplt emits a prominent warning when this flag is set on Linux. **Prefer `--proxy-forced`**, which supersedes `allow_localhost_any` (see [Proxy-forced mode](#proxy-forced-mode-53)), or scope to specific ports with `--allow-localhost <PORT>`, which keeps kernel connect-restriction on.
 
-The proxy provides:
+### Layer 3: Input validation
 
-1. **Connection logging** — every CONNECT target is logged with timestamp and status
-2. **Domain blocklist** — configurable file-based blocklist with subdomain matching
-3. **Port enforcement** — only port 443 (and `--allow-port` values) are permitted, matching the sandbox policy
-4. **DNS rebinding protection** — resolves DNS first, validates the *resolved IP*, then connects using the pinned address
-5. **Comprehensive private IP blocking** — covers all reserved ranges
-
-#### DNS Rebinding Defense
-
-A naïve proxy checks the hostname string (e.g., "api.github.com") against a blocklist before connecting. An attacker can register a domain that resolves to `127.0.0.1` — the hostname check passes but the connection reaches localhost.
-
-Our defense (following [OWASP SSRF Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html) guidance):
-
-```
-1. Check hostname against blocklist           → block known-bad domains
-2. Check hostname patterns (localhost, .local) → fast-path reject
-3. DNS resolve hostname → IP address           → get actual target
-4. Check RESOLVED IP against private ranges    → catch rebinding
-5. Connect to the resolved IP (not hostname)   → pin the address, prevent TOCTOU
-```
-
-Step 5 is critical: we connect to the `SocketAddr` from step 3, not re-resolving. This prevents time-of-check-to-time-of-use (TOCTOU) attacks where the DNS response changes between validation and connection.
-
-#### IP Ranges Blocked
-
-| Range | RFC | Purpose |
-|---|---|---|
-| `127.0.0.0/8` | RFC 1122 | Loopback |
-| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | RFC 1918 | Private networks |
-| `169.254.0.0/16` | RFC 3927 | Link-local |
-| `100.64.0.0/10` | RFC 6598 | CGNAT (Tailscale, WireGuard) |
-| `198.18.0.0/15` | RFC 2544 | Benchmarking |
-| `240.0.0.0/4` | RFC 1112 | Reserved/future |
-| `192.0.0.0/24` | RFC 6890 | IETF protocol assignments |
-| `0.0.0.0` | — | Unspecified |
-| `255.255.255.255` | — | Broadcast |
-| `::1` | RFC 4291 | IPv6 loopback |
-| `fc00::/7` | RFC 4193 | IPv6 ULA (private) |
-| `fe80::/10` | RFC 4291 | IPv6 link-local |
-| `::ffff:A.B.C.D` (private v4) | RFC 4291 | IPv4-mapped IPv6 |
-
-### Layer 3: Input Validation
-
-#### SBPL Injection Prevention
+#### SBPL injection prevention
 
 All paths interpolated into sandbox profiles are validated against unsafe characters:
 
@@ -656,66 +646,66 @@ All paths interpolated into sandbox profiles are validated against unsafe charac
 Blocked: " ) ( ; \ \n \r \0
 ```
 
-The newline character is the most dangerous — a path containing `\n(allow file-read* (subpath "/"))` would inject a rule granting read access to the entire filesystem. We validate:
+The newline character is the dangerous one. A path containing `\n(allow file-read* (subpath "/"))` would inject a rule granting read access to the entire filesystem. We validate:
 
 - Project directory path
 - Home directory path
-- All user-specified allow/deny paths (from CLI and config file)
+- All user-specified allow/deny paths, from CLI and config file
 
 Config file paths are additionally canonicalized (resolved to absolute paths) at load time.
 
-#### Temp File Safety
+#### Temp file safety
 
 The sandbox profile is written to a temp file with:
 
-- **Unique filename**: `cplt-{PID}-{nanosecond_timestamp}.sb`
-- **Atomic creation**: `OpenOptions::create_new(true)` — fails if file exists (prevents symlink following)
-- **Restricted permissions**: mode `0o600` (owner read/write only)
-- **Cleanup on exit**: file is removed after sandbox-exec completes
+- **Unique filename:** `cplt-{PID}-{nanosecond_timestamp}.sb`
+- **Atomic creation:** `OpenOptions::create_new(true)`, which fails if the file exists and so prevents symlink following
+- **Restricted permissions:** mode `0o600`, owner read/write only
+- **Cleanup on exit:** the file is removed after sandbox-exec completes
 
-#### Unsafe Root Rejection
+#### Unsafe root rejection
 
-cplt refuses to sandbox overly broad directories that would grant the agent access to sensitive areas:
+cplt refuses to sandbox overly broad directories that would hand the agent access to sensitive areas:
 
-- `/` — entire filesystem
-- `/Users` — all user home directories
-- `$HOME` — user's entire home directory
-- `/tmp`, `/private/tmp` — shared temp directories
-- `/var`, `/private/var` — system variable data
-- `/Applications` — installed applications
-- `/System` — macOS system files
+- `/` (entire filesystem)
+- `/Users` (all user home directories)
+- `$HOME` (user's entire home directory)
+- `/tmp`, `/private/tmp` (shared temp directories)
+- `/var`, `/private/var` (system variable data)
+- `/Applications` (installed applications)
+- `/System` (macOS system files)
 
-#### CLI Path Handling
+#### CLI path handling
 
-- **Allow paths** (`--allow-read`, `--allow-write`): canonicalized; unresolvable paths are warned and skipped
-- **Deny paths** (`--deny-path`): canonicalized; unresolvable paths cause a **hard error** (silently dropping a deny rule is a security risk)
+- **Allow paths** (`--allow-read`, `--allow-write`) are canonicalized, and unresolvable paths are warned about and skipped
+- **Deny paths** (`--deny-path`) are canonicalized, and unresolvable paths cause a **hard error**, because silently dropping a deny rule is a security risk
 
-### Layer 4: Per-Repo Config Trust Model (`.cplt.toml`)
+### Layer 4: Per-repo config trust model (`.cplt.toml`)
 
-Repository maintainers can commit a `.cplt.toml` to configure sandbox settings for all contributors. This creates an attack surface: a compromised or malicious maintainer could weaken the sandbox for everyone who clones the repo. The trust model addresses this with defense-in-depth.
+Repository maintainers can commit a `.cplt.toml` to configure sandbox settings for all contributors. That creates an attack surface, since a compromised or malicious maintainer could weaken the sandbox for everyone who clones the repo. The trust model addresses this with defense-in-depth.
 
 #### Security design principles
 
-1. **Deny-default for permissions.** The `[propose]` section requests sandbox relaxations, but they have **no effect** until the local user explicitly approves them with `cplt trust accept`. Unapproved permissions are silently ignored — the agent runs safely with the tighter default sandbox.
+1. **Deny-default for permissions.** The `[propose]` section requests sandbox relaxations, but they have **no effect** until the local user explicitly approves them with `cplt trust accept`. Unapproved permissions are silently ignored and the agent runs with the tighter default sandbox.
 
-2. **Deny section is tighten-only.** The `[deny]` section can only add restrictions (block paths, block env vars). It is applied automatically without approval because it cannot weaken the sandbox.
+2. **Deny section is tighten-only.** The `[deny]` section can only add restrictions, blocking paths and env vars. It is applied automatically without approval, because it cannot weaken the sandbox.
 
-3. **No interactive approval during launch.** cplt deliberately does *not* prompt "approve these? [y/N]" when unapproved permissions exist. This prevents approval fatigue — users reflexively hitting `y` to proceed. Instead, approval requires a separate deliberate command (`cplt trust accept`), matching the security model of Deno workspace trust and VS Code Restricted Mode.
+3. **No interactive approval during launch.** cplt deliberately does *not* prompt "approve these? [y/N]" when unapproved permissions exist. That prevents approval fatigue, where users reflexively hit `y` to proceed. Approval requires a separate deliberate command (`cplt trust accept`), matching the security model of Deno workspace trust and VS Code Restricted Mode.
 
-4. **Tamper-proof source.** `.cplt.toml` is read from `git HEAD` (committed state) via `git cat-file`, not from the working tree. The sandboxed agent cannot modify its own config mid-session. Write access to `.cplt.toml` is kernel-denied inside the sandbox.
+4. **Tamper-proof source.** `.cplt.toml` is read from `git HEAD` (committed state) via `git cat-file`, not from the working tree, so the sandboxed agent cannot modify its own config mid-session. Write access to `.cplt.toml` is kernel-denied inside the sandbox.
 
-5. **Content-pinned approvals.** Trust entries store a SHA-256 hash of the approved `[propose]` values. If the maintainer changes any proposed values (even reordering array elements is hash-stable due to pre-sort), previous approvals are automatically invalidated and the user must re-approve.
+5. **Content-pinned approvals.** Trust entries store a SHA-256 hash of the approved `[propose]` values. If the maintainer changes any proposed value, previous approvals are automatically invalidated and the user must re-approve. Reordering array elements is hash-stable, thanks to a pre-sort.
 
 6. **Additive-only semantics.** Repo config can enable features (`allow_docker = true`) but cannot disable anything set by the user's CLI flags or global config. Precedence: CLI > global config > approved repo permissions > defaults.
 
-7. **Path traversal rejection.** Paths in `.cplt.toml` containing `..` components are rejected at parse time, preventing escape attempts like `../../.ssh`.
+7. **Path traversal rejection.** Paths in `.cplt.toml` containing `..` components are rejected at parse time, which prevents escape attempts like `../../.ssh`.
 
 #### Trust store integrity
 
-- Trust entries are stored in `~/.config/cplt/trust/` — protected from the sandbox (the agent cannot self-approve).
-- Each entry's **filename** is a SHA-256 fingerprint of the normalized git remote URL (or the canonicalized project path when there is no remote). Remote URLs are normalized (SSH/HTTPS variants, credentials stripped, ports removed) so the same repo accessed via different URLs shares one trust entry.
-- **The remote URL is not an authenticity signal.** It is attacker-controllable: a malicious repo can `git remote set-url origin <victim>` and copy the victim's approved `[propose]` block verbatim (so the content hash also matches) to look up the victim's trust entry and inherit its approved permissions — a confused-deputy escalation. To defeat this, every approval is **also bound to the absolute local checkout path** it was granted at (`repo.path`). Before applying a trust entry, cplt requires the current project directory to match that recorded path (canonicalized); a matching fingerprint presented from a *different* path is **not** auto-trusted and triggers a re-approval prompt. An attacker cannot satisfy this without already controlling the victim's exact on-disk location. Legacy entries with no recorded path are treated as unmatched (one-time re-approval).
-- Trust writes are atomic (temp file + rename) to prevent corruption from interrupted writes.
+- Trust entries live in `~/.config/cplt/trust/`, protected from the sandbox, so the agent cannot self-approve.
+- Each entry's **filename** is a SHA-256 fingerprint of the normalized git remote URL, or the canonicalized project path when there is no remote. Remote URLs are normalized (SSH/HTTPS variants, credentials stripped, ports removed) so the same repo accessed via different URLs shares one trust entry.
+- **The remote URL is not an authenticity signal.** It is attacker-controllable. A malicious repo can `git remote set-url origin <victim>` and copy the victim's approved `[propose]` block verbatim, so the content hash also matches, then look up the victim's trust entry and inherit its approved permissions. That is a confused-deputy escalation. To defeat it, every approval is **also bound to the absolute local checkout path** it was granted at (`repo.path`). Before applying a trust entry, cplt requires the current project directory to match that recorded path, canonicalized. A matching fingerprint presented from a *different* path is **not** auto-trusted and triggers a re-approval prompt. An attacker cannot satisfy this without already controlling the victim's exact on-disk location. Legacy entries with no recorded path are treated as unmatched, giving a one-time re-approval.
+- Trust writes are atomic (temp file plus rename) so an interrupted write cannot corrupt the store.
 
 #### Threat scenarios
 
@@ -724,103 +714,84 @@ Repository maintainers can commit a `.cplt.toml` to configure sandbox settings f
 | Maintainer adds `allow_docker = true` | No effect until each user explicitly approves |
 | Agent modifies `.cplt.toml` at runtime | Read from `git HEAD`, not working tree; writes kernel-denied |
 | Maintainer changes proposed values after approval | Content hash mismatch invalidates approval |
-| `.cplt.toml` blocks critical env vars via `[deny].env` | `[deny]` can only tighten — removing env vars reduces attack surface |
+| `.cplt.toml` blocks critical env vars via `[deny].env` | `[deny]` can only tighten, and removing env vars reduces attack surface |
 | Path traversal in deny/allow paths | `..` components rejected at parse time |
 | Agent self-approves via trust store | Trust dir (`~/.config/cplt/trust/`) is outside the sandbox |
-| Origin-URL spoof to inherit a victim's approval (`git remote set-url origin <victim>` + copy `[propose]`) | Approvals are bound to the local checkout path; a match from a different path is not auto-trusted (re-approval required) |
+| Origin-URL spoof to inherit a victim's approval (`git remote set-url origin <victim>` + copy `[propose]`) | Approvals are bound to the local checkout path; a match from a different path is not auto-trusted, and re-approval is required |
 
-### GPG Signing Risk Analysis (`--allow-gpg-signing`)
+### GPG signing risk analysis (`--allow-gpg-signing`)
 
-When `--allow-gpg-signing` is enabled, cplt grants targeted access to the GPG subsystem:
+When `--allow-gpg-signing` is enabled, cplt grants targeted access to the GPG subsystem.
 
 **What is exposed:**
-- Read-only access to `~/.gnupg/pubring.kbx`, `pubring.gpg`, `trustdb.gpg`, `gpg.conf`, `common.conf` (public data only)
-- Unix socket connect to `~/.gnupg/S.gpg-agent` (IPC to the GPG agent daemon running outside the sandbox)
+- Read-only access to `~/.gnupg/pubring.kbx`, `pubring.gpg`, `trustdb.gpg`, `gpg.conf`, `common.conf`, all public data
+- Unix socket connect to `~/.gnupg/S.gpg-agent`, IPC to the GPG agent daemon running outside the sandbox
 
 **What stays denied:**
-- `~/.gnupg/private-keys-v1.d/` — private key files remain kernel-blocked
-- `~/.gnupg/secring.gpg` — legacy private keyring explicitly denied
-- All writes to `~/.gnupg/` — no modifications possible
-- `~/.ssh/` and `SSH_AUTH_SOCK` — SSH signing is not enabled by this flag
+- `~/.gnupg/private-keys-v1.d/`, private key files remain kernel-blocked
+- `~/.gnupg/secring.gpg`, the legacy private keyring, explicitly denied
+- All writes to `~/.gnupg/`, so no modifications are possible
+- `~/.ssh/` and `SSH_AUTH_SOCK`, since SSH signing is not enabled by this flag
 
-**Key exfiltration is impossible.** The GPG agent uses the Assuan IPC protocol, which exposes `PKSIGN` (sign), `PKDECRYPT` (decrypt), `READKEY` (public key), and `KEYINFO` (metadata) — but has **no command to export private key material**. The agent is a privilege-separation boundary by design. Even if the on-disk key files weren't denied, they are encrypted with the user's passphrase.
+**Key exfiltration is impossible.** The GPG agent uses the Assuan IPC protocol, which exposes `PKSIGN` (sign), `PKDECRYPT` (decrypt), `READKEY` (public key), and `KEYINFO` (metadata), but has **no command to export private key material**. The agent is a privilege-separation boundary by design. Even if the on-disk key files were not denied, they are encrypted with the user's passphrase.
 
-**The actual risk is signature impersonation AND decryption.** A compromised process with agent socket access can:
-1. Request signatures via `PKSIGN` — signing arbitrary data, including malicious commits
-2. Request decryptions via `PKDECRYPT` — if the user has an encryption subkey, the compromised process can decrypt arbitrary ciphertext
+**The actual risk is signature impersonation and decryption.** A compromised process with agent socket access can:
+1. Request signatures via `PKSIGN`, signing arbitrary data including malicious commits
+2. Request decryptions via `PKDECRYPT`, so if the user has an encryption subkey, the compromised process can decrypt arbitrary ciphertext
 
-This is **not key theft** — the attacker cannot take the key with them. Operations can only be performed while the sandbox is running and the agent connection is active.
+This is **not key theft**. The attacker cannot take the key with them, and operations only work while the sandbox is running and the agent connection is active.
 
-**Risk context:** Copilot already has `git commit` ability and can make commits as the user. GPG signing only adds the "Verified" badge. The incremental risk is specifically: a compromised agent can make commits that appear cryptographically verified by the user, and can decrypt data if an encryption subkey exists. Mitigating factors:
-- Agent passphrase cache has a TTL (default: 10 min idle, 2 hr max)
-- The network proxy (when enabled) can audit/block pushes to unexpected remotes
+**Risk context:** Copilot already has `git commit` ability and can make commits as the user. GPG signing only adds the "Verified" badge. The incremental risk is that a compromised agent can make commits that appear cryptographically verified by the user, and can decrypt data if an encryption subkey exists. Mitigating factors:
+- The agent passphrase cache has a TTL, by default 10 min idle and 2 hr max
+- The network proxy, when enabled, can audit or block pushes to unexpected remotes
 - Branch protection rules may still require PR review regardless of signature status
 
-**Deny-path override:** If `--deny-path ~/.gnupg` is specified alongside `--allow-gpg-signing`, the deny wins — all GPG allows are suppressed. This is consistent with the project-wide principle that explicit denies always take precedence.
+**Deny-path override:** if `--deny-path ~/.gnupg` is specified alongside `--allow-gpg-signing`, the deny wins and all GPG allows are suppressed. This matches the project-wide principle that explicit denies always take precedence.
 
 **Known limitations:**
-- `GNUPGHOME` is not in `ENV_ALLOWLIST` but could be injected via `--pass-env` or `--inherit-env`, redirecting GPG to a different directory outside the SBPL policy. The SBPL rules only cover `~/.gnupg/`.
-- If `~/.gnupg` is a symlink, SBPL path resolution may cause rules to not match as expected. Signing will fail closed (no access) rather than open.
+- `GNUPGHOME` is not in `ENV_ALLOWLIST`, but it could be injected via `--pass-env` or `--inherit-env`, redirecting GPG to a directory outside the SBPL policy. The SBPL rules only cover `~/.gnupg/`.
+- If `~/.gnupg` is a symlink, SBPL path resolution may cause rules not to match as expected. Signing then fails closed, with no access, rather than open.
 
-### Network Limitations
-
-#### Proxy support for Copilot traffic
-
-Copilot CLI bundles Node.js v24.11.1, which supports `NODE_USE_ENV_PROXY=1` (added in Node.js v24.5.0). When this env var is set, Node.js natively honors `HTTP_PROXY`/`HTTPS_PROXY` — routing all outbound connections through the specified proxy.
-
-cplt injects `NODE_USE_ENV_PROXY=1`, `HTTP_PROXY`, and `HTTPS_PROXY` into the sandbox environment. All traffic — Copilot CLI, `gh`, `curl`, and any other tool — routes through the localhost CONNECT proxy.
-
-**Historical context:** Earlier versions of Copilot CLI used a Node.js runtime that did not support proxy env vars, and injecting them broke the auth flow. This is no longer the case as of Copilot CLI 1.0.24+ with bundled Node.js v24.11.1.
-
-**Design decision:** The proxy is enabled by default. It listens on an OS-assigned ephemeral port (port 0), so there are no fixed-port conflicts. Use `--no-proxy` to disable for a single run, or set `proxy.enabled = false` in config to disable permanently.
-
-| Component | Language | Routes through proxy? |
-|---|---|---|
-| Copilot CLI | Node.js | ✅ Yes (via `NODE_USE_ENV_PROXY=1`) |
-| `gh` CLI | Go | ✅ Yes (via `net/http.ProxyFromEnvironment()`) |
-| `curl` | C | ✅ Yes |
+### Network limitations
 
 #### SBPL network filtering limitations
 
-SBPL has fundamental limitations for network filtering:
+SBPL has fundamental limits for network filtering:
 
-- **No domain-based rules** — SBPL operates at the syscall level, not the application level. It cannot match on hostnames.
-- **No wildcard port filtering** — there is no syntax for "allow any host on port 443 only"
-- **IP-based rules require known IPs** — Copilot's API endpoints use CDN-backed IPs that change regularly
-- **No loopback-only bind** — SBPL only accepts `*` or `localhost` as the host part of IP filters. Literal IPs like `127.0.0.1` cause `"host must be * or localhost"` errors. The `localhost` host matches `INADDR_ANY` (`0.0.0.0`), meaning `(allow network-bind (local ip "localhost:*"))` also permits binding on all interfaces. This is a macOS Seatbelt limitation — processes inside the sandbox can start listeners accessible on the network. Mitigations: outbound is locked to port 443 (no exfiltration via inbound connections), dev machines are typically behind NAT/firewall, and the proxy intercepts all outbound traffic.
+- **No domain-based rules.** SBPL operates at the syscall level, not the application level, so it cannot match on hostnames.
+- **No wildcard port filtering.** There is no syntax for "allow any host on port 443 only".
+- **IP-based rules require known IPs.** Copilot's API endpoints use CDN-backed IPs that change regularly.
+- **No loopback-only bind.** SBPL accepts only `*` or `localhost` as the host part of IP filters. Literal IPs like `127.0.0.1` produce `"host must be * or localhost"` errors. The `localhost` host matches `INADDR_ANY` (`0.0.0.0`), so `(allow network-bind (local ip "localhost:*"))` also permits binding on all interfaces. This is a macOS Seatbelt limitation, and it means processes inside the sandbox can start listeners reachable on the network. Mitigations: outbound is locked to port 443 so there is no exfiltration via inbound connections, dev machines are typically behind NAT/firewall, and the proxy intercepts all outbound traffic.
 
 The only viable options are `(allow network-outbound (remote tcp))` (allow all) or `(deny network*)` (deny all). We allow outbound TCP because Copilot cannot function without network access, and use port restrictions as a secondary control.
 
 #### Current state
 
-- **Outbound TCP is allowed** in the sandbox profile, restricted to port 443 (+ `--allow-port`)
-- **Filesystem isolation is the primary security control** — credentials are kernel-blocked regardless of network policy
-- **The proxy** (when enabled) provides connection logging, domain blocking, port enforcement, and DNS rebinding protection for all traffic including Copilot
-- **By default the proxy is not mandatory** — because `*:443` is kernel-allowed, a raw socket or `env -u HTTPS_PROXY` can reach the network without traversing the proxy. Opt into **proxy-forced mode** (`--proxy-forced` / `proxy.forced = true`, #53) to restrict kernel egress to the proxy port and close that bypass. Enforcement is asymmetric: macOS pins to `localhost:<proxy_port>` (full, no residual); Linux blocks direct `:443` but is port-based, so a narrow `evil.com:<proxy_port>` residual remains until [#114](https://github.com/navikt/cplt/issues/114). See [Layer 2 → Proxy-forced mode](#proxy-forced-mode-53)
+Outbound TCP is allowed in the sandbox profile, restricted to port 443 plus `--allow-port`, and filesystem isolation stays the primary security control. See [Layer 2](#layer-2-connect-proxy-logging-and-domain-filtering) for what the proxy enforces, and [Proxy-forced mode](#proxy-forced-mode-53) for why the proxy is advisory by default and how to make it mandatory.
 
-### Self-Update Security (`cplt update`)
+### Self-update security (`cplt update`)
 
 The update mechanism downloads releases from GitHub, verifies SHA256 checksums, and atomically replaces the binary.
 
 **Verified:**
-- SHA256 checksum is mandatory — update aborts on mismatch
-- `--proto-redir =https` prevents HTTP downgrade on redirects
-- Archive validation: must contain exactly one regular file named `cplt` (no symlinks, no directories)
-- Extracted binary verified via `symlink_metadata` (rejects symlinks)
-- Uses absolute paths for system tools on macOS (`/usr/bin/curl`, `/usr/bin/shasum`, `/usr/bin/tar`) and Linux (`/usr/bin/sha256sum`, standard paths only — no bare PATH lookup)
-- Atomic replacement: stage to `.new`, set permissions, rename
+- The SHA256 checksum is mandatory, and the update aborts on mismatch
+- `--proto-redir =https` prevents an HTTP downgrade on redirects
+- Archive validation requires exactly one regular file named `cplt`, no symlinks and no directories
+- The extracted binary is verified via `symlink_metadata`, which rejects symlinks
+- Absolute paths are used for system tools on macOS (`/usr/bin/curl`, `/usr/bin/shasum`, `/usr/bin/tar`) and Linux (`/usr/bin/sha256sum`, standard paths only, no bare PATH lookup)
+- Replacement is atomic: stage to `.new`, set permissions, rename
 
 **Not verified:**
-- No cryptographic signature (GPG or Sigstore). `SHA256SUMS` and binary come from the same GitHub release — a compromised release controls both. This is consistent with most Go/Rust CLI tools but weaker than signed package managers.
-- Temp directory uses `/tmp/cplt-update-{PID}` — predictable by local attackers, but extracted binary is checked for symlinks before installation.
+- There is no cryptographic signature, neither GPG nor Sigstore. `SHA256SUMS` and the binary come from the same GitHub release, so a compromised release controls both. This matches most Go/Rust CLI tools but is weaker than signed package managers.
+- The temp directory is `/tmp/cplt-update-{PID}`, predictable by local attackers, though the extracted binary is checked for symlinks before installation.
 
 The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS.
 
-### Install Script Security (`install.sh`)
+### Install script security (`install.sh`)
 
 The install script downloads from GitHub Releases and verifies SHA256 checksums.
 
-**Caveat:** If the `SHA256SUMS` file cannot be downloaded, or no hash utility is available, the script prints a warning and **continues without verification**. This is a deliberate trade-off for usability in minimal CI environments.
+**Caveat:** if the `SHA256SUMS` file cannot be downloaded, or no hash utility is available, the script prints a warning and **continues without verification**. This is a deliberate trade-off for usability in minimal CI environments.
 
 For high-security environments, verify the binary manually:
 ```bash
@@ -833,23 +804,23 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 `cplt --doctor` probes the environment by running `--version` on all known agent binaries found in PATH (copilot, opencode, gemini, claude). These commands run **outside the sandbox** with full user privileges.
 
-Trust model: cplt trusts that binaries in your PATH are legitimate. This is the same trust model as typing `copilot --version` yourself. If you don't trust a binary in your PATH, remove it before running `--doctor`.
+Trust model: cplt trusts that binaries in your PATH are legitimate, the same trust model as typing `copilot --version` yourself. If you don't trust a binary in your PATH, remove it before running `--doctor`.
 
-### Config File Trust Model
+### Config file trust model
 
-`~/.config/cplt/config.toml` and `~/.config/cplt/trust/*.toml` are trusted inputs read before sandboxing. They are not permission-checked — the trust model assumes `$HOME` is protected by OS-level permissions (0700 or 0755).
+`~/.config/cplt/config.toml` and `~/.config/cplt/trust/*.toml` are trusted inputs read before sandboxing. They are not permission-checked. The trust model assumes `$HOME` is protected by OS-level permissions (0700 or 0755).
 
-On shared systems, ensure `~/.config/cplt/` has restrictive permissions (0700). A user who can write to this directory can weaken the sandbox configuration.
+On shared systems, give `~/.config/cplt/` restrictive permissions (0700). A user who can write to this directory can weaken the sandbox configuration.
 
-### Scratch Directory Session IDs
+### Scratch directory session IDs
 
-Session IDs for per-session scratch directories are generated from `/dev/urandom` (16 random bytes, hex-encoded). Fallback to PID + nanosecond timestamp if `/dev/urandom` is unavailable (not expected on standard macOS/Linux). The fallback is predictable but the failure mode is denial-of-service (directory creation fails if it already exists), not compromise.
+Session IDs for per-session scratch directories come from `/dev/urandom` (16 random bytes, hex-encoded), falling back to PID plus nanosecond timestamp if `/dev/urandom` is unavailable, which is not expected on standard macOS or Linux. The fallback is predictable, but the failure mode is denial-of-service (directory creation fails if it already exists), not compromise.
 
-## Test Strategy
+## Test strategy
 
-### Unit Tests (cross-platform, run on Linux CI)
+### Unit tests (cross-platform, run on Linux CI)
 
-These test core logic without invoking `sandbox-exec`, using the real library functions (not duplicated copies):
+These test core logic without invoking `sandbox-exec`, using the real library functions rather than duplicated copies:
 
 | Category | Tests | What's verified |
 |---|---|---|
@@ -864,7 +835,7 @@ These test core logic without invoking `sandbox-exec`, using the real library fu
 | Env behavior | 17 | Sanitization, hardening injection, pass-env overrides, LANG prefix leak prevention, YARN hardening bypass prevention, scratch dir TMPDIR redirect, JAVA_TOOL_OPTIONS injection/append/override |
 | Config parsing | 24 | TOML parsing, CLI/config merge precedence, tilde expansion, SBPL validation, scratch dir, allow-tmp-exec |
 
-### Integration Tests (macOS only, 39 tests)
+### Integration tests (macOS only, 39 tests)
 
 These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-level enforcement**:
 
@@ -877,7 +848,7 @@ These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-leve
 | Tool dir permissions | 15 | Each HOME_TOOL_DIR has correct exec/map-exec/write at kernel level |
 | GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |
 
-### E2E Project Tests (macOS only, 38 tests)
+### E2E project tests (macOS only, 38 tests)
 
 End-to-end tests using realistic project scaffolding (Node, Go, Python, Rust, Java/Maven, Kotlin) with fake copilot scripts:
 
@@ -890,7 +861,7 @@ End-to-end tests using realistic project scaffolding (Node, Go, Python, Rust, Ja
 | Git persistence | 1 | Cannot write .git/hooks or .git/config |
 | Lifecycle scripts | 3 | npm/yarn/pnpm lifecycle script hardening |
 
-### Smoke Tests (macOS only, 6 tests, `#[ignore]`)
+### Smoke tests (macOS only, 6 tests, `#[ignore]`)
 
 Real Copilot CLI integration tests requiring authentication and network access:
 
@@ -903,57 +874,57 @@ Real Copilot CLI integration tests requiring authentication and network access:
 | `smoke_copilot_write_file` | Copilot creates a new file on disk (side-effect assertion) |
 | `smoke_env_vars_denied` | `SUPER_SECRET_TOKEN` not visible inside sandbox |
 
-### CI Pipeline
+### CI pipeline
 
 The GitHub Actions workflow runs in two stages:
 
-1. **Linux (ubuntu-latest)**: formatting check (`cargo fmt`), linting (`cargo clippy -D warnings`), unit tests
-2. **macOS (macos-latest)**: full test suite including integration tests, release binary build and verification
+1. **Linux (ubuntu-latest):** formatting check (`cargo fmt`), linting (`cargo clippy -D warnings`), unit tests
+2. **macOS (macos-latest):** full test suite including integration tests, release binary build and verification
 
-## Prior Art and References
+## Prior art and references
 
 ### macOS Seatbelt / sandbox-exec
 
-- [Apple sandbox-exec(1) man page](https://keith.github.io/xcode-man-pages/sandbox-exec.1.html) — Official documentation for the command-line sandbox tool
-- [Chromium Seatbelt V2 Design](https://chromium.googlesource.com/chromium/src/sandbox/+show/refs/heads/main/mac/seatbelt_sandbox_design.md) — How Chromium designs and maintains Seatbelt profiles for browser process sandboxing; influenced our deny-default + bsd.sb import approach
-- [HackTricks: macOS Sandbox](https://book.hacktricks.wiki/en/macos-hardening/macos-security-and-privilege-escalation/macos-security-protections/macos-sandbox/index.html) — Comprehensive security research on Seatbelt internals, bypass techniques, and rule evaluation
-- [A New Era of macOS Sandbox Escapes (POC2024)](https://jhftss.github.io/A-New-Era-of-macOS-Sandbox-Escapes/) — Recent CVE research on sandbox escape via XPC/Mach services; informed our understanding of Seatbelt's limitations
-- [michaelneale/agent-seatbelt-sandbox](https://github.com/michaelneale/agent-seatbelt-sandbox) — Early proof-of-concept for sandboxing AI coding agents with Seatbelt; validated the basic approach
+- [Apple sandbox-exec(1) man page](https://keith.github.io/xcode-man-pages/sandbox-exec.1.html). Official documentation for the command-line sandbox tool.
+- [Chromium Seatbelt V2 Design](https://chromium.googlesource.com/chromium/src/sandbox/+show/refs/heads/main/mac/seatbelt_sandbox_design.md). How Chromium designs and maintains Seatbelt profiles for browser process sandboxing; influenced our deny-default plus bsd.sb import approach.
+- [HackTricks: macOS Sandbox](https://book.hacktricks.wiki/en/macos-hardening/macos-security-and-privilege-escalation/macos-security-protections/macos-sandbox/index.html). Security research on Seatbelt internals, bypass techniques, and rule evaluation.
+- [A New Era of macOS Sandbox Escapes (POC2024)](https://jhftss.github.io/A-New-Era-of-macOS-Sandbox-Escapes/). Recent CVE research on sandbox escape via XPC/Mach services; informed our understanding of Seatbelt's limitations.
+- [michaelneale/agent-seatbelt-sandbox](https://github.com/michaelneale/agent-seatbelt-sandbox). Early proof-of-concept for sandboxing AI coding agents with Seatbelt; validated the basic approach.
 
-### DNS Rebinding and SSRF Prevention
+### DNS rebinding and SSRF prevention
 
-- [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html) — Authoritative guidance on validating resolved IPs (not hostnames) and pinning addresses to prevent TOCTOU attacks
-- [RFC 1918](https://datatracker.ietf.org/doc/html/rfc1918) — Private IPv4 address ranges (10/8, 172.16/12, 192.168/16)
-- [RFC 4193](https://datatracker.ietf.org/doc/html/rfc4193) — IPv6 Unique Local Addresses (fc00::/7)
-- [RFC 6598](https://datatracker.ietf.org/doc/html/rfc6598) — CGNAT shared address space (100.64.0.0/10); important for Tailscale/WireGuard environments
-- [RFC 4291](https://datatracker.ietf.org/doc/html/rfc4291) — IPv6 addressing architecture (loopback, link-local, IPv4-mapped addresses)
+- [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html). Authoritative guidance on validating resolved IPs rather than hostnames, and pinning addresses to prevent TOCTOU attacks.
+- [RFC 1918](https://datatracker.ietf.org/doc/html/rfc1918). Private IPv4 address ranges (10/8, 172.16/12, 192.168/16).
+- [RFC 4193](https://datatracker.ietf.org/doc/html/rfc4193). IPv6 Unique Local Addresses (fc00::/7).
+- [RFC 6598](https://datatracker.ietf.org/doc/html/rfc6598). CGNAT shared address space (100.64.0.0/10), important for Tailscale and WireGuard environments.
+- [RFC 4291](https://datatracker.ietf.org/doc/html/rfc4291). IPv6 addressing architecture (loopback, link-local, IPv4-mapped addresses).
 
-### Secure Temporary Files
+### Secure temporary files
 
-- [CWE-377: Insecure Temporary File](https://cwe.mitre.org/data/definitions/377.html) — Motivation for unique filenames and `O_CREAT|O_EXCL`
-- [CWE-59: Improper Link Resolution Before File Access](https://cwe.mitre.org/data/definitions/59.html) — Symlink attacks on predictable temp paths
+- [CWE-377: Insecure Temporary File](https://cwe.mitre.org/data/definitions/377.html). Motivation for unique filenames and `O_CREAT|O_EXCL`.
+- [CWE-59: Improper Link Resolution Before File Access](https://cwe.mitre.org/data/definitions/59.html). Symlink attacks on predictable temp paths.
 
-### AI Agent Sandboxing (broader context)
+### AI agent sandboxing (broader context)
 
-- [GitHub Copilot Workspace sandbox settings](https://docs.github.com/en/copilot/customizing-copilot/customizing-copilot-in-your-ide) — VS Code's built-in sandbox options for Copilot (terminal command restrictions)
-- [Copilot cloud agent firewall](https://docs.github.com/en/enterprise-cloud@latest/copilot/customizing-copilot/customizing-or-disabling-the-firewall-for-copilot-coding-agent) — GitHub's server-side network firewall for the cloud coding agent
-- [Copilot allowlist reference](https://docs.github.com/en/copilot/reference/copilot-allowlist-reference) — Default allowed domains for Copilot cloud agent
-- [OpenAI Codex sandbox](https://platform.openai.com/docs/guides/codex) — OpenAI's approach to sandboxing code execution with network and filesystem restrictions
-- [Anthropic Claude Code permissions](https://docs.anthropic.com/en/docs/claude-code/security) — Permission-based tool approval model for local agent execution
+- [GitHub Copilot Workspace sandbox settings](https://docs.github.com/en/copilot/customizing-copilot/customizing-copilot-in-your-ide). VS Code's built-in sandbox options for Copilot (terminal command restrictions).
+- [Copilot cloud agent firewall](https://docs.github.com/en/enterprise-cloud@latest/copilot/customizing-copilot/customizing-or-disabling-the-firewall-for-copilot-coding-agent). GitHub's server-side network firewall for the cloud coding agent.
+- [Copilot allowlist reference](https://docs.github.com/en/copilot/reference/copilot-allowlist-reference). Default allowed domains for the Copilot cloud agent.
+- [OpenAI Codex sandbox](https://platform.openai.com/docs/guides/codex). OpenAI's approach to sandboxing code execution with network and filesystem restrictions.
+- [Anthropic Claude Code permissions](https://docs.anthropic.com/en/docs/claude-code/security). Permission-based tool approval model for local agent execution.
 
-### Supply Chain Attack Research
+### Supply chain attack research
 
-- [Mend.io: Shai-Hulud npm worm analysis (2025)](https://www.mend.io/blog/npm-supply-chain-attack-packages-compromised-by-self-spreading-malware) — Self-replicating worm that compromised 700+ npm packages
-- [Wiz: Shai-Hulud 2.0 — 25K+ repos exposed](https://www.wiz.io/blog/shai-hulud-2-0-ongoing-supply-chain-attack) — Second wave and blast radius analysis
-- [Socket: 60 malicious npm packages](https://socket.dev/blog/60-malicious-npm-packages-leak-network-and-host-data) — Network recon exfiltration to Discord webhooks
-- [Oligo: npm supply chain risks with AI agents](https://www.oligo.security/blog/the-hidden-risks-of-the-npm-supply-chain-attacks-ai-agents) — How AI coding agents amplify supply chain attacks
-- [ReversingLabs: npm reverse shell malware](https://www.reversinglabs.com/blog/malicious-npm-patch-delivers-reverse-shell) — Patched legitimate packages delivering reverse shells
-- [Rafter: AI Agent Security Incident Timeline (2025–2026)](https://rafter.so/blog/incidents/ai-agent-security-timeline-2025-2026) — Comprehensive timeline of agent security incidents
-- [CamoLeak: Copilot Chat exfiltration (CVE-2025-59145)](https://rafter.so/blog/incidents/camoleak-invisible-exfiltration-channel) — Invisible data exfiltration via GitHub image proxy
-- [LOTS Project — Living Off Trusted Sites](https://lots-project.com/) — Catalog of legitimate domains abused for C2 and exfiltration
-- [Veracode: npm C2 via Ethereum smart contracts](https://www.veracode.com/blog/54-new-npm-packages-found-beaconing-to-c2-server-in-ethereum-smart-contract/) — Dead-drop C2 rotation technique
+- [Mend.io: Shai-Hulud npm worm analysis (2025)](https://www.mend.io/blog/npm-supply-chain-attack-packages-compromised-by-self-spreading-malware). Self-replicating worm that compromised 700+ npm packages.
+- [Wiz: Shai-Hulud 2.0, 25K+ repos exposed](https://www.wiz.io/blog/shai-hulud-2-0-ongoing-supply-chain-attack). Second wave and blast radius analysis.
+- [Socket: 60 malicious npm packages](https://socket.dev/blog/60-malicious-npm-packages-leak-network-and-host-data). Network recon exfiltration to Discord webhooks.
+- [Oligo: npm supply chain risks with AI agents](https://www.oligo.security/blog/the-hidden-risks-of-the-npm-supply-chain-attacks-ai-agents). How AI coding agents amplify supply chain attacks.
+- [ReversingLabs: npm reverse shell malware](https://www.reversinglabs.com/blog/malicious-npm-patch-delivers-reverse-shell). Patched legitimate packages delivering reverse shells.
+- [Rafter: AI Agent Security Incident Timeline (2025-2026)](https://rafter.so/blog/incidents/ai-agent-security-timeline-2025-2026). Timeline of agent security incidents.
+- [CamoLeak: Copilot Chat exfiltration (CVE-2025-59145)](https://rafter.so/blog/incidents/camoleak-invisible-exfiltration-channel). Invisible data exfiltration via GitHub image proxy.
+- [LOTS Project, Living Off Trusted Sites](https://lots-project.com/). Catalog of legitimate domains abused for C2 and exfiltration.
+- [Veracode: npm C2 via Ethereum smart contracts](https://www.veracode.com/blog/54-new-npm-packages-found-beaconing-to-c2-server-in-ethereum-smart-contract/). Dead-drop C2 rotation technique.
 
-## Reporting Security Issues
+## Reporting security issues
 
 If you discover a vulnerability in cplt, please report it responsibly:
 
