@@ -2666,9 +2666,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Warn about repo deny.env interactions up front — these describe policy,
     // not the outcome of token resolution, so they belong before it.
-    if token_denied_by_repo
-        && auth_plan.applies
-        && auth_plan.mode != config::CopilotAuth::Keychain
+    if token_denied_by_repo && auth_plan.applies && auth_plan.mode != config::CopilotAuth::Keychain
     {
         ui::warn(
             "Repo deny.env blocks GitHub token env vars: the agent will run without \
