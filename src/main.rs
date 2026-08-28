@@ -123,6 +123,19 @@ struct Cli {
     #[arg(long, value_name = "PRESET")]
     preset: Option<config::Preset>,
 
+    /// How to obtain the Copilot/GitHub token before the sandbox starts, which
+    /// decides whether the agent needs macOS Keychain access at all. Granting
+    /// Keychain lets the agent read *every* credential you own; pre-extracting
+    /// one GitHub token in the unsandboxed parent is narrower — it is the full
+    /// gh OAuth token, not a scoped one, but it is a single credential.
+    /// Resolved in order: this flag > [sandbox] copilot_auth config.
+    ///   auto:      env token, else `gh auth token`; Keychain only as fallback (default)
+    ///   env_only:  env token only; refuse to launch without one
+    ///   gh_only:   `gh auth token` only; refuse to launch if it fails
+    ///   keychain:  never pre-extract; grant the agent Keychain access
+    #[arg(long, value_name = "MODE")]
+    copilot_auth: Option<config::CopilotAuth>,
+
     /// Which directory the agent can read and write to.
     /// Defaults to the current git repository root, or the working directory
     /// if you're not inside a git repo.
@@ -1133,6 +1146,57 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     }
 }
 
+/// Prompt for an additional confirmation when cplt had to tighten policy.
+fn prompt_policy_change_confirm(auto_yes: bool, quiet: bool, change: &str) -> Result<(), String> {
+    if auto_yes {
+        if !quiet {
+            ui::info("Auto-confirmed policy change (--yes)");
+        }
+        return Ok(());
+    }
+
+    let Ok(tty) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    else {
+        return Err(
+            "No TTY available for policy-change confirmation. Use --yes for non-interactive runs."
+                .to_string(),
+        );
+    };
+
+    if quiet {
+        eprint!(
+            "{}[cplt]{} Policy changed ({}). Continue? [y/N] ",
+            ui::color(ui::YELLOW),
+            ui::color(ui::RESET),
+            change
+        );
+    } else {
+        eprint!(
+            "{}[cplt]{} Policy changed: {}. Continue? [y/N] ",
+            ui::color(ui::YELLOW),
+            ui::color(ui::RESET),
+            change
+        );
+    }
+
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(tty);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return Err("Failed to read policy-change confirmation input".to_string());
+    }
+
+    let answer = line.trim().to_lowercase();
+    if answer == "y" || answer == "yes" {
+        Ok(())
+    } else {
+        Err("Aborted by user".to_string())
+    }
+}
+
 /// Canonicalize a list of paths, warning on failures.
 fn canonicalize_paths(paths: &[PathBuf], flag_name: &str) -> Vec<PathBuf> {
     paths
@@ -1246,6 +1310,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     };
     let mut resolved = match cfg.merge(config::CliFlags {
         preset: cli.preset,
+        copilot_auth: cli.copilot_auth,
         proxy: config::FeatureToggle::from_pair(cli.with_proxy, cli.no_proxy),
         proxy_forced: config::FeatureToggle::from_pair(cli.proxy_forced, cli.no_proxy_forced),
         proxy_port: cli.proxy_port,
@@ -1710,6 +1775,260 @@ struct DomainAllowlistDecision {
     force_proxy_on: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthDecisionMode {
+    Strict,
+    Default,
+}
+
+impl AuthDecisionMode {
+    fn from_preset(preset: Option<config::Preset>) -> Self {
+        if preset == Some(config::Preset::Strict) {
+            Self::Strict
+        } else {
+            Self::Default
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthSource {
+    None,
+    EnvToken,
+    RuntimeGhToken,
+}
+
+impl AuthSource {
+    fn display_label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::EnvToken => "environment token",
+            Self::RuntimeGhToken => "GitHub CLI session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthDecisionReason {
+    EnvTokenPresent,
+    RuntimeTokenResolved,
+    RuntimeTokenMissing,
+    RuntimeTokenNotRequested,
+    NonCopilotAgent,
+}
+
+impl AuthDecisionReason {
+    fn as_code(self) -> &'static str {
+        match self {
+            Self::EnvTokenPresent => "env_token_present",
+            Self::RuntimeTokenResolved => "runtime_token_resolved",
+            Self::RuntimeTokenMissing => "runtime_token_missing",
+            Self::RuntimeTokenNotRequested => "runtime_token_not_requested",
+            Self::NonCopilotAgent => "non_copilot_agent",
+        }
+    }
+
+    fn user_message(self) -> &'static str {
+        match self {
+            Self::EnvTokenPresent => {
+                "an authentication token is already available in the environment"
+            }
+            Self::RuntimeTokenResolved => {
+                "an authentication token was found from your GitHub CLI session"
+            }
+            Self::RuntimeTokenMissing => "no authentication token could be resolved",
+            Self::RuntimeTokenNotRequested => "runtime token resolution was not required",
+            Self::NonCopilotAgent => "this agent does not use Copilot auth",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthDecision {
+    source: AuthSource,
+    token_present: bool,
+    allow_keychain: bool,
+    reason: AuthDecisionReason,
+    mode: AuthDecisionMode,
+    fallback_used: bool,
+    deny_env_stripped: bool,
+}
+
+fn deny_env_strips_auth_token(deny_env: &[String]) -> bool {
+    deny_env
+        .iter()
+        .any(|name| sandbox::GITHUB_TOKEN_VARS.iter().any(|token| name == token))
+}
+
+/// Whether repo `deny.env` blocks the variable cplt actually injects into.
+///
+/// `GH_TOKEN` is the injection target (see `inject_gh_token_if_needed`), so it
+/// alone decides whether a pre-extracted token can reach the agent. Testing all
+/// three token vars instead would refuse a perfectly good run: denying only
+/// `COPILOT_GITHUB_TOKEN` leaves an exported `GH_TOKEN` flowing to the child
+/// untouched. Whether a *surviving* env token exists is a separate question,
+/// and `SandboxEnv::has_github_token` already answers it against the
+/// post-deny environment.
+fn deny_env_blocks_token_injection(deny_env: &[String]) -> bool {
+    deny_env.iter().any(|name| name == "GH_TOKEN")
+}
+
+fn deny_env_disables_gh_guard_injection(
+    gh_guard: &config::GhGuardPolicy,
+    deny_env: &[String],
+) -> bool {
+    gh_guard.enabled && gh_guard.inject_token && deny_env_strips_auth_token(deny_env)
+}
+
+/// The pre-sandbox authentication plan: which token sources are in play, and
+/// whether the macOS Keychain grant is still required.
+///
+/// Pure so the whole matrix (mode x agent x OS x env token x repo deny x
+/// gh_guard) is testable — the interactions here are exactly the ones that are
+/// easy to get subtly wrong, and getting them wrong either hands an agent every
+/// credential the user owns or launches it with none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthPlan {
+    /// The mode actually in force, after scoping to agent and OS.
+    mode: config::CopilotAuth,
+    /// Whether `copilot_auth` governs this run at all.
+    applies: bool,
+    /// Whether an ambient token env var satisfies this run.
+    env_token_counts: bool,
+    /// Whether `gh auth token` may be called.
+    needs_runtime_gh_token: bool,
+    /// Whether a gh-resolved token can actually satisfy *this mode* — false
+    /// when repo `deny.env` will strip it back out before the agent sees it.
+    /// gh_guard may still have resolved one for its own wrapper.
+    mode_wants_token: bool,
+    /// The Keychain grant as computed before `prepare()`.
+    allow_keychain: bool,
+}
+
+fn plan_copilot_auth(
+    requested: config::CopilotAuth,
+    agent: agent::Agent,
+    is_macos: bool,
+    has_env_token: bool,
+    token_denied_by_repo: bool,
+    gh_guard_wants_token: bool,
+) -> AuthPlan {
+    // `copilot_auth` trades a GitHub token for the Keychain grant. That trade
+    // only exists for Copilot (the other agents cannot use a GitHub token) and
+    // only on macOS (the Keychain rules live in the SBPL profile). Everywhere
+    // else the mode is a no-op, so a global `gh_only` cannot refuse to launch
+    // an agent it was never about.
+    let applies = agent == agent::Agent::Copilot && is_macos;
+    let mode = if applies {
+        requested
+    } else {
+        config::CopilotAuth::Keychain
+    };
+
+    // Repo `[deny]` is auto-applied because it can only tighten. Denying a
+    // token var therefore means "no GitHub credential", not "use the Keychain
+    // instead" — otherwise agent-written repo config could widen the sandbox.
+    //
+    // Two bounds on that. It only applies where the mode does: for
+    // Gemini/Claude/Antigravity the deny is vacuous (they never receive token
+    // env vars) but the Keychain is where *their* own credentials live, so
+    // honouring it there would strip an unrelated credential for no gain. And
+    // an explicit `keychain` mode still wins, because `copilot_auth` cannot be
+    // set from repo config — it is not a `[propose]` key — so choosing it is
+    // always the user's own decision, out of reach of repo content.
+    let deny_blocks_keychain =
+        applies && token_denied_by_repo && mode != config::CopilotAuth::Keychain;
+    let allow_keychain = agent.needs_keychain() && !has_env_token && !deny_blocks_keychain;
+
+    // `has_env_token` is computed against the post-`deny.env` environment, so a
+    // denied variable is already absent from it — no extra term needed, and
+    // adding one would discount a surviving token from a var that was not denied.
+    let env_token_counts = has_env_token && mode.accepts_env_token();
+
+    // gh_guard wants a token for its wrapper, `copilot_auth` wants one to buy
+    // back the Keychain grant. Either can ask, but a mode that forbids the gh
+    // CLI vetoes both — otherwise `env_only` degrades to `auto` whenever
+    // gh_guard happens to be on.
+    let may_call_gh = !(applies && mode.forbids_gh_cli());
+    let mode_wants_token = mode.may_use_gh_cli() && !token_denied_by_repo;
+    let needs_runtime_gh_token = may_call_gh && (gh_guard_wants_token || mode_wants_token);
+
+    AuthPlan {
+        mode,
+        applies,
+        env_token_counts,
+        needs_runtime_gh_token,
+        mode_wants_token,
+        allow_keychain,
+    }
+}
+
+fn resolve_auth_decision(
+    has_effective_env_token: bool,
+    needs_runtime_gh_token: bool,
+    agent: agent::Agent,
+    allow_keychain: bool,
+    preset: Option<config::Preset>,
+    deny_env: &[String],
+    resolved_gh_token: Option<&str>,
+) -> AuthDecision {
+    let mode = AuthDecisionMode::from_preset(preset);
+    let deny_env_stripped = deny_env_strips_auth_token(deny_env);
+    if has_effective_env_token {
+        return AuthDecision {
+            source: AuthSource::EnvToken,
+            token_present: true,
+            allow_keychain,
+            reason: AuthDecisionReason::EnvTokenPresent,
+            mode,
+            fallback_used: false,
+            deny_env_stripped,
+        };
+    }
+    if agent != agent::Agent::Copilot {
+        return AuthDecision {
+            source: AuthSource::None,
+            token_present: false,
+            allow_keychain,
+            reason: AuthDecisionReason::NonCopilotAgent,
+            mode,
+            fallback_used: false,
+            deny_env_stripped,
+        };
+    }
+    if needs_runtime_gh_token {
+        if resolved_gh_token.is_some_and(|v| !v.trim().is_empty()) {
+            return AuthDecision {
+                source: AuthSource::RuntimeGhToken,
+                token_present: true,
+                allow_keychain,
+                reason: AuthDecisionReason::RuntimeTokenResolved,
+                mode,
+                fallback_used: true,
+                deny_env_stripped,
+            };
+        }
+        return AuthDecision {
+            source: AuthSource::None,
+            token_present: false,
+            allow_keychain,
+            reason: AuthDecisionReason::RuntimeTokenMissing,
+            mode,
+            fallback_used: false,
+            deny_env_stripped,
+        };
+    }
+    AuthDecision {
+        source: AuthSource::None,
+        token_present: false,
+        allow_keychain,
+        reason: AuthDecisionReason::RuntimeTokenNotRequested,
+        mode,
+        fallback_used: false,
+        deny_env_stripped,
+    }
+}
+
 /// Compute the domain-allowlist decision from the two allow-all escape hatches
 /// and whether the agent default allowlist is enabled.
 ///
@@ -1727,6 +2046,20 @@ fn resolve_domain_allowlist_decision(
         use_allowed_file: !(allow_all_domains || observe_allow_all),
         use_default_allowlist: default_allowlist_enabled && !observe_allow_all,
         force_proxy_on: observe_domains,
+    }
+}
+
+/// Apply repo-config denied env vars to the precomputed sandbox env model used
+/// for keychain gating decisions.
+fn apply_repo_deny_env(effective_env: &mut sandbox::SandboxEnv, deny_env: &[String]) {
+    // deny_env is applied at exec time after environment setup, so it must
+    // win over both inherited values and explicit env overrides.
+    effective_env
+        .vars
+        .retain(|(k, _)| !deny_env.iter().any(|d| d == k));
+
+    if !effective_env.clear_first {
+        effective_env.remove.extend(deny_env.iter().cloned());
     }
 }
 
@@ -2394,41 +2727,82 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // by prepare(), so callers don't need to know about backend-specific risks.
     // proxy_port comes from the running handle so the actual ephemeral port is embedded.
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
-    let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
-        project_dir: &project_dir,
-        home_dir: &home_dir,
-        extra_read: &resolved.allow_read,
-        extra_write: &resolved.allow_write,
-        extra_socket: &resolved.allow_socket,
-        extra_deny: &resolved.deny_paths,
-        existing_home_tool_dirs: Some(&existing_home_tool_dirs),
-        existing_app_dirs: Some(&existing_app_dirs),
-        extra_ports: &resolved.allow_ports,
-        localhost_ports: &resolved.allow_localhost,
-        proxy_port: proxy_port_for_profile,
-        proxy_forced: resolved.proxy_forced,
-        allow_env_files: resolved.allow_env_files,
-        allow_localhost_any: resolved.allow_localhost_any,
-        scratch_dir: scratch_path,
-        allow_tmp_exec: resolved.allow_tmp_exec,
-        copilot_install_dir: copilot_install_dir.as_deref(),
-        java_home: java_home_dir.as_deref(),
-        dotnet_root: dotnet_root_dir.as_deref(),
-        git_hooks_path: git_hooks_path.as_deref(),
-        git_common_dir: git_common_dir.as_deref(),
-        allow_gpg_signing: resolved.allow_gpg_signing,
-        deny_clipboard: resolved.deny_clipboard,
-        allow_jvm_attach: resolved.allow_jvm_attach,
-        allow_msbuild: resolved.allow_msbuild,
-        allow_docker: resolved.allow_docker,
-        electron_app_dir: electron_app_dir.as_deref(),
-        agent: active_agent,
-        agent_dirs: &agent_dirs,
-        allow_cache_exec: &resolved.allow_cache_exec,
-        allow_cache_exec_any: resolved.allow_cache_exec_any,
-        allow_browser: resolved.allow_browser,
-        use_bubblewrap: resolved.use_bubblewrap,
-    }) {
+
+    // Compute hardening categories and build the effective sandbox environment
+    // *before* prepare(), so allow_keychain is derived from what the sandboxed
+    // process will actually receive — not just the raw parent env.
+    let disabled_categories = resolved.disabled_hardening_categories();
+    let parent_env: Vec<(String, String)> = std::env::vars().collect();
+    let mut effective_env = sandbox::build_sandbox_env(
+        &parent_env,
+        &resolved.pass_env,
+        resolved.inherit_env,
+        &disabled_categories,
+        scratch_path,
+        active_agent,
+    );
+
+    // Apply repo-config denied env vars so this matches the actual child process env.
+    apply_repo_deny_env(&mut effective_env, &resolved.deny_env);
+
+    // Keep profile generation side-effect free: only definite env-token
+    // presence disables Keychain at prepare time.
+    let has_effective_env_token = effective_env.has_github_token(&parent_env);
+    // Repo `deny.env` on a token var must never *widen* the sandbox — see
+    // `plan_copilot_auth` for why that matters.
+    let token_denied_by_repo = deny_env_blocks_token_injection(&resolved.deny_env);
+    let gh_guard_wants_token = resolved.gh_guard.enabled
+        && (resolved.gh_guard.inject_token || resolved.gh_guard.block_auth_token);
+    let auth_plan = plan_copilot_auth(
+        resolved.copilot_auth,
+        active_agent,
+        cfg!(target_os = "macos"),
+        has_effective_env_token,
+        token_denied_by_repo,
+        gh_guard_wants_token,
+    );
+    let mut allow_keychain = auth_plan.allow_keychain;
+
+    let build_prepared = |allow_keychain: bool| {
+        sandbox::prepare(&sandbox::SandboxConfig {
+            project_dir: &project_dir,
+            home_dir: &home_dir,
+            extra_read: &resolved.allow_read,
+            extra_write: &resolved.allow_write,
+            extra_socket: &resolved.allow_socket,
+            extra_deny: &resolved.deny_paths,
+            existing_home_tool_dirs: Some(&existing_home_tool_dirs),
+            existing_app_dirs: Some(&existing_app_dirs),
+            extra_ports: &resolved.allow_ports,
+            localhost_ports: &resolved.allow_localhost,
+            proxy_port: proxy_port_for_profile,
+            proxy_forced: resolved.proxy_forced,
+            allow_env_files: resolved.allow_env_files,
+            allow_localhost_any: resolved.allow_localhost_any,
+            scratch_dir: scratch_path,
+            allow_tmp_exec: resolved.allow_tmp_exec,
+            copilot_install_dir: copilot_install_dir.as_deref(),
+            java_home: java_home_dir.as_deref(),
+            dotnet_root: dotnet_root_dir.as_deref(),
+            git_hooks_path: git_hooks_path.as_deref(),
+            git_common_dir: git_common_dir.as_deref(),
+            allow_gpg_signing: resolved.allow_gpg_signing,
+            deny_clipboard: resolved.deny_clipboard,
+            allow_jvm_attach: resolved.allow_jvm_attach,
+            allow_docker: resolved.allow_docker,
+            allow_msbuild: resolved.allow_msbuild,
+            electron_app_dir: electron_app_dir.as_deref(),
+            agent: active_agent,
+            agent_dirs: &agent_dirs,
+            allow_cache_exec: &resolved.allow_cache_exec,
+            allow_cache_exec_any: resolved.allow_cache_exec_any,
+            allow_browser: resolved.allow_browser,
+            allow_keychain,
+            use_bubblewrap: resolved.use_bubblewrap,
+        })
+    };
+
+    let mut prepared = match build_prepared(allow_keychain) {
         Ok(s) => s,
         Err(e) => bail!("{e}"),
     };
@@ -2477,16 +2851,150 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         }
     }
 
-    // Print comprehensive summary and confirm before launching Copilot
+    // Resolve gh token before printing the final sandbox summary so auth
+    // decisions can be reflected in the shown policy (including Keychain).
+    //
+    // Two independent reasons to want a token here:
+    //   1. gh_guard needs one to inject or to serve the wrapper's cache.
+    //   2. `copilot_auth` wants one so the macOS Keychain grant can be dropped.
+    // (2) is the reason this fires for a plain `cplt` run: granting Keychain
+    // lets the agent read every credential the user owns, while a pre-extracted
+    // token is a single scoped one.
+    //
+    let auth_mode = auth_plan.mode;
+    let env_token_counts = auth_plan.env_token_counts;
+    let needs_runtime_gh_token = auth_plan.needs_runtime_gh_token;
+
+    if token_denied_by_repo && auth_plan.applies && auth_mode != config::CopilotAuth::Keychain {
+        ui::warn(
+            "Repo deny.env blocks GitHub token env vars: the agent will run without \
+             GitHub authentication (Keychain stays blocked). Set copilot_auth = \"keychain\" \
+             in your own config if you want Keychain access instead.",
+        );
+    }
+
+    let resolved_gh_token =
+        sandbox::resolve_gh_token_for_exec(env_token_counts, needs_runtime_gh_token, active_agent);
+
+    let gh_token_resolved = resolved_gh_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+
+    // Fail closed: `env_only` / `gh_only` promise the Keychain is never needed,
+    // so a missing token is an error rather than a silent fallback to it. Only
+    // a token this mode actually accepts counts — a gh-resolved token must not
+    // satisfy `env_only`.
+    // `mode_wants_token` (not `may_use_gh_cli`) is the right test: gh_guard can
+    // resolve a token for its own wrapper even when repo `deny.env` will strip
+    // it back out of the child env, and such a token must not be counted as
+    // satisfying a fail-closed mode.
+    let have_token = env_token_counts || (auth_plan.mode_wants_token && gh_token_resolved);
+    if auth_mode.fails_closed() && !have_token {
+        bail!(
+            "copilot_auth = \"{auth_mode}\" could not obtain a GitHub token \
+             (env vars {}; `gh auth token` {}). Refusing to fall back to Keychain access.",
+            if token_denied_by_repo {
+                "blocked by repo deny.env"
+            } else if auth_mode.accepts_env_token() {
+                "not set"
+            } else {
+                "ignored by this mode"
+            },
+            if auth_mode.may_use_gh_cli() {
+                "failed"
+            } else {
+                "not attempted by this mode"
+            },
+        );
+    }
+
+    let auth_decision = resolve_auth_decision(
+        env_token_counts,
+        needs_runtime_gh_token,
+        active_agent,
+        allow_keychain,
+        resolved.preset,
+        &resolved.deny_env,
+        resolved_gh_token.as_deref(),
+    );
+    if deny_env_disables_gh_guard_injection(&resolved.gh_guard, &resolved.deny_env) {
+        ui::warn(
+            "gh_guard.inject_token is enabled, but deny_env blocks auth token env vars; \
+             token injection is disabled by policy (deny_env wins).",
+        );
+    }
+    // An explicit `keychain` mode opts out of trading the Keychain for a token,
+    // so the gh_guard-driven rebuild must not do it behind the user's back —
+    // otherwise the documented escape hatch works only when gh_guard is off.
+    let keychain_mode_opts_out =
+        auth_plan.applies && auth_plan.mode == config::CopilotAuth::Keychain;
+    let keychain_policy_changed = auth_decision.token_present
+        && auth_decision.allow_keychain
+        && allow_keychain
+        && !keychain_mode_opts_out;
+    if auth_decision.token_present && auth_decision.allow_keychain && !keychain_mode_opts_out {
+        if auth_decision.mode == AuthDecisionMode::Strict {
+            bail!(
+                "auth invariant violation (strict): token source {:?} would run with Keychain enabled (reason={})",
+                auth_decision.source,
+                auth_decision.reason.as_code()
+            );
+        }
+        ui::warn(&format!(
+            "Authentication is available via {}. Rebuilding sandbox with Keychain access blocked.",
+            auth_decision.source.display_label()
+        ));
+        allow_keychain = false;
+        prepared = match build_prepared(allow_keychain) {
+            Ok(s) => s,
+            Err(e) => bail!("{e}"),
+        };
+        if !resolved.no_validate
+            && let Err(e) = sandbox::preflight(&prepared)
+        {
+            bail!("Sandbox validation failed after keychain policy rebuild: {e}");
+        }
+    }
+
+    // Derived from the FINAL Keychain decision, not from the auth mode: whenever
+    // the profile ends up without the Keychain grant, a token cplt resolved is
+    // the agent's only credential and must be injected. Computing it here also
+    // covers the gh_guard-driven rebuild above, which could previously drop
+    // Keychain while leaving injection gated behind `gh_guard.inject_token` —
+    // the wrapper's 0600 file only answers `gh auth token`, not the agent's own
+    // reads, so that combination launched an agent with no way to authenticate.
+    // Gated on `applies`: off macOS (or for a non-Copilot agent) there is no
+    // Keychain grant being traded away, so `!allow_keychain` says nothing about
+    // whether this token is the agent's only credential — and overriding an
+    // explicit `inject_token = false` there would widen for no reason.
+    let token_is_sole_credential = auth_plan.applies && !allow_keychain && gh_token_resolved;
+    if token_is_sole_credential && resolved.gh_guard.enabled && !resolved.gh_guard.inject_token {
+        ui::warn(
+            "Keychain access is blocked, so the resolved GitHub token is the agent's only \
+             credential and is being injected as GH_TOKEN despite gh_guard.inject_token = false.",
+        );
+    }
+
+    // Print comprehensive summary and confirm before launching Copilot.
+    // The Keychain status shown here is the final effective value.
     if !resolved.quiet {
-        resolved.print_summary(&project_dir, &home_dir, active_agent);
+        resolved.print_summary(&project_dir, &home_dir, active_agent, allow_keychain);
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
     }
-
-    // Compute hardening categories for environment sanitization
-    let disabled_categories = resolved.disabled_hardening_categories();
+    if keychain_policy_changed
+        && let Err(e) = prompt_policy_change_confirm(
+            resolved.yes,
+            resolved.quiet,
+            &format!(
+                "Keychain access was automatically blocked because {}",
+                auth_decision.reason.user_message()
+            ),
+        )
+    {
+        bail!("{e}");
+    }
 
     // proxy_handle is set up before sandbox::prepare() (see above)
 
@@ -2526,6 +3034,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             resolved.inherit_env,
             &disabled_categories,
             &resolved.deny_env,
+            resolved_gh_token.as_deref(),
+            token_is_sole_credential,
             &resolved.gh_guard,
             &resolved.git_guard,
         )
@@ -2930,6 +3440,8 @@ fn prepare_shell_sandbox(
         allow_cache_exec: &resolved.allow_cache_exec,
         allow_cache_exec_any: resolved.allow_cache_exec_any,
         allow_browser: resolved.allow_browser,
+        // Shell agent never uses Keychain (needs_keychain() = false).
+        allow_keychain: false,
         use_bubblewrap: resolved.use_bubblewrap,
     };
 
@@ -3061,7 +3573,8 @@ fn run_exec_command(
 
     // Summary (only shown with --no-quiet)
     if !resolved.quiet {
-        resolved.print_summary(&project_dir, &home_dir, active_agent);
+        // Shell agent never uses Keychain.
+        resolved.print_summary(&project_dir, &home_dir, active_agent, false);
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -3082,6 +3595,10 @@ fn run_exec_command(
             resolved.inherit_env,
             &disabled_categories,
             &resolved.deny_env,
+            None,
+            // `cplt exec` runs under the Shell policy, which never gets a
+            // Keychain grant to trade away.
+            false,
             &resolved.gh_guard,
             &resolved.git_guard,
         )
@@ -3144,6 +3661,9 @@ fn probe_shell(
         resolved.inherit_env,
         disabled,
         &resolved.deny_env,
+        None,
+        // Same as `cplt exec`: Shell policy, no Keychain grant in play.
+        false,
         &resolved.gh_guard,
         &resolved.git_guard,
     )
@@ -6118,6 +6638,114 @@ mod tests {
         Cli::parse_from(std::iter::once("cplt").chain(args.iter().copied()))
     }
 
+    fn make_sandbox_env(
+        vars: &[(&str, &str)],
+        remove: &[&str],
+        clear_first: bool,
+    ) -> sandbox::SandboxEnv {
+        sandbox::SandboxEnv {
+            vars: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            remove: remove.iter().map(ToString::to_string).collect(),
+            clear_first,
+        }
+    }
+
+    #[test]
+    fn apply_repo_deny_env_inherit_mode_removes_token_from_vars_for_keychain_model() {
+        let parent_env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        let mut effective_env = make_sandbox_env(&[("GH_TOKEN", "ghp_abc123")], &[], false);
+        let deny_env = vec!["GH_TOKEN".to_string()];
+
+        apply_repo_deny_env(&mut effective_env, &deny_env);
+
+        assert!(
+            !effective_env.has_github_token(&parent_env),
+            "deny_env must win over inherit-mode overrides in vars so keychain gating matches exec-time env"
+        );
+        assert!(
+            effective_env.remove.iter().any(|k| k == "GH_TOKEN"),
+            "inherit-mode deny_env must still be tracked in remove"
+        );
+    }
+
+    #[test]
+    fn deny_env_strips_auth_token_detects_any_known_token_var() {
+        assert!(deny_env_strips_auth_token(&[
+            "FOO".to_string(),
+            "GITHUB_TOKEN".to_string()
+        ]));
+        assert!(!deny_env_strips_auth_token(&[
+            "FOO".to_string(),
+            "BAR".to_string()
+        ]));
+    }
+
+    #[test]
+    fn deny_env_disables_gh_guard_injection_only_when_guard_enabled_and_token_denied() {
+        let enabled_injecting_guard = config::GhGuardPolicy {
+            enabled: true,
+            inject_token: true,
+            ..config::GhGuardPolicy::default()
+        };
+        assert!(deny_env_disables_gh_guard_injection(
+            &enabled_injecting_guard,
+            &["GH_TOKEN".to_string()],
+        ));
+        assert!(!deny_env_disables_gh_guard_injection(
+            &enabled_injecting_guard,
+            &["FOO".to_string()],
+        ));
+
+        let disabled_guard = config::GhGuardPolicy {
+            enabled: false,
+            inject_token: true,
+            ..config::GhGuardPolicy::default()
+        };
+        assert!(!deny_env_disables_gh_guard_injection(
+            &disabled_guard,
+            &["GH_TOKEN".to_string()],
+        ));
+    }
+
+    #[test]
+    fn resolve_auth_decision_prefers_effective_env_token() {
+        let decision = resolve_auth_decision(
+            true,
+            true,
+            agent::Agent::Copilot,
+            false,
+            Some(config::Preset::Standard),
+            &[],
+            Some("ghp_from_runtime"),
+        );
+        assert_eq!(decision.source, AuthSource::EnvToken);
+        assert!(decision.token_present);
+        assert!(!decision.fallback_used);
+        assert_eq!(decision.reason, AuthDecisionReason::EnvTokenPresent);
+    }
+
+    #[test]
+    fn resolve_auth_decision_uses_runtime_token_when_env_missing() {
+        let decision = resolve_auth_decision(
+            false,
+            true,
+            agent::Agent::Copilot,
+            true,
+            Some(config::Preset::Strict),
+            &["GH_TOKEN".to_string()],
+            Some("ghp_runtime"),
+        );
+        assert_eq!(decision.source, AuthSource::RuntimeGhToken);
+        assert!(decision.token_present);
+        assert!(decision.fallback_used);
+        assert!(decision.deny_env_stripped);
+        assert_eq!(decision.mode, AuthDecisionMode::Strict);
+        assert_eq!(decision.reason, AuthDecisionReason::RuntimeTokenResolved);
+    }
+
     #[test]
     fn observe_domains_flags_parse() {
         let cli = parse(&["--observe-domains", "--observe-domains-out", "/tmp/obs.txt"]);
@@ -6529,6 +7157,264 @@ mod tests {
             ..Default::default()
         };
         assert!(resolved_ip_block_item(&optin, "127.0.0.1", 443).is_none());
+    }
+
+    // --- plan_copilot_auth: findings from the adversarial review ------------
+
+    use crate::config::CopilotAuth;
+
+    fn plan(
+        mode: CopilotAuth,
+        agent: agent::Agent,
+        is_macos: bool,
+        env_token: bool,
+        denied: bool,
+        gh_guard: bool,
+    ) -> AuthPlan {
+        plan_copilot_auth(mode, agent, is_macos, env_token, denied, gh_guard)
+    }
+
+    /// The security property, stated as monotonicity: repo `[deny]` is applied
+    /// with no approval prompt because it can only *tighten*. The project dir
+    /// is agent-writable, so adding a token-var deny must never turn the
+    /// Keychain grant on — otherwise an agent writes `.cplt.toml` in one
+    /// session and reads every credential the user owns in the next.
+    ///
+    /// Stated this way rather than "deny always means no Keychain", because an
+    /// explicit `keychain` mode legitimately keeps the grant it would have had
+    /// anyway — the deny simply does not add anything.
+    ///
+    /// Scope: this proves the property for `plan_copilot_auth`. It carries to
+    /// the profile that actually runs only because the one downstream mutation
+    /// of `allow_keychain` (the rebuild) can exclusively set it *false*. Any
+    /// future code that can set it true after the plan needs its own check.
+    #[test]
+    fn a_repo_deny_can_never_widen_the_keychain_grant() {
+        for mode in [
+            CopilotAuth::Auto,
+            CopilotAuth::EnvOnly,
+            CopilotAuth::GhOnly,
+            CopilotAuth::Keychain,
+        ] {
+            for agent in [
+                agent::Agent::Copilot,
+                agent::Agent::Claude,
+                agent::Agent::Gemini,
+            ] {
+                for env_token in [false, true] {
+                    for is_macos in [false, true] {
+                        let without = plan(mode, agent, is_macos, env_token, false, false);
+                        let with = plan(mode, agent, is_macos, env_token, true, false);
+                        assert!(
+                            !with.allow_keychain || without.allow_keychain,
+                            "deny.env widened the Keychain grant \
+                             (mode={mode}, agent={agent:?}, env_token={env_token}, macos={is_macos})"
+                        );
+                        assert!(
+                            !with.env_token_counts || !with.allow_keychain,
+                            "a denied env token must not count as a credential"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `env_only` promises gh is never consulted. gh_guard independently wants
+    /// a token for its wrapper, and letting that trigger extraction would
+    /// silently degrade `env_only` to `auto` in exactly the hardened setups
+    /// that chose it.
+    #[test]
+    fn env_only_never_calls_gh_even_when_gh_guard_wants_a_token() {
+        let p = plan(
+            CopilotAuth::EnvOnly,
+            agent::Agent::Copilot,
+            true,
+            false,
+            false,
+            true,
+        );
+        assert!(
+            !p.needs_runtime_gh_token,
+            "env_only must not shell out to gh"
+        );
+    }
+
+    /// `auto` and `gh_only` may extract; that is the whole point.
+    #[test]
+    fn extracting_modes_do_call_gh() {
+        for mode in [CopilotAuth::Auto, CopilotAuth::GhOnly] {
+            let p = plan(mode, agent::Agent::Copilot, true, false, false, false);
+            assert!(
+                p.needs_runtime_gh_token,
+                "{mode} should extract a token to drop the Keychain grant"
+            );
+        }
+    }
+
+    /// The Keychain grant only exists in the macOS profile. On Linux there is
+    /// nothing to trade away, so extraction would hand the agent the user's gh
+    /// token while narrowing nothing in return.
+    #[test]
+    fn the_mode_is_inert_off_macos() {
+        let p = plan(
+            CopilotAuth::GhOnly,
+            agent::Agent::Copilot,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(!p.applies, "copilot_auth must not govern non-macOS runs");
+        assert_eq!(p.mode, CopilotAuth::Keychain);
+        assert!(
+            !p.needs_runtime_gh_token,
+            "no Keychain to buy back means no reason to extract"
+        );
+    }
+
+    /// A GitHub token is not a credential Gemini/Antigravity/Claude can use, so
+    /// a global `gh_only` must not refuse to launch them.
+    #[test]
+    fn the_mode_is_inert_for_non_copilot_agents() {
+        for a in [
+            agent::Agent::Gemini,
+            agent::Agent::Claude,
+            agent::Agent::Shell,
+        ] {
+            let p = plan(CopilotAuth::GhOnly, a, true, false, false, false);
+            assert!(!p.applies, "copilot_auth must not govern {a:?}");
+            assert!(!p.needs_runtime_gh_token);
+        }
+    }
+
+    /// gh_guard keeps its own reason to resolve a token, independent of the
+    /// auth mode — as long as the mode does not forbid the gh CLI.
+    #[test]
+    fn gh_guard_still_resolves_its_own_token_under_keychain_mode() {
+        let p = plan(
+            CopilotAuth::Keychain,
+            agent::Agent::Copilot,
+            true,
+            false,
+            false,
+            true,
+        );
+        assert!(p.needs_runtime_gh_token);
+    }
+
+    /// An ambient env token already removes the Keychain grant, whatever the
+    /// mode — the agent has a credential without it.
+    #[test]
+    fn an_env_token_drops_the_keychain_grant() {
+        let p = plan(
+            CopilotAuth::Auto,
+            agent::Agent::Copilot,
+            true,
+            true,
+            false,
+            false,
+        );
+        assert!(!p.allow_keychain);
+        assert!(p.env_token_counts);
+    }
+
+    /// The escape hatch the deny.env warning and the docs both point at must
+    /// actually work. `copilot_auth` is not a `[propose]` key, so repo config
+    /// can never set it — an explicit `keychain` mode is always the user's own
+    /// decision and repo content cannot use it to widen anything.
+    #[test]
+    fn explicit_keychain_mode_survives_a_repo_deny() {
+        let p = plan(
+            CopilotAuth::Keychain,
+            agent::Agent::Copilot,
+            true,
+            false,
+            true,
+            false,
+        );
+        assert!(
+            p.allow_keychain,
+            "the documented escape hatch must restore Keychain"
+        );
+        // ...but the default mode must NOT, or the deny becomes a widening lever.
+        let auto = plan(
+            CopilotAuth::Auto,
+            agent::Agent::Copilot,
+            true,
+            false,
+            true,
+            false,
+        );
+        assert!(!auto.allow_keychain);
+    }
+
+    /// A repo denying GitHub token vars is sensible Copilot hardening, but the
+    /// deny is vacuous for agents that never receive those vars — and the
+    /// Keychain is where *their* own credentials live. Stripping it there costs
+    /// a credential and buys nothing.
+    #[test]
+    fn a_repo_deny_does_not_strip_the_keychain_from_other_agents() {
+        for a in [
+            agent::Agent::Claude,
+            agent::Agent::Gemini,
+            agent::Agent::Antigravity,
+        ] {
+            let p = plan(CopilotAuth::Auto, a, true, false, true, false);
+            assert!(
+                p.allow_keychain,
+                "{a:?} must keep its own Keychain credentials"
+            );
+        }
+    }
+
+    /// Denying a token var that is not the injection target must not refuse a
+    /// run that still has a usable credential: cplt injects into `GH_TOKEN`, so
+    /// denying only `COPILOT_GITHUB_TOKEN` leaves an exported `GH_TOKEN`
+    /// working.
+    #[test]
+    fn denying_a_non_injected_token_var_does_not_block_the_run() {
+        assert!(deny_env_blocks_token_injection(&["GH_TOKEN".to_string()]));
+        assert!(!deny_env_blocks_token_injection(&[
+            "COPILOT_GITHUB_TOKEN".to_string(),
+            "GITHUB_TOKEN".to_string(),
+        ]));
+    }
+
+    /// gh_guard resolves a token for its own wrapper even when repo deny.env
+    /// will strip it back out of the child env. Such a token must not count as
+    /// satisfying a fail-closed mode, or `gh_only` launches credential-less
+    /// exactly where it promised to bail.
+    #[test]
+    fn a_denied_token_cannot_satisfy_a_fail_closed_mode() {
+        let p = plan(
+            CopilotAuth::GhOnly,
+            agent::Agent::Copilot,
+            true,
+            false,
+            true,
+            true,
+        );
+        assert!(
+            !p.mode_wants_token,
+            "a token deny.env will strip cannot satisfy gh_only"
+        );
+    }
+
+    /// `gh_only` ignores an ambient env token for *extraction* purposes, so the
+    /// credential provably comes from gh's own store.
+    #[test]
+    fn gh_only_does_not_accept_an_ambient_env_token() {
+        let p = plan(
+            CopilotAuth::GhOnly,
+            agent::Agent::Copilot,
+            true,
+            true,
+            false,
+            false,
+        );
+        assert!(!p.env_token_counts);
+        assert!(p.needs_runtime_gh_token, "it must go and ask gh instead");
     }
 }
 

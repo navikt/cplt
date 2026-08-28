@@ -8,8 +8,8 @@ use std::path::Path;
 use crate::agent::Agent;
 
 use super::policy::{
-    ENV_ALLOWLIST, ENV_ALWAYS_DENY, ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HardeningCategory,
-    SCRATCH_DIR_ENV_VARS, is_secret_suffix,
+    ENV_ALLOWLIST, ENV_ALWAYS_DENY, ENV_PREFIX_ALLOWLIST, GITHUB_TOKEN_VARS, HARDENING_ENV_VARS,
+    HardeningCategory, SCRATCH_DIR_ENV_VARS, is_secret_suffix,
 };
 
 /// Environment configuration for the sandboxed process.
@@ -22,9 +22,47 @@ pub struct SandboxEnv {
     pub clear_first: bool,
 }
 
-/// Environment variables that are Copilot-specific and should not be exposed
-/// to other agents. These contain GitHub auth tokens that OpenCode doesn't need.
-const COPILOT_ONLY_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
+impl SandboxEnv {
+    /// Returns `true` if at least one GitHub token env var (`GH_TOKEN`,
+    /// `GITHUB_TOKEN`, or `COPILOT_GITHUB_TOKEN`) will be present with a
+    /// non-empty value in the sandboxed process's effective environment.
+    ///
+    /// In **secure mode** (`clear_first = true`) the effective env is exactly
+    /// `self.vars` — token vars are forwarded only if they appeared in the
+    /// parent env and were picked up via `ENV_ALLOWLIST`.
+    ///
+    /// In **inherit mode** (`clear_first = false`) the parent env is inherited
+    /// with `self.remove` applied, then `self.vars` are applied as explicit
+    /// overrides/additions (same order as command configuration). A token var
+    /// is present only if its final effective value is non-empty.
+    ///
+    /// Use this to gate SBPL Keychain rules: if the process will have a usable
+    /// token, Keychain access is unnecessary and can be omitted.
+    pub fn has_github_token(&self, parent_env: &[(String, String)]) -> bool {
+        if self.clear_first {
+            // Secure mode: effective env = self.vars only.
+            GITHUB_TOKEN_VARS.iter().any(|var| {
+                self.vars
+                    .iter()
+                    .any(|(k, v)| k == *var && !v.trim().is_empty())
+            })
+        } else {
+            // Inherit mode: effective env = (parent_env minus self.remove)
+            // with self.vars applied as explicit overrides/additions.
+            GITHUB_TOKEN_VARS.iter().any(|var| {
+                if let Some((_, v)) = self.vars.iter().rev().find(|(k, _)| k == *var) {
+                    !v.trim().is_empty()
+                } else {
+                    let removed = self.remove.iter().any(|r| r == var);
+                    !removed
+                        && parent_env
+                            .iter()
+                            .any(|(k, v)| k == *var && !v.trim().is_empty())
+                }
+            })
+        }
+    }
+}
 
 /// Environment variable prefix that is Copilot-specific.
 const COPILOT_ONLY_PREFIXES: &[&str] = &["COPILOT_"];
@@ -34,7 +72,7 @@ fn is_agent_suppressed(key: &str, agent: Agent) -> bool {
     if agent == Agent::Copilot {
         return false; // Copilot gets everything in the allowlist
     }
-    if COPILOT_ONLY_VARS.contains(&key) {
+    if GITHUB_TOKEN_VARS.contains(&key) {
         return true;
     }
     if COPILOT_ONLY_PREFIXES
@@ -307,4 +345,103 @@ fn strip_dangerous_node_flags(value: &str) -> String {
         i += 1;
     }
     result.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_env(vars: &[(&str, &str)], remove: &[&str], clear_first: bool) -> SandboxEnv {
+        SandboxEnv {
+            vars: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            remove: remove.iter().map(ToString::to_string).collect(),
+            clear_first,
+        }
+    }
+
+    // ── Secure mode (clear_first = true) ─────────────────────────
+
+    #[test]
+    fn has_github_token_secure_true_when_gh_token_in_vars() {
+        let env = make_env(&[("GH_TOKEN", "ghp_abc123")], &[], true);
+        assert!(env.has_github_token(&[]));
+    }
+
+    #[test]
+    fn has_github_token_secure_true_when_github_token_in_vars() {
+        let env = make_env(&[("GITHUB_TOKEN", "ghp_abc123")], &[], true);
+        assert!(env.has_github_token(&[]));
+    }
+
+    #[test]
+    fn has_github_token_secure_true_when_copilot_github_token_in_vars() {
+        let env = make_env(&[("COPILOT_GITHUB_TOKEN", "ghp_abc123")], &[], true);
+        assert!(env.has_github_token(&[]));
+    }
+
+    #[test]
+    fn has_github_token_secure_false_when_token_empty() {
+        let env = make_env(&[("GH_TOKEN", "")], &[], true);
+        assert!(!env.has_github_token(&[]));
+    }
+
+    #[test]
+    fn has_github_token_secure_false_when_no_token_in_vars() {
+        let env = make_env(&[("PATH", "/usr/bin")], &[], true);
+        assert!(!env.has_github_token(&[]));
+    }
+
+    // ── Inherit mode (clear_first = false) ───────────────────────
+
+    #[test]
+    fn has_github_token_inherit_true_when_token_in_parent_env() {
+        let parent = vec![("GH_TOKEN".to_string(), "ghp_abc123".to_string())];
+        let env = make_env(&[], &[], false);
+        assert!(env.has_github_token(&parent));
+    }
+
+    #[test]
+    fn has_github_token_inherit_false_when_token_removed() {
+        let parent = vec![("GH_TOKEN".to_string(), "ghp_abc123".to_string())];
+        let env = make_env(&[], &["GH_TOKEN"], false);
+        assert!(!env.has_github_token(&parent));
+    }
+
+    #[test]
+    fn has_github_token_inherit_false_when_token_empty_in_parent() {
+        let parent = vec![("GH_TOKEN".to_string(), "   ".to_string())];
+        let env = make_env(&[], &[], false);
+        assert!(!env.has_github_token(&parent));
+    }
+
+    #[test]
+    fn has_github_token_inherit_false_when_no_token_in_parent() {
+        let parent = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        let env = make_env(&[], &[], false);
+        assert!(!env.has_github_token(&parent));
+    }
+
+    #[test]
+    fn has_github_token_inherit_true_when_token_in_vars() {
+        let parent = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        let env = make_env(&[("GH_TOKEN", "ghp_abc123")], &[], false);
+        assert!(env.has_github_token(&parent));
+    }
+
+    #[test]
+    fn has_github_token_inherit_false_when_token_overridden_empty_in_vars() {
+        let parent = vec![("GH_TOKEN".to_string(), "ghp_abc123".to_string())];
+        let env = make_env(&[("GH_TOKEN", "   ")], &[], false);
+        assert!(!env.has_github_token(&parent));
+    }
+
+    #[test]
+    fn has_github_token_inherit_true_when_token_removed_but_readded_in_vars() {
+        let parent = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        let env = make_env(&[("GH_TOKEN", "ghp_abc123")], &["GH_TOKEN"], false);
+        assert!(env.has_github_token(&parent));
+    }
 }

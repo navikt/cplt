@@ -3566,6 +3566,83 @@ paths = [
     }
 
     #[test]
+    fn e2e_trust_deny_gh_token_uses_fallback_resolution() {
+        require_sandbox!();
+        let (repo, config_file) =
+            make_trust_repo("deny-gh-token", "[deny]\nenv = [\"GH_TOKEN\"]\n");
+        std::fs::write(
+            &config_file,
+            "[gh_guard]\nenabled = true\ninject_token = true\nblock_auth_token = true\n",
+        )
+        .expect("should write config");
+
+        let fake_gh_dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-gh-deny-")
+            .tempdir_in(project_dir())
+            .expect("create fake gh dir");
+        let fake_gh = fake_gh_dir.path().join("gh");
+        std::fs::write(
+            &fake_gh,
+            "#!/bin/sh\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"token\" ]; then\n  echo fake_resolved_from_cli\n  exit 0\nfi\necho \"unexpected gh args: $*\" 1>&2\nexit 1\n",
+        )
+        .expect("should write fake gh");
+
+        let fake_copilot_dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-copilot-deny-gh-")
+            .tempdir_in(project_dir())
+            .expect("create fake copilot dir");
+        let fake_copilot = fake_copilot_dir.path().join("copilot");
+        std::fs::write(&fake_copilot, "#!/bin/sh\nset -eu\nenv | sort\n")
+            .expect("should write fake copilot");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755))
+                .expect("fake gh should be executable");
+            std::fs::set_permissions(&fake_copilot, std::fs::Permissions::from_mode(0o755))
+                .expect("fake copilot should be executable");
+        }
+
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!(
+            "{}:{}:{current_path}",
+            fake_gh_dir.path().display(),
+            fake_copilot_dir.path().display(),
+        );
+
+        let output = Command::new(binary_path())
+            .args(["--yes", "--no-validate", "--", "--version"])
+            .current_dir(&repo)
+            .env("PATH", &new_path)
+            .env("CPLT_CONFIG", config_file.to_str().unwrap())
+            .env("GH_TOKEN", "abc")
+            .output()
+            .expect("should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "run should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("GH_TOKEN=fake_resolved_from_cli"),
+            "resolved token must not be injected when deny.env blocks GH_TOKEN.\nstdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("GH_TOKEN=abc"),
+            "child env must not keep denied parent token.\nstdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("token injection is disabled by policy (deny_env wins)"),
+            "should warn when inject_token conflicts with deny.env.\nstderr: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn e2e_accept_repo_config_flag_does_not_persist() {
         require_sandbox!();
         let (repo, config_file) =

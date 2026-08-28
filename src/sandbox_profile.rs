@@ -110,6 +110,16 @@ pub struct ProfileOptions<'a> {
     pub allow_cache_exec_any: bool,
     /// Allow Launch Services (`open` command) for OAuth browser flows.
     pub allow_browser: bool,
+    /// Grant read/write access to ~/Library/Keychains.
+    ///
+    /// Set to `false` when a GitHub token env var (`GH_TOKEN`, `GITHUB_TOKEN`,
+    /// or `COPILOT_GITHUB_TOKEN`) is already injected into the environment —
+    /// Copilot will use the env var instead of reading from Keychain, so the
+    /// sandbox rule is unnecessary.
+    ///
+    /// Has no effect for agents where `Agent::needs_keychain()` returns false
+    /// (e.g. OpenCode), which never receive Keychain access regardless.
+    pub allow_keychain: bool,
 }
 
 /// Generate a complete SBPL sandbox profile from the given options.
@@ -145,7 +155,13 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_header(&mut sb, &project);
     emit_process_rules(&mut sb);
     emit_project_access(&mut sb, &project);
-    emit_home_access(&mut sb, &home, opts.agent, opts.agent_dirs);
+    emit_home_access(
+        &mut sb,
+        &home,
+        opts.agent,
+        opts.agent_dirs,
+        opts.allow_keychain,
+    );
     emit_git_hooks(&mut sb, opts.git_hooks_path);
     emit_git_worktree(&mut sb, opts.git_common_dir);
     emit_system_access(
@@ -301,7 +317,13 @@ fn emit_sensitive_project_denies(sb: &mut String, project: &str, allow_env_files
     }
 }
 
-fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[AgentDir]) {
+fn emit_home_access(
+    sb: &mut String,
+    home: &str,
+    agent: Agent,
+    agent_dirs: &[AgentDir],
+    allow_keychain: bool,
+) {
     // Agent-specific directories (Copilot: ~/.copilot, OpenCode: ~/.config/opencode, etc.)
     if agent.needs_copilot_dir() {
         // Copilot config — the CLI needs its auth tokens and settings.
@@ -406,7 +428,10 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
     // macOS Keychain access — Copilot stores auth tokens here.
     // OpenCode stores its /connect credentials in its own data dir, and
     // third-party providers use env/config files — no Keychain needed.
-    if agent.needs_keychain() {
+    // When a GitHub token is already available (env var, or a pre-extracted
+    // one) `allow_keychain` is false and the rules are skipped entirely — see
+    // `plan_copilot_auth` for the exact gating.
+    if agent.needs_keychain() && allow_keychain {
         sbpl!(sb, ";; macOS Keychain (Copilot auth tokens)");
         sbpl!(
             sb,
@@ -1565,6 +1590,7 @@ mod tests {
             allow_cache_exec: &[],
             allow_cache_exec_any: false,
             allow_browser: false,
+            allow_keychain: true,
         }
     }
 
@@ -1760,6 +1786,56 @@ mod tests {
         assert!(
             !p.contains("\"*:443\""),
             "fail-closed: proxy_forced without a port must not emit *:443"
+        );
+    }
+
+    #[test]
+    fn keychain_allowed_when_flag_true() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        opts.agent = crate::agent::Agent::Copilot;
+        opts.allow_keychain = true;
+        let p = generate_profile(&opts);
+
+        assert!(
+            p.contains("Library/Keychains"),
+            "Keychain rules must be present when allow_keychain=true"
+        );
+    }
+
+    #[test]
+    fn keychain_absent_when_flag_false() {
+        // Simulates the case where GH_TOKEN is set: Copilot uses the env var,
+        // so the Keychain SBPL rules are unnecessary and must be omitted.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        opts.agent = crate::agent::Agent::Copilot;
+        opts.allow_keychain = false;
+        let p = generate_profile(&opts);
+
+        assert!(
+            !p.contains("Library/Keychains"),
+            "Keychain rules must be absent when allow_keychain=false (GH_TOKEN set)"
+        );
+    }
+
+    #[test]
+    fn keychain_absent_for_agent_that_does_not_need_keychain() {
+        // Verifies the contract: allow_keychain=true has no effect for agents
+        // where Agent::needs_keychain() returns false. OpenCode never uses
+        // Keychain, so the SBPL rules must be absent regardless of the flag.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        opts.agent = crate::agent::Agent::OpenCode;
+        opts.allow_keychain = true; // flag is true — but agent doesn't need Keychain
+        let p = generate_profile(&opts);
+
+        assert!(
+            !p.contains("Library/Keychains"),
+            "Keychain rules must be absent for OpenCode even when allow_keychain=true"
         );
     }
 }

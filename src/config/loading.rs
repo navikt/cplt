@@ -98,6 +98,14 @@ impl Config {
         // `*.to_option().or(config).unwrap_or(baseline)` for toggles and the
         // `.resolve(config.or(...).unwrap_or(baseline))` for the guards/proxy).
         let preset = cli.preset.or(self.sandbox.preset);
+        // Copilot auth mode: CLI (--copilot-auth) wins over config
+        // ([sandbox] copilot_auth), defaulting to `auto`. Not preset-derived —
+        // it is orthogonal to the posture axis and `auto` is already the
+        // narrow choice (it removes the Keychain grant whenever it can).
+        let copilot_auth = cli
+            .copilot_auth
+            .or(self.sandbox.copilot_auth)
+            .unwrap_or_default();
         // No preset == "standard" == cplt's hardcoded defaults (all five
         // toggles off, no guards, no forced proxy). Only `strict` turns the
         // safety features on.
@@ -615,6 +623,7 @@ impl Config {
             gh_guard,
             git_guard,
             preset,
+            copilot_auth,
             agent: self.sandbox.agent.clone(),
             deny_env: Vec::new(),
         })
@@ -683,6 +692,8 @@ impl Resolved {
         project_dir: &std::path::Path,
         home_dir: &std::path::Path,
         agent: crate::agent::Agent,
+        #[cfg(target_os = "macos")] allow_keychain: bool,
+        #[cfg(not(target_os = "macos"))] _allow_keychain: bool,
     ) {
         let blue = ui::color(ui::BLUE);
         let dim = ui::color(ui::DIM);
@@ -816,11 +827,23 @@ impl Resolved {
                 "{blue}[cplt]{nc}    Copilot dir:   {green}allowed{nc}     {dim}~/.copilot{nc}"
             );
         }
-        if agent.needs_keychain() {
-            #[cfg(target_os = "macos")]
-            eprintln!(
-                "{blue}[cplt]{nc}    Keychain:      {green}allowed{nc}     {dim}~/Library/Keychains{nc}"
-            );
+        #[cfg(target_os = "macos")]
+        {
+            if agent.needs_keychain() {
+                if allow_keychain {
+                    eprintln!(
+                        "{blue}[cplt]{nc}    Keychain:      {green}allowed{nc}     {dim}~/Library/Keychains{nc}"
+                    );
+                } else {
+                    eprintln!(
+                        "{blue}[cplt]{nc}    Keychain:      {yellow}blocked{nc}     {dim}using token auth (Keychain not needed){nc}"
+                    );
+                }
+            } else {
+                eprintln!(
+                    "{blue}[cplt]{nc}    Keychain:      {dim}n/a{nc}         {dim}not used by this agent{nc}"
+                );
+            }
         }
         eprintln!(
             "{blue}[cplt]{nc}    GH CLI config: {green}read-only{nc}   {dim}~/.config/gh/{{hosts,config}}.yml{nc}"

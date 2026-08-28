@@ -327,6 +327,7 @@ fun main() {
     ) -> (String, String, bool) {
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_copilot_dir.display());
+        let config_path = isolated_config_path(project);
 
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate"])
@@ -338,10 +339,7 @@ fun main() {
             .args(extra_args)
             .args(["--", "--version"]) // fake copilot ignores this
             .env("PATH", &new_path)
-            // Point at a config file that doesn't exist so a developer's real
-            // ~/.config/cplt/config.toml (allow_docker, allow_msbuild, etc.)
-            // can never leak into these tests' sandbox behavior.
-            .env("CPLT_CONFIG", "/dev/null/nonexistent")
+            .env("CPLT_CONFIG", config_path.to_string_lossy().as_ref())
             .output()
             .expect("cplt should run");
 
@@ -350,6 +348,16 @@ fun main() {
             String::from_utf8_lossy(&output.stderr).to_string(),
             output.status.success(),
         )
+    }
+
+    /// Create an empty per-project config file so tests never inherit user-local
+    /// ~/.config/cplt/config.toml settings (proxy/auth toggles vary by machine).
+    fn isolated_config_path(project: &TempProject) -> PathBuf {
+        let path = project.path().join(".cplt-e2e-config.toml");
+        if !path.exists() {
+            fs::write(&path, "").expect("write isolated e2e config");
+        }
+        path
     }
 
     /// Assert that a RESULT line is present and OK.
@@ -942,6 +950,7 @@ if [ "${GIT_TERMINAL_PROMPT:-}" = "0" ]; then echo "RESULT:env_hardening_git:OK"
 
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.display());
+        let isolated_config = isolated_config_path(&project);
 
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate"])
@@ -949,7 +958,7 @@ if [ "${GIT_TERMINAL_PROMPT:-}" = "0" ]; then echo "RESULT:env_hardening_git:OK"
             .args(["--agent", "copilot"])
             .args(["--", "--version"])
             .env("PATH", &new_path)
-            .env("CPLT_CONFIG", "/dev/null/nonexistent")
+            .env("CPLT_CONFIG", isolated_config.to_string_lossy().as_ref())
             .env("AWS_SECRET_ACCESS_KEY", "FAKESECRET")
             .env("DATABASE_URL", "postgres://localhost/prod")
             .env("NPM_TOKEN", "npm_faketoken")
@@ -2154,6 +2163,7 @@ if [ -n "${CLASSPATH:-}" ]; then echo "RESULT:env_classpath:OK"; else echo "RESU
 
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.display());
+        let isolated_config = isolated_config_path(&project);
 
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate"])
@@ -2161,7 +2171,7 @@ if [ -n "${CLASSPATH:-}" ]; then echo "RESULT:env_classpath:OK"; else echo "RESU
             .args(["--agent", "copilot"])
             .args(["--", "--version"])
             .env("PATH", &new_path)
-            .env("CPLT_CONFIG", "/dev/null/nonexistent")
+            .env("CPLT_CONFIG", isolated_config.to_string_lossy().as_ref())
             .env("JAVA_HOME", "/opt/java/21")
             .env("MAVEN_OPTS", "-Xmx512m -Djava.io.tmpdir=/tmp")
             .env("JAVA_TOOL_OPTIONS", "-Dfile.encoding=UTF-8")
@@ -2371,6 +2381,7 @@ esac
         let fake_dir = create_fake_copilot(&project, script);
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.display());
+        let isolated_config = isolated_config_path(&project);
 
         let output = Command::new(binary_path())
             .args(["--yes", "--no-validate"])
@@ -2379,7 +2390,7 @@ esac
             .args(["--agent", "copilot"])
             .args(["--", "--version"])
             .env("PATH", &new_path)
-            .env("CPLT_CONFIG", "/dev/null/nonexistent")
+            .env("CPLT_CONFIG", isolated_config.to_string_lossy().as_ref())
             .env("JAVA_TOOL_OPTIONS", "-Xmx256m")
             .output()
             .expect("cplt should run");
@@ -2493,11 +2504,17 @@ fi
             r#"
 SOCK="{socket_dir}/daemon.sock"
 
+# Require a runnable python3 inside the sandbox, not just a PATH entry.
+HAS_PYTHON3=0
+if command -v python3 >/dev/null 2>&1 && python3 -c "import sys" >/dev/null 2>&1; then
+    HAS_PYTHON3=1
+fi
+
 # Clean up any stale socket
 rm -f "$SOCK"
 
 # Test 1: UDS bind+connect in ~/.gradle (Gradle daemon IPC)
-if command -v python3 >/dev/null 2>&1; then
+if [ "$HAS_PYTHON3" -eq 1 ]; then
     python3 -c "
 import socket, os, sys
 
@@ -2556,7 +2573,7 @@ else
 fi
 
 # Test 2: UDS in scratch dir (TMPDIR) — build tools may create sockets here
-if command -v python3 >/dev/null 2>&1; then
+if [ "$HAS_PYTHON3" -eq 1 ]; then
     SCRATCH_SOCK="${{TMPDIR:-/tmp}}/cplt-test-scratch.sock"
     rm -f "$SCRATCH_SOCK"
     SCRATCH_RESULT=$(python3 -c "
@@ -2580,7 +2597,7 @@ else
 fi
 
 # Test 3: TCP localhost bind (IPv4)
-if command -v python3 >/dev/null 2>&1; then
+if [ "$HAS_PYTHON3" -eq 1 ]; then
     TCP_RESULT=$(python3 -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2604,7 +2621,7 @@ else
 fi
 
 # Test 4: TCP localhost bind (IPv6)
-if command -v python3 >/dev/null 2>&1; then
+if [ "$HAS_PYTHON3" -eq 1 ]; then
     TCP6_RESULT=$(python3 -c "
 import socket
 s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
@@ -2632,7 +2649,7 @@ fi
 # (see sandbox_profile.rs — it must cover IPv4 127.0.0.1 bind() which SBPL's
 # "localhost" host does not match), so a wildcard bind is EXPECTED TO SUCCEED.
 # Assert that specific documented outcome instead of accepting allowed-or-denied.
-if command -v python3 >/dev/null 2>&1; then
+if [ "$HAS_PYTHON3" -eq 1 ]; then
     BIND_ALL_RESULT=$(python3 -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

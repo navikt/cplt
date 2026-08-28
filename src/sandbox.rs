@@ -51,9 +51,10 @@ mod profile;
 
 pub use policy::{
     AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
-    ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
-    HomeToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs, home_tool_dirs,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_sbpl_path,
+    ENV_PREFIX_ALLOWLIST, GITHUB_TOKEN_VARS, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory,
+    HardeningEnvVar, HomeToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs,
+    github_token_in_env, home_tool_dirs, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_sbpl_path,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -63,6 +64,7 @@ pub use profile::{ProfileOptions, generate_profile};
 
 // Environment construction — already platform-agnostic.
 pub use env::{SandboxEnv, build_sandbox_env};
+pub use exec::resolve_gh_token_for_exec;
 
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{
@@ -140,6 +142,20 @@ pub struct SandboxConfig<'a> {
     pub allow_cache_exec_any: bool,
     /// Allow Launch Services (`open` command) for OAuth browser flows.
     pub allow_browser: bool,
+    /// Grant read/write access to `~/Library/Keychains` (macOS only).
+    ///
+    /// Derive this from *definite* environment token presence only.
+    /// Do not trigger `gh auth token` reads during profile generation.
+    ///
+    /// ```text
+    /// let has_effective_env_token = effective_env.has_github_token(&parent_env);
+    /// let allow_keychain = agent.needs_keychain() && !has_effective_env_token;
+    /// ```
+    ///
+    /// For agents that need Keychain (for example Copilot on macOS), set this
+    /// to `false` when a GitHub token will be present in the sandboxed env.
+    /// For agents that do not use Keychain, this flag has no effect.
+    pub allow_keychain: bool,
     /// Use Bubblewrap for namespace isolation (Linux only).
     /// - `Some(true)`: Always use bwrap (fail if unavailable)
     /// - `Some(false)`: Never use bwrap (Landlock+seccomp only)
@@ -238,6 +254,10 @@ pub fn exec_sandboxed(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
+    resolved_gh_token: Option<&str>,
+    // See `exec::configure_command`: the token is the agent's only credential
+    // because the Keychain grant was dropped, so it must be injected.
+    token_is_sole_credential: bool,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
@@ -249,6 +269,8 @@ pub fn exec_sandboxed(
         inherit_env,
         disabled_categories,
         deny_env,
+        resolved_gh_token,
+        token_is_sole_credential,
         gh_guard,
         git_guard,
     )
@@ -259,6 +281,10 @@ pub fn exec_sandboxed(
 #[cfg(target_os = "macos")]
 fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     validate_config_paths(config)?;
+
+    // allow_keychain is derived from the effective sandbox environment by the
+    // caller (see SandboxConfig::allow_keychain doc). We trust the field here.
+    let allow_keychain = config.allow_keychain;
 
     let profile_text = profile::generate_profile(&profile::ProfileOptions {
         project_dir: config.project_dir,
@@ -293,6 +319,7 @@ fn prepare_impl(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
         allow_cache_exec: config.allow_cache_exec,
         allow_cache_exec_any: config.allow_cache_exec_any,
         allow_browser: config.allow_browser,
+        allow_keychain,
     });
 
     Ok(PreparedSandbox {

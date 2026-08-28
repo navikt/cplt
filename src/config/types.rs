@@ -332,6 +332,108 @@ impl std::fmt::Display for Preset {
     }
 }
 
+/// How cplt obtains the Copilot/GitHub token *before* the sandbox starts.
+///
+/// This is the lever that decides whether the sandboxed agent needs macOS
+/// Keychain access at all. Granting Keychain means the agent can read **every**
+/// credential the user owns, not just the GitHub one; pre-extracting a single
+/// single GitHub token in the unsandboxed parent and handing only that to the
+/// agent is narrower. Note it is the user's full gh OAuth token, not a scoped
+/// one — narrower than the whole Keychain, but not harmless.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CopilotAuth {
+    /// Env token first, then `gh auth token`. If either yields a token the
+    /// Keychain grant is dropped; if neither does, fall back to granting
+    /// Keychain so the agent can still authenticate itself.
+    ///
+    /// Default: the common case is a developer with a working `gh` login and no
+    /// token env var, and for them this removes the Keychain grant entirely.
+    #[default]
+    #[value(name = "auto")]
+    Auto,
+    /// Only an env token counts. No `gh auth token` call, and no Keychain
+    /// fallback — if no token env var is set, cplt refuses to launch.
+    #[value(name = "env_only", alias = "env-only")]
+    EnvOnly,
+    /// Only `gh auth token` counts. Env tokens are ignored for extraction (and
+    /// stripped from the `gh` subprocess so it cannot read them back), and
+    /// there is no Keychain fallback — extraction failure refuses the launch.
+    #[value(name = "gh_only", alias = "gh-only")]
+    GhOnly,
+    /// Never pre-extract. The agent gets the Keychain grant and authenticates
+    /// itself, as cplt did before this option existed. The widest posture;
+    /// keep it only for agents or flows that genuinely need the Keychain.
+    #[value(name = "keychain")]
+    Keychain,
+}
+
+impl CopilotAuth {
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "env_only" => Some(Self::EnvOnly),
+            "gh_only" => Some(Self::GhOnly),
+            "keychain" => Some(Self::Keychain),
+            _ => None,
+        }
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::EnvOnly => "env_only",
+            Self::GhOnly => "gh_only",
+            Self::Keychain => "keychain",
+        }
+    }
+
+    /// Whether this mode may call `gh auth token`.
+    pub fn may_use_gh_cli(self) -> bool {
+        matches!(self, Self::Auto | Self::GhOnly)
+    }
+
+    /// Whether an env token satisfies this mode.
+    pub fn accepts_env_token(self) -> bool {
+        matches!(self, Self::Auto | Self::EnvOnly)
+    }
+
+    /// Whether this mode forbids running `gh auth token` *at all*.
+    ///
+    /// Only `env_only` does: its promise is that the credential comes from the
+    /// environment and gh is never consulted, so it vetoes even gh_guard's own
+    /// independent reason to resolve a token. `keychain` merely declines to
+    /// pre-extract for auth purposes — it does not stop gh_guard working.
+    pub fn forbids_gh_cli(self) -> bool {
+        matches!(self, Self::EnvOnly)
+    }
+
+    /// Whether failing to obtain a token is fatal rather than a fall back to
+    /// the Keychain grant.
+    pub fn fails_closed(self) -> bool {
+        matches!(self, Self::EnvOnly | Self::GhOnly)
+    }
+}
+
+impl std::fmt::Display for CopilotAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for CopilotAuth {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::from_name(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "invalid copilot_auth '{s}': expected \"auto\", \"env_only\", \"gh_only\", or \"keychain\""
+            ))
+        })
+    }
+}
+
 impl<'de> Deserialize<'de> for Preset {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -567,6 +669,10 @@ pub struct SandboxConfig {
     /// One of "strict", "standard", "permissive", "full-trust". Default: none
     /// (equivalent to "standard" — a no-op baseline).
     pub preset: Option<Preset>,
+    /// How to obtain the Copilot/GitHub token before the sandbox starts, which
+    /// decides whether the agent needs Keychain access at all. One of "auto"
+    /// (default), "env_only", "gh_only", "keychain". See `CopilotAuth`.
+    pub copilot_auth: Option<CopilotAuth>,
     /// Run sandbox-exec validation test on startup (default: true).
     pub validate: Option<bool>,
     /// Allow reading .env files and private keys in project dir (default: false).
@@ -787,6 +893,9 @@ pub struct Resolved {
     /// Purely informational — the baseline it implies is already applied to the
     /// individual toggle fields above. Used for the startup summary / config show.
     pub preset: Option<Preset>,
+    /// How the Copilot/GitHub token is obtained before the sandbox starts, and
+    /// therefore whether the Keychain grant is needed. See `CopilotAuth`.
+    pub copilot_auth: CopilotAuth,
     /// Preferred agent from config (None = auto-detect).
     pub agent: Option<String>,
     /// Env vars to strip from the sandbox environment (from repo config [deny] section).
@@ -801,6 +910,8 @@ pub struct Resolved {
 pub struct CliFlags {
     /// Policy preset from `--preset` (None = not given). CLI wins over config.
     pub preset: Option<Preset>,
+    /// `--copilot-auth` (None = not given). CLI wins over config.
+    pub copilot_auth: Option<CopilotAuth>,
     pub proxy: FeatureToggle,
     pub proxy_forced: FeatureToggle,
     pub proxy_port: Option<u16>,

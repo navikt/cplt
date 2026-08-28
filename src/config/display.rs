@@ -309,6 +309,13 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         ),
         None => println!("{blue}[cplt]{nc}    preset                = {dim}standard (default){nc}"),
     }
+    match c.sandbox.copilot_auth {
+        Some(mode) => println!(
+            "{blue}[cplt]{nc}    copilot_auth          = {mode}{}",
+            src(true)
+        ),
+        None => println!("{blue}[cplt]{nc}    copilot_auth          = {dim}auto (default){nc}"),
+    }
     let validate = c.sandbox.validate.unwrap_or(true);
     println!(
         "{blue}[cplt]{nc}    validate              = {}{}",
