@@ -1,6 +1,6 @@
 # Security
 
-One static Rust binary with a short, audited dependency list (see `Cargo.toml`). No runtime services, no telemetry. Every security boundary is kernel-enforced and tested. Every design decision is documented with the threat it mitigates and the prior art it builds on.
+One Rust binary, and a dependency list short enough to read in a sitting (see `Cargo.toml`). No runtime services, no telemetry. Every security boundary is kernel-enforced and tested. Every design decision is documented with the threat it mitigates and the prior art it builds on.
 
 **Our priorities, in order:**
 

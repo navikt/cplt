@@ -758,7 +758,9 @@ This is **not key theft**. The attacker cannot take the key with them, and opera
 
 Port filtering works. The host part is what SBPL cannot express.
 
-**Ports are filterable, and cplt relies on it.** `(allow network-outbound (remote ip "*:443"))` permits 443 and nothing else, and `(allow network-outbound (remote ip "*:48443"))` permits 48443 while 48080 stays denied. This is verified against the kernel, not inferred. `src/sandbox_profile.rs` emits exactly these rules: a blanket `(deny network-outbound (remote tcp))`, then `*:443`, then one `*:PORT` per `--allow-port`, then the localhost deny or allow, then a `localhost:PORT` carve-out per proxy port and `--allow-localhost` port. SBPL is last-match-wins, so the ordering is the policy.
+**Ports are filterable, and cplt relies on it.** `src/sandbox_profile.rs` emits a blanket `(deny network-outbound (remote tcp))`, then `*:443` unless proxy-forced mode drops it, then one `*:PORT` per `--allow-port`, then the localhost deny or allow, then a `localhost:PORT` carve-out per proxy port and per `--allow-localhost` port. SBPL is last-match-wins, so the ordering is the policy.
+
+`real_profile_port_filtering_is_enforced_by_the_kernel` in `tests/integration.rs` runs a generated profile under `sandbox-exec` against two loopback listeners on ephemeral ports, one named in the profile and one not, and asserts the named one connects while the other does not. It is the only test here that proves the filtering filters rather than that the rule parses.
 
 **The host part accepts only `*` or `localhost`.** A literal address such as `127.0.0.1` or `140.82.121.4` is a parse error, `"host must be * or localhost"`. So a rule can say "any host on this port" or "loopback on this port", and nothing narrower.
 
@@ -840,9 +842,9 @@ These test core logic without invoking `sandbox-exec`, using the real library fu
 | Env behavior | 17 | Sanitization, hardening injection, pass-env overrides, LANG prefix leak prevention, YARN hardening bypass prevention, scratch dir TMPDIR redirect, JAVA_TOOL_OPTIONS injection/append/override |
 | Config parsing | 24 | TOML parsing, CLI/config merge precedence, tilde expansion, SBPL validation, scratch dir, allow-tmp-exec |
 
-### Integration tests (macOS only, 54 tests)
+### Integration tests (macOS only, 55 tests)
 
-These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-level enforcement**:
+Most of these invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-level enforcement**. Three do not, and are marked below: they generate profile text and assert on it, which proves a rule is emitted, not that the kernel honours it.
 
 | Category | Tests | What's verified |
 |---|---|---|
@@ -852,10 +854,10 @@ These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-leve
 | Temp and scratch exec | 3 | Exec from `/tmp` blocked by default, allowed with `--allow-tmp-exec`, allowed inside the scratch dir |
 | Env files | 4 | `.env` read, symlink read, and delete blocked; allowed with `--allow-env-files` |
 | GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |
-| Network | 9 | Outbound blocked by default, `*:443` allowed, localhost blocked by default and allowed with `--allow-localhost-any`, Java localhost with and without `preferIPv4Stack`, localhost TCP bind, the wildcard-bind SBPL limitation, and proxy-forced pinning `localhost:<port>` while dropping `*:443` |
+| Network | 10 | Outbound blocked by default, a port named in the profile reachable while an unnamed one is not, localhost blocked by default and allowed with `--allow-localhost-any`, Java localhost with and without `preferIPv4Stack`, localhost TCP bind, and the wildcard-bind SBPL limitation. Two are text-only: that the default profile emits `*:443`, and that proxy-forced emits the `localhost:<port>` pin and drops `*:443` |
 | Unix sockets | 6 | JVM Attach sockets in `/tmp` and `/var/folders` allowed, MSBuild worker-node socket allowed and blocked without the flag, SSH agent blocked, arbitrary `/tmp` sockets blocked |
 | Clipboard | 3 | `--deny-clipboard` blocks `pbpaste` and `pbcopy`, `pbpaste` works by default |
-| Binary CLI | 5 | Version, help, root/home dir rejection, `--print-profile` under proxy-forced |
+| Binary CLI | 5 | Version, help, root/home dir rejection. The `--print-profile` proxy-forced check is text-only, since `--print-profile` never invokes `sandbox-exec` |
 
 ### E2E project tests (macOS only, 49 tests)
 

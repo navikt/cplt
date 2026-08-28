@@ -26,9 +26,11 @@ enforce.
 `git_guard.allow_push` is a structured exception list for the cases where a
 push has to go through. Each entry may name a `remote`, a list of `branches`
 (glob patterns), and whether `force` is permitted. An entry matches only if
-every constraint it sets matches, and a force push needs `force = true`. It is
-marked dangerous, so setting it takes `--force`. Because it is an array of
-tables, write it in the config file directly:
+every constraint it sets matches, and a force push needs `force = true`. One
+exception: under `protect_default_branch_only`, a force push to a feature
+branch is rejected by `prevent_force_push` before the allow list is consulted,
+so `force = true` does not reach that path. `cplt config set` cannot write this
+key at all, because it is an array of tables, so edit the config file directly:
 
 ```toml
 [[git_guard.allow_push]]
@@ -134,7 +136,8 @@ Force push is blocked wherever it lands while `prevent_force_push` is on, which
 is the default, including on a feature branch under
 `protect_default_branch_only`. Set `git_guard.prevent_force_push = false` if you
 want the agent to be able to force-push its own branch. Force push to a default
-branch is always blocked.
+branch is blocked unless a `git_guard.allow_push` entry names that branch with
+`force = true`.
 
 ## Allowed commands
 

@@ -1818,6 +1818,66 @@ except Exception as e:
         );
     }
 
+    /// The only kernel-level proof that SBPL port filtering actually filters.
+    /// Every other test in this section asserts on generated *text*, which
+    /// cannot tell a rule that works from a rule that parses.
+    ///
+    /// Uses `localhost_ports` rather than `extra_ports` deliberately. An
+    /// `extra_ports` entry emits `(allow ... "*:{port}")`, but the default
+    /// profile emits `(deny ... "localhost:*")` after it, and SBPL is
+    /// last-match-wins, so a loopback connect on that port is denied and the
+    /// test would prove nothing about ports. `localhost_ports` emits its allow
+    /// last, which is the only shape that can be exercised without a remote
+    /// host to dial.
+    #[test]
+    fn real_profile_port_filtering_is_enforced_by_the_kernel() {
+        require_sandbox!();
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // Two listeners on ephemeral ports. One is named in the profile, one
+        // is not, and nothing else about them differs.
+        let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let denied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let allowed_port = allowed.local_addr().unwrap().port();
+        let denied_port = denied.local_addr().unwrap().port();
+
+        for listener in [allowed, denied] {
+            std::thread::spawn(move || {
+                for mut s in listener.incoming().flatten() {
+                    let _ = s.write_all(b"ok");
+                }
+            });
+        }
+
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let localhost_ports = [allowed_port];
+        let mut opts = default_opts(&project, &home);
+        opts.localhost_ports = &localhost_ports;
+        let profile_text = generate_profile(&opts);
+
+        let profile_path =
+            std::env::temp_dir().join(format!("cplt-portfilter-{}.sb", std::process::id()));
+        fs::write(&profile_path, &profile_text).unwrap();
+
+        let cmd = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{allowed_port} 2>&1 && echo ALLOWED_OK; \
+             exec 4<>/dev/tcp/127.0.0.1/{denied_port} 2>&1 && echo DENIED_REACHED"
+        );
+        let (output, _) = run_sandboxed(&profile_path, &cmd);
+        fs::remove_file(&profile_path).ok();
+
+        assert!(
+            output.contains("ALLOWED_OK"),
+            "the port named in the profile must be reachable, got:\n{output}"
+        );
+        assert!(
+            !output.contains("DENIED_REACHED"),
+            "a port NOT named in the profile must be blocked by the kernel, got:\n{output}"
+        );
+    }
+
     /// Contrast control that keeps the negative assertion above meaningful: the
     /// DEFAULT profile (proxy_forced = false) DOES allow `*:443`. Without this,
     /// "profile lacks *:443" could pass vacuously if the rule were renamed or

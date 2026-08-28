@@ -476,8 +476,9 @@ grants exec to every binary cached by any application. Prefer
     /// Use Bubblewrap for namespace isolation on Linux (auto-detect if not specified).
     /// Adds PID, mount, IPC, UTS, cgroup, and user namespaces plus a private
     /// /tmp, on top of Landlock + seccomp-BPF. It shares the host network so
-    /// proxy-based filtering keeps working. Falls back to Landlock + seccomp if
-    /// bwrap is unavailable. Linux only. macOS ignores it.
+    /// proxy-based filtering keeps working. Passing this flag is an error when
+    /// bwrap is unavailable. Auto-detect, the default, falls back to Landlock +
+    /// seccomp instead. Linux only. macOS ignores it.
     #[arg(long)]
     use_bubblewrap: bool,
 
