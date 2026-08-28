@@ -113,7 +113,9 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.scratch_dir` | local temp handling |
 | `sandbox.use_bubblewrap` | depends on bwrap being installed on the machine |
 | `sandbox.pass_env` | machine-specific env passthrough |
-| `sandbox.inherit_env` | local debug-only behavior |
+| `sandbox.audit` | local output preference, not project sandbox policy |
+| `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
+| `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
 | `sandbox.allow_cache_exec` | cache paths differ per machine |
 | `sandbox.allow_cache_exec_any` | too broad for repo policy |
 | `proxy.enabled` | local proxy preference |
@@ -124,6 +126,10 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `proxy.timeout` | local network condition preference |
 | `proxy.blocked_domains` | local path to a blocklist file |
 | `proxy.allowed_domains` | local path to an allowlist file |
+| `proxy.default_allowlist` | proxy settings are machine-specific, not project policy |
+| `proxy.upstream` | the corporate proxy is machine-specific and network-specific |
+| `proxy.upstream_no_proxy` | same, and it only means anything alongside `proxy.upstream` |
+| all `[proxy.subscriptions]` keys | subscription sources are security-sensitive, and a repo must not be able to add one |
 | all `[gh_guard]` keys | guard policy is configured globally, not per-repo |
 | all `[git_guard]` keys | guard policy is configured globally, not per-repo |
 | all `[audit]` keys | audit destination and level are a local concern |
@@ -148,47 +154,12 @@ cplt config validate                      # check for syntax errors and unknown 
 
 ## Configuration file
 
-The config file lives at `~/.config/cplt/config.toml`. `cplt config init` creates a commented starter template there:
+The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, `[git_guard]`, and `[audit]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
 
-```toml
-[proxy]
-# enabled = true             # Default: true. Disable with --no-proxy or set false
-# forced = false             # Default: false (opt-in). Force ALL egress through the proxy:
-#                            # restrict kernel egress to the proxy port (no direct *:443),
-#                            # closing the raw-socket / env-unset bypass. Fails closed if the
-#                            # proxy can't start; conflicts with proxy.enabled = false. See docs/proxy.md
-# port = 0                   # Default: 0 (OS-assigned ephemeral port)
-# blocked_domains = "~/.config/cplt/blocked-domains.txt"
-# allowed_domains = "~/.config/cplt/allowed-domains.txt"
-# log_file = "~/.config/cplt/proxy.log"
-# log_level = "none"             # Stderr verbosity: none, error, blocked, all
-# timeout = 60                   # Request/header read timeout in seconds (tunnels idle up to 1h)
-# allow_private_domains = ["intern.nav.no"]  # Allow internal/intranet domains to resolve to private IPs
-
-[sandbox]
-# agent = "copilot"          # Preferred agent: copilot, opencode, gemini, pi, shell (auto-detected if not set)
-# validate = true
-# allow_env_files = false
-# allow_lifecycle_scripts = false
-# allow_gpg_signing = false    # Allow GPG commit signing (see SECURITY.md)
-# allow_jvm_attach = false     # Allow JVM Attach API unix sockets (MockK, Mockito)
-# allow_msbuild = false        # Allow MSBuild worker-node unix sockets (dotnet build)
-# allow_localhost_any = false
-# scratch_dir = true           # On by default; set false to disable
-# allow_tmp_exec = false       # Dangerous, prefer scratch_dir
-# allow_cache_exec = []        # Allow exec from specific ~/Library/Caches subdirs, e.g. ["ms-playwright", "pnpm/dlx"]
-# allow_cache_exec_any = false # Dangerous, allows exec from all of ~/Library/Caches
-# inherit_env = false          # Dangerous, exposes all env vars
-# pass_env = ["MY_CUSTOM_VAR"]
-
-[allow]
-# read = ["~/some/path"]
-# write = ["~/another/path"]
-# ports = [8080]
-# localhost = [3000, 8080]
-
-[deny]
-# paths = ["~/extra/secret"]
+```bash
+cplt config init
+cplt config explain            # every key, its type, default, and what it does
+cplt config explain proxy.forced
 ```
 
 For arrays of objects, multi-line values, and other complex configuration, edit the file directly and run `cplt config validate` afterwards.
@@ -294,15 +265,15 @@ Supported ecosystems:
 | Python | `pyproject.toml`, `requirements.txt` | localhost ports (for Django/FastAPI) |
 | Rust | `Cargo.toml` | (works with defaults) |
 | Go | `go.mod` | (works with defaults) |
-| Playwright | `@playwright/test` in package.json | `allow_cache_exec` (personal config hint) |
+| Playwright | `@playwright/test` or `"playwright"` in package.json | `allow_cache_exec` (personal config hint) |
 | Environment secrets | `.env.example` | `deny.env` for sensitive variables |
 | Spring Boot | `application.yml` + Spring in Gradle | localhost 8080, PostgreSQL port |
 | Ktor | `application.conf` + Ktor in Gradle | localhost 8080 |
 | TestContainers | `testcontainers` in Gradle deps | `allow_docker` (dangerous), `allow_localhost_any` |
-| Next.js | `next.config.ts/js` | localhost 3000, `allow_localhost_any` |
-| Vite | `vite.config.ts/js` | localhost 5173, `allow_localhost_any` |
-| Flyway | `db/migration(s)` directories | PostgreSQL port 5432 |
-| Cypress | `cypress.config.ts` + `cypress/` dir | `allow_browser`, `allow_localhost_any` |
+| Next.js | `next.config.ts/js/mjs` | localhost 3000, `allow_localhost_any` |
+| Vite | `vite.config.ts/js/mjs` | localhost 5173, `allow_localhost_any` |
+| Flyway | `src/main/resources/db/migration` or `.../migrations` | PostgreSQL port 5432 |
+| Cypress | `cypress.config.ts/js/mjs` + `cypress/` dir | `allow_browser`, `allow_localhost_any` |
 
 Machine-specific suggestions such as `allow_cache_exec` or home-relative read paths come out as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
 
@@ -321,7 +292,9 @@ It detects:
 
 | Tool | Probes | Suggests |
 |------|--------|----------|
-| Playwright browsers | `~/Library/Caches/ms-playwright/` | `allow_cache_exec = ["ms-playwright"]` |
-| GPG signing | `~/.gnupg/` + git config | `allow_gpg_signing = true` |
-| Gradle registry | `~/.gradle/gradle.properties` | `allow.read` for credentials file |
-| Alternative agents | `opencode`/`aider` in PATH | `agent = "..."` |
+| Playwright browsers | `~/Library/Caches/ms-playwright/` (macOS) or `~/.cache/ms-playwright/` (Linux) | `allow_cache_exec = ["ms-playwright"]` |
+| GPG signing | `~/.gnupg/`, plus `commit.gpgsign` from global git config for the reason text | `allow_gpg_signing = true` |
+| Gradle registry credentials | `~/.gradle/gradle.properties` mentioning `repository`, `nexus`, or `artifactory` | `allow.read` for that file |
+| npm registry credentials | `~/.npmrc` with a `registry` or `_authToken` line | `allow.read` for that file |
+| Maven repository settings | `~/.m2/settings.xml` with a `<server>`, `<mirror>`, or `<repository>` | `allow.read` for that file |
+| Default agent | `copilot`, `opencode`, `aider`, `gemini`, `claude` in PATH | `agent = "..."`, but only when exactly one is found and it is not `copilot` |
