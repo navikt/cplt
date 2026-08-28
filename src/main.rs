@@ -1146,57 +1146,6 @@ fn prompt_confirm(auto_yes: bool, quiet: bool) -> Result<(), String> {
     }
 }
 
-/// Prompt for an additional confirmation when cplt had to tighten policy.
-fn prompt_policy_change_confirm(auto_yes: bool, quiet: bool, change: &str) -> Result<(), String> {
-    if auto_yes {
-        if !quiet {
-            ui::info("Auto-confirmed policy change (--yes)");
-        }
-        return Ok(());
-    }
-
-    let Ok(tty) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-    else {
-        return Err(
-            "No TTY available for policy-change confirmation. Use --yes for non-interactive runs."
-                .to_string(),
-        );
-    };
-
-    if quiet {
-        eprint!(
-            "{}[cplt]{} Policy changed ({}). Continue? [y/N] ",
-            ui::color(ui::YELLOW),
-            ui::color(ui::RESET),
-            change
-        );
-    } else {
-        eprint!(
-            "{}[cplt]{} Policy changed: {}. Continue? [y/N] ",
-            ui::color(ui::YELLOW),
-            ui::color(ui::RESET),
-            change
-        );
-    }
-
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(tty);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return Err("Failed to read policy-change confirmation input".to_string());
-    }
-
-    let answer = line.trim().to_lowercase();
-    if answer == "y" || answer == "yes" {
-        Ok(())
-    } else {
-        Err("Aborted by user".to_string())
-    }
-}
-
 /// Canonicalize a list of paths, warning on failures.
 fn canonicalize_paths(paths: &[PathBuf], flag_name: &str) -> Vec<PathBuf> {
     paths
@@ -1775,85 +1724,6 @@ struct DomainAllowlistDecision {
     force_proxy_on: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthDecisionMode {
-    Strict,
-    Default,
-}
-
-impl AuthDecisionMode {
-    fn from_preset(preset: Option<config::Preset>) -> Self {
-        if preset == Some(config::Preset::Strict) {
-            Self::Strict
-        } else {
-            Self::Default
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthSource {
-    None,
-    EnvToken,
-    RuntimeGhToken,
-}
-
-impl AuthSource {
-    fn display_label(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::EnvToken => "environment token",
-            Self::RuntimeGhToken => "GitHub CLI session",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthDecisionReason {
-    EnvTokenPresent,
-    RuntimeTokenResolved,
-    RuntimeTokenMissing,
-    RuntimeTokenNotRequested,
-    NonCopilotAgent,
-}
-
-impl AuthDecisionReason {
-    fn as_code(self) -> &'static str {
-        match self {
-            Self::EnvTokenPresent => "env_token_present",
-            Self::RuntimeTokenResolved => "runtime_token_resolved",
-            Self::RuntimeTokenMissing => "runtime_token_missing",
-            Self::RuntimeTokenNotRequested => "runtime_token_not_requested",
-            Self::NonCopilotAgent => "non_copilot_agent",
-        }
-    }
-
-    fn user_message(self) -> &'static str {
-        match self {
-            Self::EnvTokenPresent => {
-                "an authentication token is already available in the environment"
-            }
-            Self::RuntimeTokenResolved => {
-                "an authentication token was found from your GitHub CLI session"
-            }
-            Self::RuntimeTokenMissing => "no authentication token could be resolved",
-            Self::RuntimeTokenNotRequested => "runtime token resolution was not required",
-            Self::NonCopilotAgent => "this agent does not use Copilot auth",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AuthDecision {
-    source: AuthSource,
-    token_present: bool,
-    allow_keychain: bool,
-    reason: AuthDecisionReason,
-    mode: AuthDecisionMode,
-    fallback_used: bool,
-    deny_env_stripped: bool,
-}
-
 fn deny_env_strips_auth_token(deny_env: &[String]) -> bool {
     deny_env
         .iter()
@@ -1938,7 +1808,20 @@ fn plan_copilot_auth(
     // always the user's own decision, out of reach of repo content.
     let deny_blocks_keychain =
         applies && token_denied_by_repo && mode != config::CopilotAuth::Keychain;
-    let allow_keychain = agent.needs_keychain() && !has_env_token && !deny_blocks_keychain;
+
+    // Trading the Keychain grant away for an ambient env token is subject to the
+    // same two bounds as the deny. It only makes sense where `copilot_auth`
+    // governs: for Gemini/Claude/Antigravity a GitHub token in the environment
+    // (e.g. via `pass_env = ["GITHUB_TOKEN"]`, which bypasses agent
+    // suppression) says nothing about *their* Keychain credentials, so dropping
+    // the grant there costs a credential and buys nothing. And an explicit
+    // `keychain` mode still wins — it is the user's own out-of-reach decision to
+    // keep the grant, so a stale token exported in a shell profile must not
+    // silently defeat it.
+    let env_token_blocks_keychain =
+        applies && has_env_token && mode != config::CopilotAuth::Keychain;
+    let allow_keychain =
+        agent.needs_keychain() && !env_token_blocks_keychain && !deny_blocks_keychain;
 
     // `has_env_token` is computed against the post-`deny.env` environment, so a
     // denied variable is already absent from it — no extra term needed, and
@@ -1963,70 +1846,22 @@ fn plan_copilot_auth(
     }
 }
 
-fn resolve_auth_decision(
-    has_effective_env_token: bool,
-    needs_runtime_gh_token: bool,
-    agent: agent::Agent,
-    allow_keychain: bool,
-    preset: Option<config::Preset>,
-    deny_env: &[String],
-    resolved_gh_token: Option<&str>,
-) -> AuthDecision {
-    let mode = AuthDecisionMode::from_preset(preset);
-    let deny_env_stripped = deny_env_strips_auth_token(deny_env);
-    if has_effective_env_token {
-        return AuthDecision {
-            source: AuthSource::EnvToken,
-            token_present: true,
-            allow_keychain,
-            reason: AuthDecisionReason::EnvTokenPresent,
-            mode,
-            fallback_used: false,
-            deny_env_stripped,
-        };
-    }
-    if agent != agent::Agent::Copilot {
-        return AuthDecision {
-            source: AuthSource::None,
-            token_present: false,
-            allow_keychain,
-            reason: AuthDecisionReason::NonCopilotAgent,
-            mode,
-            fallback_used: false,
-            deny_env_stripped,
-        };
-    }
-    if needs_runtime_gh_token {
-        if resolved_gh_token.is_some_and(|v| !v.trim().is_empty()) {
-            return AuthDecision {
-                source: AuthSource::RuntimeGhToken,
-                token_present: true,
-                allow_keychain,
-                reason: AuthDecisionReason::RuntimeTokenResolved,
-                mode,
-                fallback_used: true,
-                deny_env_stripped,
-            };
-        }
-        return AuthDecision {
-            source: AuthSource::None,
-            token_present: false,
-            allow_keychain,
-            reason: AuthDecisionReason::RuntimeTokenMissing,
-            mode,
-            fallback_used: false,
-            deny_env_stripped,
-        };
-    }
-    AuthDecision {
-        source: AuthSource::None,
-        token_present: false,
-        allow_keychain,
-        reason: AuthDecisionReason::RuntimeTokenNotRequested,
-        mode,
-        fallback_used: false,
-        deny_env_stripped,
-    }
+/// Fold the runtime `gh auth token` result into the Keychain decision.
+///
+/// `plan_copilot_auth` computes `allow_keychain` optimistically — it runs
+/// before `gh auth token` and cannot know whether that call will yield
+/// anything. Once it has, a resolved token that *this mode accepts as its
+/// credential* removes the last reason to grant the Keychain, so the profile
+/// can be built once, already narrowed, with no rebuild.
+///
+/// Modes that do not use the gh CLI for auth (`keychain`, `env_only`) are
+/// untouched: `mode_wants_token` is already false for them, so a token
+/// gh_guard happened to resolve for its own wrapper cannot trade their grant
+/// away. Likewise a repo `deny.env` on the injection target zeroes
+/// `mode_wants_token`, so a denied token never counts here.
+fn finalize_allow_keychain(plan: &AuthPlan, gh_token_resolved: bool) -> bool {
+    let runtime_token_satisfies = plan.applies && plan.mode_wants_token && gh_token_resolved;
+    plan.allow_keychain && !runtime_token_satisfies
 }
 
 /// Compute the domain-allowlist decision from the two allow-all escape hatches
@@ -2761,8 +2596,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         token_denied_by_repo,
         gh_guard_wants_token,
     );
-    let mut allow_keychain = auth_plan.allow_keychain;
-
     let build_prepared = |allow_keychain: bool| {
         sandbox::prepare(&sandbox::SandboxConfig {
             project_dir: &project_dir,
@@ -2802,20 +2635,22 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         })
     };
 
-    let mut prepared = match build_prepared(allow_keychain) {
-        Ok(s) => s,
-        Err(e) => bail!("{e}"),
-    };
-
-    // --print-profile: dump the sandbox policy and exit (no copilot binary needed)
+    // --print-profile is a static preview and must stay side-effect free (it
+    // never spawns `gh auth token`): show the profile *as planned*, before any
+    // runtime token resolution could narrow the Keychain grant.
     if cli.print_profile {
+        let prepared = match build_prepared(auth_plan.allow_keychain) {
+            Ok(s) => s,
+            Err(e) => bail!("{e}"),
+        };
         println!("{}", sandbox::describe(&prepared));
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Recursion guard: detect if we're already inside a cplt sandbox.
-    // Placed after --print-profile/--doctor/--init-config so those subcommands
-    // still work inside the sandbox. Only the actual sandbox launch is blocked.
+    // Recursion guard: detect if we're already inside a cplt sandbox. Placed
+    // after --print-profile/--doctor/--init-config so those subcommands still
+    // work inside the sandbox, but before `gh auth token` so a nested run does
+    // not spawn it. Only the actual sandbox launch is blocked.
     if std::env::var("__CPLT_WRAPPED").is_ok() {
         bail!(
             "cplt is already running (recursion detected). \
@@ -2827,6 +2662,87 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let agent_bin = match agent_bin_result {
         Ok(path) => path,
         Err(msg) => bail!("{msg}"),
+    };
+
+    // Warn about repo deny.env interactions up front — these describe policy,
+    // not the outcome of token resolution, so they belong before it.
+    if token_denied_by_repo
+        && auth_plan.applies
+        && auth_plan.mode != config::CopilotAuth::Keychain
+    {
+        ui::warn(
+            "Repo deny.env blocks GitHub token env vars: the agent will run without \
+             GitHub authentication (Keychain stays blocked). Set copilot_auth = \"keychain\" \
+             in your own config if you want Keychain access instead.",
+        );
+    }
+    if deny_env_disables_gh_guard_injection(&resolved.gh_guard, &resolved.deny_env) {
+        ui::warn(
+            "gh_guard.inject_token is enabled, but deny_env blocks auth token env vars; \
+             token injection is disabled by policy (deny_env wins).",
+        );
+    }
+
+    // Resolve the GitHub token now — *before* the single profile build — so the
+    // Keychain grant is computed once from the final auth picture instead of
+    // granted optimistically and then rebuilt away. `gh auth token` runs in the
+    // unsandboxed parent and only reads; the launch itself is still gated by the
+    // confirmation prompt below.
+    //
+    // Two independent reasons to want a token:
+    //   1. gh_guard needs one to inject or to serve the wrapper's cache.
+    //   2. `copilot_auth` wants one so the macOS Keychain grant can be dropped —
+    //      granting Keychain lets the agent read every credential the user owns,
+    //      while the pre-extracted token is just the one.
+    let auth_mode = auth_plan.mode;
+    let resolved_gh_token = sandbox::resolve_gh_token_for_exec(
+        auth_plan.env_token_counts,
+        auth_plan.needs_runtime_gh_token,
+        active_agent,
+    );
+    let gh_token_resolved = resolved_gh_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+
+    // Fail closed: `env_only` / `gh_only` promise the Keychain is never needed,
+    // so a missing token is an error rather than a silent fallback to it. Only
+    // a token this mode actually accepts counts — a gh-resolved token must not
+    // satisfy `env_only`.
+    // `mode_wants_token` (not `may_use_gh_cli`) is the right test: gh_guard can
+    // resolve a token for its own wrapper even when repo `deny.env` will strip
+    // it back out of the child env, and such a token must not be counted as
+    // satisfying a fail-closed mode.
+    let have_token =
+        auth_plan.env_token_counts || (auth_plan.mode_wants_token && gh_token_resolved);
+    if auth_mode.fails_closed() && !have_token {
+        bail!(
+            "copilot_auth = \"{auth_mode}\" could not obtain a GitHub token \
+             (env vars {}; `gh auth token` {}). Refusing to fall back to Keychain access.",
+            if token_denied_by_repo {
+                "blocked by repo deny.env"
+            } else if auth_mode.accepts_env_token() {
+                "not set"
+            } else {
+                "ignored by this mode"
+            },
+            if auth_mode.may_use_gh_cli() {
+                "failed"
+            } else {
+                "not attempted by this mode"
+            },
+        );
+    }
+
+    // The final Keychain decision. Fold the runtime token into it, then build
+    // the profile exactly once — already narrowed, with no rebuild step. When a
+    // token was resolved and this mode accepts it, the strict-preset invariant
+    // ("a credential is present, so the Keychain is not needed") holds by
+    // construction rather than being checked and bailed on.
+    let allow_keychain = finalize_allow_keychain(&auth_plan, gh_token_resolved);
+
+    let prepared = match build_prepared(allow_keychain) {
+        Ok(s) => s,
+        Err(e) => bail!("{e}"),
     };
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
@@ -2851,122 +2767,16 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         }
     }
 
-    // Resolve gh token before printing the final sandbox summary so auth
-    // decisions can be reflected in the shown policy (including Keychain).
-    //
-    // Two independent reasons to want a token here:
-    //   1. gh_guard needs one to inject or to serve the wrapper's cache.
-    //   2. `copilot_auth` wants one so the macOS Keychain grant can be dropped.
-    // (2) is the reason this fires for a plain `cplt` run: granting Keychain
-    // lets the agent read every credential the user owns, while a pre-extracted
-    // token is a single scoped one.
-    //
-    let auth_mode = auth_plan.mode;
-    let env_token_counts = auth_plan.env_token_counts;
-    let needs_runtime_gh_token = auth_plan.needs_runtime_gh_token;
-
-    if token_denied_by_repo && auth_plan.applies && auth_mode != config::CopilotAuth::Keychain {
-        ui::warn(
-            "Repo deny.env blocks GitHub token env vars: the agent will run without \
-             GitHub authentication (Keychain stays blocked). Set copilot_auth = \"keychain\" \
-             in your own config if you want Keychain access instead.",
-        );
-    }
-
-    let resolved_gh_token =
-        sandbox::resolve_gh_token_for_exec(env_token_counts, needs_runtime_gh_token, active_agent);
-
-    let gh_token_resolved = resolved_gh_token
-        .as_deref()
-        .is_some_and(|t| !t.trim().is_empty());
-
-    // Fail closed: `env_only` / `gh_only` promise the Keychain is never needed,
-    // so a missing token is an error rather than a silent fallback to it. Only
-    // a token this mode actually accepts counts — a gh-resolved token must not
-    // satisfy `env_only`.
-    // `mode_wants_token` (not `may_use_gh_cli`) is the right test: gh_guard can
-    // resolve a token for its own wrapper even when repo `deny.env` will strip
-    // it back out of the child env, and such a token must not be counted as
-    // satisfying a fail-closed mode.
-    let have_token = env_token_counts || (auth_plan.mode_wants_token && gh_token_resolved);
-    if auth_mode.fails_closed() && !have_token {
-        bail!(
-            "copilot_auth = \"{auth_mode}\" could not obtain a GitHub token \
-             (env vars {}; `gh auth token` {}). Refusing to fall back to Keychain access.",
-            if token_denied_by_repo {
-                "blocked by repo deny.env"
-            } else if auth_mode.accepts_env_token() {
-                "not set"
-            } else {
-                "ignored by this mode"
-            },
-            if auth_mode.may_use_gh_cli() {
-                "failed"
-            } else {
-                "not attempted by this mode"
-            },
-        );
-    }
-
-    let auth_decision = resolve_auth_decision(
-        env_token_counts,
-        needs_runtime_gh_token,
-        active_agent,
-        allow_keychain,
-        resolved.preset,
-        &resolved.deny_env,
-        resolved_gh_token.as_deref(),
-    );
-    if deny_env_disables_gh_guard_injection(&resolved.gh_guard, &resolved.deny_env) {
-        ui::warn(
-            "gh_guard.inject_token is enabled, but deny_env blocks auth token env vars; \
-             token injection is disabled by policy (deny_env wins).",
-        );
-    }
-    // An explicit `keychain` mode opts out of trading the Keychain for a token,
-    // so the gh_guard-driven rebuild must not do it behind the user's back —
-    // otherwise the documented escape hatch works only when gh_guard is off.
-    let keychain_mode_opts_out =
-        auth_plan.applies && auth_plan.mode == config::CopilotAuth::Keychain;
-    let keychain_policy_changed = auth_decision.token_present
-        && auth_decision.allow_keychain
-        && allow_keychain
-        && !keychain_mode_opts_out;
-    if auth_decision.token_present && auth_decision.allow_keychain && !keychain_mode_opts_out {
-        if auth_decision.mode == AuthDecisionMode::Strict {
-            bail!(
-                "auth invariant violation (strict): token source {:?} would run with Keychain enabled (reason={})",
-                auth_decision.source,
-                auth_decision.reason.as_code()
-            );
-        }
-        ui::warn(&format!(
-            "Authentication is available via {}. Rebuilding sandbox with Keychain access blocked.",
-            auth_decision.source.display_label()
-        ));
-        allow_keychain = false;
-        prepared = match build_prepared(allow_keychain) {
-            Ok(s) => s,
-            Err(e) => bail!("{e}"),
-        };
-        if !resolved.no_validate
-            && let Err(e) = sandbox::preflight(&prepared)
-        {
-            bail!("Sandbox validation failed after keychain policy rebuild: {e}");
-        }
-    }
-
     // Derived from the FINAL Keychain decision, not from the auth mode: whenever
     // the profile ends up without the Keychain grant, a token cplt resolved is
-    // the agent's only credential and must be injected. Computing it here also
-    // covers the gh_guard-driven rebuild above, which could previously drop
-    // Keychain while leaving injection gated behind `gh_guard.inject_token` —
-    // the wrapper's 0600 file only answers `gh auth token`, not the agent's own
-    // reads, so that combination launched an agent with no way to authenticate.
-    // Gated on `applies`: off macOS (or for a non-Copilot agent) there is no
-    // Keychain grant being traded away, so `!allow_keychain` says nothing about
-    // whether this token is the agent's only credential — and overriding an
-    // explicit `inject_token = false` there would widen for no reason.
+    // the agent's only credential and must be injected — the gh wrapper's 0600
+    // file only answers `gh auth token`, not the agent's own reads, so gating
+    // injection behind `gh_guard.inject_token` there would launch an agent with
+    // no way to authenticate. Gated on `applies`: off macOS (or for a
+    // non-Copilot agent) there is no Keychain grant being traded away, so
+    // `!allow_keychain` says nothing about whether this token is the only
+    // credential — and overriding an explicit `inject_token = false` there would
+    // widen for no reason.
     let token_is_sole_credential = auth_plan.applies && !allow_keychain && gh_token_resolved;
     if token_is_sole_credential && resolved.gh_guard.enabled && !resolved.gh_guard.inject_token {
         ui::warn(
@@ -2981,18 +2791,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         resolved.print_summary(&project_dir, &home_dir, active_agent, allow_keychain);
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
-        bail!("{e}");
-    }
-    if keychain_policy_changed
-        && let Err(e) = prompt_policy_change_confirm(
-            resolved.yes,
-            resolved.quiet,
-            &format!(
-                "Keychain access was automatically blocked because {}",
-                auth_decision.reason.user_message()
-            ),
-        )
-    {
         bail!("{e}");
     }
 
@@ -6711,39 +6509,49 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auth_decision_prefers_effective_env_token() {
-        let decision = resolve_auth_decision(
-            true,
-            true,
+    fn finalize_allow_keychain_drops_grant_when_runtime_token_resolves() {
+        // Copilot + macOS + auto + a working gh login: the plan is optimistic
+        // (keychain on), the resolved token turns it off — in one build.
+        let plan = plan_copilot_auth(
+            CopilotAuth::Auto,
             agent::Agent::Copilot,
+            true,
             false,
-            Some(config::Preset::Standard),
-            &[],
-            Some("ghp_from_runtime"),
+            false,
+            false,
         );
-        assert_eq!(decision.source, AuthSource::EnvToken);
-        assert!(decision.token_present);
-        assert!(!decision.fallback_used);
-        assert_eq!(decision.reason, AuthDecisionReason::EnvTokenPresent);
+        assert!(plan.allow_keychain, "plan is optimistic before resolution");
+        assert!(!finalize_allow_keychain(&plan, true));
+        // No token resolved → the auto fallback keeps the grant.
+        assert!(finalize_allow_keychain(&plan, false));
     }
 
     #[test]
-    fn resolve_auth_decision_uses_runtime_token_when_env_missing() {
-        let decision = resolve_auth_decision(
-            false,
-            true,
+    fn finalize_allow_keychain_keeps_grant_for_keychain_mode_and_other_agents() {
+        // Explicit keychain mode: a resolved token (e.g. gh_guard's) must not
+        // trade the grant away.
+        let keychain = plan_copilot_auth(
+            CopilotAuth::Keychain,
             agent::Agent::Copilot,
             true,
-            Some(config::Preset::Strict),
-            &["GH_TOKEN".to_string()],
-            Some("ghp_runtime"),
+            false,
+            false,
+            true,
         );
-        assert_eq!(decision.source, AuthSource::RuntimeGhToken);
-        assert!(decision.token_present);
-        assert!(decision.fallback_used);
-        assert!(decision.deny_env_stripped);
-        assert_eq!(decision.mode, AuthDecisionMode::Strict);
-        assert_eq!(decision.reason, AuthDecisionReason::RuntimeTokenResolved);
+        assert!(finalize_allow_keychain(&keychain, true));
+
+        // Non-Copilot agent: `applies` is false, the token is not its credential.
+        for a in [
+            agent::Agent::Claude,
+            agent::Agent::Gemini,
+            agent::Agent::Antigravity,
+        ] {
+            let plan = plan_copilot_auth(CopilotAuth::Auto, a, true, false, false, true);
+            assert!(
+                finalize_allow_keychain(&plan, true),
+                "{a:?} keeps its own Keychain credentials"
+            );
+        }
     }
 
     #[test]
@@ -7303,8 +7111,9 @@ mod tests {
         assert!(p.needs_runtime_gh_token);
     }
 
-    /// An ambient env token already removes the Keychain grant, whatever the
-    /// mode — the agent has a credential without it.
+    /// An ambient env token removes the Keychain grant for a Copilot run on
+    /// macOS in any mode that accepts one — the agent has a credential without
+    /// it.
     #[test]
     fn an_env_token_drops_the_keychain_grant() {
         let p = plan(
@@ -7317,6 +7126,48 @@ mod tests {
         );
         assert!(!p.allow_keychain);
         assert!(p.env_token_counts);
+    }
+
+    /// ...but only where `copilot_auth` governs. A GitHub token in a
+    /// Gemini/Claude/Antigravity environment (e.g. forwarded via `pass_env`)
+    /// is not their credential — the Keychain holds that, and dropping the
+    /// grant would strip it for nothing.
+    #[test]
+    fn an_env_token_does_not_strip_the_keychain_from_other_agents() {
+        for a in [
+            agent::Agent::Claude,
+            agent::Agent::Gemini,
+            agent::Agent::Antigravity,
+        ] {
+            let p = plan(CopilotAuth::Auto, a, true, true, false, false);
+            assert!(
+                p.allow_keychain,
+                "{a:?} must keep its own Keychain credentials"
+            );
+        }
+    }
+
+    /// The `keychain` escape hatch must also survive an ambient env token, not
+    /// just a repo deny: a stale `GITHUB_TOKEN` exported in a shell profile is
+    /// exactly the case where a user reaches for `copilot_auth = "keychain"`.
+    #[test]
+    fn explicit_keychain_mode_survives_an_env_token() {
+        let p = plan(
+            CopilotAuth::Keychain,
+            agent::Agent::Copilot,
+            true,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            p.allow_keychain,
+            "explicit keychain mode must keep the grant despite an env token"
+        );
+        assert!(
+            !p.env_token_counts,
+            "keychain mode does not accept the env token as its credential"
+        );
     }
 
     /// The escape hatch the deny.env warning and the docs both point at must
