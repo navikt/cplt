@@ -16,7 +16,7 @@
 
 ## Why cplt?
 
-AI agents execute arbitrary code. A compromised agent, whether through prompt injection, a supply chain attack, or a malicious MCP server, can read `~/.ssh`, push to main, merge PRs, or exfiltrate your code. Unless the OS itself says no.
+AI agents execute arbitrary code. A compromised agent, whether through prompt injection, a supply chain attack, or a malicious MCP server, can read `~/.ssh`, push to main, merge PRs, or exfiltrate your code, unless the OS itself says no.
 
 cplt gives you kernel-level enforcement with team-configurable policy:
 
@@ -107,8 +107,8 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Outbound network (port 443) | ✅ Allowed | Every other port is blocked. Add extras with `--allow-port` |
 | Localhost outbound | 🔒 Kernel-blocked | Prevents local service access. Inbound still works for the proxy |
 | SSH agent (unix socket) | 🔒 Kernel-blocked | Prevents signing git operations or SSH to hosts |
-| Developer tools (`~/.cargo`, `~/.gradle`, `~/.m2`, `~/.sdkman`, `~/.jenv`, `~/.pyenv`, `~/.konan`, etc.) | ✅ Allowed (read+write for caches) | Only dirs that exist on disk. Tightened at runtime via `--doctor` |
-| Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked (macOS. On Linux the parent tool dir stays readable) | Override with `--allow-read`. See [Private registries](docs/known-impacts.md#private-registries) |
+| Developer tools (`~/.cargo`, `~/.gradle`, `~/.m2`, `~/.sdkman`, `~/.jenv`, `~/.pyenv`, `~/.konan`, etc.) | ✅ Allowed (read+write for caches) | Only dirs that exist on disk. Tightened at runtime by what `cplt doctor` detects |
+| Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked on macOS. On Linux the parent tool dir stays readable | Override with `--allow-read`. See [Private registries](docs/known-impacts.md#private-registries) |
 | Read `~/.npmrc` | 🔒 Kernel-blocked (both platforms) | Override with `--allow-read`. Breaks yarn 1, see [yarn 1](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files) |
 | Go source code (`~/go/src`) | 🔒 Kernel-blocked | Only `~/go/bin` and `~/go/pkg` are readable |
 | Read `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure` | 🔒 Kernel-blocked | |
@@ -304,7 +304,7 @@ curl -fsSL https://raw.githubusercontent.com/navikt/cplt/main/install.sh | bash
 cplt doctor
 ```
 
-**Do not install Copilot CLI on the Windows side.** With interop on (the default), the Windows `PATH` is appended to the distro's, so a Windows-side `npm install -g @github/copilot` turns up inside the distro as `/mnt/c/Users/<user>/AppData/Roaming/npm/copilot`. That is a Windows install reached through interop. It cannot run in the Linux sandbox, and the npm shim execs a `node` that the distro will not have unless you installed one there too. The symptom used to be an unrelated runtime-extraction error. cplt now names the cause when it resolves an agent under `/mnt/<drive>/` *and* it is running under WSL, and `cplt doctor` reports it as a failing check instead of passing ([#188](https://github.com/navikt/cplt/issues/188)). WSL is detected from kernel-owned state, either `/run/WSL` or the kernel name in `/proc/sys/kernel/osrelease` and `/proc/version`, not from `WSL_DISTRO_NAME`, which is absent under `sudo` and in systemd units and which any process can set. On a plain Linux box `/mnt/c` is left alone, it is an ordinary mount point there.
+**Do not install Copilot CLI on the Windows side.** With interop on (the default), the Windows `PATH` is appended to the distro's, so a Windows-side `npm install -g @github/copilot` turns up inside the distro as `/mnt/c/Users/<user>/AppData/Roaming/npm/copilot`. That is a Windows install reached through interop. It cannot run in the Linux sandbox, and the npm shim execs a `node` that the distro will not have unless you installed one there too. The symptom used to be an unrelated runtime-extraction error. cplt now names the cause when it resolves an agent under `/mnt/<drive>/` *and* it is running under WSL, and `cplt doctor` reports it as a failing check instead of passing ([#188](https://github.com/navikt/cplt/issues/188)). WSL is detected from kernel-owned state, either `/run/WSL` or the kernel name in `/proc/sys/kernel/osrelease` and `/proc/version`, not from `WSL_DISTRO_NAME`, which is absent under `sudo` and in systemd units and which any process can set. On a plain Linux box `/mnt/c` is left alone. It is an ordinary mount point there.
 
 That check has two limits, both deliberate. It keys on the *default* automount root, so if you have relocated it (`[automount] root` in `/etc/wsl.conf`) the Windows-side install is not recognised and you get the old, less helpful failure with the path in it. And turning interop off stops the Windows `PATH` from leaking in but does **not** unmount `/mnt/c`.
 
@@ -354,7 +354,7 @@ Same pattern mise, direnv, and starship use.
 
 **Why an alias instead of a symlink?** cplt and Copilot CLI install into the same Homebrew bin directory (`/opt/homebrew/bin/`), and only one file named `copilot` can live there, so a symlink would conflict. An alias sidesteps that. The real `copilot` binary stays in PATH where cplt can find and wrap it, and the alias redirects your command.
 
-> **Note:** cplt refuses to nest. If it detects that it is already running inside a sandbox (via the `__CPLT_WRAPPED` environment variable), it will not launch again. Read-only subcommands such as `--print-profile` and `--doctor` still work inside an existing sandbox.
+> **Note:** cplt refuses to nest. If it detects that it is already running inside a sandbox (via the `__CPLT_WRAPPED` environment variable), it will not launch again. Read-only subcommands such as `--print-profile` and `cplt doctor` still work inside an existing sandbox.
 
 ## Usage
 
@@ -722,11 +722,11 @@ One static binary, minimal dependencies, no runtime services, no telemetry. Thre
 
 What cplt protects against:
 
-- Secret exfiltration (SSH keys, cloud credentials, `.env` files), kernel-blocked
-- Unauthorized code execution from temp dirs, kernel-blocked
-- Persistence via git hooks or cache-dir binaries, kernel-blocked
-- Data exfiltration to unauthorized domains, proxy-blocked
-- Accidental pushes to main and PR merges without review, guard-blocked
+- Secret exfiltration (SSH keys, cloud credentials, `.env` files): kernel-blocked
+- Unauthorized code execution from temp dirs: kernel-blocked
+- Persistence via git hooks or cache-dir binaries: kernel-blocked
+- Data exfiltration to unauthorized domains: proxy-blocked
+- Accidental pushes to main and PR merges without review: guard-blocked
 
 What cplt does not protect against:
 
@@ -736,7 +736,7 @@ What cplt does not protect against:
 - Network attacks on allowed domains. If github.com is allowed, the agent can read and write there
 - macOS Keychain access, which Copilot auth needs. Contents are password-protected
 
-Our priorities, in order: **correct** (every claim is tested, every edge case has a CVE or research reference), **transparent** ([SECURITY.md](SECURITY.md) hides nothing), **simple** (one static binary, zero config required, sane defaults), and **useful** (get out of the way and let the agent work).
+Our priorities, in order: **correct** (every claim is tested, every edge case has a CVE or research reference), **transparent** ([SECURITY.md](SECURITY.md) hides nothing), **simple** (one static binary, zero config required, sane defaults), and **useful** (get out of the way and let the agent work, safely).
 
 More: [docs/security.md](docs/security.md) · [SECURITY.md](SECURITY.md)
 
@@ -778,7 +778,7 @@ Enable them and cplt intercepts `gh` and `git` through wrapper scripts in `$PATH
 
 This is Layer 3, a soft barrier. It stops a compliant agent from doing something destructive by accident. For a hard boundary, lean on the kernel sandbox and server-side branch protection.
 
-With the gh guard on, cplt also caches the GitHub token at launch and serves it once through the `gh auth token` callback, then deletes the cache, so later subprocesses cannot retrieve it. Read [SECURITY.md](SECURITY.md) on `block_auth_token` for what that does and does not guarantee.
+With the gh guard on, cplt also caches the GitHub token at launch and serves it once through the `gh auth token` callback, then deletes the cache. That cuts accidental and environment-based leakage. It is not a boundary against a hostile agent, because the cache lives in the agent's own `TMPDIR` and an agent that reads it before the legitimate consumer still gets the token. [SECURITY.md](SECURITY.md) has the full statement on `block_auth_token`.
 
 Full behavior: [docs/gh-guard.md](docs/gh-guard.md) · [docs/git-guard.md](docs/git-guard.md)
 
@@ -811,7 +811,7 @@ Every impact, with the per-tool tables, JVM and Kotlin daemon notes, GPG trouble
 ### macOS
 
 - `sandbox-exec` is deprecated. Apple has not removed it, but may in a future macOS version.
-- SBPL has no domain-based filtering. The CONNECT proxy provides domain blocking instead.
+- SBPL has no domain-based filtering. The optional CONNECT proxy provides domain blocking instead.
 
 ### Linux
 
