@@ -271,14 +271,14 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth token` provides credentials            |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked   | SSH agent socket denied, use HTTPS                                |
-| `git config` (local)               | ❌ Blocked   | `.git/config` is write-protected (prevents `url.*.insteadOf` hijacking) |
+| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
-| `git remote set-url`               | ❌ Blocked   | Writes to `.git/config`                                           |
-| `git submodule add`                | ❌ Blocked   | `.gitmodules` is write-protected (supply chain vector)            |
-| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected (hooks run unsandboxed)          |
+| `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`, which stays writable on Linux |
+| `git submodule add`                | ❌ Blocked on macOS | `.gitmodules` is write-protected on macOS. Writable on Linux, same Landlock limit (supply chain vector) |
+| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project and in every `allow.write` grant, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, see [security.md](security.md) |
 | Signed commits/tags                | ❌ Disabled  | `commit.gpgsign` and `tag.gpgsign` overridden to `false` via env; use `--allow-gpg-signing` to enable |
 
-**Global git hooks:** if `core.hooksPath` is set in `~/.gitconfig`, cplt auto-detects the hooks directory and allows reading it so git operations succeed. Write access is explicitly denied, again to stop persistence attacks. The hooks path must be under `$HOME` with at least 3 path components (`~/.config/git/hooks`, for instance) so the read grant cannot be overly broad.
+**Global git hooks:** if `core.hooksPath` is set in `~/.gitconfig`, cplt auto-detects the hooks directory and allows reading it so git operations succeed. Write access is explicitly denied, to stop persistence attacks. The hooks path must be under `$HOME` with at least 3 path components (`~/.config/git/hooks`, for instance) to keep the read grant from being overly broad.
 
 **Commit signing:** `~/.ssh` and `~/.gnupg` are blocked, so GPG/SSH signing would fail. Rather than open private key directories, cplt injects `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_N`/`GIT_CONFIG_VALUE_N` env vars that disable `commit.gpgsign` and `tag.gpgsign` inside the sandbox. Commits made by Copilot are unsigned, which is expected since users typically re-sign on merge or squash. Use `--allow-gpg-signing` to override this (see [GPG signing](#gpg-commit-signing)).
 
