@@ -150,7 +150,7 @@ Localhost outbound is blocked by default, so sandboxed processes cannot connect 
 | `npm install` (registry)       | ✅ Works           | Uses HTTPS to `registry.npmjs.org:443`               |
 | `gradle build` (Maven Central) | ✅ Works           | Uses HTTPS to `repo1.maven.org:443`                  |
 | Gradle daemon (ephemeral port) | ❌ Blocked         | Use `--allow-localhost-any` (daemon uses random ports) |
-| Gradle/JVM startup (native libs)| ❌ Blocked        | Use scratch dir (default) or `--allow-tmp-exec`, see [JVM note](#temp-dir-exec) |
+| Gradle/JVM startup (native libs)| ❌ Blocked        | Use scratch dir (default) or `--allow-tmp-exec`, see [JVM note](#temp-dir-execution-go-test-mise-node-gyp) |
 | Local PostgreSQL (`:5432`)     | ❌ Blocked         | Use `--allow-localhost 5432`                         |
 | Local Redis (`:6379`)          | ❌ Blocked         | Use `--allow-localhost 6379`                         |
 | Local Kafka (`:9092`)          | ❌ Blocked         | Use `--allow-localhost 9092`                         |
@@ -322,7 +322,7 @@ If all of that works, `cplt --allow-gpg-signing` will work too. The `gpg-agent` 
 |---|---|---|
 | `error: gpg failed to sign the data` | Agent not running or passphrase not cached | Run `gpg-connect-agent 'GETINFO version' /bye` and `echo test \| gpg --clearsign` outside cplt |
 | `signing failed: No secret key` | Wrong `user.signingkey` in git config | Run `gpg --list-secret-keys` and set `git config --global user.signingkey <KEY_ID>` |
-| `signing failed: Operation not permitted` | Flag not set, or `--deny-path` overriding | Check `cplt --doctor` output for GPG signing status |
+| `signing failed: Operation not permitted` | Flag not set, or `--deny-path` overriding | Check `cplt doctor` output for GPG signing status |
 | Commits unsigned despite flag | `gpg.format=ssh` in git config | This flag is GPG-only; SSH signing is not supported |
 | `GNUPGHOME` set to non-default path | SBPL rules only cover `~/.gnupg` | Unset `GNUPGHOME` or symlink to `~/.gnupg` |
 | `git log --show-signature` shows `Fatal: can't open trustdb.gpg` | GPG opens `trustdb.gpg` for writing during *verification*, which the sandbox denies | Expected. **Signing works**, only verification is affected. Verify signatures outside the sandbox or in CI |
