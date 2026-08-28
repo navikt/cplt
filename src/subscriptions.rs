@@ -252,7 +252,7 @@ fn curl_fetch_inner(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String> {
         let _ = child.kill();
         let _ = child.wait();
         return Err(format!(
-            "response exceeds {MAX_FETCH_BYTES}-byte limit — refusing (possible size bomb)"
+            "response exceeds the {MAX_FETCH_BYTES}-byte limit, refusing it (possible size bomb)"
         ));
     }
 
@@ -431,7 +431,7 @@ fn update_one(
     // the cache. Oversize is rejected fail-open: the last-good cache is preserved.
     if bytes.len() as u64 > MAX_FETCH_BYTES {
         let reason = format!(
-            "response is {} bytes, over the {MAX_FETCH_BYTES}-byte limit — rejected",
+            "response is {} bytes, over the {MAX_FETCH_BYTES}-byte limit, so cplt rejected it",
             bytes.len()
         );
         return if cache_exists {
@@ -474,8 +474,7 @@ fn update_one(
     if !write_ok {
         return UpdateOutcome::WriteFailed {
             url: sub.url.clone(),
-            reason: "could not write cache file — keeping prior state, next run retries"
-                .to_string(),
+            reason: "could not write cache file, keeping prior state, next run retries".to_string(),
         };
     }
 
@@ -574,7 +573,7 @@ pub fn staleness_warnings(set: &SubscriptionSet, now: SystemTime) -> Vec<String>
         let cache_exists = cache_path(&set.cache_dir, &sub.url).exists();
         if !cache_exists {
             warnings.push(format!(
-                "blocklist subscription {} has never been fetched — run `cplt update-lists`",
+                "blocklist subscription {} has never been fetched. Run `cplt update-lists`",
                 sub.url
             ));
             continue;
@@ -584,7 +583,7 @@ pub fn staleness_warnings(set: &SubscriptionSet, now: SystemTime) -> Vec<String>
             if age >= STALE_WARN.as_secs() {
                 let days = age / (24 * 60 * 60);
                 warnings.push(format!(
-                    "blocklist subscription {} cache is {days} days old — run `cplt update-lists`",
+                    "blocklist subscription {} cache is {days} days old. Run `cplt update-lists`",
                     sub.url
                 ));
             }

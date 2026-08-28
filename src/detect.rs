@@ -48,10 +48,10 @@ impl SandboxFlag {
     pub fn risk_warning(self) -> Option<&'static str> {
         match self {
             Self::AllowLifecycleScripts => {
-                Some("runs arbitrary scripts on install — only enable if builds fail without it")
+                Some("runs arbitrary scripts on install, only enable if builds fail without it")
             }
             Self::AllowDocker => {
-                Some("grants access to Docker socket — effectively root on the host")
+                Some("grants access to the Docker socket, effectively root on the host")
             }
             Self::AllowTmpExec => Some("allows code execution from /tmp"),
             _ => None,
@@ -486,7 +486,7 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
             });
             diagnostics.push(Diagnostic {
                 detector: "node",
-                message: "lifecycle scripts detected — only add allow_lifecycle_scripts if npm install fails without it (runs arbitrary code)".to_string(),
+                message: "lifecycle scripts detected. Only add allow_lifecycle_scripts if npm install fails without it, since it runs arbitrary code".to_string(),
             });
         }
 
@@ -1293,7 +1293,7 @@ fn try_add_member(
         diagnostics.push(Diagnostic {
             detector: "workspace",
             message: format!(
-                "Skipped workspace member {relative:?} — path traversal or absolute path"
+                "Skipped workspace member {relative:?}, path traversal or absolute path"
             ),
         });
         return;
@@ -1324,7 +1324,7 @@ fn try_add_member(
         diagnostics.push(Diagnostic {
             detector: "workspace",
             message: format!(
-                "Skipped workspace member {relative:?} — resolves outside repository root"
+                "Skipped workspace member {relative:?}, it resolves outside the repository root"
             ),
         });
         return;

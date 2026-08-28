@@ -49,7 +49,7 @@ impl Config {
             // describe_unknown_key already includes "in [section]"; append the
             // file and the ignored note without repeating "in".
             ui::warn(&format!(
-                "{} — ignored ({})",
+                "{}, ignored ({})",
                 super::validation::describe_unknown_key(key_path),
                 path.display()
             ));
@@ -696,7 +696,7 @@ impl Resolved {
 
         if let Some(preset) = self.preset {
             eprintln!(
-                "{blue}[cplt]{nc}  {dim}Preset:{nc}        {green}{preset}{nc}         {dim}baseline — individual flags still override{nc}"
+                "{blue}[cplt]{nc}  {dim}Preset:{nc}        {green}{preset}{nc}         {dim}baseline, individual flags still override{nc}"
             );
             eprintln!();
         }
@@ -1004,7 +1004,7 @@ impl Resolved {
         }
         eprintln!("{blue}[cplt]{nc}  {dim}Full profile:{nc}   cplt --print-profile");
         eprintln!(
-            "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet or: cplt config set sandbox.quiet true{nc}"
+            "{blue}[cplt]{nc}  {yellow}Tip:{nc}            {dim}use --quiet, or cplt config set sandbox.quiet true{nc}"
         );
         eprintln!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
     }
@@ -1207,7 +1207,7 @@ fn resolve_repo_allow_path(path_str: &str, config_dir: &Path, key: &str) -> Opti
     let resolved = resolve_repo_path(path_str, config_dir);
     if expand_tilde(path_str).is_relative() && !resolved.starts_with(config_dir) {
         ui::warn(&format!(
-            "{key} entry {path_str:?} resolves outside the repository ({}) — ignoring it.\n  \
+            "{key} entry {path_str:?} resolves outside the repository ({}), so cplt is ignoring it.\n  \
              A symlink target is not covered by the trust approval, so a later commit could \
              repoint it without re-approval. Name the target directly in .cplt.toml if you \
              mean to grant it.",

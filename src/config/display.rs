@@ -173,7 +173,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
             p.display()
         );
     } else {
-        println!("{blue}[cplt]{nc}  {dim}File:{nc}  {dim}(no config path — $HOME not set){nc}");
+        println!("{blue}[cplt]{nc}  {dim}File:{nc}  {dim}(no config path, $HOME not set){nc}");
     }
     println!();
 

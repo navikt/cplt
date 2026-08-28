@@ -244,7 +244,7 @@ pub enum RepoConfigState {
 const UNCOMMITTED_EFFECT: &str = if cfg!(target_os = "linux") {
     "Until then cplt ignores it entirely."
 } else {
-    "Until then cplt loads it from the working tree — unaudited, so its [deny] keys \
+    "Until then cplt loads it from the working tree unaudited, so its [deny] keys \
      apply but its [propose] keys cannot be approved."
 };
 
@@ -267,8 +267,8 @@ impl RepoConfigState {
                  {UNCOMMITTED_EFFECT}\n  \
                  Commit it first:\n    \
                  git add {REPO_CONFIG_FILE} && git commit -m \"chore: add cplt sandbox config\"\n  \
-                 (if {REPO_CONFIG_FILE} is listed in .gitignore, un-ignore it — an ignored \
-                 file can never reach HEAD)"
+                 (if {REPO_CONFIG_FILE} is listed in .gitignore, un-ignore it, because an \
+                 ignored file can never reach HEAD)"
             )),
             Self::NotAGitRepo { has_file: true } => Some(format!(
                 "{REPO_CONFIG_FILE} exists here, but this is not a git repository.\n  \

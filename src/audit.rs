@@ -470,7 +470,7 @@ impl AuditReport {
                 ));
                 // Distinct, honest outcome: a baseline existed but git could not
                 // measure the net changes. Never rendered as a clean session.
-                ui::warn("audit incomplete — could not verify project changes");
+                ui::warn("audit incomplete, cplt could not verify project changes");
             }
             AuditReport::Available {
                 duration,

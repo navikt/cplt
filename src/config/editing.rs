@@ -74,7 +74,7 @@ fn parse_value_for_key(
             Ok(toml_edit::Value::Array(arr))
         }
         ConfigValueType::ArrayOfTables => Err(ConfigError::Validation(format!(
-            "{}.{} is an array of tables — edit config.toml directly to configure this key",
+            "{}.{} is an array of tables. Edit config.toml directly to configure this key",
             key_info.section, key_info.key
         ))),
     }
@@ -98,7 +98,7 @@ fn parse_element_for_key(
         ConfigValueType::StrArray => {
             if value.contains(',') {
                 return Err(ConfigError::Validation(format!(
-                    "value contains a comma — add one value at a time:\n  \
+                    "value contains a comma. Add one value at a time:\n  \
                      cplt config set {}.{} <VALUE>",
                     key_info.section, key_info.key
                 )));
@@ -111,7 +111,7 @@ fn parse_element_for_key(
                 .unwrap())
         }
         _ => Err(ConfigError::Validation(format!(
-            "{}.{} is not an array key — use 'set' without --append",
+            "{}.{} is not an array key. Use 'set' without --append",
             key_info.section, key_info.key
         ))),
     }

@@ -23,22 +23,20 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 
 /// Run AI coding agents inside a kernel-level sandbox.
 ///
-/// The agent can read and write your project files, but cannot access your
-/// SSH keys, cloud credentials, or other secrets. The sandbox is enforced
-/// by the OS kernel — the agent (and any process it spawns) cannot bypass it.
+/// The agent reads and writes your project files. It cannot reach your SSH
+/// keys, cloud credentials, or other secrets. The kernel enforces the sandbox,
+/// so neither the agent nor anything it spawns can escape it. On macOS that is
+/// Apple Seatbelt (SBPL) via sandbox-exec. On Linux it is Landlock LSM plus
+/// seccomp-BPF, needing kernel 5.13+, or 6.7+ for full network filtering.
 ///
-/// Platform enforcement:
-/// - macOS: Apple Seatbelt/SBPL via sandbox-exec
-/// - Linux: Landlock LSM + seccomp-BPF (kernel 5.13+, full network filtering on 6.7+)
+/// cplt sandboxes GitHub Copilot CLI, OpenCode, Google Gemini CLI, Antigravity
+/// CLI, Pi, and Claude Code. It auto-detects Copilot, OpenCode, Gemini, and
+/// Antigravity from PATH. Pick Pi or Claude Code with --agent, which also
+/// overrides the detected agent at any time.
 ///
-/// Supports GitHub Copilot CLI, OpenCode, Google Gemini CLI, Antigravity CLI,
-/// Pi, and Claude Code. Copilot, OpenCode, Gemini, and Antigravity are
-/// auto-detected from PATH; Pi and Claude Code are explicit-only — select them
-/// with --agent. Use --agent to override the detected agent at any time.
-///
-/// Defaults can be saved to ~/.config/cplt/config.toml
-/// so you don't need to pass flags every time. Run `cplt config init` to
-/// create a starter config, or `cplt config validate` to check for typos.
+/// Save your defaults in ~/.config/cplt/config.toml to stop passing flags every
+/// time. Run `cplt config init` for a starter config, or `cplt config validate`
+/// to check it for typos.
 #[derive(Parser)]
 #[command(
     name = "cplt",
@@ -105,21 +103,17 @@ EXAMPLES:
 "
 )]
 struct Cli {
-    /// Which AI coding agent to sandbox.
-    /// Resolved in order: this flag > sandbox.agent config > auto-detect from PATH.
+    /// Which AI coding agent to sandbox. This flag wins over the sandbox.agent
+    /// config key, which wins over auto-detection from PATH.
     /// Supported: copilot, opencode, gemini, antigravity, pi, claude, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 
     /// Apply a named policy preset that sets a baseline for the five sandbox
     /// toggles (localhost, env files, tmp exec, docker, lifecycle scripts).
-    /// Individual flags still override it (e.g. `--preset permissive
-    /// --no-allow-tmp-exec`). Resolved in order: this flag > [sandbox] preset
-    /// config. `standard` (the default when omitted) is a no-op baseline.
-    ///   strict:      all five off (deny-default)
-    ///   standard:    current defaults (all five off, scratch dir stays on)
-    ///   permissive:  localhost + tmp exec + lifecycle scripts on
-    ///   full-trust:  all five on
+    /// Individual flags still override it, e.g. `--preset permissive
+    /// --no-allow-tmp-exec`. This flag wins over the [sandbox] preset config
+    /// key. Omitting it gives you `standard`, which changes nothing.
     #[arg(long, value_name = "PRESET")]
     preset: Option<config::Preset>,
 
@@ -130,10 +124,10 @@ struct Cli {
     project_dir: Option<PathBuf>,
 
     /// Enable a local CONNECT proxy that logs and filters outbound connections.
-    /// All agent traffic is routed through the proxy via
-    /// HTTP_PROXY/HTTPS_PROXY env vars. Can block known-bad domains with
-    /// --blocked-domains. The proxy enforces the same port restrictions as
-    /// the sandbox (443 + --allow-port values).
+    /// cplt routes all agent traffic through it with the HTTP_PROXY and
+    /// HTTPS_PROXY env vars. Block known-bad domains with --blocked-domains.
+    /// The proxy enforces the same port restrictions as the sandbox
+    /// (443 plus --allow-port values).
     #[arg(long)]
     with_proxy: bool,
 
@@ -141,10 +135,11 @@ struct Cli {
     #[arg(long)]
     no_proxy: bool,
 
-    /// Force all egress through the proxy (#53). Makes the proxy mandatory and
+    /// Force all egress through the proxy. Makes the proxy mandatory and
     /// restricts kernel-level egress to the proxy port only (no direct *:443),
-    /// closing the raw-socket / `env -u HTTPS_PROXY` bypass. Fails closed: if the
-    /// proxy cannot start, the agent is not launched. Conflicts with --no-proxy.
+    /// which closes the raw-socket and `env -u HTTPS_PROXY` bypass. Fails
+    /// closed. If the proxy cannot start, cplt does not launch the agent.
+    /// Conflicts with --no-proxy.
     #[arg(long)]
     proxy_forced: bool,
 
@@ -159,36 +154,36 @@ struct Cli {
 
     /// File with domains to block (one per line, e.g. pastebin.com).
     /// Only relevant when --with-proxy is enabled.
-    /// The proxy will refuse CONNECT requests to these domains.
+    /// The proxy refuses CONNECT requests to these domains.
     /// The file is re-read on every request, so you can edit it live.
     #[arg(long, value_name = "FILE")]
     blocked_domains: Option<PathBuf>,
 
-    /// File with domains to allow (one per line). When set, the proxy
-    /// only permits connections to listed domains — everything else is
-    /// blocked. Blocklist still applies on top. Parsed at startup.
+    /// File with domains to allow (one per line). When set, the proxy permits
+    /// connections to the listed domains and blocks everything else. The
+    /// blocklist still applies on top. Parsed at startup.
     #[arg(long, value_name = "FILE")]
     allowed_domains: Option<PathBuf>,
 
-    /// Enable fail-closed networking for this run (#52): restrict egress to the
-    /// agent's built-in default allowlist (GitHub Copilot infrastructure +
-    /// package registries for Copilot) merged with any --allowed-domains.
-    /// Everything else is blocked. Opt-in; overrides proxy.default_allowlist = false.
+    /// Enable fail-closed networking for this run. Restricts egress to the
+    /// agent's built-in default allowlist (GitHub Copilot infrastructure and
+    /// package registries for Copilot) merged with any --allowed-domains, and
+    /// blocks everything else. Overrides proxy.default_allowlist = false.
     #[arg(long)]
     default_allowlist: bool,
 
-    /// Escape hatch: disable the default allowlist for this run and allow all
-    /// domains (subject to the blocklist). Overrides --default-allowlist and
-    /// proxy.default_allowlist, and also ignores any --allowed-domains file.
+    /// Disable the default allowlist for this run and allow all domains, still
+    /// subject to the blocklist. Overrides --default-allowlist and
+    /// proxy.default_allowlist, and ignores any --allowed-domains file.
     #[arg(long)]
     allow_all_domains: bool,
 
-    /// Discovery mode: run with the proxy in ALLOW-ALL mode (nothing is blocked)
-    /// and record every domain the agent contacts, then print the observed set
-    /// as a ready-to-paste allowlist. Use it to empirically build/verify an
-    /// agent's default allowlist. This run does NOT enforce domain filtering —
-    /// it overrides --preset strict / --default-allowlist / any configured
-    /// allowlist for the session. See docs/proxy.md.
+    /// Run the proxy in ALLOW-ALL mode, block nothing, record every domain the
+    /// agent contacts, then print the observed set as a ready-to-paste
+    /// allowlist. Use it to build or verify an agent's default allowlist. This
+    /// run does NOT enforce domain filtering. It overrides --preset strict,
+    /// --default-allowlist, and any configured allowlist for the session.
+    /// See docs/proxy.md.
     #[arg(long)]
     observe_domains: bool,
 
@@ -203,13 +198,13 @@ struct Cli {
     proxy_log: Option<PathBuf>,
 
     /// Proxy stderr verbosity: none (default), error, blocked, or all.
-    /// Controls what the proxy prints to stderr. The audit log file
-    /// (--proxy-log) always records everything regardless of this setting.
+    /// The audit log file (--proxy-log) always records everything, whatever
+    /// this is set to.
     #[arg(long, value_name = "LEVEL")]
     proxy_log_level: Option<String>,
 
     /// Timeout for proxy connections in seconds (default: 60).
-    /// Prevents long-running requests (like generating large reports) from hanging.
+    /// Stops long-running requests, such as generating large reports, from hanging.
     #[arg(long, value_name = "SECONDS")]
     proxy_timeout: Option<u64>,
 
@@ -220,12 +215,13 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     proxy_upstream: Option<String>,
 
-    /// Host that BYPASSES the upstream proxy and is connected to directly, like
+    /// Host that BYPASSES the upstream proxy and gets a direct connection, like
     /// NO_PROXY. Only meaningful together with --proxy-upstream. Suffix matching:
     /// "example.com" covers all its subdomains. Can be specified multiple times.
-    /// When set, overrides proxy.upstream_no_proxy in config; the ambient
-    /// NO_PROXY/no_proxy environment is always merged on top. cplt still enforces
-    /// all domain, port, and SSRF filtering — the host is just connected directly.
+    /// When set, overrides proxy.upstream_no_proxy in config, and cplt always
+    /// merges the ambient NO_PROXY/no_proxy environment on top. cplt still
+    /// enforces all domain, port, and SSRF filtering. Only the upstream hop is
+    /// skipped.
     #[arg(long = "proxy-upstream-no-proxy", value_name = "DOMAIN")]
     proxy_upstream_no_proxy: Vec<String>,
 
@@ -244,7 +240,7 @@ struct Cli {
     allow_read: Vec<PathBuf>,
 
     /// Let the agent read AND write files outside the project directory.
-    /// Use carefully — this gives the agent full access to modify these paths.
+    /// Use carefully. The agent can modify anything under these paths.
     /// Can be specified multiple times.
     #[arg(long = "allow-write", value_name = "PATH")]
     allow_write: Vec<PathBuf>,
@@ -330,8 +326,8 @@ struct Cli {
         long_help = "\
 Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run (DANGEROUS).
 
-These are blocked by default because malicious postinstall hooks are a primary
-supply chain attack vector — they can deploy RATs, exfiltrate env vars, or
+cplt blocks these by default. A malicious postinstall hook is one of the most
+common supply chain attacks. It can deploy a RAT, exfiltrate env vars, or
 modify source files during `npm install`.
 
 Only enable this if your project needs native module compilation (node-gyp,
@@ -346,10 +342,10 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
     no_allow_lifecycle_scripts: bool,
 
     /// Allow GPG commit/tag signing inside the sandbox (DANGEROUS).
-    /// Exposes the GPG agent socket — enables signing AND decryption requests.
-    /// Private keys remain protected — only the public keyring and agent
-    /// socket are accessible. A compromised process cannot extract the key,
-    /// but CAN request arbitrary signatures and decryptions while active.
+    /// Exposes the GPG agent socket, which enables signing AND decryption
+    /// requests. Private keys stay protected. Only the public keyring and the
+    /// agent socket are reachable, so a compromised process cannot extract the
+    /// key, but it CAN request arbitrary signatures and decryptions while active.
     #[arg(long)]
     allow_gpg_signing: bool,
 
@@ -360,8 +356,8 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
     /// Allow JVM Attach API unix sockets in /tmp.
     /// Needed for JVM testing frameworks that use runtime self-attach:
     /// MockK inline mocking, Mockito inline agents, ByteBuddy, JMX tools.
-    /// Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
-    /// all other unix sockets remain blocked.
+    /// Only allows sockets matching /tmp/.java_pid<PID>. The SSH agent and
+    /// all other unix sockets stay blocked.
     #[arg(long)]
     allow_jvm_attach: bool,
 
@@ -369,9 +365,9 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
     /// Needed for `dotnet build`, which forks worker nodes that communicate
     /// with the client over a Unix domain socket at /tmp/MSBuild<PID>.
     /// This does NOT allow the persistent MSBuild Server (MSBuildServer-<hash>),
-    /// which stays blocked; reuse of that server is also disabled via
-    /// DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1. SSH agent and all other unix
-    /// sockets remain blocked.
+    /// which stays blocked. cplt also disables reuse of that server with
+    /// DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1. The SSH agent and all other unix
+    /// sockets stay blocked.
     #[arg(long)]
     allow_msbuild: bool,
 
@@ -382,9 +378,9 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
 Allow Docker/Colima/OrbStack access inside the sandbox (DANGEROUS).
 
 Exposes ~/.docker config (read-only) and Docker daemon unix sockets.
-WARNING: Docker container volumes can mount ANY host path, completely
-bypassing sandbox filesystem restrictions. A compromised agent could
-use `docker run -v /:/host` to read all files on your machine.
+WARNING: Docker container volumes can mount ANY host path, bypassing
+sandbox filesystem restrictions. A compromised agent can run
+`docker run -v /:/host` and read every file on your machine.
 
 Only enable if you trust the agent to manage containers and understand
 that Docker volume mounts are an escape hatch from the sandbox."
@@ -403,9 +399,8 @@ that Docker volume mounts are an escape hatch from the sandbox."
         long_help = "\
 Allow process execution from system temp directories (DANGEROUS).
 
-Re-enables exec from /private/tmp and /private/var/folders. This weakens
-code-exec isolation significantly — any process can drop a binary in /tmp
-and this flag lets it execute.
+Re-enables exec from /private/tmp and /private/var/folders. Any process can
+drop a binary in /tmp, and this flag lets it run.
 
 Prefer --scratch-dir which creates a per-session controlled executable temp
 directory. Only use --allow-tmp-exec as a last resort when --scratch-dir is
@@ -434,24 +429,23 @@ insufficient (e.g., third-party tools that hardcode /tmp for executables)."
         long_help = "\
 Allow process execution from ALL ~/Library/Caches subdirectories (DANGEROUS).
 
-This is much broader than --allow-cache-exec which targets specific tool caches.
-Grants exec to every binary cached by any application, significantly expanding
-the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
---allow-cache-exec ms-playwright --allow-cache-exec gradle)."
+Much broader than --allow-cache-exec, which targets specific tool caches. This
+grants exec to every binary cached by any application. Prefer
+--allow-cache-exec with specific subdirs, e.g.
+--allow-cache-exec ms-playwright --allow-cache-exec gradle."
     )]
     allow_cache_exec_any: bool,
 
     /// Allow the agent to open URLs in your default browser.
     /// Needed for OAuth code flows (MCP servers, Gemini CLI, gh auth login).
-    /// Disabled by default because it lets the agent leverage your browser session.
+    /// Disabled by default because it lets the agent use your browser session.
     #[arg(long)]
     allow_browser: bool,
 
     /// Enable a per-session scratch directory for TMPDIR redirect (default).
     /// Creates ~/.cache/cplt/tmp/{session}/ with write+exec permissions
-    /// and redirects TMPDIR/GOTMPDIR there. This allows tools like
-    /// `go test`, `mise` inline tasks, and `node-gyp` to work.
-    /// Cleaned up automatically on exit.
+    /// and redirects TMPDIR/GOTMPDIR there. This lets tools like `go test`,
+    /// `mise` inline tasks, and `node-gyp` work. cplt removes it on exit.
     #[arg(long)]
     scratch_dir: bool,
 
@@ -480,10 +474,10 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
     no_git_guard: bool,
 
     /// Use Bubblewrap for namespace isolation on Linux (auto-detect if not specified).
-    /// Provides defense-in-depth: PID, mount, IPC, UTS, cgroup, and user namespaces
-    /// plus a private /tmp, on top of Landlock + seccomp-BPF. The host network is
-    /// shared so proxy-based filtering keeps working. Falls back to Landlock+seccomp
-    /// if bwrap is unavailable. Only effective on Linux — ignored on macOS.
+    /// Adds PID, mount, IPC, UTS, cgroup, and user namespaces plus a private
+    /// /tmp, on top of Landlock + seccomp-BPF. It shares the host network so
+    /// proxy-based filtering keeps working. Falls back to Landlock + seccomp if
+    /// bwrap is unavailable. Linux only. macOS ignores it.
     #[arg(long)]
     use_bubblewrap: bool,
 
@@ -524,7 +518,7 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
 
     /// Install the shell alias permanently into your shell rc file.
     /// Detects your shell (zsh/bash/fish) and appends the setup line.
-    /// Safe to run multiple times — won't add duplicates.
+    /// Safe to run multiple times. It will not add duplicates.
     #[arg(long)]
     shell_install: bool,
 
@@ -548,13 +542,13 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
 
     /// Auto-approve all permissions from .cplt.toml for this run only.
     /// For CI/scripts where interactive approval isn't possible.
-    /// Does not persist trust — approvals apply only to the current invocation.
+    /// Does not persist trust. Approvals apply to the current invocation only.
     #[arg(long)]
     accept_repo_config: bool,
 
     /// Suppress the startup configuration summary and non-essential messages.
-    /// Errors and warnings are always shown. Use when you've reviewed the
-    /// sandbox settings and don't need to see them every time.
+    /// cplt always shows errors and warnings. Use this once you have reviewed
+    /// the sandbox settings and no longer need to see them every time.
     /// Can also be set in config: sandbox.quiet = true
     #[arg(long, short = 'q')]
     quiet: bool,
@@ -565,11 +559,10 @@ the attack surface. Prefer --allow-cache-exec with specific subdirs (e.g.,
     no_quiet: bool,
 
     /// Suppress the post-session project-change audit report.
-    /// By default, after the sandboxed agent exits, cplt prints a trustworthy
-    /// summary of the net file changes made during the session (measured from
-    /// outside the sandbox against a pinned baseline commit). Use this to skip
-    /// it. Can also be set in config: sandbox.audit = false.
-    /// The report is also suppressed under --quiet.
+    /// After the sandboxed agent exits, cplt prints the net file changes from
+    /// the session, measured from outside the sandbox against a pinned baseline
+    /// commit. Can also be set in config: sandbox.audit = false.
+    /// --quiet suppresses the report too.
     #[arg(long)]
     no_audit: bool,
 
@@ -666,14 +659,15 @@ QUICK START:
         force: bool,
     },
 
-    /// Update subscribed blocklists (issue #144, Phase 1).
+    /// Update subscribed blocklists.
     ///
     /// Fetches, SHA256-verifies (when pinned), and caches every blocklist under
     /// [proxy.subscriptions] in your global config, then reports a per-list
-    /// result. Cached lists are UNIONed into the effective blocklist on the next
-    /// run. Tighten-only and fail-open: a fetch failure keeps the last-good
-    /// cache; a pinned-hash mismatch rejects the download (tamper) and keeps the
-    /// last-good cache. Subscriptions are global-only — a repo cannot add one.
+    /// result. The next run unions the cached lists into the effective
+    /// blocklist. Tighten-only and fail-open. A fetch failure keeps the
+    /// last-good cache, and a pinned-hash mismatch rejects the download as
+    /// tampering and keeps the last-good cache. Subscriptions are global only.
+    /// A repo cannot add one.
     #[command(name = "update-lists")]
     UpdateLists,
 
@@ -725,9 +719,9 @@ QUICK START:
 
     /// Verify & explain sandbox enforcement.
     ///
-    /// Runs probes inside the REAL resolved sandbox/proxy (the same policy the
-    /// agent would get) and reports, for each, whether cplt allows or blocks it
-    /// AND why + the exact fix. Honours the policy-affecting flags — put them
+    /// Runs probes inside the REAL resolved sandbox and proxy, the same policy
+    /// the agent would get, and reports for each whether cplt allows or blocks
+    /// it, why, and the exact fix. Honours the policy-affecting flags. Put them
     /// before `check`, e.g. `cplt --preset strict check`.
     ///
     /// With no subcommand it runs a battery demonstrating enforcement and exits
@@ -746,9 +740,9 @@ QUICK START:
     ///     Report whether a command would run or is gated.
     #[command(after_help = "\
 NOTE:
-  Probes reflect cplt's resolved policy. A passing network probe means
-  \"cplt is not blocking this\" — not that the host is up or that an
-  arbitrary agent action would behave identically.")]
+  Probes reflect cplt's resolved policy. A passing network probe means only
+  that cplt is not blocking the target. It does not mean the host is up, or
+  that an arbitrary agent action behaves the same way.")]
     Check {
         #[command(subcommand)]
         target: Option<CheckTarget>,
@@ -763,9 +757,9 @@ NOTE:
     /// Uses the same sandbox as `--agent shell`: filesystem isolation,
     /// env filtering, network proxy, etc.
     ///
-    /// stdin/stdout/stderr are passed through transparently.
-    /// Exit code is forwarded from the child process.
-    /// No startup banner or confirmation prompt — clean for piping and aliases.
+    /// cplt passes stdin, stdout, and stderr straight through and forwards the
+    /// child process exit code. No startup banner and no confirmation prompt,
+    /// so it pipes and aliases cleanly.
     ///
     /// All top-level cplt flags work: --project-dir, --allow-read, --with-proxy, etc.
     ///
@@ -879,9 +873,9 @@ NOTE:
 enum CheckTarget {
     /// Probe filesystem access to PATH inside the sandbox.
     ///
-    /// Runs a hermetic read (and, with --write, a write) probe inside the real
-    /// sandbox and reports allowed/blocked + why + the fix. Reads nothing from
-    /// the file and never mutates user state.
+    /// Runs a hermetic read probe, and with --write a write probe, inside the
+    /// real sandbox, then reports allowed or blocked, why, and the fix. It
+    /// reads nothing from the file and never changes user state.
     Path {
         /// The path to probe (file or directory).
         path: PathBuf,
@@ -901,7 +895,7 @@ enum CheckTarget {
         /// Target as `domain` or `domain:port` (default port 443).
         target: String,
 
-        /// Explain from policy only — do not make any outbound connection.
+        /// Explain from policy only. Makes no outbound connection.
         #[arg(long)]
         no_connect: bool,
     },
@@ -959,7 +953,7 @@ enum ConfigAction {
         value: Option<String>,
 
         /// Append value to an array key instead of replacing.
-        /// Note: `set` already appends for array keys, so --append is optional.
+        /// `set` already appends for array keys, so --append is optional.
         #[arg(long)]
         append: bool,
 
@@ -1343,7 +1337,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // Safety check: reject overly broad project roots
     if is_unsafe_root(&project_dir, &home_dir) {
         bail!(
-            "Refusing to sandbox '{}' — too broad. Use a specific project directory.",
+            "cplt refuses to sandbox '{}', it is too broad. Use a specific project directory.",
             project_dir.display()
         );
     }
@@ -1389,8 +1383,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                                 t.repo.path.clone()
                             };
                             ui::warn(&format!(
-                                ".cplt.toml for this remote was approved at a different path ({where_approved}) — \
-                                 not auto-trusting here. Re-approve with `cplt trust accept`.",
+                                ".cplt.toml for this remote was approved at a different path \
+                                 ({where_approved}), so cplt is not auto-trusting it here. \
+                                 Re-approve with `cplt trust accept`.",
                             ));
                         }
                         Vec::new()
@@ -1403,7 +1398,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         // entry) — invalidate and require re-approval.
                         if !resolved.quiet {
                             ui::warn(
-                                ".cplt.toml permissions changed since last approval — re-approve with `cplt trust accept`",
+                                ".cplt.toml permissions changed since the last approval. Re-approve with `cplt trust accept`",
                             );
                         }
                         Vec::new()
@@ -1415,7 +1410,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     let proposed = repo_config::proposed_keys(&loaded.config.propose);
                     if !proposed.is_empty() && !resolved.quiet {
                         ui::warn(
-                            "Untrusted .cplt.toml — this repo wants to relax sandbox permissions.",
+                            "Untrusted .cplt.toml. This repo wants to relax sandbox permissions.",
                         );
                         eprintln!(
                             "  {}⚠{} Review proposed permissions before approving.",
@@ -1457,9 +1452,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // than erroring, so the feature stays usable where allow_localhost_any is set.
     if resolved.reconcile_proxy_forced() {
         ui::warn(
-            "proxy.forced is active: ignoring allow_localhost_any — all outbound traffic \
-             must go through the proxy. Allowing any localhost port would disable kernel \
-             network restriction and defeat forced egress.",
+            "proxy.forced is active, so cplt is ignoring allow_localhost_any. All outbound \
+             traffic must go through the proxy. Allowing any localhost port would disable \
+             kernel network restriction and defeat forced egress.",
         );
     }
 
@@ -1516,9 +1511,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                         // which profile is being reported. Goes to stderr, so it
                         // never contaminates --json output on stdout.
                         ui::info(
-                            "check: no agent specified/detected — checking the 'shell' \
-                             sandbox profile (pass --agent <name> to check a specific \
-                             agent's policy)",
+                            "check: no agent specified or detected, so cplt is checking \
+                             the 'shell' sandbox profile. Pass --agent <name> to check a \
+                             specific agent's policy.",
                         );
                         agent::Agent::Shell
                     } else {
@@ -1587,7 +1582,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             && !resolved.allow_browser
         {
             ui::warn(&format!(
-                "{} signs in through a browser on first run — add --allow-browser \
+                "{} signs in through a browser on first run. Add --allow-browser \
                  if you have not authenticated yet.",
                 active_agent.display_name()
             ));
@@ -1984,7 +1979,7 @@ fn load_subscription_blocklist(resolved: &config::Resolved, quiet: bool) -> Vec<
             ui::warn(&format!(
                 "SHA256 verification failed for blocklist subscription {url}!\n  \
                  Expected: {expected}\n  Got:      {actual}\n  \
-                 Download may be corrupted or tampered with — keeping the last-good cache."
+                 Download may be corrupted or tampered with, so cplt is keeping the last-good cache."
             ));
         }
     }
@@ -2055,12 +2050,12 @@ fn run_update_lists() -> ExitCode {
             }
             subscriptions::UpdateOutcome::CacheKept { url, reason } => {
                 ui::warn(&format!(
-                    "{url}\n    fetch failed ({reason}) — keeping last-good cache"
+                    "{url}\n    fetch failed ({reason}). Keeping last-good cache"
                 ));
             }
             subscriptions::UpdateOutcome::EmptyNoCache { url, reason } => {
                 ui::warn(&format!(
-                    "{url}\n    fetch failed ({reason}) — no cache yet, treated as empty"
+                    "{url}\n    fetch failed ({reason}). No cache yet, treated as empty"
                 ));
             }
             subscriptions::UpdateOutcome::WriteFailed { url, reason } => {
@@ -2075,7 +2070,7 @@ fn run_update_lists() -> ExitCode {
             } => {
                 had_verify_failure = true;
                 ui::error(&format!(
-                    "{url}\n    SHA256 verification FAILED — download REJECTED (tamper?), \
+                    "{url}\n    SHA256 verification FAILED. Download REJECTED (tamper?), \
                      keeping last-good cache\n    Expected: {expected}\n    Got:      {actual}"
                 ));
             }
@@ -2684,7 +2679,7 @@ fn serve_cached_gh_token() -> ExitCode {
         .unwrap_or_default();
 
     if tmpdir.is_empty() {
-        eprintln!("⚠️ BLOCKED by sandbox: 'gh auth token' — no cached token available.");
+        eprintln!("⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available.");
         return ExitCode::FAILURE;
     }
 
@@ -2700,7 +2695,7 @@ fn serve_cached_gh_token() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("⚠️ BLOCKED by sandbox: 'gh auth token' — no cached token available.");
+            eprintln!("⚠️ BLOCKED by sandbox: 'gh auth token'. No cached token available.");
             ExitCode::FAILURE
         }
     }
@@ -3015,16 +3010,16 @@ fn run_exec_command(
     // the user never explicitly chose quiet mode, so we must warn here.
     if resolved.inherit_env {
         ui::warn(
-            "exec: --inherit-env is active — all env vars (including credentials) are passed to the sandbox",
+            "exec: --inherit-env is active, so cplt passes every env var, credentials included, to the sandbox",
         );
     }
     if resolved.allow_docker {
         ui::warn(
-            "exec: --allow-docker is active — container volume mounts bypass sandbox filesystem restrictions",
+            "exec: --allow-docker is active, so container volume mounts bypass sandbox filesystem restrictions",
         );
     }
     if resolved.allow_tmp_exec {
-        ui::warn("exec: --allow-tmp-exec is active — code execution from /tmp is allowed");
+        ui::warn("exec: --allow-tmp-exec is active, so code in /tmp can run");
     }
 
     // Always use the Shell sandbox policy
@@ -3383,7 +3378,7 @@ fn probe_reachable(host: &str, port: u16) -> String {
         return format!("policy allows it, but {host} did not resolve here");
     };
     match std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(4)) {
-        Ok(_) => format!("reachable — connected to {sa} then closed"),
+        Ok(_) => format!("reachable, connected to {sa} then closed"),
         Err(_) => "policy allows it, but the host was not reachable from here".to_string(),
     }
 }
@@ -3650,7 +3645,7 @@ fn build_battery(
             target: "(proxy)".to_string(),
             decision: check::Decision::Inconclusive,
             expected: None,
-            reason: "the CONNECT proxy is disabled — cplt is not filtering domains this run."
+            reason: "the CONNECT proxy is disabled, so cplt is not filtering domains this run."
                 .to_string(),
             fix: Some(
                 "enable it with --with-proxy, or --preset strict for a full lockdown.".to_string(),
@@ -3669,7 +3664,7 @@ fn baseline_note(decision: check::Decision) -> Option<String> {
         check::Decision::Allowed => None,
         check::Decision::Inconclusive => Some("sandbox probe could not be spawned".to_string()),
         check::Decision::Blocked => Some(
-            "baseline access failed — the sandbox may be unavailable here \
+            "baseline access failed. The sandbox may be unavailable here \
              (e.g. running inside another sandbox)"
                 .to_string(),
         ),
@@ -3711,7 +3706,7 @@ fn build_path_check(
             ("covered by a writable rule.".to_string(), None)
         } else if expl.credential {
             (
-                "protected path — writes are denied (deny-by-default).".to_string(),
+                "protected path, writes are denied (deny-by-default).".to_string(),
                 None,
             )
         } else {
@@ -3721,7 +3716,7 @@ fn build_path_check(
             )
         };
         let note = if write_dec == check::Decision::Inconclusive {
-            Some("path does not exist — cannot probe write without creating it".to_string())
+            Some("path does not exist, so cplt cannot probe write without creating it".to_string())
         } else {
             mismatch_note(write_dec, expl.write_decision())
         };
@@ -3790,7 +3785,7 @@ fn resolved_ip_block_item(
         decision: check::Decision::Blocked,
         expected: None,
         reason: format!(
-            "{host} resolves to {} — a private / loopback / link-local IP the proxy blocks \
+            "{host} resolves to {}, a private / loopback / link-local IP the proxy blocks \
              AFTER DNS (BLOCKED-PRIVATE-RESOLVED) as an SSRF / DNS-rebinding safeguard \
              (e.g. cloud metadata 169.254.169.254, internal services).",
             addr.ip()
@@ -3968,7 +3963,7 @@ fn run_doctor() -> ExitCode {
                     );
                 } else {
                     println!(
-                        "    {}✓{} {} — {}",
+                        "    {}✓{} {}: {}",
                         ui::stdout_color(ui::GREEN),
                         ui::stdout_color(ui::RESET),
                         member.relative_path,
@@ -4285,7 +4280,7 @@ fn run_config_get(key: &str) -> ExitCode {
     println!("{value}");
     if !from_file {
         eprintln!(
-            "{}[cplt]{} (default — not set in config file)",
+            "{}[cplt]{} (default, not set in config file)",
             ui::color(ui::BLUE),
             ui::color(ui::RESET)
         );
@@ -4476,7 +4471,7 @@ fn run_config_set_repo(
         && !force
     {
         ui::error(&format!(
-            "{key} is dangerous — it requests weakened security for anyone approving this repo config.\n  \
+            "{key} is dangerous. It requests weakened security for anyone approving this repo config.\n  \
              Add --force to confirm: cplt config set --repo {key} true --force"
         ));
         return ExitCode::FAILURE;
@@ -4688,7 +4683,7 @@ fn run_init_global_command(write: bool, force: bool, quiet: bool) -> ExitCode {
     if report.detections.is_empty() {
         if !quiet {
             eprintln!("No machine-level configuration detected.");
-            eprintln!("Your setup works with cplt defaults — no personal config needed.");
+            eprintln!("Your setup works with cplt defaults, no personal config needed.");
         }
         return ExitCode::SUCCESS;
     }
@@ -4903,7 +4898,7 @@ fn trust_show(project_dir: &std::path::Path, loaded: &repo_config::LoadedRepoCon
         // shown above will NOT auto-apply — surface that honestly.
         if !trust::approved_path_matches(entry, project_dir) {
             println!(
-                "{blue}[cplt]{nc}  {red}⚠ Approved at a different path ({}) — not auto-trusted here.{nc}",
+                "{blue}[cplt]{nc}  {red}⚠ Approved at a different path ({}), not auto-trusted here.{nc}",
                 if entry.repo.path.is_empty() {
                     "unrecorded"
                 } else {
@@ -4953,7 +4948,7 @@ fn trust_accept(
     let proposed = repo_config::proposed_keys(&loaded.config.propose);
 
     if proposed.is_empty() {
-        ui::info("No permissions requested in .cplt.toml — nothing to approve.");
+        ui::info("No permissions requested in .cplt.toml, nothing to approve.");
         return ExitCode::SUCCESS;
     }
 
@@ -5008,7 +5003,7 @@ fn trust_accept(
 
         if hash_mismatch {
             println!(
-                "{}[cplt]{} Proposal values have changed since last approval — re-approval needed.",
+                "{}[cplt]{} Proposal values have changed since the last approval. Re-approve to continue.",
                 ui::stdout_color(ui::YELLOW),
                 ui::stdout_color(ui::RESET),
             );
@@ -5050,7 +5045,7 @@ fn trust_accept(
         }
         let answer = input.trim().to_lowercase();
         if answer != "y" && answer != "yes" {
-            ui::info("Cancelled — no permissions approved.");
+            ui::info("Cancelled. No permissions approved.");
             return ExitCode::SUCCESS;
         }
 
