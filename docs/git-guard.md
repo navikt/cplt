@@ -112,7 +112,7 @@ The explicit block list is enough.
 | **Agent commits on main locally** | Local commit is allowed | Push guard prevents remote effect; human reviews before push |
 | **Wrapper bypass via real binary** | Agent can read wrapper script to find real git path | Wrapper is in scratch dir; kernel blocks writes there but path is readable |
 | **SSH push (if creds available)** | Agent could use raw SSH if keys were accessible | Kernel sandbox blocks `~/.ssh/` access entirely |
-| **Agent modifies `.git/hooks`** | Post-push hooks or other persistence | Kernel sandbox blocks writes to `.git/hooks/` and `.git/config` |
+| **Agent modifies `.git/hooks`** | Post-push hooks or other persistence | Kernel sandbox blocks writes to `.git/hooks/` on both platforms, and to `.git/config` on macOS only. On Linux `.git/config` stays writable, so `core.hooksPath` can still redirect hooks. |
 | **Git credential helper** | Could theoretically extract tokens | `GIT_TERMINAL_PROMPT=0` disables interactive prompts; credential files blocked |
 
 ### Defense in depth
@@ -126,7 +126,7 @@ it. These are the layers around it:
 | AGENTS.md | Instructs agent not to push | Soft (compliance-based) |
 | `GIT_TERMINAL_PROMPT=0` | Blocks interactive credential prompts | Medium |
 | **Git wrapper (this feature)** | Blocks `git push` at command level | Strong (kernel PATH) |
-| Kernel sandbox | Blocks `~/.ssh/`, `.git/hooks` writes | Strongest (unbypassable) |
+| Kernel sandbox | Blocks `~/.ssh/` and `.git/hooks` writes. `.git/config` only on macOS | Strongest (unbypassable) |
 | Server branch protection | Rejects unauthorized pushes server-side | Strongest (server-side) |
 
 Use the git wrapper as the primary enforcement and AGENTS.md as the UX layer, so
