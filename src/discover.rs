@@ -960,9 +960,19 @@ pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
 /// Returns `None` when `dir` is not in a git repository, does not exist, or git
 /// is unavailable. Callers must treat that as a no-op, never an error.
 ///
-/// Unlike [`git_common_dir`] this applies **no** unsafe-root/`$HOME` filtering:
-/// the result is only ever used to place write *denies*, which can never widen
-/// access. `git_common_dir` needs those filters because it also grants access.
+/// Unlike [`git_common_dir`] this applies **no** unsafe-root/`$HOME` filtering.
+/// A path it returns can only ever narrow access, because the caller turns it
+/// into write denies, so there is nothing for a filter to protect against.
+/// `git_common_dir` needs those filters because it also grants access.
+///
+/// The asymmetry runs the other way, and it is the part worth guarding: a
+/// `None` here means the denies are never emitted, so every new reason to
+/// return `None` fails **open**. The three current ones (not a repo, no git,
+/// not a directory) leave nothing to protect. Do not add a refusal that a repo
+/// can trigger through its own config. `rev-parse` is on
+/// `git::CONTENT_FREE_SUBCOMMANDS` for exactly this reason: were it not, a
+/// hostile `filter.*.clean` in a granted repo would make the hardened invoker
+/// refuse, and that repo's `.git/hooks` would lose its deny.
 pub fn git_dir_of(dir: &Path) -> Option<PathBuf> {
     let output = crate::git::command(dir, &["rev-parse", "--git-common-dir"])?
         .output()
