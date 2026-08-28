@@ -376,6 +376,24 @@ forkOptions {
 
 Known affected: `ktlint-gradle` ([JLLeitschuh/ktlint-gradle#1110](https://github.com/JLLeitschuh/ktlint-gradle/issues/1110)). SBPL itself cannot be fixed — macOS sandbox profiles have no primitive for IPv4-mapped addresses, which is why cplt uses the `preferIPv4Stack` workaround at all.
 
+That last claim is not a guess. SBPL accepts only `*` or `localhost` as the host in a `remote ip` rule; a literal address is a parse error, and the `localhost` token does not match an IPv4-mapped connect:
+
+```
+(remote ip "*:*")                  connect succeeds
+(remote ip "localhost:*")          PermissionError [Errno 1] Operation not permitted
+(remote ip "::ffff:127.0.0.1:*")   sandbox-exec: host must be * or localhost in network address
+(remote ip "127.0.0.1:*")          sandbox-exec: host must be * or localhost in network address
+```
+
+So the only rule that would match these workers is `*:*`, which allows every outbound address rather than loopback. `--allow-localhost-any` will not be widened to mean that.
+
+**Workaround until the plugin propagates the environment:** run the affected tasks outside cplt, and keep the rest of the build inside.
+
+```bash
+./gradlew ktlintFormat
+./gradlew ktlintCheck detektMain detektTest build
+```
+
 ## Gradle toolchain JDKs
 
 `~/.gradle` is a dependency store: the sandbox grants read, write, and `file-map-executable` (for JNI libs) but **not** `process-exec`, so a rogue agent cannot drop a binary into the dependency cache and run it. Gradle's toolchain support auto-provisions JDKs into `~/.gradle/jdks`, which lands inside that non-executable tree — forking a toolchain `javac` or test JVM failed with `Operation not permitted`, and no config key could grant exec.
