@@ -634,7 +634,7 @@ Linux-specific tool directories use XDG-style paths:
 2. **No subpath deny.** The entire directory must be allowed or denied. See [Out of scope](#out-of-scope).
 3. **No auth integration.** Linux v1 supports env token and `gh auth` only, with no D-Bus/Secret Service.
 4. **No localhost isolation at kernel level.** Landlock network rules are port-based only and cannot distinguish `localhost:443` from `remote:443`. On macOS, Seatbelt blocks localhost outbound separately. On Linux, use `--with-proxy` for localhost SSRF protection, since the proxy resolves DNS and blocks private IPs.
-5. **`--allow-localhost-any` disables ALL kernel network restriction on Linux.** Landlock is port-based and cannot express "any localhost port but no remote host", so opening all localhost ports means dropping *every* Landlock TCP-connect rule. The result is unrestricted outbound TCP at the kernel level: an agent can raw-socket to any remote `host:port` and exfiltrate directly, not just reach localhost. macOS (Seatbelt) still pins `localhost:*` and is unaffected. cplt emits a prominent warning when this flag is set on Linux. **Prefer `--proxy-forced`**, which supersedes `allow_localhost_any` (see [Proxy-forced mode](#proxy-forced-mode-53)), or scope to specific ports with `--allow-localhost <PORT>`, which keeps kernel connect-restriction on.
+5. **`--allow-localhost-any` disables ALL kernel network restriction on Linux.** Landlock is port-based and cannot express "any localhost port but no remote host", so opening all localhost ports means dropping *every* Landlock TCP-connect rule. The result is unrestricted outbound TCP at the kernel level, so an agent can raw-socket to any remote `host:port` and exfiltrate directly, not just reach localhost. macOS behaves differently. There, `--allow-localhost-any` swaps one SBPL line, replacing `(deny network-outbound (remote ip "localhost:*"))` with the matching allow. The blanket `(deny network-outbound (remote tcp))` and the `*:443` allow are untouched, so remote egress stays scoped to 443 plus any `--allow-port`. Only loopback opens up. cplt emits a prominent warning when this flag is set on Linux. **Prefer `--proxy-forced`**, which supersedes `allow_localhost_any` (see [Proxy-forced mode](#proxy-forced-mode-53)), or scope to specific ports with `--allow-localhost <PORT>`, which keeps kernel connect-restriction on.
 
 ### Layer 3: Input validation
 
@@ -756,14 +756,19 @@ This is **not key theft**. The attacker cannot take the key with them, and opera
 
 #### SBPL network filtering limitations
 
-SBPL has fundamental limits for network filtering:
+Port filtering works. The host part is what SBPL cannot express.
 
-- **No domain-based rules.** SBPL operates at the syscall level, not the application level, so it cannot match on hostnames.
-- **No wildcard port filtering.** There is no syntax for "allow any host on port 443 only".
-- **IP-based rules require known IPs.** Copilot's API endpoints use CDN-backed IPs that change regularly.
-- **No loopback-only bind.** SBPL accepts only `*` or `localhost` as the host part of IP filters. Literal IPs like `127.0.0.1` produce `"host must be * or localhost"` errors. The `localhost` host matches `INADDR_ANY` (`0.0.0.0`), so `(allow network-bind (local ip "localhost:*"))` also permits binding on all interfaces. This is a macOS Seatbelt limitation, and it means processes inside the sandbox can start listeners reachable on the network. Mitigations: outbound is locked to port 443 so there is no exfiltration via inbound connections, dev machines are typically behind NAT/firewall, and the proxy intercepts all outbound traffic.
+**Ports are filterable, and cplt relies on it.** `(allow network-outbound (remote ip "*:443"))` permits 443 and nothing else, and `(allow network-outbound (remote ip "*:48443"))` permits 48443 while 48080 stays denied. This is verified against the kernel, not inferred. `src/sandbox_profile.rs` emits exactly these rules: a blanket `(deny network-outbound (remote tcp))`, then `*:443`, then one `*:PORT` per `--allow-port`, then the localhost deny or allow, then a `localhost:PORT` carve-out per proxy port and `--allow-localhost` port. SBPL is last-match-wins, so the ordering is the policy.
 
-The only viable options are `(allow network-outbound (remote tcp))` (allow all) or `(deny network*)` (deny all). We allow outbound TCP because Copilot cannot function without network access, and use port restrictions as a secondary control.
+**The host part accepts only `*` or `localhost`.** A literal address such as `127.0.0.1` or `140.82.121.4` is a parse error, `"host must be * or localhost"`. So a rule can say "any host on this port" or "loopback on this port", and nothing narrower.
+
+What follows from that:
+
+- **No domain-based rules.** SBPL operates at the syscall level, not the application level, so it cannot match on hostnames. Domain filtering is the CONNECT proxy's job, see [Layer 2](#layer-2-connect-proxy-logging-and-domain-filtering).
+- **No IP allowlisting.** Even if Copilot's API endpoints had stable IPs, which they do not, being CDN-backed, SBPL could not name them.
+- **No loopback-only bind.** The `localhost` host matches `INADDR_ANY` (`0.0.0.0`), so `(allow network-bind (local ip "localhost:*"))` also permits binding on all interfaces. Processes inside the sandbox can therefore start listeners reachable on the network. Mitigations: outbound is locked to port 443 so there is no exfiltration via inbound connections, dev machines are typically behind NAT or a firewall, and the proxy intercepts all outbound traffic.
+
+Port scoping is the kernel-level control; domain and host scoping happens one layer up, in the proxy.
 
 #### Current state
 
@@ -800,11 +805,11 @@ curl -fsSL -o SHA256SUMS "https://github.com/navikt/cplt/releases/latest/.../SHA
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
-### Discovery and `--doctor`
+### Discovery and `cplt doctor`
 
-`cplt --doctor` probes the environment by running `--version` on all known agent binaries found in PATH (copilot, opencode, gemini, claude). These commands run **outside the sandbox** with full user privileges.
+`cplt doctor` probes the environment by running `--version` on all known agent binaries found in PATH (copilot, opencode, gemini, claude). These commands run **outside the sandbox** with full user privileges.
 
-Trust model: cplt trusts that binaries in your PATH are legitimate, the same trust model as typing `copilot --version` yourself. If you don't trust a binary in your PATH, remove it before running `--doctor`.
+Trust model: cplt trusts that binaries in your PATH are legitimate, the same trust model as typing `copilot --version` yourself. If you don't trust a binary in your PATH, remove it before running `cplt doctor`.
 
 ### Config file trust model
 
@@ -835,31 +840,39 @@ These test core logic without invoking `sandbox-exec`, using the real library fu
 | Env behavior | 17 | Sanitization, hardening injection, pass-env overrides, LANG prefix leak prevention, YARN hardening bypass prevention, scratch dir TMPDIR redirect, JAVA_TOOL_OPTIONS injection/append/override |
 | Config parsing | 24 | TOML parsing, CLI/config merge precedence, tilde expansion, SBPL validation, scratch dir, allow-tmp-exec |
 
-### Integration tests (macOS only, 39 tests)
+### Integration tests (macOS only, 54 tests)
 
 These invoke `sandbox-exec` with real Seatbelt profiles and verify **kernel-level enforcement**:
 
 | Category | Tests | What's verified |
 |---|---|---|
-| File access | 5 | Project read/write, copilot config, temp write, process execution |
-| Sensitive dir blocks | 4 | `~/.ssh`, `~/.aws`, `~/.docker`, `~/.kube` blocked |
-| Network | 6 | Outbound blocked, JVM Attach socket allowed, MSBuild worker-node socket allowed (persistent MSBuild Server socket stays blocked), SSH agent blocked, `/tmp` sockets blocked, localhost TCP bind on all interfaces (SBPL "localhost" doesn't match Java mapped addresses), `--allow-localhost-any` + `--allow-jvm-attach` opens all outbound TCP |
-| Binary CLI | 4 | Version, help, root/home dir rejection |
-| Tool dir permissions | 15 | Each HOME_TOOL_DIR has correct exec/map-exec/write at kernel level |
+| File access | 7 | Project read/write, copilot config, temp write, process execution, `git` execution, Copilot package dir write blocked |
+| Sensitive dir and file blocks | 8 | `~/.ssh`, `~/.aws`, `~/.docker`, `~/.kube`, `.netrc`, `.npmrc`, credentials planted in a temp `HOME`, and `--deny-path` overriding `--allow-read` |
+| Git repository protection | 5 | Writes to `.git/hooks`, `.git/config`, `.gitmodules`, and `.cplt.toml` blocked; local git config and the global ignore file stay readable |
+| Temp and scratch exec | 3 | Exec from `/tmp` blocked by default, allowed with `--allow-tmp-exec`, allowed inside the scratch dir |
+| Env files | 4 | `.env` read, symlink read, and delete blocked; allowed with `--allow-env-files` |
 | GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |
+| Network | 9 | Outbound blocked by default, `*:443` allowed, localhost blocked by default and allowed with `--allow-localhost-any`, Java localhost with and without `preferIPv4Stack`, localhost TCP bind, the wildcard-bind SBPL limitation, and proxy-forced pinning `localhost:<port>` while dropping `*:443` |
+| Unix sockets | 6 | JVM Attach sockets in `/tmp` and `/var/folders` allowed, MSBuild worker-node socket allowed and blocked without the flag, SSH agent blocked, arbitrary `/tmp` sockets blocked |
+| Clipboard | 3 | `--deny-clipboard` blocks `pbpaste` and `pbcopy`, `pbpaste` works by default |
+| Binary CLI | 5 | Version, help, root/home dir rejection, `--print-profile` under proxy-forced |
 
-### E2E project tests (macOS only, 38 tests)
+### E2E project tests (macOS only, 49 tests)
 
-End-to-end tests using realistic project scaffolding (Node, Go, Python, Rust, Java/Maven, Kotlin) with fake copilot scripts:
+End-to-end tests using realistic project scaffolding (Node, Go, Python, Rust, Java/Maven, Kotlin/Ktor, .NET) with fake agent scripts:
 
 | Category | Tests | What's verified |
 |---|---|---|
-| Per-language file ops | 7 | Read/write files in Node, Go, Python, Rust, Maven, Kotlin/Maven, multi-module Maven project structures |
-| Git workflows | 2 | git init/commit/status/diff/log, multi-step edit cycles |
-| Security matrix | 2 | Secret files blocked (.env, .pem, .key), home secrets (~/.ssh, ~/.aws) |
-| Mode combinations | 7 | allow-env-files, scratch-dir exec, deny-path, config file, deny-path + scratch-dir, allow-lifecycle-scripts, JAVA_TOOL_OPTIONS injection |
-| Git persistence | 1 | Cannot write .git/hooks or .git/config |
-| Lifecycle scripts | 3 | npm/yarn/pnpm lifecycle script hardening |
+| Per-language file ops | 9 | Read/write files in Node, Go, Python, Rust, Ktor, Maven, Kotlin/Maven, and multi-module Maven layouts |
+| Git workflows and persistence | 8 | init/commit/status/diff/log, multi-step edit cycles, `.git/hooks` writes blocked including via a nested or renamed git dir, a granted sibling repo, and a bare repo |
+| Post-session audit | 1 | The audit report names the writable roots it did not audit |
+| Security matrix | 4 | Secret files blocked (`.env`, `.pem`, `.key`), all `.env` spellings blocked, home secrets (`~/.ssh`, `~/.aws`), env var sanitization |
+| Mode combinations | 7 | allow-env-files, scratch-dir exec, deny-path, config file, external allow-read, proxy mode, spawning common tools |
+| Proxy behavior | 5 | Proxy env vars injected and absent without the flag, port filtering, allowlist blocking an unlisted domain, audit log written |
+| Go toolchain | 4 | `go build`, `go test` with the scratch dir, `GOCACHE` redirect, `go test` blocked without a scratch dir |
+| .NET and MSBuild | 3 | `dotnet build` with `--allow-msbuild`, the MSBuild Server env opt-out, the socket blocked without the flag |
+| Gradle | 3 | Build over the Gradle daemon unix socket, the daemon socket itself, macOS Gradle sandbox opt-out |
+| JVM env and exec | 5 | Maven env passthrough, `JAVA_TOOL_OPTIONS` injection and append, native lib exec from the JVM tmpdir, JVM cache dir permissions |
 
 ### Smoke tests (macOS only, 6 tests, `#[ignore]`)
 
