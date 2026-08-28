@@ -11,8 +11,30 @@ The git guard is opt-in and disabled by default.
 
 ```bash
 cplt config set git_guard.enabled true
-cplt config set git_guard.prevent_push true                  # block git push/request-pull/send-pack
+cplt config set git_guard.prevent_push true                  # block git push/request-pull/send-pack (default true)
+cplt config set git_guard.prevent_force_push true            # block force push (default true)
 cplt config set git_guard.protect_default_branch_only false  # block all pushes (default)
+cplt config set git_guard.mode block                         # block | warn | audit (default block)
+```
+
+`mode` controls what happens on a block. `block` prints the message and exits
+non-zero. `warn` prints `⚠️  WARNING (would block): …` and runs the command
+anyway. `audit` prints `[audit] git-gate: would block: …` and runs it. Use
+`warn` or `audit` during a rollout to find out what would break before you
+enforce.
+
+`git_guard.allow_push` is a structured exception list for the cases where a
+push has to go through. Each entry may name a `remote`, a list of `branches`
+(glob patterns), and whether `force` is permitted. An entry matches only if
+every constraint it sets matches, and a force push needs `force = true`. It is
+marked dangerous, so setting it takes `--force`. Because it is an array of
+tables, write it in the config file directly:
+
+```toml
+[[git_guard.allow_push]]
+remote = "origin"
+branches = ["renovate/*", "dependabot/*"]
+force = false
 ```
 
 <details>
@@ -43,18 +65,26 @@ target branch:
 | `git push origin master` | `master` | Blocked |
 | `git push origin HEAD:refs/heads/main` | `main` (from refspec) | Blocked |
 | `git push origin HEAD:main` | `main` (from refspec) | Blocked |
-| `git push` (bare) | none, no explicit target | Allowed, conservatively assumed to be a feature branch |
-| `git push origin` | none, no branch given | Allowed |
-| `git push --force origin feature/x` | `feature/x` | Allowed, force-push to a feature branch |
+| `git push` (bare) | resolved from the current branch via the real git | Allowed on a feature branch, blocked on `main`/`master`, blocked if the branch cannot be resolved |
+| `git push origin` | same, no branch in the arguments | Allowed on a feature branch, blocked on `main`/`master`, blocked if the branch cannot be resolved |
+| `git push --force origin feature/x` | `feature/x` | Blocked while `prevent_force_push` is on, which is the default |
 | `git push --force origin main` | `main` | Blocked |
 
 The default branch names are `main` and `master`, recognized with or without an
-`origin/` prefix.
+`origin/` prefix. When several refspecs are given, the guard checks all of them
+and blocks if any names a default branch, so `git push origin feature main`
+does not slip through.
 
-**Security note:** This mode is intentionally permissive. The agent can push
-to any non-default branch. The human review gate becomes the pull request,
-not the push prevention itself. Use full `prevent_push = true` if you want
-no pushes at all.
+A push with no branch in the arguments is not waved through. The guard shells
+out to the real git to resolve the current branch, and fails closed when it
+cannot: an unresolvable branch counts as protected and the push is blocked.
+
+**Security note:** This mode is intentionally permissive about branches. The
+agent can push to any non-default branch, and the human review gate becomes the
+pull request rather than the push prevention itself. Force push stays blocked
+even on a feature branch while `prevent_force_push` is on, which is the
+default. Use full `prevent_push = true` with `protect_default_branch_only =
+false` if you want no pushes at all.
 
 ## How it works
 
@@ -63,7 +93,7 @@ A wrapper script lives in the sandbox's scratch directory, which is prepended to
 `cplt git-gate` for evaluation:
 
 ```
-cplt git-gate --real-git /usr/bin/git --mode block --prevent-push true --prevent-force-push true -- push origin feature/x
+cplt git-gate --real-git /usr/bin/git --mode=block --prevent-push=true --prevent-force-push=true --protect-default-branch-only=false -- push origin feature/x
 ```
 
 If the gate allows the command, the wrapper `exec`s the real `git` and the agent
@@ -77,6 +107,18 @@ non-zero.
 | `git push` | Remote write, a human should review and push |
 | `git request-pull` | Initiates upstream merge requests |
 | `git send-pack` | Plumbing equivalent of push, also a remote write |
+| `git subtree push` | A remote write in subtree clothing. The local forms `add`, `pull`, `split`, and `merge` stay allowed |
+| `git remote add origin …`, `git remote set-url origin …`, `git remote rename <old> origin` | Retargets the `origin` remote, which is where the gh guard reads the enforced repo scope from |
+| `git config remote.origin.url …`, `git config remote.origin.pushurl …` | Same retargeting, through config instead of the `remote` subcommand |
+| `git config url.<base>.insteadOf …`, `…pushInsteadOf …` | git's URL-rewrite rules silently redirect transport for any matching URL |
+| `git -c alias.<name>=<cmd> …` | An alias defined on the command line expands inside the real git, after the guard has already decided |
+| Any unrecognized subcommand | See below |
+
+Remote-URL mutation is blocked whenever the guard is active, not only under
+`prevent_push`. Read-only inspection stays allowed: `git remote -v`,
+`git remote get-url origin`, `git config --get remote.origin.url`, and the other
+read forms. Managing remotes other than `origin`, such as
+`git remote add upstream …`, is also allowed.
 
 ### Flag detection
 
@@ -88,20 +130,29 @@ The guard also spots the force-push flags on `git push`:
 | `--force-with-lease` | Including the `--force-with-lease=ref` form |
 | `--force-if-includes` | Modern force-push variant |
 
-When `protect_default_branch_only` is active, force-push to a feature branch is
-allowed, since that is the agent's own branch. Force-push to a default branch is
-always blocked.
+Force push is blocked wherever it lands while `prevent_force_push` is on, which
+is the default, including on a feature branch under
+`protect_default_branch_only`. Set `git_guard.prevent_force_push = false` if you
+want the agent to be able to force-push its own branch. Force push to a default
+branch is always blocked.
 
 ## Allowed commands
 
-Everything else passes through unchanged: `commit`, `add`, `branch`,
-`checkout`, `merge`, `rebase`, `fetch`, `pull`, `log`, `diff`, `status`,
-`stash`, `tag`, `remote`, `config` (read), etc.
+The guard holds an explicit allowlist of read-only, local-write, and
+remote-read subcommands: `status`, `log`, `show`, `diff`, `blame`, `bisect`,
+`branch`, `checkout`, `switch`, `merge`, `rebase`, `cherry-pick`, `revert`,
+`reset`, `restore`, `stash`, `tag`, `worktree`, `add`, `rm`, `mv`, `clean`,
+`commit`, `am`, `apply`, `fetch`, `pull`, `clone`, `ls-remote`, `remote`,
+`config`, `submodule`, `lfs`, `subtree`, and the read and local-packing
+plumbing (`cat-file`, `rev-parse`, `ls-files`, `pack-objects`, `gc`, and so on).
+`src/gh_proxy.rs` holds the full list.
 
-**Default-allow, unlike the gh guard.** The gh guard is default-deny. The git
-guard is not, because git has hundreds of plumbing commands, aliases, and
-extensions, and push is the only remote-write git command that needs blocking.
-The explicit block list is enough.
+**Default-deny while push prevention is active.** An unrecognized subcommand is
+blocked, not passed through, whenever `prevent_push` is on. An agent can define
+an alias that resolves to a blocked subcommand, and git expands aliases inside
+the real binary after the guard has approved the command, so anything the guard
+cannot classify has to be refused. If only `prevent_force_push` is on, the
+guard checks force flags on `push` and lets everything else through.
 
 ## Security boundaries
 
@@ -145,20 +196,23 @@ This requires developer approval (`cplt trust accept`) before taking effect.
 
 ## Error messages
 
-When a push is blocked, the agent sees:
+Every block starts with `⚠️ BLOCKED by sandbox:`, followed by the reason, what
+is still allowed, and a line asking the agent to note it for the human operator
+and carry on. The opening lines:
 
 ```
-[cplt] BLOCKED: git push is not allowed inside the sandbox.
-       The human developer should review changes and push manually.
-       To allow feature-branch pushes: set git_guard.protect_default_branch_only = true
+⚠️ BLOCKED by sandbox: 'git push' is not allowed in this environment.
+⚠️ BLOCKED by sandbox: 'git push --force' is not allowed in this environment.
+⚠️ BLOCKED by sandbox: 'git subtree push' is not allowed in this environment.
+⚠️ BLOCKED by sandbox: 'git frobnicate' is not a recognized subcommand.
+⚠️ BLOCKED by sandbox: 'git remote' would change a remote's URL.
+⚠️ BLOCKED by sandbox: 'git -c alias.*' is not allowed.
 ```
 
-When only default branch is blocked:
-
-```
-[cplt] BLOCKED: git push to 'main' is not allowed.
-       Push to feature branches instead. The human developer merges to main.
-```
+In `warn` mode the same text is prefixed with `⚠️  WARNING (would block):` and
+the command runs anyway. In `audit` mode the prefix is
+`[audit] git-gate: would block:`. The full message bodies live in
+`src/gh_proxy.rs`.
 
 ## Testing
 
