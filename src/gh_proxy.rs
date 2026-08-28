@@ -1617,7 +1617,7 @@ fn gate_with_scope_resolver(
     {
         return Err(
             "⚠️ BLOCKED by sandbox: revealing the GitHub token is not allowed in this environment.\n\
-             Reason: token exfiltration prevention — use GH_TOKEN env var instead.\n\
+             Reason: token exfiltration prevention. Use the GH_TOKEN env var instead.\n\
              This operation is restricted by the cplt sandbox to prevent credential leaks.\n\
              Please make a note of this for the human operator and continue with your remaining work."
                 .to_string(),

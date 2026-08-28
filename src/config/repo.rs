@@ -57,8 +57,8 @@ pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
 pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
     match (key_info.section, key_info.key) {
         ("sandbox", "preset") => {
-            "composes multiple dangerous permissions (docker, tmp exec, ...) — \
-             a repo must request individual keys so each can be reviewed and trusted"
+            "composes multiple dangerous permissions (docker, tmp exec, ...). \
+             A repo must request individual keys so each can be reviewed and trusted"
         }
         ("sandbox", "quiet") => "controls local CLI output, not project sandbox policy",
         ("sandbox", "validate") => "controls local validation behavior, not project policy",
@@ -68,12 +68,12 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
             "depends on bwrap being installed locally, not project policy"
         }
         ("sandbox", "inherit_env") => {
-            "too dangerous for repo config — would affect all team members"
+            "too dangerous for repo config, it would affect all team members"
         }
         ("sandbox", "pass_env") => "environment variables are machine-specific, not project policy",
         ("sandbox", "allow_cache_exec") => "cache paths are machine-specific, not project policy",
         ("sandbox", "allow_cache_exec_any") => {
-            "too dangerous for repo config — would affect all team members"
+            "too dangerous for repo config, it would affect all team members"
         }
         ("proxy", "enabled") => "proxy settings are machine-specific, not project policy",
         ("proxy", "forced") => "proxy settings are machine-specific, not project policy",
@@ -96,7 +96,7 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
         | ("proxy", "subscriptions.blocklists")
         | ("proxy", "subscriptions.refresh") => {
             "subscription sources are machine/network-specific and security-sensitive, \
-             not project policy — a repo must not be able to add a subscription"
+             not project policy. A repo must not be able to add a subscription"
         }
         ("proxy", "upstream") => {
             "the corporate proxy is machine/network-specific, not project policy"

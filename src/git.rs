@@ -351,8 +351,8 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
         // site, so reaching it means someone added one and needs to know the
         // call was refused rather than quietly degraded.
         crate::ui::warn(&format!(
-            "refusing git invocation with a value-taking global flag: {args:?} \
-             — put config overrides in git::CONFIG_OVERRIDES instead"
+            "refusing git invocation with a value-taking global flag: {args:?}. \
+             Put config overrides in git::CONFIG_OVERRIDES instead."
         ));
         return None;
     }
@@ -436,9 +436,9 @@ fn warn_refused_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::ui::warn(
-            "repository config defines a git content filter (filter.*.clean/process); \
-             skipping working-tree git queries so the filter is not executed outside \
-             the sandbox — see cplt issue #210",
+            "repository config defines a git content filter (filter.*.clean/process). \
+             cplt is skipping working-tree git queries so the filter never runs outside \
+             the sandbox. See cplt issue #210.",
         );
     });
 }

@@ -235,14 +235,14 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
         {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
-                message: "sandbox.allow_gpg_signing = true: GPG agent socket exposed — signing requests possible (DANGEROUS)"
+                message: "sandbox.allow_gpg_signing = true exposes the GPG agent socket, which makes signing requests possible (DANGEROUS)"
                     .to_string(),
             });
         }
         if sandbox.get("allow_docker").and_then(toml::Value::as_bool) == Some(true) {
             diagnostics.push(ConfigDiagnostic {
                 level: DiagnosticLevel::Warning,
-                message: "sandbox.allow_docker = true: Docker socket exposed — container mounts bypass sandbox (DANGEROUS)"
+                message: "sandbox.allow_docker = true exposes the Docker socket, and container mounts bypass the sandbox (DANGEROUS)"
                     .to_string(),
             });
         }

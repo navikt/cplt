@@ -182,7 +182,7 @@ pub fn explain_path(
 
     let (reason, fix) = if credential && !acc.read {
         (
-            "protected credential path — never exposed to the agent (deny-by-default). \
+            "protected credential path, never exposed to the agent (deny-by-default). \
              This is intentional."
                 .to_string(),
             None,
@@ -213,7 +213,7 @@ pub fn explain_path(
         )
     } else {
         (
-            "not covered by any allow rule — denied by default.".to_string(),
+            "not covered by any allow rule, so it is denied by default.".to_string(),
             Some(
                 "grant access with --allow-read <PATH> (read) or --allow-write <PATH> (read+write), \
                  or add it under [allow] read/write in config."
@@ -278,7 +278,7 @@ pub fn explain_domain(
     let (decision, reason, fix) = match verdict {
         NetVerdict::Allowed => (
             Decision::Allowed,
-            "permitted by the proxy policy — cplt is not blocking this.".to_string(),
+            "permitted by the proxy policy, cplt is not blocking this.".to_string(),
             None,
         ),
         NetVerdict::BlockedPort => (
@@ -309,7 +309,7 @@ pub fn explain_domain(
         ),
         NetVerdict::BlockedPrivate => (
             Decision::Blocked,
-            "private / loopback / link-local target — blocked as an SSRF safeguard \
+            "private / loopback / link-local target, blocked as an SSRF safeguard \
              (e.g. cloud metadata 169.254.169.254, internal services)."
                 .to_string(),
             Some(
@@ -389,9 +389,9 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
         } else {
             ExecExplain {
                 decision: Decision::Blocked,
-                reason: "Docker access is gated off — the daemon socket and ~/.docker are denied \
-                         (allow_docker=off). It is dangerous: socket access is effectively host RCE \
-                         and volume mounts bypass the sandbox filesystem."
+                reason: "Docker access is gated off. cplt denies the daemon socket and \
+                         ~/.docker (allow_docker=off) because socket access is effectively \
+                         host RCE and volume mounts bypass the sandbox filesystem."
                     .to_string(),
                 fix: Some(
                     "--allow-docker, or [sandbox] allow_docker = true (or --preset full-trust)."
@@ -491,7 +491,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
 
     ExecExplain {
         decision: Decision::Allowed,
-        reason: "not specifically gated — runs inside the sandbox, subject to the \
+        reason: "not specifically gated. It runs inside the sandbox, subject to the \
                  filesystem, network, and env policy."
             .to_string(),
         fix: None,
@@ -632,7 +632,7 @@ impl Report {
             } else {
                 let _ = writeln!(
                     out,
-                    "→ Sandbox is NOT ENFORCING — {} · {}",
+                    "→ Sandbox is NOT ENFORCING. {} · {}",
                     self.failure_summary(),
                     suffix
                 );

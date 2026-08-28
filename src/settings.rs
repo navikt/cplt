@@ -912,10 +912,7 @@ fn render(frame: &mut ratatui::Frame, app: &mut SettingsApp) {
             } else {
                 ""
             };
-            format!(
-                "{}.{} — {}{}",
-                key.section, key.key, key.description, danger
-            )
+            format!("{}.{}: {}{}", key.section, key.key, key.description, danger)
         },
     );
     let footer = format!(

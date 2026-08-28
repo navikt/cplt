@@ -766,7 +766,7 @@ impl Agent {
                 if is_wsl_interop_binary(&resolved, wsl) {
                     if windows_interop.is_none() {
                         ui::warn(&format!(
-                            "Ignoring {} — Windows install reached through WSL interop",
+                            "Ignoring {}, it is a Windows install reached through WSL interop",
                             resolved.display()
                         ));
                         windows_interop = Some(resolved);
@@ -816,10 +816,10 @@ impl Agent {
             return Err(format!(
                 "{} resolves to a Windows install reached through WSL interop:\n  \
                  {}\n  \
-                 Under WSL, /mnt/<drive>/ is the Windows filesystem: that binary is a Windows \
-                 executable (npm installs it as a shim that execs `node`), so it cannot run in \
-                 the Linux sandbox — and unless you installed Node in the distro too, the shim \
-                 has no `node` to exec.\n  \
+                 Under WSL, /mnt/<drive>/ is the Windows filesystem, so that binary is a \
+                 Windows executable (npm installs it as a shim that execs `node`) and cannot \
+                 run in the Linux sandbox. Unless you installed Node in the distro too, the \
+                 shim also has no `node` to exec.\n  \
                  Fix: install Node and the agent inside the WSL distro. {install_hint}",
                 self.display_name(),
                 win.display()

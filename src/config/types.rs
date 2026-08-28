@@ -167,13 +167,13 @@ impl<'de> Deserialize<'de> for UnknownCommandPolicy {
 /// `standard`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Preset {
-    /// Locked-down posture: no localhost, env files, tmp exec, docker, or
-    /// lifecycle scripts, AND gh_guard + git_guard + forced-proxy egress on.
+    /// Locked down. No localhost, env files, tmp exec, docker, or lifecycle
+    /// scripts, AND gh_guard + git_guard + forced-proxy egress on.
     Strict,
-    /// The current defaults (scratch dir stays on; all five toggles off, no
-    /// guards, no forced proxy).
+    /// The current defaults. Scratch dir stays on, all five toggles off, no
+    /// guards, no forced proxy.
     Standard,
-    /// Developer-friendly: localhost, tmp exec, and lifecycle scripts on.
+    /// Developer-friendly. Localhost, tmp exec, and lifecycle scripts on.
     Permissive,
     /// Everything allowed (equivalent to enabling all five toggles).
     #[value(name = "full-trust")]

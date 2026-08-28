@@ -92,7 +92,7 @@ pub enum UpdateError {
     CodesignFailed,
 
     #[error(
-        "Version mismatch: binary reports '{got}' but release tag expects '{expected}'.\n  This is a release pipeline bug — the binary was built with a different version than the tag."
+        "Version mismatch: binary reports '{got}' but release tag expects '{expected}'.\n  This is a release pipeline bug. The binary was built with a different version than the tag."
     )]
     VersionMismatch { expected: String, got: String },
 }

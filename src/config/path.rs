@@ -47,8 +47,8 @@ pub fn default_config_contents() -> String {
 [proxy]
 # enabled = true
 # Force all egress through the proxy: makes the proxy mandatory and restricts
-# kernel-level egress to the proxy port only (no direct *:443). Fails closed —
-# if the proxy cannot start, the agent is not launched. (default: false)
+# kernel-level egress to the proxy port only (no direct *:443). Fails closed.
+# If the proxy cannot start, the agent is not launched. (default: false)
 # forced = false
 # port = 0  # 0 = OS-assigned ephemeral port (avoids conflicts, default)
 # blocked_domains = "~/.config/cplt/blocked-domains.txt"
@@ -75,10 +75,10 @@ pub fn default_config_contents() -> String {
 # NO_PROXY). Only meaningful together with `upstream`. Suffix matching:
 # "example.com" covers all its subdomains. The ambient NO_PROXY/no_proxy env var
 # is merged in automatically. All of cplt's domain/port/SSRF filtering still
-# applies — a listed host is just connected directly instead of forwarded.
+# applies. A listed host is just connected directly instead of forwarded.
 # upstream_no_proxy = ["internal.example.com"]
 #
-# Subscribable blocklists (issue #144). GLOBAL-only, tighten-only, opt-in — no
+# Subscribable blocklists. GLOBAL-only, tighten-only, opt-in. No
 # subscription is enabled by default, so leaving this unset keeps today's
 # behavior. Cached lists are UNIONed into the effective blocklist (they can only
 # ADD blocks). Fetch with `cplt update-lists`. A fetch/verify failure falls back
@@ -87,7 +87,7 @@ pub fn default_config_contents() -> String {
 # [proxy.subscriptions]
 # refresh = "manual"   # "manual" (default), "daily", or "weekly"
 # blocklists = [
-#     # cplt-maintained default blocklist (opt-in — add it yourself):
+#     # cplt-maintained default blocklist (opt-in, add it yourself):
 #     "https://raw.githubusercontent.com/navikt/cplt/main/blocked-domains.txt",
 #     # Pin a sha256 to reject tampered downloads:
 #     # { url = "https://example.com/blocklist.txt", sha256 = "<64-hex>" },
@@ -135,7 +135,7 @@ pub fn default_config_contents() -> String {
 # Supported: copilot, opencode, gemini, antigravity, pi, claude, shell
 # agent = "copilot"
 #
-# Named policy preset — sets a baseline for the five sandbox toggles below
+# Named policy preset. Sets a baseline for the five sandbox toggles below
 # (allow_localhost_any, allow_env_files, allow_tmp_exec, allow_docker,
 # allow_lifecycle_scripts). Individual keys still override the preset.
 #   strict      = all five off (deny-default)
@@ -152,27 +152,27 @@ pub fn default_config_contents() -> String {
 # validate = true
 #
 # Allow Copilot to read .env files and private keys (.pem, .key)
-# in the project directory. Blocked by default — these often contain
+# in the project directory. Blocked by default, because these often contain
 # secrets that a rogue agent could exfiltrate via HTTPS.
 # allow_env_files = false
 #
 # Allow npm/yarn/pnpm lifecycle scripts (postinstall hooks) to run.
-# Blocked by default — supply chain attacks (e.g. axios March 2026)
+# Blocked by default. Supply chain attacks (e.g. axios March 2026)
 # use postinstall hooks to execute malicious payloads.
 # allow_lifecycle_scripts = false
 #
 # DANGEROUS: Allow GPG commit/tag signing inside the sandbox.
 # Exposes the GPG agent socket so gpg can request signatures.
-# Private keys remain protected — only the public keyring and agent
-# socket are accessible. A compromised process cannot extract the key,
+# Private keys stay protected. Only the public keyring and agent
+# socket are reachable. A compromised process cannot extract the key,
 # but it CAN request arbitrary signatures while the session is active.
 # allow_gpg_signing = false
 #
 # Allow JVM Attach API unix sockets in /tmp.
 # Needed for JVM testing frameworks that use runtime self-attach:
 # MockK inline mocking, Mockito inline agents, ByteBuddy, JMX tools.
-# Only allows sockets matching /tmp/.java_pid<PID> — SSH agent and
-# all other unix sockets in /tmp remain blocked.
+# Only allows sockets matching /tmp/.java_pid<PID>. The SSH agent and
+# all other unix sockets in /tmp stay blocked.
 # Enable this if you work with Kotlin/Java projects that use inline mocking.
 # allow_jvm_attach = false
 #
@@ -180,9 +180,9 @@ pub fn default_config_contents() -> String {
 # Needed for `dotnet build`, which forks worker nodes that communicate with
 # the client over a Unix domain socket at /tmp/MSBuild<PID>.
 # This does NOT allow the persistent MSBuild Server (MSBuildServer-<hash>),
-# which stays blocked — reuse of that server is also disabled via
-# DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1. SSH agent and all other unix
-# sockets in /tmp remain blocked.
+# which stays blocked. cplt also disables reuse of that server via
+# DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1. The SSH agent and all other unix
+# sockets in /tmp stay blocked.
 # Enable this if you work with .NET/MSBuild projects.
 # allow_msbuild = false
 #
@@ -242,12 +242,12 @@ pub fn default_config_contents() -> String {
 # allow_cache_exec = []
 #
 # DANGEROUS: Allow process execution from ALL ~/Library/Caches subdirectories.
-# Much broader than allow_cache_exec — prefer specifying exact subdirs.
+# Much broader than allow_cache_exec. Prefer specifying exact subdirs.
 # allow_cache_exec_any = false
 #
 # Allow the agent to open URLs in your default browser.
 # Needed for OAuth code flows (MCP servers, Gemini CLI, gh auth login).
-# Disabled by default because it lets the agent leverage your browser session.
+# Disabled by default because it lets the agent use your browser session.
 # allow_browser = false
 #
 # Suppress the startup configuration summary and non-essential messages.

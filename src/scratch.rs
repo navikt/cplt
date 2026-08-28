@@ -70,8 +70,8 @@ impl ScratchDir {
         let expected_prefix = canonical_home.join(SCRATCH_BASE);
         if canonical_base != expected_prefix {
             return Err(format!(
-                "Scratch base resolved to {} but expected {} — \
-                 an ancestor directory may be a symlink",
+                "Scratch base resolved to {} but expected {}. \
+                 An ancestor directory may be a symlink",
                 canonical_base.display(),
                 expected_prefix.display()
             ));
@@ -211,7 +211,7 @@ fn validate_dir_safety(path: &Path) -> Result<(), String> {
     // Must be a real directory, not a symlink
     if metadata.file_type().is_symlink() {
         return Err(format!(
-            "Scratch base {} is a symlink — refusing to use it",
+            "Scratch base {} is a symlink, cplt refuses to use it",
             path.display()
         ));
     }
@@ -227,7 +227,7 @@ fn validate_dir_safety(path: &Path) -> Result<(), String> {
     let my_uid = unsafe { libc::getuid() };
     if metadata.uid() != my_uid {
         return Err(format!(
-            "Scratch base {} is owned by uid {}, expected {} — refusing to use it",
+            "Scratch base {} is owned by uid {}, expected {}. cplt refuses to use it",
             path.display(),
             metadata.uid(),
             my_uid

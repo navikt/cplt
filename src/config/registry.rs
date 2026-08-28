@@ -127,7 +127,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::StrArray,
         dangerous: false,
         default_display: "[]",
-        description: "Hosts that BYPASS the upstream proxy and are connected to directly (like NO_PROXY). Only meaningful with proxy.upstream. Suffix matching: \"example.com\" covers all subdomains; CIDR/IP ranges are NOT honored. Merged additively with the ambient NO_PROXY/no_proxy environment. All of cplt's domain/port/SSRF filtering still applies — so an internal host that resolves to a private IP is BLOCKED (403) unless you ALSO add it to proxy.allow_private_domains.",
+        description: "Hosts that BYPASS the upstream proxy and are connected to directly (like NO_PROXY). Only meaningful with proxy.upstream. Suffix matching: \"example.com\" covers all subdomains; CIDR/IP ranges are NOT honored. Merged additively with the ambient NO_PROXY/no_proxy environment. All of cplt's domain/port/SSRF filtering still applies, so an internal host that resolves to a private IP is BLOCKED (403) unless you ALSO add it to proxy.allow_private_domains.",
     },
     ConfigKeyInfo {
         section: "proxy",
@@ -152,7 +152,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::StrArray,
         dangerous: false,
         default_display: "[]",
-        description: "Extra directories to allow write access (use sparingly — project dir is already writable).",
+        description: "Extra directories to allow write access (use sparingly, the project dir is already writable).",
     },
     ConfigKeyInfo {
         section: "allow",
@@ -210,7 +210,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Str,
         dangerous: false,
         default_display: "standard",
-        description: "Security posture baseline: \"strict\" (all toggles off AND gh_guard + git_guard + proxy.forced ON — locked down), \"standard\" (default, no-op), \"permissive\", or \"full-trust\". Only strict enables the guards/forced proxy; the others leave them at default. Individual keys/flags override it.",
+        description: "Security posture baseline: \"strict\" (all toggles off AND gh_guard + git_guard + proxy.forced ON, fully locked down), \"standard\" (default, no-op), \"permissive\", or \"full-trust\". Only strict enables the guards/forced proxy; the others leave them at default. Individual keys/flags override it.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -411,7 +411,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "true",
-        description: "Enforce same-repo check — blocks operations targeting other repositories via -R flag.",
+        description: "Enforce same-repo check. Blocks operations targeting other repositories via the -R flag.",
     },
     ConfigKeyInfo {
         section: "gh_guard",

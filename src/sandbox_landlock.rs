@@ -1064,7 +1064,7 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
         } else {
             ui::error(&format!(
                 "WARNING: Landlock ABI v{abi_version} (kernel < 6.7) \
-                 and no proxy configured — outbound network is UNRESTRICTED. \
+                 and no proxy configured, so outbound network is UNRESTRICTED. \
                  Use --with-proxy or upgrade to kernel 6.7+ for network isolation."
             ));
         }
