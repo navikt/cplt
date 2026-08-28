@@ -406,7 +406,7 @@ The primary defense is Apple's mandatory access control framework, enforced in t
 ;; Java IPv4-mapped issue solved by -Djava.net.preferIPv4Stack=true in JAVA_TOOL_OPTIONS
 ```
 
-> **Socket note:** SSH agent access (unix sockets) is blocked. JVM Attach API sockets (`/tmp/.java_pid*`) are available via `--allow-jvm-attach`, opt-in and regex-restricted to `.java_pid<PID>` only; all other unix sockets in `/tmp` stay blocked. MSBuild worker-node IPC sockets (`/tmp/MSBuild<PID>`) are available via `--allow-msbuild`, opt-in and regex-restricted to `MSBuild<PID>` only. That does NOT allow the persistent MSBuild Server, whose socket is named `MSBuildServer-<hash>` and never matches the regex; cplt also unconditionally sets `DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1`, so that server is never started or reused, including one started outside the sandbox. SBPL supports no domain-based rules, so filesystem isolation is the primary security control.
+> **Network and socket note:** Outbound TCP is restricted to port 443 by default, with `--allow-port` for more. Localhost outbound is blocked, which stops the agent reaching a service bound on your machine. SSH agent access (unix sockets) is blocked. JVM Attach API sockets (`/tmp/.java_pid*`) are available via `--allow-jvm-attach`, opt-in and regex-restricted to `.java_pid<PID>` only; all other unix sockets in `/tmp` stay blocked. MSBuild worker-node IPC sockets (`/tmp/MSBuild<PID>`) are available via `--allow-msbuild`, opt-in and regex-restricted to `MSBuild<PID>` only. That does NOT allow the persistent MSBuild Server, whose socket is named `MSBuildServer-<hash>` and never matches the regex; cplt also unconditionally sets `DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1`, so that server is never started or reused, including one started outside the sandbox. SBPL supports no domain-based rules, so filesystem isolation is the primary security control.
 
 **Key design decision:** Deny rules are placed AFTER allow rules. In Seatbelt's evaluation model with `(deny default)`, more-specific rules override broader ones, and later rules take precedence at equal specificity. Our deny rules for `~/.ssh` therefore correctly override the broader temp and system allows.
 
@@ -724,12 +724,12 @@ Repository maintainers can commit a `.cplt.toml` to configure sandbox settings f
 When `--allow-gpg-signing` is enabled, cplt grants targeted access to the GPG subsystem.
 
 **What is exposed:**
-- Read-only access to `~/.gnupg/pubring.kbx`, `pubring.gpg`, `trustdb.gpg`, `gpg.conf`, `common.conf`, all public data
-- Unix socket connect to `~/.gnupg/S.gpg-agent`, IPC to the GPG agent daemon running outside the sandbox
+- Read-only access to public data only: `~/.gnupg/pubring.kbx`, `pubring.gpg`, `trustdb.gpg`, `gpg.conf`, `common.conf`
+- Unix socket connect to `~/.gnupg/S.gpg-agent`, which is IPC to the GPG agent daemon running outside the sandbox
 
 **What stays denied:**
-- `~/.gnupg/private-keys-v1.d/`, private key files remain kernel-blocked
-- `~/.gnupg/secring.gpg`, the legacy private keyring, explicitly denied
+- `~/.gnupg/private-keys-v1.d/` stays kernel-blocked. That is where the private keys live.
+- `~/.gnupg/secring.gpg`, the legacy private keyring, is explicitly denied
 - All writes to `~/.gnupg/`, so no modifications are possible
 - `~/.ssh/` and `SSH_AUTH_SOCK`, since SSH signing is not enabled by this flag
 
