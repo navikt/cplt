@@ -434,6 +434,8 @@ What passes through:
 | `--allow-cache-exec-any` | ⚠️ Dangerous. Allow exec from all of `~/Library/Caches`. Prefer `--allow-cache-exec <SUBDIR>` |
 | `--allow-browser` | Let the agent open URLs in your default browser. Needed for OAuth code flows (MCP servers, Gemini CLI). Off by default |
 | `--deny-clipboard` | Block the agent from reading or writing the macOS clipboard (`pbpaste`/`pbcopy`) by denying the `com.apple.pasteboard` Mach service. Every other Mach service (Keychain, DNS, Security framework) is unaffected |
+| `--use-bubblewrap` | Linux only. Require the bubblewrap namespace layer (PID, mount, IPC, UTS, cgroup, user namespaces plus a private `/tmp`) on top of Landlock and seccomp. Errors out if `bwrap` is missing. Auto-detected when neither flag is given |
+| `--no-bubblewrap` | Linux only. Never use bubblewrap, even when installed. Falls back to Landlock and seccomp. Use it when bwrap breaks a specific tool |
 
 ### Supported runtimes
 
@@ -465,6 +467,7 @@ Run `cplt doctor` to see what cplt detected on your machine.
 | `-y, --yes` | Skip the interactive confirmation prompt. The configuration summary still prints, for auditability. Required when stdin is not a TTY, so CI and scripts need it |
 | `-q, --quiet` | Suppress the startup banner and non-essential messages. Errors and warnings still print. Also `sandbox.quiet = true` in config |
 | `--no-quiet` | Override `sandbox.quiet = true` and show the startup summary anyway |
+| `--no-audit` | Skip the post-session change report. cplt normally diffs the working tree against a baseline commit pinned before the run and lists what the session touched, flagging sensitive paths. `-q` suppresses it too |
 | `--init-config` | Create a starter config file at `~/.config/cplt/config.toml` and exit |
 
 ### Session flags
@@ -478,17 +481,19 @@ These translate into the agent's own session flags, so you do not need a `--` se
 | `--remote` | Enable remote control, so you can monitor and steer the session from GitHub.com or mobile |
 | `--name SESSION` | Name the session so `--resume=NAME` can find it later |
 
-`--continue` and `--resume` are mapped for OpenCode and Antigravity too:
+`--continue` and `--resume` are mapped for OpenCode, Antigravity, and Claude Code too:
 
-| cplt flag | Copilot | OpenCode | Antigravity (`agy`) |
-| --- | --- | --- | --- |
-| `--continue` | `--continue` | `--continue` | `--continue` |
-| `--resume` | `--resume` | `--continue`¹ | `--continue`¹ |
-| `--resume=ID` | `--resume=ID` | `--session ID` | `--conversation ID` |
-| `--remote` | `--remote` | ignored | ignored |
-| `--name NAME` | `--name NAME` | ignored | ignored |
+| cplt flag | Copilot | OpenCode | Antigravity (`agy`) | Claude Code |
+| --- | --- | --- | --- | --- |
+| `--continue` | `--continue` | `--continue` | `--continue` | `--continue` |
+| `--resume` | `--resume` | `--continue`¹ | `--continue`¹ | `--resume` |
+| `--resume=ID` | `--resume=ID` | `--session ID` | `--conversation ID` | `--resume ID` |
+| `--remote` | `--remote` | ignored | ignored | ignored |
+| `--name NAME` | `--name NAME` | ignored | ignored | ignored |
 
-¹ Neither OpenCode nor Antigravity has an interactive session picker, so a bare `--resume` means "continue last session". Auto-resume, where cplt injects a session flag when invoked with no args, applies only to Copilot and Gemini. The four flags above are Copilot-specific and are ignored for Gemini.
+¹ Neither OpenCode nor Antigravity has an interactive session picker, so a bare `--resume` means "continue last session". Claude Code has one, so it maps straight across.
+
+`--remote` and `--name` are Copilot-only. Gemini, Pi, and shell mode get no translation at all, so all four flags are dropped for them. Auto-resume is a separate mechanism: when you invoke cplt with no pass-through args and no session flags, it appends `--resume` for you, and that applies to Copilot and Gemini only.
 
 Combine them with sandbox flags and `--` pass-through args:
 
@@ -660,7 +665,7 @@ localhost = [3000]
 socket = ["/var/run/docker.sock"]
 ```
 
-cplt reads it from `git HEAD`, so the agent cannot tamper with its own policy mid-session, and trust approvals are pinned to the file's content. `cplt init` writes one for you by detecting the project's tooling:
+cplt reads it from `git HEAD`, so the agent cannot tamper with its own policy mid-session, and trust approvals are pinned to the file's content. In CI and scripts, where nobody can answer a prompt, `--accept-repo-config` approves the file's proposals for that one run without persisting any trust. `cplt init` writes one for you by detecting the project's tooling:
 
 ```bash
 cplt init             # preview detected permissions
@@ -703,7 +708,7 @@ Full details, including the trust model, path expansion rules, and the complete 
 └──────────────────────────────────┘
 ```
 
-The security model is a deny-by-default filesystem with kernel enforcement. On macOS, and on Linux with kernel 6.7+ (Landlock ABI v4), the network is restricted to port 443 by default, with `--allow-port` for extras. On older Linux kernels the CONNECT proxy provides that restriction instead, which is why it is enabled by default. SSH agent access and localhost outbound are blocked in the kernel on macOS and via the proxy on Linux. The profile generator discovers your environment (`--doctor`) and emits rules only for tool directories that actually exist on disk. Fewer rules, tighter sandbox.
+The security model is a deny-by-default filesystem with kernel enforcement. On macOS, and on Linux with kernel 6.7+ (Landlock ABI v4), the network is restricted to port 443 by default, with `--allow-port` for extras. On older Linux kernels the CONNECT proxy provides that restriction instead, which is why it is enabled by default. SSH agent access and localhost outbound are blocked in the kernel on macOS and via the proxy on Linux. The profile generator discovers your environment (`cplt doctor` shows the same probe results) and emits rules only for tool directories that actually exist on disk. Fewer rules, tighter sandbox.
 
 - **macOS**: a Seatbelt/SBPL profile is generated and handed to `sandbox-exec`
 - **Linux**: Landlock LSM rules plus a seccomp-BPF filter, applied via `pre_exec` (kernel 5.13+, TCP port filtering on 6.7+)
@@ -749,7 +754,14 @@ cplt --proxy-forced -- -p "fix tests"                 # force all egress through
 cplt --no-proxy -- -p "fix tests"                     # disable for one run
 cplt --blocked-domains blocked-domains.txt -- -p "x"  # block known-bad domains
 cplt --allowed-domains allowed-domains.txt -- -p "x"  # allowlist mode
+cplt --default-allowlist -- -p "x"                    # fail-closed: only the agent's own domains
+cplt --observe-domains -- -p "x"                      # record what the agent contacts, block nothing
+cplt --proxy-upstream http://proxy.corp:8080 -- -p "x" # chain through a corporate proxy
 ```
+
+`--observe-domains-out <FILE>` writes the observed set one domain per line, and
+`--proxy-upstream-no-proxy <HOST>` lists hosts to reach directly instead of through
+the upstream.
 
 ```bash
 cplt config set proxy.enabled false
