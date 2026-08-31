@@ -910,6 +910,23 @@ The GitHub Actions workflow runs in two stages:
 1. **Linux (ubuntu-latest)**: formatting check (`cargo fmt`), linting (`cargo clippy -D warnings`), unit tests
 2. **macOS (macos-latest)**: full test suite including integration tests, release binary build and verification
 
+#### Cache poisoning
+
+The release workflow (`release.yaml`) deliberately uses **no** `actions/cache`
+step. It runs in a privileged context, triggered on the default branch via
+`workflow_run`, with `contents: write`, `id-token: write`, and
+`attestations: write`, and it publishes signed, attested binaries. A cache entry
+populated by a lower-trust run (a `pull_request` build, or a `workflow_dispatch`
+on an attacker-controlled branch) must never be able to reach that build, so the
+release job always compiles from a cold checkout. Releases are infrequent, so the
+extra few minutes are an acceptable price for keeping untrusted bytes out of the
+release artifact.
+
+The CI workflow (`ci.yaml`) keeps its caches: its jobs hold only
+`contents: read`, publish nothing privileged, and PR-run caches are scoped to the
+pull request's own ref, so there is no cross-context path by which one PR could
+poison another run or the default branch.
+
 ## Prior Art and References
 
 ### macOS Seatbelt / sandbox-exec
