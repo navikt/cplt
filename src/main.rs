@@ -797,6 +797,10 @@ NOTE:
         #[arg(long)]
         repo_scope: Option<String>,
 
+        /// Trusted Git binary used to verify implicit repository targets from cwd.
+        #[arg(long)]
+        real_git: Option<PathBuf>,
+
         /// Enforcement mode: block, warn, or audit.
         #[arg(long, default_value = "block")]
         mode: String,
@@ -2186,6 +2190,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::GhGate {
                 real_gh,
                 repo_scope,
+                real_git,
                 mode,
                 scope_check,
                 no_scope_check,
@@ -2211,7 +2216,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     },
                     allow_api_write: allow_api_write && !no_allow_api_write,
                 };
-                run_gh_gate(&real_gh, repo_scope.as_deref(), &args, &policy)
+                run_gh_gate(
+                    &real_gh,
+                    repo_scope.as_deref(),
+                    real_git.as_deref(),
+                    &args,
+                    &policy,
+                )
             }
             Command::GitGate {
                 real_git,
@@ -2613,6 +2624,7 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 fn run_gh_gate(
     real_gh: &Path,
     repo_scope: Option<&str>,
+    real_git: Option<&Path>,
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
@@ -2625,7 +2637,7 @@ fn run_gh_gate(
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope) {
+    match gh_proxy::gate_with_repo_scope_and_git(&arg_refs, policy, repo_scope, real_git) {
         Ok(approval) => exec_gh(real_gh, args, approval.repo_scope.as_deref()),
         Err(msg) => match policy.mode {
             config::EnforcementMode::Block => {

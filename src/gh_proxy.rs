@@ -1207,10 +1207,11 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
     }
 }
 
-/// Check if a repo flag targets the expected repository.
+/// Check if a command targets the expected repository.
 ///
-/// `current_repo` should be in "owner/name" format.
-/// Returns true if the command targets the current repo (or has no -R flag).
+/// `startup_repo` should be in "owner/name" format. Explicit repository targets
+/// are compared with it directly. Implicit repository targets require
+/// `invocation_repo`, which is resolved from the command's cwd by the caller.
 /// For `gh api` commands, also checks the endpoint URL path for /repos/{owner}/{repo}/.
 /// Non-repo API endpoints (orgs, users) are NOT implicitly allowed — they require
 /// explicit -R or a matching /repos/ path.
@@ -1219,12 +1220,14 @@ fn evaluate_api(cmd: &ParsedCommand, allow_api_write: bool) -> PolicyResult {
 /// relative-path fallback — they require an explicit /repos/{owner}/{repo}/... match.
 /// This prevents scope-check bypass via top-level endpoints (e.g. `gists`, `app/...`)
 /// that don't start with a deny-listed prefix.
-pub fn is_repo_in_scope(cmd: &ParsedCommand, current_repo: &str) -> bool {
+pub fn is_repo_in_scope(
+    cmd: &ParsedCommand,
+    startup_repo: &str,
+    invocation_repo: Option<&str>,
+) -> bool {
     // Check -R/--repo flag first
     if let Some(target) = &cmd.repo_flag {
-        let target_clean = target.trim_end_matches(".git").to_lowercase();
-        let current_clean = current_repo.to_lowercase();
-        return target_clean == current_clean;
+        return repos_match(target, startup_repo);
     }
 
     // For gh api: extract repo from endpoint path like /repos/{owner}/{repo}/...
@@ -1234,8 +1237,7 @@ pub fn is_repo_in_scope(cmd: &ParsedCommand, current_repo: &str) -> bool {
                 return false;
             };
             if let Some(endpoint_repo) = extract_repo_from_api_path(endpoint) {
-                let current_clean = current_repo.to_lowercase();
-                return endpoint_repo.to_lowercase() == current_clean;
+                return repos_match(&endpoint_repo, startup_repo);
             }
             // Write operations (input flags or non-GET method) require an explicit
             // /repos/{owner}/{repo}/... path — no relative-path fallback.
@@ -1257,8 +1259,9 @@ pub fn is_repo_in_scope(cmd: &ParsedCommand, current_repo: &str) -> bool {
                 && !path.starts_with("notifications")
                 && !path.starts_with("graphql")
             {
-                // Relative read endpoint — gh CLI resolves to current repo. Allow.
-                return true;
+                // Relative read endpoint — gh CLI resolves to the invocation cwd's
+                // repo, which must still match the immutable startup scope.
+                return invocation_repo.is_some_and(|repo| repos_match(repo, startup_repo));
             }
             // Absolute non-repo endpoint (e.g., /orgs/..., /user/...) — not in scope.
             return false;
@@ -1267,8 +1270,33 @@ pub fn is_repo_in_scope(cmd: &ParsedCommand, current_repo: &str) -> bool {
         return false;
     }
 
-    // Non-api commands: no -R flag → implicitly targets current repo
-    true
+    // Non-api commands: no -R flag → implicitly targets the invocation cwd's repo.
+    invocation_repo.is_some_and(|repo| repos_match(repo, startup_repo))
+}
+
+fn repos_match(left: &str, right: &str) -> bool {
+    left.trim_end_matches(".git")
+        .eq_ignore_ascii_case(right.trim_end_matches(".git"))
+}
+
+fn requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
+    if cmd.repo_flag.is_some() {
+        return false;
+    }
+
+    if cmd.command != "api" {
+        return true;
+    }
+
+    // An explicit /repos/{owner}/{repo}/ API path already carries its target;
+    // preserve the existing endpoint-vs-startup-scope check for that form.
+    match cmd.api_endpoint.as_deref() {
+        Some(endpoint) => github_api_endpoint_path(endpoint)
+            .ok()
+            .and_then(extract_repo_from_api_path)
+            .is_none(),
+        None => true,
+    }
 }
 
 /// Extract "owner/repo" from a GitHub API endpoint path.
@@ -1420,12 +1448,14 @@ fn shell_escape(s: &str) -> String {
 ///
 /// `real_gh` is the path to the real `gh` binary.
 /// `repo_scope` is the repository verified before the sandboxed agent starts.
+/// `real_git` is the trusted Git binary used to verify an implicit target's cwd.
 /// `cplt_bin` is the path to the cplt binary (for calling `gh-gate`).
 /// Policy flags are baked into the wrapper invocation so the gate doesn't
 /// re-read config at runtime (security: agent could edit config files).
 pub fn generate_wrapper_script(
     real_gh: &str,
     repo_scope: Option<&str>,
+    real_git: Option<&str>,
     cplt_bin: &str,
     policy: &crate::config::GhGuardPolicy,
 ) -> String {
@@ -1433,6 +1463,9 @@ pub fn generate_wrapper_script(
     let gh_escaped = shell_escape(real_gh);
     let repo_scope_flag = repo_scope
         .map(|repo| format!("--repo-scope {}", shell_escape(repo)))
+        .unwrap_or_default();
+    let real_git_flag = real_git
+        .map(|git| format!("--real-git {}", shell_escape(git)))
         .unwrap_or_default();
     let mode_flag = match policy.mode {
         crate::config::EnforcementMode::Block => "--mode=block",
@@ -1463,7 +1496,7 @@ pub fn generate_wrapper_script(
 # cplt gh proxy — blocks destructive gh operations in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} -- "$@"
+exec {cplt_escaped} gh-gate --real-gh {gh_escaped} {repo_scope_flag} {real_git_flag} {mode_flag} {scope_flag} {auth_flag} {unknown_flag} {api_write_flag} -- "$@"
 "#
     )
 }
@@ -1571,7 +1604,12 @@ pub fn gate_with_git(
     policy: &GatePolicy,
     real_git: &Path,
 ) -> Result<GateApproval, String> {
-    gate_with_scope_resolver(args, policy, || detect_current_repo(real_git, project_dir))
+    gate_with_scope_resolver(
+        args,
+        policy,
+        || detect_current_repo(real_git, project_dir),
+        || detect_current_repo(real_git, project_dir),
+    )
 }
 
 /// Evaluate a `gh` command using repository scope captured before agent startup.
@@ -1580,17 +1618,44 @@ pub fn gate_with_repo_scope(
     policy: &GatePolicy,
     repo_scope: Option<&str>,
 ) -> Result<GateApproval, String> {
-    gate_with_scope_resolver(args, policy, || {
-        repo_scope
-            .map(str::to_owned)
-            .ok_or_else(|| "repository scope was unavailable at sandbox startup".to_string())
-    })
+    gate_with_repo_scope_and_git(args, policy, repo_scope, None)
+}
+
+/// Evaluate a `gh` command using startup scope and a trusted Git binary for cwd checks.
+///
+/// The startup scope remains authoritative. The invocation cwd is consulted only
+/// for implicit repository targets, and only as evidence that the command still
+/// refers to that immutable scope.
+pub fn gate_with_repo_scope_and_git(
+    args: &[&str],
+    policy: &GatePolicy,
+    repo_scope: Option<&str>,
+    real_git: Option<&Path>,
+) -> Result<GateApproval, String> {
+    gate_with_scope_resolver(
+        args,
+        policy,
+        || {
+            repo_scope
+                .map(str::to_owned)
+                .ok_or_else(|| "repository scope was unavailable at sandbox startup".to_string())
+        },
+        || {
+            let real_git = real_git.ok_or_else(|| {
+                "trusted Git binary was unavailable for invocation cwd verification".to_string()
+            })?;
+            let cwd = std::env::current_dir()
+                .map_err(|e| format!("failed to determine invocation cwd: {e}"))?;
+            detect_current_repo(real_git, &cwd)
+        },
+    )
 }
 
 fn gate_with_scope_resolver(
     args: &[&str],
     policy: &GatePolicy,
     resolve_scope: impl FnOnce() -> Result<String, String>,
+    resolve_invocation_repo: impl Fn() -> Result<String, String>,
 ) -> Result<GateApproval, String> {
     let Some(cmd) = parse_command(args) else {
         // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.
@@ -1665,7 +1730,7 @@ fn gate_with_scope_resolver(
                 return Ok(GateApproval::default());
             }
 
-            let current_repo = resolve_scope().map_err(|reason| {
+            let startup_repo = resolve_scope().map_err(|reason| {
                 format!(
                     "⚠️ BLOCKED by sandbox: 'gh {} {}' cannot verify target repository scope.\n\
                      Reason: {reason}.\n\
@@ -1676,13 +1741,48 @@ fn gate_with_scope_resolver(
                 )
             })?;
 
-            if is_repo_in_scope(&cmd, &current_repo) {
+            let invocation_repo = if requires_invocation_repo_check(&cmd) {
+                Some(resolve_invocation_repo().map_err(|reason| {
+                    format!(
+                        "⚠️ BLOCKED by sandbox: 'gh {}{}' cannot verify the repository for its implicit target.\n\
+                         Reason: {reason}.\n\
+                         The invocation cwd must resolve to the repository captured at sandbox startup.\n\
+                         This operation is restricted by the cplt sandbox environment.\n\
+                         Please make a note of this for the human operator and continue with your remaining work.",
+                        cmd.command,
+                        cmd.subcommand
+                            .as_deref()
+                            .map(|s| format!(" {s}"))
+                            .unwrap_or_default(),
+                    )
+                })?)
+            } else {
+                None
+            };
+
+            if is_repo_in_scope(&cmd, &startup_repo, invocation_repo.as_deref()) {
                 Ok(GateApproval {
-                    repo_scope: Some(format!("github.com/{current_repo}")),
+                    repo_scope: Some(format!("github.com/{startup_repo}")),
                 })
+            } else if let Some(invocation_repo) = invocation_repo.as_deref()
+                && !repos_match(invocation_repo, &startup_repo)
+            {
+                Err(format!(
+                    "⚠️ BLOCKED by sandbox: 'gh {}{}' was invoked from repository '{}' outside the startup repo '{}'.\n\
+                     Reason: implicit repository targets must resolve to the repository captured at sandbox startup.\n\
+                     This operation is restricted by the cplt sandbox environment.\n\
+                     Please make a note of this for the human operator and continue with your remaining work.",
+                    cmd.command,
+                    cmd.subcommand
+                        .as_deref()
+                        .map(|s| format!(" {s}"))
+                        .unwrap_or_default(),
+                    invocation_repo,
+                    startup_repo,
+                ))
             } else {
                 Err(format!(
-                    "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the current repo '{}'.\n\
+                    "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the startup repo '{}'.\n\
                      Reason: {}\n\
                      This operation is restricted by the cplt sandbox environment.\n\
                     Please make a note of this for the human operator and continue with your remaining work.",
@@ -1695,7 +1795,7 @@ fn gate_with_scope_resolver(
                         .as_deref()
                         .or(cmd.api_endpoint.as_deref())
                         .unwrap_or("unknown"),
-                    current_repo,
+                    startup_repo,
                     result.reason,
                 ))
             }
@@ -2709,7 +2809,7 @@ mod tests {
     // ── repo scope tests ──
 
     #[test]
-    fn scope_check_no_repo_flag_is_in_scope() {
+    fn scope_check_no_repo_flag_requires_matching_invocation_repo() {
         let cmd = ParsedCommand {
             command: "pr".to_string(),
             subcommand: Some("create".to_string()),
@@ -2718,7 +2818,13 @@ mod tests {
             has_input_flags: false,
             api_endpoint: None,
         };
-        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
+        assert!(!is_repo_in_scope(
+            &cmd,
+            "navikt/cplt",
+            Some("evil-org/other-repo")
+        ));
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     #[test]
@@ -2731,7 +2837,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: None,
         };
-        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     #[test]
@@ -2744,7 +2850,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: None,
         };
-        assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     #[test]
@@ -2757,7 +2863,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: None,
         };
-        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     #[test]
@@ -2770,7 +2876,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: None,
         };
-        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     // ── API endpoint scope tests ──
@@ -2785,7 +2891,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: Some("/repos/other/repo/pulls".to_string()),
         };
-        assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     #[test]
@@ -2798,7 +2904,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: Some("/repos/navikt/cplt/pulls".to_string()),
         };
-        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     #[test]
@@ -2812,7 +2918,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: Some("/user".to_string()),
         };
-        assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     #[test]
@@ -2825,7 +2931,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: Some("/orgs/navikt/members".to_string()),
         };
-        assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     #[test]
@@ -2839,7 +2945,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: Some("pulls/67/comments".to_string()),
         };
-        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
     }
 
     #[test]
@@ -2852,7 +2958,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: Some("pulls?state=open".to_string()),
         };
-        assert!(is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(is_repo_in_scope(&cmd, "navikt/cplt", Some("navikt/cplt")));
     }
 
     #[test]
@@ -2866,7 +2972,7 @@ mod tests {
             has_input_flags: false,
             api_endpoint: Some("/repos/navikt/cplt/pulls".to_string()),
         };
-        assert!(!is_repo_in_scope(&cmd, "navikt/cplt"));
+        assert!(!is_repo_in_scope(&cmd, "navikt/cplt", None));
     }
 
     #[test]
@@ -2959,12 +3065,14 @@ mod tests {
         let script = generate_wrapper_script(
             "/usr/bin/gh",
             Some("navikt/cplt"),
+            Some("/usr/bin/git"),
             "/usr/local/bin/cplt",
             &policy,
         );
         assert!(script.contains("/usr/bin/gh"));
         assert!(script.contains("--repo-scope 'navikt/cplt'"));
         assert!(script.contains("/usr/local/bin/cplt"));
+        assert!(script.contains("--real-git '/usr/bin/git'"));
         assert!(script.starts_with("#!/bin/sh"));
         assert!(script.contains("--mode=block"));
         assert!(script.contains("--scope-check"));
@@ -2982,6 +3090,7 @@ mod tests {
         let script = generate_wrapper_script(
             "/usr/bin/gh",
             Some("navikt/cplt"),
+            Some("/usr/bin/git"),
             "/usr/local/bin/cplt",
             &policy,
         );
@@ -3091,7 +3200,7 @@ mod tests {
                 api_endpoint: Some(endpoint.to_string()),
             };
             assert!(
-                !is_repo_in_scope(&cmd, "navikt/cplt"),
+                !is_repo_in_scope(&cmd, "navikt/cplt", None),
                 "write to top-level endpoint '{endpoint}' must not be in scope",
             );
         }
@@ -3226,6 +3335,7 @@ mod tests {
         let script = generate_wrapper_script(
             "/path/with'quote/gh",
             Some("navikt/repo'with-quote"),
+            Some("/path/with'quote/git"),
             "/path/with\"dq/cplt",
             &policy,
         );

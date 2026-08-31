@@ -86,13 +86,13 @@ git_push_prevention = true   # maps to [git_guard] enabled=true with defaults
 
 ### Policy is baked at launch
 
-cplt bakes the policy flags, the absolute path to the real `gh` binary, and the
-verified repository scope into the wrapper script when the sandbox starts. The
-`gh-gate` subcommand receives `--repo-scope`, `--scope-check`,
-`--block-auth-token`, `--unknown-command=block`, and
-`--allow-api-write`/`--no-allow-api-write` as CLI flags. Runtime working
+cplt bakes the policy flags, the absolute paths to the real `gh` and trusted
+`git` binaries, and the verified repository scope into the wrapper script when
+the sandbox starts. The `gh-gate` subcommand receives `--repo-scope`,
+`--real-git`, `--scope-check`, `--block-auth-token`, `--unknown-command=block`,
+and `--allow-api-write`/`--no-allow-api-write` as CLI flags. Runtime working
 directories, nested repositories, Git configuration, and `PATH` cannot redefine
-the approved scope.
+the approved scope; the cwd is only checked as evidence for an implicit target.
 
 ## How it works
 
@@ -105,7 +105,7 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 
 1. At sandbox launch (when scratch directory is enabled), cplt writes a small wrapper to `{scratch}/bin/gh`
 2. `{scratch}/bin` is prepended to PATH, shadowing the real `gh`
-3. The wrapper calls `cplt gh-gate --real-gh /path/to/gh --repo-scope owner/repo -- <args>`
+3. The wrapper calls `cplt gh-gate --real-gh /path/to/gh --real-git /path/to/git --repo-scope owner/repo -- <args>`
 4. cplt evaluates the command against the policy table
 5. If allowed, `exec()` replaces the process with the real `gh`, so there is no runtime overhead
 6. If blocked, it prints an error explaining why and exits non-zero
@@ -118,7 +118,7 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 | Tier | Behavior | Examples |
 |------|----------|----------|
 | **Allow** | Always permitted | `pr list`, `issue view`, `run list`, `search` |
-| **ScopeCheck** | Permitted only for current repo | `pr create`, `issue comment`, `pr close` |
+| **ScopeCheck** | Permitted only for the startup repo; implicit targets must resolve there from cwd | `pr create`, `issue comment`, `pr close` |
 | **Block** | Never permitted | `repo delete`, `pr merge`, `release create`, `workflow run` |
 | **Unknown** | Not in the policy table, blocked by default | anything GitHub adds to `gh` after the table was last updated |
 
@@ -137,14 +137,16 @@ intercepted separately, in every spelling (`--show-token`, `--show-token=true`,
 ## Scope checking
 
 When a command is classified as `ScopeCheck`, cplt verifies that the command
-targets the current repository:
+targets the repository captured at sandbox startup:
 
 1. At sandbox startup, reads `remote.origin.url` from the project root using the trusted Git binary
 2. Ignores global/system config, config includes, and inherited `GIT_*` variables
-3. Bakes the verified `owner/repo` into the wrapper; unavailable scope remains fail-closed
+3. Bakes the verified `owner/repo` and trusted Git path into the wrapper; unavailable scope remains fail-closed
 4. If the command has `-R`/`--repo`, compares it to the startup scope
-5. Rejects a conflicting `--hostname` or fully qualified non-GitHub API endpoint
-6. Sets `GH_REPO=github.com/owner/repo` and clears `GH_HOST` before executing `gh`
+5. Otherwise, resolves the invocation cwd with the trusted Git binary and requires that repo to match the startup scope
+6. Preserves explicit `/repos/owner/repo/...` API endpoint checks without requiring cwd matching
+7. Rejects a conflicting `--hostname` or fully qualified non-GitHub API endpoint
+8. Sets `GH_REPO=github.com/owner/repo` and clears `GH_HOST` before executing `gh`
 
 ## Command classifications
 
