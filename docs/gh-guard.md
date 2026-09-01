@@ -57,8 +57,8 @@ enabled = true              # blocks destructive gh operations
 scope_check = true          # enforce repo-scoping on write commands
 block_auth_token = true     # deny "gh auth token" exfiltration
 inject_token = false        # inject GH_TOKEN into sandbox (opt-in)
-# NOTE: repo deny.env still wins if GH_TOKEN/GITHUB_TOKEN/COPILOT_GITHUB_TOKEN
-# are denied there.
+# NOTE: repo deny.env still wins — deny GH_TOKEN (the injection target) there
+# and the injected value is stripped from the child.
 unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 
@@ -228,9 +228,13 @@ If you prefer the simpler approach (token in env), set `inject_token = true`:
 inject_token = true   # injects GH_TOKEN env var (visible to all subprocesses)
 ```
 
-If repo `.cplt.toml` sets `deny.env` for `GH_TOKEN` / `GITHUB_TOKEN` /
-`COPILOT_GITHUB_TOKEN`, `deny.env` takes precedence and injection is disabled.
-cplt prints a startup warning for this conflict.
+If repo `.cplt.toml` denies `GH_TOKEN` in `deny.env`, `deny.env` takes
+precedence: the injected value is stripped from the child and cplt prints a
+startup warning for the conflict. Denying only `GITHUB_TOKEN` /
+`COPILOT_GITHUB_TOKEN` clears those inherited variables but does not block the
+`GH_TOKEN` injection. `deny.env` does not yet cover the `block_auth_token` token
+cache (`$SCRATCH/.gh-token`) — tracked in
+[#224](https://github.com/navikt/cplt/issues/224).
 
 ## `gh api` handling
 
@@ -380,7 +384,7 @@ This section is explicit about what the gh/git guard protects against and what i
 | Agent triggers CI workflows | `gh workflow run` blocked |
 | Agent pushes directly to main/master | `git push` blocked (or only default branch blocked with `protect_default_branch_only`) |
 | Agent force-pushes and rewrites history | `--force`/`--force-with-lease` detection on push |
-| Agent exfiltrates `gh auth token` value | `gh auth token` blocked; token served via one-time-read file (deleted after first use). Env var injection only with `inject_token=true` and only when not denied by repo `deny.env` |
+| Agent exfiltrates `gh auth token` value | `gh auth token` blocked; token served via one-time-read file (deleted after first use). Env var injection only with `inject_token=true`, and stripped from the child when repo `deny.env` denies `GH_TOKEN` |
 | Agent modifies secrets/variables | `gh secret set/delete`, `gh variable set/delete` blocked |
 | Agent installs malicious gh extensions | `gh extension install/remove` blocked |
 | Agent operates on other repositories | `-R other/repo` checked via ScopeCheck |

@@ -226,10 +226,16 @@ Whenever cplt injects a token it first clears all three variables, so the one it
 resolved is the one the agent sees rather than whichever an inherited variable
 happened to set.
 
-**Repo `deny.env` still wins, and only ever tightens.** If a repository's
-`[deny] env` list blocks the GitHub token variables, no pre-extracted token can
-reach the agent — the variable is stripped from the child process. cplt then runs
-the agent with *no* GitHub credential: it does not fall back to Keychain access.
+**Repo `deny.env` still wins, and only ever tightens.** cplt injects the
+pre-extracted token as `GH_TOKEN`, so a repo `[deny] env` list that blocks
+`GH_TOKEN` stops it from reaching the agent — the variable is stripped from the
+child process — and cplt then runs the agent with no GitHub credential in the
+environment rather than falling back to Keychain access. (Denying only
+`GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN` clears those inherited variables but
+does not block a fresh `GH_TOKEN` injection; deny `GH_TOKEN` for that.) One
+channel `deny.env` does *not* yet cover: with `gh_guard.block_auth_token`, the
+gh wrapper's one-time-read token cache is still served — hardening tracked in
+[#224](https://github.com/navikt/cplt/issues/224).
 
 That asymmetry is deliberate. Repo `[deny]` is applied with no approval prompt
 precisely because it can only tighten the sandbox, and the project directory is

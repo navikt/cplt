@@ -1724,12 +1724,6 @@ struct DomainAllowlistDecision {
     force_proxy_on: bool,
 }
 
-fn deny_env_strips_auth_token(deny_env: &[String]) -> bool {
-    deny_env
-        .iter()
-        .any(|name| sandbox::GITHUB_TOKEN_VARS.iter().any(|token| name == token))
-}
-
 /// Whether repo `deny.env` blocks the variable cplt actually injects into.
 ///
 /// `GH_TOKEN` is the injection target (see `inject_gh_token_if_needed`), so it
@@ -1743,11 +1737,19 @@ fn deny_env_blocks_token_injection(deny_env: &[String]) -> bool {
     deny_env.iter().any(|name| name == "GH_TOKEN")
 }
 
+/// Whether `gh_guard.inject_token` is asking for an injection that repo
+/// `deny.env` will then strip back out.
+///
+/// Keyed on `GH_TOKEN` alone, for the same reason as
+/// [`deny_env_blocks_token_injection`]: `GH_TOKEN` is the injection target, so
+/// denying only `GITHUB_TOKEN` / `COPILOT_GITHUB_TOKEN` does not stop the
+/// injected token from reaching the agent — and the warning must not claim it
+/// does.
 fn deny_env_disables_gh_guard_injection(
     gh_guard: &config::GhGuardPolicy,
     deny_env: &[String],
 ) -> bool {
-    gh_guard.enabled && gh_guard.inject_token && deny_env_strips_auth_token(deny_env)
+    gh_guard.enabled && gh_guard.inject_token && deny_env_blocks_token_injection(deny_env)
 }
 
 /// The pre-sandbox authentication plan: which token sources are in play, and
@@ -2676,8 +2678,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
     if deny_env_disables_gh_guard_injection(&resolved.gh_guard, &resolved.deny_env) {
         ui::warn(
-            "gh_guard.inject_token is enabled, but deny_env blocks auth token env vars; \
-             token injection is disabled by policy (deny_env wins).",
+            "gh_guard.inject_token is enabled, but repo deny.env denies GH_TOKEN \
+             (the variable cplt injects into); token injection is disabled by policy \
+             (deny_env wins).",
         );
     }
 
@@ -6468,18 +6471,6 @@ mod tests {
     }
 
     #[test]
-    fn deny_env_strips_auth_token_detects_any_known_token_var() {
-        assert!(deny_env_strips_auth_token(&[
-            "FOO".to_string(),
-            "GITHUB_TOKEN".to_string()
-        ]));
-        assert!(!deny_env_strips_auth_token(&[
-            "FOO".to_string(),
-            "BAR".to_string()
-        ]));
-    }
-
-    #[test]
     fn deny_env_disables_gh_guard_injection_only_when_guard_enabled_and_token_denied() {
         let enabled_injecting_guard = config::GhGuardPolicy {
             enabled: true,
@@ -6493,6 +6484,15 @@ mod tests {
         assert!(!deny_env_disables_gh_guard_injection(
             &enabled_injecting_guard,
             &["FOO".to_string()],
+        ));
+        // Denying a non-injection-target token var must NOT fire the warning:
+        // cplt injects `GH_TOKEN`, so an injected token still reaches the agent.
+        assert!(!deny_env_disables_gh_guard_injection(
+            &enabled_injecting_guard,
+            &[
+                "GITHUB_TOKEN".to_string(),
+                "COPILOT_GITHUB_TOKEN".to_string()
+            ],
         ));
 
         let disabled_guard = config::GhGuardPolicy {
