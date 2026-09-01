@@ -252,8 +252,12 @@ drops the grant, so it holds with `gh_guard` enabled too and regardless of any
 token variable set in your environment.
 
 `env_only` and `gh_only` refuse to launch in this situation rather than continue
-without a credential, including when `gh_guard` has separately resolved a token
-for its wrapper: that token is stripped from the child too, so it cannot count.
+without a credential. A token `gh_guard` separately resolved for its wrapper is
+not counted as satisfying them: `deny.env` strips it from the child's
+environment, and a wrapper-only credential is not what these modes promise. (The
+`block_auth_token` one-time cache at `$SCRATCH/.gh-token` is the one channel
+`deny.env` does not yet close — see
+[#224](https://github.com/navikt/cplt/issues/224).)
 
 The deny only affects Copilot. For the other Keychain-using agents a GitHub token
 deny is vacuous — they never receive those variables — while the Keychain is where

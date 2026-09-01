@@ -2671,9 +2671,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if token_denied_by_repo && auth_plan.applies && auth_plan.mode != config::CopilotAuth::Keychain
     {
         ui::warn(
-            "Repo deny.env blocks GitHub token env vars: the agent will run without \
-             GitHub authentication (Keychain stays blocked). Set copilot_auth = \"keychain\" \
-             in your own config if you want Keychain access instead.",
+            "Repo deny.env denies GH_TOKEN: cplt will not inject a GitHub token and \
+             Keychain access stays blocked. A GITHUB_TOKEN / COPILOT_GITHUB_TOKEN you set \
+             yourself still reaches the agent; without one it runs unauthenticated. Set \
+             copilot_auth = \"keychain\" in your own config if you want Keychain access instead.",
         );
     }
     if deny_env_disables_gh_guard_injection(&resolved.gh_guard, &resolved.deny_env) {

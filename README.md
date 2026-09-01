@@ -395,7 +395,7 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | Core system       | `HOME`, `USER`, `PATH`, `SHELL`, `TMPDIR`, `LANG`                          | Explicit allowlist                      |
 | Terminal          | `TERM`, `COLORTERM`, `TERM_PROGRAM`                                        | Explicit allowlist                      |
 | Editor            | `EDITOR`, `VISUAL`, `PAGER`                                                | Explicit allowlist                      |
-| Auth tokens       | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`                         | Passed only if already set by user; gh guard uses one-time file instead. If repo `deny.env` blocks them, deny wins. |
+| Auth tokens       | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`                         | Passed if set by user. On macOS + Copilot, `copilot_auth` (default `auto`) may pre-extract a token via `gh` and inject `GH_TOKEN` even when unset; gh guard serves it from a one-time file instead. Repo `deny.env` on `GH_TOKEN` wins. |
 | Copilot config    | `COPILOT_DEBUG`, `COPILOT_*`                                               | Prefix allowlist                        |
 | Language runtimes | `NODE_*`, `GOPATH`, `CARGO_HOME`, `JAVA_HOME`, `VIRTUAL_ENV`, `PYTHONPATH` | Explicit allowlist                      |
 | Tool managers     | `NVM_*`, `FNM_*`, `PYENV_*`, `MISE_*`, `SDKMAN_*`, `COREPACK_*`, `YARN_*`  | Prefix allowlist                        |
@@ -1302,7 +1302,7 @@ If all of that works, `cplt --allow-gpg-signing` will work too. The `gpg-agent` 
 - **Risk: signature impersonation and decryption.** A compromised process with agent socket access can request signatures on arbitrary data (adding a "Verified" badge) and, if an encryption subkey exists, decrypt arbitrary ciphertext. This is the same level of impersonation Copilot already has for unsigned commits — signing just adds the badge.
 - **GPG-only.** This flag does not enable SSH signing (`gpg.format=ssh`). SSH keys and `SSH_AUTH_SOCK` remain blocked.
 - **`--deny-path` wins.** If you specify `--deny-path ~/.gnupg` alongside `--allow-gpg-signing`, the deny takes precedence — all GPG allows are suppressed.
-- **`deny.env` wins over `gh_guard.inject_token`.** If repo config denies `GH_TOKEN`/`GITHUB_TOKEN`/`COPILOT_GITHUB_TOKEN`, cplt does not re-inject tokens later in exec. You will see a startup warning when this conflict exists.
+- **`deny.env` wins over `gh_guard.inject_token`.** `GH_TOKEN` is the variable cplt injects into, so a repo `deny.env` that denies `GH_TOKEN` strips the injected value from the child even with `inject_token = true` (denying only `GITHUB_TOKEN` / `COPILOT_GITHUB_TOKEN` does not block a fresh `GH_TOKEN` injection). cplt prints a startup warning for the conflict. See [gh & git command guard](#gh--git-command-guard) and [docs/gh-guard.md](docs/gh-guard.md).
 - **`GNUPGHOME`** is not supported yet — only the default `~/.gnupg` location is allowed.
 
 ### JVM Attach API
