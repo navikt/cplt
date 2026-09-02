@@ -149,12 +149,31 @@ pub(crate) const TRUSTED_BIN_DIRS: &[&str] = &[
     "/home/linuxbrew/.linuxbrew/bin",
 ];
 
-/// First `name` found in `dirs`. Split out of [`trusted_binary`] so the
-/// not-found path is testable without depending on the host's `/usr/bin`.
+/// An existing regular file with at least one execute bit.
+///
+/// `which` and `execvp` both require `X_OK`, so a non-executable file of the
+/// right name is not a match — it is a shadow that would turn every spawn into
+/// `EACCES` instead of falling through to the next directory.
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// First executable `name` found in `dirs`. Split out of [`trusted_binary`] so
+/// the not-found path is testable without depending on the host's `/usr/bin`.
+///
+/// `name` must be a single normal path component. `Path::join` drops the base
+/// entirely for an absolute `name` and happily walks out of it for `../x`, so
+/// without this check `trusted_binary` could return a path outside
+/// [`TRUSTED_BIN_DIRS`] — the one guarantee it exists to make.
 fn find_in(dirs: &[&str], name: &str) -> Option<PathBuf> {
+    let mut parts = Path::new(name).components();
+    if !matches!(parts.next(), Some(std::path::Component::Normal(_))) || parts.next().is_some() {
+        return None;
+    }
     dirs.iter()
         .map(|dir| Path::new(dir).join(name))
-        .find(|p| p.is_file())
+        .find(|p| is_executable_file(p))
 }
 
 /// Resolve `name` from [`TRUSTED_BIN_DIRS`], never from `PATH`.
@@ -636,7 +655,7 @@ mod tests {
         let empty = tempfile::tempdir().expect("tempdir");
         let populated = tempfile::tempdir().expect("tempdir");
         let planted = populated.path().join("git");
-        std::fs::write(&planted, "#!/bin/sh\n").expect("write");
+        plant_executable(&planted);
         let dirs = [empty.path().to_str().expect("utf8")];
         assert_eq!(find_in(&dirs, "git"), None);
         let dirs = [
@@ -645,6 +664,51 @@ mod tests {
         ];
         // First match wins, and the earlier directory is searched first.
         assert_eq!(find_in(&dirs, "git"), Some(planted));
+    }
+
+    fn plant_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// A non-executable file named `git` in an earlier trusted directory must
+    /// not shadow the real one: `execvp` needs `X_OK`, so matching it would turn
+    /// every parent-side spawn into `EACCES` instead of searching on.
+    #[test]
+    fn find_in_skips_a_non_executable_shadow() {
+        let shadow = tempfile::tempdir().expect("tempdir");
+        let real = tempfile::tempdir().expect("tempdir");
+        std::fs::write(shadow.path().join("git"), "not executable").expect("write");
+        let planted = real.path().join("git");
+        plant_executable(&planted);
+
+        let dirs = [shadow.path().to_str().expect("utf8")];
+        assert_eq!(find_in(&dirs, "git"), None);
+        let dirs = [
+            shadow.path().to_str().expect("utf8"),
+            real.path().to_str().expect("utf8"),
+        ];
+        assert_eq!(find_in(&dirs, "git"), Some(planted));
+    }
+
+    /// `Path::join` drops the base for an absolute `name` and walks out of it
+    /// for `../x`, either of which would return a path outside
+    /// [`TRUSTED_BIN_DIRS`] — the guarantee `trusted_binary` exists to make.
+    #[test]
+    fn find_in_refuses_anything_but_a_bare_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("git");
+        plant_executable(&outside);
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        let dirs = [sub.to_str().expect("utf8")];
+
+        assert_eq!(find_in(&dirs, outside.to_str().expect("utf8")), None);
+        assert_eq!(find_in(&dirs, "../git"), None);
+        assert_eq!(find_in(&dirs, "./git"), None);
+        assert_eq!(find_in(&dirs, ""), None);
+        assert_eq!(trusted_binary("/bin/sh"), None);
     }
 
     #[test]

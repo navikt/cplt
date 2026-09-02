@@ -415,16 +415,16 @@ fn install_command_wrappers(
     }
 }
 
-/// Find a binary in PATH by name.
+/// Find an executable in PATH by name.
+///
+/// Executability matters: `which` and `execvp` both skip a non-executable file,
+/// so accepting one here would report a stub as the tool's location (`cplt
+/// doctor`) or hand a caller a path that can only ever fail with `EACCES`.
 pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|p| crate::git::is_executable_file(p))
 }
 
 /// Ignore SIGTTOU/SIGTTIN — copilot (Node.js) may manipulate terminal

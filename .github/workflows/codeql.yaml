@@ -102,6 +102,22 @@ jobs:
           # and rust/log-injection has already earned its keep here (a real
           # ESC-injection sink in `log_connection`). Test-code alerts are
           # dismissed as "used in tests" in the security tab instead.
+          #
+          # Same treatment for the three `rust/cleartext-logging` alerts on
+          # `git::trusted_git()` / `git::trusted_binary()` (#236). The values
+          # are `TRUSTED_BIN_DIRS` entries joined with a literal binary name —
+          # `/usr/bin/git`, `/usr/bin/bwrap` — with no env var, config value or
+          # user input anywhere in the flow, and `find_in` refuses any `name`
+          # that is not a bare path component. What trips the query is the
+          # *name*: CodeQL's shared sensitive-data heuristic classifies anything
+          # matching `(?<!un|un_|is|is_)trusted(?!_iter)` as
+          # `SensitiveDataClassification::secret()` — its own docs call that
+          # "generic secret or trusted data". `trusted_git`, `trusted_binary`
+          # and `TRUSTED_BIN_DIRS` all match, so every path they produce is
+          # treated as secret material at any log sink. The lookbehind exempts
+          # only `untrusted`/`is_trusted`; there is no spelling of "resolved
+          # from a trusted directory" that keeps the meaning and dodges the
+          # regex. Dismiss as "false positive".
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # ratchet:github/codeql-action/analyze@v4.37.9
