@@ -112,7 +112,10 @@ pub fn discover_auth(home_dir: &Path, project_dir: &Path) -> AuthDiscovery {
     // the project dir, so a repo-planted `./bin/gh` must not be probed.
     let gh_cli_auth = crate::sandbox::resolve_trusted_gh(project_dir).is_some_and(|gh| {
         std::process::Command::new(gh)
-            .args(["auth", "token"])
+            .args(["auth", "token", "--hostname", "github.com"])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("COPILOT_GITHUB_TOKEN")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
