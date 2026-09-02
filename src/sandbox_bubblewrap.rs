@@ -111,6 +111,15 @@ pub(crate) struct BubblewrapWrapper {
     /// falls back to Landlock-only), which silently un-enforces them — so
     /// the fallback warning needs this to say what was lost.
     pub deny_mask_count: usize,
+    /// How many built-in UNIX-socket masks these args carry. Same fallback
+    /// problem as `deny_mask_count`, but a security-relevant one: without the
+    /// masks the D-Bus / systemd / container sockets are reachable again and
+    /// Landlock cannot substitute for them below ABI v9 (kernel 7.1).
+    pub socket_mask_count: usize,
+    /// Whether egress is locked to the proxy port (`proxy.forced`). Needed
+    /// in-namespace so the helper builds the same seccomp filter as the
+    /// fork-based path (the UDP/raw-socket denial is gated on it).
+    pub proxy_forced: bool,
 }
 
 /// Check if bubblewrap is available on this system.
@@ -315,6 +324,12 @@ pub(crate) struct DenyMasks {
     /// mount or `/tmp`, no longer resolvable, or file masks with no usable
     /// placeholder). The caller warns about these when the wrapper is active.
     skipped: Vec<PathBuf>,
+    /// How many of the built-in socket masks are actually covered — by their
+    /// own entry, or by an ancestor directory mask that shadows them.
+    socket_masks: usize,
+    /// How many entries came from the user's deny paths. Tracked separately so
+    /// the deny-path diagnostics report only what the user asked for.
+    user_masks: usize,
     /// Why the placeholder could not be created, when that is what forced
     /// file masks into `skipped`. Reported by the caller rather than warned
     /// about here: this runs before we know whether bwrap will be used at
@@ -323,8 +338,15 @@ pub(crate) struct DenyMasks {
 }
 
 impl DenyMasks {
+    /// Number of masks that came from the user's `--deny-path` / `deny.paths`.
     pub(crate) fn mask_count(&self) -> usize {
-        self.dirs.len() + self.files.len()
+        self.user_masks
+    }
+
+    /// Number of masks that came from the built-in UNIX-socket set
+    /// ([`crate::sandbox::policy::socket_mask_paths`]).
+    pub(crate) fn socket_mask_count(&self) -> usize {
+        self.socket_masks
     }
 
     pub(crate) fn skipped(&self) -> &[PathBuf] {
@@ -360,11 +382,32 @@ impl DenyMasks {
 /// them): dirs nested under another masked dir, and files under any masked
 /// dir — their mount points vanish once the ancestor tmpfs is mounted (bwrap
 /// would otherwise error and sink the wrapper).
-pub(crate) fn build_deny_masks(extra_deny: &[PathBuf], scratch_dir: Option<&Path>) -> DenyMasks {
+///
+/// `socket_masks` carries the built-in UNIX-socket set (see
+/// [`crate::sandbox::policy::socket_mask_paths`]). It goes through exactly the
+/// same machinery — the caller has already dropped the entries that do not
+/// exist on this host, so nothing from it should ever land in `skipped` — and
+/// is only counted separately so the deny-path diagnostics keep reporting the
+/// user's own paths.
+pub(crate) fn build_deny_masks(
+    extra_deny: &[PathBuf],
+    socket_masks: &[PathBuf],
+    scratch_dir: Option<&Path>,
+) -> DenyMasks {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
     let mut skipped: Vec<PathBuf> = Vec::new();
-    for path in extra_deny {
+    // Canonicalized paths by origin. Kept apart (rather than one list and a
+    // negation) because a path can legitimately be in both: a user
+    // `--deny-path /run/docker.sock` names something the built-in socket set
+    // already covers, and it must count for both, not neither.
+    let mut socket_canon: Vec<PathBuf> = Vec::new();
+    let mut user_canon: Vec<PathBuf> = Vec::new();
+    for (path, is_socket_mask) in extra_deny
+        .iter()
+        .map(|p| (p, false))
+        .chain(socket_masks.iter().map(|p| (p, true)))
+    {
         if !path.is_absolute() {
             skipped.push(path.clone());
             continue;
@@ -373,6 +416,11 @@ pub(crate) fn build_deny_masks(extra_deny: &[PathBuf], scratch_dir: Option<&Path
             skipped.push(path.clone());
             continue;
         };
+        if is_socket_mask {
+            socket_canon.push(canon.clone());
+        } else {
+            user_canon.push(canon.clone());
+        }
         if canon.starts_with("/proc")
             || canon.starts_with("/dev")
             || canon.starts_with("/sys")
@@ -420,11 +468,40 @@ pub(crate) fn build_deny_masks(extra_deny: &[PathBuf], scratch_dir: Option<&Path
         }
     };
 
+    // Deduplicate before counting. `/var/run` is a symlink to `/run` on most
+    // distributions, so `/var/run/docker.sock` and `/run/docker.sock`
+    // canonicalize to one path; `files` already dedups, and without this the
+    // message would claim two masks for one socket.
+    socket_canon.sort();
+    socket_canon.dedup();
+    user_canon.sort();
+    user_canon.dedup();
+
+    // Counted by *coverage*, not by surviving entries: a socket mask pruned
+    // because a user deny path (or another mask) already tmpfs-es its parent
+    // is still masked. Counting entries would report 0 escape sockets for a
+    // run that in fact covers all of them, e.g. `--deny-path /run/user/<uid>`.
+    let socket_masks = socket_canon
+        .iter()
+        .filter(|p| kept_dirs.iter().any(|k| p.starts_with(k)) || files.contains(p))
+        .count();
+    // Counted by origin, not as "everything that is not a socket mask": a path
+    // the user denied that also appears in the built-in set is still a deny
+    // path they asked for, and subtracting it would drop the "Deny paths
+    // enforced" line entirely for a run that does enforce them.
+    let user_masks = kept_dirs
+        .iter()
+        .chain(files.iter())
+        .filter(|p| user_canon.contains(*p))
+        .count();
+
     DenyMasks {
         dirs: kept_dirs,
         files,
         placeholder,
         skipped,
+        socket_masks,
+        user_masks,
         placeholder_error,
     }
 }
@@ -530,6 +607,7 @@ pub(crate) fn resolve(
     fs_rules: &[FsRule],
     net_rules: &[NetRule],
     restrict_net_connect: bool,
+    proxy_forced: bool,
     ro_protect: &[PathBuf],
     deny_masks: &DenyMasks,
 ) -> Result<Option<BubblewrapWrapper>, String> {
@@ -539,6 +617,7 @@ pub(crate) fn resolve(
             fs_rules,
             net_rules,
             restrict_net_connect,
+            proxy_forced,
             ro_protect,
             deny_masks,
             true,
@@ -554,6 +633,7 @@ pub(crate) fn resolve(
             fs_rules,
             net_rules,
             restrict_net_connect,
+            proxy_forced,
             ro_protect,
             deny_masks,
             false,
@@ -573,6 +653,7 @@ fn build_wrapper(
     fs_rules: &[FsRule],
     net_rules: &[NetRule],
     restrict_net_connect: bool,
+    proxy_forced: bool,
     ro_protect: &[PathBuf],
     deny_masks: &DenyMasks,
     strict: bool,
@@ -588,6 +669,8 @@ fn build_wrapper(
         restrict_net_connect,
         strict,
         deny_mask_count: deny_masks.mask_count(),
+        socket_mask_count: deny_masks.socket_mask_count(),
+        proxy_forced,
     })
 }
 
@@ -631,6 +714,7 @@ struct InnerPolicy {
     fs_rules: Vec<InnerRule>,
     net_ports: Vec<u16>,
     restrict_net_connect: bool,
+    proxy_forced: bool,
     /// `[agent_binary, args...]` — `execve`-ed verbatim by the helper.
     agent_argv: Vec<String>,
 }
@@ -654,6 +738,7 @@ pub(crate) fn serialize_policy(
             .collect(),
         net_ports: wrapper.net_rules.iter().map(|r| r.port).collect(),
         restrict_net_connect: wrapper.restrict_net_connect,
+        proxy_forced: wrapper.proxy_forced,
         agent_argv,
     };
     serde_json::to_vec(&policy).map_err(std::io::Error::other)
@@ -715,6 +800,7 @@ fn run_inner() {
         &fs_rules,
         &net_rules,
         policy.restrict_net_connect,
+        policy.proxy_forced,
     )
     .is_err()
     {
@@ -938,9 +1024,17 @@ mod tests {
     #[test]
     fn resolve_disabled_returns_none() {
         assert!(
-            resolve(Some(false), &[], &[], true, &[], &DenyMasks::default())
-                .unwrap()
-                .is_none()
+            resolve(
+                Some(false),
+                &[],
+                &[],
+                true,
+                false,
+                &[],
+                &DenyMasks::default()
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -1150,7 +1244,7 @@ mod tests {
         let hooks_proj = base.path().join("proj");
         std::fs::create_dir_all(hooks_proj.join(".git/hooks")).expect("hooks");
 
-        let masks = build_deny_masks(std::slice::from_ref(&secret), None);
+        let masks = build_deny_masks(std::slice::from_ref(&secret), &[], None);
         assert_eq!(masks.mask_count(), 1);
 
         let rules = [writable_rule(&base.path().to_string_lossy())];
@@ -1189,7 +1283,7 @@ mod tests {
         let scratch = base.path().join("scratch");
         std::fs::create_dir(&scratch).expect("scratch");
 
-        let masks = build_deny_masks(std::slice::from_ref(&secret), Some(&scratch));
+        let masks = build_deny_masks(std::slice::from_ref(&secret), &[], Some(&scratch));
         assert_eq!(masks.mask_count(), 1);
         let placeholder = masks.placeholder.clone().expect("placeholder created");
         use std::os::unix::fs::PermissionsExt;
@@ -1231,7 +1325,7 @@ mod tests {
         let base = non_tmp_tempdir();
         let secret = base.path().join("token.txt");
         std::fs::write(&secret, "s").expect("write");
-        let masks = build_deny_masks(std::slice::from_ref(&secret), None);
+        let masks = build_deny_masks(std::slice::from_ref(&secret), &[], None);
         assert_eq!(masks.mask_count(), 0, "no scratch dir → no file mask");
         assert!(masks.placeholder.is_none());
         // The unmaskable file is reported rather than silently dropped, and
@@ -1262,7 +1356,7 @@ mod tests {
         };
         resolved.apply_repo_config(&repo_config, base.path(), &[]);
 
-        let masks = build_deny_masks(&resolved.deny_paths, None);
+        let masks = build_deny_masks(&resolved.deny_paths, &[], None);
         assert!(
             masks.skipped().is_empty(),
             "an anchored repo deny path must not be skipped: {:?}",
@@ -1282,6 +1376,7 @@ mod tests {
                 PathBuf::from("/nonexistent/cplt-test-path"),
                 under_tmp.path().to_path_buf(),
             ],
+            &[],
             None,
         );
         assert_eq!(masks.mask_count(), 0);
@@ -1300,7 +1395,7 @@ mod tests {
         let link = base.path().join("link-secrets");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-        let masks = build_deny_masks(&[link], None);
+        let masks = build_deny_masks(&[link], &[], None);
         assert_eq!(masks.dirs, vec![real.canonicalize().unwrap()]);
     }
 
@@ -1318,7 +1413,7 @@ mod tests {
         let scratch = base.path().join("scratch");
         std::fs::create_dir(&scratch).expect("scratch");
 
-        let masks = build_deny_masks(&[child, parent.clone(), file_under], Some(&scratch));
+        let masks = build_deny_masks(&[child, parent.clone(), file_under], &[], Some(&scratch));
         assert_eq!(masks.dirs, vec![parent.canonicalize().unwrap()]);
         assert!(
             masks.files.is_empty(),
@@ -1342,7 +1437,7 @@ mod tests {
         let scratch = base.path().join("scratch");
         std::fs::create_dir(&scratch).expect("scratch");
 
-        let masks = build_deny_masks(&[dir.clone(), file], Some(&scratch));
+        let masks = build_deny_masks(&[dir.clone(), file], &[], Some(&scratch));
         let args = build_bwrap_args(&[], &[], &masks);
         let file_pos = args.iter().position(|a| a.ends_with("f.txt")).unwrap();
         let dir_canon = dir.canonicalize().unwrap().to_string_lossy().into_owned();
@@ -1351,5 +1446,149 @@ mod tests {
             .position(|w| w[0] == "--tmpfs" && w[1] == dir_canon)
             .unwrap();
         assert!(file_pos < dir_pos, "file masks must precede dir masks");
+    }
+
+    #[test]
+    fn socket_masks_are_counted_apart_from_deny_paths() {
+        // The two sets go through the same machinery but mean different things
+        // to the user: "your --deny-path was enforced" must not be inflated by
+        // masks cplt added on its own, and the fallback warning about losing
+        // the socket masks must not fire for a run with no deny paths at all.
+        let base = non_tmp_tempdir();
+        let scratch = base.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch");
+        let denied = base.path().join("secret.txt");
+        std::fs::write(&denied, "s").expect("write");
+        let sock_dir = base.path().join("runtime");
+        std::fs::create_dir(&sock_dir).expect("runtime");
+        let sock_file = base.path().join("bus");
+        std::fs::write(&sock_file, "").expect("bus");
+
+        let masks = build_deny_masks(
+            std::slice::from_ref(&denied),
+            &[sock_dir, sock_file],
+            Some(&scratch),
+        );
+        assert_eq!(masks.mask_count(), 1, "one user deny path");
+        assert_eq!(
+            masks.socket_mask_count(),
+            2,
+            "one socket dir + one socket file"
+        );
+
+        // With no deny paths at all the socket masks still apply, and the
+        // deny-path count stays zero.
+        // A fresh scratch dir: the mode-000 placeholder from the call above
+        // cannot be rewritten in place.
+        let scratch2 = base.path().join("scratch2");
+        std::fs::create_dir(&scratch2).expect("scratch2");
+        let only_sockets = build_deny_masks(&[], std::slice::from_ref(&denied), Some(&scratch2));
+        assert_eq!(only_sockets.mask_count(), 0);
+        assert_eq!(only_sockets.socket_mask_count(), 1);
+    }
+
+    #[test]
+    fn socket_mask_count_dedups_aliases_and_keeps_user_deny_paths() {
+        // Two entries, one inode: `/var/run` is a symlink to `/run` on most
+        // distributions, so the built-in list's `/var/run/docker.sock` and
+        // `/run/docker.sock` canonicalize together. Reported as 2, the message
+        // would overstate what is masked.
+        let base = non_tmp_tempdir();
+        let scratch = base.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch");
+        let real = base.path().join("run");
+        std::fs::create_dir(&real).expect("run");
+        let sock = real.join("docker.sock");
+        std::fs::write(&sock, "").expect("sock");
+        let alias = base.path().join("var-run");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+
+        let masks = build_deny_masks(
+            &[],
+            &[sock.clone(), alias.join("docker.sock")],
+            Some(&scratch),
+        );
+        assert_eq!(
+            masks.socket_mask_count(),
+            1,
+            "two aliases of one socket are one mask"
+        );
+
+        // A user deny path that names the same socket is still their deny
+        // path: it must not vanish from the deny-path count just because the
+        // built-in set covers it too, or the "Deny paths enforced" line never
+        // prints for a run that does enforce it.
+        let scratch2 = base.path().join("scratch2");
+        std::fs::create_dir(&scratch2).expect("scratch2");
+        let both = build_deny_masks(
+            std::slice::from_ref(&sock),
+            std::slice::from_ref(&sock),
+            Some(&scratch2),
+        );
+        assert_eq!(both.mask_count(), 1, "the user asked for this deny path");
+        assert_eq!(both.socket_mask_count(), 1, "and it is a socket mask too");
+    }
+
+    #[test]
+    fn socket_masks_covered_by_an_ancestor_still_count() {
+        // A user deny path over the runtime dir prunes the nested socket
+        // entries (their mount points vanish under the tmpfs), but they are
+        // still masked. Counting surviving entries would report "0 escape
+        // sockets masked" for the run that covers them most thoroughly.
+        let base = non_tmp_tempdir();
+        let scratch = base.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch");
+        let run_user = base.path().join("run-user");
+        std::fs::create_dir(&run_user).expect("run-user");
+        let bus = run_user.join("bus");
+        std::fs::write(&bus, "").expect("bus");
+        let systemd = run_user.join("systemd");
+        std::fs::create_dir(&systemd).expect("systemd");
+
+        let masks = build_deny_masks(
+            std::slice::from_ref(&run_user),
+            &[bus, systemd],
+            Some(&scratch),
+        );
+        assert_eq!(masks.mask_count(), 1, "the user's one deny path");
+        assert_eq!(
+            masks.socket_mask_count(),
+            2,
+            "both sockets are covered by the ancestor tmpfs"
+        );
+    }
+
+    #[test]
+    fn socket_masks_reach_the_bwrap_args() {
+        // A mask that never makes it into the argv is a mask that does nothing.
+        let base = non_tmp_tempdir();
+        let scratch = base.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch");
+        let bus = base.path().join("bus");
+        std::fs::write(&bus, "").expect("bus");
+        let systemd = base.path().join("systemd");
+        std::fs::create_dir(&systemd).expect("systemd");
+
+        let masks = build_deny_masks(&[], &[bus.clone(), systemd.clone()], Some(&scratch));
+        let args = build_bwrap_args(&[], &[], &masks);
+
+        let bus_str = bus.canonicalize().unwrap().to_string_lossy().into_owned();
+        let systemd_str = systemd
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // `--ro-bind <placeholder> <target>` is three argv entries, so the
+        // masked path is the third one.
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[2] == bus_str),
+            "socket file must be shadowed by the placeholder bind: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == systemd_str),
+            "socket dir must be shadowed by a tmpfs: {args:?}"
+        );
     }
 }

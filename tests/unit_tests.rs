@@ -8565,3 +8565,82 @@ fn repo_config_state_not_a_git_repo() {
         "must say it is not a git repo"
     );
 }
+
+// ── Linux UNIX-socket mount masks (Finding A) ──────────────────
+//
+// The path list is pure data, so it is tested here (cross-platform) rather
+// than in the Linux-only bubblewrap module. What the masks are *for* is
+// documented on `socket_mask_paths`; these tests pin the contents, because a
+// dropped entry is a silent hole.
+
+#[test]
+fn socket_masks_cover_the_escape_sockets() {
+    let masks = cplt::sandbox::socket_mask_paths(1000, false);
+    for expected in [
+        "/run/user/1000/bus",          // D-Bus session bus -> systemd-run --user
+        "/run/user/1000/systemd",      // systemd's private socket
+        "/run/dbus/system_bus_socket", // D-Bus system bus
+        "/run/docker.sock",            // docker daemon == host root
+        "/var/run/docker.sock",
+        "/run/user/1000/docker.sock", // rootless docker
+        "/run/user/1000/podman",      // podman.sock lives beneath
+        "/run/podman",
+    ] {
+        assert!(
+            masks.iter().any(|p| p == std::path::Path::new(expected)),
+            "socket mask list must contain {expected}, got {masks:?}"
+        );
+    }
+}
+
+#[test]
+fn allow_docker_lifts_only_the_container_masks() {
+    let with_docker = cplt::sandbox::socket_mask_paths(1000, true);
+    let docker_paths = cplt::sandbox::linux_docker_socket_paths(1000);
+
+    for p in &docker_paths {
+        assert!(
+            !with_docker.contains(p),
+            "--allow-docker must lift the mask on {}",
+            p.display()
+        );
+    }
+    // The escape sockets that have nothing to do with containers are never
+    // lifted: --allow-docker is not a general socket escape hatch.
+    for expected in [
+        "/run/user/1000/bus",
+        "/run/user/1000/systemd",
+        "/run/dbus/system_bus_socket",
+    ] {
+        assert!(
+            with_docker
+                .iter()
+                .any(|p| p == std::path::Path::new(expected)),
+            "--allow-docker must NOT lift the mask on {expected}"
+        );
+    }
+    assert_eq!(
+        with_docker.len() + docker_paths.len(),
+        cplt::sandbox::socket_mask_paths(1000, false).len(),
+        "allow_docker must differ from the default set by exactly the container sockets"
+    );
+}
+
+#[test]
+fn socket_masks_follow_the_uid() {
+    // The runtime-dir entries are per-user; a hardcoded uid would mask nothing
+    // on any host but the developer's.
+    let masks = cplt::sandbox::socket_mask_paths(4242, false);
+    assert!(
+        masks
+            .iter()
+            .any(|p| p == std::path::Path::new("/run/user/4242/bus")),
+        "runtime-dir masks must use the caller's uid, got {masks:?}"
+    );
+    assert!(
+        !masks
+            .iter()
+            .any(|p| p.to_string_lossy().contains("/run/user/1000/")),
+        "no other uid may leak into the list, got {masks:?}"
+    );
+}

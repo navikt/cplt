@@ -596,6 +596,43 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 },
             });
         }
+        // GnuPG >= 2.1.13 keeps the real sockets in the runtime dir
+        // (`/run/user/<uid>/gnupg/d.<hash>/S.gpg-agent`); the `~/.gnupg`
+        // entries above are then plain "socket redirect" files naming this
+        // path. Connecting there needed no Landlock right before ABI v9, so
+        // the omission was invisible; from v9 on, `ResolveUnix` is enforced and
+        // signing would break without this rule. Scoped to `gnupg/` — not the
+        // whole runtime dir, which holds the D-Bus and systemd sockets.
+        fs_rules.push(FsRule {
+            path: PathBuf::from(format!("/run/user/{}/gnupg", policy::current_uid())),
+            access: FsAccess {
+                read: true,
+                write: true,
+                execute: false,
+                ioctl: false,
+            },
+        });
+    }
+
+    // ── Docker/Podman daemon sockets (--allow-docker) ──
+    // Landlock's first actual effect for this flag on Linux (#155): read+write
+    // on the daemon endpoints, which is what `connect(2)` needs once the kernel
+    // gates pathname sockets (ABI v9). Below v9 it changes nothing — an
+    // ungranted socket was already connectable — so this is not a widening.
+    // Sockets are *not* masked by bubblewrap in this mode either; both halves
+    // read the same path list.
+    if config.allow_docker {
+        for path in policy::linux_docker_socket_paths(policy::current_uid()) {
+            fs_rules.push(FsRule {
+                path,
+                access: FsAccess {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    ioctl: false,
+                },
+            });
+        }
     }
 
     // ── Home config files: individual read-only rules ──
@@ -833,14 +870,14 @@ pub fn describe_policy(policy: &LandlockPolicy) -> String {
 /// probing under-reports availability).
 #[cfg(target_os = "linux")]
 pub fn available_abi_version() -> Option<u32> {
-    Some(match check_availability().ok()? {
-        ABI::V6 => 6,
-        ABI::V5 => 5,
-        ABI::V4 => 4,
-        ABI::V3 => 3,
-        ABI::V2 => 2,
-        _ => 1,
-    })
+    // `landlock::ABI` carries the version as its discriminant (`V1 = 1` …
+    // `V9 = 9`), so the cast IS the mapping. This used to be a hand-kept
+    // `match` with a `_ => 1` fallback, which silently reported 1 for every
+    // ABI whose arm was missing — not merely under-reporting: it makes
+    // `require_landlock!(n)` in the Linux suite panic on a capable host and
+    // inverts the ABI-conditional tests. A cast cannot drift out of date, so
+    // the bug class is gone rather than guarded against.
+    Some(check_availability().ok()? as u32)
 }
 
 /// Check Landlock availability and return the highest supported ABI version.
@@ -893,7 +930,7 @@ pub fn check_availability() -> Result<ABI, String> {
     }
 
     // Clamp to the highest ABI this build understands. A newer kernel reporting
-    // a version above V6 is treated as V6 — best-effort construction still
+    // a version above V9 is treated as V9 — best-effort construction still
     // opportunistically enables every feature the kernel supports.
     let abi = match ret {
         1 => ABI::V1,
@@ -901,7 +938,10 @@ pub fn check_availability() -> Result<ABI, String> {
         3 => ABI::V3,
         4 => ABI::V4,
         5 => ABI::V5,
-        _ => ABI::V6,
+        6 => ABI::V6,
+        7 => ABI::V7,
+        8 => ABI::V8,
+        _ => ABI::V9,
     };
     Ok(abi)
 }
@@ -917,12 +957,40 @@ pub fn check_availability() -> Result<ABI, String> {
 /// * The ABI v1 filesystem baseline is a **hard requirement**. If the kernel
 ///   cannot enforce even v1 filesystem access control, ruleset construction
 ///   fails here and the sandbox refuses to run (fail closed — see below).
-/// * Everything above v1 (Refer, Truncate, IoctlDev, TCP-connect scoping, …)
-///   is declared at the v6 level under [`CompatLevel::BestEffort`], so on older
-///   kernels those rights are silently dropped instead of causing a hard error.
+/// * Everything above v1 (Refer, Truncate, IoctlDev, TCP-connect scoping, …) is
+///   declared under [`CompatLevel::BestEffort`] — the v6 set as a block, plus
+///   `ResolveUnix` (v9) and `Scope::AbstractUnixSocket` (v6) named
+///   individually — so on older kernels those rights are silently dropped
+///   instead of causing a hard error.
 ///
-/// This lets one binary degrade gracefully across kernels 5.13 → 6.12+ without
+/// This lets one binary degrade gracefully across kernels 5.13 → 7.1+ without
 /// branching on the ABI version in application code.
+///
+/// # What the v9/v6 additions buy, and where they buy nothing
+///
+/// * `AccessFs::ResolveUnix` (v9, kernel **7.1**) is the only right that can
+///   gate `connect(2)` to a **pathname** UNIX socket. It is what stops the
+///   `/run/user/<uid>/bus` → `systemd-run --user` escape at the kernel. On any
+///   kernel below 7.1 the crate drops it and **nothing** in Landlock replaces
+///   it — the mount masks in `sandbox_bubblewrap` are then the only defence,
+///   and only when bwrap actually runs. Today that means: on essentially every
+///   deployed kernel (Ubuntu 24.04 = 6.8, Debian 13 = 6.12, Fedora 42 ≈ 6.15)
+///   this line does nothing at all.
+/// * `Scope::AbstractUnixSocket` (v6, kernel 6.12) blocks connecting to
+///   **abstract** sockets created outside the sandbox — X11 input injection via
+///   `@/tmp/.X11-unix/X0` being the motivating case. Abstract sockets have no
+///   path, so bwrap cannot mask them; below 6.12 that channel stays open.
+///   What it costs: Xlib tries the abstract name first and falls back to the
+///   pathname socket `/tmp/.X11-unix/X0`, which stays reachable (`/tmp` is
+///   granted read+write), so X clients still connect — they just lose the
+///   abstract shortcut. Under bubblewrap X11 is already unreachable either
+///   way, since `/tmp` is a fresh tmpfs. Sockets the agent's own children
+///   create are inside the domain and unaffected. Note #114's `--unshare-net`
+///   would close this channel on any kernel, since abstract sockets are
+///   scoped to a network namespace.
+///
+/// Both are requested best-effort, so neither can turn a sandbox that works
+/// today into one that fails to start.
 ///
 /// # Fail-closed contract
 ///
@@ -939,7 +1007,7 @@ fn build_best_effort_ruleset(
     restrict_net_connect: bool,
 ) -> std::io::Result<landlock::RulesetCreated> {
     use landlock::{
-        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr,
+        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr, Scope,
     };
 
     let ruleset = Ruleset::default()
@@ -952,6 +1020,22 @@ fn build_best_effort_ruleset(
         // unsupported rights on older kernels.
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(ABI::V6))
+        .map_err(std::io::Error::other)?
+        // ResolveUnix (v9) is requested by name rather than via
+        // `AccessFs::from_all(ABI::V9)`. In this crate version the two happen
+        // to be equivalent (v7 and v8 add no `AccessFs` right; `from_all(V9)`
+        // == `from_all(V6) | ResolveUnix`), but naming it keeps a future crate
+        // bump from silently pulling an unknown right into the *handled* set —
+        // and in Landlock, handled-but-never-granted means denied, so that
+        // would break exactly the newest kernels this line exists to protect.
+        .handle_access(AccessFs::ResolveUnix)
+        .map_err(std::io::Error::other)?
+        // Scope abstract UNIX sockets out of the domain (v6, kernel 6.12+).
+        // Named individually for the same reason (v6 also defines
+        // `Scope::Signal`, which cplt deliberately does not request: bwrap's
+        // PID namespace already covers cross-domain signalling, and requesting
+        // it without bwrap would break nothing but buys little).
+        .scope(Scope::AbstractUnixSocket)
         .map_err(std::io::Error::other)?;
 
     // Handle TCP connect (ABI v4+) only when network restriction is enabled.
@@ -1039,7 +1123,7 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     use std::os::unix::ffi::OsStrExt;
 
     let abi_version = check_availability()?;
-    let seccomp_filter = build_seccomp_filter();
+    let seccomp_filter = build_seccomp_filter(policy.proxy_forced);
 
     // Fail closed (#53): proxy-forced mode locks kernel egress to the proxy port
     // (the default `*:443` allow is dropped). Enforcing that requires Landlock
@@ -1148,8 +1232,52 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
 ///
 /// Security: The filter validates `seccomp_data.arch` first to prevent
 /// bypass via 32-bit compat syscall ABI (e.g. `int 0x80` on x86_64).
+///
+/// # `proxy_forced`: restricting IP sockets to plain TCP
+///
+/// Landlock's network rights cover **TCP only** (`ConnectTcp` / `BindTcp`);
+/// UDP is not gated until ABI v10, which no released kernel and no version of
+/// the `landlock` crate provides. So in every mode — `proxy.forced` included —
+/// outbound UDP was completely unrestricted at the kernel, and
+/// `socket(AF_INET, SOCK_DGRAM, 0)` + `sendto()` exfiltrated to any host with
+/// no preconditions and without ever touching the proxy or its logs. macOS is
+/// unaffected: under proxy-forced its SBPL drops the `*:443` allow and
+/// `(deny default)` closes UDP along with everything else.
+///
+/// seccomp can close this because the socket *family*, *type* and *protocol*
+/// are plain integer arguments — no pointer dereference, so BPF can inspect
+/// them directly, on every kernel, with no ABI dependency. The rule is an
+/// allow-list (AF_INET/AF_INET6 may only be SOCK_STREAM with protocol 0 or
+/// IPPROTO_TCP) rather than a deny-list of UDP and raw, because SCTP and DCCP
+/// are stream/seqpacket protocols that would otherwise walk straight through
+/// it with the same never-touches-the-proxy property as UDP.
+///
+/// It is gated on `proxy_forced` and applied nowhere else. In default mode
+/// denying `SOCK_DGRAM` would break `getaddrinfo(3)` for every non-proxied
+/// tool. Under `proxy.forced` the agent's own DNS is already pointless — the
+/// only reachable TCP port is the proxy's, and the proxy resolves names itself
+/// on the far side of `CONNECT` — so nothing that was working stops working.
+///
+/// What it does cost: any non-TCP IP socket, so a UDP-speaking dev tool
+/// reached through `--allow-localhost <port>` (a local statsd, a DNS server
+/// under test) loses its socket — and so does code that never sends a packet
+/// but opens such a socket to ask the kernel something. The JDK's
+/// `NetworkInterface.c` opens `socket(AF_INET, SOCK_DGRAM, 0)` purely to issue
+/// `SIOCGIFCONF` and throws `SocketException` on `EPERM`, which Gradle's
+/// `InetAddressFactory` propagates; Gradle is already unusable under
+/// `proxy.forced` on Linux because kernel egress is pinned to the proxy port,
+/// so this costs little in practice, but "UDP tool" understates the blast
+/// radius. It happens because seccomp sees only the family and type at
+/// `socket(2)` —
+/// the destination address does not exist until `connect`/`sendto`, and it
+/// arrives behind a pointer, which BPF cannot follow. A loopback carve-out is
+/// therefore not expressible at this layer; it would need per-syscall address
+/// inspection (seccomp-unotify or eBPF LSM), which is far more machinery than
+/// this branch. The trade is deliberate: `proxy.forced` means "all egress goes
+/// through the proxy", and a silent UDP side channel contradicts that far more
+/// than a rare local UDP tool needs it.
 #[cfg(target_os = "linux")]
-fn build_seccomp_filter() -> Vec<BpfInstruction> {
+fn build_seccomp_filter(proxy_forced: bool) -> Vec<BpfInstruction> {
     // BPF constants
     const BPF_LD: u16 = 0x00;
     const BPF_W: u16 = 0x00;
@@ -1158,14 +1286,20 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
     const BPF_JEQ: u16 = 0x10;
     const BPF_K: u16 = 0x00;
     const BPF_RET: u16 = 0x06;
+    const BPF_ALU: u16 = 0x04;
+    const BPF_AND: u16 = 0x50;
 
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
     const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
     const EPERM_VAL: u32 = 1;
 
-    // seccomp_data field offsets
+    // seccomp_data field offsets. `args` starts at 16 and each entry is 8
+    // bytes little-endian, so the low word of arg N is at 16 + 8*N.
     const NR_OFFSET: u32 = 0;
     const ARCH_OFFSET: u32 = 4;
+    const ARG0_LO_OFFSET: u32 = 16;
+    const ARG1_LO_OFFSET: u32 = 24;
+    const ARG2_LO_OFFSET: u32 = 32;
 
     // Expected architecture audit values
     #[cfg(target_arch = "x86_64")]
@@ -1238,9 +1372,81 @@ fn build_seccomp_filter() -> Vec<BpfInstruction> {
     // Step 2: Load syscall number and check against blocklist.
     filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, NR_OFFSET));
 
+    // Step 2a (x86_64 only): reject the x32 ABI outright.
+    //
+    // x32 syscalls arrive with arch == AUDIT_ARCH_X86_64 — so the arch check
+    // above passes them — but the syscall number carries __X32_SYSCALL_BIT
+    // (0x4000_0000). Nothing below matches such a number, so every JEQ falls
+    // through to the default allow: on a kernel built with CONFIG_X86_X32_ABI
+    // that let x32 callers reach `ptrace`, `unshare` and (once the rule below
+    // exists) `socket` unfiltered. Two instructions close the whole class.
+    #[cfg(target_arch = "x86_64")]
+    {
+        const BPF_JGE: u16 = 0x30;
+        const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+        filter.push(jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 0, 1));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
+    }
+
     // For each blocked syscall: compare and jump to EPERM if match
     for &nr in &blocked {
         filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
+    }
+
+    // Step 3 (proxy-forced only): allow only plain TCP for AF_INET/AF_INET6.
+    // See the function doc for why this is gated and what it costs.
+    //
+    // Deliberately an allow-list, not a deny-list of UDP and raw. Denying
+    // SOCK_DGRAM and SOCK_RAW would leave SCTP and DCCP wide open —
+    // `socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)` and
+    // `socket(AF_INET, SOCK_SEQPACKET, IPPROTO_SCTP)` are neither, and
+    // `inet_create()` autoloads the protocol module for an unprivileged
+    // caller, so they carry exactly the UDP property this rule exists to
+    // remove: egress that never touches the proxy and appears in no log.
+    // Enumerating protocols is a losing game; permitting the one the sandbox
+    // actually needs is not.
+    //
+    // Only the low 32 bits of each argument are examined, which is exactly
+    // what the kernel itself uses: `socket(2)` takes `int` family, type and
+    // protocol, so the upper word is truncated away and cannot be used to slip
+    // a matching value past this check.
+    //
+    // The type argument carries SOCK_NONBLOCK/SOCK_CLOEXEC in its high bits,
+    // so it is masked with SOCK_TYPE_MASK (0xf) before comparison — the same
+    // thing `__sock_create()` does.
+    if proxy_forced {
+        const AF_INET: u32 = libc::AF_INET as u32;
+        const AF_INET6: u32 = libc::AF_INET6 as u32;
+        const SOCK_TYPE_MASK: u32 = 0xf;
+        const SOCK_STREAM: u32 = libc::SOCK_STREAM as u32;
+        const IPPROTO_TCP: u32 = libc::IPPROTO_TCP as u32;
+
+        // A (the accumulator) still holds the syscall number here: the
+        // blocklist loop above only compares and jumps, it never reloads.
+        // jf = 10 skips the whole block below and lands on the default-allow
+        // return appended after it.
+        filter.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::SYS_socket as u32,
+            0,
+            10,
+        ));
+        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, ARG0_LO_OFFSET));
+        // AF_INET / AF_INET6 → fall through to the type check; anything else
+        // (AF_UNIX, AF_NETLINK, …) → skip the whole block to the allow.
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 1, 0));
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 0, 7));
+        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, ARG1_LO_OFFSET));
+        filter.push(stmt(BPF_ALU | BPF_AND | BPF_K, SOCK_TYPE_MASK));
+        // Anything but SOCK_STREAM (DGRAM, RAW, SEQPACKET, …) → deny.
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 0, 3));
+        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, ARG2_LO_OFFSET));
+        // protocol 0 (the default for SOCK_STREAM, i.e. TCP) or an explicit
+        // IPPROTO_TCP → allow. IPPROTO_SCTP / IPPROTO_MPTCP / anything else on
+        // a stream socket → deny.
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 2, 0));
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_TCP, 1, 0));
         filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
     }
 
@@ -1365,6 +1571,7 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     fs_rules: &[FsRule],
     net_rules: &[NetRule],
     restrict_net_connect: bool,
+    proxy_forced: bool,
 ) -> std::io::Result<()> {
     use landlock::{AccessNet, NetPort, RulesetCreatedAttr, RulesetStatus};
     use std::ffi::CString;
@@ -1409,7 +1616,7 @@ pub(crate) fn apply_landlock_and_seccomp_now(
     // Seccomp is rebuilt here rather than serialized across the re-entry — the
     // BPF program is architecture-specific but otherwise constant, so building
     // it in-process is simpler and cannot drift from the fork-based path.
-    apply_seccomp_filter(&build_seccomp_filter())?;
+    apply_seccomp_filter(&build_seccomp_filter(proxy_forced))?;
 
     Ok(())
 }
@@ -1428,7 +1635,7 @@ pub(crate) fn apply_landlock_and_seccomp_now(
 /// pattern, and keeps this function free of `abi_version` comparisons.
 ///
 /// The consistency check the crate runs uses the ruleset's *requested* handled
-/// access (`AccessFs::from_all(ABI::V6)`), which is a superset of everything
+/// access (`AccessFs::from_all(ABI::V9)`), which is a superset of everything
 /// set below, so no rule is ever rejected here.
 #[cfg(target_os = "linux")]
 fn create_path_beneath_rule<'fd>(
@@ -1459,7 +1666,44 @@ fn create_path_beneath_rule<'fd>(
             // Truncate (v3): truncate()/ftruncate() and O_TRUNC opens.
             // Both are best-effort-stripped on kernels that predate them.
             | AccessFs::Refer
-            | AccessFs::Truncate;
+            | AccessFs::Truncate
+            // ResolveUnix (v9, kernel >= 7.1): connect()/sendmsg() to a
+            // pathname UNIX socket. `build_best_effort_ruleset` *handles* this
+            // right from v9 up, and in Landlock handled-but-ungranted means
+            // denied — so it has to be granted deliberately or a 7.1 kernel
+            // starts refusing connections that work everywhere else today.
+            //
+            // Granting it with write (never with read alone) is the decision.
+            // Connecting to a socket is a write-shaped operation, and the
+            // write set is exactly the set of places a socket may legitimately
+            // be reached: `--allow-socket` paths and the gpg-agent /
+            // Docker-daemon sockets are all added as read+write rules above,
+            // and agent-created sockets live in the project dir or the scratch
+            // dir. The read-only tree (system libs, tool configs) holds no
+            // socket anyone needs.
+            //
+            // Denied on 7.1+ as a result, each checked and each intended:
+            // `/run/user/<uid>/{bus,systemd}` and `/run/dbus/system_bus_socket`
+            // (the escape this whole change exists to close);
+            // `/run/systemd/resolve/io.systemd.Resolve` — nss-resolve then
+            // returns UNAVAIL and glibc falls through to the `dns` NSS source,
+            // so name resolution still works; `/var/run/nscd/socket` — same
+            // graceful fallback; `/dev/log` — syslog(3) fails silently and
+            // nothing in an agent session depends on it; Wayland, PulseAudio
+            // and PipeWire sockets under `$XDG_RUNTIME_DIR` — a terminal
+            // coding agent has no business in a display or audio server.
+            //
+            // Residual, stated plainly: `/tmp` is granted read+write wholesale
+            // (agents genuinely need it, and `--allow-jvm-attach` /
+            // `--allow-msbuild` exist precisely to connect to sockets there),
+            // so a pre-existing ssh-agent or tmux socket under `/tmp` keeps
+            // ResolveUnix on 7.1+. Under bubblewrap that is moot — `/tmp` is a
+            // fresh empty tmpfs — but without bubblewrap it stays reachable.
+            //
+            // Below kernel 7.1 the crate strips this right and none of the
+            // above is enforced at all; the bwrap mount masks are the only
+            // thing standing there.
+            | AccessFs::ResolveUnix;
     }
 
     if access.execute {
@@ -2079,6 +2323,267 @@ mod tests {
         );
         // Non-forced with restriction disabled is fine.
         assert!(check_proxy_forced_enforceable(false, ABI::V5, false).is_ok());
+    }
+
+    // ── seccomp: UDP / raw-socket denial under proxy-forced (Finding B) ──
+
+    /// Run the built filter against a synthetic `seccomp_data` and return the
+    /// action the kernel would take. A ~30-line interpreter is cheaper than
+    /// asserting on instruction shapes, and it actually tests the semantics:
+    /// an off-by-one in a jump offset silently allows the syscall it is meant
+    /// to block, and no structural assertion would catch that.
+    #[cfg(target_os = "linux")]
+    fn run_filter(filter: &[BpfInstruction], nr: u32, arch: u32, args: [u64; 6]) -> u32 {
+        // seccomp_data as a byte-addressable little-endian record.
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        for (i, a) in args.iter().enumerate() {
+            data[16 + i * 8..24 + i * 8].copy_from_slice(&a.to_le_bytes());
+        }
+
+        let mut acc: u32 = 0;
+        let mut pc: usize = 0;
+        loop {
+            let ins = &filter[pc];
+            pc += 1;
+            match ins.code {
+                // BPF_LD | BPF_W | BPF_ABS
+                0x20 => {
+                    let o = ins.k as usize;
+                    acc = u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
+                }
+                // BPF_ALU | BPF_AND | BPF_K
+                0x54 => acc &= ins.k,
+                // BPF_JMP | BPF_JEQ | BPF_K
+                0x15 => {
+                    pc += usize::from(if acc == ins.k { ins.jt } else { ins.jf });
+                }
+                // BPF_JMP | BPF_JGE | BPF_K
+                0x35 => {
+                    pc += usize::from(if acc >= ins.k { ins.jt } else { ins.jf });
+                }
+                // BPF_RET | BPF_K
+                0x06 => return ins.k,
+                other => panic!("unhandled BPF opcode {other:#x} at pc {}", pc - 1),
+            }
+            assert!(pc < filter.len(), "filter ran off the end (missing return)");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const ALLOW: u32 = 0x7fff_0000;
+    #[cfg(target_os = "linux")]
+    const EPERM: u32 = 0x0005_0000 | 1;
+    #[cfg(target_os = "linux")]
+    const ARCH: u32 = if cfg!(target_arch = "x86_64") {
+        0xC000_003E
+    } else {
+        0xC000_00B7
+    };
+
+    #[cfg(target_os = "linux")]
+    fn sock(family: u64, ty: u64) -> [u64; 6] {
+        [family, ty, 0, 0, 0, 0]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sock_proto(family: u64, ty: u64, proto: u64) -> [u64; 6] {
+        [family, ty, proto, 0, 0, 0]
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_forced_seccomp_denies_inet_datagram_and_raw() {
+        let filter = build_seccomp_filter(true);
+        let nr = libc::SYS_socket as u32;
+        for family in [libc::AF_INET as u64, libc::AF_INET6 as u64] {
+            for ty in [libc::SOCK_DGRAM as u64, libc::SOCK_RAW as u64] {
+                assert_eq!(
+                    run_filter(&filter, nr, ARCH, sock(family, ty)),
+                    EPERM,
+                    "proxy-forced must EPERM socket(family={family}, type={ty}) — \
+                     this is the UDP exfiltration channel Landlock cannot see"
+                );
+                // SOCK_NONBLOCK / SOCK_CLOEXEC must not open a bypass: the
+                // type is masked with SOCK_TYPE_MASK before comparison.
+                let flagged = ty | (libc::SOCK_NONBLOCK as u64) | (libc::SOCK_CLOEXEC as u64);
+                assert_eq!(
+                    run_filter(&filter, nr, ARCH, sock(family, flagged)),
+                    EPERM,
+                    "SOCK_NONBLOCK/SOCK_CLOEXEC must not bypass the type check"
+                );
+                // The kernel truncates the args to int, so a high-word trick
+                // cannot produce a matching family the filter fails to see.
+                assert_eq!(
+                    run_filter(&filter, nr, ARCH, sock(family | 0x1_0000_0000, ty)),
+                    EPERM,
+                    "high bits in the family argument must not bypass the check"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_forced_seccomp_denies_sctp_and_dccp() {
+        // The reason the rule is an allow-list. SCTP and DCCP are reached with
+        // SOCK_STREAM / SOCK_SEQPACKET, so a deny-list of DGRAM+RAW would let
+        // them through — and inet_create() autoloads the module for an
+        // unprivileged caller, so "the module probably is not loaded" is not a
+        // mitigation.
+        let filter = build_seccomp_filter(true);
+        let nr = libc::SYS_socket as u32;
+        for family in [libc::AF_INET as u64, libc::AF_INET6 as u64] {
+            for (ty, proto) in [
+                (libc::SOCK_STREAM as u64, libc::IPPROTO_SCTP as u64),
+                (libc::SOCK_SEQPACKET as u64, libc::IPPROTO_SCTP as u64),
+                (libc::SOCK_DCCP as u64, 0),
+                // MPTCP is also not plain TCP; it is denied by the same arm.
+                (libc::SOCK_STREAM as u64, 262),
+            ] {
+                assert_eq!(
+                    run_filter(&filter, nr, ARCH, sock_proto(family, ty, proto)),
+                    EPERM,
+                    "proxy-forced must deny socket({family}, {ty}, {proto}) —                      a non-TCP IP socket never reaches the proxy"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn x32_syscalls_cannot_walk_past_the_filter() {
+        // x32 passes the arch check (arch == AUDIT_ARCH_X86_64) but sets
+        // __X32_SYSCALL_BIT in the syscall number, so no JEQ in the blocklist
+        // or the socket rule matches and everything fell through to the
+        // default allow. Both filter shapes must reject the whole ABI.
+        const X32_BIT: u32 = 0x4000_0000;
+        for proxy_forced in [false, true] {
+            let filter = build_seccomp_filter(proxy_forced);
+            for nr in [
+                libc::SYS_ptrace as u32,
+                libc::SYS_socket as u32,
+                libc::SYS_read as u32,
+            ] {
+                assert_eq!(
+                    run_filter(&filter, nr | X32_BIT, ARCH, [0; 6]),
+                    EPERM,
+                    "x32 syscall {nr} must be refused (proxy_forced={proxy_forced})"
+                );
+            }
+            // The native numbers are unaffected by the guard.
+            assert_eq!(
+                run_filter(&filter, libc::SYS_read as u32, ARCH, [0; 6]),
+                ALLOW
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_forced_seccomp_still_allows_what_the_agent_needs() {
+        let filter = build_seccomp_filter(true);
+        let nr = libc::SYS_socket as u32;
+        // TCP is Landlock's job (ConnectTcp pins it to the proxy port) and
+        // must stay callable, or the agent cannot reach the proxy at all.
+        for family in [libc::AF_INET as u64, libc::AF_INET6 as u64] {
+            assert_eq!(
+                run_filter(&filter, nr, ARCH, sock(family, libc::SOCK_STREAM as u64)),
+                ALLOW,
+                "TCP sockets must stay allowed under proxy-forced"
+            );
+        }
+        // An explicit IPPROTO_TCP is the same thing as protocol 0 here and
+        // must not be caught by the protocol arm.
+        for family in [libc::AF_INET as u64, libc::AF_INET6 as u64] {
+            assert_eq!(
+                run_filter(
+                    &filter,
+                    nr,
+                    ARCH,
+                    sock_proto(family, libc::SOCK_STREAM as u64, libc::IPPROTO_TCP as u64)
+                ),
+                ALLOW,
+                "an explicit IPPROTO_TCP stream socket must stay allowed"
+            );
+        }
+        // Non-IP families are untouched: AF_UNIX carries local IPC that the
+        // agent's own tooling needs, AF_NETLINK is used by libc for interface
+        // enumeration.
+        for family in [libc::AF_UNIX as u64, libc::AF_NETLINK as u64] {
+            assert_eq!(
+                run_filter(&filter, nr, ARCH, sock(family, libc::SOCK_DGRAM as u64)),
+                ALLOW,
+                "only AF_INET/AF_INET6 datagrams are denied, family={family} is not"
+            );
+        }
+        // A different syscall whose first args happen to look like AF_INET +
+        // SOCK_DGRAM must not be caught by the socket rule.
+        assert_eq!(
+            run_filter(
+                &filter,
+                libc::SYS_write as u32,
+                ARCH,
+                sock(libc::AF_INET as u64, libc::SOCK_DGRAM as u64)
+            ),
+            ALLOW,
+            "the UDP rule must only apply to socket(2)"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_mode_seccomp_leaves_udp_alone() {
+        // Not a nicety: denying SOCK_DGRAM outside proxy-forced would break
+        // getaddrinfo(3) for every non-proxied tool in the sandbox.
+        let filter = build_seccomp_filter(false);
+        let nr = libc::SYS_socket as u32;
+        for family in [libc::AF_INET as u64, libc::AF_INET6 as u64] {
+            for ty in [libc::SOCK_DGRAM as u64, libc::SOCK_RAW as u64] {
+                assert_eq!(
+                    run_filter(&filter, nr, ARCH, sock(family, ty)),
+                    ALLOW,
+                    "default mode must not touch UDP/raw sockets (DNS depends on it)"
+                );
+            }
+        }
+        // The rule is genuinely absent, not merely inert.
+        assert!(
+            build_seccomp_filter(true).len() > filter.len(),
+            "the proxy-forced filter must carry extra instructions"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_blocklist_and_arch_guard_survive_the_udp_rule() {
+        // Regression guard: the UDP block is appended after the blocklist and
+        // must not shift any jump target in it.
+        for proxy_forced in [false, true] {
+            let filter = build_seccomp_filter(proxy_forced);
+            assert_eq!(
+                run_filter(&filter, libc::SYS_ptrace as u32, ARCH, [0; 6]),
+                EPERM,
+                "ptrace must stay blocked (proxy_forced={proxy_forced})"
+            );
+            assert_eq!(
+                run_filter(&filter, libc::SYS_unshare as u32, ARCH, [0; 6]),
+                EPERM,
+                "unshare must stay blocked (proxy_forced={proxy_forced})"
+            );
+            assert_eq!(
+                run_filter(&filter, libc::SYS_read as u32, ARCH, [0; 6]),
+                ALLOW,
+                "ordinary syscalls must stay allowed (proxy_forced={proxy_forced})"
+            );
+            // Wrong arch (32-bit compat entry) is refused before anything else.
+            assert_eq!(
+                run_filter(&filter, libc::SYS_read as u32, 0x4000_0003, [0; 6]),
+                EPERM,
+                "arch guard must reject the compat ABI (proxy_forced={proxy_forced})"
+            );
+        }
     }
 
     #[test]
@@ -2793,7 +3298,7 @@ mod tests {
 
     /// `available_abi_version()` and `check_availability()` must agree: the
     /// single-syscall probe backs both, and the reported version stays within
-    /// the range this build understands (v1..=v6).
+    /// the range this build understands (v1..=v9).
     #[cfg(target_os = "linux")]
     #[test]
     fn available_abi_version_agrees_with_check_availability() {
@@ -2802,7 +3307,7 @@ mod tests {
                 let v = available_abi_version()
                     .expect("available_abi_version must be Some when check_availability is Ok");
                 assert!(
-                    (1..=6).contains(&v),
+                    (1..=9).contains(&v),
                     "reported ABI version {v} must be within the supported range"
                 );
             }
@@ -2810,6 +3315,35 @@ mod tests {
                 available_abi_version().is_none(),
                 "available_abi_version must be None when Landlock is unavailable"
             ),
+        }
+    }
+
+    /// `available_abi_version` casts the `ABI` discriminant instead of keeping
+    /// a hand-written table, which is only correct while the crate keeps
+    /// numbering the variants after the ABI they name.
+    ///
+    /// Checked over every variant rather than through the probe: an assertion
+    /// that only inspects the running kernel's ABI proves nothing about the
+    /// arms that kernel does not report, so on a 6.8 runner (v4) a broken v9
+    /// would sail through CI. This runs the same on every host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abi_discriminants_match_their_version_numbers() {
+        for (abi, expected) in [
+            (ABI::V1, 1),
+            (ABI::V2, 2),
+            (ABI::V3, 3),
+            (ABI::V4, 4),
+            (ABI::V5, 5),
+            (ABI::V6, 6),
+            (ABI::V7, 7),
+            (ABI::V8, 8),
+            (ABI::V9, 9),
+        ] {
+            assert_eq!(
+                abi as u32, expected,
+                "ABI::{abi:?} must have discriminant {expected};                  available_abi_version() casts it directly"
+            );
         }
     }
 }
