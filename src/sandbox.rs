@@ -589,10 +589,17 @@ mod tests {
     /// macOS-only, `/run/current-system/sw/bin` NixOS-only).
     ///
     /// Scope, so the name does not promise more than it checks: this asserts
-    /// membership in the read-only tool-dir grants. It does not scan the write
-    /// grants for an overlap, because every write grant is `$HOME`-relative or a
-    /// per-tool config dir and so cannot contain an absolute system bin dir. If
-    /// an absolute write grant is ever added, extend this.
+    /// membership in the read-only tool-dir grants, and it only covers the
+    /// **built-in** grant lists. It does not scan those for a write overlap
+    /// because every built-in write grant is `$HOME`-relative or a per-tool
+    /// config dir, so none of them can name an absolute system bin dir; if a
+    /// built-in absolute write grant is ever added, extend this.
+    ///
+    /// User configuration is outside that scope. `allow.write` paths go through
+    /// `resolve_config_path`, which accepts an absolute path as-is, so a user
+    /// can grant write on `/usr/local/bin` and overlap a trusted directory. No
+    /// test can see that from here — it is a property of the running config, not
+    /// of the constants.
     #[test]
     fn every_trusted_dir_is_covered_by_a_tool_read_grant() {
         let granted: Vec<&str> = policy::TOOL_READ_DIRS
