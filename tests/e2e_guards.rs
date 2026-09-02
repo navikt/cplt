@@ -44,20 +44,50 @@ fn gh_gate(args: &[&str]) -> (String, String, bool) {
     gh_gate_with_opts(args, &[])
 }
 
-/// Run `cplt gh-gate` with extra policy flags.
+/// Create a throwaway Git repository with `origin` pointing at `remote`
+/// ("owner/name"), so the gate's cwd checks do not depend on the developer's
+/// own checkout origin.
+fn temp_repo(remote: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let git = binary_in_path("git");
+    let run_git = |args: &[&str]| {
+        Command::new(&git)
+            .args(args)
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git should run")
+    };
+    assert!(run_git(&["init", "--quiet"]).success());
+    assert!(
+        run_git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{remote}.git"),
+        ])
+        .success()
+    );
+    dir
+}
+
+/// Run `cplt gh-gate` with extra policy flags, from a temp checkout of the
+/// scoped repo.
 fn gh_gate_with_opts(args: &[&str], opts: &[&str]) -> (String, String, bool) {
+    let repo = temp_repo("navikt/cplt");
     let mut cmd = Command::new(binary_path());
     cmd.arg("gh-gate")
         .arg("--real-gh")
         .arg("/usr/bin/true") // if allowed, exec this harmless binary
         .arg("--real-git")
-        .arg("/usr/bin/git")
+        .arg(binary_in_path("git"))
         .arg("--repo-scope")
         .arg("navikt/cplt")
         .args(opts)
         .arg("--")
         .args(args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"));
+        .current_dir(repo.path());
 
     let output = cmd.output().expect("cplt gh-gate should run");
     (
@@ -417,6 +447,84 @@ fn gh_gate_blocks_implicit_repo_scope_from_sibling_repo() {
 }
 
 #[test]
+fn gh_gate_blocks_implicit_read_from_sibling_repo() {
+    // #213 also covers reads: `gh pr list` in a sibling repo must not silently
+    // answer from the startup repo.
+    let sibling = temp_repo("evil-org/other-repo");
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg("/usr/bin/true")
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["pr", "list"])
+        .current_dir(sibling.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "read-only commands must not silently retarget the startup repo: {stderr}"
+    );
+    assert!(
+        stderr.contains("evil-org/other-repo") && stderr.contains("navikt/cplt"),
+        "denial should name both repos: {stderr}"
+    );
+}
+
+#[test]
+fn gh_gate_warns_but_allows_implicit_read_from_sibling_in_warn_mode() {
+    let sibling = temp_repo("evil-org/other-repo");
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg("/usr/bin/true")
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--mode=warn")
+        .arg("--")
+        .args(["pr", "list"])
+        .current_dir(sibling.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "warn mode should allow: {stderr}");
+    assert!(stderr.contains("WARNING"), "should warn: {stderr}");
+}
+
+#[test]
+fn gh_gate_allows_global_read_from_sibling_repo() {
+    // Commands that do not resolve a repository from the cwd stay usable.
+    let sibling = temp_repo("evil-org/other-repo");
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg("/usr/bin/true")
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["search", "repos", "cplt"])
+        .current_dir(sibling.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    assert!(
+        output.status.success(),
+        "global commands must not depend on the cwd repo: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn gh_gate_fails_closed_when_implicit_repo_scope_is_unverifiable() {
     let temp = tempfile::tempdir().unwrap();
     let git = binary_in_path("git");
@@ -545,6 +653,7 @@ fn gh_gate_pins_verified_repo_in_gh_repo() {
     )
     .unwrap();
     std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let repo = temp_repo("navikt/cplt");
 
     let output = Command::new(binary_path())
         .arg("gh-gate")
@@ -556,7 +665,7 @@ fn gh_gate_pins_verified_repo_in_gh_repo() {
         .arg("navikt/cplt")
         .arg("--")
         .args(["pr", "comment", "42", "--body", "test"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(repo.path())
         .env("GH_REPO", "evil-org/other")
         .env("GH_HOST", "evil.example")
         .output()
