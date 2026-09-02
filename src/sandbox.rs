@@ -422,18 +422,19 @@ fn prepare_impl(
     // agent runs outside cplt (Claude/Gemini hooks, Pi/Gemini extensions). macOS
     // emits these as SBPL write-denies; Landlock cannot carve a sub-deny out of
     // an allowed tree, so the bwrap read-only overlay is the only mechanism here
-    // — WITHOUT bwrap this is unenforced on Linux. Even with it, a path that
-    // does not exist yet is skipped (bwrap cannot bind a missing source), so it
-    // protects what is already on disk, not what the agent creates.
-    for dir in config.agent_dirs.iter().filter(|d| d.write) {
-        ro_protect.extend(
-            config
-                .agent
-                .host_persistence_denies()
-                .iter()
-                .map(|sub| dir.path.join(sub)),
-        );
-    }
+    // — WITHOUT bwrap this is unenforced on Linux.
+    //
+    // KNOWN GAP: even with bwrap, `build_bwrap_args` skips a path that does not
+    // exist, because bwrap cannot bind a missing source. `.git/hooks` rarely
+    // hits this (`git init` creates it) but `extensions/` does not exist until
+    // the first extension is installed, so that deny is nominal in the common
+    // case. Masking a missing path with the `deny_masks` machinery (a `--tmpfs`
+    // over a directory, a mode-000 placeholder `--ro-bind` over a file) would
+    // close it, but it also makes the path *appear to exist* as an empty dir or
+    // empty file, which changes what the agent reads at startup. That is not a
+    // change to make untested, and this is a macOS host. Documented in
+    // SECURITY.md instead of half-done.
+    ro_protect.extend(config.agent.host_persistence_paths(config.agent_dirs));
     ro_protect.sort();
     ro_protect.dedup();
 

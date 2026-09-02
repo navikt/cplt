@@ -1128,16 +1128,21 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
     });
 }
 
-/// The documented escape hatch for a first-run login (`--allow-write
-/// ~/.gemini/settings.json`) has to actually beat the persistence deny.
-/// `emit_home_access` runs before `emit_user_allows`, so SBPL last-match-wins
-/// puts the user's allow on top. If that call order is ever swapped, the
-/// instructions `Agent::login_refusal` prints become a lie — hence this test.
+/// A user `allow.write` must NOT reopen the host-persistence denies.
+///
+/// `allow.write = ["~/.gemini"]` is an ordinary thing to write — `is_unsafe_root`
+/// only rejects `~` itself — and while these denies lived beside the dir-wide
+/// allow in `emit_home_access` it silently reopened every one of them, including
+/// Claude's pre-existing `statusline.sh`/`plugins`. SBPL is last-match-wins, so
+/// the fix is placement: `emit_host_persistence_denies` runs at the tail, after
+/// `emit_user_allows`. This test fails if it is ever moved back before it.
 #[test]
-fn user_allow_write_overrides_host_persistence_deny() {
+fn host_persistence_denies_survive_a_later_user_allow_write() {
     let home = std::path::Path::new("/Users/test");
     let agent_dirs = cplt::agent::Agent::Gemini.config_dirs(home);
-    let settings = home.join(".gemini/settings.json");
+    // The whole config dir, not just the file: the wider grant is the one that
+    // used to swallow the denies.
+    let settings = home.join(".gemini");
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: home,
@@ -1173,16 +1178,20 @@ fn user_allow_write_overrides_host_persistence_deny() {
         allow_cache_exec_any: false,
         allow_browser: false,
     });
-    let deny = p
-        .find("(deny file-write* (subpath \"/Users/test/.gemini/settings.json\"))")
-        .expect("persistence deny must be emitted");
+    // rfind, not find: emit_home_access emits the identical allow line for the
+    // agent-dir grant itself, so the LAST occurrence is the user's allow.write
+    // and the one the denies have to outlive.
     let allow = p
-        .find("(allow file-write* (subpath \"/Users/test/.gemini/settings.json\"))")
+        .rfind("(allow file-write* (subpath \"/Users/test/.gemini\"))")
         .expect("user allow.write must be emitted");
-    assert!(
-        allow > deny,
-        "user allow.write must come after the deny for last-match-wins to reopen the file"
-    );
+    for sub in cplt::agent::Agent::Gemini.host_persistence_denies() {
+        let line = format!("(deny file-write* (subpath \"/Users/test/.gemini/{sub}\"))");
+        let deny = p.find(&line).expect("persistence deny must be emitted");
+        assert!(
+            deny > allow,
+            "{line} must come AFTER the user allow.write, or last-match-wins reopens it"
+        );
+    }
 }
 
 #[test]

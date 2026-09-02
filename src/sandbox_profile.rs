@@ -214,6 +214,10 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         opts.git_common_dir,
         opts.extra_git_dirs,
     );
+    // Same reason, and the fix for the same bug one tree over: keeps the
+    // agent's own auto-executing config unwritable even when a user
+    // `allow.write` covers the whole config dir.
+    emit_host_persistence_denies(&mut sb, opts.agent, opts.agent_dirs);
     // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
     // when a user allow.write covers them (write-then-exec).
     emit_dotnet_exec_denies(&mut sb, opts.dotnet_root);
@@ -409,35 +413,12 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
             if dir.write && !dir.map_exec {
                 sbpl!(sb, "(deny file-map-executable (subpath \"{path}\"))");
             }
-            // Explicitly deny writes on exec-only dirs (prevents write+exec persistence
-            // even when a parent dir is writable — this deny is emitted after the
-            // parent allow, so SBPL last-match-wins lets it override)
-            if !dir.write && dir.process_exec {
-                sbpl!(sb, "(deny file-write* (subpath \"{path}\"))");
-            }
+            // Writes on exec-only dirs (Pi's bin/, OpenCode's cache bin/) are
+            // denied by emit_host_persistence_denies at the tail of the
+            // profile, not here: a later user allow.write would otherwise
+            // reopen them.
         }
         sbpl!(sb);
-    }
-
-    // Agent config dirs are writable (sessions, history, credentials), but a few
-    // artifacts in them auto-execute on the HOST the next time the agent runs
-    // outside the sandbox — a persistence vector the agent never needs to write
-    // mid-session. Deny those specifically (emitted after the dir-wide allow
-    // above, so SBPL last-match-wins lets the deny override). See
-    // `Agent::host_persistence_denies` for the per-agent set and its rationale.
-    // macOS only — Landlock cannot deny a subpath within an allowed dir, so on
-    // Linux the bubblewrap read-only overlay carries this (see SECURITY.md).
-    //
-    // Apply to every writable grant rather than the first one: Claude's default
-    // layout grants both ~/.claude (the data dir these subpaths live under) and
-    // the ~/.claude.json file, and we must not depend on their ordering. The
-    // deny on a file grant (~/.claude.json/statusline.sh) can never match a real
-    // path, so it is a harmless no-op; the deny on the data dir is what matters.
-    for cfg in agent_dirs.iter().filter(|d| d.write) {
-        for sub in agent.host_persistence_denies() {
-            let p = cfg.path.join(sub).display().to_string();
-            sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
-        }
     }
 
     // GitHub CLI auth — Copilot spawns `gh auth token` which reads these specific files.
@@ -718,6 +699,55 @@ fn emit_gitdir_denies(sb: &mut String, gitdir: &str) {
 /// `<root>/.git` is emitted for every writable root unconditionally, even one
 /// that is not a repo today, so a repo the agent creates mid-session with
 /// `git init` at the grant root is covered too.
+/// Write-denies the agent's own host-persistence paths, plus writes on any
+/// exec-only agent dir.
+///
+/// The paths come from [`Agent::host_persistence_paths`]: files inside a
+/// writable agent config dir that auto-execute on the HOST the next time the
+/// agent runs outside the sandbox — hooks, extensions, plugins, installed
+/// package code — which the agent never needs to write mid-session.
+///
+/// **Emitted at the tail of the profile, after `emit_user_allows`, and that
+/// placement is the whole point.** SBPL is last-match-wins, so while these
+/// lived next to the dir-wide allow in `emit_home_access` a user
+/// `allow.write = ["~/.gemini"]` (or `["~/.claude"]`) silently reopened every
+/// one of them — the same bug #212 fixed for the git-persistence denies by
+/// moving them here. `is_unsafe_root` only rejects `~` itself, so a
+/// whole-config-dir grant is an ordinary thing for a user to write.
+///
+/// The consequence is that there is no `allow.write` escape hatch for these
+/// paths any more: a first-run login that needs to write a denied file has to
+/// happen outside cplt (see `Agent::login_refusal`).
+///
+/// Applies to every writable grant rather than the first one: Claude's default
+/// layout grants both `~/.claude` (the data dir these subpaths live under) and
+/// the `~/.claude.json` file, and we must not depend on their ordering. A deny
+/// on a file grant (`~/.claude.json/statusline.sh`) can never match a real
+/// path, so it is a harmless no-op; the deny on the data dir is what matters.
+/// Same for Antigravity's two grants, whose entries belong to one dir each.
+///
+/// macOS only — Landlock cannot deny a subpath within an allowed dir, so on
+/// Linux the bubblewrap read-only overlay carries this (see SECURITY.md).
+fn emit_host_persistence_denies(sb: &mut String, agent: Agent, agent_dirs: &[AgentDir]) {
+    let paths = agent.host_persistence_paths(agent_dirs);
+    let exec_only = agent_dirs.iter().filter(|d| !d.write && d.process_exec);
+    let mut wrote_header = false;
+    for path in paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .chain(exec_only.map(|d| d.path.display().to_string()))
+    {
+        if !wrote_header {
+            sbpl!(sb, ";; Agent config-dir host-persistence denies");
+            wrote_header = true;
+        }
+        sbpl!(sb, "(deny file-write* (subpath \"{path}\"))");
+    }
+    if wrote_header {
+        sbpl!(sb);
+    }
+}
+
 fn emit_git_persistence_denies(
     sb: &mut String,
     project: &str,

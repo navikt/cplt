@@ -1574,21 +1574,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             ));
         }
 
-        // Suppressing the API-key hint for OAuth-first agents leaves the
-        // browser-flow ones with no signal at all: Google's login opens a
-        // browser, and --allow-browser is off by default, so a first-time user
-        // hits a dead end. Point at the flag rather than the key.
-        if active_agent.oauth_first()
-            && active_agent.oauth_needs_browser()
-            && !resolved.allow_browser
-        {
-            ui::warn(&format!(
-                "{} signs in through a browser on first run. Add --allow-browser \
-                 if you have not authenticated yet.",
-                active_agent.display_name()
-            ));
-        }
-
         // #237: the host-persistence guard write-denies the agent's own
         // settings.json, which for Gemini is also where first-run login records
         // the auth method. Catch that here rather than letting the user meet it
@@ -1596,12 +1581,40 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         // provider API key is passed through (that authenticates without
         // touching the file) or when env is inherited wholesale, and never in
         // `cplt check`, which must be able to report on any configuration.
+        //
+        // Emitted BEFORE the --allow-browser hint below, deliberately: telling
+        // someone to add a flag for a login that cannot succeed in here is the
+        // contradiction this refusal exists to remove.
+        //
+        // `--print-profile` and `--doctor` are exempt for the same reason as
+        // `cplt check`: they are diagnostics that must keep working on any
+        // configuration, and neither launches the agent.
         if !check_mode
+            && !cli.print_profile
+            && !cli.doctor
             && !has_api_key
             && !resolved.inherit_env
             && let Some(msg) = active_agent.login_refusal(&home_dir)
         {
             anyhow::bail!(msg);
+        }
+
+        // Suppressing the API-key hint for OAuth-first agents leaves the
+        // browser-flow ones with no signal at all: Google's login opens a
+        // browser, and --allow-browser is off by default, so a user who hits a
+        // sign-in prompt hits a dead end. Point at the flag rather than the key.
+        // Says "if you are prompted", not "on first run": a Gemini first run
+        // never gets this far (the refusal above fires instead), so the prompts
+        // this is really about are re-auth and OAuth from an MCP server.
+        if active_agent.oauth_first()
+            && active_agent.oauth_needs_browser()
+            && !resolved.allow_browser
+        {
+            ui::warn(&format!(
+                "{} signs in through a browser. Add --allow-browser if you are \
+                 prompted to sign in.",
+                active_agent.display_name()
+            ));
         }
 
         // Warn if Copilot-only flags are used with a non-Copilot agent

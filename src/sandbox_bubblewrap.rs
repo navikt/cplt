@@ -191,8 +191,10 @@ pub(crate) fn test_functionality(
 ///    protected set is deliberately narrow (`.git/hooks`, `.cplt.toml`) — see
 ///    [`git_persistence_paths`] for why `.git/config`/`.gitmodules` are left
 ///    writable and for the `core.hooksPath` residual. The caller appends the
-///    agent's own config-dir persistence paths (`Agent::host_persistence_denies`)
-///    to the same set — same mechanism, same "must already exist" caveat.
+///    agent's own config-dir persistence paths (`Agent::host_persistence_paths`)
+///    to the same set — same mechanism, same "must already exist" caveat, which
+///    bites harder there: `git init` creates `.git/hooks`, but `extensions/`
+///    does not exist until the first extension is installed.
 ///
 ///    Two documented residuals: a read-only bind only protects paths that
 ///    already **exist** at launch — bwrap errors on a missing bind source and
