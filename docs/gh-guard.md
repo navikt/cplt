@@ -117,7 +117,7 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 
 | Tier | Behavior | Examples |
 |------|----------|----------|
-| **Allow** | Always permitted | `pr list`, `issue view`, `run list`, `search` |
+| **Allow** | Read-only; repo-scoped reads must still be invoked from the startup repo | `pr list`, `issue view`, `run list`, `search` |
 | **ScopeCheck** | Permitted only for the startup repo; implicit targets must resolve there from cwd | `pr create`, `issue comment`, `pr close` |
 | **Block** | Never permitted | `repo delete`, `pr merge`, `release create`, `workflow run` |
 | **Unknown** | Not in the policy table, blocked by default | anything GitHub adds to `gh` after the table was last updated |
@@ -134,6 +134,12 @@ The policy table classifies `auth status` as a read, so the token flag is
 intercepted separately, in every spelling (`--show-token`, `--show-token=true`,
 `-t`, and bundled clusters such as `-at`).
 
+"Always permitted" in the Allow tier means permitted for the startup repo. A
+repo-scoped read invoked from a *different* repository is blocked rather than
+silently answered from the startup repo (#213); commands that do not resolve a
+repository from the cwd (`auth`, `search`, `gist`, `org`, `project`, `config`,
+`extension`, key listings) stay usable from any directory.
+
 ## Scope checking
 
 When a command is classified as `ScopeCheck`, cplt verifies that the command
@@ -147,6 +153,12 @@ targets the repository captured at sandbox startup:
 6. Preserves explicit `/repos/owner/repo/...` API endpoint checks without requiring cwd matching
 7. Rejects a conflicting `--hostname` or fully qualified non-GitHub API endpoint
 8. Sets `GH_REPO=github.com/owner/repo` and clears `GH_HOST` before executing `gh`
+
+Repo-scoped `Allow` commands get the same cwd check (step 5) when their target is
+implicit, so a read from a sibling repository is blocked instead of silently
+answered from the startup repo. Unlike `ScopeCheck`, an *unverifiable* cwd is not
+fatal for a read: the command stays pinned to the startup repo, which is the safe
+target.
 
 ## Command classifications
 

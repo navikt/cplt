@@ -2637,7 +2637,7 @@ fn run_gh_gate(
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match gh_proxy::gate_with_repo_scope_and_git(&arg_refs, policy, repo_scope, real_git) {
+    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope, real_git) {
         Ok(approval) => exec_gh(real_gh, args, approval.repo_scope.as_deref()),
         Err(msg) => match policy.mode {
             config::EnforcementMode::Block => {

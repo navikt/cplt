@@ -1299,6 +1299,78 @@ fn requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
     }
 }
 
+/// Read-only command groups whose implicit target is the repository of the cwd.
+///
+/// Global commands (`auth`, `search`, `gist`, `org`, `project`, `config`,
+/// `extension`, ssh/gpg keys) do not resolve a repository from the cwd, so they
+/// stay usable from any directory.
+const CWD_SCOPED_COMMANDS: &[&str] = &[
+    "pr", "issue", "run", "workflow", "release", "label", "cache", "secret", "variable",
+];
+
+/// Allow-tier commands are read-only, but an implicit target still silently
+/// retargets the startup repo when the agent is working in a sibling repo (#213).
+/// Check the cwd for the repo-scoped ones only.
+fn allow_tier_requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
+    requires_invocation_repo_check(cmd) && CWD_SCOPED_COMMANDS.contains(&cmd.command.as_str())
+}
+
+/// Resolve the repository of the invocation cwd with the trusted Git binary.
+fn resolve_invocation_repo(real_git: Option<&Path>) -> Result<String, String> {
+    let real_git = real_git.ok_or_else(|| {
+        "trusted Git binary was unavailable for invocation cwd verification".to_string()
+    })?;
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("failed to determine invocation cwd: {e}"))?;
+    detect_current_repo(real_git, &cwd)
+}
+
+fn out_of_scope_cwd_error(
+    cmd: &ParsedCommand,
+    invocation_repo: &str,
+    startup_repo: &str,
+) -> String {
+    format!(
+        "⚠️ BLOCKED by sandbox: 'gh {}{}' was invoked from repository '{invocation_repo}' outside the startup repo '{startup_repo}'.\n\
+         Reason: implicit repository targets must resolve to the repository captured at sandbox startup.\n\
+         This operation is restricted by the cplt sandbox environment.\n\
+         Please make a note of this for the human operator and continue with your remaining work.",
+        cmd.command,
+        cmd.subcommand
+            .as_deref()
+            .map(|s| format!(" {s}"))
+            .unwrap_or_default(),
+    )
+}
+
+/// Approval for an Allow-tier (read-only) command.
+///
+/// The startup scope stays authoritative and is pinned into `GH_REPO`. An
+/// implicit repo-scoped read from a *different* repository is blocked instead of
+/// being silently answered from the startup repo. An unverifiable cwd keeps the
+/// previous behaviour (pin to the startup repo): these commands are read-only,
+/// and the startup repo is the safe target.
+fn allow_tier_approval(
+    cmd: &ParsedCommand,
+    policy: &GatePolicy,
+    resolve_scope: impl FnOnce() -> Result<String, String>,
+    real_git: Option<&Path>,
+) -> Result<GateApproval, String> {
+    if !policy.scope_check {
+        return Ok(GateApproval::default());
+    }
+    let Ok(startup_repo) = resolve_scope() else {
+        return Ok(GateApproval::default());
+    };
+    if allow_tier_requires_invocation_repo_check(cmd)
+        && let Ok(invocation_repo) = resolve_invocation_repo(real_git)
+        && !repos_match(&invocation_repo, &startup_repo)
+    {
+        return Err(out_of_scope_cwd_error(cmd, &invocation_repo, &startup_repo));
+    }
+    Ok(approval_from_scope(Some(startup_repo)))
+}
+
 /// Extract "owner/repo" from a GitHub API endpoint path.
 ///
 /// Matches patterns like:
@@ -1608,17 +1680,8 @@ pub fn gate_with_git(
         args,
         policy,
         || detect_current_repo(real_git, project_dir),
-        || detect_current_repo(real_git, project_dir),
+        Some(real_git),
     )
-}
-
-/// Evaluate a `gh` command using repository scope captured before agent startup.
-pub fn gate_with_repo_scope(
-    args: &[&str],
-    policy: &GatePolicy,
-    repo_scope: Option<&str>,
-) -> Result<GateApproval, String> {
-    gate_with_repo_scope_and_git(args, policy, repo_scope, None)
 }
 
 /// Evaluate a `gh` command using startup scope and a trusted Git binary for cwd checks.
@@ -1626,7 +1689,7 @@ pub fn gate_with_repo_scope(
 /// The startup scope remains authoritative. The invocation cwd is consulted only
 /// for implicit repository targets, and only as evidence that the command still
 /// refers to that immutable scope.
-pub fn gate_with_repo_scope_and_git(
+pub fn gate_with_repo_scope(
     args: &[&str],
     policy: &GatePolicy,
     repo_scope: Option<&str>,
@@ -1640,14 +1703,7 @@ pub fn gate_with_repo_scope_and_git(
                 .map(str::to_owned)
                 .ok_or_else(|| "repository scope was unavailable at sandbox startup".to_string())
         },
-        || {
-            let real_git = real_git.ok_or_else(|| {
-                "trusted Git binary was unavailable for invocation cwd verification".to_string()
-            })?;
-            let cwd = std::env::current_dir()
-                .map_err(|e| format!("failed to determine invocation cwd: {e}"))?;
-            detect_current_repo(real_git, &cwd)
-        },
+        real_git,
     )
 }
 
@@ -1655,7 +1711,7 @@ fn gate_with_scope_resolver(
     args: &[&str],
     policy: &GatePolicy,
     resolve_scope: impl FnOnce() -> Result<String, String>,
-    resolve_invocation_repo: impl Fn() -> Result<String, String>,
+    real_git: Option<&Path>,
 ) -> Result<GateApproval, String> {
     let Some(cmd) = parse_command(args) else {
         // No command parsed — this happens for `gh --help`, `gh --version`, `gh help`, etc.
@@ -1720,11 +1776,7 @@ fn gate_with_scope_resolver(
     }
 
     match result.decision {
-        Decision::Allow => Ok(if policy.scope_check {
-            approval_from_scope(resolve_scope().ok())
-        } else {
-            GateApproval::default()
-        }),
+        Decision::Allow => allow_tier_approval(&cmd, policy, resolve_scope, real_git),
         Decision::ScopeCheck => {
             if !policy.scope_check {
                 return Ok(GateApproval::default());
@@ -1742,7 +1794,7 @@ fn gate_with_scope_resolver(
             })?;
 
             let invocation_repo = if requires_invocation_repo_check(&cmd) {
-                Some(resolve_invocation_repo().map_err(|reason| {
+                Some(resolve_invocation_repo(real_git).map_err(|reason| {
                     format!(
                         "⚠️ BLOCKED by sandbox: 'gh {}{}' cannot verify the repository for its implicit target.\n\
                          Reason: {reason}.\n\
@@ -1767,19 +1819,7 @@ fn gate_with_scope_resolver(
             } else if let Some(invocation_repo) = invocation_repo.as_deref()
                 && !repos_match(invocation_repo, &startup_repo)
             {
-                Err(format!(
-                    "⚠️ BLOCKED by sandbox: 'gh {}{}' was invoked from repository '{}' outside the startup repo '{}'.\n\
-                     Reason: implicit repository targets must resolve to the repository captured at sandbox startup.\n\
-                     This operation is restricted by the cplt sandbox environment.\n\
-                     Please make a note of this for the human operator and continue with your remaining work.",
-                    cmd.command,
-                    cmd.subcommand
-                        .as_deref()
-                        .map(|s| format!(" {s}"))
-                        .unwrap_or_default(),
-                    invocation_repo,
-                    startup_repo,
-                ))
+                Err(out_of_scope_cwd_error(&cmd, invocation_repo, &startup_repo))
             } else {
                 Err(format!(
                     "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the startup repo '{}'.\n\
@@ -1814,11 +1854,9 @@ fn gate_with_scope_resolver(
             result.reason,
         )),
         Decision::Unknown => match policy.unknown_command {
-            UnknownCommandDecision::Allow => Ok(if policy.scope_check {
-                approval_from_scope(resolve_scope().ok())
-            } else {
-                GateApproval::default()
-            }),
+            UnknownCommandDecision::Allow => {
+                allow_tier_approval(&cmd, policy, resolve_scope, real_git)
+            }
             UnknownCommandDecision::Block => Err(format!(
                 "⚠️ BLOCKED by sandbox: 'gh {}{}' is not recognized by the policy table.\n\
                      This command may have been added in a newer gh CLI version.\n\
