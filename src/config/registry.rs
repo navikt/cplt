@@ -374,6 +374,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "keychain_substitute",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "EXPERIMENTAL: drop the macOS Keychain grant when the agent has a credential it can reach without it.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "gh_proxy",
         value_type: ConfigValueType::Bool,
         dangerous: false,

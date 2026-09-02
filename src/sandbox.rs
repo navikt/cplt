@@ -144,6 +144,12 @@ pub struct SandboxConfig<'a> {
     pub allow_cache_exec_any: bool,
     /// Allow Launch Services (`open` command) for OAuth browser flows.
     pub allow_browser: bool,
+    /// The credential this agent can use *instead of* the login Keychain, if
+    /// any (#242). `Some` drops the Keychain grant from the profile and, for an
+    /// env-var substitute, forwards that variable into the sandbox — those two
+    /// derive from this one field so they cannot disagree. `None` keeps the
+    /// grant and forwards nothing extra. Inert on Linux.
+    pub keychain_substitute: Option<crate::agent::KeychainSubstitute>,
     /// Use Bubblewrap for namespace isolation (Linux only).
     /// - `Some(true)`: Always use bwrap (fail if unavailable)
     /// - `Some(false)`: Never use bwrap (Landlock+seccomp only)
@@ -175,6 +181,9 @@ pub struct PreparedSandbox {
     /// Whether the user explicitly re-allowed `$HOME/.npmrc` via `allow.read`.
     /// Suppresses the `NPM_CONFIG_USERCONFIG` redirect (see #180).
     npmrc_allowed: bool,
+    /// The credential forwarded into the sandbox in place of the Keychain
+    /// grant, if any (#242). `None` on every run where the trade did not apply.
+    pub(crate) keychain_substitute: Option<crate::agent::KeychainSubstitute>,
     /// Landlock + seccomp pre-computed sandbox data (Linux only).
     /// Built in the parent process; applied in pre_exec.
     #[cfg(target_os = "linux")]
@@ -337,6 +346,7 @@ fn prepare_impl(
         allow_cache_exec: config.allow_cache_exec,
         allow_cache_exec_any: config.allow_cache_exec_any,
         allow_browser: config.allow_browser,
+        credential_outside_keychain: config.keychain_substitute.is_some(),
     });
 
     Ok(PreparedSandbox {
@@ -349,6 +359,7 @@ fn prepare_impl(
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
+        keychain_substitute: config.keychain_substitute.clone(),
     })
 }
 
@@ -580,6 +591,7 @@ fn prepare_impl(
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
         npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
+        keychain_substitute: config.keychain_substitute.clone(),
         precomputed,
         bwrap_wrapper,
     })

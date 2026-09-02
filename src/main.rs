@@ -2421,6 +2421,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // by prepare(), so callers don't need to know about backend-specific risks.
     // proxy_port comes from the running handle so the actual ephemeral port is embedded.
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
+    // #242: drop the whole-Keychain grant only when the agent can authenticate
+    // without it. Resolved against `deny_env` because that list is stripped from
+    // the child environment later — a repo `.cplt.toml` naming the token var
+    // must not leave the run with neither Keychain nor token.
+    let keychain_substitute = active_agent.credential_outside_keychain(
+        &home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
     let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
         project_dir: &project_dir,
         home_dir: &home_dir,
@@ -2454,6 +2463,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         allow_cache_exec: &resolved.allow_cache_exec,
         allow_cache_exec_any: resolved.allow_cache_exec_any,
         allow_browser: resolved.allow_browser,
+        keychain_substitute,
         use_bubblewrap: resolved.use_bubblewrap,
     }) {
         Ok(s) => s,
@@ -2923,6 +2933,12 @@ fn prepare_shell_sandbox(
     // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
     merge_tool_path_env_overrides(resolved, home_dir);
 
+    // See the #242 note at the other `SandboxConfig` construction.
+    let keychain_substitute = active_agent.credential_outside_keychain(
+        home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
     let sandbox_config = sandbox::SandboxConfig {
         project_dir,
         home_dir,
@@ -2957,6 +2973,7 @@ fn prepare_shell_sandbox(
         allow_cache_exec: &resolved.allow_cache_exec,
         allow_cache_exec_any: resolved.allow_cache_exec_any,
         allow_browser: resolved.allow_browser,
+        keychain_substitute,
         use_bubblewrap: resolved.use_bubblewrap,
     };
 

@@ -420,6 +420,7 @@ mod macos_tests {
             allow_cache_exec: &[],
             allow_cache_exec_any: false,
             allow_browser: false,
+            credential_outside_keychain: false,
         }
     }
 
@@ -1970,6 +1971,141 @@ except Exception as e:
         assert!(
             !stderr.contains("not signed in"),
             "an authenticated Gemini must not warn, got stderr:\n{stderr}"
+        );
+    }
+
+    // ── macOS Keychain grant (#242) ───────────────────────────────
+    //
+    // The grant is file rules on `~/Library/Keychains`. Verified by execution:
+    // denying those rules is enough to stop `security find-generic-password`
+    // (`SecKeychainSearchCopyNext: The specified item could not be found`),
+    // even though `(allow mach-lookup)` still reaches securityd. So the grant —
+    // and its removal — is decided at the file layer, which is what these
+    // tests exercise.
+
+    fn login_keychain() -> PathBuf {
+        home_dir().join("Library/Keychains/login.keychain-db")
+    }
+
+    /// Keychain-needing agent, no substitute credential in the environment:
+    /// the grant stays, because an agent that cannot authenticate and cannot
+    /// re-authenticate is worse than a broad grant.
+    #[test]
+    fn real_profile_keychain_accessible_when_credential_not_in_env() {
+        require_sandbox!();
+        if !login_keychain().exists() {
+            eprintln!("SKIPPED: no login.keychain-db on this host");
+            return;
+        }
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let mut opts = default_opts(&project, &home);
+        opts.agent = cplt::agent::Agent::Claude;
+        opts.credential_outside_keychain = false;
+        let profile = write_real_profile(&opts);
+        let cmd = format!(
+            "cat '{}' > /dev/null 2>&1; echo EXIT:$?",
+            login_keychain().display()
+        );
+        let (out, _) = run_sandboxed(&profile, &cmd);
+        fs::remove_file(&profile).ok();
+        assert!(
+            out.contains("EXIT:0"),
+            "Keychain grant must be kept when no substitute credential resolved: {out}"
+        );
+    }
+
+    /// Substitute credential resolved from the environment: the grant is gone,
+    /// so the agent can no longer reach any item in the login keychain.
+    #[test]
+    fn real_profile_keychain_denied_when_credential_in_env() {
+        require_sandbox!();
+        if !login_keychain().exists() {
+            eprintln!("SKIPPED: no login.keychain-db on this host");
+            return;
+        }
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        for agent in [
+            cplt::agent::Agent::Claude,
+            cplt::agent::Agent::Copilot,
+            cplt::agent::Agent::Gemini,
+            cplt::agent::Agent::Antigravity,
+        ] {
+            let mut opts = default_opts(&project, &home);
+            opts.agent = agent;
+            opts.credential_outside_keychain = true;
+            let profile = write_real_profile(&opts);
+            let cmd = format!(
+                "cat '{}' > /dev/null 2>&1; echo EXIT:$?",
+                login_keychain().display()
+            );
+            let (out, _) = run_sandboxed(&profile, &cmd);
+            fs::remove_file(&profile).ok();
+            assert!(
+                !out.contains("EXIT:0"),
+                "{agent:?}: login keychain must be unreadable once the credential came from the environment: {out}"
+            );
+        }
+    }
+
+    /// The end-to-end exposure from #242: `/usr/bin/security` pulling a secret
+    /// out of the login keychain. Runs only when the probed item actually
+    /// exists on this host, and never prints the secret — only its length.
+    #[test]
+    fn real_profile_security_tool_cannot_extract_secret_when_credential_in_env() {
+        require_sandbox!();
+        // Opt-in: this test asks securityd for a real secret inside the sandbox.
+        // On a host whose item ACL does not already trust /usr/bin/security that
+        // pops an authorization dialog, which hangs a headless run — so it stays
+        // off unless someone asks for it.
+        if std::env::var("CPLT_TEST_KEYCHAIN_PROBE").as_deref() != Ok("1") {
+            eprintln!("SKIPPED: set CPLT_TEST_KEYCHAIN_PROBE=1 to probe a real keychain item");
+            return;
+        }
+        // Discovery is metadata-only (no `-w`), so choosing a service never
+        // reads a secret or triggers an ACL prompt outside the sandbox.
+        let probe = ["Claude Code-credentials", "copilot-cli", "gemini"]
+            .into_iter()
+            .find(|svc| {
+                Command::new("/usr/bin/security")
+                    .args(["find-generic-password", "-s", svc])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            });
+        let Some(service) = probe else {
+            eprintln!("SKIPPED: no probe keychain item on this host");
+            return;
+        };
+
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let cmd = format!(
+            "/usr/bin/security find-generic-password -s '{service}' -w > /dev/null 2>&1; echo EXIT:$?"
+        );
+
+        let mut granted = default_opts(&project, &home);
+        granted.agent = cplt::agent::Agent::Claude;
+        granted.credential_outside_keychain = false;
+        let p1 = write_real_profile(&granted);
+        let (with_grant, _) = run_sandboxed(&p1, &cmd);
+        fs::remove_file(&p1).ok();
+
+        let mut dropped = default_opts(&project, &home);
+        dropped.agent = cplt::agent::Agent::Claude;
+        dropped.credential_outside_keychain = true;
+        let p2 = write_real_profile(&dropped);
+        let (without_grant, _) = run_sandboxed(&p2, &cmd);
+        fs::remove_file(&p2).ok();
+
+        assert!(
+            with_grant.contains("EXIT:0"),
+            "baseline: with the grant, `security` reads '{service}' silently — that is #242: {with_grant}"
+        );
+        assert!(
+            !without_grant.contains("EXIT:0"),
+            "with the grant dropped, `security` must not read '{service}': {without_grant}"
         );
     }
 }

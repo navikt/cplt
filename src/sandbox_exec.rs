@@ -45,6 +45,31 @@ fn compute_mise_ignored_paths(project_dir: &Path, home: &Path) -> Vec<PathBuf> {
 
 // ── Shared command setup ──────────────────────────────────────
 
+/// Strip repo-config denied env vars, then forward the Keychain substitute.
+///
+/// Both steps live here so the ordering is local and cannot drift: the
+/// substitute is applied *after* the deny sweep, and it can never name a denied
+/// variable in the first place because `Agent::credential_outside_keychain`
+/// filters `deny_env` before returning one (#242).
+///
+/// The forwarded variable is deliberately NOT in `ENV_ALLOWLIST` — it reaches
+/// the agent only as part of this trade, so with `sandbox.keychain_substitute`
+/// off the child environment is exactly what it was before the key existed.
+fn apply_deny_env_and_credential(
+    cmd: &mut Command,
+    deny_env: &[String],
+    substitute: Option<&crate::agent::KeychainSubstitute>,
+) {
+    for var in deny_env {
+        cmd.env_remove(var);
+    }
+    if let Some(var) = substitute.and_then(crate::agent::KeychainSubstitute::env_var)
+        && let Ok(val) = std::env::var(var)
+    {
+        cmd.env(var, val);
+    }
+}
+
 /// Configure environment, proxy, and common args on a sandboxed Command.
 ///
 /// Both macOS (Seatbelt) and Linux (Landlock) paths call this to apply the
@@ -576,10 +601,7 @@ pub fn exec(
         sandbox.npmrc_allowed,
     );
 
-    // Strip repo-config denied env vars
-    for var in deny_env {
-        cmd.env_remove(var);
-    }
+    apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
 
     let exit_code = spawn_and_wait(&mut cmd);
     let _ = std::fs::remove_file(&profile_path);
@@ -727,10 +749,7 @@ pub fn exec(
         sandbox.npmrc_allowed,
     );
 
-    // Strip repo-config denied env vars
-    for var in deny_env {
-        cmd.env_remove(var);
-    }
+    apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
 
     // Apply pre-computed sandbox in the child process, between fork and exec.
     // Safety: The proxy thread is running (multi-threaded at fork), making this
@@ -864,9 +883,7 @@ fn exec_bwrap(
         git_guard,
         sandbox.npmrc_allowed,
     );
-    for var in deny_env {
-        cmd.env_remove(var);
-    }
+    apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     // Set the re-entry env AFTER configure_command so a `clear_first` env build
     // cannot wipe them.
     cmd.env(
@@ -975,5 +992,48 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
             return ConfirmResult::Eof;
         }
         return ConfirmResult::Confirmed;
+    }
+}
+
+#[cfg(test)]
+mod keychain_substitute_tests {
+    use super::*;
+    use crate::agent::KeychainSubstitute;
+
+    /// The forwarded variable is not in `ENV_ALLOWLIST`, so this helper is the
+    /// only thing that puts it in the child environment (#242). If it stops
+    /// working the agent silently loses the credential it traded the Keychain
+    /// for, which is the failure this whole change exists to avoid.
+    #[test]
+    fn env_var_substitute_is_forwarded_and_file_substitute_is_not() {
+        temp_env::with_var("CPLT_TEST_SUBSTITUTE", Some("tok"), || {
+            let mut cmd = Command::new("/usr/bin/true");
+            apply_deny_env_and_credential(
+                &mut cmd,
+                &[],
+                Some(&KeychainSubstitute::EnvVar("CPLT_TEST_SUBSTITUTE")),
+            );
+            let set: Vec<_> = cmd.get_envs().collect();
+            assert!(
+                set.iter()
+                    .any(|(k, v)| *k == "CPLT_TEST_SUBSTITUTE" && *v == Some("tok".as_ref())),
+                "an env-var substitute must be forwarded: {set:?}"
+            );
+
+            // A file substitute needs nothing forwarded — the agent reads it.
+            let mut cmd = Command::new("/usr/bin/true");
+            apply_deny_env_and_credential(
+                &mut cmd,
+                &[],
+                Some(&KeychainSubstitute::File("/tmp/tok".into())),
+            );
+            assert_eq!(cmd.get_envs().count(), 0);
+
+            // No substitute: nothing forwarded, deny sweep still applies.
+            let mut cmd = Command::new("/usr/bin/true");
+            apply_deny_env_and_credential(&mut cmd, &["FOO".to_string()], None);
+            let set: Vec<_> = cmd.get_envs().collect();
+            assert_eq!(set, vec![("FOO".as_ref(), None)]);
+        });
     }
 }

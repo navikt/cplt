@@ -1847,6 +1847,7 @@ mod tests {
             allow_cache_exec_any: false,
             allow_browser: false,
             use_bubblewrap: None,
+            keychain_substitute: None,
         }
     }
 
