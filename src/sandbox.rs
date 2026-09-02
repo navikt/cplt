@@ -65,6 +65,7 @@ pub use profile::{ProfileOptions, generate_profile};
 // Environment construction — already platform-agnostic.
 pub use env::{SandboxEnv, build_sandbox_env};
 pub use exec::resolve_gh_token_for_exec;
+pub(crate) use exec::resolve_trusted_gh;
 
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{

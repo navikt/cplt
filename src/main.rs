@@ -2703,6 +2703,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         has_env_token_for_resolution,
         auth_plan.needs_runtime_gh_token,
         active_agent,
+        &project_dir,
     );
     let gh_token_resolved = resolved_gh_token
         .as_deref()

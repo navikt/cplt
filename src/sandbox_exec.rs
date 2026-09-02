@@ -65,6 +65,11 @@ fn configure_command(
     allow_localhost: &[u16],
     allow_localhost_any: bool,
     agent: Agent,
+    // Repo-config denied env vars. The callers also strip these *after* this
+    // function, but it needs them here to avoid a futile `GH_TOKEN` injection
+    // (and the sibling-var clearing that comes with it) when `deny.env` will
+    // remove `GH_TOKEN` anyway.
+    deny_env: &[String],
     resolved_gh_token: Option<&str>,
     // The pre-extracted token is the agent's ONLY credential, because the
     // Keychain grant was dropped on the strength of having it. Forces the
@@ -176,8 +181,12 @@ fn configure_command(
     //     credential the agent has. The gh wrapper's 0600 file does not cover
     //     this case — it only answers `gh auth token`, while the agent itself
     //     reads GH_TOKEN.
-    // `deny_env` is applied by the callers *after* this and still wins.
-    if (gh_guard.enabled && gh_guard.inject_token) || token_is_sole_credential {
+    // `deny_env` is applied by the callers *after* this and still wins — so when
+    // it strips `GH_TOKEN` we skip the whole block: injecting would be undone,
+    // and clearing the sibling vars would wrongly drop a `GITHUB_TOKEN` /
+    // `COPILOT_GITHUB_TOKEN` the user set, which stays the agent's credential
+    // when only `GH_TOKEN` is denied (see the startup warning in `main.rs`).
+    if should_manage_token_env(gh_guard, token_is_sole_credential, deny_env) {
         // Clear every token var first so the one cplt resolved is the one the
         // agent sees. Without this an ambient `COPILOT_GITHUB_TOKEN` would
         // still shadow the injected `GH_TOKEN` for readers that prefer it —
@@ -213,8 +222,52 @@ fn configure_command(
     }
 }
 
-fn extract_gh_token_from_cli() -> Option<String> {
-    let mut cmd = std::process::Command::new("gh");
+/// Locate a `gh` binary that is safe to run *unsandboxed* in a project dir.
+///
+/// Callers spawn `gh` as the user, outside the sandbox — token pre-extraction
+/// before the agent starts, or the `cplt doctor` auth probe — so a `gh` planted
+/// by hostile repo content must never be the one that runs. A bare
+/// `Command::new("gh")` does an OS `PATH` lookup that would happily pick up
+/// `./bin/gh`, `node_modules/.bin/gh`, or anything reachable through a relative
+/// `PATH` entry (`.`, `bin`, an empty segment). Instead we walk `PATH` ourselves
+/// and accept only a directory that is absolute and outside the project tree,
+/// and only a `gh` whose symlink-resolved target is also outside it.
+///
+/// Returns `None` when nothing qualifies; the caller then behaves exactly as if
+/// `gh` were not installed (token extraction falls back to Keychain under
+/// `auto`, or fails closed under `env_only` / `gh_only`).
+pub(crate) fn resolve_trusted_gh(project_dir: &Path) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let project_canon =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+
+    for dir in std::env::split_paths(&path_var) {
+        // Skip empty segments (POSIX-equivalent to the cwd) and any relative
+        // entry — both let repo content decide what `gh` resolves to.
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+        let dir_canon = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if dir_canon.starts_with(&project_canon) {
+            continue;
+        }
+        let candidate = dir.join("gh");
+        if !candidate.is_file() {
+            continue;
+        }
+        // A trusted-looking dir may still hold a symlink into the repo.
+        let target = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if target.starts_with(&project_canon) {
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+fn extract_gh_token_from_cli(project_dir: &Path) -> Option<String> {
+    let gh = resolve_trusted_gh(project_dir)?;
+    let mut cmd = std::process::Command::new(&gh);
     // Pin the host: with several hosts logged in (github.com plus a GHES
     // instance) a bare `gh auth token` resolves against the *active* host, so
     // the agent could be handed an enterprise token for github.com work.
@@ -320,12 +373,12 @@ fn extract_gh_token_from_command(
     if token.is_empty() { None } else { Some(token) }
 }
 
-fn resolve_gh_token_from_cli_if_needed(agent: Agent) -> Option<String> {
+fn resolve_gh_token_from_cli_if_needed(agent: Agent, project_dir: &Path) -> Option<String> {
     if agent != Agent::Copilot {
         return None;
     }
 
-    extract_gh_token_from_cli()
+    extract_gh_token_from_cli(project_dir)
 }
 
 fn evaluate_exec_github_token_presence(
@@ -387,12 +440,13 @@ pub fn resolve_gh_token_for_exec(
     has_effective_env_token: bool,
     needs_runtime_gh_token: bool,
     agent: Agent,
+    project_dir: &Path,
 ) -> Option<String> {
     resolve_gh_token_for_exec_with_resolver(
         has_effective_env_token,
         needs_runtime_gh_token,
         agent,
-        resolve_gh_token_from_cli_if_needed,
+        |agent| resolve_gh_token_from_cli_if_needed(agent, project_dir),
     )
 }
 
@@ -405,9 +459,30 @@ fn inject_gh_token_if_needed(cmd: &mut Command, token: Option<&str>) {
     }
 }
 
-#[cfg(test)]
+/// Whether repo `deny.env` will strip `GH_TOKEN` — the sole injection target —
+/// from the child. When true, `configure_command` must not inject it or clear
+/// the sibling token vars: the injection would be undone, and a `GITHUB_TOKEN`
+/// / `COPILOT_GITHUB_TOKEN` the user set stays the agent's credential.
 fn deny_env_strips_gh_token(deny_env: &[String]) -> bool {
     deny_env.iter().any(|v| v == "GH_TOKEN")
+}
+
+/// Whether `configure_command` should take over the child's GitHub token env —
+/// inject the resolved `GH_TOKEN` and normalize the sibling vars around it.
+///
+/// True when something wants a `GH_TOKEN` in the child (`gh_guard.inject_token`,
+/// or the pre-extracted token being the sole credential) **and** repo
+/// `deny.env` will not strip `GH_TOKEN` straight back out. In the denied case
+/// the injection is futile and clearing `GITHUB_TOKEN` / `COPILOT_GITHUB_TOKEN`
+/// would wrongly drop a credential the user set that a `GH_TOKEN`-only deny is
+/// meant to leave alone.
+fn should_manage_token_env(
+    gh_guard: &crate::config::GhGuardPolicy,
+    token_is_sole_credential: bool,
+    deny_env: &[String],
+) -> bool {
+    let inject_wanted = (gh_guard.enabled && gh_guard.inject_token) || token_is_sole_credential;
+    inject_wanted && !deny_env_strips_gh_token(deny_env)
 }
 
 /// Cache the GitHub token to a file in the scratch dir.
@@ -714,6 +789,7 @@ pub fn exec(
         &sandbox.allow_localhost,
         sandbox.allow_localhost_any,
         sandbox.agent,
+        deny_env,
         resolved_gh_token,
         token_is_sole_credential,
         gh_guard,
@@ -862,6 +938,7 @@ pub fn exec(
         &sandbox.allow_localhost,
         sandbox.allow_localhost_any,
         sandbox.agent,
+        deny_env,
         resolved_gh_token,
         token_is_sole_credential,
         gh_guard,
@@ -1007,6 +1084,7 @@ fn exec_bwrap(
         &sandbox.allow_localhost,
         sandbox.allow_localhost_any,
         sandbox.agent,
+        deny_env,
         resolved_gh_token,
         token_is_sole_credential,
         gh_guard,
@@ -1131,7 +1209,7 @@ mod tests {
     use super::{
         deny_env_strips_gh_token, evaluate_exec_github_token_presence,
         extract_gh_token_from_command, inject_gh_token_if_needed,
-        resolve_gh_token_for_exec_with_resolver,
+        resolve_gh_token_for_exec_with_resolver, should_manage_token_env,
     };
     use crate::agent::Agent;
     use std::cell::Cell;
@@ -1250,6 +1328,84 @@ mod tests {
     fn deny_env_strips_gh_token_ignores_other_vars() {
         let deny = vec!["GITHUB_TOKEN".to_string(), "FOO".to_string()];
         assert!(!deny_env_strips_gh_token(&deny));
+    }
+
+    fn gh_guard_injecting() -> crate::config::GhGuardPolicy {
+        crate::config::GhGuardPolicy {
+            enabled: true,
+            inject_token: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn should_manage_token_env_true_when_inject_token_and_gh_token_not_denied() {
+        assert!(should_manage_token_env(&gh_guard_injecting(), false, &[]));
+    }
+
+    #[test]
+    fn should_manage_token_env_true_when_sole_credential_and_gh_token_not_denied() {
+        assert!(should_manage_token_env(
+            &crate::config::GhGuardPolicy::default(),
+            true,
+            &["GITHUB_TOKEN".to_string()],
+        ));
+    }
+
+    #[test]
+    fn should_manage_token_env_false_when_gh_token_denied() {
+        // Even with inject_token AND sole-credential, a GH_TOKEN deny means the
+        // injection is doomed — leave the child's token vars untouched.
+        let deny = vec!["GH_TOKEN".to_string()];
+        assert!(!should_manage_token_env(&gh_guard_injecting(), true, &deny));
+    }
+
+    #[test]
+    fn should_manage_token_env_false_when_nothing_wants_a_token() {
+        assert!(!should_manage_token_env(
+            &crate::config::GhGuardPolicy::default(),
+            false,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn resolve_trusted_gh_rejects_gh_inside_project_dir() {
+        let project = exec_tempdir(".cplt-trusted-gh-project-");
+        let bin = project.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        fs::write(&gh, "#!/bin/sh\necho pwned\n").unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+        temp_env::with_var("PATH", Some(bin.as_os_str()), || {
+            assert_eq!(super::resolve_trusted_gh(project.path()), None);
+        });
+    }
+
+    #[test]
+    fn resolve_trusted_gh_rejects_relative_and_empty_path_entries() {
+        let project = exec_tempdir(".cplt-trusted-gh-rel-");
+        // `.`, a bare `bin`, and the empty segment are all repo-influenced.
+        temp_env::with_var("PATH", Some(".:bin:"), || {
+            assert_eq!(super::resolve_trusted_gh(project.path()), None);
+        });
+    }
+
+    #[test]
+    fn resolve_trusted_gh_accepts_absolute_dir_outside_project() {
+        let project = exec_tempdir(".cplt-trusted-gh-ok-project-");
+        let trusted = exec_tempdir(".cplt-trusted-gh-ok-bin-");
+        let gh = trusted.path().join("gh");
+        fs::write(&gh, "#!/bin/sh\ntrue\n").unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+        temp_env::with_var("PATH", Some(trusted.path().as_os_str()), || {
+            assert_eq!(
+                super::resolve_trusted_gh(project.path()).as_deref(),
+                Some(gh.as_path())
+            );
+        });
     }
 
     #[test]
