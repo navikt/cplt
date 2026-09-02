@@ -257,6 +257,39 @@ pub fn build_sandbox_env(
     env
 }
 
+/// Where to point `NPM_CONFIG_USERCONFIG`, or `None` when the injection must be skipped.
+///
+/// The sandbox denies `~/.npmrc` (it holds registry auth tokens). npm, pnpm and bun
+/// treat the resulting EACCES/EPERM as "no user config"; yarn 1 only tolerates
+/// ENOENT/EISDIR and aborts the whole install (#180). Pointing the user-config path
+/// at a file that does not exist inside the scratch dir turns the denial into ENOENT,
+/// which every one of them handles. Semantically a no-op: the real `~/.npmrc` was
+/// unreadable in the sandbox either way.
+///
+/// Skipped when:
+/// - the user opted back into `~/.npmrc` via `allow.read` (`npmrc_allowed`) — they
+///   want the token, and redirecting would silently break private-registry auth;
+/// - the user set `NPM_CONFIG_USERCONFIG` themselves (it is on `ENV_ALLOWLIST`);
+/// - there is no scratch dir — `/dev/null` would make `npm config set` writes vanish
+///   silently, so leaving the EACCES in place is the honest failure.
+pub fn npmrc_userconfig_override(
+    parent_env: &[(String, String)],
+    scratch_dir: Option<&Path>,
+    npmrc_allowed: bool,
+) -> Option<std::path::PathBuf> {
+    if npmrc_allowed {
+        return None;
+    }
+    if parent_env
+        .iter()
+        .any(|(k, v)| k == "NPM_CONFIG_USERCONFIG" && !v.is_empty())
+    {
+        return None;
+    }
+    // "npmrc" (no dot) so it cannot collide with a real dotfile the agent creates.
+    Some(scratch_dir?.join("npmrc"))
+}
+
 /// Dangerous NODE_OPTIONS flags that allow code preloading or module interception.
 const NODE_OPTIONS_DANGEROUS: &[&str] = &[
     "--require",

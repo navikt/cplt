@@ -8,7 +8,8 @@ use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
     HardeningCategory, ProfileOptions, SandboxConfig, build_sandbox_env, generate_policy,
-    generate_profile, tool_override_path_is_safe, tool_path_env_overrides, validate_sbpl_path,
+    generate_profile, npmrc_userconfig_override, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_sbpl_path,
 };
 
 // ============================================================
@@ -5439,6 +5440,64 @@ fn profile_gpg_signing_allows_socket_file_read() {
 // ============================================================
 // build_sandbox_env — scratch dir env injection
 // ============================================================
+
+// #180: the sandbox denies ~/.npmrc, and yarn 1 aborts on EACCES/EPERM where it
+// tolerates ENOENT. Redirecting NPM_CONFIG_USERCONFIG at a nonexistent scratch
+// path turns the denial into ENOENT — unless the user opted back in.
+
+#[test]
+fn npmrc_userconfig_redirected_by_default() {
+    let parent = make_env(&[("HOME", "/Users/test")]);
+    let scratch = std::path::Path::new("/scratch/session123");
+    assert_eq!(
+        npmrc_userconfig_override(&parent, Some(scratch), false),
+        Some(scratch.join("npmrc")),
+        "NPM_CONFIG_USERCONFIG should point at a nonexistent scratch path by default"
+    );
+    assert!(
+        !scratch.join("npmrc").exists(),
+        "the redirect target must not exist, or the read is not ENOENT"
+    );
+}
+
+#[test]
+fn npmrc_userconfig_not_redirected_when_user_allows_npmrc() {
+    let parent = make_env(&[("HOME", "/Users/test")]);
+    let scratch = std::path::Path::new("/scratch/session123");
+    assert_eq!(
+        npmrc_userconfig_override(&parent, Some(scratch), true),
+        None,
+        "allow.read ~/.npmrc means the user wants the real file — do not redirect"
+    );
+}
+
+#[test]
+fn npmrc_userconfig_not_redirected_when_user_set_it() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("NPM_CONFIG_USERCONFIG", "/Users/test/custom-npmrc"),
+    ]);
+    let scratch = std::path::Path::new("/scratch/session123");
+    assert_eq!(
+        npmrc_userconfig_override(&parent, Some(scratch), false),
+        None,
+        "a user-set NPM_CONFIG_USERCONFIG must not be clobbered"
+    );
+    // An empty value is treated as unset.
+    let empty = make_env(&[("NPM_CONFIG_USERCONFIG", "")]);
+    assert!(npmrc_userconfig_override(&empty, Some(scratch), false).is_some());
+}
+
+#[test]
+fn npmrc_userconfig_not_redirected_without_scratch_dir() {
+    let parent = make_env(&[("HOME", "/Users/test")]);
+    assert_eq!(
+        npmrc_userconfig_override(&parent, None, false),
+        None,
+        "without a scratch dir there is nowhere safe to point: `npm config set` writes \
+         would vanish silently"
+    );
+}
 
 #[test]
 fn env_scratch_dir_sets_tmpdir_vars() {

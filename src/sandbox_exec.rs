@@ -65,6 +65,7 @@ fn configure_command(
     agent: Agent,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    npmrc_allowed: bool,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -112,6 +113,16 @@ fn configure_command(
         .any(|(k, v)| k == "DOTNET_CLI_HOME" && !v.is_empty());
     if !user_dotnet_cli_home {
         cmd.env("DOTNET_CLI_HOME", home_dir);
+    }
+
+    // Point npm-family tools at a nonexistent user config inside the scratch dir so
+    // the denied ~/.npmrc reads as ENOENT instead of EACCES/EPERM — yarn 1 aborts the
+    // whole install on the latter (#180). See `npmrc_userconfig_override` for the cases
+    // where this must not fire.
+    if let Some(path) =
+        super::env::npmrc_userconfig_override(&parent_env, scratch_dir, npmrc_allowed)
+    {
+        cmd.env("NPM_CONFIG_USERCONFIG", path);
     }
 
     // Tell mise to ignore config files in ancestor directories that the sandbox blocks.
@@ -556,6 +567,7 @@ pub fn exec(
         sandbox.agent,
         gh_guard,
         git_guard,
+        sandbox.npmrc_allowed,
     );
 
     // Strip repo-config denied env vars
@@ -694,6 +706,7 @@ pub fn exec(
         sandbox.agent,
         gh_guard,
         git_guard,
+        sandbox.npmrc_allowed,
     );
 
     // Strip repo-config denied env vars
@@ -831,6 +844,7 @@ fn exec_bwrap(
         sandbox.agent,
         gh_guard,
         git_guard,
+        sandbox.npmrc_allowed,
     );
     for var in deny_env {
         cmd.env_remove(var);
