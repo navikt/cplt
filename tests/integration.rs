@@ -56,6 +56,11 @@ mod macos_tests {
         PathBuf::from(env!("CARGO_BIN_EXE_cplt"))
     }
 
+    /// Path to the integration probe helper binary.
+    fn probe_binary_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_BIN_EXE_integration_probe"))
+    }
+
     fn home_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap();
         fs::canonicalize(&home).unwrap()
@@ -149,14 +154,29 @@ mod macos_tests {
 
     /// Run a shell command inside the sandbox and return (combined output, success).
     fn run_sandboxed(profile_path: &PathBuf, shell_cmd: &str) -> (String, bool) {
-        let output = Command::new("sandbox-exec")
-            .arg("-f")
+        run_sandboxed_with_env(profile_path, shell_cmd, &[])
+    }
+
+    /// Like `run_sandboxed`, but also sets extra environment variables on the
+    /// `sandbox-exec` child process. Use this to pass path arguments to scripts
+    /// without interpolating them into shell/Python literals (which breaks on
+    /// paths containing quotes or special characters).
+    fn run_sandboxed_with_env(
+        profile_path: &PathBuf,
+        shell_cmd: &str,
+        extra_env: &[(&str, &str)],
+    ) -> (String, bool) {
+        let mut cmd = Command::new("sandbox-exec");
+        cmd.arg("-f")
             .arg(profile_path)
             .arg("/bin/bash")
             .arg("-c")
-            .arg(shell_cmd)
-            .output()
-            .expect("failed to run sandbox-exec");
+            .arg(shell_cmd);
+        cmd.env("CPLT_TEST_PROBE", probe_binary_path());
+        for &(k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("failed to run sandbox-exec");
 
         let combined = format!(
             "{}{}",
@@ -420,6 +440,7 @@ mod macos_tests {
             allow_cache_exec: &[],
             allow_cache_exec_any: false,
             allow_browser: false,
+            allow_keychain: true,
         }
     }
 
@@ -1272,32 +1293,7 @@ public class T2 {
         let profile = write_real_profile(&opts);
 
         // Simulate JVM Attach API: bind+connect a .java_pid<PID> socket
-        let cmd = r#"python3 -c "
-import socket, os, threading, time
-SOCK = '/tmp/.java_pid99999'
-try: os.unlink(SOCK)
-except: pass
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.bind(SOCK)
-s.listen(1)
-s.settimeout(3)
-def accept():
-    try:
-        c,_ = s.accept()
-        c.send(b'OK')
-        c.close()
-    except: pass
-t = threading.Thread(target=accept)
-t.start()
-time.sleep(0.2)
-c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-c.connect(SOCK)
-print(c.recv(10).decode())
-c.close()
-s.close()
-os.unlink(SOCK)
-t.join(2)
-""#;
+        let cmd = r#""$CPLT_TEST_PROBE" uds-echo /tmp/.java_pid99999"#;
         let (output, _) = run_sandboxed(&profile, cmd);
 
         fs::remove_file(&profile).ok();
@@ -1318,37 +1314,7 @@ t.join(2)
 
         // The JDK on macOS uses confstr(_CS_DARWIN_USER_TEMP_DIR) which returns
         // /var/folders/<xx>/<hash>/T/ — test bind+accept+connect at this path.
-        let cmd = r#"python3 -c "
-import socket, os, threading, time, ctypes, ctypes.util
-# Get the real darwin user temp dir via confstr(_CS_DARWIN_USER_TEMP_DIR = 65537)
-libc = ctypes.CDLL(ctypes.util.find_library('c'))
-buf = ctypes.create_string_buffer(1024)
-libc.confstr(65537, buf, 1024)
-tmpdir = buf.value.decode().rstrip('/')
-SOCK = tmpdir + '/.java_pid88888'
-try: os.unlink(SOCK)
-except: pass
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.bind(SOCK)
-s.listen(1)
-s.settimeout(3)
-def accept():
-    try:
-        c,_ = s.accept()
-        c.send(b'OK')
-        c.close()
-    except: pass
-t = threading.Thread(target=accept)
-t.start()
-time.sleep(0.2)
-c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-c.connect(SOCK)
-print(c.recv(10).decode())
-c.close()
-s.close()
-os.unlink(SOCK)
-t.join(2)
-""#;
+        let cmd = r#""$CPLT_TEST_PROBE" uds-echo "${TMPDIR%/}/.java_pid88888""#;
         let (output, _) = run_sandboxed(&profile, cmd);
 
         fs::remove_file(&profile).ok();
@@ -1450,26 +1416,7 @@ finally:
 
         // SSH_AUTH_SOCK on macOS is /private/tmp/com.apple.launchd.*/Listeners
         // The sandbox must NOT allow connecting to it — even though .java_pid* is allowed.
-        let cmd = r#"python3 -c "
-import socket, os
-sock_path = os.environ.get('SSH_AUTH_SOCK', '')
-if not sock_path:
-    print('NO_SSH_AGENT')
-else:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(sock_path)
-        print('EXPOSED')
-    except PermissionError:
-        print('BLOCKED')
-    except OSError as e:
-        if e.errno == 1:
-            print('BLOCKED')
-        else:
-            print(f'ERROR:{e}')
-    finally:
-        s.close()
-""#;
+        let cmd = r#""$CPLT_TEST_PROBE" ssh-agent-check"#;
         let (output, _) = run_sandboxed(&profile, cmd);
 
         fs::remove_file(&profile).ok();
@@ -1491,27 +1438,7 @@ else:
         let profile = write_real_profile(&opts);
 
         // Non-.java_pid sockets in /tmp must be blocked
-        let cmd = r#"python3 -c "
-import socket, os
-SOCK = '/tmp/.cplt_evil_test'
-try: os.unlink(SOCK)
-except: pass
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-try:
-    s.bind(SOCK)
-    print('EXPOSED')
-    s.close()
-    os.unlink(SOCK)
-except PermissionError:
-    print('BLOCKED')
-except OSError as e:
-    if e.errno == 1:
-        print('BLOCKED')
-    else:
-        print(f'ERROR:{e}')
-finally:
-    s.close()
-""#;
+        let cmd = r#""$CPLT_TEST_PROBE" unix-bind /tmp/.cplt_evil_test"#;
         let (output, _) = run_sandboxed(&profile, cmd);
 
         fs::remove_file(&profile).ok();
@@ -1699,38 +1626,15 @@ finally:
         let profile = write_real_profile(&opts);
 
         // IPv4 localhost bind
-        let (output, success) = run_sandboxed(
-            &profile,
-            r#"python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', 0))
-s.listen(1)
-port = s.getsockname()[1]
-s.close()
-print(f'OK:{port}')
-""#,
-        );
+        let (output, success) =
+            run_sandboxed(&profile, r#""$CPLT_TEST_PROBE" tcp-bind 127.0.0.1 0"#);
         assert!(
             success && output.contains("OK:"),
             "IPv4 localhost bind should be allowed.\noutput: {output}"
         );
 
         // IPv6 localhost bind
-        let (output, success) = run_sandboxed(
-            &profile,
-            r#"python3 -c "
-import socket
-s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('::1', 0))
-s.listen(1)
-port = s.getsockname()[1]
-s.close()
-print(f'OK:{port}')
-""#,
-        );
+        let (output, success) = run_sandboxed(&profile, r#""$CPLT_TEST_PROBE" tcp-bind ::1 0"#);
         assert!(
             success && output.contains("OK:"),
             "IPv6 localhost bind should be allowed.\noutput: {output}"
@@ -1750,27 +1654,14 @@ print(f'OK:{port}')
         let opts = default_opts(&project, &home);
         let profile = write_real_profile(&opts);
 
-        let (output, success) = run_sandboxed(
-            &profile,
-            r#"python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try:
-    s.bind(('0.0.0.0', 18998))
-    s.listen(1)
-    s.close()
-    print('ALLOWED')
-except Exception as e:
-    print(f'DENIED:{e}')
-""#,
-        );
+        let (output, success) =
+            run_sandboxed(&profile, r#""$CPLT_TEST_PROBE" tcp-bind 0.0.0.0 18998"#);
 
         // This SHOULD be denied but SBPL can't distinguish localhost from INADDR_ANY.
         // If SBPL is ever fixed (or we find a workaround), this test will start
         // failing with "DENIED" — update it to assert denied at that point.
         assert!(
-            success && output.contains("ALLOWED"),
+            success && output.contains("OK:"),
             "SBPL limitation: wildcard bind should (unfortunately) be allowed.\n\
              If this fails with DENIED, great — SBPL behavior changed and we can \n\
              now properly restrict bind. Update this test and remove the limitation \n\
@@ -1921,6 +1812,92 @@ except Exception as e:
         assert!(
             !stdout.contains("\"*:443\""),
             "`--proxy-forced --print-profile` must not allow direct *:443 egress, got:\n{stdout}"
+        );
+    }
+
+    // ── Keychain access controlled by allow_keychain flag ─────────
+
+    /// Kernel-level: when `allow_keychain = false` the sandbox must deny reads
+    /// from `~/Library/Keychains`. This mirrors the env-token path: when
+    /// `GH_TOKEN` (or siblings) is injected, Copilot uses the token directly and
+    /// Keychain access is unnecessary — removing the SBPL rules is the security
+    /// gain we're testing here.
+    ///
+    /// Uses the real home dir and skips when `~/Library/Keychains` is absent,
+    /// so ENOENT is not conflated with sandbox enforcement.
+    /// The path is passed via env var to avoid Python string-escaping issues.
+    #[test]
+    fn real_profile_keychain_denied_when_flag_false() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let keychains_dir = home.join("Library/Keychains");
+        if !keychains_dir.exists() {
+            eprintln!("Skipping: ~/Library/Keychains does not exist");
+            return;
+        }
+
+        let mut opts = default_opts(&project, &home);
+        opts.allow_keychain = false;
+        let profile = write_real_profile(&opts);
+
+        // Path is injected via CPLT_TEST_DIR env var — no string interpolation
+        // into Python literals, so paths with quotes or special chars are safe.
+        // The real ~/Library/Keychains is used so it is not inside /private/var/folders
+        // (which is broadly allowed by the profile), ensuring only the explicit
+        // Keychain rule can grant access.
+        let cmd = r#""$CPLT_TEST_PROBE" dir-list "$CPLT_TEST_DIR""#;
+        let keychains_str = keychains_dir.to_string_lossy();
+        let (output, success) =
+            run_sandboxed_with_env(&profile, cmd, &[("CPLT_TEST_DIR", &keychains_str)]);
+        fs::remove_file(&profile).ok();
+
+        assert!(
+            !success,
+            "Keychain must be denied (non-zero exit) when allow_keychain=false, got: {output}"
+        );
+        assert!(
+            output.contains("BLOCKED"),
+            "Expected a BLOCKED marker from sandbox denial, got: {output}"
+        );
+    }
+
+    /// Control: when `allow_keychain = true` the Copilot agent must be able to
+    /// read `~/Library/Keychains` (the normal case when no token env var is set).
+    ///
+    /// Uses the real home dir so the path is not inside /private/var/folders
+    /// (broadly allowed); access is only permitted via the explicit Keychain rule.
+    /// Skipped if ~/Library/Keychains does not exist on this machine.
+    #[test]
+    fn real_profile_keychain_accessible_when_flag_true() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let keychains_dir = home.join("Library/Keychains");
+        if !keychains_dir.exists() {
+            eprintln!("Skipping: ~/Library/Keychains does not exist");
+            return;
+        }
+
+        let mut opts = default_opts(&project, &home);
+        opts.allow_keychain = true;
+        let profile = write_real_profile(&opts);
+
+        // Path injected via env var — safe for any path content.
+        // Exit 0 unambiguously means the sandbox allowed the read.
+        let cmd = r#""$CPLT_TEST_PROBE" dir-list "$CPLT_TEST_DIR""#;
+        let keychains_str = keychains_dir.to_string_lossy();
+        let (output, success) =
+            run_sandboxed_with_env(&profile, cmd, &[("CPLT_TEST_DIR", &keychains_str)]);
+        fs::remove_file(&profile).ok();
+
+        assert!(
+            success,
+            "Keychain must be accessible (exit 0) when allow_keychain=true, got: {output}"
+        );
+        assert!(
+            output.contains("ALLOWED"),
+            "Expected an ALLOWED marker when allow_keychain=true, got: {output}"
         );
     }
 }

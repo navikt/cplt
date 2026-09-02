@@ -6,14 +6,16 @@
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use super::env::build_sandbox_env;
-use super::policy::HardeningCategory;
+use super::policy::{GITHUB_TOKEN_VARS, HardeningCategory};
 use crate::agent::Agent;
 use crate::ui;
 
 /// Config filenames that mise searches for in ancestor directories.
 const MISE_CONFIG_FILENAMES: &[&str] = &[".tool-versions", ".mise.toml", "mise.toml"];
+const GH_AUTH_TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Compute `MISE_IGNORED_CONFIG_PATHS` for ancestor directories the sandbox can't read.
 ///
@@ -63,6 +65,17 @@ fn configure_command(
     allow_localhost: &[u16],
     allow_localhost_any: bool,
     agent: Agent,
+    // Repo-config denied env vars. The callers also strip these *after* this
+    // function, but it needs them here to avoid a futile `GH_TOKEN` injection
+    // (and the sibling-var clearing that comes with it) when `deny.env` will
+    // remove `GH_TOKEN` anyway.
+    deny_env: &[String],
+    resolved_gh_token: Option<&str>,
+    // The pre-extracted token is the agent's ONLY credential, because the
+    // Keychain grant was dropped on the strength of having it. Forces the
+    // `GH_TOKEN` env injection even when gh_guard is off — without it the
+    // agent would launch with no way to authenticate at all.
+    token_is_sole_credential: bool,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     npmrc_allowed: bool,
@@ -177,12 +190,36 @@ fn configure_command(
     // Install command wrappers if scratch dir exists and features are enabled.
     // - gh proxy: intercepts gh commands and blocks destructive operations
     // - git push prevention: blocks git push while allowing all other git operations
+    // Token delivery is deliberately NOT gated on gh_guard. Two separate
+    // reasons to put GH_TOKEN in the child env:
+    //   - gh_guard.inject_token: the user asked for it.
+    //   - token_is_sole_credential: cplt pre-extracted the token and dropped
+    //     the Keychain grant on that basis, so this env var is the only
+    //     credential the agent has. The gh wrapper's 0600 file does not cover
+    //     this case — it only answers `gh auth token`, while the agent itself
+    //     reads GH_TOKEN.
+    // `deny_env` is applied by the callers *after* this and still wins — so when
+    // it strips `GH_TOKEN` we skip the whole block: injecting would be undone,
+    // and clearing the sibling vars would wrongly drop a `GITHUB_TOKEN` /
+    // `COPILOT_GITHUB_TOKEN` the user set, which stays the agent's credential
+    // when only `GH_TOKEN` is denied (see the startup warning in `main.rs`).
+    if should_manage_token_env(gh_guard, token_is_sole_credential, deny_env) {
+        // Clear every token var first so the one cplt resolved is the one the
+        // agent sees. Without this an ambient `COPILOT_GITHUB_TOKEN` would
+        // still shadow the injected `GH_TOKEN` for readers that prefer it —
+        // and under `copilot_auth = "gh_only"`, whose whole promise is that the
+        // credential comes from gh's store, an inherited env token would
+        // quietly win.
+        if resolved_gh_token.is_some_and(|t| !t.trim().is_empty()) {
+            for var in GITHUB_TOKEN_VARS {
+                cmd.env_remove(var);
+            }
+        }
+        inject_gh_token_if_needed(cmd, resolved_gh_token);
+    }
+
     if let Some(scratch) = scratch_dir {
         if gh_guard.enabled {
-            // Inject GH_TOKEN into env only when explicitly requested.
-            if gh_guard.inject_token {
-                inject_gh_token_if_needed(cmd, agent);
-            }
             // Cache token to file so the wrapper can serve `gh auth token`
             // requests without exposing the token as an env var to all child
             // processes. NOTE (Finding 3): this is best-effort, NOT a same-UID
@@ -194,52 +231,275 @@ fn configure_command(
             // the first read (see `serve_cached_gh_token`), which narrows — but
             // does not close — the window. A determined agent that reads
             // `$TMPDIR/.gh-token` before the legitimate consumer still wins.
-            if gh_guard.block_auth_token {
-                cache_gh_token_to_file(scratch, agent);
+            if let Some(token) = resolved_gh_token.filter(|_| gh_guard.block_auth_token) {
+                cache_gh_token_to_file(scratch, token);
             }
         }
         install_command_wrappers(cmd, scratch, project_dir, gh_guard, git_guard);
     }
 }
 
-/// Inject GH_TOKEN into the command env if not already present.
+/// Locate a `gh` binary that is safe to run *unsandboxed* in a project dir.
 ///
-/// Runs `gh auth token` outside the sandbox to extract the token from
-/// `~/.config/gh/hosts.yml`, then injects it as GH_TOKEN. This allows
-/// the gh proxy to safely block `gh auth token` inside the sandbox
-/// while still giving the agent API access.
+/// Callers spawn `gh` as the user, outside the sandbox — token pre-extraction
+/// before the agent starts, or the `cplt doctor` auth probe — so a `gh` planted
+/// by hostile repo content must never be the one that runs. A bare
+/// `Command::new("gh")` does an OS `PATH` lookup that would happily pick up
+/// `./bin/gh`, `node_modules/.bin/gh`, or anything reachable through a relative
+/// `PATH` entry (`.`, `bin`, an empty segment). Instead we walk `PATH` ourselves
+/// and accept only a directory that is absolute and outside the project tree,
+/// and only a `gh` whose symlink-resolved target is also outside it.
 ///
-/// Only injects for agents that need GitHub access (Copilot).
-fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
-    // Only inject for Copilot — other agents have their own auth
-    if agent != Agent::Copilot {
-        return;
-    }
+/// Returns `None` when nothing qualifies; the caller then behaves exactly as if
+/// `gh` were not installed (token extraction falls back to Keychain under
+/// `auto`, or fails closed under `env_only` / `gh_only`).
+pub(crate) fn resolve_trusted_gh(project_dir: &Path) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let project_canon =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
 
-    // Skip if any GitHub token is already set (non-empty) in the environment
-    let has_token = |key| std::env::var(key).is_ok_and(|v| !v.is_empty());
-    if has_token("GH_TOKEN") || has_token("GITHUB_TOKEN") || has_token("COPILOT_GITHUB_TOKEN") {
-        return;
+    for dir in std::env::split_paths(&path_var) {
+        // Skip empty segments (POSIX-equivalent to the cwd) and any relative
+        // entry — both let repo content decide what `gh` resolves to.
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+        let dir_canon = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if dir_canon.starts_with(&project_canon) {
+            continue;
+        }
+        let candidate = dir.join("gh");
+        if !candidate.is_file() {
+            continue;
+        }
+        // A trusted-looking dir may still hold a symlink into the repo.
+        let target = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if target.starts_with(&project_canon) {
+            continue;
+        }
+        return Some(candidate);
     }
+    None
+}
 
-    // Extract token from gh CLI config (outside sandbox)
-    let Ok(output) = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-    else {
-        return;
+fn extract_gh_token_from_cli(project_dir: &Path) -> Option<String> {
+    let gh = resolve_trusted_gh(project_dir)?;
+    let mut cmd = std::process::Command::new(&gh);
+    // Pin the host: with several hosts logged in (github.com plus a GHES
+    // instance) a bare `gh auth token` resolves against the *active* host, so
+    // the agent could be handed an enterprise token for github.com work.
+    cmd.args(["auth", "token", "--hostname", "github.com"]);
+    for var in GITHUB_TOKEN_VARS {
+        cmd.env_remove(var);
+    }
+    extract_gh_token_from_command(cmd, GH_AUTH_TOKEN_TIMEOUT)
+}
+
+fn extract_gh_token_from_command(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> Option<String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    use std::thread;
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            ui::warn(&format!("gh auth token failed to start: {err}"));
+            return None;
+        }
     };
 
-    if !output.status.success() {
-        return;
+    let stdout_reader = child.stdout.take().map(|mut stdout| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let join_readers = |out: Option<thread::JoinHandle<Vec<u8>>>,
+                        err: Option<thread::JoinHandle<Vec<u8>>>| {
+        if let Some(h) = out {
+            let _ = h.join();
+        }
+        if let Some(h) = err {
+            let _ = h.join();
+        }
+    };
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            if let Err(err) = child.wait() {
+                ui::warn(&format!("gh auth token wait failed after timeout: {err}"));
+            }
+            join_readers(stdout_reader, stderr_reader);
+            ui::warn(&format!(
+                "gh auth token timed out after {}s",
+                timeout.as_secs()
+            ));
+            return None;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                join_readers(stdout_reader, stderr_reader);
+                ui::warn(&format!("gh auth token wait failed: {err}"));
+                return None;
+            }
+        }
+    };
+
+    let stdout = stdout_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+
+    if !status.success() {
+        if stderr.is_empty() {
+            ui::warn(&format!("gh auth token failed with status {status}"));
+        } else {
+            ui::warn(&format!(
+                "gh auth token failed with status {status} (stderr omitted for safety)"
+            ));
+        }
+        return None;
     }
 
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !token.is_empty() {
-        cmd.env("GH_TOKEN", &token);
+    let token = String::from_utf8_lossy(&stdout).trim().to_string();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+fn resolve_gh_token_from_cli_if_needed(agent: Agent, project_dir: &Path) -> Option<String> {
+    if agent != Agent::Copilot {
+        return None;
     }
+
+    extract_gh_token_from_cli(project_dir)
+}
+
+fn evaluate_exec_github_token_presence(
+    has_effective_env_token: bool,
+    needs_runtime_gh_token: bool,
+    agent: Agent,
+    injectable_token: Option<&str>,
+) -> bool {
+    has_effective_env_token
+        || (needs_runtime_gh_token
+            && agent == Agent::Copilot
+            && injectable_token.is_some_and(|token| !token.trim().is_empty()))
+}
+
+fn should_resolve_gh_token_for_exec(
+    has_effective_env_token: bool,
+    needs_runtime_gh_token: bool,
+    agent: Agent,
+) -> bool {
+    !has_effective_env_token && needs_runtime_gh_token && agent == Agent::Copilot
+}
+
+fn resolve_gh_token_for_exec_with_resolver<F>(
+    has_effective_env_token: bool,
+    needs_runtime_gh_token: bool,
+    agent: Agent,
+    resolver: F,
+) -> Option<String>
+where
+    F: FnOnce(Agent) -> Option<String>,
+{
+    if !should_resolve_gh_token_for_exec(has_effective_env_token, needs_runtime_gh_token, agent) {
+        return None;
+    }
+
+    let resolved_token = resolver(agent);
+
+    if evaluate_exec_github_token_presence(
+        has_effective_env_token,
+        needs_runtime_gh_token,
+        agent,
+        resolved_token.as_deref(),
+    ) {
+        resolved_token
+    } else {
+        None
+    }
+}
+
+/// Resolve a GitHub token for exec-time injection/caching.
+///
+/// Has side effects — it spawns `gh auth token`, which may read the login
+/// store or the Keychain — so it must run in the unsandboxed parent, and only
+/// when a token is actually needed (`should_resolve_gh_token_for_exec`). It is
+/// a read: no launch happens here. cplt calls it *before* the confirmation
+/// prompt on purpose, so the resolved token can narrow the Keychain grant
+/// shown in the summary; the launch itself stays gated by that prompt.
+pub fn resolve_gh_token_for_exec(
+    has_effective_env_token: bool,
+    needs_runtime_gh_token: bool,
+    agent: Agent,
+    project_dir: &Path,
+) -> Option<String> {
+    resolve_gh_token_for_exec_with_resolver(
+        has_effective_env_token,
+        needs_runtime_gh_token,
+        agent,
+        |agent| resolve_gh_token_from_cli_if_needed(agent, project_dir),
+    )
+}
+
+/// Inject GH_TOKEN into the command env if not already present.
+///
+/// The token is resolved once in `configure_command()` and passed here.
+fn inject_gh_token_if_needed(cmd: &mut Command, token: Option<&str>) {
+    if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
+        cmd.env("GH_TOKEN", token);
+    }
+}
+
+/// Whether repo `deny.env` will strip `GH_TOKEN` — the sole injection target —
+/// from the child. When true, `configure_command` must not inject it or clear
+/// the sibling token vars: the injection would be undone, and a `GITHUB_TOKEN`
+/// / `COPILOT_GITHUB_TOKEN` the user set stays the agent's credential.
+fn deny_env_strips_gh_token(deny_env: &[String]) -> bool {
+    deny_env.iter().any(|v| v == "GH_TOKEN")
+}
+
+/// Whether `configure_command` should take over the child's GitHub token env —
+/// inject the resolved `GH_TOKEN` and normalize the sibling vars around it.
+///
+/// True when something wants a `GH_TOKEN` in the child (`gh_guard.inject_token`,
+/// or the pre-extracted token being the sole credential) **and** repo
+/// `deny.env` will not strip `GH_TOKEN` straight back out. In the denied case
+/// the injection is futile and clearing `GITHUB_TOKEN` / `COPILOT_GITHUB_TOKEN`
+/// would wrongly drop a credential the user set that a `GH_TOKEN`-only deny is
+/// meant to leave alone.
+fn should_manage_token_env(
+    gh_guard: &crate::config::GhGuardPolicy,
+    token_is_sole_credential: bool,
+    deny_env: &[String],
+) -> bool {
+    let inject_wanted = (gh_guard.enabled && gh_guard.inject_token) || token_is_sole_credential;
+    inject_wanted && !deny_env_strips_gh_token(deny_env)
 }
 
 /// Cache the GitHub token to a file in the scratch dir.
@@ -261,38 +521,7 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
 /// window. They do NOT prevent a determined same-UID agent from `cat`-ing
 /// `$TMPDIR/.gh-token` before the legitimate read. Do not treat this as
 /// confidentiality against an adversarial agent.
-fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent) {
-    // Only cache for Copilot — other agents have their own auth
-    if agent != Agent::Copilot {
-        return;
-    }
-
-    // Skip if any GitHub token is already set (non-empty) in the environment —
-    // in that case Copilot will use the env var directly.
-    let has_token = |key| std::env::var(key).is_ok_and(|v| !v.is_empty());
-    if has_token("GH_TOKEN") || has_token("GITHUB_TOKEN") || has_token("COPILOT_GITHUB_TOKEN") {
-        return;
-    }
-
-    // Extract token from gh CLI config (outside sandbox)
-    let Ok(output) = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-    else {
-        return;
-    };
-
-    if !output.status.success() {
-        return;
-    }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        return;
-    }
-
+fn cache_gh_token_to_file(scratch_dir: &Path, token: &str) {
     // Write token to file, creating it with 0600 from the start to avoid a
     // permissions window where the file is world-readable.
     use std::io::Write;
@@ -544,6 +773,12 @@ pub fn exec(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
+    resolved_gh_token: Option<&str>,
+    // The pre-extracted token is the agent's ONLY credential, because the
+    // Keychain grant was dropped on the strength of having it. Forces the
+    // `GH_TOKEN` env injection even when gh_guard is off — without it the
+    // agent would launch with no way to authenticate at all.
+    token_is_sole_credential: bool,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
@@ -571,6 +806,9 @@ pub fn exec(
         &sandbox.allow_localhost,
         sandbox.allow_localhost_any,
         sandbox.agent,
+        deny_env,
+        resolved_gh_token,
+        token_is_sole_credential,
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
@@ -658,6 +896,12 @@ pub fn exec(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
+    resolved_gh_token: Option<&str>,
+    // The pre-extracted token is the agent's ONLY credential, because the
+    // Keychain grant was dropped on the strength of having it. Forces the
+    // `GH_TOKEN` env injection even when gh_guard is off — without it the
+    // agent would launch with no way to authenticate at all.
+    token_is_sole_credential: bool,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
@@ -674,6 +918,8 @@ pub fn exec(
             inherit_env,
             disabled_categories,
             deny_env,
+            resolved_gh_token,
+            token_is_sole_credential,
             gh_guard,
             git_guard,
         ) {
@@ -710,6 +956,9 @@ pub fn exec(
         &sandbox.allow_localhost,
         sandbox.allow_localhost_any,
         sandbox.agent,
+        deny_env,
+        resolved_gh_token,
+        token_is_sole_credential,
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
@@ -766,6 +1015,12 @@ fn exec_bwrap(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
+    resolved_gh_token: Option<&str>,
+    // The pre-extracted token is the agent's ONLY credential, because the
+    // Keychain grant was dropped on the strength of having it. Forces the
+    // `GH_TOKEN` env injection even when gh_guard is off — without it the
+    // agent would launch with no way to authenticate at all.
+    token_is_sole_credential: bool,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) -> BwrapOutcome {
@@ -848,6 +1103,9 @@ fn exec_bwrap(
         &sandbox.allow_localhost,
         sandbox.allow_localhost_any,
         sandbox.agent,
+        deny_env,
+        resolved_gh_token,
+        token_is_sole_credential,
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
@@ -963,5 +1221,385 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
             return ConfirmResult::Eof;
         }
         return ConfirmResult::Confirmed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        deny_env_strips_gh_token, evaluate_exec_github_token_presence,
+        extract_gh_token_from_command, inject_gh_token_if_needed,
+        resolve_gh_token_for_exec_with_resolver, should_manage_token_env,
+    };
+    use crate::agent::Agent;
+    use std::cell::Cell;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn write_script(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
+        let script_path = dir.path().join(name);
+        fs::write(&script_path, body).expect("should write script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("script metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("script should be executable");
+        script_path
+    }
+
+    fn exec_tempdir(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("tempdir should be created")
+    }
+
+    #[test]
+    fn effective_env_token_always_wins() {
+        assert!(evaluate_exec_github_token_presence(
+            true,
+            false,
+            Agent::Copilot,
+            None
+        ));
+    }
+
+    #[test]
+    fn copilot_with_injection_and_token_has_token() {
+        assert!(evaluate_exec_github_token_presence(
+            false,
+            true,
+            Agent::Copilot,
+            Some("ghp_abc123")
+        ));
+    }
+
+    #[test]
+    fn copilot_with_injection_but_no_token_has_no_token() {
+        assert!(!evaluate_exec_github_token_presence(
+            false,
+            true,
+            Agent::Copilot,
+            None
+        ));
+    }
+
+    #[test]
+    fn non_copilot_does_not_get_injected_token() {
+        assert!(!evaluate_exec_github_token_presence(
+            false,
+            true,
+            Agent::OpenCode,
+            Some("ghp_abc123")
+        ));
+    }
+
+    #[test]
+    fn disabled_injection_keeps_no_token_without_env_token() {
+        assert!(!evaluate_exec_github_token_presence(
+            false,
+            false,
+            Agent::Copilot,
+            Some("ghp_abc123")
+        ));
+    }
+
+    #[test]
+    fn whitespace_token_is_not_treated_as_usable() {
+        assert!(!evaluate_exec_github_token_presence(
+            false,
+            true,
+            Agent::Copilot,
+            Some("   ")
+        ));
+    }
+
+    #[test]
+    fn inject_skips_whitespace_token() {
+        let mut cmd = Command::new("true");
+        inject_gh_token_if_needed(&mut cmd, Some("   "));
+        let has_token = cmd
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new("GH_TOKEN") && value.is_some());
+        assert!(!has_token, "whitespace token must not set GH_TOKEN");
+    }
+
+    #[test]
+    fn inject_sets_non_empty_token() {
+        let mut cmd = Command::new("true");
+        inject_gh_token_if_needed(&mut cmd, Some("ghp_abc123"));
+        let has_token = cmd.get_envs().any(|(key, value)| {
+            key == OsStr::new("GH_TOKEN") && value == Some(OsStr::new("ghp_abc123"))
+        });
+        assert!(has_token, "non-empty token must set GH_TOKEN");
+    }
+
+    #[test]
+    fn deny_env_strips_gh_token_detects_exact_match() {
+        let deny = vec!["FOO".to_string(), "GH_TOKEN".to_string()];
+        assert!(deny_env_strips_gh_token(&deny));
+    }
+
+    #[test]
+    fn deny_env_strips_gh_token_ignores_other_vars() {
+        let deny = vec!["GITHUB_TOKEN".to_string(), "FOO".to_string()];
+        assert!(!deny_env_strips_gh_token(&deny));
+    }
+
+    fn gh_guard_injecting() -> crate::config::GhGuardPolicy {
+        crate::config::GhGuardPolicy {
+            enabled: true,
+            inject_token: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn should_manage_token_env_true_when_inject_token_and_gh_token_not_denied() {
+        assert!(should_manage_token_env(&gh_guard_injecting(), false, &[]));
+    }
+
+    #[test]
+    fn should_manage_token_env_true_when_sole_credential_and_gh_token_not_denied() {
+        assert!(should_manage_token_env(
+            &crate::config::GhGuardPolicy::default(),
+            true,
+            &["GITHUB_TOKEN".to_string()],
+        ));
+    }
+
+    #[test]
+    fn should_manage_token_env_false_when_gh_token_denied() {
+        // Even with inject_token AND sole-credential, a GH_TOKEN deny means the
+        // injection is doomed — leave the child's token vars untouched.
+        let deny = vec!["GH_TOKEN".to_string()];
+        assert!(!should_manage_token_env(&gh_guard_injecting(), true, &deny));
+    }
+
+    #[test]
+    fn should_manage_token_env_false_when_nothing_wants_a_token() {
+        assert!(!should_manage_token_env(
+            &crate::config::GhGuardPolicy::default(),
+            false,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn resolve_trusted_gh_rejects_gh_inside_project_dir() {
+        let project = exec_tempdir(".cplt-trusted-gh-project-");
+        let bin = project.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        fs::write(&gh, "#!/bin/sh\necho pwned\n").unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+        temp_env::with_var("PATH", Some(bin.as_os_str()), || {
+            assert_eq!(super::resolve_trusted_gh(project.path()), None);
+        });
+    }
+
+    #[test]
+    fn resolve_trusted_gh_rejects_relative_and_empty_path_entries() {
+        let project = exec_tempdir(".cplt-trusted-gh-rel-");
+        // `.`, a bare `bin`, and the empty segment are all repo-influenced.
+        temp_env::with_var("PATH", Some(".:bin:"), || {
+            assert_eq!(super::resolve_trusted_gh(project.path()), None);
+        });
+    }
+
+    #[test]
+    fn resolve_trusted_gh_accepts_absolute_dir_outside_project() {
+        let project = exec_tempdir(".cplt-trusted-gh-ok-project-");
+        let trusted = exec_tempdir(".cplt-trusted-gh-ok-bin-");
+        let gh = trusted.path().join("gh");
+        fs::write(&gh, "#!/bin/sh\ntrue\n").unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+        temp_env::with_var("PATH", Some(trusted.path().as_os_str()), || {
+            assert_eq!(
+                super::resolve_trusted_gh(project.path()).as_deref(),
+                Some(gh.as_path())
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_plan_does_not_call_resolver_when_injection_disabled() {
+        let called = Cell::new(0);
+        let resolved =
+            resolve_gh_token_for_exec_with_resolver(false, false, Agent::Copilot, |_| {
+                called.set(called.get() + 1);
+                Some("ghp_abc123".to_string())
+            });
+        assert!(resolved.is_none());
+        assert_eq!(called.get(), 0);
+    }
+
+    #[test]
+    fn resolve_plan_does_not_call_resolver_when_env_token_exists() {
+        let called = Cell::new(0);
+        let resolved = resolve_gh_token_for_exec_with_resolver(true, true, Agent::Copilot, |_| {
+            called.set(called.get() + 1);
+            Some("ghp_abc123".to_string())
+        });
+        assert!(resolved.is_none());
+        assert_eq!(called.get(), 0);
+    }
+
+    #[test]
+    fn resolve_plan_non_copilot_skips_resolver() {
+        let called = Cell::new(0);
+        let resolved =
+            resolve_gh_token_for_exec_with_resolver(false, true, Agent::OpenCode, |_| {
+                called.set(called.get() + 1);
+                Some("ghp_abc123".to_string())
+            });
+        assert!(resolved.is_none());
+        assert_eq!(called.get(), 0);
+    }
+
+    #[test]
+    fn resolve_plan_rejects_whitespace_token() {
+        let called = Cell::new(0);
+        let resolved = resolve_gh_token_for_exec_with_resolver(false, true, Agent::Copilot, |_| {
+            called.set(called.get() + 1);
+            Some("   ".to_string())
+        });
+        assert!(resolved.is_none());
+        assert_eq!(called.get(), 1);
+    }
+
+    #[test]
+    fn resolve_plan_accepts_non_empty_token_for_copilot() {
+        let called = Cell::new(0);
+        let resolved = resolve_gh_token_for_exec_with_resolver(false, true, Agent::Copilot, |_| {
+            called.set(called.get() + 1);
+            Some("ghp_abc123".to_string())
+        });
+        assert_eq!(resolved.as_deref(), Some("ghp_abc123"));
+        assert_eq!(called.get(), 1);
+    }
+
+    #[test]
+    fn resolve_plan_ignores_parent_env_token_when_effective_env_missing_token() {
+        temp_env::with_var("GH_TOKEN", Some("ghp_env_token"), || {
+            let called = Cell::new(0);
+            let resolved =
+                resolve_gh_token_for_exec_with_resolver(false, true, Agent::Copilot, |_| {
+                    called.set(called.get() + 1);
+                    Some("ghp_abc123".to_string())
+                });
+            assert_eq!(resolved.as_deref(), Some("ghp_abc123"));
+            assert_eq!(called.get(), 1);
+        });
+    }
+
+    #[test]
+    fn extract_gh_token_command_returns_stdout_token_on_success() {
+        let dir = exec_tempdir(".cplt-extract-gh-success-");
+        let script = write_script(&dir, "gh-success.sh", "#!/bin/sh\necho 'ghp_abc123'\n");
+        let token = extract_gh_token_from_command(Command::new(script), Duration::from_secs(3));
+        assert_eq!(token.as_deref(), Some("ghp_abc123"));
+    }
+
+    #[test]
+    fn extract_gh_token_command_returns_none_on_non_zero_exit() {
+        let dir = exec_tempdir(".cplt-extract-gh-fail-");
+        let script = write_script(&dir, "gh-fail.sh", "#!/bin/sh\necho 'boom' 1>&2\nexit 17\n");
+        let token = extract_gh_token_from_command(Command::new(script), Duration::from_secs(3));
+        assert!(token.is_none(), "non-zero exit must not return a token");
+    }
+
+    #[test]
+    fn extract_gh_token_command_times_out_and_returns_none() {
+        let dir = exec_tempdir(".cplt-extract-gh-timeout-");
+        let script = write_script(&dir, "gh-timeout.sh", "#!/bin/sh\nsleep 1\necho late\n");
+        let token = extract_gh_token_from_command(Command::new(script), Duration::from_millis(50));
+        assert!(token.is_none(), "timeout must return no token");
+    }
+
+    #[test]
+    fn extract_gh_token_command_timeout_kills_child_process() {
+        let dir = exec_tempdir(".cplt-extract-gh-timeout-kill-");
+        let script = write_script(
+            &dir,
+            "gh-timeout-kill.sh",
+            // `exec sleep` keeps the recorded pid ($$) as the live process and
+            // stays alive well past the timeout without burning a CPU core.
+            "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 30\n",
+        );
+        let pid_file = dir.path().join("child.pid");
+        let mut cmd = Command::new(script);
+        cmd.arg(&pid_file);
+
+        let token = extract_gh_token_from_command(cmd, Duration::from_secs(2));
+        assert!(token.is_none(), "timeout must return no token");
+
+        for _ in 0..80 {
+            if pid_file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("child pid file should exist before timeout kill verification")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("child pid should parse");
+
+        let rc = unsafe { libc::kill(pid, 0) };
+        assert_eq!(rc, -1, "child process should not still be running");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "child process should be gone after timeout kill"
+        );
+    }
+
+    #[test]
+    fn extract_gh_token_command_captures_stdout_with_whitespace_trim() {
+        let dir = exec_tempdir(".cplt-extract-gh-stdout-");
+        let script = write_script(
+            &dir,
+            "gh-stdout.sh",
+            "#!/bin/sh\nprintf '  ghp_trimmed  \\n'\n",
+        );
+        let token = extract_gh_token_from_command(Command::new(script), Duration::from_secs(3));
+        assert_eq!(token.as_deref(), Some("ghp_trimmed"));
+    }
+
+    #[test]
+    fn extract_gh_token_command_handles_stderr_without_token_leak() {
+        let dir = exec_tempdir(".cplt-extract-gh-stderr-");
+        let script = write_script(
+            &dir,
+            "gh-stderr.sh",
+            "#!/bin/sh\necho 'auth failed' 1>&2\nexit 1\n",
+        );
+        let token = extract_gh_token_from_command(Command::new(script), Duration::from_secs(3));
+        assert!(token.is_none(), "stderr failure must not return a token");
+    }
+
+    #[test]
+    fn extract_gh_token_command_handles_quick_exit_without_double_wait() {
+        let dir = exec_tempdir(".cplt-extract-gh-quick-");
+        let script = write_script(&dir, "gh-quick.sh", "#!/bin/sh\necho ghp_fast\nexit 0\n");
+        let token = extract_gh_token_from_command(Command::new(script), Duration::from_secs(3));
+        assert_eq!(token.as_deref(), Some("ghp_fast"));
+    }
+
+    #[test]
+    fn extract_gh_token_command_supports_repeated_invocation() {
+        for _ in 0..3 {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg("echo ghp_repeat");
+            let token = extract_gh_token_from_command(cmd, Duration::from_secs(3));
+            assert_eq!(token.as_deref(), Some("ghp_repeat"));
+        }
     }
 }

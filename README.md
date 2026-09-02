@@ -403,7 +403,7 @@ What passes through:
 | Core system | `HOME`, `USER`, `PATH`, `SHELL`, `TMPDIR`, `LANG` | Explicit allowlist |
 | Terminal | `TERM`, `COLORTERM`, `TERM_PROGRAM` | Explicit allowlist |
 | Editor | `EDITOR`, `VISUAL`, `PAGER` | Explicit allowlist |
-| Auth tokens | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` | Passed only if you already set them. The gh guard uses a one-time file instead |
+| Auth tokens | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN` | Passed only if you already set them. The gh guard uses a one-time file instead. A repo `deny.env` on them wins |
 | Copilot config | `COPILOT_DEBUG`, `COPILOT_*` | Prefix allowlist |
 | Language runtimes | `NODE_*`, `GOPATH`, `CARGO_HOME`, `JAVA_HOME`, `VIRTUAL_ENV`, `PYTHONPATH` | Explicit allowlist |
 | Tool managers | `NVM_*`, `FNM_*`, `PYENV_*`, `MISE_*`, `SDKMAN_*`, `COREPACK_*`, `YARN_*` | Prefix allowlist |

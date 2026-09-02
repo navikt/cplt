@@ -214,6 +214,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "copilot_auth",
+        value_type: ConfigValueType::Str,
+        dangerous: false,
+        default_display: "auto",
+        description: "How the Copilot/GitHub token is obtained before the sandbox starts, which decides whether the agent needs macOS Keychain access at all: \"auto\" (default: env token, else `gh auth token`, Keychain only as a fallback), \"env_only\" (env token or refuse to launch), \"gh_only\" (`gh auth token` or refuse to launch), \"keychain\" (never pre-extract; grant the agent Keychain access). Keychain access lets the agent read every credential you own, so prefer a pre-extracted token.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "validate",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -427,7 +435,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "false",
-        description: "Pre-extract GH_TOKEN before sandbox launch (only for Copilot agent).",
+        description: "Pre-extract GH_TOKEN before sandbox launch (only for Copilot agent). Repo deny.env still wins for denied token vars.",
     },
     ConfigKeyInfo {
         section: "gh_guard",

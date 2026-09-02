@@ -519,6 +519,7 @@ fn resolved_values(
                 ("sandbox", "preset") => resolved
                     .preset
                     .map_or_else(|| "standard".to_string(), |preset| preset.to_string()),
+                ("sandbox", "copilot_auth") => resolved.copilot_auth.to_string(),
                 ("sandbox", "validate") => (!resolved.no_validate).to_string(),
                 ("sandbox", "allow_env_files") => resolved.allow_env_files.to_string(),
                 ("sandbox", "allow_localhost_any") => resolved.allow_localhost_any.to_string(),

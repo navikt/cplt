@@ -51,9 +51,10 @@ mod profile;
 
 pub use policy::{
     AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
-    ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
-    HomeToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs, home_tool_dirs,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_sbpl_path,
+    ENV_PREFIX_ALLOWLIST, GITHUB_TOKEN_VARS, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory,
+    HardeningEnvVar, HomeToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs,
+    github_token_in_env, home_tool_dirs, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_sbpl_path,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -66,6 +67,8 @@ pub use env::{
     SandboxEnv, build_sandbox_env, npmrc_explicitly_allowed, npmrc_userconfig_override,
     npmrc_userconfig_stale_variants,
 };
+pub use exec::resolve_gh_token_for_exec;
+pub(crate) use exec::resolve_trusted_gh;
 
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{
@@ -143,6 +146,26 @@ pub struct SandboxConfig<'a> {
     pub allow_cache_exec_any: bool,
     /// Allow Launch Services (`open` command) for OAuth browser flows.
     pub allow_browser: bool,
+    /// Grant read/write access to `~/Library/Keychains` (macOS only).
+    ///
+    /// Pass the *final* Keychain decision in — `prepare()` only consumes this
+    /// flag, it never computes it. Resolve everything that feeds it in the
+    /// unsandboxed parent *before* calling `prepare()`; profile generation
+    /// itself must stay side-effect free (no `gh auth token`, no Keychain read).
+    ///
+    /// `--print-profile` and other side-effect-free previews pass
+    /// `plan_copilot_auth`'s pre-resolution decision (`AuthPlan::allow_keychain`
+    /// in `main.rs`): it honours the `copilot_auth` mode (explicit `keychain`
+    /// keeps the grant), an ambient GitHub token, and repo `deny.env` — but it
+    /// does not run `gh auth token`. A real launch then folds the pre-extracted
+    /// token into that decision via `finalize_allow_keychain`.
+    ///
+    /// For agents that need Keychain (for example Copilot on macOS), the net
+    /// effect is `false` when a GitHub token — ambient or pre-extracted — will
+    /// be the agent's credential instead, unless `copilot_auth = "keychain"`
+    /// keeps the grant regardless. For agents that do not use Keychain, this
+    /// flag has no effect.
+    pub allow_keychain: bool,
     /// Use Bubblewrap for namespace isolation (Linux only).
     /// - `Some(true)`: Always use bwrap (fail if unavailable)
     /// - `Some(false)`: Never use bwrap (Landlock+seccomp only)
@@ -273,6 +296,10 @@ pub fn exec_sandboxed(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     deny_env: &[String],
+    resolved_gh_token: Option<&str>,
+    // See `exec::configure_command`: the token is the agent's only credential
+    // because the Keychain grant was dropped, so it must be injected.
+    token_is_sole_credential: bool,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
@@ -284,6 +311,8 @@ pub fn exec_sandboxed(
         inherit_env,
         disabled_categories,
         deny_env,
+        resolved_gh_token,
+        token_is_sole_credential,
         gh_guard,
         git_guard,
     )
@@ -301,6 +330,10 @@ fn prepare_impl(
     for p in extra_git_dirs {
         policy::validate_sbpl_path(p).map_err(|e| format!("Granted repo .git dir: {e}"))?;
     }
+
+    // allow_keychain is derived from the effective sandbox environment by the
+    // caller (see SandboxConfig::allow_keychain doc). We trust the field here.
+    let allow_keychain = config.allow_keychain;
 
     let profile_text = profile::generate_profile(&profile::ProfileOptions {
         project_dir: config.project_dir,
@@ -336,6 +369,7 @@ fn prepare_impl(
         allow_cache_exec: config.allow_cache_exec,
         allow_cache_exec_any: config.allow_cache_exec_any,
         allow_browser: config.allow_browser,
+        allow_keychain,
     });
 
     Ok(PreparedSandbox {

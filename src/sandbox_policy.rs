@@ -283,6 +283,25 @@ pub const ENV_PREFIX_ALLOWLIST: &[&str] = &[
     "OTEL_",
 ];
 
+/// GitHub token environment variables recognised for authentication.
+///
+/// This list is used by [`github_token_in_env()`] and
+/// [`super::env::SandboxEnv::has_github_token()`]. Keep these names aligned
+/// with any other token checks that intentionally enumerate vars directly.
+pub const GITHUB_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
+
+/// Returns `true` if any recognised GitHub token env var is set in the current
+/// process environment.
+///
+/// When true, Copilot will authenticate using the injected token directly,
+/// making Keychain access unnecessary. The corresponding SBPL rules can then be
+/// omitted to reduce the sandbox's attack surface.
+pub fn github_token_in_env() -> bool {
+    GITHUB_TOKEN_VARS
+        .iter()
+        .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
+}
+
 /// Environment variables always stripped, even with --inherit-env.
 pub(super) const ENV_ALWAYS_DENY: &[&str] = &[
     "NO_COLOR",      // Color suppression from parent runtime
@@ -1359,5 +1378,74 @@ mod tests {
             );
             assert!(result.unwrap().is_absolute());
         });
+    }
+
+    #[test]
+    fn github_token_in_env_true_when_gh_token_set() {
+        temp_env::with_var("GH_TOKEN", Some("ghp_testtoken"), || {
+            assert!(super::github_token_in_env());
+        });
+    }
+
+    #[test]
+    fn github_token_in_env_true_when_github_token_set() {
+        temp_env::with_var("GITHUB_TOKEN", Some("ghp_testtoken"), || {
+            assert!(super::github_token_in_env());
+        });
+    }
+
+    #[test]
+    fn github_token_in_env_true_when_copilot_token_set() {
+        temp_env::with_var("COPILOT_GITHUB_TOKEN", Some("ghp_testtoken"), || {
+            assert!(super::github_token_in_env());
+        });
+    }
+
+    #[test]
+    fn github_token_in_env_false_when_empty_string() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", Some("")),
+                ("GITHUB_TOKEN", Some("")),
+                ("COPILOT_GITHUB_TOKEN", Some("")),
+            ],
+            || {
+                assert!(
+                    !super::github_token_in_env(),
+                    "empty vars must not count as a token"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn github_token_in_env_false_when_whitespace_only() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", Some("   ")),
+                ("GITHUB_TOKEN", Some("\t")),
+                ("COPILOT_GITHUB_TOKEN", Some("\n")),
+            ],
+            || {
+                assert!(
+                    !super::github_token_in_env(),
+                    "whitespace-only vars must not count as a token"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn github_token_in_env_false_when_none_set() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                assert!(!super::github_token_in_env());
+            },
+        );
     }
 }

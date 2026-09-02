@@ -11,3 +11,4 @@
 
 # Local agent worktrees/metadata — never track
 .claude/
+/.agents/

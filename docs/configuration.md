@@ -152,6 +152,94 @@ cplt config explain sandbox.pass_env      # explain a specific key
 cplt config validate                      # check for syntax errors and unknown keys
 ```
 
+## Copilot authentication and the Keychain
+
+On macOS, granting the sandbox Keychain access lets the agent read **every**
+credential you own, not just the GitHub one. cplt avoids that by obtaining a
+single GitHub token *before* the sandbox starts — in the unsandboxed parent,
+where `gh` is the real binary — and handing only that token to the agent. When
+it succeeds, the Keychain rules are left out of the profile entirely.
+
+The token cplt hands over is your full `gh` OAuth token — write access to
+everything you own on GitHub. That is a genuinely narrower grant than the whole
+Keychain, but it is not a scoped or short-lived credential, and it is injected as
+`GH_TOKEN` where every process the agent spawns can read it.
+
+`sandbox.copilot_auth` (or `--copilot-auth`) chooses how:
+
+| Mode | Env token | `gh auth token` | No token available |
+|---|---|---|---|
+| `auto` (default) | used | used | falls back to Keychain access |
+| `env_only` | used | not attempted | **refuses to launch** |
+| `gh_only` | ignored | used | **refuses to launch** |
+| `keychain` | — | not attempted | grants Keychain access |
+
+```toml
+[sandbox]
+copilot_auth = "auto"
+```
+
+`auto` is the default because the common case — a developer with a working `gh`
+login and no token env var — gets the Keychain grant removed without configuring
+anything. The two restrictive modes exist for environments that would rather
+fail than fall back: they never grant Keychain access, so if no token can be
+obtained cplt stops instead of launching with a wider policy than you asked for.
+
+`gh_only` deliberately ignores an ambient `GH_TOKEN`/`GITHUB_TOKEN`/
+`COPILOT_GITHUB_TOKEN`, so the credential provably comes from gh's own store.
+Whenever cplt injects a token it first clears all three variables, so the one it
+resolved is the one the agent sees rather than whichever an inherited variable
+happened to set.
+
+**Repo `deny.env` still wins, and only ever tightens.** cplt injects the
+pre-extracted token as `GH_TOKEN`, so a repo `[deny] env` list that blocks
+`GH_TOKEN` stops it from reaching the agent — the variable is stripped from the
+child process — and cplt then runs the agent with no GitHub credential in the
+environment rather than falling back to Keychain access. (Denying only
+`GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN` clears those inherited variables but
+does not block a fresh `GH_TOKEN` injection; deny `GH_TOKEN` for that.) One
+channel `deny.env` does *not* yet cover: with `gh_guard.block_auth_token`, the
+gh wrapper's one-time-read token cache is still served — hardening tracked in
+[#224](https://github.com/navikt/cplt/issues/224).
+
+That asymmetry is deliberate. Repo `[deny]` is applied with no approval prompt
+precisely because it can only tighten the sandbox, and the project directory is
+writable by the agent. If denying a token variable re-granted Keychain access, an
+agent could write a `.cplt.toml` in one session and read every credential you own
+in the next.
+
+If you want Keychain access anyway, set `copilot_auth = "keychain"` in your own
+config. That is safe to honour because `copilot_auth` is not a `[propose]` key —
+a repo `.cplt.toml` accepts only `[deny]` and `[propose]` sections and rejects
+anything else outright, so choosing this is always your decision. `keychain` keeps
+Keychain access (no pre-extraction to drop the grant). Note: if `gh_guard` is enabled,
+cplt may still run `gh auth token` to support `inject_token` / `block_auth_token`.
+It holds with `gh_guard` enabled too and regardless of any token variable set in your environment.
+
+`env_only` and `gh_only` refuse to launch in this situation rather than continue
+without a credential. A token `gh_guard` separately resolved for its wrapper is
+not counted as satisfying them: `deny.env` strips it from the child's
+environment, and a wrapper-only credential is not what these modes promise. (The
+`block_auth_token` one-time cache at `$SCRATCH/.gh-token` is the one channel
+`deny.env` does not yet close — see
+[#224](https://github.com/navikt/cplt/issues/224).)
+
+The deny only affects Copilot. For the other Keychain-using agents a GitHub token
+deny is vacuous — they never receive those variables — while the Keychain is where
+their own credentials live, so it is left alone.
+
+**Scope.** `copilot_auth` only governs Copilot runs on macOS — that is the only
+place where a GitHub token can be traded for the Keychain grant. For other agents
+(which cannot use a GitHub token) and on Linux (which has no Keychain rules to
+drop) the setting is inert, so a global `gh_only` will not refuse to launch them.
+
+**The token is the agent's only credential once Keychain is dropped**, so it is
+injected as `GH_TOKEN` even when `gh_guard` is disabled. With `gh_guard` enabled,
+the gh wrapper additionally serves it from a 0600 file that is deleted after the
+first read — but that path only answers `gh auth token` calls, not the agent's
+own reads, so it does not replace the env var.
+
+
 ## Configuration file
 
 The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, `[git_guard]`, and `[audit]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
@@ -180,6 +268,7 @@ cplt config set --repo allow.ports 8080
 # Deny section: tightens security, applied immediately without approval
 cplt config set --repo deny.paths "~/secrets"
 cplt config set --repo deny.env "VAULT_TOKEN"
+# Example: deny.env "GH_TOKEN" also disables gh_guard.inject_token for this repo
 
 # Remove a permission request
 cplt config set --repo sandbox.allow_jvm_attach --unset

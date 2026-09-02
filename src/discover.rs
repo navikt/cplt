@@ -99,21 +99,28 @@ pub struct PathDiscovery {
 
 // ── Auth discovery ──────────────────────────────────────────────
 
-const AUTH_ENV_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
-
-pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
-    let env_tokens: Vec<String> = AUTH_ENV_VARS
+pub fn discover_auth(home_dir: &Path, project_dir: &Path) -> AuthDiscovery {
+    // A whitespace-only value is not a usable token — match the `trim()` check
+    // the injection path uses so discovery doesn't report auth that won't work.
+    let env_tokens: Vec<String> = crate::sandbox::GITHUB_TOKEN_VARS
         .iter()
-        .filter(|var| std::env::var(var).is_ok_and(|v| !v.is_empty()))
+        .filter(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
         .map(std::string::ToString::to_string)
         .collect();
 
-    let gh_cli_auth = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    // Resolve `gh` to a trusted absolute path first — this runs unsandboxed in
+    // the project dir, so a repo-planted `./bin/gh` must not be probed.
+    let gh_cli_auth = crate::sandbox::resolve_trusted_gh(project_dir).is_some_and(|gh| {
+        std::process::Command::new(gh)
+            .args(["auth", "token", "--hostname", "github.com"])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("COPILOT_GITHUB_TOKEN")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    });
 
     let gh_config_exists = home_dir.join(".config/gh/hosts.yml").exists();
 
@@ -348,7 +355,7 @@ pub fn discover_paths(home_dir: &Path, project_dir: &Path) -> PathDiscovery {
 /// Run all discovery probes and return a complete report.
 pub fn discover_all(home_dir: &Path, project_dir: &Path) -> Discovery {
     Discovery {
-        auth: discover_auth(home_dir),
+        auth: discover_auth(home_dir, project_dir),
         copilot: discover_copilot(home_dir),
         agents: discover_agents(),
         tools: discover_tools(home_dir),
@@ -1478,7 +1485,7 @@ mod tests {
     fn auth_discovery_detects_env_vars() {
         let home = PathBuf::from(std::env::var("HOME").unwrap());
         temp_env::with_var("COPILOT_GITHUB_TOKEN", Some("test-token-value"), || {
-            let auth = discover_auth(&home);
+            let auth = discover_auth(&home, &home);
             assert!(
                 auth.env_tokens
                     .contains(&"COPILOT_GITHUB_TOKEN".to_string())
