@@ -53,19 +53,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # `actions` just parses workflow YAML — nothing to build.
-          - language: actions
-            build-mode: none
-          # `none` is the only build mode the Rust extractor accepts —
-          # `autobuild` is rejected outright ("Rust does not support the
-          # autobuild build mode"). It extracts 35 of 41 files with errors,
-          # which is exactly what the repository's default setup produces
-          # today, so this is not a regression — but treat Rust findings as
-          # best-effort until the extractor improves. Pre-fetching crate
-          # sources (`cargo fetch`) was measured and changed nothing.
-          - language: rust
-            build-mode: none
+        # `actions` just parses workflow YAML — nothing to build.
+        #
+        # `none` is the only build mode the Rust extractor accepts —
+        # `autobuild` is rejected outright ("Rust does not support the
+        # autobuild build mode"). It extracts 35 of 41 files with errors,
+        # which is exactly what the repository's default setup produces
+        # today, so this is not a regression — but treat Rust findings as
+        # best-effort until the extractor improves. Pre-fetching crate
+        # sources (`cargo fetch`) was measured and changed nothing.
+        #
+        # Rust is left out in the merge queue. The ruleset's `code_scanning`
+        # rule only needs *a* CodeQL result on the queue's temporary ref, and
+        # `actions` produces one in ~40s. Rust takes ~4.5 minutes — longer
+        # than the entry survives — so by upload time GitHub has already
+        # merged it and deleted `refs/heads/gh-readonly-queue/main/pr-N-...`,
+        # and the SARIF upload 404s ("ref ... not found in this repository"),
+        # failing the job. Every merge_group run whose Rust analysis ran past
+        # ~4 minutes has died this way since #200. Rust is still analyzed on
+        # every pull_request, on every push to main, and on the weekly
+        # schedule, so nothing goes unscanned.
+        include: >-
+          ${{ github.event_name == 'merge_group'
+          && fromJSON('[{"language":"actions","build-mode":"none"}]')
+          || fromJSON('[{"language":"actions","build-mode":"none"},{"language":"rust","build-mode":"none"}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
 
