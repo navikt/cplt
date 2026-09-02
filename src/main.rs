@@ -2616,6 +2616,19 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
     args
 }
 
+/// Restate a block-mode policy message for warn mode.
+///
+/// Policy errors are written for block mode and lead with `⚠️ BLOCKED by
+/// sandbox:`. In warn mode the command is allowed to run, so that prefix is
+/// swapped for the warning label instead of being stacked behind it — otherwise
+/// the user reads "WARNING … BLOCKED" for a command that just ran.
+fn warn_mode_message(msg: &str) -> String {
+    match msg.strip_prefix("⚠️ BLOCKED by sandbox:") {
+        Some(rest) => format!("⚠️  WARNING (would block):{rest}"),
+        None => format!("⚠️  WARNING (would block): {msg}"),
+    }
+}
+
 /// Handle `cplt gh-gate` — evaluate a gh command and exec the real binary if allowed.
 ///
 /// Called from the wrapper script placed in the sandbox's PATH. If the command
@@ -2645,7 +2658,7 @@ fn run_gh_gate(
                 ExitCode::FAILURE
             }
             config::EnforcementMode::Warn => {
-                eprintln!("⚠️  WARNING (would block): {msg}");
+                eprintln!("{}", warn_mode_message(&msg));
                 // Allow through in warn mode
                 exec_gh(real_gh, args, None)
             }
@@ -2755,7 +2768,7 @@ fn run_git_gate(
                 ExitCode::FAILURE
             }
             config::EnforcementMode::Warn => {
-                eprintln!("⚠️  WARNING (would block): {msg}");
+                eprintln!("{}", warn_mode_message(&msg));
                 use std::os::unix::process::CommandExt;
                 let err = std::process::Command::new(real_git).args(args).exec();
                 ui::error(&format!("Failed to exec git: {err}"));
@@ -6124,6 +6137,26 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("cplt").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn warn_mode_message_replaces_the_block_prefix() {
+        let blocked = "\u{26a0}\u{fe0f} BLOCKED by sandbox: 'gh pr merge' is not allowed.\nReason: needs a human.";
+        let warned = warn_mode_message(blocked);
+        assert!(
+            !warned.contains("BLOCKED"),
+            "warn mode must not tell the user the command was blocked: {warned}"
+        );
+        assert!(warned.starts_with("\u{26a0}\u{fe0f}  WARNING (would block): 'gh pr merge'"));
+        assert!(
+            warned.ends_with("Reason: needs a human."),
+            "the body must survive: {warned}"
+        );
+        // A message without the block prefix still gets labelled.
+        assert_eq!(
+            warn_mode_message("nope"),
+            "\u{26a0}\u{fe0f}  WARNING (would block): nope"
+        );
     }
 
     #[test]

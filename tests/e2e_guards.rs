@@ -1600,8 +1600,10 @@ mod sandbox_integration {
         ]);
 
         // Create gh wrapper script (same as cplt would generate)
+        let git_bin = binary_in_path("git");
+        let git_str = git_bin.to_string_lossy();
         let wrapper_content = format!(
-            "#!/bin/sh\nexec {cplt_str} gh-gate --real-gh /usr/bin/true --real-git /usr/bin/git --repo-scope navikt/cplt --mode=block --scope-check --block-auth-token --unknown-command=block -- \"$@\"\n"
+            "#!/bin/sh\nexec {cplt_str} gh-gate --real-gh /usr/bin/true --real-git '{git_str}' --repo-scope navikt/cplt --mode=block --scope-check --block-auth-token --unknown-command=block -- \"$@\"\n"
         );
         let bin_dir = tmp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
