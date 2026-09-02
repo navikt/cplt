@@ -1302,17 +1302,26 @@ fn requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
 /// Read-only command groups whose implicit target is the repository of the cwd.
 ///
 /// Global commands (`auth`, `search`, `gist`, `org`, `project`, `config`,
-/// `extension`, ssh/gpg keys) do not resolve a repository from the cwd, so they
-/// stay usable from any directory.
+/// `extension`, `attestation`, `copilot`, ssh/gpg keys) do not resolve a
+/// repository from the cwd, so they stay usable from any directory.
 const CWD_SCOPED_COMMANDS: &[&str] = &[
-    "pr", "issue", "run", "workflow", "release", "label", "cache", "secret", "variable",
+    "pr", "issue", "run", "workflow", "release", "label", "cache", "secret", "variable", "repo",
+    "ruleset",
 ];
+
+/// Subcommands of a [`CWD_SCOPED_COMMANDS`] group that do not target the cwd
+/// repository: they take an owner (or nothing) instead.
+const CWD_SCOPED_EXCEPTIONS: &[(&str, &str)] =
+    &[("repo", "list"), ("repo", "gitignore"), ("repo", "license")];
 
 /// Allow-tier commands are read-only, but an implicit target still silently
 /// retargets the startup repo when the agent is working in a sibling repo (#213).
 /// Check the cwd for the repo-scoped ones only.
 fn allow_tier_requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
-    requires_invocation_repo_check(cmd) && CWD_SCOPED_COMMANDS.contains(&cmd.command.as_str())
+    let sub = cmd.subcommand.as_deref().unwrap_or("");
+    requires_invocation_repo_check(cmd)
+        && CWD_SCOPED_COMMANDS.contains(&cmd.command.as_str())
+        && !CWD_SCOPED_EXCEPTIONS.contains(&(cmd.command.as_str(), sub))
 }
 
 /// Resolve the repository of the invocation cwd with the trusted Git binary.
@@ -1325,14 +1334,19 @@ fn resolve_invocation_repo(real_git: Option<&Path>) -> Result<String, String> {
     detect_current_repo(real_git, &cwd)
 }
 
+/// `hint` names the way out of the block, which differs by tier: an Allow-tier
+/// read accepts an explicit `-R owner/repo` for any repository, a ScopeCheck
+/// write does not.
 fn out_of_scope_cwd_error(
     cmd: &ParsedCommand,
     invocation_repo: &str,
     startup_repo: &str,
+    hint: &str,
 ) -> String {
     format!(
         "⚠️ BLOCKED by sandbox: 'gh {}{}' was invoked from repository '{invocation_repo}' outside the startup repo '{startup_repo}'.\n\
          Reason: implicit repository targets must resolve to the repository captured at sandbox startup.\n\
+         {hint}\n\
          This operation is restricted by the cplt sandbox environment.\n\
          Please make a note of this for the human operator and continue with your remaining work.",
         cmd.command,
@@ -1366,7 +1380,13 @@ fn allow_tier_approval(
         && let Ok(invocation_repo) = resolve_invocation_repo(real_git)
         && !repos_match(&invocation_repo, &startup_repo)
     {
-        return Err(out_of_scope_cwd_error(cmd, &invocation_repo, &startup_repo));
+        return Err(out_of_scope_cwd_error(
+            cmd,
+            &invocation_repo,
+            &startup_repo,
+            "Run it from the startup repository's checkout, or name the target \
+             explicitly with -R owner/repo where the command accepts it.",
+        ));
     }
     Ok(approval_from_scope(Some(startup_repo)))
 }
@@ -1819,7 +1839,12 @@ fn gate_with_scope_resolver(
             } else if let Some(invocation_repo) = invocation_repo.as_deref()
                 && !repos_match(invocation_repo, &startup_repo)
             {
-                Err(out_of_scope_cwd_error(&cmd, invocation_repo, &startup_repo))
+                Err(out_of_scope_cwd_error(
+                    &cmd,
+                    invocation_repo,
+                    &startup_repo,
+                    "Run it from the startup repository's checkout.",
+                ))
             } else {
                 Err(format!(
                     "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the startup repo '{}'.\n\

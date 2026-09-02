@@ -500,6 +500,85 @@ fn gh_gate_warns_but_allows_implicit_read_from_sibling_in_warn_mode() {
 }
 
 #[test]
+fn gh_gate_blocks_implicit_repo_view_from_sibling_repo() {
+    // `gh repo view` with no argument shows the repository of the cwd.
+    let sibling = temp_repo("evil-org/other-repo");
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg("/usr/bin/true")
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["repo", "view"])
+        .current_dir(sibling.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "gh repo view must not silently show the startup repo: {stderr}"
+    );
+    assert!(
+        stderr.contains("evil-org/other-repo") && stderr.contains("navikt/cplt"),
+        "denial should name both repos: {stderr}"
+    );
+}
+
+#[test]
+fn gh_gate_allows_owner_scoped_repo_list_from_sibling_repo() {
+    // `gh repo list <owner>` takes an owner, not the cwd repository.
+    let sibling = temp_repo("evil-org/other-repo");
+    let output = Command::new(binary_path())
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg("/usr/bin/true")
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/cplt")
+        .arg("--")
+        .args(["repo", "list", "navikt"])
+        .current_dir(sibling.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    assert!(
+        output.status.success(),
+        "owner-scoped repo list must not depend on the cwd repo: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn cplt_check_matches_the_gate_when_cwd_differs_from_project_dir() {
+    // `cplt check exec gh …` must report what the runtime gate enforces: the
+    // startup scope comes from --project-dir, the implicit target from the cwd.
+    let startup = temp_repo("navikt/cplt");
+    let sibling = temp_repo("evil-org/other-repo");
+    let output = Command::new(binary_path())
+        .arg("--project-dir")
+        .arg(startup.path())
+        .args(["check", "exec", "gh", "pr", "create"])
+        .current_dir(sibling.path())
+        .output()
+        .expect("cplt check should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("BLOCKED"),
+        "check must not diverge from the runtime gate: {stdout}"
+    );
+    assert!(
+        stdout.contains("evil-org/other-repo"),
+        "check should name the invocation repo: {stdout}"
+    );
+}
+
+#[test]
 fn gh_gate_allows_global_read_from_sibling_repo() {
     // Commands that do not resolve a repository from the cwd stay usable.
     let sibling = temp_repo("evil-org/other-repo");

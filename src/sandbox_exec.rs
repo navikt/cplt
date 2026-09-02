@@ -340,23 +340,37 @@ fn install_command_wrappers(
     if gh_guard.enabled
         && let Some(real_gh) = which_binary("gh")
     {
-        let real_git = gh_guard.scope_check.then(|| which_binary("git")).flatten();
-        if gh_guard.scope_check && real_git.is_none() {
-            ui::warn(
-                "gh guard could not find Git to capture repository scope. \
-                 Scope-checked commands will be blocked.",
-            );
-        }
-        let repo_scope = real_git.as_deref().and_then(|real_git| {
-            crate::gh_proxy::detect_current_repo(real_git, project_dir)
-                .map_err(|reason| {
-                    ui::warn(&format!(
-                        "gh guard could not capture repository scope: {reason}. \
-                         Scope-checked commands will be blocked."
-                    ));
-                })
-                .ok()
-        });
+        let real_git = if gh_guard.scope_check {
+            if let Some(real_git) = which_binary("git") {
+                Some(real_git)
+            } else {
+                ui::warn(
+                    "gh guard could not find Git to capture repository scope. \
+                     Scope-checked commands will be blocked.",
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let repo_scope = if gh_guard.scope_check {
+            if let Some(real_git) = real_git.as_deref() {
+                match crate::gh_proxy::detect_current_repo(real_git, project_dir) {
+                    Ok(repo) => Some(repo),
+                    Err(reason) => {
+                        ui::warn(&format!(
+                            "gh guard could not capture repository scope: {reason}. \
+                             Scope-checked commands will be blocked."
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let real_git_str = real_git
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());

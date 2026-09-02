@@ -136,9 +136,12 @@ intercepted separately, in every spelling (`--show-token`, `--show-token=true`,
 
 "Always permitted" in the Allow tier means permitted for the startup repo. A
 repo-scoped read invoked from a *different* repository is blocked rather than
-silently answered from the startup repo (#213); commands that do not resolve a
-repository from the cwd (`auth`, `search`, `gist`, `org`, `project`, `config`,
-`extension`, key listings) stay usable from any directory.
+silently answered from the startup repo (#213). The repo-scoped groups are
+`pr`, `issue`, `run`, `workflow`, `release`, `label`, `cache`, `secret`,
+`variable`, `repo` and `ruleset`; commands that do not resolve a repository from
+the cwd (`auth`, `search`, `gist`, `org`, `project`, `config`, `extension`,
+`attestation`, `copilot`, ssh/gpg key listings, and the owner-scoped `repo list`
+/ `repo gitignore` / `repo license`) stay usable from any directory.
 
 ## Scope checking
 
