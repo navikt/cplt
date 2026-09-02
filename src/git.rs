@@ -22,6 +22,12 @@
 //! That is a straight sandbox escape, and for [`crate::repo_config`] it is
 //! worse still: those invocations are the input to the trust decision.
 //!
+//! The repository's config is not the only thing an agent can aim at these
+//! invocations. The *binary* is the other one: `git` looked up by name is
+//! resolved from the parent's `PATH` at spawn time, after the agent has
+//! finished writing to directories that are on it. See [`TRUSTED_BIN_DIRS`],
+//! which also spells out the part of that this module does not fix.
+//!
 //! # What is actually reachable
 //!
 //! Measured against git 2.55 for exactly the subcommands cplt runs
@@ -90,8 +96,65 @@
 //! is a loud "could not verify", never a forged clean session, so denial of the
 //! *report* is the correct trade against execution of the *payload*.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+/// Absolute directories a parent-side `git` may be resolved from.
+///
+/// `Command::new("git")` resolves through `execvp` **at spawn time**, using the
+/// *parent's* `PATH` — and the parent spawns git after the agent has exited
+/// (`audit::Baseline::finish`). The sandbox grants write **and** exec to several
+/// directories that are on a developer's `PATH` (mise shims, `PNPM_HOME`,
+/// `~/.deno/bin`, `~/.bun/bin` — see `sandbox_policy::HOME_TOOL_DIRS` and
+/// `APP_DIRS`), so an agent can drop a file named `git` into one of them and
+/// have the parent execute it unsandboxed moments later.
+///
+/// These four directories are the ones the sandbox exposes read-only
+/// (`sandbox_policy::TOOL_READ_DIRS`), so nothing inside the sandbox can write
+/// to them. `/usr/bin` first: it is the only one that is SIP-protected on macOS
+/// and root-owned on Linux.
+///
+/// # What this does not fix
+///
+/// This closes the "attacker prepends a directory that wins `PATH` resolution"
+/// half of the problem, and nothing more. If the user's own `git` lives in an
+/// agent-writable tree that also happens to be one of these directories — a
+/// Homebrew prefix owned by the user, say, that a `sandbox.allow.write` grant
+/// opened up — then resolving to a fixed absolute path still finds the
+/// trojaned file. Making the whole class safe means not granting write to
+/// directories that also carry exec, which is a separate decision.
+const TRUSTED_BIN_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"];
+
+/// The `git` binary, resolved once from [`TRUSTED_BIN_DIRS`].
+///
+/// Resolved once per process so a directory that appears *during* a session
+/// cannot change the answer between two calls, and so the warning below is
+/// emitted at most once.
+///
+/// `None` when no trusted `git` exists. Callers then degrade exactly as they do
+/// when git is missing (the audit reports `Incomplete`), which is the honest
+/// outcome — falling back to the bare name would restore the very `PATH` lookup
+/// this exists to remove.
+fn trusted_git() -> Option<&'static Path> {
+    static GIT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    GIT.get_or_init(|| {
+        let found = TRUSTED_BIN_DIRS
+            .iter()
+            .map(|dir| Path::new(dir).join("git"))
+            .find(|p| p.is_file());
+        if found.is_none() {
+            crate::ui::warn(&format!(
+                "no git found in {} — parent-side git queries (audit, repo config \
+                 trust) are skipped rather than resolved through PATH, which a \
+                 sandboxed agent can write to",
+                TRUSTED_BIN_DIRS.join(", ")
+            ));
+        }
+        found
+    })
+    .as_deref()
+}
 
 /// `-c key=value` overrides prepended to every parent-side git invocation.
 ///
@@ -360,7 +423,7 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
         warn_refused_once();
         return None;
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(trusted_git()?);
     harden(&mut cmd);
     for arg in insert_diff_flags(args) {
         cmd.arg(arg);
@@ -384,7 +447,10 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
 /// on its own terms.
 #[must_use]
 pub fn repo_defines_content_filter(project_dir: &Path) -> bool {
-    let mut cmd = Command::new("git");
+    let Some(git) = trusted_git() else {
+        return false;
+    };
+    let mut cmd = Command::new(git);
     harden(&mut cmd);
     let Ok(out) = cmd
         .args(["config", "--list", "--show-scope", "--includes", "-z"])
@@ -473,6 +539,45 @@ mod tests {
             actual, expected,
             "CONFIG_OVERRIDES changed. Removing an entry weakens #210 hardening; \
              adding one needs a reviewed cost note. Update this list deliberately."
+        );
+    }
+
+    /// Fails if [`command`] goes back to `Command::new("git")`. The bare name
+    /// is resolved by `execvp` at spawn time from the *parent's* `PATH`, and the
+    /// parent spawns git after the agent has exited — so any agent-writable
+    /// directory on `PATH` (mise shims, `PNPM_HOME`, `~/.bun/bin`) is an
+    /// unsandboxed exec.
+    #[test]
+    fn git_is_resolved_from_a_trusted_absolute_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(cmd) = command(dir.path(), &["rev-parse", "HEAD"]) else {
+            // No trusted git on this machine: the call must be refused, never
+            // degraded to the bare name. That is the other half of the contract.
+            assert!(trusted_git().is_none(), "refused despite a resolved git");
+            return;
+        };
+        let program = PathBuf::from(cmd.get_program());
+        assert_eq!(program.file_name().and_then(|n| n.to_str()), Some("git"));
+        assert!(
+            program.is_absolute(),
+            "git must not be resolved through PATH: {program:?}"
+        );
+        assert!(
+            TRUSTED_BIN_DIRS.iter().any(|d| program.starts_with(d)),
+            "{program:?} is outside TRUSTED_BIN_DIRS"
+        );
+    }
+
+    /// Spelled out independently of the const, like the override table above: a
+    /// test that only iterates it cannot notice a writable directory being added
+    /// or `/usr/bin` being dropped.
+    #[test]
+    fn the_trusted_bin_dirs_are_exactly_this() {
+        assert_eq!(
+            TRUSTED_BIN_DIRS,
+            &["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"],
+            "TRUSTED_BIN_DIRS changed. Every entry must be read-only to the \
+             sandbox (sandbox_policy::TOOL_READ_DIRS) and absolute."
         );
     }
 

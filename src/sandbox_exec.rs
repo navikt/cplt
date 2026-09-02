@@ -500,11 +500,20 @@ fn install_signal_forwarding(child_pid: i32) {
 
 // ── macOS: Seatbelt / sandbox-exec ────────────────────────────
 
+/// The Seatbelt driver. Absolute on purpose: a bare program name is resolved
+/// from the parent's PATH at spawn time, and the sandbox grants the agent
+/// write+exec on directories that sit on it (see `TRUSTED_BIN_DIRS` in git.rs).
+#[cfg(target_os = "macos")]
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
 /// Verify the SBPL profile works by running `/usr/bin/true` inside sandbox-exec.
 #[cfg(target_os = "macos")]
 pub fn preflight(sandbox: &super::PreparedSandbox) -> Result<(), String> {
     let profile_path = write_temp_profile(&sandbox.profile_text)?;
-    let output = Command::new("sandbox-exec")
+    // Absolute: `sandbox-exec` only ever lives in /usr/bin (SIP-protected), and
+    // resolving it by name would go through the parent's PATH, which contains
+    // directories the sandbox itself grants the agent write+exec on.
+    let output = Command::new(SANDBOX_EXEC)
         .arg("-f")
         .arg(&profile_path)
         .arg("/usr/bin/true")
@@ -549,7 +558,7 @@ pub fn exec(
         }
     };
 
-    let mut cmd = Command::new("sandbox-exec");
+    let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-f").arg(&profile_path).arg(copilot_bin);
 
     configure_command(
