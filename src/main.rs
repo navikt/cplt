@@ -2697,8 +2697,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     //      granting Keychain lets the agent read every credential the user owns,
     //      while the pre-extracted token is just the one.
     let auth_mode = auth_plan.mode;
+    let has_env_token_for_resolution =
+        has_effective_env_token && auth_mode != config::CopilotAuth::GhOnly;
     let resolved_gh_token = sandbox::resolve_gh_token_for_exec(
-        auth_plan.env_token_counts,
+        has_env_token_for_resolution,
         auth_plan.needs_runtime_gh_token,
         active_agent,
     );
