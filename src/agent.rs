@@ -289,6 +289,43 @@ impl Agent {
         matches!(self, Agent::Copilot)
     }
 
+    /// Paths inside this agent's writable config dir(s) that auto-execute on
+    /// the HOST the next time the agent runs *outside* cplt — a persistence
+    /// vector the agent never needs to write mid-session. Each entry is joined
+    /// onto every writable [`Agent::agent_dirs`] grant and denied for writing.
+    ///
+    /// - Claude: `statusline.sh` runs on every prompt render, `plugins/` loads
+    ///   at startup, and `settings.json` carries `hooks` (`SessionStart`,
+    ///   `UserPromptSubmit`, …) which fire automatically. `commands/`,
+    ///   `agents/` and `skills/` stay writable — those do require explicit user
+    ///   invocation.
+    /// - Gemini: `settings.json` holds `hooks.SessionStart[]`, which fires on
+    ///   startup, on resume and after `/clear`; folder trust is workspace-scoped
+    ///   and does not gate user-level hooks. `extensions/` is auto-loaded.
+    /// - Pi: `extensions/*.ts` and `extensions/*/index.ts` are auto-discovered
+    ///   at startup (the trust gate covers only the project-local path), and
+    ///   `settings.json` can name extension paths and npm/git packages, so
+    ///   denying the directory alone is not enough.
+    ///
+    /// Cost: denying `settings.json` breaks *first-run login inside the
+    /// sandbox* for Gemini (it writes `selectedAuthType` there) and Pi package
+    /// management. Log in once outside cplt — see SECURITY.md.
+    ///
+    /// Enforcement is macOS-first: Seatbelt emits these as write-denies after
+    /// the dir-wide allow (last match wins). Landlock cannot sub-deny inside an
+    /// allowed tree, so on Linux they are re-bound read-only when bubblewrap is
+    /// available and are **unenforced** when it is not.
+    pub fn host_persistence_denies(&self) -> &'static [&'static str] {
+        match self {
+            Agent::Claude => &["statusline.sh", "plugins", "settings.json"],
+            Agent::Gemini | Agent::Pi => &["settings.json", "extensions"],
+            // Antigravity's grants are ~/.gemini/config and
+            // ~/.gemini/antigravity-cli, not ~/.gemini itself, so Gemini's
+            // user-level settings.json is not writable through it.
+            Agent::Antigravity | Agent::Copilot | Agent::OpenCode | Agent::Shell => &[],
+        }
+    }
+
     /// The agent's built-in default domain allowlist — the set of domains the
     /// agent legitimately needs to reach.
     ///
@@ -1468,6 +1505,28 @@ mod tests {
         assert!(Agent::Gemini.needs_keychain());
         assert!(Agent::Antigravity.needs_keychain());
         assert!(!Agent::OpenCode.needs_keychain());
+    }
+
+    #[test]
+    fn host_persistence_denies_per_agent() {
+        assert_eq!(
+            Agent::Claude.host_persistence_denies(),
+            ["statusline.sh", "plugins", "settings.json"],
+            "Claude's settings.json hooks auto-fire — it must be denied (#237)"
+        );
+        assert_eq!(
+            Agent::Gemini.host_persistence_denies(),
+            ["settings.json", "extensions"]
+        );
+        assert_eq!(
+            Agent::Pi.host_persistence_denies(),
+            ["settings.json", "extensions"]
+        );
+        // No writable dir that hosts auto-executing config for these.
+        assert!(Agent::Antigravity.host_persistence_denies().is_empty());
+        assert!(Agent::Copilot.host_persistence_denies().is_empty());
+        assert!(Agent::OpenCode.host_persistence_denies().is_empty());
+        assert!(Agent::Shell.host_persistence_denies().is_empty());
     }
 
     #[test]

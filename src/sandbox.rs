@@ -415,7 +415,27 @@ fn prepare_impl(
     write_roots.extend(config.extra_write.iter().map(PathBuf::as_path));
     let mut git_dirs: Vec<&Path> = config.git_common_dir.into_iter().collect();
     git_dirs.extend(extra_git_dirs.iter().map(PathBuf::as_path));
-    let ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
+    let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
+
+    // #237: same class, different tree — the agent's own config dir is granted
+    // writable, and some files in it auto-execute on the host the next time the
+    // agent runs outside cplt (Claude/Gemini hooks, Pi/Gemini extensions). macOS
+    // emits these as SBPL write-denies; Landlock cannot carve a sub-deny out of
+    // an allowed tree, so the bwrap read-only overlay is the only mechanism here
+    // — WITHOUT bwrap this is unenforced on Linux. Even with it, a path that
+    // does not exist yet is skipped (bwrap cannot bind a missing source), so it
+    // protects what is already on disk, not what the agent creates.
+    for dir in config.agent_dirs.iter().filter(|d| d.write) {
+        ro_protect.extend(
+            config
+                .agent
+                .host_persistence_denies()
+                .iter()
+                .map(|sub| dir.path.join(sub)),
+        );
+    }
+    ro_protect.sort();
+    ro_protect.dedup();
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied

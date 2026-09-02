@@ -1060,6 +1060,71 @@ fn profile_grants_claude_config_access() {
         // lets it override.
         assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/statusline.sh\"))"));
         assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/plugins\"))"));
+        // settings.json carries `hooks`, which auto-fire on SessionStart /
+        // UserPromptSubmit — it is a persistence vector, not a user-invoked file.
+        assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/settings.json\"))"));
+    });
+}
+
+/// Every agent's `host_persistence_denies` entries must actually reach the
+/// profile as write-denies under each of its writable config-dir grants.
+#[test]
+fn profile_denies_host_persistence_paths_for_every_agent() {
+    temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
+        let home = std::path::Path::new("/Users/test");
+        for agent in [
+            cplt::agent::Agent::Copilot,
+            cplt::agent::Agent::OpenCode,
+            cplt::agent::Agent::Gemini,
+            cplt::agent::Agent::Antigravity,
+            cplt::agent::Agent::Pi,
+            cplt::agent::Agent::Claude,
+            cplt::agent::Agent::Shell,
+        ] {
+            let agent_dirs = agent.config_dirs(home);
+            let p = generate_profile(&ProfileOptions {
+                project_dir: std::path::Path::new("/projects/app"),
+                home_dir: home,
+                extra_read: &[],
+                extra_write: &[],
+                allow_socket: &[],
+                extra_deny: &[],
+                existing_home_tool_dirs: None,
+                existing_app_dirs: None,
+                extra_ports: &[],
+                localhost_ports: &[],
+                proxy_port: None,
+                proxy_forced: false,
+                allow_env_files: false,
+                allow_localhost_any: false,
+                scratch_dir: None,
+                allow_tmp_exec: false,
+                copilot_install_dir: None,
+                java_home: None,
+                dotnet_root: None,
+                git_hooks_path: None,
+                git_common_dir: None,
+                extra_git_dirs: &[],
+                allow_gpg_signing: false,
+                deny_clipboard: false,
+                allow_jvm_attach: false,
+                allow_msbuild: false,
+                allow_docker: false,
+                electron_app_dir: None,
+                agent,
+                agent_dirs: &agent_dirs,
+                allow_cache_exec: &[],
+                allow_cache_exec_any: false,
+                allow_browser: false,
+            });
+            for dir in agent_dirs.iter().filter(|d| d.write) {
+                for sub in agent.host_persistence_denies() {
+                    let path = dir.path.join(sub).display().to_string();
+                    let line = format!("(deny file-write* (subpath \"{path}\"))");
+                    assert!(p.contains(&line), "{agent:?} profile missing: {line}");
+                }
+            }
+        }
     });
 }
 

@@ -419,26 +419,24 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
         sbpl!(sb);
     }
 
-    // Claude Code: the config dir is writable (sessions, history, credentials),
-    // but a few artifacts auto-execute on the HOST the next time `claude` runs
+    // Agent config dirs are writable (sessions, history, credentials), but a few
+    // artifacts in them auto-execute on the HOST the next time the agent runs
     // outside the sandbox — a persistence vector the agent never needs to write
     // mid-session. Deny those specifically (emitted after the dir-wide allow
-    // above, so SBPL last-match-wins lets the deny override). settings.json,
-    // commands/, agents/, skills/ stay
-    // writable: Claude legitimately authors them and they require user invocation.
-    // macOS only — Landlock cannot deny a subpath within an allowed dir (see SECURITY.md).
+    // above, so SBPL last-match-wins lets the deny override). See
+    // `Agent::host_persistence_denies` for the per-agent set and its rationale.
+    // macOS only — Landlock cannot deny a subpath within an allowed dir, so on
+    // Linux the bubblewrap read-only overlay carries this (see SECURITY.md).
     //
-    // Apply to every writable grant rather than the first one: the default layout
-    // grants both ~/.claude (the data dir these subpaths live under) and the
-    // ~/.claude.json file, and we must not depend on their ordering. The deny on
-    // a file grant (~/.claude.json/statusline.sh) can never match a real path, so
-    // it is a harmless no-op; the deny on the data dir is the one that matters.
-    if matches!(agent, Agent::Claude) {
-        for cfg in agent_dirs.iter().filter(|d| d.write) {
-            for sub in ["statusline.sh", "plugins"] {
-                let p = cfg.path.join(sub).display().to_string();
-                sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
-            }
+    // Apply to every writable grant rather than the first one: Claude's default
+    // layout grants both ~/.claude (the data dir these subpaths live under) and
+    // the ~/.claude.json file, and we must not depend on their ordering. The
+    // deny on a file grant (~/.claude.json/statusline.sh) can never match a real
+    // path, so it is a harmless no-op; the deny on the data dir is what matters.
+    for cfg in agent_dirs.iter().filter(|d| d.write) {
+        for sub in agent.host_persistence_denies() {
+            let p = cfg.path.join(sub).display().to_string();
+            sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
         }
     }
 
