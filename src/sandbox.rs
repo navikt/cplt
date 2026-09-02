@@ -41,7 +41,7 @@ mod exec;
 #[path = "sandbox_landlock.rs"]
 pub(crate) mod landlock_mod;
 #[path = "sandbox_policy.rs"]
-pub(crate) mod policy;
+mod policy;
 #[path = "sandbox_profile.rs"]
 mod profile;
 
@@ -63,6 +63,10 @@ pub use profile::{ProfileOptions, generate_profile};
 
 // Environment construction — already platform-agnostic.
 pub use env::{SandboxEnv, build_sandbox_env, npmrc_explicitly_allowed, npmrc_userconfig_override};
+
+// The in-process PATH lookup. Re-exported (rather than opening the whole `exec`
+// module) for `discover::which_resolved`, which must not spawn `which`.
+pub(crate) use exec::which_binary;
 
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{
@@ -569,6 +573,61 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant behind [`crate::git::TRUSTED_BIN_DIRS`], not just its
+    /// contents: every directory cplt resolves a parent-side binary from must be
+    /// one the sandbox grants **read** access to and nothing more. A directory
+    /// the sandbox also granted write to would be planted into exactly as easily
+    /// as a `PATH` directory, and the whole fix would be theatre.
+    ///
+    /// Lives here rather than in `git.rs` because both grant lists are private
+    /// to this module, and one test reaching in is cheaper than opening them to
+    /// the crate.
+    ///
+    /// Checked against both platform lists because the resolver is shared; each
+    /// entry only has to be covered by one of them (`/opt/homebrew/bin` is
+    /// macOS-only, `/run/current-system/sw/bin` NixOS-only).
+    ///
+    /// Scope, so the name does not promise more than it checks: this asserts
+    /// membership in the read-only tool-dir grants. It does not scan the write
+    /// grants for an overlap, because every write grant is `$HOME`-relative or a
+    /// per-tool config dir and so cannot contain an absolute system bin dir. If
+    /// an absolute write grant is ever added, extend this.
+    #[test]
+    fn every_trusted_dir_is_covered_by_a_tool_read_grant() {
+        let granted: Vec<&str> = policy::TOOL_READ_DIRS
+            .iter()
+            .chain(landlock_mod::LINUX_TOOL_DIRS)
+            .copied()
+            .collect();
+        for dir in crate::git::TRUSTED_BIN_DIRS {
+            assert!(
+                Path::new(dir).is_absolute(),
+                "{dir} must be an absolute path"
+            );
+            assert!(
+                granted.iter().any(|g| Path::new(dir).starts_with(g)),
+                "{dir} is not covered by a read-only tool dir grant — either it is \
+                 unreachable from the sandbox's own view or, worse, it is writable"
+            );
+        }
+    }
+
+    /// Linux only, and it actually runs in CI: `bwrap` is the sandbox driver,
+    /// executed by the unsandboxed parent, so it must never come off `PATH`.
+    /// Passes vacuously on a host without bwrap; on a host with one it fails if
+    /// [`bubblewrap::check_availability`] is reverted to a `PATH` lookup.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_is_never_resolved_from_path() {
+        let found = bubblewrap::check_availability();
+        assert!(
+            found.as_ref().is_none_or(|p| crate::git::TRUSTED_BIN_DIRS
+                .iter()
+                .any(|d| p.starts_with(d))),
+            "bwrap resolved to {found:?}, outside TRUSTED_BIN_DIRS"
+        );
+    }
 
     /// `extra_git_dirs` is the wiring between `prepare()` and the profile: the
     /// emitter test proves the denies get written, this proves the right

@@ -1187,17 +1187,23 @@ fn find_app_contents(path: &Path) -> Option<PathBuf> {
 }
 
 /// Resolve a command name to its real path (following symlinks).
+///
+/// Reads `PATH` in-process rather than spawning `which`. `discover_tools` runs
+/// on every launch, in the unsandboxed parent, before the agent starts — and it
+/// called this once per tool plus once per app dir. Spawning a bare `which`
+/// there means a `which` planted in one of the write+exec grants a previous
+/// session had (mise shims, `PNPM_HOME`, `~/.bun/bin`) executes as the user.
+/// A pure-Rust lookup has nothing to hijack. Same reasoning as
+/// `git::TRUSTED_BIN_DIRS`, one rung better: no spawn beats a trusted spawn.
+///
+/// Not a trusted-directory lookup, deliberately: the point of discovery is to
+/// report what is on the user's `PATH`, wherever it lives. The returned path is
+/// only ever *reported* or turned into a sandbox grant, never executed — except
+/// by `discover_agents`/`discover_copilot`, which run version probes for
+/// `cplt doctor` only.
 fn which_resolved(name: &str) -> Option<PathBuf> {
-    let output = std::process::Command::new("which")
-        .arg(name)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    // Follow symlinks to get the real path
-    std::fs::canonicalize(&path).ok().or(Some(path))
+    let path = crate::sandbox::which_binary(name)?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 /// Find native `.node` modules matching a name in `~/.copilot/pkg/`.

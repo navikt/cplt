@@ -5453,7 +5453,10 @@ fn start_denial_stream() -> Option<std::process::Child> {
     #[cfg(target_os = "macos")]
     {
         ui::info("Streaming sandbox denial logs (--show-denials)...");
-        match std::process::Command::new("log")
+        // Absolute: a bare name is resolved from the parent's PATH at spawn
+        // time, and the sandbox grants the agent write+exec on directories that
+        // sit on it. /usr/bin/log is the only valid location.
+        match std::process::Command::new("/usr/bin/log")
             .args([
                 "stream",
                 "--predicate",

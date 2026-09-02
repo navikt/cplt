@@ -118,7 +118,9 @@ use std::sync::OnceLock;
 /// Every entry is a directory the sandbox exposes **read-only**
 /// (`sandbox_policy::TOOL_READ_DIRS` on macOS,
 /// `sandbox_landlock::LINUX_TOOL_DIRS` on Linux), so nothing inside the sandbox
-/// can write to it — an invariant the test below enforces. `/usr/bin` first: it
+/// can write to it — an invariant `sandbox.rs`'s
+/// `every_trusted_dir_is_covered_by_a_tool_read_grant` enforces. `/usr/bin`
+/// first: it
 /// is the only one that is SIP-protected on macOS and root-owned on Linux.
 ///
 /// # What this does not fix
@@ -622,36 +624,9 @@ mod tests {
                 "/home/linuxbrew/.linuxbrew/bin",
             ],
             "TRUSTED_BIN_DIRS changed. Every entry must be absolute and read-only \
-             to the sandbox — see the coverage test below."
+             to the sandbox — see `every_trusted_dir_is_covered_by_a_tool_read_grant` \
+             in sandbox.rs."
         );
-    }
-
-    /// The invariant behind the list, not just its contents: a trusted
-    /// directory must be one the sandbox grants **read-only**. An entry the
-    /// sandbox also grants write to would be planted into exactly as easily as
-    /// a PATH directory, and the whole fix would be theatre.
-    ///
-    /// Checked against both platform lists because the resolver is shared; each
-    /// entry only has to be covered by one of them (`/opt/homebrew/bin` is
-    /// macOS, `/run/current-system/sw/bin` is NixOS).
-    #[test]
-    fn every_trusted_dir_is_a_read_only_tool_dir() {
-        let granted: Vec<&str> = crate::sandbox::policy::TOOL_READ_DIRS
-            .iter()
-            .chain(crate::sandbox::landlock_mod::LINUX_TOOL_DIRS)
-            .copied()
-            .collect();
-        for dir in TRUSTED_BIN_DIRS {
-            assert!(
-                Path::new(dir).is_absolute(),
-                "{dir} must be an absolute path"
-            );
-            assert!(
-                granted.iter().any(|g| Path::new(dir).starts_with(g)),
-                "{dir} is not covered by a read-only tool dir grant — either it is \
-                 unreachable from the sandbox's own view or, worse, it is writable"
-            );
-        }
     }
 
     /// The not-found path, which the host's real `/usr/bin/git` would otherwise

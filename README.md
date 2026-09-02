@@ -732,7 +732,8 @@ What cplt protects against:
 - Persistence via cache-dir binaries: kernel-blocked, since those dirs are denied exec
 - Persistence via git hooks in the project: `.git/hooks` is write-denied at the kernel on macOS. On Linux, with Landlock and no Bubblewrap, it stays writable, and cplt's own parent-side `git` then runs with `core.hooksPath=/dev/null` so it never executes a planted hook, though a `git` you run yourself still will
 - Persistence via package-manager tool dirs that are both writable and executable (mise shims, `PNPM_HOME`, `~/.deno/bin`, `~/.bun/bin`): write is granted there so `pnpm add -g` and friends work in-sandbox, so an agent can leave a binary behind that a *later* shell picks up off your `PATH`
-- A planted binary hijacking the **agent** cplt launches: cplt resolves its own helpers (`git`, `gh`, `bwrap`, `sandbox-exec`, `mise`) from fixed system directories rather than `PATH`, but the agent binary itself runs from wherever it was found, which for an npm-global install is commonly under a writable mise or node tree
+- A planted binary hijacking the **agent** cplt launches: at launch and audit, cplt resolves the helpers it runs itself (`git`, `bwrap`, `sandbox-exec`, `mise`, and the `gh` it reads a token from) from fixed system directories rather than `PATH`, but the agent binary itself runs from wherever it was discovered, which for an npm-global install is commonly under a writable mise or node tree
+- `cplt doctor`: its version probes (`gh`, `copilot`, `uname`, and each agent it finds) are plain `PATH` lookups run in the parent, so a planted binary executes there. The launch and audit paths do not use them
 - Data exfiltration to unauthorized domains: proxy-blocked
 - Accidental pushes to main and PR merges without review: guard-blocked
 
