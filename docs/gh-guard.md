@@ -232,8 +232,14 @@ If repo `.cplt.toml` denies `GH_TOKEN` in `deny.env`, `deny.env` takes
 precedence: the injected value is stripped from the child and cplt prints a
 startup warning for the conflict. Denying only `GITHUB_TOKEN` /
 `COPILOT_GITHUB_TOKEN` clears those inherited variables but does not block the
-`GH_TOKEN` injection. `deny.env` does not yet cover the `block_auth_token` token
-cache (`$SCRATCH/.gh-token`) — tracked in
+`GH_TOKEN` injection.
+
+Note: on macOS with the Copilot agent, `sandbox.copilot_auth` may also cause cplt
+to inject `GH_TOKEN` even when `gh_guard.inject_token = false`, because the
+resolved token can become the agent’s only credential once Keychain access is
+blocked.
+
+`deny.env` does not yet cover the `block_auth_token` token cache (`$SCRATCH/.gh-token`) — tracked in
 [#224](https://github.com/navikt/cplt/issues/224).
 
 ## `gh api` handling
