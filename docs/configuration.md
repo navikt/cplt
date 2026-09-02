@@ -246,10 +246,10 @@ in the next.
 If you want Keychain access anyway, set `copilot_auth = "keychain"` in your own
 config. That is safe to honour because `copilot_auth` is not a `[propose]` key —
 a repo `.cplt.toml` accepts only `[deny]` and `[propose]` sections and rejects
-anything else outright, so choosing this is always your decision. `keychain` opts
-out of pre-extraction entirely: cplt never runs `gh auth token` for it and never
-drops the grant, so it holds with `gh_guard` enabled too and regardless of any
-token variable set in your environment.
+anything else outright, so choosing this is always your decision. `keychain` keeps
+Keychain access (no pre-extraction to drop the grant). Note: if `gh_guard` is enabled,
+cplt may still run `gh auth token` to support `inject_token` / `block_auth_token`.
+It holds with `gh_guard` enabled too and regardless of any token variable set in your environment.
 
 `env_only` and `gh_only` refuse to launch in this situation rather than continue
 without a credential. A token `gh_guard` separately resolved for its wrapper is
