@@ -169,7 +169,9 @@ cplt does not restrict outbound *domains* by default, but the proxy still enforc
 
 ## Docker and Testcontainers
 
-Docker is **intentionally blocked**. `~/.docker` is denied and the Docker socket is not accessible. Docker gives near-root access to the host system, which defeats the purpose of sandboxing.
+Docker is **intentionally blocked**. `~/.docker` is denied, and on macOS the Docker socket is not reachable, since `(deny default)` covers `network-outbound` to unix sockets. Docker gives near-root access to the host system, which defeats the purpose of sandboxing.
+
+**On Linux the socket is not blocked.** Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1) and cplt clamps at v6, the seccomp filter blocks no socket syscall, and bubblewrap's read-only bind of `/` leaves `/run` and `/var/run` visible, which would not stop a `connect()` in any case. An agent that can reach a `docker` client, or just speak HTTP over `/var/run/docker.sock`, has near-root access to the host on Linux regardless of `allow_docker`. `--allow-docker` itself is a macOS flag and is ignored with a warning on Linux.
 
 - Docker commands, `docker compose`, and Testcontainers will fail
 - Local databases via Docker Compose need `--allow-localhost <PORT>` for the exposed port (the database container runs outside the sandbox)
@@ -185,11 +187,29 @@ cplt --allow-docker
 
 ## SSH agent blocking
 
-SSH agent access is blocked (unix socket denied), which means:
+SSH agent access is blocked on macOS (the agent socket is not reachable — the profile's `(deny default)` covers `network-outbound` to unix sockets) and `SSH_AUTH_SOCK` is stripped from the environment on both platforms. Which means:
 
 - `git clone` over SSH fails. Use HTTPS clones instead
 - `ssh` commands spawned by the agent fail
 - `gh` CLI uses HTTPS by default and is unaffected
+
+**Linux caveat — this is not kernel-enforced.** Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1) and cplt clamps at v6, and the seccomp filter blocks no socket syscall. The withheld `SSH_AUTH_SOCK` is the whole barrier: `/tmp` is readable, so `ls /tmp/ssh-*/agent.*` finds the socket and `SSH_AUTH_SOCK=... ssh-add -l` uses the loaded keys. With bubblewrap the private `/tmp` tmpfs hides the usual socket location, which raises the bar but is concealment rather than a deny. If your keys must be unusable by a compromised agent on Linux, unload them from the agent (`ssh-add -D`) before starting the session.
+
+## D-Bus and systemd (Linux) — the sandbox is escapable by default
+
+`XDG_RUNTIME_DIR` is on the environment allowlist, and `connect()` to a pathname unix socket is not restricted on Linux at the Landlock ABI cplt targets, so `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox. `systemd-run --user <cmd>` therefore hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
+
+- This works with and without bubblewrap — bwrap does not give the sandbox its own `/run` or a private session bus
+- cplt has no mitigation today; there is no flag that closes it
+- If your threat model needs it closed, run cplt inside a container or VM, or on a session with no user D-Bus instance
+
+## UDP is unrestricted (Linux)
+
+Landlock gates UDP only at ABI v10 and cplt handles TCP connect alone, so outbound UDP to any host and port — and inbound UDP bind — is unrestricted at the kernel in **every** Linux mode, `proxy.forced` included. The CONNECT proxy carries TCP only, so UDP traffic never reaches it and never appears in the proxy log.
+
+- DNS tunnelling, QUIC/HTTP-3, and plain UDP exfiltration are not covered by any cplt layer on Linux
+- The proxy log is therefore not a complete record of what left the machine on Linux
+- macOS is unaffected: SBPL `remote ip` rules cover UDP as well as TCP, and `(deny default)` closes everything the profile does not name — under `proxy.forced` the `*:443` allow is dropped entirely
 
 ## macOS protected folders (Desktop, Documents)
 

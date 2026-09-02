@@ -273,7 +273,7 @@ Supported ecosystems:
 | Next.js | `next.config.ts/js/mjs` | localhost 3000, `allow_localhost_any` |
 | Vite | `vite.config.ts/js/mjs` | localhost 5173, `allow_localhost_any` |
 | Flyway | `src/main/resources/db/migration` or `.../migrations` | PostgreSQL port 5432 |
-| Cypress | `cypress.config.ts/js/mjs` + `cypress/` dir | `allow_browser`, `allow_localhost_any` |
+| Cypress | `cypress.config.ts/js/mjs` + `cypress/` dir | `allow_localhost_any` |
 
 Machine-specific suggestions such as `allow_cache_exec` or home-relative read paths come out as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
 

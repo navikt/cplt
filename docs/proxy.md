@@ -76,12 +76,12 @@ forced = true
 **What it changes:**
 
 - **The proxy becomes mandatory.** It is forced on regardless of other proxy defaults.
-- **Kernel egress is restricted to the proxy port.** Instead of allowing outbound `*:443`, the sandbox allows outbound only to the proxy's listening port, plus any configured localhost ports. Direct `:443` connections that skip the proxy are blocked in the kernel, so raw sockets and `env`-unset attempts can no longer reach the network that way. Traffic that does get out goes through the proxy, which applies domain allow/block filtering as usual. How complete this is depends on the platform.
+- **Kernel TCP egress is restricted to the proxy port.** Instead of allowing outbound `*:443`, the sandbox allows outbound only to the proxy's listening port, plus any configured localhost ports. Direct `:443` connections that skip the proxy are blocked in the kernel, so raw sockets and `env`-unset attempts can no longer reach the network that way. Traffic that does get out goes through the proxy, which applies domain allow/block filtering as usual. How complete this is depends on the platform, and on Linux UDP is not restricted at all.
 
 **Platform asymmetry.** Enforcement is not equal on the two platforms:
 
 - **macOS (Seatbelt):** the profile pins egress to `localhost:<proxy_port>`. There is no direct-network path at all, so enforcement is complete with no residual.
-- **Linux (Landlock):** Landlock is port-based and cannot pin to localhost. Proxy-forced drops the `:443` rule and allows only the proxy port, which blocks direct `:443` to any host, but a narrow `evil.com:<proxy_port>` channel remains reachable if a remote host happens to answer on that exact port. Closing this residual requires a network namespace and is tracked in [#114](https://github.com/navikt/cplt/issues/114). Until then, treat Linux proxy-forced as "no direct `:443` bypass" rather than "no egress except the proxy".
+- **Linux (Landlock):** Landlock is port-based and cannot pin to localhost. Proxy-forced drops the `:443` rule and allows only the proxy port, which blocks direct `:443` to any host, but a narrow `evil.com:<proxy_port>` channel remains reachable if a remote host happens to answer on that exact port. Landlock also gates **TCP only**, since UDP support lands at ABI v10 and cplt handles TCP connect alone, so outbound UDP to any host and port stays unrestricted under proxy-forced and the CONNECT proxy never sees it. Closing both requires a network namespace and is tracked in [#114](https://github.com/navikt/cplt/issues/114). Until then, treat Linux proxy-forced as "no direct TCP `:443` bypass" rather than "no egress except the proxy".
 
 **Fail-closed behavior:**
 

@@ -90,7 +90,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | --- | --- | --- |
 | Read/write project directory | ✅ Allowed | |
 | Read/write/delete `.env*`, `.pem`, `.key` in project | 🔒 Kernel-blocked | Prevents secret exfiltration and destruction. `--allow-env-files` overrides |
-| Write `.git/hooks`, `.git/config`, `.gitmodules` | 🔒 Kernel-blocked | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking. Applies to **every** writable root, the project and each `allow.write` grant, including a granted worktree or bare repo whose real hooks live outside `<root>/.git` |
+| Write `.git/hooks`, `.git/config`, `.gitmodules` | 🔒 Kernel-blocked (macOS), ⚠️ partial on Linux | Prevents persistence via git hooks, hooksPath redirect, submodule hijacking. **Linux:** Landlock cannot deny a subpath inside an allowed tree, so these stay writable on the Landlock-only path. `bwrap` re-binds `.git/hooks` read-only but deliberately leaves `.git/config` and `.gitmodules` writable, so `core.hooksPath` remains a persistence route, see [Linux limitations](docs/security.md#linux). Applies to **every** writable root, the project and each `allow.write` grant, including a granted worktree or bare repo whose real hooks live outside `<root>/.git` |
 | Execute from `/tmp`, `/var/folders` | 🔒 Kernel-blocked | Prevents write-then-exec. The scratch dir redirects TMPDIR to a safe location, on by default |
 | Execute from `~/Library/Caches` | 🔒 Kernel-blocked by default | Prevents binary-drop staging. Copilot native modules are exempted via a carve-out. Add targeted exemptions with `--allow-cache-exec <SUBDIR>`, e.g. `ms-playwright` |
 | Modify `.vscode/tasks.json`, `launch.json` | ⚠️ Allowed, known risk | IDE trust boundary. See [SECURITY.md](SECURITY.md) for mitigations |
@@ -106,7 +106,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Access macOS Keychain | ✅ Allowed (read+write) | The Security framework locks the db during access. Copilot uses `keytar.node` for token storage |
 | Outbound network (port 443) | ✅ Allowed | Every other port is blocked. Add extras with `--allow-port` |
 | Localhost outbound | 🔒 Kernel-blocked | Prevents local service access. Inbound still works for the proxy |
-| SSH agent (unix socket) | 🔒 Kernel-blocked | Prevents signing git operations or SSH to hosts |
+| SSH agent (unix socket) | 🔒 Kernel-blocked (macOS), ⚠️ env-only on Linux | Prevents signing git operations or SSH to hosts. **Linux:** Landlock cannot restrict `connect()` to a pathname unix socket at the ABI cplt targets, so the only barrier is that `SSH_AUTH_SOCK` is withheld. An agent that locates the socket under `/tmp` and sets the variable itself can use the loaded keys. `bwrap`'s private `/tmp` hides the usual location but does not deny the connect |
 | Developer tools (`~/.cargo`, `~/.gradle`, `~/.m2`, `~/.sdkman`, `~/.jenv`, `~/.pyenv`, `~/.konan`, etc.) | ✅ Allowed (read+write for caches) | Only dirs that exist on disk. Tightened at runtime by what `cplt doctor` detects |
 | Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked on macOS. On Linux the parent tool dir stays readable | Override with `--allow-read`. See [Private registries](docs/known-impacts.md#private-registries) |
 | Read `~/.npmrc` | 🔒 Kernel-blocked (both platforms) | Override with `--allow-read`. Breaks yarn 1, see [yarn 1](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files) |
@@ -386,7 +386,7 @@ The project directory is the writable workspace, plus a narrow allowlist needed 
 | `-d, --project-dir <DIR>` | Which directory Copilot can work in. Defaults to the current git repo root |
 | `--allow-read <PATH>` | Let Copilot read files outside the project, read-only. Repeatable |
 | `--allow-write <PATH>` | Let Copilot read and write outside the project. Use carefully. Repeatable |
-| `--allow-socket <PATH>` | Allow a Unix domain socket path, for example a custom LSP daemon or a database socket. Repeatable |
+| `--allow-socket <PATH>` | ⚠️ Dangerous. Allow a Unix domain socket path, for example a custom LSP daemon or a database socket. Repeatable. Whatever is on the other end runs outside the sandbox, so pointing this at `docker.sock` or an agent socket is equivalent to `--allow-docker`, and the only guard is that `--deny-path` overlaps are rejected. On Linux it is also a no-op, since unix socket connects are not gated there at all (see [Linux limitations](docs/security.md#linux)) |
 | `--deny-path <PATH>` | Block a path that would otherwise be allowed. Deny always wins. Repeatable |
 | `--allow-port <PORT>` | Allow outbound TCP on an extra port. Only 443 by default. Repeatable |
 | `--allow-localhost <PORT>` | Allow outbound to `localhost` on one port. Localhost is blocked by default. Use for MCP servers or dev servers. Repeatable |
@@ -432,7 +432,7 @@ What passes through:
 | `--allow-tmp-exec` | ⚠️ Dangerous. Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer the scratch dir |
 | `--allow-cache-exec <SUBDIR>` | Allow exec from one `~/Library/Caches/<SUBDIR>`. Repeatable. For tools that cache compiled binaries there, such as Playwright and pnpm dlx |
 | `--allow-cache-exec-any` | ⚠️ Dangerous. Allow exec from all of `~/Library/Caches`. Prefer `--allow-cache-exec <SUBDIR>` |
-| `--allow-browser` | Let the agent open URLs in your default browser. Needed for OAuth code flows (MCP servers, Gemini CLI). Off by default |
+| `--allow-browser` | ⚠️ Dangerous. Emits an unscoped `(allow lsopen)`, which lets the agent hand any file or URL to Launch Services. launchd starts the target **outside** the Seatbelt profile, so `open -a Terminal /tmp/x.sh` is an immediate sandbox escape, not just browser-session access. Only turn it on for a first-time OAuth login (MCP servers, Gemini CLI), then turn it back off. Off by default |
 | `--deny-clipboard` | Block the agent from reading or writing the macOS clipboard (`pbpaste`/`pbcopy`) by denying the `com.apple.pasteboard` Mach service. Every other Mach service (Keychain, DNS, Security framework) is unaffected |
 | `--use-bubblewrap` | Linux only. Require the bubblewrap namespace layer (PID, mount, IPC, UTS, cgroup, user namespaces plus a private `/tmp`) on top of Landlock and seccomp. Errors out if `bwrap` is missing. Auto-detected when neither flag is given |
 | `--no-bubblewrap` | Linux only. Never use bubblewrap, even when installed. Falls back to Landlock and seccomp. Use it when bwrap breaks a specific tool |
@@ -770,7 +770,7 @@ cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
 cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 ```
 
-Proxy-forced mode is opt-in. It restricts kernel egress to the proxy port so a raw socket or an `env -u HTTPS_PROXY` cannot slip past. Enforcement is full on macOS, which pins to `localhost:<proxy_port>`. Linux blocks direct `:443` but keeps a port-based residual until [#114](https://github.com/navikt/cplt/issues/114).
+Proxy-forced mode is opt-in. It restricts kernel TCP egress to the proxy port so a raw socket or an `env -u HTTPS_PROXY` cannot slip past. Enforcement is full on macOS, which pins to `localhost:<proxy_port>`. Linux blocks direct TCP `:443` but keeps a port-based residual, and leaves UDP unrestricted because Landlock gates only TCP connect, until [#114](https://github.com/navikt/cplt/issues/114).
 
 Both lists match the same way: `example.com` covers the exact domain and every subdomain, matching is case-insensitive, and trailing dots are stripped. Blocklist and allowlist files are re-read every five seconds, so you can edit them live. Localhost traffic bypasses the proxy via `NO_PROXY` and never appears in the audit log. `--proxy-timeout <SECONDS>` bounds request and header reads (default 60) and does not tear down established CONNECT tunnels, which may idle for up to an hour.
 
