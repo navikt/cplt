@@ -164,6 +164,8 @@ cplt config explain proxy.forced
 
 For arrays of objects, multi-line values, and other complex configuration, edit the file directly and run `cplt config validate` afterwards.
 
+**Dotted keys:** `allow.read` is the `cplt config set` spelling. In the file the same setting is `read = [...]` under an `[allow]` header. A dotted line below another section's header (`allow.read = [...]` under `[git_guard]`) is scoped into that section by TOML and ignored.
+
 ## Per-repo configuration (`.cplt.toml`)
 
 Commit a `.cplt.toml` to your repository for project-specific sandbox settings, so every developer does not have to configure the same CLI flags or global config. Global config stays the default, so pass `--repo` explicitly for project settings:

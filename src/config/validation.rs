@@ -70,6 +70,18 @@ fn top_level_keys() -> Vec<&'static str> {
 /// automatically cover any option present in the registry.
 pub(super) fn describe_unknown_key(path: &str) -> String {
     if let Some((section, key)) = path.split_once('.') {
+        // A section name showing up as a key inside another section is a dotted
+        // key written below the wrong header: TOML scopes `allow.read = [...]`
+        // under the preceding `[git_guard]` header as `git_guard.allow.read`,
+        // so the grant is silently dropped (#228).
+        if known_sections().contains(&key) {
+            let example = section_keys(key).first().copied().unwrap_or("x");
+            return format!(
+                "unknown key '{key}' in [{section}]: '{key}' is a top-level section; TOML \
+                 scopes '{key}.{example} = ...' written under [{section}] into [{section}] \
+                 — move it under its own [{key}] header"
+            );
+        }
         // Exclude the reported key itself from the suggestion candidates. The
         // candidates come from CONFIG_KEYS (a superset that includes repo-only
         // keys like `deny.env`), so a key that is valid in the registry but not
@@ -635,5 +647,29 @@ some_new_option = true
         // A real typo of a user-struct key still gets a suggestion.
         let msg = describe_unknown_key("sandbox.inherit_evn");
         assert!(msg.contains("did you mean 'inherit_env'"), "got: {msg}");
+    }
+
+    /// #228: a dotted key like `allow.read = [...]` written below another
+    /// section's header is scoped INTO that section by TOML, so the grant is
+    /// silently dropped. The message must explain that, not just "unknown key".
+    #[test]
+    fn section_name_used_as_key_explains_toml_scoping() {
+        let toml =
+            "[git_guard]\nenabled = true\n\nallow.read = [\"~/.gradle/gradle.properties\"]\n";
+        let diagnostics = validate_config(toml);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("unknown key 'allow' in [git_guard]"))
+            .unwrap_or_else(|| panic!("should flag allow under git_guard: {diagnostics:?}"));
+        assert!(
+            diagnostic.message.contains("allow.read"),
+            "got: {}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("[allow]"),
+            "got: {}",
+            diagnostic.message
+        );
     }
 }
