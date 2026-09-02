@@ -8517,6 +8517,13 @@ fn copilot_auth_parses_every_documented_name() {
         assert_eq!(CopilotAuth::from_name(name), Some(expected), "{name}");
         assert_eq!(expected.as_name(), name, "round trip for {name}");
     }
+    // Dashed spellings are CLI aliases; config parsing accepts them too so a
+    // value copied from `--copilot-auth` does not fail in `.cplt.toml`.
+    assert_eq!(
+        CopilotAuth::from_name("env-only"),
+        Some(CopilotAuth::EnvOnly)
+    );
+    assert_eq!(CopilotAuth::from_name("gh-only"), Some(CopilotAuth::GhOnly));
     assert_eq!(CopilotAuth::from_name("nope"), None);
 }
 

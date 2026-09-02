@@ -377,8 +377,12 @@ where
 
 /// Resolve a GitHub token for exec-time injection/caching.
 ///
-/// This has side effects (`gh auth token`) and must be called only immediately
-/// before sandbox exec, after user confirmation.
+/// Has side effects — it spawns `gh auth token`, which may read the login
+/// store or the Keychain — so it must run in the unsandboxed parent, and only
+/// when a token is actually needed (`should_resolve_gh_token_for_exec`). It is
+/// a read: no launch happens here. cplt calls it *before* the confirmation
+/// prompt on purpose, so the resolved token can narrow the Keychain grant
+/// shown in the summary; the launch itself stays gated by that prompt.
 pub fn resolve_gh_token_for_exec(
     has_effective_env_token: bool,
     needs_runtime_gh_token: bool,

@@ -369,10 +369,13 @@ pub enum CopilotAuth {
 
 impl CopilotAuth {
     pub fn from_name(s: &str) -> Option<Self> {
+        // Accept the dashed spellings too: they are `clap` aliases on the CLI,
+        // so a user copying `--copilot-auth gh-only` into `.cplt.toml` should
+        // not hit a parse error.
         match s {
             "auto" => Some(Self::Auto),
-            "env_only" => Some(Self::EnvOnly),
-            "gh_only" => Some(Self::GhOnly),
+            "env_only" | "env-only" => Some(Self::EnvOnly),
+            "gh_only" | "gh-only" => Some(Self::GhOnly),
             "keychain" => Some(Self::Keychain),
             _ => None,
         }

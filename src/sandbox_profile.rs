@@ -118,10 +118,12 @@ pub struct ProfileOptions<'a> {
     pub allow_browser: bool,
     /// Grant read/write access to ~/Library/Keychains.
     ///
-    /// Set to `false` when a GitHub token env var (`GH_TOKEN`, `GITHUB_TOKEN`,
-    /// or `COPILOT_GITHUB_TOKEN`) is already injected into the environment —
-    /// Copilot will use the env var instead of reading from Keychain, so the
-    /// sandbox rule is unnecessary.
+    /// The caller passes the final decision; this module only consumes it. Set
+    /// to `false` whenever Copilot will have a GitHub token as its credential
+    /// instead — whether an ambient `GH_TOKEN` / `GITHUB_TOKEN` /
+    /// `COPILOT_GITHUB_TOKEN`, or one cplt pre-extracted in the unsandboxed
+    /// parent (see `finalize_allow_keychain` in `main.rs`) — so the Keychain
+    /// rule is unnecessary.
     ///
     /// Has no effect for agents where `Agent::needs_keychain()` returns false
     /// (e.g. OpenCode), which never receive Keychain access regardless.

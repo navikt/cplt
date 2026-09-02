@@ -395,7 +395,7 @@ By default, `cplt` sanitizes the child environment — only safe variables pass 
 | Core system       | `HOME`, `USER`, `PATH`, `SHELL`, `TMPDIR`, `LANG`                          | Explicit allowlist                      |
 | Terminal          | `TERM`, `COLORTERM`, `TERM_PROGRAM`                                        | Explicit allowlist                      |
 | Editor            | `EDITOR`, `VISUAL`, `PAGER`                                                | Explicit allowlist                      |
-| Auth tokens       | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`                         | Passed if set by user. On macOS + Copilot, `copilot_auth` (default `auto`) may pre-extract a token via `gh` and inject `GH_TOKEN` even when unset; gh guard serves it from a one-time file instead. Repo `deny.env` on `GH_TOKEN` wins. |
+| Auth tokens       | `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`                         | Passed through if set by user. On macOS + Copilot, `copilot_auth` (default `auto`) may pre-extract a token via `gh` and inject it as `GH_TOKEN` even when none is set. With `gh_guard.block_auth_token`, `GH_TOKEN` is withheld from the env and served once from a 0600 file instead. Repo `deny.env` on `GH_TOKEN` overrides all of this. |
 | Copilot config    | `COPILOT_DEBUG`, `COPILOT_*`                                               | Prefix allowlist                        |
 | Language runtimes | `NODE_*`, `GOPATH`, `CARGO_HOME`, `JAVA_HOME`, `VIRTUAL_ENV`, `PYTHONPATH` | Explicit allowlist                      |
 | Tool managers     | `NVM_*`, `FNM_*`, `PYENV_*`, `MISE_*`, `SDKMAN_*`, `COREPACK_*`, `YARN_*`  | Prefix allowlist                        |
