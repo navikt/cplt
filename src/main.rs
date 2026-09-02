@@ -2582,8 +2582,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // Apply repo-config denied env vars so this matches the actual child process env.
     apply_repo_deny_env(&mut effective_env, &resolved.deny_env);
 
-    // Keep profile generation side-effect free: only definite env-token
-    // presence disables Keychain at prepare time.
+    // Keep profile generation side-effect free: the prepare-time Keychain
+    // decision (`plan_copilot_auth`) may only read *definite* signals — an
+    // ambient token, repo `deny.env`, the mode — never a `gh auth token` call.
     let has_effective_env_token = effective_env.has_github_token(&parent_env);
     // Repo `deny.env` on a token var must never *widen* the sandbox — see
     // `plan_copilot_auth` for why that matters.

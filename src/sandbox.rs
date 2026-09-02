@@ -150,15 +150,17 @@ pub struct SandboxConfig<'a> {
     /// unsandboxed parent *before* calling `prepare()`; profile generation
     /// itself must stay side-effect free (no `gh auth token`, no Keychain read).
     ///
-    /// For `--print-profile` and other side-effect-free previews, derive it from
-    /// definite environment-token presence alone
-    /// (`effective_env.has_github_token(&parent_env)`). For a real launch, a
-    /// token cplt pre-extracted in the parent can *also* drop the grant — see
-    /// `finalize_allow_keychain` in `main.rs`.
+    /// `--print-profile` and other side-effect-free previews pass
+    /// `plan_copilot_auth`'s pre-resolution decision (`AuthPlan::allow_keychain`
+    /// in `main.rs`): it honours the `copilot_auth` mode (explicit `keychain`
+    /// keeps the grant), an ambient GitHub token, and repo `deny.env` — but it
+    /// does not run `gh auth token`. A real launch then folds the pre-extracted
+    /// token into that decision via `finalize_allow_keychain`.
     ///
-    /// For agents that need Keychain (for example Copilot on macOS), this is
-    /// `false` when a GitHub token — ambient or pre-extracted — will be the
-    /// agent's credential instead. For agents that do not use Keychain, this
+    /// For agents that need Keychain (for example Copilot on macOS), the net
+    /// effect is `false` when a GitHub token — ambient or pre-extracted — will
+    /// be the agent's credential instead, unless `copilot_auth = "keychain"`
+    /// keeps the grant regardless. For agents that do not use Keychain, this
     /// flag has no effect.
     pub allow_keychain: bool,
     /// Use Bubblewrap for namespace isolation (Linux only).
