@@ -2778,8 +2778,14 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // non-Copilot agent) there is no Keychain grant being traded away, so
     // `!allow_keychain` says nothing about whether this token is the only
     // credential — and overriding an explicit `inject_token = false` there would
-    // widen for no reason.
-    let token_is_sole_credential = auth_plan.applies && !allow_keychain && gh_token_resolved;
+    // widen for no reason. Gated on `!token_denied_by_repo`: when repo deny.env
+    // strips `GH_TOKEN` from the child, gh_guard may still have resolved a token
+    // for its own wrapper, but it can never reach the agent as an env var — so
+    // it is not a "sole credential", and treating it as one here would fire a
+    // warning that contradicts the deny.env notice above and needlessly clear
+    // the other token vars in `configure_command`.
+    let token_is_sole_credential =
+        auth_plan.applies && !allow_keychain && gh_token_resolved && !token_denied_by_repo;
     if token_is_sole_credential && resolved.gh_guard.enabled && !resolved.gh_guard.inject_token {
         ui::warn(
             "Keychain access is blocked, so the resolved GitHub token is the agent's only \

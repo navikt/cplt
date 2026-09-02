@@ -144,17 +144,21 @@ pub struct SandboxConfig<'a> {
     pub allow_browser: bool,
     /// Grant read/write access to `~/Library/Keychains` (macOS only).
     ///
-    /// Derive this from *definite* environment token presence only.
-    /// Do not trigger `gh auth token` reads during profile generation.
+    /// Pass the *final* Keychain decision in — `prepare()` only consumes this
+    /// flag, it never computes it. Resolve everything that feeds it in the
+    /// unsandboxed parent *before* calling `prepare()`; profile generation
+    /// itself must stay side-effect free (no `gh auth token`, no Keychain read).
     ///
-    /// ```text
-    /// let has_effective_env_token = effective_env.has_github_token(&parent_env);
-    /// let allow_keychain = agent.needs_keychain() && !has_effective_env_token;
-    /// ```
+    /// For `--print-profile` and other side-effect-free previews, derive it from
+    /// definite environment-token presence alone
+    /// (`effective_env.has_github_token(&parent_env)`). For a real launch, a
+    /// token cplt pre-extracted in the parent can *also* drop the grant — see
+    /// `finalize_allow_keychain` in `main.rs`.
     ///
-    /// For agents that need Keychain (for example Copilot on macOS), set this
-    /// to `false` when a GitHub token will be present in the sandboxed env.
-    /// For agents that do not use Keychain, this flag has no effect.
+    /// For agents that need Keychain (for example Copilot on macOS), this is
+    /// `false` when a GitHub token — ambient or pre-extracted — will be the
+    /// agent's credential instead. For agents that do not use Keychain, this
+    /// flag has no effect.
     pub allow_keychain: bool,
     /// Use Bubblewrap for namespace isolation (Linux only).
     /// - `Some(true)`: Always use bwrap (fail if unavailable)
