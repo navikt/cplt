@@ -208,8 +208,9 @@ const LINUX_TOOL_DIRS: &[&str] = &[
     "/usr/share",
     "/lib",
     "/lib64",
-    "/snap",               // Ubuntu Snap packages
-    "/run/current-system", // NixOS
+    "/snap",                      // Ubuntu Snap packages
+    "/run/current-system",        // NixOS
+    "/home/linuxbrew/.linuxbrew", // Homebrew on Linux; /opt/homebrew counterpart in TOOL_READ_DIRS
 ];
 
 /// Individual home config files (and select config directories) that tools
@@ -1844,6 +1845,27 @@ mod tests {
             assert!(!rule.access.write, "{p} should NOT have write");
             assert!(rule.access.execute, "{p} should have execute");
         }
+    }
+
+    /// #202: Homebrew on Linux installs into /home/linuxbrew/.linuxbrew, and the whole
+    /// prefix needs read + execute. `bin/*` are symlinks into `Cellar/`, and Landlock
+    /// checks the resolved inode, so a bin-only grant never covers the binary at all;
+    /// the binaries then carry PT_INTERP=/home/linuxbrew/.linuxbrew/lib/ld.so, which
+    /// needs read + execute in its own right.
+    #[test]
+    fn linuxbrew_prefix_is_readable_and_executable() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let policy = generate_policy(&test_config(&project, &home));
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == Path::new("/home/linuxbrew/.linuxbrew"))
+            .expect("linuxbrew prefix should be a tool dir");
+        assert!(rule.access.read);
+        assert!(rule.access.execute);
+        assert!(!rule.access.write, "linuxbrew prefix must not be writable");
     }
 
     #[test]

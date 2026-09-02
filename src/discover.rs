@@ -258,10 +258,14 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
         })
         .collect();
 
-    let homebrew_prefix = ["/opt/homebrew", "/usr/local/Homebrew"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists());
+    let homebrew_prefix = [
+        "/opt/homebrew",
+        "/usr/local/Homebrew",
+        "/home/linuxbrew/.linuxbrew",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|p| p.exists());
 
     let existing_home_tool_dirs: Vec<String> = home_tool_dirs()
         .iter()
