@@ -593,10 +593,14 @@ else:
     // type at `socket(2)`, which needs no kernel feature at all.
 
     /// Probe that returns the errno of `socket(family, type, 0)`.
+    ///
+    /// The symbolic name, not the number: a caller has to tell "seccomp said
+    /// no" (EPERM) apart from "this host has no IPv6" (EAFNOSUPPORT /
+    /// EPROTONOSUPPORT), and raw errno numbers in a string match are a trap.
     fn udp_socket_probe(family: &str, ty: &str) -> String {
         format!(
             r#"python3 -c "
-import socket, sys
+import errno, socket
 try:
     s = socket.socket(socket.{family}, socket.{ty})
     s.close()
@@ -604,10 +608,17 @@ try:
 except PermissionError:
     print('EPERM')
 except OSError as e:
-    print(f'OTHER {{e.errno}}')
+    print('OTHER ' + errno.errorcode.get(e.errno, str(e.errno)))
 "
 "#
         )
+    }
+
+    /// A high port derived from the pid, the same way `e2e.rs` does it: a
+    /// hard-coded port fails for whoever already has it bound. The two
+    /// proxy-forced tests take different bases because they share a pid.
+    fn derived_port(base: u16) -> String {
+        (base + (std::process::id() % 800) as u16).to_string()
     }
 
     fn have_python3() -> bool {
@@ -625,7 +636,7 @@ except OSError as e:
             return;
         }
         let project = create_test_project();
-        let port = "47331";
+        let port = derived_port(21200);
 
         for (family, ty) in [
             ("AF_INET", "SOCK_DGRAM"),
@@ -634,9 +645,21 @@ except OSError as e:
         ] {
             let (_, stdout, stderr) = run_sandboxed_with_flags(
                 project.path(),
-                &["--with-proxy", "--proxy-port", port, "--proxy-forced"],
+                &["--with-proxy", "--proxy-port", &port, "--proxy-forced"],
                 &udp_socket_probe(family, ty),
             );
+            // A host with IPv6 compiled out or disabled fails AF_INET6 inside
+            // `socket(2)` before seccomp ever sees it. That is the host's
+            // answer, not the sandbox's, so it cannot prove the rule — but it
+            // must not fail the test either. EPERM stays the only pass, and
+            // the AF_INET rows keep the test's teeth on every host.
+            if family == "AF_INET6"
+                && (stdout.contains("OTHER EAFNOSUPPORT")
+                    || stdout.contains("OTHER EPROTONOSUPPORT"))
+            {
+                eprintln!("SKIPPED AF_INET6 row: IPv6 unsupported on this host");
+                continue;
+            }
             assert!(
                 stdout.contains("EPERM"),
                 "proxy-forced must deny socket({family}, {ty}) — otherwise UDP \
@@ -653,14 +676,14 @@ except OSError as e:
             return;
         }
         let project = create_test_project();
-        let port = "47332";
+        let port = derived_port(22200);
 
         // TCP must survive: it is how the agent reaches the proxy at all.
         // AF_UNIX must survive: local IPC is not an egress channel.
         for (family, ty) in [("AF_INET", "SOCK_STREAM"), ("AF_UNIX", "SOCK_STREAM")] {
             let (_, stdout, stderr) = run_sandboxed_with_flags(
                 project.path(),
-                &["--with-proxy", "--proxy-port", port, "--proxy-forced"],
+                &["--with-proxy", "--proxy-port", &port, "--proxy-forced"],
                 &udp_socket_probe(family, ty),
             );
             assert!(
