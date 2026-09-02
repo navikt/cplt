@@ -164,7 +164,7 @@ cplt config explain proxy.forced
 
 For arrays of objects, multi-line values, and other complex configuration, edit the file directly and run `cplt config validate` afterwards.
 
-**Dotted keys:** `allow.read` is the `cplt config set` spelling. In the file the same setting is `read = [...]` under an `[allow]` header. A dotted line below another section's header (`allow.read = [...]` under `[git_guard]`) is scoped into that section by TOML and ignored.
+**Dotted keys:** `allow.read` is the `cplt config set` spelling. In the file the same setting is `read = [...]` under an `[allow]` header. A dotted line below another section's header (`allow.read = [...]` under `[git_guard]`) is scoped into that section by TOML, so cplt sees it as an unknown key and ignores it — with a warning at launch and an error from `cplt config validate`.
 
 ## Per-repo configuration (`.cplt.toml`)
 

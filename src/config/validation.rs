@@ -76,6 +76,16 @@ pub(super) fn describe_unknown_key(path: &str) -> String {
         // so the grant is silently dropped (#228).
         if known_sections().contains(&key) {
             let example = section_keys(key).first().copied().unwrap_or("x");
+            // Repeating the section name under its own header (`[allow]` +
+            // `allow.read = ...`) needs the opposite advice: drop the prefix.
+            if section == key {
+                return format!(
+                    "unknown key '{key}' in [{section}]: the [{section}] header already \
+                     scopes its keys, so '{key}.{example} = ...' reads as \
+                     '{section}.{key}.{example}' — drop the '{key}.' prefix and write \
+                     '{example} = ...'"
+                );
+            }
             return format!(
                 "unknown key '{key}' in [{section}]: '{key}' is a top-level section; TOML \
                  scopes '{key}.{example} = ...' written under [{section}] into [{section}] \
@@ -661,8 +671,10 @@ some_new_option = true
             .iter()
             .find(|d| d.message.contains("unknown key 'allow' in [git_guard]"))
             .unwrap_or_else(|| panic!("should flag allow under git_guard: {diagnostics:?}"));
+        // The example subkey comes from the registry, so assert the shape of the
+        // hint rather than pinning whichever key happens to be listed first.
         assert!(
-            diagnostic.message.contains("allow.read"),
+            diagnostic.message.contains("allow.") && diagnostic.message.contains("= ..."),
             "got: {}",
             diagnostic.message
         );
@@ -671,5 +683,14 @@ some_new_option = true
             "got: {}",
             diagnostic.message
         );
+    }
+
+    /// The same detection must give the opposite advice when the section name is
+    /// repeated under its own header: the prefix is redundant, not misplaced.
+    #[test]
+    fn section_name_repeated_under_its_own_header_says_drop_the_prefix() {
+        let msg = describe_unknown_key("allow.allow");
+        assert!(msg.contains("drop the 'allow.' prefix"), "got: {msg}");
+        assert!(!msg.contains("move it"), "got: {msg}");
     }
 }
