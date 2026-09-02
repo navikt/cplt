@@ -191,6 +191,21 @@ Whenever cplt injects a token it first clears all three variables, so the one it
 resolved is the one the agent sees rather than whichever an inherited variable
 happened to set.
 
+**Classic PATs do not count.** Copilot refuses classic personal access tokens
+(`ghp_…`) outright, so cplt does not treat one as a credential: under `auto` it
+keeps the Keychain grant and warns, and under `env_only` / `gh_only` it refuses
+to launch. Trading the grant away for a token Copilot rejects would leave the
+agent unable to authenticate *and* unable to log in again. `gh auth login`
+produces a `gho_` OAuth token, which works; fine-grained PATs
+(`github_pat_…`) work too.
+
+**Logging in from inside the sandbox needs the Keychain.** Copilot stores its own
+credential as a Keychain item (`copilot-cli`), and once the grant is dropped a
+write to the Keychain is denied by the kernel — so `/login` inside a running
+session cannot persist a token. Run `copilot` outside cplt to log in, or start
+the session with `--copilot-auth keychain`. This only matters for a first login
+or a re-login; an already-working `gh` login needs neither.
+
 **Repo `deny.env` still wins, and only ever tightens.** cplt injects the
 pre-extracted token as `GH_TOKEN`, so a repo `[deny] env` list that blocks
 `GH_TOKEN` stops it from reaching the agent — the variable is stripped from the

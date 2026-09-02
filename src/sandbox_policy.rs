@@ -290,6 +290,25 @@ pub const ENV_PREFIX_ALLOWLIST: &[&str] = &[
 /// with any other token checks that intentionally enumerate vars directly.
 pub const GITHUB_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
 
+/// Whether a GitHub token value can actually authenticate Copilot, and is
+/// therefore worth trading the macOS Keychain grant for.
+///
+/// Copilot rejects **classic** personal access tokens outright ("Classic
+/// Personal Access Tokens (ghp_) are not supported by Copilot"), so a `ghp_`
+/// token is not a credential as far as this trade is concerned. Counting one
+/// would drop the Keychain grant and then launch an agent that cannot
+/// authenticate and cannot recover in-session — `/login` needs the Keychain
+/// that was just taken away.
+///
+/// Everything else is accepted: `gho_` (the `gh auth login` OAuth token, the
+/// common case), `github_pat_` (fine-grained), `ghu_`/`ghs_`. The check is
+/// deliberately a denylist of the one prefix Copilot names, so a future token
+/// format is used rather than silently discarded.
+pub fn token_authenticates_copilot(token: &str) -> bool {
+    let token = token.trim();
+    !token.is_empty() && !token.starts_with("ghp_")
+}
+
 /// Returns `true` if any recognised GitHub token env var is set in the current
 /// process environment.
 ///
@@ -299,7 +318,7 @@ pub const GITHUB_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GI
 pub fn github_token_in_env() -> bool {
     GITHUB_TOKEN_VARS
         .iter()
-        .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
+        .any(|var| std::env::var(var).is_ok_and(|v| token_authenticates_copilot(&v)))
 }
 
 /// Environment variables always stripped, even with --inherit-env.
@@ -1307,6 +1326,23 @@ pub fn validate_sbpl_path(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Copilot refuses classic PATs, so one must never count as the credential
+    /// that buys away the Keychain grant. Everything else counts, including the
+    /// `gho_` token `gh auth login` produces — the common case the whole
+    /// pre-extraction design rests on.
+    #[test]
+    fn classic_pats_do_not_authenticate_copilot() {
+        assert!(!token_authenticates_copilot("ghp_0123456789abcdef"));
+        assert!(!token_authenticates_copilot("  ghp_0123456789abcdef  "));
+        assert!(!token_authenticates_copilot(""));
+        assert!(!token_authenticates_copilot("   "));
+
+        assert!(token_authenticates_copilot("gho_0123456789abcdef"));
+        assert!(token_authenticates_copilot("github_pat_0123456789"));
+        assert!(token_authenticates_copilot("ghu_0123456789abcdef"));
+        assert!(token_authenticates_copilot("ghs_0123456789abcdef"));
+    }
+
     #[test]
     fn resolve_rejects_relative_xdg_cache_home() {
         // A relative XDG_CACHE_HOME must be rejected to prevent sandbox path widening.
@@ -1382,21 +1418,21 @@ mod tests {
 
     #[test]
     fn github_token_in_env_true_when_gh_token_set() {
-        temp_env::with_var("GH_TOKEN", Some("ghp_testtoken"), || {
+        temp_env::with_var("GH_TOKEN", Some("gho_testtoken"), || {
             assert!(super::github_token_in_env());
         });
     }
 
     #[test]
     fn github_token_in_env_true_when_github_token_set() {
-        temp_env::with_var("GITHUB_TOKEN", Some("ghp_testtoken"), || {
+        temp_env::with_var("GITHUB_TOKEN", Some("gho_testtoken"), || {
             assert!(super::github_token_in_env());
         });
     }
 
     #[test]
     fn github_token_in_env_true_when_copilot_token_set() {
-        temp_env::with_var("COPILOT_GITHUB_TOKEN", Some("ghp_testtoken"), || {
+        temp_env::with_var("COPILOT_GITHUB_TOKEN", Some("gho_testtoken"), || {
             assert!(super::github_token_in_env());
         });
     }

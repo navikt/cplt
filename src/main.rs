@@ -2702,9 +2702,24 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         active_agent,
         &project_dir,
     );
+    // A classic PAT does not count as a credential here: Copilot refuses `ghp_`
+    // tokens outright, so trading the Keychain grant away for one would launch
+    // an agent that cannot authenticate and cannot recover — `/login` needs the
+    // Keychain it just lost. The token is still handed to gh_guard if the user
+    // asked for injection; it just does not buy the Keychain grant.
     let gh_token_resolved = resolved_gh_token
         .as_deref()
-        .is_some_and(|t| !t.trim().is_empty());
+        .is_some_and(sandbox::token_authenticates_copilot);
+    if auth_plan.applies
+        && !gh_token_resolved
+        && resolved_gh_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+    {
+        ui::warn(
+            "`gh auth token` returned a classic personal access token (ghp_), which Copilot              does not accept. Keeping Keychain access so Copilot can use its own credential.              Run `gh auth login` for an OAuth token, or use a fine-grained PAT, to drop the              Keychain grant.",
+        );
+    }
 
     // Fail closed: `env_only` / `gh_only` promise the Keychain is never needed,
     // so a missing token is an error rather than a silent fallback to it. Only
@@ -2723,7 +2738,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             if token_denied_by_repo {
                 "blocked by repo deny.env"
             } else if auth_mode.accepts_env_token() {
-                "not set"
+                "not set, or set to a token Copilot rejects (classic ghp_ PATs)"
             } else {
                 "ignored by this mode"
             },

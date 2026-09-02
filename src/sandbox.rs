@@ -53,8 +53,8 @@ pub use policy::{
     AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
     ENV_PREFIX_ALLOWLIST, GITHUB_TOKEN_VARS, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory,
     HardeningEnvVar, HomeToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs,
-    github_token_in_env, home_tool_dirs, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_sbpl_path,
+    github_token_in_env, home_tool_dirs, token_authenticates_copilot, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_sbpl_path,
 };
 
 // SBPL profile generation — kept public for unit tests.

@@ -9,7 +9,7 @@ use crate::agent::Agent;
 
 use super::policy::{
     ENV_ALLOWLIST, ENV_ALWAYS_DENY, ENV_PREFIX_ALLOWLIST, GITHUB_TOKEN_VARS, HARDENING_ENV_VARS,
-    HardeningCategory, SCRATCH_DIR_ENV_VARS, is_secret_suffix,
+    HardeningCategory, SCRATCH_DIR_ENV_VARS, is_secret_suffix, token_authenticates_copilot,
 };
 
 /// Environment configuration for the sandboxed process.
@@ -24,8 +24,10 @@ pub struct SandboxEnv {
 
 impl SandboxEnv {
     /// Returns `true` if at least one GitHub token env var (`GH_TOKEN`,
-    /// `GITHUB_TOKEN`, or `COPILOT_GITHUB_TOKEN`) will be present with a
-    /// non-empty value in the sandboxed process's effective environment.
+    /// `GITHUB_TOKEN`, or `COPILOT_GITHUB_TOKEN`) will reach the sandboxed
+    /// process with a value that can actually authenticate Copilot — see
+    /// [`token_authenticates_copilot`], which rules out classic `ghp_` PATs
+    /// as well as empty values.
     ///
     /// In **secure mode** (`clear_first = true`) the effective env is exactly
     /// `self.vars` — token vars are forwarded only if they appeared in the
@@ -37,27 +39,29 @@ impl SandboxEnv {
     /// is present only if its final effective value is non-empty.
     ///
     /// Use this to gate SBPL Keychain rules: if the process will have a usable
-    /// token, Keychain access is unnecessary and can be omitted.
+    /// token, Keychain access is unnecessary and can be omitted. A token Copilot
+    /// would reject is *not* usable — dropping the grant for one would leave the
+    /// agent with no credential and no way to log in again.
     pub fn has_github_token(&self, parent_env: &[(String, String)]) -> bool {
         if self.clear_first {
             // Secure mode: effective env = self.vars only.
             GITHUB_TOKEN_VARS.iter().any(|var| {
                 self.vars
                     .iter()
-                    .any(|(k, v)| k == *var && !v.trim().is_empty())
+                    .any(|(k, v)| k == *var && token_authenticates_copilot(v))
             })
         } else {
             // Inherit mode: effective env = (parent_env minus self.remove)
             // with self.vars applied as explicit overrides/additions.
             GITHUB_TOKEN_VARS.iter().any(|var| {
                 if let Some((_, v)) = self.vars.iter().rev().find(|(k, _)| k == *var) {
-                    !v.trim().is_empty()
+                    token_authenticates_copilot(v)
                 } else {
                     let removed = self.remove.iter().any(|r| r == var);
                     !removed
                         && parent_env
                             .iter()
-                            .any(|(k, v)| k == *var && !v.trim().is_empty())
+                            .any(|(k, v)| k == *var && token_authenticates_copilot(v))
                 }
             })
         }
@@ -433,23 +437,40 @@ mod tests {
         }
     }
 
+    /// A classic PAT in the child env must not read as "has a token": dropping
+    /// the Keychain grant for it would leave Copilot unable to authenticate and
+    /// unable to `/login`, because `/login` needs the Keychain.
+    #[test]
+    fn a_classic_pat_does_not_count_as_a_github_token() {
+        let secure = make_env(&[("GH_TOKEN", "ghp_dead")], &[], true);
+        assert!(!secure.has_github_token(&[]));
+
+        let parent = vec![("GITHUB_TOKEN".to_string(), "ghp_dead".to_string())];
+        let inherit = make_env(&[], &[], false);
+        assert!(!inherit.has_github_token(&parent));
+
+        // ...while the OAuth token `gh auth login` writes does count.
+        let ok = make_env(&[("GH_TOKEN", "gho_live")], &[], true);
+        assert!(ok.has_github_token(&[]));
+    }
+
     // ── Secure mode (clear_first = true) ─────────────────────────
 
     #[test]
     fn has_github_token_secure_true_when_gh_token_in_vars() {
-        let env = make_env(&[("GH_TOKEN", "ghp_abc123")], &[], true);
+        let env = make_env(&[("GH_TOKEN", "gho_abc123")], &[], true);
         assert!(env.has_github_token(&[]));
     }
 
     #[test]
     fn has_github_token_secure_true_when_github_token_in_vars() {
-        let env = make_env(&[("GITHUB_TOKEN", "ghp_abc123")], &[], true);
+        let env = make_env(&[("GITHUB_TOKEN", "gho_abc123")], &[], true);
         assert!(env.has_github_token(&[]));
     }
 
     #[test]
     fn has_github_token_secure_true_when_copilot_github_token_in_vars() {
-        let env = make_env(&[("COPILOT_GITHUB_TOKEN", "ghp_abc123")], &[], true);
+        let env = make_env(&[("COPILOT_GITHUB_TOKEN", "gho_abc123")], &[], true);
         assert!(env.has_github_token(&[]));
     }
 
@@ -469,14 +490,14 @@ mod tests {
 
     #[test]
     fn has_github_token_inherit_true_when_token_in_parent_env() {
-        let parent = vec![("GH_TOKEN".to_string(), "ghp_abc123".to_string())];
+        let parent = vec![("GH_TOKEN".to_string(), "gho_abc123".to_string())];
         let env = make_env(&[], &[], false);
         assert!(env.has_github_token(&parent));
     }
 
     #[test]
     fn has_github_token_inherit_false_when_token_removed() {
-        let parent = vec![("GH_TOKEN".to_string(), "ghp_abc123".to_string())];
+        let parent = vec![("GH_TOKEN".to_string(), "gho_abc123".to_string())];
         let env = make_env(&[], &["GH_TOKEN"], false);
         assert!(!env.has_github_token(&parent));
     }
@@ -498,13 +519,13 @@ mod tests {
     #[test]
     fn has_github_token_inherit_true_when_token_in_vars() {
         let parent = vec![("PATH".to_string(), "/usr/bin".to_string())];
-        let env = make_env(&[("GH_TOKEN", "ghp_abc123")], &[], false);
+        let env = make_env(&[("GH_TOKEN", "gho_abc123")], &[], false);
         assert!(env.has_github_token(&parent));
     }
 
     #[test]
     fn has_github_token_inherit_false_when_token_overridden_empty_in_vars() {
-        let parent = vec![("GH_TOKEN".to_string(), "ghp_abc123".to_string())];
+        let parent = vec![("GH_TOKEN".to_string(), "gho_abc123".to_string())];
         let env = make_env(&[("GH_TOKEN", "   ")], &[], false);
         assert!(!env.has_github_token(&parent));
     }
@@ -512,7 +533,7 @@ mod tests {
     #[test]
     fn has_github_token_inherit_true_when_token_removed_but_readded_in_vars() {
         let parent = vec![("PATH".to_string(), "/usr/bin".to_string())];
-        let env = make_env(&[("GH_TOKEN", "ghp_abc123")], &["GH_TOKEN"], false);
+        let env = make_env(&[("GH_TOKEN", "gho_abc123")], &["GH_TOKEN"], false);
         assert!(env.has_github_token(&parent));
     }
 }
