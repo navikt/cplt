@@ -143,7 +143,8 @@ Or for a single run: `cplt --allow-cache-exec ms-playwright --allow-cache-exec p
 
 ## Localhost blocking
 
-Localhost outbound is blocked by default, so sandboxed processes cannot connect to local services:
+Localhost outbound is blocked by default on macOS, so sandboxed processes cannot connect to local services. On Linux, Landlock rules are port numbers only and cannot pin to localhost, so a local service on an allowed port is reachable; use `--with-proxy` for SSRF protection, and see [Linux limitations](../SECURITY.md#linux-specific-limitations).
+
 
 | Operation                      | Impact            | Why                                                  |
 | ------------------------------ | ----------------- | ---------------------------------------------------- |
@@ -171,7 +172,7 @@ cplt does not restrict outbound *domains* by default, but the proxy still enforc
 
 Docker is **intentionally blocked**. `~/.docker` is denied, and on macOS the Docker socket is not reachable, since `(deny default)` covers `network-outbound` to unix sockets. Docker gives near-root access to the host system, which defeats the purpose of sandboxing.
 
-**On Linux the socket is not blocked.** Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1) and cplt clamps at v6, the seccomp filter blocks no socket syscall, and bubblewrap's read-only bind of `/` leaves `/run` and `/var/run` visible, which would not stop a `connect()` in any case. An agent that can reach a `docker` client, or just speak HTTP over `/var/run/docker.sock`, has near-root access to the host on Linux regardless of `allow_docker`. `--allow-docker` itself is a macOS flag and is ignored with a warning on Linux.
+**On Linux the socket is not blocked.** Unix socket `connect()` is not gated at the Landlock ABI cplt targets, and a read-only bwrap bind does not stop a `connect()` either, so an agent that can speak HTTP over `/var/run/docker.sock` has near-root access to the host regardless of `allow_docker`, itself a macOS flag that is ignored with a warning on Linux. See [Linux limitations](../SECURITY.md#linux-specific-limitations).
 
 - Docker commands, `docker compose`, and Testcontainers will fail
 - Local databases via Docker Compose need `--allow-localhost <PORT>` for the exposed port (the database container runs outside the sandbox)
@@ -193,11 +194,15 @@ SSH agent access is blocked on macOS (the agent socket is not reachable — the 
 - `ssh` commands spawned by the agent fail
 - `gh` CLI uses HTTPS by default and is unaffected
 
-**Linux caveat — this is not kernel-enforced.** Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1) and cplt clamps at v6, and the seccomp filter blocks no socket syscall. The withheld `SSH_AUTH_SOCK` is the whole barrier: `/tmp` is readable, so `ls /tmp/ssh-*/agent.*` finds the socket and `SSH_AUTH_SOCK=... ssh-add -l` uses the loaded keys. With bubblewrap the private `/tmp` tmpfs hides the usual socket location, which raises the bar but is concealment rather than a deny. If your keys must be unusable by a compromised agent on Linux, unload them from the agent (`ssh-add -D`) before starting the session.
+**Linux caveat — this is not kernel-enforced.** Unix socket `connect()` is not gated at the Landlock ABI cplt targets (see [Linux limitations](../SECURITY.md#linux-specific-limitations)), so the withheld `SSH_AUTH_SOCK` is the whole barrier: `/tmp` is readable, so `ls /tmp/ssh-*/agent.*` finds a stock OpenSSH socket and `SSH_AUTH_SOCK=... ssh-add -l` uses the loaded keys.
 
-## D-Bus and systemd (Linux) — the sandbox is escapable by default
+Bubblewrap's private `/tmp` helps only for that stock layout. The desktop agents put their socket under `$XDG_RUNTIME_DIR` — `gcr/ssh` (gnome-keyring), `keyring/ssh`, `openssh_agent` (systemd) — a fixed path under `/run/user/<uid>` that bwrap's read-only bind of `/` leaves visible and that needs no enumeration. On GNOME or KDE, bwrap adds nothing here.
 
-`XDG_RUNTIME_DIR` is on the environment allowlist, and `connect()` to a pathname unix socket is not restricted on Linux at the Landlock ABI cplt targets, so `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox. `systemd-run --user <cmd>` therefore hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
+If your keys must be unusable by a compromised agent on Linux, unload them (`ssh-add -D`) before starting the session.
+
+## D-Bus and systemd (Linux) — the session manager is reachable
+
+`XDG_RUNTIME_DIR` is on the environment allowlist, and `connect()` to a pathname unix socket is not restricted on Linux at the Landlock ABI cplt targets, so `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox. This is established by reading the code, not by running it on a host — treat it as reachable rather than demonstrated. `systemd-run --user <cmd>` therefore hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
 
 - This works with and without bubblewrap — bwrap does not give the sandbox its own `/run` or a private session bus
 - cplt has no mitigation today; there is no flag that closes it
@@ -209,7 +214,7 @@ Landlock gates UDP only at ABI v10 and cplt handles TCP connect alone, so outbou
 
 - DNS tunnelling, QUIC/HTTP-3, and plain UDP exfiltration are not covered by any cplt layer on Linux
 - The proxy log is therefore not a complete record of what left the machine on Linux
-- macOS is unaffected: SBPL `remote ip` rules cover UDP as well as TCP, and `(deny default)` closes everything the profile does not name — under `proxy.forced` the `*:443` allow is dropped entirely
+- macOS restricts UDP but does not route it through the proxy either: `remote ip "*:443"` covers UDP as well as TCP, so in default mode QUIC/HTTP-3 on 443 leaves without being logged there too. Only under `proxy.forced`, where the `*:443` allow is dropped and `(deny default)` closes the rest, is the macOS proxy log complete
 
 ## macOS protected folders (Desktop, Documents)
 
@@ -290,7 +295,7 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | `git add/commit/status/diff/log`   | ✅ Works     | Local operations, no writes to protected paths                    |
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth token` provides credentials            |
-| `git fetch/pull/push` (SSH)        | ❌ Blocked   | SSH agent socket denied, use HTTPS                                |
+| `git fetch/pull/push` (SSH)        | ❌ Blocked on macOS | SSH agent socket denied, use HTTPS. On Linux only `SSH_AUTH_SOCK` is withheld |
 | `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
 | `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`, which stays writable on Linux |
@@ -443,7 +448,7 @@ Or for a single run: `cplt --allow-jvm-attach`
 - Any test suite that gets `"Could not self-attach to current VM using external process"` errors
 - JMX monitoring tools that attach to running JVMs
 
-**How it works:** the JVM creates a socket at `/tmp/.java_pid<PID>`, a hardcoded path that `java.io.tmpdir` does not affect. A helper JVM process connects to that socket to load an instrumentation agent. The sandbox rule uses a regex that only allows sockets matching `.java_pid<PID>`, so every other Unix socket in `/tmp` (SSH agent, tmux, PostgreSQL) stays blocked.
+**How it works:** the JVM creates a socket at `/tmp/.java_pid<PID>`, a hardcoded path that `java.io.tmpdir` does not affect. A helper JVM process connects to that socket to load an instrumentation agent. The sandbox rule uses a regex that only allows sockets matching `.java_pid<PID>`, so on macOS every other Unix socket in `/tmp` (SSH agent, tmux, PostgreSQL) stays blocked. On Linux no unix socket is gated in the first place, so the flag grants nothing that was not already reachable, see [Linux limitations](../SECURITY.md#linux-specific-limitations).
 
 **Security note:** this opens a narrow IPC channel for `.java_pid*`-named sockets only. SSH agent access (`SSH_AUTH_SOCK`) is NOT exposed. On macOS it lives at `/private/tmp/com.apple.launchd.*/Listeners`, which does not match the pattern.
 
@@ -467,7 +472,7 @@ Or for a single run: `cplt --allow-msbuild`
 
 This is a **different socket** from the persistent **MSBuild Server**, the opt-in `dotnet build` acceleration feature that keeps a compiler process alive between builds. That one names its pipe `MSBuildServer-<hash>` (see [MSBuild-Server.md](https://github.com/dotnet/msbuild/blob/main/documentation/MSBuild-Server.md#pipe-name-convention--handshake)), a name the `--allow-msbuild` regex does not match, so it stays blocked. To close that off structurally instead of leaning on the socket-path allowlist alone, cplt also sets `DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1` unconditionally inside the sandbox, so `dotnet build` never starts or reuses a persistent server, including one a process outside the sandbox already started.
 
-**Security note:** this opens a narrow IPC channel for `MSBuild<PID>`-named sockets only. SSH agent access and all other Unix sockets in `/tmp`, the persistent MSBuild Server included, stay blocked.
+**Security note:** this opens a narrow IPC channel for `MSBuild<PID>`-named sockets only. On macOS, SSH agent access and all other Unix sockets in `/tmp`, the persistent MSBuild Server included, stay blocked. On Linux no unix socket is gated in the first place, so the flag grants nothing that was not already reachable, see [Linux limitations](../SECURITY.md#linux-specific-limitations).
 
 ## Port restriction
 

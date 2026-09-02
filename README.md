@@ -105,8 +105,8 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read `~/Library/Application Support/Microsoft` | ✅ Allowed (read-only) | Device ID for telemetry |
 | Access macOS Keychain | ✅ Allowed (read+write) | The Security framework locks the db during access. Copilot uses `keytar.node` for token storage |
 | Outbound network (port 443) | ✅ Allowed | Every other port is blocked. Add extras with `--allow-port` |
-| Localhost outbound | 🔒 Kernel-blocked | Prevents local service access. Inbound still works for the proxy |
-| SSH agent (unix socket) | 🔒 Kernel-blocked (macOS), ⚠️ env-only on Linux | Prevents signing git operations or SSH to hosts. **Linux:** Landlock cannot restrict `connect()` to a pathname unix socket at the ABI cplt targets, so the only barrier is that `SSH_AUTH_SOCK` is withheld. An agent that locates the socket under `/tmp` and sets the variable itself can use the loaded keys. `bwrap`'s private `/tmp` hides the usual location but does not deny the connect |
+| Localhost outbound | 🔒 Kernel-blocked (macOS), ⚠️ port-based on Linux | Prevents local service access. Inbound still works for the proxy. **Linux:** Landlock rules are port numbers only and cannot tell `localhost:443` from `remote:443`, so a local service on an allowed port is reachable and there is no localhost-specific deny. Use `--with-proxy` for SSRF protection, see [Linux limitations](docs/security.md#linux) |
+| SSH agent (unix socket) | 🔒 Kernel-blocked (macOS), ⚠️ env-only on Linux | Prevents signing git operations or SSH to hosts. **Linux:** unix socket `connect()` is not gated, so the withheld `SSH_AUTH_SOCK` is the only barrier and an agent that sets it itself can use the loaded keys. `bwrap` hides the stock OpenSSH socket under `/tmp`, but not a gnome-keyring/gcr or systemd agent under `$XDG_RUNTIME_DIR`. See [Linux limitations](docs/security.md#linux) |
 | Developer tools (`~/.cargo`, `~/.gradle`, `~/.m2`, `~/.sdkman`, `~/.jenv`, `~/.pyenv`, `~/.konan`, etc.) | ✅ Allowed (read+write for caches) | Only dirs that exist on disk. Tightened at runtime by what `cplt doctor` detects |
 | Registry credential files (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials`) | 🔒 Kernel-blocked on macOS. On Linux the parent tool dir stays readable | Override with `--allow-read`. See [Private registries](docs/known-impacts.md#private-registries) |
 | Read `~/.npmrc` | 🔒 Kernel-blocked (both platforms) | Override with `--allow-read`. Breaks yarn 1, see [yarn 1](docs/known-impacts.md#yarn-1-and-unreadable-home-rc-files) |
@@ -172,7 +172,7 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | Credential dir protection | 15+ dirs denied by default | User must configure manually |
 | DNS rebinding protection | ✅ Post-DNS IP checked against private ranges | ❌ Not implemented |
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
-| SSH git | Blocked at kernel (SSH agent socket denied) | Proxied via SOCKS5 |
+| SSH git | Blocked at kernel on macOS (agent socket denied); on Linux only `SSH_AUTH_SOCK` is withheld | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`) | Not blocked |
 | Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, Shell | Claude Code |
 | Config | TOML (global + per-repo) | JSON (global only) + `--control-fd` live updates |
@@ -708,7 +708,7 @@ Full details, including the trust model, path expansion rules, and the complete 
 └──────────────────────────────────┘
 ```
 
-The security model is a deny-by-default filesystem with kernel enforcement. On macOS, and on Linux with kernel 6.7+ (Landlock ABI v4), the network is restricted to port 443 by default, with `--allow-port` for extras. On older Linux kernels the CONNECT proxy provides that restriction instead, which is why it is enabled by default. SSH agent access and localhost outbound are blocked in the kernel on macOS and via the proxy on Linux. The profile generator discovers your environment (`cplt doctor` shows the same probe results) and emits rules only for tool directories that actually exist on disk. Fewer rules, tighter sandbox.
+The security model is a deny-by-default filesystem with kernel enforcement. On macOS, and on Linux with kernel 6.7+ (Landlock ABI v4), the network is restricted to port 443 by default, with `--allow-port` for extras. On older Linux kernels the CONNECT proxy provides that restriction instead, which is why it is enabled by default. SSH agent access and localhost outbound are blocked in the kernel on macOS. On Linux neither is: port-based Landlock rules cannot tell localhost from a remote host, and unix socket `connect()` is not gated at all, so the withheld `SSH_AUTH_SOCK` is the only thing standing between the agent and your loaded keys. The profile generator discovers your environment (`cplt doctor` shows the same probe results) and emits rules only for tool directories that actually exist on disk. Fewer rules, tighter sandbox.
 
 - **macOS**: a Seatbelt/SBPL profile is generated and handed to `sandbox-exec`
 - **Linux**: Landlock LSM rules plus a seccomp-BPF filter, applied via `pre_exec` (kernel 5.13+, TCP port filtering on 6.7+)
