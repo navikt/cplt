@@ -1048,10 +1048,11 @@ fn detect_cypress(ctx: &DetectContext) -> DetectorOutput {
     DetectorOutput::detected(Detection {
         name: "Cypress",
         signals,
-        suggestions: vec![
-            Suggestion::Propose(SandboxFlag::AllowBrowser),
-            Suggestion::Propose(SandboxFlag::AllowLocalhostAny),
-        ],
+        // Deliberately no `allow_browser` proposal: it emits an unscoped
+        // `(allow lsopen)`, and launchd starts the target outside the Seatbelt
+        // profile, so it is a sandbox escape rather than a browser-session
+        // grant. Users who need it set it explicitly.
+        suggestions: vec![Suggestion::Propose(SandboxFlag::AllowLocalhostAny)],
     })
 }
 
@@ -2806,6 +2807,13 @@ services:
         assert!(report.detections.iter().any(|d| d.name == "Cypress"));
         assert!(
             report
+                .suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowLocalhostAny))
+        );
+        // allow_browser is an escape hatch (unscoped `lsopen` -> launchd runs
+        // the target outside the profile) and is never auto-proposed.
+        assert!(
+            !report
                 .suggestions
                 .contains(&Suggestion::Propose(SandboxFlag::AllowBrowser))
         );
