@@ -337,7 +337,7 @@ impl std::fmt::Display for Preset {
 /// This is the lever that decides whether the sandboxed agent needs macOS
 /// Keychain access at all. Granting Keychain means the agent can read **every**
 /// credential the user owns, not just the GitHub one; pre-extracting a single
-/// single GitHub token in the unsandboxed parent and handing only that to the
+/// GitHub token in the unsandboxed parent and handing only that to the
 /// agent is narrower. Note it is the user's full gh OAuth token, not a scoped
 /// one — narrower than the whole Keychain, but not harmless.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]

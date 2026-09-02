@@ -1509,7 +1509,9 @@ mod tests {
         let script = write_script(
             &dir,
             "gh-timeout-kill.sh",
-            "#!/bin/sh\necho $$ > \"$1\"\nwhile :; do :; done\n",
+            // `exec sleep` keeps the recorded pid ($$) as the live process and
+            // stays alive well past the timeout without burning a CPU core.
+            "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 30\n",
         );
         let pid_file = dir.path().join("child.pid");
         let mut cmd = Command::new(script);

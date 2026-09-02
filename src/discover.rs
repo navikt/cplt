@@ -99,12 +99,12 @@ pub struct PathDiscovery {
 
 // ── Auth discovery ──────────────────────────────────────────────
 
-const AUTH_ENV_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
-
 pub fn discover_auth(home_dir: &Path, project_dir: &Path) -> AuthDiscovery {
-    let env_tokens: Vec<String> = AUTH_ENV_VARS
+    // A whitespace-only value is not a usable token — match the `trim()` check
+    // the injection path uses so discovery doesn't report auth that won't work.
+    let env_tokens: Vec<String> = crate::sandbox::GITHUB_TOKEN_VARS
         .iter()
-        .filter(|var| std::env::var(var).is_ok_and(|v| !v.is_empty()))
+        .filter(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
         .map(std::string::ToString::to_string)
         .collect();
 
