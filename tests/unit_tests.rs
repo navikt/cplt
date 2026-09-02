@@ -9,7 +9,8 @@ use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, i
 use cplt::sandbox::{
     HardeningCategory, ProfileOptions, SandboxConfig, build_sandbox_env, generate_policy,
     generate_profile, npmrc_explicitly_allowed, npmrc_userconfig_override,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_sbpl_path,
+    npmrc_userconfig_stale_variants, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_sbpl_path,
 };
 
 // ============================================================
@@ -5489,6 +5490,40 @@ fn npmrc_userconfig_not_redirected_when_user_set_it() {
     // An empty value is treated as unset.
     let empty = make_env(&[("NPM_CONFIG_USERCONFIG", "")]);
     assert!(npmrc_userconfig_override(&empty, Some(scratch), false).is_some());
+    // Including in the lowercase spelling npm and yarn also accept.
+    let empty_lower = make_env(&[("npm_config_userconfig", "")]);
+    assert!(npmrc_userconfig_override(&empty_lower, Some(scratch), false).is_some());
+    // A non-empty lowercase one is still the user's own setting.
+    let lower = make_env(&[("npm_config_userconfig", "/Users/test/custom-npmrc")]);
+    assert_eq!(
+        npmrc_userconfig_override(&lower, Some(scratch), false),
+        None
+    );
+}
+
+/// #234 follow-up: injecting only the uppercase key leaves an empty lowercase
+/// one in the child env, and npm/yarn lowercase every `npm_config_*` key before
+/// merging — so the empty string could win and put the `~/.npmrc` read back.
+#[test]
+fn npmrc_userconfig_lowercase_variants_are_removed() {
+    let parent = make_env(&[
+        ("HOME", "/Users/test"),
+        ("npm_config_userconfig", ""),
+        ("NPM_CONFIG_USERCONFIG", ""),
+        ("Npm_Config_UserConfig", ""),
+        ("NPM_CONFIG_CACHE", "/tmp/cache"),
+    ]);
+    let mut stale = npmrc_userconfig_stale_variants(&parent);
+    stale.sort_unstable();
+    assert_eq!(
+        stale,
+        ["Npm_Config_UserConfig", "npm_config_userconfig"],
+        "every spelling but the one we inject must be removed, and nothing else"
+    );
+    assert!(
+        npmrc_userconfig_stale_variants(&make_env(&[("HOME", "/Users/test")])).is_empty(),
+        "no variants means nothing to remove"
+    );
 }
 
 #[test]

@@ -62,7 +62,10 @@ pub use policy::{
 pub use profile::{ProfileOptions, generate_profile};
 
 // Environment construction — already platform-agnostic.
-pub use env::{SandboxEnv, build_sandbox_env, npmrc_explicitly_allowed, npmrc_userconfig_override};
+pub use env::{
+    SandboxEnv, build_sandbox_env, npmrc_explicitly_allowed, npmrc_userconfig_override,
+    npmrc_userconfig_stale_variants,
+};
 
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{

@@ -306,6 +306,28 @@ pub fn npmrc_userconfig_override(
     Some(scratch_dir?.join("npmrc"))
 }
 
+/// Keys in `parent_env` that name the same npm setting as `NPM_CONFIG_USERCONFIG`
+/// but are spelled differently, and so must be dropped when the override is injected.
+///
+/// npm and yarn both build their config by lowercasing every `npm_config_*` key
+/// (yarn 1's `NpmRegistry.getConfigFromEnv`, npm's own `npm-conf`), so
+/// `npm_config_userconfig` and `NPM_CONFIG_USERCONFIG` collapse to one entry and
+/// the last one the environ happens to yield wins. `npmrc_userconfig_override`
+/// deliberately treats an *empty* value as unset, so it can inject alongside an
+/// empty lowercase variant — and if that variant survives, the merge may pick the
+/// empty string, drop the redirect, and put `~/.npmrc` (and yarn 1's abort) back.
+/// Removing the variants leaves exactly one value in play instead of relying on
+/// iteration order.
+pub fn npmrc_userconfig_stale_variants(parent_env: &[(String, String)]) -> Vec<&str> {
+    parent_env
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .filter(|k| {
+            k.eq_ignore_ascii_case("NPM_CONFIG_USERCONFIG") && *k != "NPM_CONFIG_USERCONFIG"
+        })
+        .collect()
+}
+
 /// Dangerous NODE_OPTIONS flags that allow code preloading or module interception.
 const NODE_OPTIONS_DANGEROUS: &[&str] = &[
     "--require",

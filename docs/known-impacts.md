@@ -543,7 +543,7 @@ One consequence is worth knowing: an agent can deliberately force the audit to `
 The injection is skipped in three cases, where the failure below can still appear:
 
 - you allowed `~/.npmrc` yourself (`allow.read`), so you asked for the real file and cplt does not redirect around it;
-- you set `NPM_CONFIG_USERCONFIG` yourself, and your value wins;
+- you set `NPM_CONFIG_USERCONFIG` yourself — in any capitalisation, since npm and yarn lowercase the key — and your value wins;
 - the scratch dir is off (`--no-scratch-dir`), so there is no session-scoped writable location to point at.
 
 Without it, `yarn install` fails outright under the default policy when an `~/.npmrc` exists on the host. Nothing is resolved and no `node_modules` is written:
@@ -592,7 +592,7 @@ error Error: EPERM: operation not permitted, open '/Users/you/.yarnrc'
 
 `~/.yarnrc` is not in any deny list. Like most home dotfiles it is simply never granted, since the sandbox enumerates the specific `$HOME` config files tools need rather than granting `$HOME` wholesale. Allow it the same way (`cplt config set allow.read "~/.yarnrc"`) if you keep one.
 
-**Why `NPM_CONFIG_USERCONFIG` works.** It is on cplt's environment allowlist because it names a path rather than carrying a secret, and yarn 1's npmrc loader honours it: `mergeEnv('npm_config_')` lowercases the variable into `config.userconfig`, which replaces the `~/.npmrc` entry in `getPossibleConfigLocations`. That list is gated on an existence check before the read, so a path that does not exist is skipped rather than read. This is why cplt injects the variable rather than granting the file. `allow.read` fixes the crash by handing the credential over, the redirect fixes it by removing the need. npm and pnpm honour the same variable and could not read `~/.npmrc` in the sandbox anyway, so nothing changes for them. It redirects only the npmrc loader, so a `~/.yarnrc` still needs the treatment above.
+**Why `NPM_CONFIG_USERCONFIG` works.** It is on cplt's environment allowlist because it names a path rather than carrying a secret, and yarn 1's npmrc loader honours it: `mergeEnv('npm_config_')` lowercases the variable into `config.userconfig`, which replaces the `~/.npmrc` entry in `getPossibleConfigLocations`. That list is gated on an existence check before the read, so a path that does not exist is skipped rather than read. Because that lowercasing collapses every spelling into one entry, and an *empty* value is falsy enough to fall back to `~/.npmrc`, cplt also removes any other-cased `npm_config_userconfig` from the child environment when it injects — otherwise a stray empty one could win the merge and undo the redirect. This is why cplt injects the variable rather than granting the file. `allow.read` fixes the crash by handing the credential over, the redirect fixes it by removing the need. npm and pnpm honour the same variable and could not read `~/.npmrc` in the sandbox anyway, so nothing changes for them. It redirects only the npmrc loader, so a `~/.yarnrc` still needs the treatment above.
 
 The XDG variables, by contrast, do not help. yarn 1's `.yarnrc` scan builds its own path list with hardcoded `~/.yarnrc` entries and runs before the XDG-aware `getConfigDir()` is consulted, so neither `XDG_CONFIG_HOME` nor `XDG_DATA_HOME` removes those paths from the list. yarn 2+ (berry) uses a different config loader and is unaffected.
 

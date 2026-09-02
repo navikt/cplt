@@ -122,6 +122,12 @@ fn configure_command(
     if let Some(path) =
         super::env::npmrc_userconfig_override(&parent_env, scratch_dir, npmrc_allowed)
     {
+        // Drop the other spellings first: npm and yarn lowercase every
+        // `npm_config_*` key, so a leftover (necessarily empty) lowercase
+        // variant would collide with the injection and could win the merge.
+        for key in super::env::npmrc_userconfig_stale_variants(&parent_env) {
+            cmd.env_remove(key);
+        }
         cmd.env("NPM_CONFIG_USERCONFIG", path);
     }
 
