@@ -636,6 +636,64 @@ impl Agent {
         }
     }
 
+    /// Refusal message for the case where this agent's **first-run login**
+    /// would have to write a file that [`Agent::host_persistence_denies`]
+    /// blocks, and that login has not happened yet on this host. `None` means
+    /// the launch is fine.
+    ///
+    /// Without this the user meets the guard as an opaque `EPERM` on
+    /// `settings.json` from inside the agent, which reads like a cplt bug.
+    ///
+    /// Only Gemini is affected. It records the auth method it picked as
+    /// `selectedAuthType` in `~/.gemini/settings.json` — denied because the
+    /// same file carries auto-firing `SessionStart` hooks. Pi has no
+    /// interactive login at all (see `oauth_first`: provider API keys only) and
+    /// Claude Code's OAuth token lands in the macOS Keychain or
+    /// `~/.claude/.credentials.json`, neither of which is denied. For those two
+    /// the deny costs package management and statusline/plugin authoring, not
+    /// sign-in.
+    ///
+    /// "Authenticated" for Gemini means either `~/.gemini/oauth_creds.json`
+    /// exists (the browser OAuth flow completed) or `settings.json` already
+    /// records a `selectedAuthType` (any auth method — API key, Vertex, OAuth).
+    /// Callers additionally skip this when a provider API key is passed
+    /// through, which authenticates without touching the file.
+    ///
+    /// Deliberately cheap and infallible: one `exists()` and at most one small
+    /// read. Any I/O error is read as "assume authenticated", so a filesystem
+    /// hiccup can never turn into a refused launch.
+    pub fn login_refusal(&self, home: &Path) -> Option<String> {
+        if !matches!(self, Agent::Gemini) {
+            return None;
+        }
+        let dir = home.join(".gemini");
+        let authenticated = dir.join("oauth_creds.json").exists()
+            || std::fs::read_to_string(dir.join("settings.json"))
+                .is_ok_and(|s| s.contains("selectedAuthType"));
+        if authenticated {
+            return None;
+        }
+        let settings = dir.join("settings.json").display().to_string();
+        Some(format!(
+            "Gemini is not signed in yet, and cplt write-denies {settings}.\n\
+             That file is where Gemini records the auth method you pick on first \
+             login, but it also holds `hooks.SessionStart[]`, which auto-fires the \
+             next time `gemini` starts outside the sandbox — so cplt denies writes \
+             to it. Signing in from inside the sandbox would fail with a confusing \
+             permission error, so cplt is not launching.\n\
+             \n\
+             Sign in once, outside cplt — this is a one-time step:\n\
+             \n\
+             \x20   gemini\n\
+             \n\
+             Then run cplt as normal. To do it under cplt instead (macOS only — \
+             on Linux the deny comes from a bubblewrap read-only bind that an \
+             allow cannot override), grant just that file for the login run:\n\
+             \n\
+             \x20   cplt --agent gemini --allow-browser --allow-write {settings}"
+        ))
+    }
+
     /// Environment variable names this agent may need for authentication.
     /// These are NOT added to the default allowlist — they must be
     /// explicitly passed via --pass-env or agent config.
@@ -1527,6 +1585,57 @@ mod tests {
         assert!(Agent::Copilot.host_persistence_denies().is_empty());
         assert!(Agent::OpenCode.host_persistence_denies().is_empty());
         assert!(Agent::Shell.host_persistence_denies().is_empty());
+    }
+
+    #[test]
+    fn login_refusal_only_for_unauthenticated_gemini() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".gemini")).expect("mkdir");
+
+        // Nothing on disk: refuse, and say what to do about it.
+        let msg = Agent::Gemini
+            .login_refusal(home)
+            .expect("unauthenticated Gemini must refuse to launch");
+        assert!(msg.contains("not signed in"), "{msg}");
+        assert!(msg.contains("one-time"), "{msg}");
+        assert!(msg.contains("gemini"), "{msg}");
+        assert!(msg.contains("--allow-write"), "{msg}");
+        assert!(
+            msg.contains(&home.join(".gemini/settings.json").display().to_string()),
+            "message must name the denied file: {msg}"
+        );
+
+        // Agents whose login does not touch a denied file never refuse, even
+        // with an equally empty home.
+        for agent in [
+            Agent::Pi,
+            Agent::Claude,
+            Agent::Copilot,
+            Agent::OpenCode,
+            Agent::Antigravity,
+            Agent::Shell,
+        ] {
+            assert!(
+                agent.login_refusal(home).is_none(),
+                "{agent:?} must not be blocked"
+            );
+        }
+
+        // Any recorded auth method counts as authenticated (API key, Vertex, …).
+        std::fs::write(
+            home.join(".gemini/settings.json"),
+            r#"{"security":{"auth":{"selectedAuthType":"gemini-api-key"}}}"#,
+        )
+        .expect("write settings");
+        assert!(Agent::Gemini.login_refusal(home).is_none());
+
+        // So does a completed browser OAuth flow, even with no settings.json.
+        let tmp2 = tempfile::tempdir().expect("tempdir");
+        let home2 = tmp2.path();
+        std::fs::create_dir_all(home2.join(".gemini")).expect("mkdir");
+        std::fs::write(home2.join(".gemini/oauth_creds.json"), "{}").expect("write creds");
+        assert!(Agent::Gemini.login_refusal(home2).is_none());
     }
 
     #[test]

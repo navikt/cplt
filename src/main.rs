@@ -1589,6 +1589,21 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             ));
         }
 
+        // #237: the host-persistence guard write-denies the agent's own
+        // settings.json, which for Gemini is also where first-run login records
+        // the auth method. Catch that here rather than letting the user meet it
+        // as an opaque permission error from inside the agent. Skipped when a
+        // provider API key is passed through (that authenticates without
+        // touching the file) or when env is inherited wholesale, and never in
+        // `cplt check`, which must be able to report on any configuration.
+        if !check_mode
+            && !has_api_key
+            && !resolved.inherit_env
+            && let Some(msg) = active_agent.login_refusal(&home_dir)
+        {
+            anyhow::bail!(msg);
+        }
+
         // Warn if Copilot-only flags are used with a non-Copilot agent
         let copilot_flags_used: Vec<&str> = [
             cli.resume.as_ref().map(|_| "--resume"),

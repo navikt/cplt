@@ -1128,6 +1128,63 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
     });
 }
 
+/// The documented escape hatch for a first-run login (`--allow-write
+/// ~/.gemini/settings.json`) has to actually beat the persistence deny.
+/// `emit_home_access` runs before `emit_user_allows`, so SBPL last-match-wins
+/// puts the user's allow on top. If that call order is ever swapped, the
+/// instructions `Agent::login_refusal` prints become a lie — hence this test.
+#[test]
+fn user_allow_write_overrides_host_persistence_deny() {
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = cplt::agent::Agent::Gemini.config_dirs(home);
+    let settings = home.join(".gemini/settings.json");
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: home,
+        extra_read: &[],
+        extra_write: std::slice::from_ref(&settings),
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        extra_git_dirs: &[],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Gemini,
+        agent_dirs: &agent_dirs,
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+    let deny = p
+        .find("(deny file-write* (subpath \"/Users/test/.gemini/settings.json\"))")
+        .expect("persistence deny must be emitted");
+    let allow = p
+        .find("(allow file-write* (subpath \"/Users/test/.gemini/settings.json\"))")
+        .expect("user allow.write must be emitted");
+    assert!(
+        allow > deny,
+        "user allow.write must come after the deny for last-match-wins to reopen the file"
+    );
+}
+
 #[test]
 fn profile_denies_sensitive_dirs() {
     let p = generate_profile(&ProfileOptions {
