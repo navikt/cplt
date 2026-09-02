@@ -4309,6 +4309,70 @@ paths = [
         );
     }
 
+    /// Pull `KEY=value` out of `env` output.
+    fn env_value<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+    }
+
+    /// #180: the sandbox denies `~/.npmrc`, and yarn 1 aborts on the denial errno where
+    /// it tolerates ENOENT. cplt redirects `NPM_CONFIG_USERCONFIG` at a nonexistent path
+    /// in the scratch dir so the read misses instead of being refused.
+    #[test]
+    fn e2e_exec_npmrc_userconfig_redirected_to_scratch() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args(["--no-validate", "exec", "--", "/usr/bin/env"])
+            .current_dir(project_dir())
+            // A developer's own value legitimately suppresses the injection.
+            .env_remove("NPM_CONFIG_USERCONFIG")
+            .env_remove("npm_config_userconfig")
+            .output()
+            .expect("cplt exec should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let tmpdir = env_value(&stdout, "TMPDIR").expect("scratch dir is on by default");
+        let userconfig = env_value(&stdout, "NPM_CONFIG_USERCONFIG").unwrap_or_else(|| {
+            panic!("NPM_CONFIG_USERCONFIG must be injected by default.\nstdout: {stdout}")
+        });
+
+        assert_eq!(
+            userconfig,
+            format!("{tmpdir}/npmrc"),
+            "NPM_CONFIG_USERCONFIG must point inside the session scratch dir.\nstdout: {stdout}"
+        );
+        assert!(
+            !std::path::Path::new(userconfig).exists(),
+            "the redirect target must not exist, or the read is not ENOENT"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_npmrc_userconfig_absent_without_scratch_dir() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args([
+                "--no-validate",
+                "--no-scratch-dir",
+                "exec",
+                "--",
+                "/usr/bin/env",
+            ])
+            .current_dir(project_dir())
+            .env_remove("NPM_CONFIG_USERCONFIG")
+            .env_remove("npm_config_userconfig")
+            .output()
+            .expect("cplt exec should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            env_value(&stdout, "NPM_CONFIG_USERCONFIG").is_none(),
+            "without a scratch dir there is nowhere to point, so nothing is injected.\n\
+             stdout: {stdout}"
+        );
+    }
+
     #[test]
     fn e2e_exec_no_command_errors() {
         let output = cplt_cmd()

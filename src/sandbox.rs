@@ -62,7 +62,7 @@ pub use policy::{
 pub use profile::{ProfileOptions, generate_profile};
 
 // Environment construction — already platform-agnostic.
-pub use env::{SandboxEnv, build_sandbox_env, npmrc_userconfig_override};
+pub use env::{SandboxEnv, build_sandbox_env, npmrc_explicitly_allowed, npmrc_userconfig_override};
 
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{
@@ -344,10 +344,7 @@ fn prepare_impl(
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
-        npmrc_allowed: config
-            .extra_read
-            .iter()
-            .any(|p| p == &config.home_dir.join(".npmrc")),
+        npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
     })
 }
 
@@ -483,10 +480,7 @@ fn prepare_impl(
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
         allow_localhost_any: config.allow_localhost_any,
-        npmrc_allowed: config
-            .extra_read
-            .iter()
-            .any(|p| p == &config.home_dir.join(".npmrc")),
+        npmrc_allowed: env::npmrc_explicitly_allowed(config.home_dir, config.extra_read),
         precomputed,
         bwrap_wrapper,
     })

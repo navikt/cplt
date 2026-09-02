@@ -519,7 +519,7 @@ The injection is skipped in three cases, where the failure below can still appea
 
 - you allowed `~/.npmrc` yourself (`allow.read`), so you asked for the real file and cplt does not redirect around it;
 - you set `NPM_CONFIG_USERCONFIG` yourself, and your value wins;
-- the scratch dir is off (`--no-scratch-dir`), so there is nowhere to point that would not silently swallow `npm config set` writes.
+- the scratch dir is off (`--no-scratch-dir`), so there is no session-scoped writable location to point at.
 
 Without it, `yarn install` fails outright under the default policy when an `~/.npmrc` exists on the host. Nothing is resolved and no `node_modules` is written:
 

@@ -8,8 +8,8 @@ use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
     HardeningCategory, ProfileOptions, SandboxConfig, build_sandbox_env, generate_policy,
-    generate_profile, npmrc_userconfig_override, tool_override_path_is_safe,
-    tool_path_env_overrides, validate_sbpl_path,
+    generate_profile, npmrc_explicitly_allowed, npmrc_userconfig_override,
+    tool_override_path_is_safe, tool_path_env_overrides, validate_sbpl_path,
 };
 
 // ============================================================
@@ -5494,9 +5494,58 @@ fn npmrc_userconfig_not_redirected_without_scratch_dir() {
     assert_eq!(
         npmrc_userconfig_override(&parent, None, false),
         None,
-        "without a scratch dir there is nowhere safe to point: `npm config set` writes \
-         would vanish silently"
+        "without a scratch dir there is no session-scoped writable location to point at"
     );
+}
+
+#[test]
+fn npmrc_allowed_matches_a_plain_file() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let npmrc = home.path().join(".npmrc");
+    std::fs::write(&npmrc, "//registry/:_authToken=t\n").expect("write npmrc");
+
+    assert!(
+        !npmrc_explicitly_allowed(home.path(), &[]),
+        "no allow.read entry means no opt-in"
+    );
+    assert!(
+        npmrc_explicitly_allowed(
+            home.path(),
+            &[std::fs::canonicalize(&npmrc).expect("canonicalize")]
+        ),
+        "an allow.read of ~/.npmrc must register as an opt-in"
+    );
+}
+
+#[test]
+fn npmrc_allowed_matches_a_symlinked_npmrc() {
+    // stow/chezmoi: ~/.npmrc -> ~/dotfiles/npmrc. Both --allow-read (canonicalize_paths)
+    // and config allow.read (resolve_config_path) canonicalize, so extra_read holds the
+    // link *target*. Comparing against the unresolved $HOME/.npmrc misses it, the flag
+    // reads false, and the redirect silently ignores the token the user allowed.
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = home.path().join("dotfiles-npmrc");
+    std::fs::write(&target, "//registry/:_authToken=t\n").expect("write target");
+    std::os::unix::fs::symlink(&target, home.path().join(".npmrc")).expect("symlink");
+
+    let extra_read = vec![std::fs::canonicalize(&target).expect("canonicalize")];
+    assert!(
+        npmrc_explicitly_allowed(home.path(), &extra_read),
+        "a symlinked ~/.npmrc allowed via its canonical target must still count as opt-in"
+    );
+}
+
+#[test]
+fn npmrc_allowed_tolerates_a_missing_npmrc() {
+    // canonicalize fails when the file does not exist; the fallback must degrade to a
+    // literal compare rather than panic. (allow.read of a missing path is dropped
+    // upstream anyway, so this only has to be safe.)
+    let home = tempfile::tempdir().expect("tempdir");
+    assert!(!npmrc_explicitly_allowed(home.path(), &[]));
+    assert!(npmrc_explicitly_allowed(
+        home.path(),
+        &[home.path().join(".npmrc")]
+    ));
 }
 
 #[test]
