@@ -5448,7 +5448,8 @@ fn profile_gpg_signing_allows_socket_file_read() {
 #[test]
 fn npmrc_userconfig_redirected_by_default() {
     let parent = make_env(&[("HOME", "/Users/test")]);
-    let scratch = std::path::Path::new("/scratch/session123");
+    let scratch_dir = tempfile::tempdir().expect("tempdir");
+    let scratch = scratch_dir.path();
     assert_eq!(
         npmrc_userconfig_override(&parent, Some(scratch), false),
         Some(scratch.join("npmrc")),
@@ -5463,7 +5464,8 @@ fn npmrc_userconfig_redirected_by_default() {
 #[test]
 fn npmrc_userconfig_not_redirected_when_user_allows_npmrc() {
     let parent = make_env(&[("HOME", "/Users/test")]);
-    let scratch = std::path::Path::new("/scratch/session123");
+    let scratch_dir = tempfile::tempdir().expect("tempdir");
+    let scratch = scratch_dir.path();
     assert_eq!(
         npmrc_userconfig_override(&parent, Some(scratch), true),
         None,
@@ -5477,7 +5479,8 @@ fn npmrc_userconfig_not_redirected_when_user_set_it() {
         ("HOME", "/Users/test"),
         ("NPM_CONFIG_USERCONFIG", "/Users/test/custom-npmrc"),
     ]);
-    let scratch = std::path::Path::new("/scratch/session123");
+    let scratch_dir = tempfile::tempdir().expect("tempdir");
+    let scratch = scratch_dir.path();
     assert_eq!(
         npmrc_userconfig_override(&parent, Some(scratch), false),
         None,
