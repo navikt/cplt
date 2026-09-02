@@ -23,10 +23,12 @@
 //! worse still: those invocations are the input to the trust decision.
 //!
 //! The repository's config is not the only thing an agent can aim at these
-//! invocations. The *binary* is the other one: `git` looked up by name is
+//! invocations. The *binary* is the other one: any program looked up by name is
 //! resolved from the parent's `PATH` at spawn time, after the agent has
-//! finished writing to directories that are on it. See [`TRUSTED_BIN_DIRS`],
-//! which also spells out the part of that this module does not fix.
+//! finished writing to directories that are on it. [`TRUSTED_BIN_DIRS`] and
+//! [`trusted_binary`] are the answer, and are used for every parent-side spawn
+//! in cplt, not only git's — this module is where the reasoning lives, so it is
+//! where they live. [`TRUSTED_BIN_DIRS`] also spells out what that does not fix.
 //!
 //! # What is actually reachable
 //!
@@ -100,20 +102,24 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-/// Absolute directories a parent-side `git` may be resolved from.
+/// Absolute directories a parent-side binary may be resolved from.
 ///
 /// `Command::new("git")` resolves through `execvp` **at spawn time**, using the
-/// *parent's* `PATH` — and the parent spawns git after the agent has exited
-/// (`audit::Baseline::finish`). The sandbox grants write **and** exec to several
-/// directories that are on a developer's `PATH` (mise shims, `PNPM_HOME`,
-/// `~/.deno/bin`, `~/.bun/bin` — see `sandbox_policy::HOME_TOOL_DIRS` and
-/// `APP_DIRS`), so an agent can drop a file named `git` into one of them and
-/// have the parent execute it unsandboxed moments later.
+/// *parent's* `PATH`. cplt spawns binaries in the parent both after the agent
+/// has exited (`audit::Baseline::finish`) and before the next one starts (the
+/// gh-guard scope check, the bwrap probe). The sandbox grants write **and**
+/// exec to several directories that are on a developer's `PATH` (mise shims,
+/// `PNPM_HOME`, `~/.deno/bin`, `~/.bun/bin` — see
+/// `sandbox_policy::HOME_TOOL_DIRS` and `APP_DIRS`), so an agent can drop a file
+/// named `git` (or `bwrap`, or `mise`) into one of them and have the parent
+/// execute it unsandboxed — at the end of this session, or at the start of the
+/// next one.
 ///
-/// These four directories are the ones the sandbox exposes read-only
-/// (`sandbox_policy::TOOL_READ_DIRS`), so nothing inside the sandbox can write
-/// to them. `/usr/bin` first: it is the only one that is SIP-protected on macOS
-/// and root-owned on Linux.
+/// Every entry is a directory the sandbox exposes **read-only**
+/// (`sandbox_policy::TOOL_READ_DIRS` on macOS,
+/// `sandbox_landlock::LINUX_TOOL_DIRS` on Linux), so nothing inside the sandbox
+/// can write to it — an invariant the test below enforces. `/usr/bin` first: it
+/// is the only one that is SIP-protected on macOS and root-owned on Linux.
 ///
 /// # What this does not fix
 ///
@@ -122,9 +128,43 @@ use std::sync::OnceLock;
 /// agent-writable tree that also happens to be one of these directories — a
 /// Homebrew prefix owned by the user, say, that a `sandbox.allow.write` grant
 /// opened up — then resolving to a fixed absolute path still finds the
-/// trojaned file. Making the whole class safe means not granting write to
-/// directories that also carry exec, which is a separate decision.
-const TRUSTED_BIN_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"];
+/// trojaned file. Nor does it cover the agent binary itself, which cplt spawns
+/// from wherever it was discovered (commonly an npm global under a mise node
+/// install, i.e. a writable+exec tree). Making the whole class safe means not
+/// granting write to directories that also carry exec, which is a separate
+/// decision.
+pub(crate) const TRUSTED_BIN_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    // NixOS: the activated system profile, root-owned and read-only granted.
+    // Without it a NixOS user has no trusted git at all, which costs more than
+    // the audit — `repo_config::load_repo_config` reads `.cplt.toml` with
+    // `git cat-file` and reports "no repo config" when git cannot run.
+    "/run/current-system/sw/bin",
+    // Homebrew on Linux; same trust level as /opt/homebrew/bin.
+    "/home/linuxbrew/.linuxbrew/bin",
+];
+
+/// First `name` found in `dirs`. Split out of [`trusted_binary`] so the
+/// not-found path is testable without depending on the host's `/usr/bin`.
+fn find_in(dirs: &[&str], name: &str) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|p| p.is_file())
+}
+
+/// Resolve `name` from [`TRUSTED_BIN_DIRS`], never from `PATH`.
+///
+/// For every parent-side spawn. `None` means "not installed anywhere the agent
+/// cannot reach"; callers degrade as they already do when the tool is missing.
+/// Deliberately no `PATH` fallback: a fallback would restore the exact lookup
+/// this exists to remove, and would do so precisely on the machines where the
+/// attacker's directory is the only match.
+pub(crate) fn trusted_binary(name: &str) -> Option<PathBuf> {
+    find_in(TRUSTED_BIN_DIRS, name)
+}
 
 /// The `git` binary, resolved once from [`TRUSTED_BIN_DIRS`].
 ///
@@ -133,21 +173,19 @@ const TRUSTED_BIN_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin", "/opt/
 /// emitted at most once.
 ///
 /// `None` when no trusted `git` exists. Callers then degrade exactly as they do
-/// when git is missing (the audit reports `Incomplete`), which is the honest
-/// outcome — falling back to the bare name would restore the very `PATH` lookup
-/// this exists to remove.
-fn trusted_git() -> Option<&'static Path> {
+/// when git is missing: `Baseline::capture` records no baseline and no
+/// untracked set, and the report is `AuditReport::Unavailable` ("change audit
+/// unavailable"). Never a clean bill of health — but note it is `Unavailable`,
+/// not `Incomplete`, because both capture queries fail together.
+pub(crate) fn trusted_git() -> Option<&'static Path> {
     static GIT: OnceLock<Option<PathBuf>> = OnceLock::new();
     GIT.get_or_init(|| {
-        let found = TRUSTED_BIN_DIRS
-            .iter()
-            .map(|dir| Path::new(dir).join("git"))
-            .find(|p| p.is_file());
+        let found = trusted_binary("git");
         if found.is_none() {
             crate::ui::warn(&format!(
                 "no git found in {} — parent-side git queries (audit, repo config \
-                 trust) are skipped rather than resolved through PATH, which a \
-                 sandboxed agent can write to",
+                 trust, gh guard scope) are skipped rather than resolved through \
+                 PATH, which a sandboxed agent can write to",
                 TRUSTED_BIN_DIRS.join(", ")
             ));
         }
@@ -575,10 +613,63 @@ mod tests {
     fn the_trusted_bin_dirs_are_exactly_this() {
         assert_eq!(
             TRUSTED_BIN_DIRS,
-            &["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"],
-            "TRUSTED_BIN_DIRS changed. Every entry must be read-only to the \
-             sandbox (sandbox_policy::TOOL_READ_DIRS) and absolute."
+            &[
+                "/usr/bin",
+                "/bin",
+                "/usr/local/bin",
+                "/opt/homebrew/bin",
+                "/run/current-system/sw/bin",
+                "/home/linuxbrew/.linuxbrew/bin",
+            ],
+            "TRUSTED_BIN_DIRS changed. Every entry must be absolute and read-only \
+             to the sandbox — see the coverage test below."
         );
+    }
+
+    /// The invariant behind the list, not just its contents: a trusted
+    /// directory must be one the sandbox grants **read-only**. An entry the
+    /// sandbox also grants write to would be planted into exactly as easily as
+    /// a PATH directory, and the whole fix would be theatre.
+    ///
+    /// Checked against both platform lists because the resolver is shared; each
+    /// entry only has to be covered by one of them (`/opt/homebrew/bin` is
+    /// macOS, `/run/current-system/sw/bin` is NixOS).
+    #[test]
+    fn every_trusted_dir_is_a_read_only_tool_dir() {
+        let granted: Vec<&str> = crate::sandbox::policy::TOOL_READ_DIRS
+            .iter()
+            .chain(crate::sandbox::landlock_mod::LINUX_TOOL_DIRS)
+            .copied()
+            .collect();
+        for dir in TRUSTED_BIN_DIRS {
+            assert!(
+                Path::new(dir).is_absolute(),
+                "{dir} must be an absolute path"
+            );
+            assert!(
+                granted.iter().any(|g| Path::new(dir).starts_with(g)),
+                "{dir} is not covered by a read-only tool dir grant — either it is \
+                 unreachable from the sandbox's own view or, worse, it is writable"
+            );
+        }
+    }
+
+    /// The not-found path, which the host's real `/usr/bin/git` would otherwise
+    /// hide: no `git` in the searched dirs must yield `None`, never a bare name.
+    #[test]
+    fn find_in_returns_none_when_the_binary_is_absent() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let populated = tempfile::tempdir().expect("tempdir");
+        let planted = populated.path().join("git");
+        std::fs::write(&planted, "#!/bin/sh\n").expect("write");
+        let dirs = [empty.path().to_str().expect("utf8")];
+        assert_eq!(find_in(&dirs, "git"), None);
+        let dirs = [
+            empty.path().to_str().expect("utf8"),
+            populated.path().to_str().expect("utf8"),
+        ];
+        // First match wins, and the earlier directory is searched first.
+        assert_eq!(find_in(&dirs, "git"), Some(planted));
     }
 
     #[test]

@@ -216,8 +216,14 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
         return;
     }
 
-    // Extract token from gh CLI config (outside sandbox)
-    let Ok(output) = std::process::Command::new("gh")
+    // Extract token from gh CLI config (outside sandbox). Trusted path, not
+    // PATH: this runs in the unsandboxed parent at launch and its stdout is
+    // treated as a GitHub token, so a planted `gh` gets both code execution as
+    // the user and a free channel into the agent's environment.
+    let Some(gh) = crate::git::trusted_binary("gh") else {
+        return;
+    };
+    let Ok(output) = std::process::Command::new(&gh)
         .args(["auth", "token"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -268,8 +274,14 @@ fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent) {
         return;
     }
 
-    // Extract token from gh CLI config (outside sandbox)
-    let Ok(output) = std::process::Command::new("gh")
+    // Extract token from gh CLI config (outside sandbox). Trusted path, not
+    // PATH: this runs in the unsandboxed parent at launch and its stdout is
+    // treated as a GitHub token, so a planted `gh` gets both code execution as
+    // the user and a free channel into the agent's environment.
+    let Some(gh) = crate::git::trusted_binary("gh") else {
+        return;
+    };
+    let Ok(output) = std::process::Command::new(&gh)
         .args(["auth", "token"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -335,8 +347,12 @@ fn install_command_wrappers(
         && let Some(real_gh) = which_binary("gh")
     {
         let repo_scope = if gh_guard.scope_check {
-            if let Some(real_git) = which_binary("git") {
-                match crate::gh_proxy::detect_current_repo(&real_git, project_dir) {
+            // Trusted, not PATH: this git runs in the UNSANDBOXED parent, at
+            // launch. A `git` the previous session planted in ~/.bun/bin (or any
+            // other write+exec grant on PATH) would otherwise execute as the
+            // user here, one session later.
+            if let Some(real_git) = crate::git::trusted_git() {
+                match crate::gh_proxy::detect_current_repo(real_git, project_dir) {
                     Ok(repo) => Some(repo),
                     Err(reason) => {
                         ui::warn(&format!(
@@ -370,8 +386,10 @@ fn install_command_wrappers(
     }
 
     // Install git guard wrapper (only if git_guard enabled)
+    // Trusted, not PATH: this path is baked into the wrapper the agent's own
+    // shell then runs, so a planted `git` would be handed the guard's identity.
     if git_guard.enabled
-        && let Some(real_git) = which_binary("git")
+        && let Some(real_git) = crate::git::trusted_git()
     {
         let script = crate::gh_proxy::generate_git_wrapper_script(
             &real_git.to_string_lossy(),

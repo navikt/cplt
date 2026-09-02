@@ -41,7 +41,7 @@ mod exec;
 #[path = "sandbox_landlock.rs"]
 pub(crate) mod landlock_mod;
 #[path = "sandbox_policy.rs"]
-mod policy;
+pub(crate) mod policy;
 #[path = "sandbox_profile.rs"]
 mod profile;
 
