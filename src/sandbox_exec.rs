@@ -417,9 +417,12 @@ fn install_command_wrappers(
 
 /// Find an executable in PATH by name.
 ///
-/// Executability matters: `which` and `execvp` both skip a non-executable file,
-/// so accepting one here would report a stub as the tool's location (`cplt
-/// doctor`) or hand a caller a path that can only ever fail with `EACCES`.
+/// Executability matters: `which` and `execvp` both skip a file the caller may
+/// not execute, so accepting one here would report a stub as the tool's
+/// location (`cplt doctor`) or hand a caller a path that can only ever fail
+/// with `EACCES`. Deliberately the same predicate as the trusted-directory
+/// lookup — [`crate::git::is_executable_file`], an `X_OK` check, not a
+/// mode-bit test — so the two resolvers cannot disagree about what counts.
 pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var)

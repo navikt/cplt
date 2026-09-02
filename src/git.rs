@@ -149,14 +149,41 @@ pub(crate) const TRUSTED_BIN_DIRS: &[&str] = &[
     "/home/linuxbrew/.linuxbrew/bin",
 ];
 
-/// An existing regular file with at least one execute bit.
+/// An existing regular file that **this process** may execute.
 ///
-/// `which` and `execvp` both require `X_OK`, so a non-executable file of the
-/// right name is not a match — it is a shadow that would turn every spawn into
-/// `EACCES` instead of falling through to the next directory.
+/// `which` and `execvp` both require `X_OK` for the calling user, so mode bits
+/// alone are the wrong question: a root-owned `0700` `git` has an execute bit
+/// set, yet every spawn of it fails with `EACCES` — and accepting it here would
+/// shadow a genuinely executable `git` later in [`TRUSTED_BIN_DIRS`], which is
+/// the failure mode this predicate exists to prevent. `faccessat` with
+/// `AT_EACCESS` asks the kernel the same question the spawn will, owner, group,
+/// supplementary groups, other and any ACL included.
+///
+/// This is a shadowing filter, not a security guarantee. The answer describes
+/// the file as it was at this instant; it can be replaced, chmod'ed or
+/// unmounted before the spawn (TOCTOU), and nothing here proves the file is
+/// the binary it claims to be. Trust comes from the directory being read-only
+/// to the sandbox — see [`TRUSTED_BIN_DIRS`] — never from this call.
 pub(crate) fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    use std::os::unix::ffi::OsStrExt;
+
+    // `X_OK` on its own would also accept a *searchable directory*, so the
+    // regular-file check stays. It runs first: it is the cheap rejection.
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false; // An interior NUL cannot name a real file.
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the call.
+    unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::X_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
 }
 
 /// First executable `name` found in `dirs`. Split out of [`trusted_binary`] so
@@ -690,6 +717,47 @@ mod tests {
             real.path().to_str().expect("utf8"),
         ];
         assert_eq!(find_in(&dirs, "git"), Some(planted));
+    }
+
+    /// A file with an execute bit that does **not** apply to us is still a
+    /// shadow. Mode `0o011` (exec for group and other, not owner) on a file we
+    /// own is the reproducible stand-in for the real case — a root-owned `0700`
+    /// `git` — which needs a second uid to create. `mode & 0o111 != 0` accepts
+    /// both; `faccessat(X_OK)` rejects both.
+    #[test]
+    fn find_in_skips_a_binary_we_may_not_execute() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: a plain getuid(), no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            // root bypasses the permission check whenever *any* execute bit is
+            // set, so there is no shadow to observe. The root-owned-0700 case
+            // this stands in for is likewise unreachable while we are root.
+            return;
+        }
+        let shadow = tempfile::tempdir().expect("tempdir");
+        let real = tempfile::tempdir().expect("tempdir");
+        let denied = shadow.path().join("git");
+        std::fs::write(&denied, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o011)).expect("chmod");
+        assert!(!is_executable_file(&denied), "execute bit is not our bit");
+
+        let planted = real.path().join("git");
+        plant_executable(&planted);
+        let dirs = [
+            shadow.path().to_str().expect("utf8"),
+            real.path().to_str().expect("utf8"),
+        ];
+        assert_eq!(find_in(&dirs, "git"), Some(planted));
+    }
+
+    /// A directory named `git` is searchable, so `X_OK` alone would accept it.
+    #[test]
+    fn is_executable_file_rejects_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("git");
+        std::fs::create_dir(&sub).expect("mkdir");
+        assert!(!is_executable_file(&sub));
     }
 
     /// `Path::join` drops the base for an absolute `name` and walks out of it
