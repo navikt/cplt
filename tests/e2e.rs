@@ -3583,7 +3583,7 @@ paths = [
         let fake_gh = fake_gh_dir.path().join("gh");
         std::fs::write(
             &fake_gh,
-            "#!/bin/sh\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"token\" ]; then\n  echo fake_resolved_from_cli\n  exit 0\nfi\necho \"unexpected gh args: $*\" 1>&2\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"token\" ] && [ \"$3\" = \"--hostname\" ] && [ \"$4\" = \"github.com\" ]; then\n  echo fake_resolved_from_cli\n  exit 0\nfi\necho \"unexpected gh args: $*\" 1>&2\nexit 1\n",
         )
         .expect("should write fake gh");
 
