@@ -88,8 +88,8 @@ pub(super) fn describe_unknown_key(path: &str) -> String {
             }
             return format!(
                 "unknown key '{key}' in [{section}]: '{key}' is a top-level section; TOML \
-                 scopes '{key}.{example} = ...' written under [{section}] into [{section}] \
-                 — move it under its own [{key}] header"
+                 scopes '{key}.{example} = ...' written under [{section}] as \
+                 '{section}.{key}.{example}' — move it under its own [{key}] header"
             );
         }
         // Exclude the reported key itself from the suggestion candidates. The
@@ -683,6 +683,28 @@ some_new_option = true
             "got: {}",
             diagnostic.message
         );
+    }
+
+    /// Line-continuation (`\` at end of line) in the scoping messages must not
+    /// leak the source indentation into the rendered warning.
+    #[test]
+    fn scoping_messages_render_without_runs_of_whitespace() {
+        for msg in [
+            describe_unknown_key("git_guard.allow"),
+            describe_unknown_key("allow.allow"),
+        ] {
+            assert!(
+                !msg.contains("  "),
+                "double space in rendered message: {msg}"
+            );
+        }
+    }
+
+    /// The scoping warning names the fully-qualified path TOML actually builds.
+    #[test]
+    fn scoping_message_shows_the_fully_qualified_path() {
+        let msg = describe_unknown_key("git_guard.allow");
+        assert!(msg.contains("'git_guard.allow."), "got: {msg}");
     }
 
     /// The same detection must give the opposite advice when the section name is
