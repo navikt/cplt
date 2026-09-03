@@ -756,6 +756,76 @@ mod macos_tests {
             .map_err(|error| format!("DevToolsActivePort contained an invalid port: {error}"))
     }
 
+    fn select_initial_page_websocket(targets: &Value, port: u16) -> Result<Option<String>, String> {
+        let Some(initial_page) = targets.as_array().into_iter().flatten().find(|target| {
+            target.get("type").and_then(Value::as_str) == Some("page")
+                && target.get("url").and_then(Value::as_str) == Some("about:blank")
+        }) else {
+            return Ok(None);
+        };
+        let websocket_url = initial_page
+            .get("webSocketDebuggerUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "Chrome's initial about:blank page target had no webSocketDebuggerUrl".to_string()
+            })?
+            .to_string();
+        let expected_prefix = format!("ws://127.0.0.1:{port}/");
+        if !websocket_url.starts_with(&expected_prefix) {
+            return Err("Chrome returned a non-local or mismatched page WebSocket URL".to_string());
+        }
+        Ok(Some(websocket_url))
+    }
+
+    #[test]
+    fn cdp_page_target_selection_keeps_missing_target_pending() {
+        assert_eq!(select_initial_page_websocket(&json!([]), 9222), Ok(None));
+        assert_eq!(
+            select_initial_page_websocket(
+                &json!([
+                    {
+                        "type": "page",
+                        "url": "https://example.invalid/",
+                        "webSocketDebuggerUrl":
+                            "ws://127.0.0.1:9222/devtools/page/wrong-url"
+                    },
+                    {
+                        "type": "service_worker",
+                        "url": "about:blank",
+                        "webSocketDebuggerUrl":
+                            "ws://127.0.0.1:9222/devtools/page/wrong-type"
+                    }
+                ]),
+                9222
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn cdp_page_target_selection_accepts_exact_initial_page() {
+        let websocket_url = "ws://127.0.0.1:9222/devtools/page/expected";
+        assert_eq!(
+            select_initial_page_websocket(
+                &json!([
+                    {
+                        "type": "page",
+                        "url": "https://example.invalid/",
+                        "webSocketDebuggerUrl":
+                            "ws://127.0.0.1:9222/devtools/page/wrong-url"
+                    },
+                    {
+                        "type": "page",
+                        "url": "about:blank",
+                        "webSocketDebuggerUrl": websocket_url
+                    }
+                ]),
+                9222
+            ),
+            Ok(Some(websocket_url.to_string()))
+        );
+    }
+
     fn discover_page_websocket(
         browser: &mut ChromeProcess,
         user_data_dir: &Path,
@@ -807,43 +877,21 @@ mod macos_tests {
                             serde_json::from_slice(&output.stdout).map_err(|error| {
                                 format!("Chrome returned invalid /json/list JSON: {error}")
                             })?;
-                        let initial_page = targets
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .find(|target| {
-                                target.get("type").and_then(Value::as_str) == Some("page")
-                                    && target.get("url").and_then(Value::as_str)
-                                        == Some("about:blank")
-                            })
-                            .ok_or_else(|| {
-                                "Chrome /json/list had no initial about:blank page target"
-                                    .to_string()
-                            })?;
-                        let websocket_url = initial_page
-                            .get("webSocketDebuggerUrl")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| {
-                                "Chrome's initial about:blank page target had no \
-                                 webSocketDebuggerUrl"
-                                    .to_string()
-                            })?
-                            .to_string();
-                        let expected_prefix = format!("ws://127.0.0.1:{port}/");
-                        if !websocket_url.starts_with(&expected_prefix) {
-                            return Err(
-                                "Chrome returned a non-local or mismatched page WebSocket URL"
-                                    .to_string(),
-                            );
+                        match select_initial_page_websocket(&targets, port)? {
+                            Some(websocket_url) => return Ok((port, websocket_url)),
+                            None => {
+                                last_error = "Chrome /json/list had no initial \
+                                              about:blank page target yet"
+                                    .to_string();
+                            }
                         }
-                        return Ok((port, websocket_url));
+                    } else {
+                        last_error = format!(
+                            "CDP discovery curl exited with {}: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
                     }
-
-                    last_error = format!(
-                        "CDP discovery curl exited with {}: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
                 }
                 Err(error) => last_error = error,
             }
