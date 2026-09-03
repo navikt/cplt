@@ -77,6 +77,41 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Install pinned Chrome for Testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          playwright_version="1.63.0-alpha-2026-08-31"
+          browser_root="$HOME/Library/Caches/ms-playwright/cplt-ci-$playwright_version"
+          PLAYWRIGHT_BROWSERS_PATH="$browser_root" \
+            npx --yes "playwright@$playwright_version" install chromium
+
+          chrome_paths=()
+          while IFS= read -r path; do
+            chrome_paths+=("$path")
+          done < <(
+            find "$browser_root" -type f \
+              -path '*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing' \
+              -perm -111 -print
+          )
+          if [ "${#chrome_paths[@]}" -ne 1 ]; then
+            echo "::error::Pinned Playwright install must provide exactly one Chrome for Testing executable"
+            exit 1
+          fi
+          chrome_path="${chrome_paths[0]}"
+          case "$chrome_path" in
+            "$browser_root"/*"/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing") ;;
+            *)
+              echo "::error::Discovered browser path is not the expected Chrome for Testing executable"
+              exit 1
+              ;;
+          esac
+          if [ ! -x "$chrome_path" ]; then
+            echo "::error::Discovered Chrome for Testing file is not executable"
+            exit 1
+          fi
+          printf 'CPLT_CHROME_FOR_TESTING=%s\n' "$chrome_path" >> "$GITHUB_ENV"
+
       - name: Verify sandbox-exec available
         run: |
           which sandbox-exec
@@ -129,15 +164,23 @@ jobs:
           # cargo hides passing-test stderr, so we run with --nocapture above and
           # count the markers here, surfacing the residual (unrunnable-in-CI) count
           # as a ::warning:: so a silent-skip regression stays observable (#115).
+          # Chrome for Testing is installed above, so its distinct marker is a
+          # setup/test regression and must fail this job.
           LOG="$RUNNER_TEMP/test-output.log"
           if [ ! -f "$LOG" ]; then
             echo "No test output captured — skipping summary"
             exit 0
           fi
           copilot_skips=$(grep -c "SKIPPED (copilot)" "$LOG" || true)
+          chrome_skips=$(grep -c "SKIPPED (chrome-for-testing):" "$LOG" || true)
           echo "Copilot-gated tests skipped (Copilot not installed in CI): $copilot_skips"
           if [ "$copilot_skips" -gt 0 ]; then
             echo "::warning::${copilot_skips} E2E test(s) skipped because the real Copilot CLI is not installed in CI. These genuinely require the Copilot binary/auth (see require_copilot! in tests/e2e.rs); all sandbox/proxy/profile behaviour is covered without it."
+          fi
+          echo "Chrome for Testing integration tests skipped: $chrome_skips"
+          if [ "$chrome_skips" -gt 0 ]; then
+            echo "::error::${chrome_skips} Chrome for Testing integration test(s) skipped despite the pinned CI browser setup."
+            exit 1
           fi
 
       - name: Assert working tree is clean (no leaked test artifacts)

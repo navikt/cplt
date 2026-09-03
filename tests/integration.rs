@@ -5,9 +5,11 @@
 
 #[cfg(target_os = "macos")]
 mod macos_tests {
+    use std::ffi::OsString;
     use std::fs;
-    use std::path::PathBuf;
-    use std::process::Command;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -421,6 +423,95 @@ mod macos_tests {
             allow_cache_exec_any: false,
             allow_browser: false,
         }
+    }
+
+    fn chrome_dump_dom_args(user_data_dir: &Path) -> Vec<OsString> {
+        vec![
+            "--headless".into(),
+            "--disable-gpu".into(),
+            "--no-first-run".into(),
+            format!("--user-data-dir={}", user_data_dir.display()).into(),
+            "--dump-dom".into(),
+            "about:blank".into(),
+        ]
+    }
+
+    fn chrome_output(output: &Output) -> String {
+        format!(
+            "status: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    #[test]
+    fn real_profile_launches_chrome_for_testing() {
+        require_sandbox!();
+
+        let Some(chrome) = std::env::var_os("CPLT_CHROME_FOR_TESTING") else {
+            eprintln!("SKIPPED (chrome-for-testing): CPLT_CHROME_FOR_TESTING is not set");
+            return;
+        };
+        let chrome = PathBuf::from(chrome);
+        let chrome = fs::canonicalize(&chrome)
+            .expect("CPLT_CHROME_FOR_TESTING must identify an existing executable");
+        let expected_suffix =
+            Path::new("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing");
+        assert!(
+            chrome.is_absolute() && chrome.ends_with(expected_suffix),
+            "CPLT_CHROME_FOR_TESTING must identify the expected \
+             Google Chrome for Testing.app executable"
+        );
+        let metadata = fs::metadata(&chrome)
+            .expect("CPLT_CHROME_FOR_TESTING executable metadata should be readable");
+        assert!(
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+            "CPLT_CHROME_FOR_TESTING must identify an executable file"
+        );
+
+        let control_data_dir = tempfile::tempdir().expect("create control browser state");
+        let control = Command::new(&chrome)
+            .args(chrome_dump_dom_args(control_data_dir.path()))
+            .output()
+            .expect("launch unsandboxed Chrome for Testing control");
+        assert!(
+            control.status.success(),
+            "unsandboxed Chrome for Testing control must succeed:\n{}",
+            chrome_output(&control)
+        );
+        assert!(
+            String::from_utf8_lossy(&control.stdout).contains("<html"),
+            "unsandboxed Chrome for Testing control must dump the about:blank DOM:\n{}",
+            chrome_output(&control)
+        );
+
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let allow_cache_exec = ["ms-playwright".to_string()];
+        let mut opts = default_opts(&project, &home);
+        opts.allow_cache_exec = &allow_cache_exec;
+        let profile = write_real_profile(&opts);
+        let sandbox_data_dir = tempfile::tempdir().expect("create sandboxed browser state");
+        let sandboxed = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile)
+            .arg(&chrome)
+            .args(chrome_dump_dom_args(sandbox_data_dir.path()))
+            .output();
+        fs::remove_file(&profile).expect("remove generated Chrome test profile");
+        let sandboxed = sandboxed.expect("launch Chrome for Testing through sandbox-exec");
+
+        assert!(
+            sandboxed.status.success(),
+            "Chrome for Testing must launch through the real cplt profile:\n{}",
+            chrome_output(&sandboxed)
+        );
+        assert!(
+            String::from_utf8_lossy(&sandboxed.stdout).contains("<html"),
+            "sandboxed Chrome for Testing must dump the about:blank DOM:\n{}",
+            chrome_output(&sandboxed)
+        );
     }
 
     #[test]
