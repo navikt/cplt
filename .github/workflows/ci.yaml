@@ -153,7 +153,56 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+
+          cleanup_log_stream() {
+            test_status=$?
+            trap - EXIT
+            log_stream_was_running=0
+            log_stream_terminated=0
+            if [ "$(jobs -pr)" = "$log_stream_pid" ]; then
+              log_stream_was_running=1
+              if kill "$log_stream_pid" 2>/dev/null; then
+                log_stream_terminated=1
+              fi
+            fi
+            if wait "$log_stream_pid"; then
+              log_stream_status=0
+            else
+              log_stream_status=$?
+            fi
+            if [ "$log_stream_was_running" -eq 0 ]; then
+              echo "::warning::Seatbelt log stream exited before cleanup (status $log_stream_status)"
+            elif [ "$log_stream_terminated" -eq 0 ]; then
+              echo "::warning::Seatbelt log stream could not be terminated"
+            elif [ "$log_stream_status" -ne 0 ] &&
+              [ "$log_stream_status" -ne 143 ]; then
+              echo "::warning::Seatbelt log stream cleanup returned status $log_stream_status"
+            fi
+            exit "$test_status"
+          }
+
+          # Temporary diagnostics for the next Chrome Seatbelt denial.
+          SEATBELT_LOG="$RUNNER_TEMP/seatbelt-denials.log"
+          /usr/bin/log stream --level debug --style compact \
+            --predicate 'eventMessage CONTAINS[c] "Sandbox:"' \
+            > "$SEATBELT_LOG" 2>&1 &
+          log_stream_pid=$!
+          trap cleanup_log_stream EXIT
           cargo test --verbose -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+
+      - name: Surface Chrome sandbox denials
+        if: always()
+        shell: bash
+        run: |
+          LOG="$RUNNER_TEMP/seatbelt-denials.log"
+          if [ ! -f "$LOG" ]; then
+            echo "::warning::Seatbelt diagnostic log was not created"
+            exit 0
+          fi
+          grep -i 'Sandbox:' "$LOG" |
+            grep -Ei 'Chrome|Chromium|Crashpad' |
+            tail -250 |
+            sed 's/^/Seatbelt denial: /' || true
 
       - name: Surface tests skipped for missing tooling
         if: always()
