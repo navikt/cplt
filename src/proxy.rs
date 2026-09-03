@@ -3211,27 +3211,43 @@ mod tests {
     /// spins out its deadline. Retrying the connect is the only thing that
     /// recovers it — the same transient `assert_connect_allowed` retries for.
     ///
-    /// Returns the status of the attempt that was recorded, so callers still
-    /// assert on the verdict the proxy actually reached.
+    /// The returned status always describes the attempt that produced the
+    /// record: a connect is only re-issued after one that provably recorded
+    /// nothing, so `status` and `rec` cannot come from different attempts.
     fn connect_and_await_observed(proxy: &ProxyHandle, host: &str) -> (String, ObservedDomain) {
-        for _ in 0..5 {
-            let status = proxy_connect(proxy.port, &format!("{host}:443"));
-            let deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                if let Some(rec) = proxy
-                    .observed_domains()
-                    .into_iter()
-                    .find(|o| o.host == host)
-                {
-                    return (status, rec);
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
+        // Only `403 EOF` / `403 ECONNRESET` mean the proxy never parsed a
+        // CONNECT, so nothing will ever be recorded for that attempt and the
+        // only recovery is another connect. Any other status was reached by
+        // parsing a CONNECT, so the record is on its way and re-issuing would
+        // leave `status` describing a different attempt than `rec`.
+        fn never_parsed(status: &str) -> bool {
+            status.contains("EOF") || status.contains("ECONNRESET")
+        }
+
+        let key = normalize_hostname(host);
+        let overall = Instant::now() + Duration::from_secs(5);
+        let mut status = proxy_connect(proxy.port, &format!("{host}:443"));
+        loop {
+            // `record_observation` stores the normalized host, so match on that
+            // rather than on the spelling the caller passed.
+            if let Some(rec) = proxy
+                .observed_domains()
+                .into_iter()
+                .find(|o| o.host == key)
+            {
+                return (status, rec);
+            }
+            assert!(
+                Instant::now() < overall,
+                "{host} was never recorded in the observed set (last status: {status})"
+            );
+            if never_parsed(&status) {
+                std::thread::sleep(Duration::from_millis(25));
+                status = proxy_connect(proxy.port, &format!("{host}:443"));
+            } else {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        panic!("{host} was never recorded in the observed set");
     }
 
     #[test]
