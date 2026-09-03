@@ -622,12 +622,35 @@ mod tests {
 
     /// Linux only, and it actually runs in CI: `bwrap` is the sandbox driver,
     /// executed by the unsandboxed parent, so it must never come off `PATH`.
-    /// Passes vacuously on a host without bwrap; on a host with one it fails if
-    /// [`bubblewrap::check_availability`] is reverted to a `PATH` lookup.
+    ///
+    /// Asserting only "the result is inside TRUSTED_BIN_DIRS" does not test
+    /// anything: every distro installs bwrap to `/usr/bin`, which is itself
+    /// trusted, so a `PATH` lookup satisfies it on every ordinary host. This
+    /// plants a decoy `bwrap` first on `PATH` instead — a `PATH` lookup returns
+    /// the decoy, trusted resolution cannot, whether or not a real bwrap exists.
     #[cfg(target_os = "linux")]
     #[test]
     fn bwrap_is_never_resolved_from_path() {
-        let found = bubblewrap::check_availability();
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let decoy = tmp.path().join("bwrap");
+        std::fs::write(&decoy, "#!/bin/sh\nexit 0\n").expect("write decoy");
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod decoy");
+
+        let path = format!(
+            "{}:{}",
+            tmp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let found = temp_env::with_var("PATH", Some(&path), bubblewrap::check_availability);
+
+        assert_ne!(
+            found.as_deref(),
+            Some(decoy.as_path()),
+            "bwrap was resolved from PATH — a planted binary would drive the sandbox"
+        );
         assert!(
             found.as_ref().is_none_or(|p| crate::git::TRUSTED_BIN_DIRS
                 .iter()

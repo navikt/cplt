@@ -1713,6 +1713,29 @@ mod tests {
     use super::*;
 
     /// Build a minimal `ProfileOptions` for SBPL-string tests.
+    /// Resolving git from trusted directories means `git_common_dir` is `None`
+    /// on a machine whose git lives elsewhere. The denies for an ordinary repo
+    /// must not depend on it: `<root>/.git` is seeded for every writable root
+    /// unconditionally, so the hooks and config denies stand with no git at all.
+    ///
+    /// Pins the boundary of that guarantee — a worktree's *shared* gitdir does
+    /// still need resolving, which is what `discover::gitdir_without_git`
+    /// recovers without spawning anything.
+    #[test]
+    fn git_persistence_denies_do_not_depend_on_a_resolved_git() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        opts.git_common_dir = None;
+        let p = generate_profile(&opts);
+        for rule in [
+            r#"(deny file-write* (subpath "/projects/app/.git/hooks"))"#,
+            r#"(deny file-write* (literal "/projects/app/.git/config"))"#,
+        ] {
+            assert!(p.contains(rule), "MISSING without git_common_dir: {rule}");
+        }
+    }
+
     fn test_options<'a>(
         project_dir: &'a std::path::Path,
         home_dir: &'a std::path::Path,

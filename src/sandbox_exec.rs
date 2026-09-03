@@ -424,6 +424,15 @@ fn install_command_wrappers(
     // Install git guard wrapper (only if git_guard enabled)
     // Trusted, not PATH: this path is baked into the wrapper the agent's own
     // shell then runs, so a planted `git` would be handed the guard's identity.
+    if git_guard.enabled && crate::git::trusted_git().is_none() {
+        // Say so. Skipping the wrapper silently leaves the user believing
+        // push/force-push are guarded when they are not — the gh branch above
+        // warns in the equivalent situation, and this one did not.
+        ui::warn(
+            "git guard could not find Git in a trusted directory — the git wrapper \
+             is not installed, so push and force-push are NOT blocked in this session.",
+        );
+    }
     if git_guard.enabled
         && let Some(real_git) = crate::git::trusted_git()
     {

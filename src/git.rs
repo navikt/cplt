@@ -293,7 +293,9 @@ pub(crate) fn trusted_git() -> Option<&'static Path> {
             crate::ui::warn(&format!(
                 "no git found in {} — parent-side git queries (audit, repo config \
                  trust, gh guard scope) are skipped rather than resolved through \
-                 PATH, which a sandboxed agent can write to",
+                 PATH, which a sandboxed agent can write to. The git-persistence \
+                 denies still cover <root>/.git for every writable root; a bare \
+                 repository's gitdir cannot be resolved without git and loses them",
                 TRUSTED_BIN_DIRS.join(", ")
             ));
         }
