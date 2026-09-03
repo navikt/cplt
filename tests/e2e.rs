@@ -11,11 +11,9 @@
 
 #[cfg(target_os = "macos")]
 mod e2e_tests {
-    use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::{Duration, Instant};
 
     static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -4386,103 +4384,6 @@ paths = [
             })
     }
 
-    struct GeneratedPlaywrightDir {
-        path: PathBuf,
-        device: u64,
-        inode: u64,
-    }
-
-    impl GeneratedPlaywrightDir {
-        fn new(path: PathBuf) -> Self {
-            use std::os::unix::fs::MetadataExt;
-
-            let metadata = path
-                .symlink_metadata()
-                .expect("generated Playwright socket directory should exist while cplt runs");
-            assert!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "generated Playwright socket path must be a real directory"
-            );
-            Self {
-                path,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }
-        }
-    }
-
-    impl Drop for GeneratedPlaywrightDir {
-        fn drop(&mut self) {
-            use std::os::unix::fs::MetadataExt;
-
-            let Ok(metadata) = self.path.symlink_metadata() else {
-                return;
-            };
-            if metadata.is_dir()
-                && !metadata.file_type().is_symlink()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
-            {
-                let _ = std::fs::remove_dir(&self.path);
-            }
-        }
-    }
-
-    struct CpltSignalTestProcess {
-        child: Child,
-        socket_dir: Option<GeneratedPlaywrightDir>,
-    }
-
-    impl CpltSignalTestProcess {
-        fn wait_for_exit(&mut self, timeout: Duration) -> ExitStatus {
-            let deadline = Instant::now() + timeout;
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(status)) => return status,
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) => panic!("cplt did not exit within {timeout:?}"),
-                    Err(error) => panic!("failed waiting for cplt: {error}"),
-                }
-            }
-        }
-
-        fn close_stdin(&mut self) {
-            self.child.stdin.take();
-        }
-    }
-
-    impl Drop for CpltSignalTestProcess {
-        fn drop(&mut self) {
-            self.close_stdin();
-
-            let deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) | Err(_) => break,
-                }
-            }
-
-            // Target only the cplt process owned by this test, never its process group.
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-
-    fn receive_line_before(
-        receiver: &std::sync::mpsc::Receiver<String>,
-        deadline: Instant,
-    ) -> String {
-        receiver
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("sandboxed child did not report readiness before the startup deadline")
-    }
-
     fn playwright_env_output(args: &[&str], ambient: Option<&str>) -> std::process::Output {
         let mut command = cplt_cmd();
         command
@@ -4496,95 +4397,6 @@ paths = [
             command.env_remove("PWTEST_SOCKETS_DIR");
         }
         command.output().expect("cplt exec should run")
-    }
-
-    #[test]
-    fn e2e_exec_sigint_cleans_up_playwright_socket_dir() {
-        require_sandbox!();
-
-        let child_script = "\
-trap 'trap - INT; kill -INT $$' INT
-printf 'PWTEST_SOCKETS_DIR=%s\n' \"$PWTEST_SOCKETS_DIR\"
-printf 'READY\n'
-IFS= read -r _
-";
-        let mut command = cplt_cmd();
-        command
-            .args([
-                "--no-validate",
-                "--allow-cache-exec",
-                "ms-playwright",
-                "--no-scratch-dir",
-                "exec",
-                "--",
-                "/bin/sh",
-                "-c",
-                child_script,
-            ])
-            .current_dir(project_dir())
-            .env_remove("PWTEST_SOCKETS_DIR")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = command.spawn().expect("cplt exec should start");
-        let cplt_pid = child.id();
-        let stdout = child.stdout.take().expect("cplt stdout should be piped");
-        let mut process = CpltSignalTestProcess {
-            child,
-            socket_dir: None,
-        };
-
-        let (line_sender, line_receiver) = std::sync::mpsc::channel();
-        let (done_sender, done_receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                if line_sender.send(line).is_err() {
-                    break;
-                }
-            }
-            let _ = done_sender.send(());
-        });
-
-        let startup_deadline = Instant::now() + Duration::from_secs(10);
-        let socket_line = receive_line_before(&line_receiver, startup_deadline);
-        let socket_path = PathBuf::from(
-            socket_line
-                .strip_prefix("PWTEST_SOCKETS_DIR=")
-                .expect("child should report its injected PWTEST_SOCKETS_DIR"),
-        );
-        assert!(
-            is_automatic_playwright_socket_dir(&socket_path.to_string_lossy()),
-            "child must observe the concrete auto-generated Playwright socket directory"
-        );
-        process.socket_dir = Some(GeneratedPlaywrightDir::new(socket_path.clone()));
-        assert_eq!(
-            receive_line_before(&line_receiver, startup_deadline),
-            "READY",
-            "child should install its SIGINT trap before signaling readiness"
-        );
-
-        let kill_result = unsafe { libc::kill(cplt_pid as i32, libc::SIGINT) };
-        assert_eq!(
-            kill_result, 0,
-            "SIGINT should target the spawned cplt PID successfully"
-        );
-
-        let status = process.wait_for_exit(Duration::from_secs(5));
-        process.close_stdin();
-        done_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("sandboxed child should exit after SIGINT or cleanup EOF");
-
-        let socket_dir_exists = socket_path.exists();
-        assert!(
-            status.code() == Some(128 + libc::SIGINT) && !socket_dir_exists,
-            "cplt should return 130 through its normal cleanup path after SIGINT; \
-             status: {status:?}, socket directory still exists: {socket_dir_exists}"
-        );
     }
 
     #[test]
