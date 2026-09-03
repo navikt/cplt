@@ -7,9 +7,12 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -30,6 +33,10 @@ TOOL_RESULT_TEXT_INSPECT_LIMIT = 8 * 1024
 TOOL_RESULT_DIAGNOSTIC_LIMIT = 2 * 1024
 GRACEFUL_EXIT_SECONDS = 3.0
 SIGNAL_EXIT_SECONDS = 3.0
+PLAYWRIGHT_SOCKET_DIRECTORY_NAME = ".pws"
+PLAYWRIGHT_SOCKET_CLEANUP_FAILURE = (
+    "reserved Playwright socket directory cleanup failed"
+)
 
 
 class SmokeFailure(Exception):
@@ -236,6 +243,70 @@ def _validate_paths(
     return runner_temp, project, prefix, cplt, node, chrome
 
 
+def _cleanup_socket_directory(
+    owned_directory: Tuple[Path, int, int]
+) -> Optional[str]:
+    socket_directory, expected_device, expected_inode = owned_directory
+    try:
+        current = socket_directory.lstat()
+    except OSError:
+        return PLAYWRIGHT_SOCKET_CLEANUP_FAILURE
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != expected_device
+        or current.st_ino != expected_inode
+    ):
+        return PLAYWRIGHT_SOCKET_CLEANUP_FAILURE
+    try:
+        resolved = socket_directory.resolve(strict=True)
+    except OSError:
+        return PLAYWRIGHT_SOCKET_CLEANUP_FAILURE
+    if resolved != socket_directory:
+        return PLAYWRIGHT_SOCKET_CLEANUP_FAILURE
+
+    try:
+        shutil.rmtree(str(socket_directory))
+    except OSError:
+        return PLAYWRIGHT_SOCKET_CLEANUP_FAILURE
+    try:
+        socket_directory.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return PLAYWRIGHT_SOCKET_CLEANUP_FAILURE
+    return PLAYWRIGHT_SOCKET_CLEANUP_FAILURE
+
+
+def _create_socket_directory(project: Path) -> Tuple[Path, int, int]:
+    socket_directory = project / PLAYWRIGHT_SOCKET_DIRECTORY_NAME
+    try:
+        socket_directory.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise SmokeFailure(
+            "reserved Playwright socket directory already exists"
+        ) from error
+    except OSError as error:
+        raise SmokeFailure(
+            "could not create reserved Playwright socket directory"
+        ) from error
+
+    owned_directory = None  # type: Optional[Tuple[Path, int, int]]
+    try:
+        created = socket_directory.lstat()
+        owned_directory = (socket_directory, created.st_dev, created.st_ino)
+        if not stat.S_ISDIR(created.st_mode):
+            raise OSError
+        if socket_directory.resolve(strict=True) != socket_directory:
+            raise OSError
+    except OSError as error:
+        if owned_directory is not None:
+            _cleanup_socket_directory(owned_directory)
+        raise SmokeFailure(
+            "reserved Playwright socket directory setup failed"
+        ) from error
+    return owned_directory
+
+
 def _build_command(
     cplt: Path,
     project: Path,
@@ -261,6 +332,8 @@ def _build_command(
         "--no-allow-docker",
         "--no-allow-tmp-exec",
         "--deny-clipboard",
+        "--pass-env",
+        "PWTEST_SOCKETS_DIR",
         "exec",
         "--",
         str(node),
@@ -949,6 +1022,68 @@ def _self_test_navigation_diagnostic() -> None:
         raise AssertionError("sensitive-only navigation result unexpectedly passed")
 
 
+def _self_test_socket_directory_lifecycle() -> None:
+    with tempfile.TemporaryDirectory(prefix="cplt-playwright-sockets-") as temporary:
+        project = Path(temporary).resolve(strict=True)
+        owned_directory = _create_socket_directory(project)
+        socket_directory = owned_directory[0]
+        assert socket_directory == project / PLAYWRIGHT_SOCKET_DIRECTORY_NAME
+        assert socket_directory.is_dir()
+        assert not socket_directory.is_symlink()
+        assert _cleanup_socket_directory(owned_directory) is None
+        assert not socket_directory.exists()
+        assert not socket_directory.is_symlink()
+
+        socket_directory.mkdir()
+        try:
+            _create_socket_directory(project)
+        except SmokeFailure as failure:
+            assert str(failure) == (
+                "reserved Playwright socket directory already exists"
+            )
+        else:
+            raise AssertionError("pre-existing socket directory was accepted")
+        assert socket_directory.is_dir()
+
+
+def _self_test_socket_directory_symlink_replacement() -> None:
+    with tempfile.TemporaryDirectory(prefix="cplt-playwright-sockets-") as temporary:
+        project = Path(temporary).resolve(strict=True)
+        owned_directory = _create_socket_directory(project)
+        socket_directory = owned_directory[0]
+        original_directory = project / "original-pws"
+        socket_directory.rename(original_directory)
+        socket_directory.symlink_to(original_directory, target_is_directory=True)
+
+        assert _cleanup_socket_directory(owned_directory) == (
+            "reserved Playwright socket directory cleanup failed"
+        )
+        assert socket_directory.is_symlink()
+        assert original_directory.is_dir()
+
+
+def _self_test_socket_directory_popen_failure() -> None:
+    with tempfile.TemporaryDirectory(prefix="cplt-playwright-sockets-") as temporary:
+        root = Path(temporary).resolve(strict=True)
+        project = root / "project"
+        runner_temp = root / "runner-temp"
+        project.mkdir()
+        runner_temp.mkdir()
+
+        try:
+            _run_protocol_smoke(
+                [str(root / "missing-cplt")], project, runner_temp
+            )
+        except SmokeFailure as failure:
+            assert str(failure) == "could not start the current cplt binary"
+        else:
+            raise AssertionError("missing cplt executable unexpectedly started")
+
+        socket_directory = project / PLAYWRIGHT_SOCKET_DIRECTORY_NAME
+        assert not socket_directory.exists()
+        assert not socket_directory.is_symlink()
+
+
 def _run_protocol_smoke(
     command: List[str], project: Path, runner_temp: Path
 ) -> Tuple[
@@ -980,6 +1115,8 @@ def _run_protocol_smoke(
         raise SmokeFailure("reserved empty cplt config path already exists")
     child_env["CPLT_CONFIG"] = str(empty_config)
 
+    owned_socket_directory = _create_socket_directory(project)
+    child_env["PWTEST_SOCKETS_DIR"] = str(owned_socket_directory[0])
     try:
         process = subprocess.Popen(
             command,
@@ -990,8 +1127,13 @@ def _run_protocol_smoke(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except OSError as error:
-        raise SmokeFailure("could not start the current cplt binary") from error
+    except BaseException as error:
+        socket_cleanup_error = _cleanup_socket_directory(owned_socket_directory)
+        if socket_cleanup_error is not None:
+            raise SmokeFailure(socket_cleanup_error) from error
+        if isinstance(error, OSError):
+            raise SmokeFailure("could not start the current cplt binary") from error
+        raise
 
     process_group_id = process.pid
     cleanup_error = None
@@ -1066,18 +1208,24 @@ def _run_protocol_smoke(
     except Exception:
         failure = SmokeFailure("unexpected local protocol error")
     finally:
-        cleanup_error, natural_exit_failure = _cleanup_process_group(
-            process, process_group_id
-        )
-        if failure is None and natural_exit_failure is not None:
-            failure = natural_exit_failure
-        stdout_stopped = not stdout_started or stdout_reader.join()
-        stderr_stopped = not stderr_started or stderr_capture.join()
-        if not stdout_stopped or not stderr_stopped:
-            cleanup_error = (
-                cleanup_error
-                or "stdio drains remained open after process-group cleanup"
+        try:
+            cleanup_error, natural_exit_failure = _cleanup_process_group(
+                process, process_group_id
             )
+            if failure is None and natural_exit_failure is not None:
+                failure = natural_exit_failure
+            stdout_stopped = not stdout_started or stdout_reader.join()
+            stderr_stopped = not stderr_started or stderr_capture.join()
+            if not stdout_stopped or not stderr_stopped:
+                cleanup_error = (
+                    cleanup_error
+                    or "stdio drains remained open after process-group cleanup"
+                )
+        finally:
+            socket_cleanup_error = _cleanup_socket_directory(
+                owned_socket_directory
+            )
+            cleanup_error = cleanup_error or socket_cleanup_error
 
     if stdout_reader is None or stderr_capture is None:
         if failure is not None:
@@ -1125,9 +1273,18 @@ def _run_self_test() -> None:
     assert command[:exec_index].count("--allow-read") == 1
     assert command[command.index("--allow-read") + 1] == str(prefix)
     assert "--allow-write" not in command
+    assert "--allow-socket" not in command
+    assert command.count("--pass-env") == 1
+    pass_env_index = command.index("--pass-env")
+    assert pass_env_index < exec_index
+    assert command[pass_env_index + 1] == "PWTEST_SOCKETS_DIR"
+    assert command.count("PWTEST_SOCKETS_DIR") == 1
     assert command[exec_index + 1] == "--"
     assert command[exec_index + 2] == "/usr/local/bin/node"
     assert "--isolated" in command
+    _self_test_socket_directory_lifecycle()
+    _self_test_socket_directory_symlink_replacement()
+    _self_test_socket_directory_popen_failure()
 
     valid_tool = {
         "tools": [
