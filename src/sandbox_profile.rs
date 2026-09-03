@@ -1353,18 +1353,36 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
     sbpl!(sb);
 }
 
+/// Resolve symlinks in a path built from `$HOME`, falling back to the path
+/// itself when it does not exist.
+///
+/// `extra_read` / `extra_write` entries are already canonicalized (`--allow-read`
+/// through `canonicalize_paths`, config `allow.read` through
+/// `resolve_config_path`), so any comparison against a path we construct from
+/// `$HOME` must resolve that side too. Without it a dotfile-managed home — where
+/// `~/.npmrc` is a symlink into `~/dotfiles` — never matches, and the user's
+/// explicit grant is silently dropped.
+fn resolved(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
 /// Re-allow credential files from `DENIED_HOME_SUBPATHS` when the user
 /// explicitly opts in via `--allow-read` or `allow.read` in config.toml.
 ///
 /// Emitted AFTER `emit_deny_rules` so SBPL last-match-wins re-allows the file.
 /// Only matches exact paths from `DENIED_HOME_SUBPATHS` — hard denies
 /// (DENIED_FILES, DENIED_DOTFILES) cannot be overridden this way.
+///
+/// The re-allow names the `$HOME` path, not the resolved one: the deny it
+/// overrides names `$HOME` too, and the macOS sandbox matches a rule against
+/// the path as opened, so the literal has to line up with the deny. The
+/// resolved target is separately allowed by `emit_user_allows`.
 fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[PathBuf]) {
     let home_path = Path::new(home);
     let mut overrides: Vec<&str> = Vec::new();
 
     for &file in DENIED_HOME_SUBPATHS {
-        let full_path = home_path.join(file);
+        let full_path = resolved(home_path.join(file));
         if extra_read.iter().any(|p| p == &full_path) {
             overrides.push(file);
         }
@@ -1396,10 +1414,21 @@ fn emit_denied_dotfile_overrides(sb: &mut String, home: &str, extra_read: &[Path
     for path in extra_read {
         for &dotfile in DENIED_DOTFILES {
             let denied_dir = home_path.join(dotfile);
-            if path.starts_with(&denied_dir) && *path != denied_dir {
-                overrides.push(path.to_string_lossy().into_owned());
-                break;
+            let resolved_dir = resolved(denied_dir.clone());
+            let Ok(rel) = path.strip_prefix(&resolved_dir) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
             }
+            overrides.push(path.to_string_lossy().into_owned());
+            // When `~/<dotfile>` is itself a symlink the deny names the $HOME
+            // path, and the macOS sandbox matches a rule against the path as
+            // opened — so the re-allow has to cover that form as well.
+            if resolved_dir != denied_dir {
+                overrides.push(denied_dir.join(rel).to_string_lossy().into_owned());
+            }
+            break;
         }
     }
 
@@ -2029,6 +2058,62 @@ mod tests {
         assert!(
             !p.contains("\"*:443\""),
             "fail-closed: proxy_forced without a port must not emit *:443"
+        );
+    }
+
+    /// Issue #244: `allow.read` entries are canonicalized, so a dotfile-managed
+    /// `~/.npmrc` symlink used to miss the `home.join(file)` comparison and the
+    /// re-allow was silently never emitted.
+    #[test]
+    fn symlinked_credential_file_still_gets_its_reallow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        std::fs::create_dir_all(home.join("dotfiles")).expect("mkdir");
+        std::fs::write(home.join("dotfiles/npmrc"), "//r/:_authToken=x\n").expect("write");
+        std::os::unix::fs::symlink(home.join("dotfiles/npmrc"), home.join(".npmrc"))
+            .expect("symlink");
+
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let mut opts = test_options(&project, &home);
+        // What canonicalize_paths / resolve_config_path would put in extra_read.
+        let extra_read = [std::fs::canonicalize(home.join(".npmrc")).expect("canonicalize")];
+        assert_eq!(extra_read[0], home.join("dotfiles/npmrc"));
+        opts.extra_read = &extra_read;
+        let p = generate_profile(&opts);
+
+        let home_str = home.display();
+        assert!(
+            p.contains(&format!(
+                "(allow file-read* (literal \"{home_str}/.npmrc\"))"
+            )),
+            "re-allow for the symlinked ~/.npmrc missing from profile:\n{p}"
+        );
+    }
+
+    /// Same class, `DENIED_DOTFILES` half: a symlinked `~/.aws` must still get
+    /// the targeted re-allow, and it must name the `$HOME` path the deny uses.
+    #[test]
+    fn symlinked_denied_dotfile_dir_still_gets_its_reallow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        std::fs::create_dir_all(home.join("dotfiles/aws")).expect("mkdir");
+        std::fs::write(home.join("dotfiles/aws/config"), "[default]\n").expect("write");
+        std::os::unix::fs::symlink(home.join("dotfiles/aws"), home.join(".aws")).expect("symlink");
+
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let mut opts = test_options(&project, &home);
+        let extra_read = [std::fs::canonicalize(home.join(".aws/config")).expect("canonicalize")];
+        opts.extra_read = &extra_read;
+        let p = generate_profile(&opts);
+
+        let home_str = home.display();
+        assert!(
+            p.contains(&format!(
+                "(allow file-read* (literal \"{home_str}/.aws/config\"))"
+            )),
+            "re-allow naming the $HOME path missing from profile:\n{p}"
         );
     }
 }
