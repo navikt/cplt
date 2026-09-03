@@ -116,8 +116,10 @@ pub struct ProfileOptions<'a> {
     pub allow_cache_exec_any: bool,
     /// Allow Launch Services (`open` command) for OAuth browser flows.
     pub allow_browser: bool,
-    /// The agent's credential was resolved from the environment before launch,
-    /// so the macOS Keychain grant is dropped for this run (#242).
+    /// The agent's credential was resolved outside the Keychain before launch —
+    /// from an environment variable, or from a credential file the sandbox
+    /// already grants (Antigravity's `agy` keyring fallback) — so the macOS
+    /// Keychain grant is dropped for this run (#242).
     ///
     /// The grant is emitted when `agent.needs_keychain()` and this is `false`.
     /// `false` is the fail-open default: no substitute credential resolved means

@@ -454,7 +454,11 @@ impl Agent {
         // `~/.gemini/antigravity-cli` read+write, so refreshes persist there.
         if *self == Agent::Antigravity {
             let token = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
-            if std::fs::metadata(&token).is_ok_and(|m| m.len() > 0) {
+            // `is_file()` as well as non-empty: a directory reports a non-zero
+            // len (64 on macOS, 4096 on ext4), so a stray directory at this path
+            // would read as a valid credential and drop the Keychain grant,
+            // stranding the agent at a browser re-login it cannot reach.
+            if std::fs::metadata(&token).is_ok_and(|m| m.is_file() && m.len() > 0) {
                 return Some(KeychainSubstitute::File(token));
             }
         }
@@ -1985,6 +1989,24 @@ mod tests {
         assert!(Agent::OpenCode.keychain_substitute_env_vars().is_empty());
         assert!(Agent::Antigravity.keychain_substitute_env_vars().is_empty());
         assert!(Agent::Copilot.keychain_substitute_env_vars().is_empty());
+    }
+
+    /// A directory at the token path is not a credential. `metadata().len()`
+    /// is non-zero for a directory (64 on macOS, 4096 on ext4), so without an
+    /// `is_file()` check a stray directory drops the Keychain grant and leaves
+    /// the agent with nothing to authenticate with.
+    #[test]
+    fn a_directory_at_the_token_path_is_not_a_credential() {
+        let tmp = std::env::temp_dir().join(format!("cplt-agy-dir-{}", std::process::id()));
+        let token = tmp.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        std::fs::create_dir_all(&token).unwrap();
+
+        assert_eq!(
+            Agent::Antigravity.credential_outside_keychain_on(&tmp, &[], true, true),
+            None,
+            "a directory must not count as the fallback token file"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// #242: `agy`'s token file is a keyring *fallback*, not a mirror. A user

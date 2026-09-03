@@ -64,6 +64,13 @@ fn apply_deny_env_and_credential(
         cmd.env_remove(var);
     }
     if let Some(var) = substitute.and_then(crate::agent::KeychainSubstitute::env_var)
+        // `deny_env` wins here too, not only in `credential_outside_keychain`.
+        // That filter is what keeps a denied var from becoming a substitute in
+        // the first place, so today this is unreachable — but this function
+        // removes and then re-adds, and re-adding a var the repo denied is the
+        // one mistake its shape invites. The check costs nothing and does not
+        // depend on a caller two modules away staying correct.
+        && !deny_env.iter().any(|d| d == var)
         && let Ok(val) = std::env::var(var)
     {
         cmd.env(var, val);
