@@ -673,13 +673,18 @@ impl Agent {
         }
     }
 
-    /// Refusal message for the case where this agent's **first-run login**
-    /// would have to write a file that [`Agent::host_persistence_denies`]
-    /// blocks, and that login has not happened yet on this host. `None` means
-    /// the launch is fine.
+    /// Warning for the case where this agent's **first-run login** would have
+    /// to write a file that [`Agent::host_persistence_denies`] blocks, and that
+    /// login has not happened yet on this host. `None` means nothing to say.
     ///
-    /// Without this the user meets the guard as an opaque `EPERM` on
-    /// `settings.json` from inside the agent, which reads like a cplt bug.
+    /// Warn-and-launch, not refuse: the login may be the only thing the deny
+    /// breaks, and blocking the run takes that judgement away from the user.
+    /// The trade is that they can still walk into the failure — Gemini's
+    /// `saveSettings` catches the `EPERM` and prints "Failed to save settings:
+    /// …" with no mention of cplt — so this text is written to be **recognised
+    /// later**, not merely read at startup: it names the exact file, the reason
+    /// it is denied, what will fail, the one-time fix, and why no flag helps.
+    /// Shortening it defeats the point.
     ///
     /// Only Gemini is affected. It records the auth method it picked as
     /// `selectedAuthType` in `~/.gemini/settings.json` — denied because the
@@ -698,8 +703,8 @@ impl Agent {
     ///
     /// Deliberately cheap and infallible: one `exists()` and at most one small
     /// read. Any I/O error is read as "assume authenticated", so a filesystem
-    /// hiccup can never turn into a refused launch.
-    pub fn login_refusal(&self, home: &Path) -> Option<String> {
+    /// hiccup can never turn into a spurious warning.
+    pub fn login_warning(&self, home: &Path) -> Option<String> {
         if !matches!(self, Agent::Gemini) {
             return None;
         }
@@ -716,10 +721,13 @@ impl Agent {
              That file is where Gemini records the auth method you pick on first \
              login, but it also holds `hooks.SessionStart[]`, which auto-fires the \
              next time `gemini` starts outside the sandbox — so cplt denies writes \
-             to it. Signing in from inside the sandbox would fail with a confusing \
-             permission error, so cplt is not launching.\n\
+             to it.\n\
              \n\
-             Sign in once, outside cplt — this is a one-time step:\n\
+             Launching anyway. If you sign in from in here, Gemini will fail to \
+             save the choice and print something like \"Failed to save settings\" \
+             — that error is this deny, not a Gemini bug.\n\
+             \n\
+             To fix it, sign in once outside cplt — a one-time step:\n\
              \n\
              \x20   gemini\n\
              \n\
@@ -1661,18 +1669,33 @@ mod tests {
     }
 
     #[test]
-    fn login_refusal_only_for_unauthenticated_gemini() {
+    fn login_warning_only_for_unauthenticated_gemini() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path();
         std::fs::create_dir_all(home.join(".gemini")).expect("mkdir");
 
-        // Nothing on disk: refuse, and say what to do about it.
+        // Nothing on disk: warn, and say enough to be recognised later. cplt
+        // launches anyway, so the user may well meet the failure inside Gemini
+        // with this text already scrolled off — every one of these parts is
+        // what lets them connect the two.
         let msg = Agent::Gemini
-            .login_refusal(home)
-            .expect("unauthenticated Gemini must refuse to launch");
+            .login_warning(home)
+            .expect("unauthenticated Gemini must warn");
         assert!(msg.contains("not signed in"), "{msg}");
+        assert!(
+            msg.contains("hooks.SessionStart[]"),
+            "why it is denied: {msg}"
+        );
+        assert!(
+            msg.contains("Failed to save settings"),
+            "must quote the error Gemini will actually print: {msg}"
+        );
         assert!(msg.contains("one-time"), "{msg}");
         assert!(msg.contains("gemini"), "{msg}");
+        assert!(
+            msg.contains(&home.join(".gemini/settings.json").display().to_string()),
+            "message must name the denied file: {msg}"
+        );
         // No in-cplt escape hatch is offered, because there is none: the deny
         // is emitted after every user allow. Advertising one would be a lie.
         assert!(
@@ -1680,10 +1703,6 @@ mod tests {
             "must not hand out an in-cplt command that cannot work: {msg}"
         );
         assert!(msg.contains("no flag"), "{msg}");
-        assert!(
-            msg.contains(&home.join(".gemini/settings.json").display().to_string()),
-            "message must name the denied file: {msg}"
-        );
 
         // Agents whose login does not touch a denied file never refuse, even
         // with an equally empty home.
@@ -1696,8 +1715,8 @@ mod tests {
             Agent::Shell,
         ] {
             assert!(
-                agent.login_refusal(home).is_none(),
-                "{agent:?} must not be blocked"
+                agent.login_warning(home).is_none(),
+                "{agent:?} must not warn"
             );
         }
 
@@ -1707,14 +1726,14 @@ mod tests {
             r#"{"security":{"auth":{"selectedAuthType":"gemini-api-key"}}}"#,
         )
         .expect("write settings");
-        assert!(Agent::Gemini.login_refusal(home).is_none());
+        assert!(Agent::Gemini.login_warning(home).is_none());
 
         // So does a completed browser OAuth flow, even with no settings.json.
         let tmp2 = tempfile::tempdir().expect("tempdir");
         let home2 = tmp2.path();
         std::fs::create_dir_all(home2.join(".gemini")).expect("mkdir");
         std::fs::write(home2.join(".gemini/oauth_creds.json"), "{}").expect("write creds");
-        assert!(Agent::Gemini.login_refusal(home2).is_none());
+        assert!(Agent::Gemini.login_warning(home2).is_none());
     }
 
     #[test]

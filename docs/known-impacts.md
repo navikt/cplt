@@ -678,7 +678,7 @@ Each agent's global config dir is mounted read/write, but the files in it that *
 
 | Agent | Denied | What breaks |
 | --- | --- | --- |
-| Gemini | `~/.gemini/settings.json`, `extensions/`, `policies/`, `hooks/` | ❌ **First login.** Gemini records the auth method it picked as `selectedAuthType` in `settings.json`. cplt refuses to launch an unauthenticated Gemini rather than let the write fail — run `gemini` once outside cplt. Also blocks editing user-level hooks, extensions and policies from inside a session |
+| Gemini | `~/.gemini/settings.json`, `extensions/`, `policies/`, `hooks/` | ❌ **First login.** Gemini records the auth method it picked as `selectedAuthType` in `settings.json`, so signing in from inside cplt fails with `Failed to save settings: …`. cplt warns about this before launching — run `gemini` once outside cplt. Also blocks editing user-level hooks, extensions and policies from inside a session |
 | Pi | `~/.pi/agent/settings.json`, `extensions/`, `npm/`, `git/` | ⚠️ `pi install`, and every in-session setting that persists to `settings.json`: `/model` (Ctrl+S), `/thinking`, `/settings`. Do those outside cplt. Auth is unaffected — Pi uses provider API keys via `--pass-env` |
 | Claude Code | `~/.claude/settings.json`, `statusline.sh`, `plugins/` | ⚠️ Editing `settings.json` (including `hooks`) from inside a session. `commands/`, `agents/` and `skills/` stay writable. Auth is unaffected — the OAuth token is in the Keychain or `.credentials.json` |
 | Antigravity | `~/.gemini/config/hooks.json`, `config/mcp_config.json`, `antigravity-cli/bin/` | ⚠️ Editing hooks or MCP server config from inside a session. Auth is unaffected |

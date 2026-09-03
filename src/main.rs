@@ -1576,36 +1576,39 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
         // #237: the host-persistence guard write-denies the agent's own
         // settings.json, which for Gemini is also where first-run login records
-        // the auth method. Catch that here rather than letting the user meet it
-        // as an opaque permission error from inside the agent. Skipped when a
-        // provider API key is passed through (that authenticates without
-        // touching the file) or when env is inherited wholesale, and never in
-        // `cplt check`, which must be able to report on any configuration.
+        // the auth method. Warn up front rather than letting the user meet it
+        // as an opaque permission error from inside the agent, with nothing
+        // naming cplt anywhere in it.
+        //
+        // A warning, not a refusal: the login may well be the only thing that
+        // breaks, and blocking the launch over it takes the choice away. The
+        // cost is that the user can still walk into the failure, so the text
+        // has to be complete enough to be *recognised* later, not just read
+        // now — see `Agent::login_warning`.
+        //
+        // Skipped only where the premise is wrong: a provider API key passed
+        // through authenticates without touching the file, and --inherit-env
+        // may carry one we cannot see. Diagnostic paths (`cplt check`,
+        // --print-profile, --doctor) are NOT exempt — now that nothing is
+        // blocked, the warning is information there too.
         //
         // Emitted BEFORE the --allow-browser hint below, deliberately: telling
         // someone to add a flag for a login that cannot succeed in here is the
-        // contradiction this refusal exists to remove.
-        //
-        // `--print-profile` and `--doctor` are exempt for the same reason as
-        // `cplt check`: they are diagnostics that must keep working on any
-        // configuration, and neither launches the agent.
-        if !check_mode
-            && !cli.print_profile
-            && !cli.doctor
-            && !has_api_key
+        // contradiction this warning exists to remove.
+        if !has_api_key
             && !resolved.inherit_env
-            && let Some(msg) = active_agent.login_refusal(&home_dir)
+            && let Some(msg) = active_agent.login_warning(&home_dir)
         {
-            anyhow::bail!(msg);
+            ui::warn(&msg);
         }
 
         // Suppressing the API-key hint for OAuth-first agents leaves the
         // browser-flow ones with no signal at all: Google's login opens a
         // browser, and --allow-browser is off by default, so a user who hits a
         // sign-in prompt hits a dead end. Point at the flag rather than the key.
-        // Says "if you are prompted", not "on first run": a Gemini first run
-        // never gets this far (the refusal above fires instead), so the prompts
-        // this is really about are re-auth and OAuth from an MCP server.
+        // Says "if you are prompted", not "on first run": for Gemini the
+        // warning above already covers first run, so the prompts this is
+        // really about are re-auth and OAuth from an MCP server.
         if active_agent.oauth_first()
             && active_agent.oauth_needs_browser()
             && !resolved.allow_browser

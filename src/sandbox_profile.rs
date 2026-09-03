@@ -717,7 +717,7 @@ fn emit_gitdir_denies(sb: &mut String, gitdir: &str) {
 ///
 /// The consequence is that there is no `allow.write` escape hatch for these
 /// paths any more: a first-run login that needs to write a denied file has to
-/// happen outside cplt (see `Agent::login_refusal`).
+/// happen outside cplt (see `Agent::login_warning`, which says so up front).
 ///
 /// Applies to every writable grant rather than the first one: Claude's default
 /// layout grants both `~/.claude` (the data dir these subpaths live under) and
