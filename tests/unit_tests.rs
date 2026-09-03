@@ -1078,6 +1078,7 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
             cplt::agent::Agent::Antigravity,
             cplt::agent::Agent::Pi,
             cplt::agent::Agent::Claude,
+            cplt::agent::Agent::Goose,
             cplt::agent::Agent::Shell,
         ] {
             let agent_dirs = agent.config_dirs(home);
