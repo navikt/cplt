@@ -479,7 +479,7 @@ fn prepare_impl(
 
     // #237: same class, different tree — the agent's own config dir is granted
     // writable, and some files in it auto-execute on the host the next time the
-    // agent runs outside cplt (Claude/Gemini hooks, Pi/Gemini extensions). macOS
+    // agent runs outside cplt (Claude hooks, Pi extensions). macOS
     // emits these as SBPL write-denies; Landlock cannot carve a sub-deny out of
     // an allowed tree, so the bwrap read-only overlay is the only mechanism here
     // — WITHOUT bwrap this is unenforced on Linux.

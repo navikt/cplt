@@ -2026,7 +2026,7 @@ fn detect_global_agent() -> Option<GlobalDetection> {
         ("copilot", "copilot"),
         ("opencode", "opencode"),
         ("aider", "aider"),
-        ("gemini", "gemini"),
+        ("antigravity", "antigravity"),
         ("claude", "claude"),
     ];
 

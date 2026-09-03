@@ -206,8 +206,13 @@ pub fn generate_toml(report: &DetectionReport) -> String {
     let mut allow_localhost: BTreeSet<u16> = BTreeSet::new();
     let mut proxy_private: BTreeSet<&str> = BTreeSet::new();
 
-    // Machine-specific suggestions → emitted as comments
-    let mut personal_hints: Vec<String> = Vec::new();
+    // Machine-specific suggestions → emitted as commented-out TOML.
+    // Kept per-section rather than as flat "allow.read = ..." lines: a dotted
+    // key pasted at the end of a config file is scoped by whichever [section]
+    // header precedes it, so the grant silently lands somewhere else (#228).
+    let mut personal_read: BTreeSet<&str> = BTreeSet::new();
+    let mut personal_write: BTreeSet<&str> = BTreeSet::new();
+    let mut personal_cache_exec: BTreeSet<&str> = BTreeSet::new();
 
     for s in &report.suggestions {
         match s {
@@ -216,14 +221,14 @@ pub fn generate_toml(report: &DetectionReport) -> String {
             }
             Suggestion::AllowRead(p) => {
                 if is_home_relative(p) {
-                    personal_hints.push(format!("allow.read = [\"{p}\"]  # in personal config"));
+                    personal_read.insert(p.as_str());
                 } else {
                     allow_read.insert(p.as_str());
                 }
             }
             Suggestion::AllowWrite(p) => {
                 if is_home_relative(p) {
-                    personal_hints.push(format!("allow.write = [\"{p}\"]  # in personal config"));
+                    personal_write.insert(p.as_str());
                 } else {
                     allow_write.insert(p.as_str());
                 }
@@ -235,9 +240,7 @@ pub fn generate_toml(report: &DetectionReport) -> String {
                 allow_localhost.insert(*p);
             }
             Suggestion::AllowCacheExec(p) => {
-                personal_hints.push(format!(
-                    "sandbox.allow_cache_exec = [\"{p}\"]  # in personal config"
-                ));
+                personal_cache_exec.insert(p.as_str());
             }
             Suggestion::DenyEnv(v) => {
                 deny_env.insert(v.as_str());
@@ -336,15 +339,39 @@ pub fn generate_toml(report: &DetectionReport) -> String {
         }
     }
 
-    // Personal config hints (machine-specific settings)
-    if !personal_hints.is_empty() {
+    // Personal config hints (machine-specific settings).
+    //
+    // Emitted as complete, section-qualified TOML rather than bare dotted keys.
+    // `allow.read = [...]` pasted at the end of a config file that already has
+    // any `[section]` header is scoped by that header — it becomes
+    // `git_guard.allow.read`, is reported as an unknown key, and the grant is
+    // dropped. That is #228, and it was this hint that produced it.
+    if !personal_read.is_empty() || !personal_write.is_empty() || !personal_cache_exec.is_empty() {
+        // The prose is double-commented, the TOML single-commented. Uncommenting
+        // the whole block once — which is what someone copying it actually does —
+        // then leaves the prose as ordinary `#` comments and the TOML live. A
+        // single `#` on the prose would turn it into invalid keys on paste.
         writeln!(
             out,
-            "# The following are machine-specific. Add them to ~/.config/cplt/config.toml:"
+            "## Machine-specific — these belong in ~/.config/cplt/config.toml, not here.\n\
+             ## Copy the [section] headers too: keys pasted at the end of that file are\n\
+             ## scoped by whichever header precedes them, which silently drops the grant."
         )
         .unwrap();
-        for hint in &personal_hints {
-            writeln!(out, "# {hint}").unwrap();
+        if !personal_read.is_empty() || !personal_write.is_empty() {
+            writeln!(out, "#").unwrap();
+            writeln!(out, "# [allow]").unwrap();
+            if !personal_read.is_empty() {
+                write_commented_string_array(&mut out, "read", &personal_read);
+            }
+            if !personal_write.is_empty() {
+                write_commented_string_array(&mut out, "write", &personal_write);
+            }
+        }
+        if !personal_cache_exec.is_empty() {
+            writeln!(out, "#").unwrap();
+            writeln!(out, "# [sandbox]").unwrap();
+            write_commented_string_array(&mut out, "allow_cache_exec", &personal_cache_exec);
         }
         writeln!(out).unwrap();
     }
@@ -590,6 +617,18 @@ fn toml_escape(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+/// Same as [`write_string_array`], but every line is commented out.
+///
+/// Used for the machine-specific block in a generated `.cplt.toml`: it must be
+/// copy-pasteable into the personal config yet inert where it sits.
+fn write_commented_string_array(out: &mut String, key: &str, values: &BTreeSet<&str>) {
+    let mut block = String::new();
+    write_string_array(&mut block, key, values);
+    for line in block.lines() {
+        writeln!(out, "# {line}").unwrap();
+    }
 }
 
 fn write_string_array(out: &mut String, key: &str, values: &BTreeSet<&str>) {
@@ -848,7 +887,10 @@ mod tests {
         // Home-relative paths go to personal config hints (comments)
         assert!(!toml.contains("[propose.allow]"));
         assert!(toml.contains("~/.gradle/gradle.properties"));
-        assert!(toml.contains("# in personal config"));
+        // Section-qualified, not a bare `allow.read = …` line (#228).
+        assert!(toml.contains("# [allow]"));
+        assert!(toml.contains("# read = "));
+        assert!(!toml.contains("# allow.read = "));
         assert!(toml.contains("allow_jvm_attach = true"));
     }
 
@@ -1089,10 +1131,13 @@ mod tests {
         let toml = generate_toml(&report);
         // Should NOT be in [propose.allow] as a real key
         assert!(!toml.contains("[propose.allow]"));
-        // Should be in personal config hint comment
-        assert!(toml.contains("# sandbox.allow_cache_exec"));
+        // Should be in the commented machine-specific block, under its own
+        // section header so it can be pasted anywhere in the personal config
+        // without being re-scoped by a preceding header (#228).
+        assert!(toml.contains("# [sandbox]"));
+        assert!(toml.contains("# allow_cache_exec"));
         assert!(toml.contains("ms-playwright"));
-        assert!(toml.contains("personal config"));
+        assert!(toml.contains("Machine-specific"));
     }
 
     #[test]
@@ -1137,6 +1182,81 @@ mod tests {
         assert_eq!(parsed.propose.allow.ports, vec![5432]);
         assert_eq!(parsed.propose.allow.localhost, vec![3000]);
         assert_eq!(parsed.deny.env, vec!["SECRET_KEY"]);
+    }
+
+    /// #228: `cplt init` told the user to add `allow.read = [...]` to their
+    /// personal config. TOML scopes a dotted key by the `[section]` header above
+    /// it, so appending that line to a file that already had `[git_guard]` made
+    /// it `git_guard.allow.read` — reported as an unknown key, grant silently
+    /// dropped. The hint block must therefore carry its own section headers and
+    /// survive being pasted at the END of an existing config.
+    #[test]
+    fn personal_hints_paste_into_the_right_section_after_an_existing_header() {
+        let suggestions = [
+            Suggestion::AllowRead("~/.gradle/gradle.properties".to_string()),
+            Suggestion::AllowCacheExec("~/.cache/thing".to_string()),
+        ];
+        let report = DetectionReport {
+            detections: vec![Detection {
+                name: "Gradle",
+                signals: vec![],
+                suggestions: suggestions.to_vec(),
+            }],
+            suggestions: suggestions.into_iter().collect(),
+            diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
+        };
+
+        // A comment after the block, to prove the extraction is bounded.
+        let generated = generate_toml(&report) + "\n# unrelated trailing note\n";
+
+        // Take the commented machine-specific block and uncomment it, exactly as
+        // a user copying those lines out of the file would.
+        //
+        // Bounded to the contiguous comment run that starts at the header:
+        // scanning to end-of-file would uncomment any later `#` line too, so an
+        // unrelated comment added below would break this test while the emitted
+        // block stayed correct.
+        let pasted: String = generated
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("## Machine-specific"))
+            .take_while(|l| l.trim_start().starts_with('#'))
+            .filter_map(|l| {
+                let l = l.trim_start();
+                l.strip_prefix("# ").or_else(|| l.strip_prefix('#'))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            pasted.contains("[allow]"),
+            "hint block must carry its own section header, got:\n{pasted}"
+        );
+        assert!(
+            !pasted.contains("unrelated trailing note"),
+            "extraction must stop at the end of the machine-specific block"
+        );
+
+        // Reproduce the reporter's file: a section header, then the paste.
+        let user_config = format!("[git_guard]\nenabled = true\n\n{pasted}\n");
+        let parsed: crate::config::Config = toml::from_str(&user_config)
+            .unwrap_or_else(|e| panic!("pasted hints must parse:\n{user_config}\n{e}"));
+
+        assert_eq!(
+            parsed.allow.read,
+            vec!["~/.gradle/gradle.properties"],
+            "the grant must land in [allow], not under the preceding header:\n{user_config}"
+        );
+        assert_eq!(
+            parsed.sandbox.allow_cache_exec,
+            vec!["~/.cache/thing"],
+            "cache-exec hint must land in [sandbox]:\n{user_config}"
+        );
+
+        // And the block must be inert where it sits — the repo config still parses.
+        let _: crate::repo_config::RepoConfig =
+            toml::from_str(&generated).expect("generated .cplt.toml must still parse");
     }
 
     // ── Global config generation tests ───────────────────────────────

@@ -29,10 +29,10 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 /// Apple Seatbelt (SBPL) via sandbox-exec. On Linux it is Landlock LSM plus
 /// seccomp-BPF, needing kernel 5.13+, or 6.7+ for full network filtering.
 ///
-/// cplt sandboxes GitHub Copilot CLI, OpenCode, Google Gemini CLI, Antigravity
-/// CLI, Pi, and Claude Code. It auto-detects Copilot, OpenCode, Gemini, and
-/// Antigravity from PATH. Pick Pi or Claude Code with --agent, which also
-/// overrides the detected agent at any time.
+/// cplt sandboxes GitHub Copilot CLI, OpenCode, Antigravity CLI, Pi, and
+/// Claude Code. It auto-detects Copilot, OpenCode, and Antigravity from PATH.
+/// Pick Pi or Claude Code with --agent, which also overrides the detected agent
+/// at any time.
 ///
 /// Save your defaults in ~/.config/cplt/config.toml to stop passing flags every
 /// time. Run `cplt config init` for a starter config, or `cplt config validate`
@@ -50,8 +50,8 @@ EXAMPLES:
   cplt --agent opencode --pass-env ANTHROPIC_API_KEY
     Run OpenCode in sandbox with Anthropic API key
 
-  cplt --agent gemini
-    Run Gemini CLI in sandbox (uses Google OAuth or GEMINI_API_KEY)
+  cplt --agent agy
+    Run Antigravity CLI in sandbox (uses Google OAuth)
 
   cplt --with-proxy -- -p \"fix the tests\"
     Run with proxy for connection logging and domain blocking
@@ -105,7 +105,7 @@ EXAMPLES:
 struct Cli {
     /// Which AI coding agent to sandbox. This flag wins over the sandbox.agent
     /// config key, which wins over auto-detection from PATH.
-    /// Supported: copilot, opencode, gemini, antigravity, pi, claude, shell
+    /// Supported: copilot, opencode, antigravity, pi, claude, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 
@@ -437,7 +437,7 @@ grants exec to every binary cached by any application. Prefer
     allow_cache_exec_any: bool,
 
     /// Allow the agent to open URLs in your default browser.
-    /// Needed for OAuth code flows (MCP servers, Gemini CLI, gh auth login).
+    /// Needed for OAuth code flows (MCP servers, Antigravity, gh auth login).
     /// Disabled by default because it lets the agent use your browser session.
     #[arg(long)]
     allow_browser: bool,
@@ -1574,11 +1574,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                              Install one of:\n\
                              [cplt]   Copilot CLI: brew install --cask copilot-cli\n\
                              [cplt]   OpenCode:    npm i -g opencode-ai\n\
-                             [cplt]   Gemini CLI:  npm i -g @google/gemini-cli\n\
                              [cplt]   Antigravity: https://antigravity.google/docs/cli-getting-started\n\
                              [cplt]   Pi:          npm i -g @earendil-works/pi-coding-agent\n\
                              [cplt]   Claude Code: npm i -g @anthropic-ai/claude-code\n\
-                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|gemini|antigravity|pi|claude|shell"
+                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|antigravity|pi|claude|shell"
                         );
                     }
                 }
@@ -1597,8 +1596,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         let has_api_key = hints.iter().any(|key| {
             parent_env.iter().any(|(k, _)| k == *key) && resolved.pass_env.iter().any(|v| v == *key)
         });
-        // OAuth-first agents (Copilot, OpenCode, Gemini, Antigravity, Claude
-        // Code) keep their credentials on disk in a granted config dir or the
+        // OAuth-first agents (Copilot, OpenCode, Antigravity, Claude Code)
+        // keep their credentials on disk in a granted config dir or the
         // macOS Keychain after an interactive login, so they authenticate with
         // no env var. Don't nag them about API keys: they prompt for login
         // themselves when unauthenticated, and the warning otherwise fires for
@@ -1623,34 +1622,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                 active_agent.binary_name(),
                 hint_to_show
             ));
-        }
-
-        // #237: the host-persistence guard write-denies the agent's own
-        // settings.json, which for Gemini is also where first-run login records
-        // the auth method. Warn up front rather than letting the user meet it
-        // as an opaque permission error from inside the agent, with nothing
-        // naming cplt anywhere in it.
-        //
-        // A warning, not a refusal: the login may well be the only thing that
-        // breaks, and blocking the launch over it takes the choice away. The
-        // cost is that the user can still walk into the failure, so the text
-        // has to be complete enough to be *recognised* later, not just read
-        // now — see `Agent::login_warning`.
-        //
-        // Skipped only where the premise is wrong: a provider API key passed
-        // through authenticates without touching the file, and --inherit-env
-        // may carry one we cannot see. Diagnostic paths (`cplt check`,
-        // --print-profile, --doctor) are NOT exempt — now that nothing is
-        // blocked, the warning is information there too.
-        //
-        // Emitted BEFORE the --allow-browser hint below, deliberately: telling
-        // someone to add a flag for a login that cannot succeed in here is the
-        // contradiction this warning exists to remove.
-        if !has_api_key
-            && !resolved.inherit_env
-            && let Some(msg) = active_agent.login_warning(&home_dir)
-        {
-            ui::warn(&msg);
         }
 
         // Suppressing the API-key hint for OAuth-first agents leaves the
@@ -2679,14 +2650,11 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 
     // Auto-resume: when no explicit args are given and no session flags are set,
     // default to --resume so the agent continues the previous session.
-    // Applies to Copilot and Gemini. Skipped if user passes -- args or uses
-    // explicit session management flags (--resume, --continue, --name).
+    // Applies to Copilot. Skipped if user passes -- args or uses explicit
+    // session management flags (--resume, --continue, --name).
     let has_session_flags =
         cli.resume.is_some() || cli.continue_session || cli.session_name.is_some();
-    if matches!(agent, agent::Agent::Copilot | agent::Agent::Gemini)
-        && cli.copilot_args.is_empty()
-        && !has_session_flags
-    {
+    if matches!(agent, agent::Agent::Copilot) && cli.copilot_args.is_empty() && !has_session_flags {
         args.push("--resume".into());
     }
 
@@ -6493,20 +6461,6 @@ mod tests {
         let cli = parse(&["--", "run", "fix tests"]);
         let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
         assert_eq!(args, vec!["run", "fix tests"]);
-    }
-
-    #[test]
-    fn gemini_auto_resume_when_no_args() {
-        let cli = parse(&[]);
-        let args = build_copilot_args(&cli, &agent::Agent::Gemini);
-        assert_eq!(args, vec!["--resume"]);
-    }
-
-    #[test]
-    fn gemini_no_auto_resume_when_args_given() {
-        let cli = parse(&["--", "-p", "fix tests"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Gemini);
-        assert_eq!(args, vec!["-p", "fix tests"]);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
