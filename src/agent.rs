@@ -279,7 +279,7 @@ impl Agent {
     /// Paths inside this agent's writable config dir(s) that auto-execute on
     /// the HOST the next time the agent runs *outside* cplt — a persistence
     /// vector the agent never needs to write mid-session. Each entry is joined
-    /// onto every writable [`Agent::agent_dirs`] grant and denied for writing.
+    /// onto every writable [`Agent::config_dirs`] grant and denied for writing.
     ///
     /// - Claude: `statusline.sh` runs on every prompt render, `plugins/` loads
     ///   at startup, and `settings.json` carries `hooks` (`SessionStart`,
@@ -298,8 +298,8 @@ impl Agent {
     ///   `settings.json` stops a *new* entry being added but leaves installed
     ///   package code editable in place, and it loads on the next host run.
     ///
-    /// Cost: for Pi, denying `settings.json` breaks package management and
-    /// every in-session setting that persists there — `/model` Ctrl+S,
+    /// Cost: for Pi this breaks package management and every in-session
+    /// setting that persists to `settings.json` — `/model` Ctrl+S,
     /// `/thinking`, `/settings`. Do those outside cplt — see SECURITY.md.
     ///
     /// Enforcement is macOS-first: Seatbelt emits these as write-denies after
@@ -311,7 +311,8 @@ impl Agent {
             Agent::Claude => &["statusline.sh", "plugins", "settings.json"],
             Agent::Pi => &["settings.json", "extensions", "npm", "git"],
             // Antigravity's grants are ~/.gemini/config and
-            // ~/.gemini/antigravity-cli, not ~/.gemini itself. Each name is
+            // ~/.gemini/antigravity-cli, not ~/.gemini itself, so Gemini's own
+            // entries would not match; these are its equivalents. Each name is
             // joined onto BOTH grants, and the join that does not correspond to
             // a real path is inert (same as ~/.claude.json/statusline.sh).
             Agent::Antigravity => &["hooks.json", "mcp_config.json", "bin"],
@@ -1482,29 +1483,6 @@ mod tests {
         assert!(!Agent::OpenCode.needs_keychain());
     }
 
-    #[test]
-    fn host_persistence_denies_per_agent() {
-        assert_eq!(
-            Agent::Claude.host_persistence_denies(),
-            ["statusline.sh", "plugins", "settings.json"],
-            "Claude's settings.json hooks auto-fire — it must be denied (#237)"
-        );
-        assert_eq!(
-            Agent::Pi.host_persistence_denies(),
-            // npm/ and git/ hold already-installed package code, editable in
-            // place: denying settings.json alone only stops a NEW entry.
-            ["settings.json", "extensions", "npm", "git"]
-        );
-        assert_eq!(
-            Agent::Antigravity.host_persistence_denies(),
-            ["hooks.json", "mcp_config.json", "bin"]
-        );
-        // No writable dir that hosts auto-executing config for these.
-        assert!(Agent::Copilot.host_persistence_denies().is_empty());
-        assert!(Agent::OpenCode.host_persistence_denies().is_empty());
-        assert!(Agent::Shell.host_persistence_denies().is_empty());
-    }
-
     /// `host_persistence_paths` is what BOTH backends consume — Seatbelt turns
     /// it into deny rules, the Linux path re-binds it read-only — so pinning it
     /// here covers the bubblewrap assembly without needing a Linux host.
@@ -2044,5 +2022,27 @@ mod tests {
         let candidate = Path::new("/home/user/.asdf/shims/copilot");
         let result = resolve_mise_shim(candidate, "copilot");
         let _ = result;
+    }
+    #[test]
+    fn host_persistence_denies_per_agent() {
+        assert_eq!(
+            Agent::Claude.host_persistence_denies(),
+            ["statusline.sh", "plugins", "settings.json"],
+            "Claude's settings.json hooks auto-fire — it must be denied (#237)"
+        );
+        assert_eq!(
+            Agent::Pi.host_persistence_denies(),
+            // npm/ and git/ hold already-installed package code, editable in
+            // place: denying settings.json alone only stops a NEW entry.
+            ["settings.json", "extensions", "npm", "git"]
+        );
+        assert_eq!(
+            Agent::Antigravity.host_persistence_denies(),
+            ["hooks.json", "mcp_config.json", "bin"]
+        );
+        // No writable dir that hosts auto-executing config for these.
+        assert!(Agent::Copilot.host_persistence_denies().is_empty());
+        assert!(Agent::OpenCode.host_persistence_denies().is_empty());
+        assert!(Agent::Shell.host_persistence_denies().is_empty());
     }
 }

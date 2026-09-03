@@ -583,6 +583,301 @@ else:
         assert_eq!(code, 0, "Normal read/write/fork/exec should work");
     }
 
+    // ── UDP egress under proxy-forced (Finding B) ─────────────────
+    //
+    // Landlock's network rights are TCP-only, so before this the sandbox let
+    // an agent open an AF_INET datagram socket and `sendto()` any host on the
+    // internet — never touching the proxy, never appearing in its log — even
+    // in proxy-forced mode, whose whole promise is that all egress goes
+    // through the proxy. seccomp closes it by rejecting the socket family and
+    // type at `socket(2)`, which needs no kernel feature at all.
+
+    /// Probe that returns the errno of `socket(family, type, 0)`.
+    ///
+    /// The symbolic name, not the number: a caller has to tell "seccomp said
+    /// no" (EPERM) apart from "this host has no IPv6" (EAFNOSUPPORT /
+    /// EPROTONOSUPPORT), and raw errno numbers in a string match are a trap.
+    fn udp_socket_probe(family: &str, ty: &str) -> String {
+        format!(
+            r#"python3 -c "
+import errno, socket
+try:
+    s = socket.socket(socket.{family}, socket.{ty})
+    s.close()
+    print('CREATED')
+except PermissionError:
+    print('EPERM')
+except OSError as e:
+    print('OTHER ' + errno.errorcode.get(e.errno, str(e.errno)))
+"
+"#
+        )
+    }
+
+    /// A high port derived from the pid, the same way `e2e.rs` does it: a
+    /// hard-coded port fails for whoever already has it bound. The two
+    /// proxy-forced tests take different bases because they share a pid.
+    fn derived_port(base: u16) -> String {
+        (base + (std::process::id() % 800) as u16).to_string()
+    }
+
+    fn have_python3() -> bool {
+        Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn proxy_forced_denies_udp_and_raw_sockets() {
+        require_landlock!(4); // proxy-forced fails closed below ABI v4
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let port = derived_port(21200);
+
+        for (family, ty) in [
+            ("AF_INET", "SOCK_DGRAM"),
+            ("AF_INET6", "SOCK_DGRAM"),
+            ("AF_INET", "SOCK_RAW"),
+        ] {
+            let (_, stdout, stderr) = run_sandboxed_with_flags(
+                project.path(),
+                &["--with-proxy", "--proxy-port", &port, "--proxy-forced"],
+                &udp_socket_probe(family, ty),
+            );
+            // A host with IPv6 compiled out or disabled fails AF_INET6 inside
+            // `socket(2)` before seccomp ever sees it. That is the host's
+            // answer, not the sandbox's, so it cannot prove the rule — but it
+            // must not fail the test either. EPERM stays the only pass, and
+            // the AF_INET rows keep the test's teeth on every host.
+            if family == "AF_INET6"
+                && (stdout.contains("OTHER EAFNOSUPPORT")
+                    || stdout.contains("OTHER EPROTONOSUPPORT"))
+            {
+                eprintln!("SKIPPED AF_INET6 row: IPv6 unsupported on this host");
+                continue;
+            }
+            assert!(
+                stdout.contains("EPERM"),
+                "proxy-forced must deny socket({family}, {ty}) — otherwise UDP \
+                 exfiltration bypasses the proxy entirely.\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_forced_still_allows_tcp_and_unix_sockets() {
+        require_landlock!(4);
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let port = derived_port(22200);
+
+        // TCP must survive: it is how the agent reaches the proxy at all.
+        // AF_UNIX must survive: local IPC is not an egress channel.
+        for (family, ty) in [("AF_INET", "SOCK_STREAM"), ("AF_UNIX", "SOCK_STREAM")] {
+            let (_, stdout, stderr) = run_sandboxed_with_flags(
+                project.path(),
+                &["--with-proxy", "--proxy-port", &port, "--proxy-forced"],
+                &udp_socket_probe(family, ty),
+            );
+            assert!(
+                stdout.contains("CREATED"),
+                "proxy-forced must still allow socket({family}, {ty}).\n\
+                 stdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mode_keeps_udp_sockets() {
+        // The other direction, and the reason the rule is gated: denying
+        // SOCK_DGRAM outside proxy-forced would break getaddrinfo(3) — i.e.
+        // all DNS — for every non-proxied tool in the sandbox.
+        require_landlock!();
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let (_, stdout, stderr) =
+            run_sandboxed(project.path(), &udp_socket_probe("AF_INET", "SOCK_DGRAM"));
+        assert!(
+            stdout.contains("CREATED"),
+            "default mode must not restrict UDP sockets.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
+    // ── Pathname UNIX-socket escape (Finding A) ───────────────────
+    //
+    // Three regimes, three tests. Only the bwrap one can run on a kernel of
+    // today; the ABI v9 test self-skips until kernel 7.1 is deployed, and is
+    // here so the guarantee is pinned the moment a runner has it.
+
+    /// Probe that tries to `connect()` to a pathname UNIX socket.
+    fn unix_connect_probe(path: &str) -> String {
+        format!(
+            r#"python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect('{path}')
+    print('CONNECTED')
+except OSError as e:
+    print(f'REFUSED {{e.errno}}')
+"
+"#
+        )
+    }
+
+    /// The session D-Bus socket, if this host has one. Connecting to it is the
+    /// full escape: `systemd-run --user` starts a unit outside every layer of
+    /// the sandbox, because the service manager is not a descendant and so
+    /// inherits neither the Landlock domain nor the seccomp filter nor the
+    /// namespaces.
+    fn session_bus_path() -> Option<String> {
+        let path = format!("/run/user/{}/bus", unsafe { libc::getuid() });
+        Path::new(&path).exists().then_some(path)
+    }
+
+    #[test]
+    fn bwrap_masks_the_session_bus_socket() {
+        // `require_bwrap!` is declared further down the file (macro_rules is
+        // order-sensitive), so the guard is spelled out here.
+        require_landlock!();
+        if !bwrap_available() {
+            assert!(
+                !require_sandbox_enforced(),
+                "Bubblewrap required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
+            );
+            eprintln!("SKIPPED: bwrap not available");
+            return;
+        }
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let Some(bus) = session_bus_path() else {
+            eprintln!("SKIPPED: no session bus on this host");
+            return;
+        };
+        let project = create_test_project();
+
+        let (_, stdout, stderr) = run_sandboxed_bwrap(project.path(), &unix_connect_probe(&bus));
+        assert!(
+            !stdout.contains("CONNECTED"),
+            "bubblewrap must mask {bus}: a mode-000 placeholder is bound over it, so \
+             connect() cannot reach the real socket.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn landlock_only_leaves_the_session_bus_reachable_below_abi_v9() {
+        // NOT a guarantee — the opposite. This documents the hole so it cannot
+        // be closed by accident and then quietly re-opened: without bwrap and
+        // below ABI v9 there is nothing in the kernel that can stop this
+        // connect(). If a future change makes it fail here, the note on
+        // `socket_mask_paths` and the Linux limitations section of SECURITY.md
+        // both need updating to match.
+        require_landlock!();
+        if landlock_abi_version().is_some_and(|v| v >= 9) {
+            eprintln!("SKIPPED: ABI v9+ — connect() is kernel-gated, see the v9 test");
+            return;
+        }
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let Some(bus) = session_bus_path() else {
+            eprintln!("SKIPPED: no session bus on this host");
+            return;
+        };
+        let project = create_test_project();
+
+        let (_, stdout, _) = run_sandboxed_with_flags(
+            project.path(),
+            &["--no-bubblewrap"],
+            &unix_connect_probe(&bus),
+        );
+        assert!(
+            stdout.contains("CONNECTED"),
+            "expected the documented hole to still be open below ABI v9 without bwrap; \
+             if this now fails, the sandbox got stronger and the docs are stale.\n\
+             stdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn abi_v9_gates_unix_socket_connect_without_bwrap() {
+        // Kernel 7.1+ only. Deliberately NOT `require_landlock!(9)`: that
+        // macro panics instead of skipping under CPLT_TEST_REQUIRE_SANDBOX=1,
+        // which CI sets, so it would turn the Linux job red on every runner
+        // until kernel 7.1 ships. An unmet *minimum kernel version* is not the
+        // same failure as a missing sandbox capability, which is what the env
+        // var exists to catch.
+        require_landlock!();
+        if landlock_abi_version().is_none_or(|v| v < 9) {
+            eprintln!("SKIPPED: need Landlock ABI v9 (kernel 7.1) for ResolveUnix");
+            return;
+        }
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let Some(bus) = session_bus_path() else {
+            eprintln!("SKIPPED: no session bus on this host");
+            return;
+        };
+        let project = create_test_project();
+
+        let (_, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--no-bubblewrap"],
+            &unix_connect_probe(&bus),
+        );
+        assert!(
+            !stdout.contains("CONNECTED"),
+            "Landlock ABI v9 must deny connect() to an ungranted pathname socket \
+             ({bus}) with no bubblewrap involved.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn agent_can_still_use_its_own_unix_sockets() {
+        // The counterweight to the tests above: ResolveUnix is granted
+        // wherever write is, so a socket the agent creates in its own project
+        // dir must still be connectable — on every ABI, including v9.
+        require_landlock!();
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+        let script = r#"python3 -c "
+import os, socket, threading
+p = os.path.join(os.getcwd(), 'agent.sock')
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(p)
+srv.listen(1)
+threading.Thread(target=srv.accept, daemon=True).start()
+c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+c.connect(p)
+print('CONNECTED')
+"
+"#;
+        let (_, stdout, stderr) = run_sandboxed(project.path(), script);
+        assert!(
+            stdout.contains("CONNECTED"),
+            "an agent-created socket in the project dir must stay usable.\n\
+             stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
     // ── Capability probe matrix (issue #113) ─────────────────────
     //
     // These probes start the real cplt binary with a shell script and assert

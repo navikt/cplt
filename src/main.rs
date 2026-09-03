@@ -1577,9 +1577,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         // browser-flow ones with no signal at all: Google's login opens a
         // browser, and --allow-browser is off by default, so a user who hits a
         // sign-in prompt hits a dead end. Point at the flag rather than the key.
-        // Says "if you are prompted", not "on first run": the prompts this
-        // is really about are first run, re-auth, and OAuth from an MCP
-        // server.
+        // Says "if you are prompted", not "on first run": for Gemini the
+        // warning above already covers first run, so the prompts this is
+        // really about are re-auth and OAuth from an MCP server.
         if active_agent.oauth_first()
             && active_agent.oauth_needs_browser()
             && !resolved.allow_browser
