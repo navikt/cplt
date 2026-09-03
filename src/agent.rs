@@ -107,16 +107,6 @@ const ANTHROPIC_DOMAINS: &[&str] = &[
 /// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
 const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 
-/// goose's OWN infrastructure only. goose (github.com/block/goose) is an
-/// open-source, provider-agnostic AI agent: model traffic goes to a
-/// user-configured provider (Anthropic/OpenAI/Google/Databricks/OpenRouter/…),
-/// so enabling `default_allowlist` for goose requires adding that provider's
-/// domain via `allowed_domains`. Only goose's own infra/docs/update endpoints
-/// are listed here.
-///
-/// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
-const GOOSE_DOMAINS: &[&str] = &["block.github.io"];
-
 /// Supported AI coding agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -133,7 +123,7 @@ pub enum Agent {
     Pi,
     /// Claude Code (Anthropic's `claude` CLI).
     Claude,
-    /// goose — open-source AI agent (github.com/block/goose).
+    /// goose — open-source AI agent (github.com/aaif-goose/goose).
     Goose,
     /// Plain sandboxed shell — no AI agent, just a secure shell session.
     Shell,
@@ -279,20 +269,30 @@ impl Agent {
                 // --remote and --name have no claude equivalent; dropped.
             }
             Agent::Goose => {
-                // goose: `--resume` continues the latest session; `--name NAME`
-                // (with `--resume`) resumes a named session. goose has no
-                // separate "continue" flag distinct from `--resume`, and no
-                // remote equivalent.
-                if let Some(session) = resume {
-                    args.push("--resume".to_string());
-                    if !session.is_empty() {
-                        args.push("--name".to_string());
-                        args.push(session.to_string());
-                    }
-                } else if continue_session {
+                // Verified against goose 1.48.0 (`goose --help`, `goose session
+                // --help`): the session flags live on the `session` SUBCOMMAND,
+                // not the top level — `goose --resume` is rejected with
+                // "unexpected argument '--resume' found". Bare `goose` already
+                // starts a session, so only emit the subcommand when there is
+                // something to translate.
+                //
+                // `-r/--resume` continues the most recent session;
+                // `--session-id ID` (requires `--resume`) selects one by id and
+                // `-n/--name NAME` selects one by name. They are alternative
+                // selectors, so at most one is emitted — cplt's explicit
+                // `--resume=ID` wins over `--name`.
+                let resuming = resume.is_some() || continue_session;
+                let selector = resume.filter(|s| !s.is_empty());
+                if resuming || session_name.is_some() {
+                    args.push("session".to_string());
+                }
+                if resuming {
                     args.push("--resume".to_string());
                 }
-                if let Some(name) = session_name {
+                if let Some(id) = selector {
+                    args.push("--session-id".to_string());
+                    args.push(id.to_string());
+                } else if let Some(name) = session_name {
                     args.push("--name".to_string());
                     args.push(name.to_string());
                 }
@@ -313,7 +313,8 @@ impl Agent {
     /// OpenCode authenticates via the `/connect` device flow by default;
     /// third-party providers use API keys from env vars or config files.
     /// goose stores provider API keys in the OS keyring by default (the macOS
-    /// login Keychain).
+    /// login Keychain); `GOOSE_DISABLE_KEYRING=1` switches it to a plaintext
+    /// `secrets.yaml` in the config dir instead, which needs no grant.
     pub fn needs_keychain(&self) -> bool {
         matches!(
             self,
@@ -379,7 +380,13 @@ impl Agent {
             // joined onto BOTH grants, and the join that does not correspond to
             // a real path is inert (same as ~/.claude.json/statusline.sh).
             Agent::Antigravity => &["hooks.json", "mcp_config.json", "bin"],
-            Agent::Copilot | Agent::OpenCode | Agent::Shell => &[],
+            // goose needs no entries: its ONLY auto-execution vector is
+            // config.yaml's `extensions:` list, and its config dir is granted
+            // read-only, so there is nothing writable left to deny. (These
+            // denies are joined onto writable dirs only, so an entry here would
+            // be inert anyway.) The data and state dirs hold sessions, logs and
+            // downloaded model weights — nothing goose auto-executes.
+            Agent::Goose | Agent::Copilot | Agent::OpenCode | Agent::Shell => &[],
         }
     }
 
@@ -436,8 +443,24 @@ impl Agent {
             Agent::Antigravity => &[GOOGLE_AI_DOMAINS, ANTIGRAVITY_DOMAINS],
             Agent::Claude => &[ANTHROPIC_DOMAINS],
             Agent::OpenCode => &[OPENCODE_DOMAINS],
-            Agent::Goose => &[GOOSE_DOMAINS],
-            Agent::Pi | Agent::Shell => &[],
+            // goose gets the package-registry base and NOTHING else. This is
+            // an observed result, not an omission: `cplt --agent goose
+            // --observe-domains -- run -t "…"` with goose 1.48.0 on 2026-09-03
+            // recorded only `api.openai.com` — the configured provider — and
+            // no goose-owned host at all. goose is provider-agnostic, so the
+            // provider domain belongs in the user's `allowed_domains`, not
+            // here.
+            //
+            // Deliberately excluded, both observed but neither on a default
+            // path: `us.i.posthog.com` (telemetry, opt-in — the same run with
+            // GOOSE_TELEMETRY_OFF=1 contacted nothing but the provider) and
+            // `github.com` (only `goose update`, which is self-update inside
+            // the sandbox and is not something to enable by default).
+            //
+            // `block.github.io` from the original patch was never contacted;
+            // goose's docs moved to goose-docs.ai and the repo to
+            // github.com/aaif-goose/goose.
+            Agent::Goose | Agent::Pi | Agent::Shell => &[],
         };
         let mut domains: Vec<&'static str> = Vec::new();
         for slice in infra {
@@ -657,12 +680,45 @@ impl Agent {
                 ]
             }
             Agent::Goose => {
-                // goose keeps its config under XDG dirs (github.com/block/goose):
-                //   ~/.config/goose        — config.yaml, recipes, sessions index
-                //   ~/.local/share/goose   — session data, logs, memory
-                //   ~/.local/state/goose   — runtime state
-                //   ~/.cache/goose         — cached downloads / temporary data
-                // All respect the XDG_* overrides, mirroring OpenCode.
+                // goose keeps its files under XDG dirs on BOTH macOS and Linux —
+                // it does not use ~/Library/Application Support. Verified with
+                // goose 1.48.0 on macOS via `goose info`, with and without the
+                // XDG_* overrides set:
+                //   ~/.config/goose        — config.yaml, secrets.yaml, skills
+                //   ~/.local/share/goose   — sessions/sessions.db, apps
+                //   ~/.local/state/goose   — logs
+                // `goose info` reports no cache dir and a full `goose run`
+                // created none, so ~/.cache/goose is not granted.
+                //
+                // The config dir is READ-ONLY, and no `write_files` narrow it
+                // back open. config.yaml's `extensions:` entries carry a `cmd`
+                // + `args` that goose spawns as a subprocess on every session
+                // start, so a writable config dir lets a sandboxed agent plant
+                // a command that runs UNSANDBOXED the next time the user
+                // launches goose — the same class as .git/hooks and .cplt.toml.
+                //
+                // A `write_files` carve-out cannot help here anyway: goose
+                // rewrites config.yaml, permission.yaml and
+                // permissions/tool_permissions.json by creating a temp file in
+                // the directory and renaming over the target, which needs
+                // directory write, not file write.
+                //
+                // What read-only costs, all of it a deliberate act that belongs
+                // outside the sandbox: `/mode` and theme changes, the first-run
+                // telemetry prompt, and persisting "always allow" tool
+                // permissions — that last one being a privilege the sandboxed
+                // agent should not be able to grant itself for future runs. A
+                // full `goose run` against a pre-configured config.yaml left
+                // the file byte-identical and wrote only under the data and
+                // state dirs.
+                //
+                // NOT covered here: goose also auto-spawns MCP servers declared
+                // in plugin manifests under `~/.agents/plugins/` and
+                // `<project>/.agents/plugins/`. The former is outside every
+                // granted dir, so it is unreadable and unwritable in the
+                // sandbox; the latter sits in the writable project tree and is
+                // the same in-repo persistence class as `.git/hooks`, which is
+                // handled by the global protected set, not per-agent.
                 let config_base = std::env::var("XDG_CONFIG_HOME")
                     .ok()
                     .map_or_else(|| home.join(".config"), PathBuf::from);
@@ -672,13 +728,10 @@ impl Agent {
                 let state_base = std::env::var("XDG_STATE_HOME")
                     .ok()
                     .map_or_else(|| home.join(".local/state"), PathBuf::from);
-                let cache_base = std::env::var("XDG_CACHE_HOME")
-                    .ok()
-                    .map_or_else(|| home.join(".cache"), PathBuf::from);
                 vec![
                     AgentDir {
                         path: config_base.join("goose"),
-                        write: true,
+                        write: false,
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
@@ -692,13 +745,6 @@ impl Agent {
                     },
                     AgentDir {
                         path: state_base.join("goose"),
-                        write: true,
-                        map_exec: false,
-                        process_exec: false,
-                        write_files: vec![],
-                    },
-                    AgentDir {
-                        path: cache_base.join("goose"),
                         write: true,
                         map_exec: false,
                         process_exec: false,
@@ -734,8 +780,10 @@ impl Agent {
             // Subscription OAuth token in ~/.claude (.credentials.json on
             // Linux) or the macOS login Keychain.
             Agent::Claude => true,
-            // Provider API keys only — no interactive login flow.
-            Agent::Pi => false,
+            // Provider API keys only — no interactive login flow. goose's own
+            // `configure` stores the provider key in the OS keyring; there is
+            // no goose account to log into.
+            Agent::Pi | Agent::Goose => false,
             // Not an AI agent: no auth of its own.
             Agent::Shell => false,
         }
@@ -757,7 +805,7 @@ impl Agent {
             // Device flow: a code and a URL, no browser required from here.
             Agent::Copilot | Agent::OpenCode | Agent::Claude => false,
             // Not OAuth-first at all.
-            Agent::Pi | Agent::Shell => false,
+            Agent::Pi | Agent::Goose | Agent::Shell => false,
         }
     }
 
@@ -793,6 +841,9 @@ impl Agent {
     /// read. Any I/O error is read as "assume authenticated", so a filesystem
     /// hiccup can never turn into a spurious warning.
     pub fn login_warning(&self, home: &Path) -> Option<String> {
+        if matches!(self, Agent::Goose) {
+            return Self::goose_unconfigured_warning(home);
+        }
         if !matches!(self, Agent::Gemini) {
             return None;
         }
@@ -827,6 +878,41 @@ impl Agent {
              Then run cplt as normal. There is deliberately no flag for doing it \
              in here: the deny is emitted after every user allow, so not even \
              `--allow-write` reopens the file."
+        ))
+    }
+
+    /// goose's counterpart to the Gemini warning: `~/.config/goose` is granted
+    /// read-only, so a first run inside cplt cannot complete `goose configure`.
+    ///
+    /// Same shape and same reason as the Gemini case — the deny is the point,
+    /// and the one-time setup belongs on the host. Only a genuinely missing
+    /// `config.yaml` counts as unconfigured; any other error is read as
+    /// "assume configured" so a filesystem hiccup stays silent.
+    fn goose_unconfigured_warning(home: &Path) -> Option<String> {
+        let config = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map_or_else(|| home.join(".config"), PathBuf::from)
+            .join("goose/config.yaml");
+        if config.try_exists().unwrap_or(true) {
+            return None;
+        }
+        let shown = config.display();
+        Some(format!(
+            "goose is not configured yet, and cplt grants {shown}'s directory \
+             read-only.\n\
+             That directory is where goose stores config.yaml, whose \
+             `extensions:` entries name a command goose spawns on every session \
+             start — so a sandboxed agent that could write it would be planting \
+             code that runs outside the sandbox on your next launch.\n\
+             \n\
+             Launching anyway. If you configure from in here, goose will fail to \
+             save the choice — that error is this deny, not a goose bug.\n\
+             \n\
+             To fix it, configure once outside cplt — a one-time step:\n\
+             \n\
+             \x20   goose configure\n\
+             \n\
+             Then run cplt as normal."
         ))
     }
 
@@ -915,9 +1001,14 @@ impl Agent {
                 "ANTHROPIC_VERTEX_PROJECT_ID",
                 "GOOGLE_CLOUD_PROJECT",
             ],
-            // goose is provider-agnostic (github.com/block/goose): it reads the
+            // goose is provider-agnostic (github.com/aaif-goose/goose): it reads the
             // active provider's API key from the environment or its keyring.
-            // These cover the common providers goose supports out of the box.
+            // goose 1.48.0 embeds a catalogue of several hundred providers, so
+            // this is deliberately the common subset — each name below was
+            // confirmed present in the goose 1.48.0 binary. NOTE: goose reads
+            // GOOGLE_API_KEY for its Google provider and does NOT read
+            // GEMINI_API_KEY; anything outside this subset still works via an
+            // explicit `--pass-env`.
             Agent::Goose => &[
                 // Anthropic
                 "ANTHROPIC_API_KEY",
@@ -926,7 +1017,6 @@ impl Agent {
                 "AZURE_OPENAI_API_KEY",
                 // Google
                 "GOOGLE_API_KEY",
-                "GEMINI_API_KEY",
                 // Databricks (a first-class goose provider)
                 "DATABRICKS_HOST",
                 "DATABRICKS_TOKEN",
@@ -1060,7 +1150,7 @@ impl Agent {
             Agent::Pi => "Install Pi: npm i -g @earendil-works/pi-coding-agent",
             Agent::Goose => {
                 "Install goose: brew install block-goose-cli, or see \
-                 https://block.github.io/goose/docs/getting-started/installation"
+                 https://goose-docs.ai/docs/getting-started/installation"
             }
             Agent::Claude => {
                 "Install Claude Code: npm i -g @anthropic-ai/claude-code, \
@@ -1418,6 +1508,42 @@ impl std::fmt::Display for Agent {
 mod tests {
     use super::*;
 
+    /// Every `Agent` variant, for the tests that must cover all of them.
+    /// `all_agents_covers_every_variant` keeps this honest.
+    const ALL_AGENTS: [Agent; 8] = [
+        Agent::Copilot,
+        Agent::OpenCode,
+        Agent::Gemini,
+        Agent::Antigravity,
+        Agent::Pi,
+        Agent::Claude,
+        Agent::Goose,
+        Agent::Shell,
+    ];
+
+    #[test]
+    fn all_agents_covers_every_variant() {
+        // The match is exhaustive, so adding a variant to `Agent` fails to
+        // compile until it is named here; the length check then forces it into
+        // ALL_AGENTS as well. Together they stop a new agent from quietly
+        // skipping every cross-agent contract test below.
+        for agent in ALL_AGENTS {
+            match agent {
+                Agent::Copilot
+                | Agent::OpenCode
+                | Agent::Gemini
+                | Agent::Antigravity
+                | Agent::Pi
+                | Agent::Claude
+                | Agent::Goose
+                | Agent::Shell => {}
+            }
+        }
+        let mut seen = ALL_AGENTS.to_vec();
+        seen.dedup();
+        assert_eq!(seen.len(), ALL_AGENTS.len(), "ALL_AGENTS has a duplicate");
+    }
+
     fn agent_dir(path: PathBuf) -> AgentDir {
         AgentDir {
             path,
@@ -1752,7 +1878,10 @@ mod tests {
             Agent::Antigravity.host_persistence_denies(),
             ["hooks.json", "mcp_config.json", "bin"]
         );
-        // No writable dir that hosts auto-executing config for these.
+        // No writable dir that hosts auto-executing config for these. goose's
+        // one auto-exec vector, config.yaml's `extensions:`, lives in a config
+        // dir granted read-only, so there is nothing writable left to deny.
+        assert!(Agent::Goose.host_persistence_denies().is_empty());
         assert!(Agent::Copilot.host_persistence_denies().is_empty());
         assert!(Agent::OpenCode.host_persistence_denies().is_empty());
         assert!(Agent::Shell.host_persistence_denies().is_empty());
@@ -1789,6 +1918,36 @@ mod tests {
         // No denies declared → nothing joined, whatever the grants look like.
         let dirs = Agent::OpenCode.config_dirs(home);
         assert!(Agent::OpenCode.host_persistence_paths(&dirs).is_empty());
+    }
+
+    #[test]
+    fn login_warning_for_unconfigured_goose() {
+        temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let home = tmp.path();
+
+            // No config.yaml: goose's first run would try to write it into a
+            // read-only dir, so say so before the user meets the bare failure.
+            let msg = Agent::Goose
+                .login_warning(home)
+                .expect("unconfigured goose must warn");
+            assert!(msg.contains("not configured"), "{msg}");
+            assert!(msg.contains("extensions:"), "why it is denied: {msg}");
+            assert!(msg.contains("goose configure"), "must name the fix: {msg}");
+            assert!(
+                msg.contains(&home.join(".config/goose/config.yaml").display().to_string()),
+                "message must name the path: {msg}"
+            );
+
+            // Configured: silent.
+            std::fs::create_dir_all(home.join(".config/goose")).expect("mkdir");
+            std::fs::write(
+                home.join(".config/goose/config.yaml"),
+                "GOOSE_PROVIDER: openai\n",
+            )
+            .expect("write config");
+            assert!(Agent::Goose.login_warning(home).is_none());
+        });
     }
 
     #[test]
@@ -1986,20 +2145,25 @@ mod tests {
 
     #[test]
     fn every_agent_declares_its_auth_model() {
-        // Pinned per agent so a new one has to make a deliberate choice: the
-        // exhaustive match in `oauth_first` forces the decision at compile
-        // time, this pins the answer. OAuth-first agents get no "No API keys
-        // passed" warning (#187) — their credentials land on disk or in the
-        // Keychain after an interactive login.
-        for (agent, expected) in [
-            (Agent::Copilot, true),     // GitHub device flow + Keychain
-            (Agent::OpenCode, true),    // /connect device flow -> auth.json
-            (Agent::Gemini, true),      // Google OAuth browser flow
-            (Agent::Antigravity, true), // Google OAuth + keychain
-            (Agent::Claude, true),      // subscription OAuth token
-            (Agent::Pi, false),         // provider API keys only
-            (Agent::Shell, false),      // not an AI agent, no auth
-        ] {
+        // The expectation comes from an EXHAUSTIVE match, not a pinned list: a
+        // new agent variant stops compiling here until someone states its auth
+        // model, so it cannot slip in uncovered. OAuth-first agents get no
+        // "No API keys passed" warning (#187) — their credentials land on disk
+        // or in the Keychain after an interactive login.
+        fn expected_oauth_first(agent: Agent) -> bool {
+            match agent {
+                Agent::Copilot => true,     // GitHub device flow + Keychain
+                Agent::OpenCode => true,    // /connect device flow -> auth.json
+                Agent::Gemini => true,      // Google OAuth browser flow
+                Agent::Antigravity => true, // Google OAuth + keychain
+                Agent::Claude => true,      // subscription OAuth token
+                Agent::Pi => false,         // provider API keys only
+                Agent::Goose => false,      // provider API keys in the keyring
+                Agent::Shell => false,      // not an AI agent, no auth
+            }
+        }
+        for agent in ALL_AGENTS {
+            let (agent, expected) = (agent, expected_oauth_first(agent));
             assert_eq!(
                 agent.oauth_first(),
                 expected,
@@ -2254,29 +2418,76 @@ mod tests {
 
     #[test]
     fn goose_config_dirs_xdg_default() {
-        let home = Path::new("/Users/test");
-        let dirs = Agent::Goose.config_dirs(home);
-        assert_eq!(dirs.len(), 4, "config + data + state + cache");
+        // Wrapped: config_dirs reads XDG_*, so an unwrapped test fails on a
+        // machine that sets them.
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", None::<&str>),
+                ("XDG_DATA_HOME", None),
+                ("XDG_STATE_HOME", None),
+            ],
+            || {
+                let home = Path::new("/Users/test");
+                let dirs = Agent::Goose.config_dirs(home);
+                assert_eq!(dirs.len(), 3, "config + data + state, no cache dir");
+                let config_dir = dirs
+                    .iter()
+                    .find(|d| d.path == home.join(".config/goose"))
+                    .expect("~/.config/goose");
+                let data_dir = dirs
+                    .iter()
+                    .find(|d| d.path == home.join(".local/share/goose"))
+                    .expect("~/.local/share/goose");
+                let state_dir = dirs
+                    .iter()
+                    .find(|d| d.path == home.join(".local/state/goose"))
+                    .expect("~/.local/state/goose");
+                for d in [data_dir, state_dir] {
+                    assert!(d.write, "{:?} should be writable", d.path);
+                }
+                for d in [config_dir, data_dir, state_dir] {
+                    assert!(!d.process_exec && !d.map_exec);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn goose_config_dir_is_not_writable() {
+        // config.yaml's `extensions:` entries name a `cmd` goose spawns on every
+        // session start, so a writable ~/.config/goose is a host-persistence
+        // vector: the sandboxed agent plants an extension, it runs unsandboxed
+        // on the user's next launch. No write_files carve-out either — goose
+        // rewrites those files by rename, which needs directory write.
+        let dirs = Agent::Goose.config_dirs(Path::new("/Users/test"));
         let config_dir = dirs
             .iter()
-            .find(|d| d.path == home.join(".config/goose"))
-            .expect("~/.config/goose");
-        let data_dir = dirs
-            .iter()
-            .find(|d| d.path == home.join(".local/share/goose"))
-            .expect("~/.local/share/goose");
-        let state_dir = dirs
-            .iter()
-            .find(|d| d.path == home.join(".local/state/goose"))
-            .expect("~/.local/state/goose");
-        let cache_dir = dirs
-            .iter()
-            .find(|d| d.path == home.join(".cache/goose"))
-            .expect("~/.cache/goose");
-        for d in [config_dir, data_dir, state_dir, cache_dir] {
-            assert!(d.write, "{:?} should be writable", d.path);
-            assert!(!d.process_exec && !d.map_exec);
-        }
+            .find(|d| d.path.ends_with("goose") && d.path.to_string_lossy().contains("config"))
+            .expect("goose config dir");
+        assert!(!config_dir.write, "goose config dir must stay read-only");
+        assert!(
+            config_dir.write_files.is_empty(),
+            "no write_files carve-out: goose writes config.yaml by rename, \
+             which needs directory write and would reopen the vector"
+        );
+    }
+
+    #[test]
+    fn goose_config_dirs_respect_xdg() {
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", Some("/xdg/cfg")),
+                ("XDG_DATA_HOME", Some("/xdg/data")),
+                ("XDG_STATE_HOME", Some("/xdg/state")),
+            ],
+            || {
+                let dirs = Agent::Goose.config_dirs(Path::new("/Users/test"));
+                let paths: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+                assert!(paths.contains(&PathBuf::from("/xdg/cfg/goose")));
+                assert!(paths.contains(&PathBuf::from("/xdg/data/goose")));
+                assert!(paths.contains(&PathBuf::from("/xdg/state/goose")));
+            },
+        );
     }
 
     #[test]
@@ -2291,25 +2502,42 @@ mod tests {
 
     #[test]
     fn session_args_goose() {
-        // --resume=ID maps to `--resume --name ID`.
+        // Verified against goose 1.48.0: the flags belong to the `session`
+        // SUBCOMMAND — top-level `goose --resume` is rejected by clap — so
+        // every translation has to lead with `session`.
+
+        // --resume=ID selects a session by id; --session-id requires --resume.
         assert_eq!(
             Agent::Goose.session_args(Some("sess1"), false, None, false),
-            vec!["--resume", "--name", "sess1"]
+            vec!["session", "--resume", "--session-id", "sess1"]
         );
-        // Bare --resume maps to `--resume`.
+        // Bare --resume resumes the most recent session.
         assert_eq!(
             Agent::Goose.session_args(Some(""), false, None, false),
-            vec!["--resume"]
+            vec!["session", "--resume"]
         );
-        // --continue maps to `--resume`.
+        // --continue is the same thing: goose has no separate continue flag.
         assert_eq!(
             Agent::Goose.session_args(None, true, None, false),
-            vec!["--resume"]
+            vec!["session", "--resume"]
         );
-        // --remote is dropped (no goose equivalent).
+        // --name alone starts (or reuses) a named session; --remote is dropped.
         assert_eq!(
             Agent::Goose.session_args(None, false, Some("x"), true),
-            vec!["--name", "x"]
+            vec!["session", "--name", "x"]
+        );
+        // --name and --session-id are in the same mutually exclusive clap
+        // group, so an explicit id wins and --name is never emitted twice.
+        assert_eq!(
+            Agent::Goose.session_args(Some("sess1"), false, Some("x"), false),
+            vec!["session", "--resume", "--session-id", "sess1"]
+        );
+        // Nothing to translate: bare `goose` already starts a session, so no
+        // subcommand is injected and `-- <args>` reach goose unprefixed.
+        assert!(
+            Agent::Goose
+                .session_args(None, false, None, false)
+                .is_empty()
         );
     }
 
@@ -2432,13 +2660,19 @@ mod tests {
     }
 
     #[test]
-    fn goose_default_domains_include_own_infra_and_registry() {
+    fn goose_gets_registry_base_only() {
+        // Observed with goose 1.48.0 on 2026-09-03 via `--observe-domains`: a
+        // full session contacted only the configured provider, no goose-owned
+        // host. Keep the list at the registry base until someone observes one.
         let domains = Agent::Goose.default_allowed_domains();
-        assert!(
-            domains.contains(&"block.github.io"),
-            "goose must include its own docs/infra domain"
+        assert_eq!(
+            domains.len(),
+            PACKAGE_REGISTRY_DOMAINS.len(),
+            "goose has no observed own-infra domain; do not fabricate one"
         );
         assert!(domains.contains(&"registry.npmjs.org"));
+        // Never contacted by goose 1.48.0; its docs moved to goose-docs.ai.
+        assert!(!domains.contains(&"block.github.io"));
         // goose is provider-agnostic: no provider LLM domain is baked in.
         assert!(
             !domains.contains(&"api.anthropic.com")
@@ -2466,16 +2700,7 @@ mod tests {
     fn every_agent_default_domains_nonempty_bare_and_registry_backed() {
         // Contract across ALL agents: non-empty, registry base present, and no
         // glob syntax (the proxy matcher does exact/subdomain matching only).
-        for agent in [
-            Agent::Copilot,
-            Agent::OpenCode,
-            Agent::Gemini,
-            Agent::Antigravity,
-            Agent::Pi,
-            Agent::Claude,
-            Agent::Goose,
-            Agent::Shell,
-        ] {
+        for agent in ALL_AGENTS {
             let domains = agent.default_allowed_domains();
             assert!(!domains.is_empty(), "{agent:?} list must not be empty");
             assert!(

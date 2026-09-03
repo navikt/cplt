@@ -529,7 +529,7 @@ Per-agent config dirs, Keychain use, exec permissions, and env isolation are in 
 
 ### goose support
 
-cplt can sandbox [goose](https://github.com/block/goose), the open-source AI agent (binary `goose`).
+cplt can sandbox [goose](https://github.com/aaif-goose/goose), the open-source AI agent (binary `goose`). Verified against goose 1.48.0.
 
 ```bash
 # Run goose (must be explicit — not auto-detected)
@@ -539,16 +539,21 @@ cplt --agent goose
 cplt --agent goose --pass-env ANTHROPIC_API_KEY
 cplt --agent goose --pass-env OPENAI_API_KEY
 
+# Skip the keyring entirely: keep the key in the environment
+GOOSE_DISABLE_KEYRING=1 cplt --agent goose --pass-env OPENAI_API_KEY --pass-env GOOSE_DISABLE_KEYRING
+
 # Set goose as your default agent
 cplt config set sandbox.agent goose
 ```
 
 **Security notes for goose:**
 - **Not auto-detected**: select explicitly with `--agent goose` or set `sandbox.agent = "goose"` in config
-- **Provider-agnostic**: goose routes model traffic to a user-configured provider (Anthropic, OpenAI, Google, Databricks, OpenRouter, …). Common provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `DATABRICKS_HOST`/`DATABRICKS_TOKEN`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`) are recognized auth hints and must be passed via `--pass-env`
-- **Keyring is exposed**: goose stores secrets in the macOS login Keychain by default (file secret store on Linux), so the Keychain is granted in the sandbox
-- goose config (`~/.config/goose/`), data (`~/.local/share/goose/`), state (`~/.local/state/goose/`), and cache (`~/.cache/goose/`) are writable in the sandbox — all respect `XDG_*` overrides
-- `--continue`/`--resume[=ID]` map to goose's `--resume` / `--resume --name ID`; `--remote` is ignored (no goose equivalent)
+- **Provider-agnostic**: goose routes model traffic to a user-configured provider (Anthropic, OpenAI, Google, Databricks, OpenRouter, …). Common provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`, `GOOGLE_API_KEY`, `DATABRICKS_HOST`/`DATABRICKS_TOKEN`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`) are recognized auth hints and must be passed via `--pass-env`. goose reads `GOOGLE_API_KEY`, not `GEMINI_API_KEY`. Any provider outside this subset still works: name its variable with `--pass-env`
+- **No default domains**: goose contacted no host of its own in an `--observe-domains` capture, so its built-in allowlist is the shared package-registry base only. Add your provider's domain via `allowed_domains` before enabling `--default-allowlist`
+- **Keychain is granted, and you can avoid it**: goose stores provider secrets in the macOS login Keychain by default, so cplt grants it — but that grant is broader than goose's own entry ([#242](https://github.com/navikt/cplt/issues/242)). `GOOSE_DISABLE_KEYRING=1` makes goose use a `secrets.yaml` in its config dir instead, and passing the key with `--pass-env` avoids stored secrets altogether. On Linux goose uses the D-Bus Secret Service, which the Keychain grant does not affect
+- **Config dir is read-only**: `~/.config/goose/config.yaml` declares `extensions:` entries whose `cmd` goose spawns on every session start, so a writable config dir is a host-persistence vector. Normal sessions do not write it; `/mode` changes and persisted tool permissions do not survive a sandboxed run. Reconfigure with `goose configure` outside cplt
+- goose's data (`~/.local/share/goose/`) and state (`~/.local/state/goose/`) dirs are writable, with exec denied. goose uses these XDG paths on macOS too, and honours the `XDG_*` overrides there
+- `--continue` and bare `--resume` map to `goose session --resume`; `--resume=ID` to `goose session --resume --session-id ID`; `--name X` to `goose session --name X`. These are subcommand flags, so cplt injects the `session` subcommand with them. `--remote` is ignored (no goose equivalent)
 
 ### Shell mode
 
