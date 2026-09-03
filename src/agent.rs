@@ -414,11 +414,27 @@ impl Agent {
         deny_env: &[String],
         enabled: bool,
     ) -> Option<KeychainSubstitute> {
+        self.credential_outside_keychain_on(home, deny_env, enabled, cfg!(target_os = "macos"))
+    }
+
+    /// [`Agent::credential_outside_keychain`] with the platform as a parameter.
+    ///
+    /// The only reason this is separate: `cfg!` is read in exactly one place
+    /// (the wrapper above), so callers cannot drift, while tests can assert
+    /// *both* platform outcomes from either host. A `#[cfg]`-gated test would
+    /// leave the Linux answer — "the trade never applies" — asserted nowhere.
+    pub(crate) fn credential_outside_keychain_on(
+        &self,
+        home: &Path,
+        deny_env: &[String],
+        enabled: bool,
+        macos: bool,
+    ) -> Option<KeychainSubstitute> {
         // The whole trade is about the macOS login Keychain. On Linux these
         // agents read credential files the sandbox already grants, so there is
         // no grant to drop — and forwarding a token there would be a change with
         // nothing bought for it.
-        if !enabled || !cfg!(target_os = "macos") {
+        if !enabled || !macos {
             return None;
         }
         if let Some(var) = self
@@ -1983,14 +1999,14 @@ mod tests {
         std::fs::create_dir_all(token.parent().unwrap()).unwrap();
 
         assert_eq!(
-            Agent::Antigravity.credential_outside_keychain(&tmp, &[], true),
+            Agent::Antigravity.credential_outside_keychain_on(&tmp, &[], true, true),
             None,
             "no fallback file — the grant must stay"
         );
 
         std::fs::write(&token, "").unwrap();
         assert_eq!(
-            Agent::Antigravity.credential_outside_keychain(&tmp, &[], true),
+            Agent::Antigravity.credential_outside_keychain_on(&tmp, &[], true, true),
             None,
             "an empty fallback file is not a credential"
         );
@@ -1998,7 +2014,7 @@ mod tests {
         std::fs::write(&token, "{\"token\":{}}").unwrap();
         assert!(
             Agent::Antigravity
-                .credential_outside_keychain(&tmp, &[], true)
+                .credential_outside_keychain_on(&tmp, &[], true, true)
                 .is_some(),
             "a populated fallback file means agy can authenticate without the keyring"
         );
@@ -2016,14 +2032,15 @@ mod tests {
         temp_env::with_var("CLAUDE_CODE_OAUTH_TOKEN", Some("sk-ant-oat01-x"), || {
             assert!(
                 Agent::Claude
-                    .credential_outside_keychain(home, &[], true)
+                    .credential_outside_keychain_on(home, &[], true, true)
                     .is_some(),
                 "an env token normally allows the trade"
             );
             assert_eq!(
-                Agent::Claude.credential_outside_keychain(
+                Agent::Claude.credential_outside_keychain_on(
                     home,
                     &["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+                    true,
                     true
                 ),
                 None,
@@ -2033,7 +2050,7 @@ mod tests {
         // Blank is not a credential either.
         temp_env::with_var("CLAUDE_CODE_OAUTH_TOKEN", Some("   "), || {
             assert_eq!(
-                Agent::Claude.credential_outside_keychain(home, &[], true),
+                Agent::Claude.credential_outside_keychain_on(home, &[], true, true),
                 None
             );
         });
@@ -2043,12 +2060,53 @@ mod tests {
     /// With it off nothing is traded, whatever the environment or the filesystem
     /// says — the property that makes the default-off build byte-identical to
     /// the behaviour before this key existed (#242).
+    /// Off macOS the trade never applies, for any agent and any input.
+    ///
+    /// There is no whole-Keychain grant to drop on Linux — those agents read
+    /// credential files the sandbox already grants — so forwarding a token
+    /// there would change the environment and buy nothing. Asserted from either
+    /// host via the platform parameter, because a `#[cfg]`-gated test would
+    /// leave exactly one of the two answers checked on exactly one of the two
+    /// CI runners.
+    #[test]
+    fn the_trade_never_applies_off_macos() {
+        let tmp = std::env::temp_dir().join(format!("cplt-nonmac-{}", std::process::id()));
+        let token = tmp.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+        std::fs::write(&token, "{\"token\":{}}").unwrap();
+
+        temp_env::with_var("CLAUDE_CODE_OAUTH_TOKEN", Some("sk-ant-oat01-x"), || {
+            for agent in Agent::ALL {
+                assert_eq!(
+                    agent.credential_outside_keychain_on(&tmp, &[], true, false),
+                    None,
+                    "{agent:?}: no trade off macOS, even with the key on and a credential present"
+                );
+            }
+            // Same inputs, macOS: the two eligible agents do trade. Without this
+            // half the assertion above would also pass if the function were
+            // simply broken.
+            assert!(
+                Agent::Claude
+                    .credential_outside_keychain_on(&tmp, &[], true, true)
+                    .is_some()
+            );
+            assert!(
+                Agent::Antigravity
+                    .credential_outside_keychain_on(&tmp, &[], true, true)
+                    .is_some()
+            );
+        });
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn keychain_substitute_disabled_never_trades_the_grant() {
         let home = Path::new("/Users/test");
         temp_env::with_var("CLAUDE_CODE_OAUTH_TOKEN", Some("sk-ant-oat01-x"), || {
             assert_eq!(
-                Agent::Claude.credential_outside_keychain(home, &[], false),
+                Agent::Claude.credential_outside_keychain_on(home, &[], false, true),
                 None
             );
         });
@@ -2058,12 +2116,12 @@ mod tests {
         std::fs::create_dir_all(token.parent().unwrap()).unwrap();
         std::fs::write(&token, "{\"token\":{}}").unwrap();
         assert_eq!(
-            Agent::Antigravity.credential_outside_keychain(&tmp, &[], false),
+            Agent::Antigravity.credential_outside_keychain_on(&tmp, &[], false, true),
             None
         );
         assert!(
             Agent::Antigravity
-                .credential_outside_keychain(&tmp, &[], true)
+                .credential_outside_keychain_on(&tmp, &[], true, true)
                 .is_some(),
             "...but the same state does trade once the key is on"
         );
