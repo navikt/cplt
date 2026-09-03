@@ -1465,14 +1465,28 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // grant is covered too, and not gated on `quiet` — it is a sandbox-boundary
     // warning, not progress chatter.
     for (granted, trusted) in resolved.write_grants_over_trusted_bins() {
+        // Two different overlaps, and the user can only act on the right one:
+        // a grant *in* the trusted dir is the direct hole, a grant on an
+        // ancestor (`/usr` over `/usr/bin`) hands out the same hole by
+        // containment. Same danger, different thing to go edit.
+        let overlap = if granted.starts_with(trusted) {
+            format!(
+                "allow.write grants {} — inside the trusted binary directory {trusted}.",
+                granted.display()
+            )
+        } else {
+            format!(
+                "allow.write grants {}, which contains the trusted binary directory {trusted}.",
+                granted.display()
+            )
+        };
         ui::warn(&format!(
-            "allow.write grants {} — inside the trusted binary directory {trusted}.\n  \
+            "{overlap}\n  \
              cplt resolves its own git, bwrap and sandbox-exec from {trusted} and runs them \
              OUTSIDE the sandbox, as you, around every agent session. An agent that can write \
              there replaces one of those binaries and gets unsandboxed execution on your next \
              cplt launch — no approval, no prompt.\n  \
-             Grant a directory cplt never executes from, or drop this grant.",
-            granted.display()
+             Grant a directory cplt never executes from, or drop this grant."
         ));
     }
 
