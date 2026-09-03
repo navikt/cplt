@@ -548,7 +548,7 @@ fn emit_system_access(
     sbpl!(sb);
 
     // Launch Services — allows `open` to launch URLs in the default browser.
-    // Needed for OAuth code flows (MCP servers, Gemini CLI, gh auth).
+    // Needed for OAuth code flows (MCP servers, Antigravity, gh auth).
     // Opt-in because it lets the agent leverage the user's browser session state.
     if allow_browser {
         sbpl!(sb, ";; Launch Services (OAuth browser flows)");
@@ -710,14 +710,14 @@ fn emit_gitdir_denies(sb: &mut String, gitdir: &str) {
 /// **Emitted at the tail of the profile, after `emit_user_allows`, and that
 /// placement is the whole point.** SBPL is last-match-wins, so while these
 /// lived next to the dir-wide allow in `emit_home_access` a user
-/// `allow.write = ["~/.gemini"]` (or `["~/.claude"]`) silently reopened every
+/// `allow.write = ["~/.claude"]` (or `["~/.pi/agent"]`) silently reopened every
 /// one of them — the same bug #212 fixed for the git-persistence denies by
 /// moving them here. `is_unsafe_root` only rejects `~` itself, so a
 /// whole-config-dir grant is an ordinary thing for a user to write.
 ///
 /// The consequence is that there is no `allow.write` escape hatch for these
-/// paths any more: a first-run login that needs to write a denied file has to
-/// happen outside cplt (see `Agent::login_warning`, which says so up front).
+/// paths any more: a step that needs to write a denied file has to happen
+/// outside cplt (see SECURITY.md).
 ///
 /// Applies to every writable grant rather than the first one: Claude's default
 /// layout grants both `~/.claude` (the data dir these subpaths live under) and

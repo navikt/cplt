@@ -299,4 +299,4 @@ It detects:
 | Gradle registry credentials | `~/.gradle/gradle.properties` mentioning `repository`, `nexus`, or `artifactory` | `allow.read` for that file |
 | npm registry credentials | `~/.npmrc` with a `registry` or `_authToken` line | `allow.read` for that file |
 | Maven repository settings | `~/.m2/settings.xml` with a `<server>`, `<mirror>`, or `<repository>` | `allow.read` for that file |
-| Default agent | `copilot`, `opencode`, `aider`, `gemini`, `claude` in PATH | `agent = "..."`, but only when exactly one is found and it is not `copilot` |
+| Default agent | `copilot`, `opencode`, `aider`, `antigravity`, `claude` in PATH | `agent = "..."`, but only when exactly one is found and it is not `copilot` |

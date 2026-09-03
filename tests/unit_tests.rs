@@ -1075,7 +1075,6 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
         for agent in [
             cplt::agent::Agent::Copilot,
             cplt::agent::Agent::OpenCode,
-            cplt::agent::Agent::Gemini,
             cplt::agent::Agent::Antigravity,
             cplt::agent::Agent::Pi,
             cplt::agent::Agent::Claude,
@@ -1130,7 +1129,7 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
 
 /// A user `allow.write` must NOT reopen the host-persistence denies.
 ///
-/// `allow.write = ["~/.gemini"]` is an ordinary thing to write — `is_unsafe_root`
+/// `allow.write = ["~/.claude"]` is an ordinary thing to write — `is_unsafe_root`
 /// only rejects `~` itself — and while these denies lived beside the dir-wide
 /// allow in `emit_home_access` it silently reopened every one of them, including
 /// Claude's pre-existing `statusline.sh`/`plugins`. SBPL is last-match-wins, so
@@ -1138,60 +1137,62 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
 /// `emit_user_allows`. This test fails if it is ever moved back before it.
 #[test]
 fn host_persistence_denies_survive_a_later_user_allow_write() {
-    let home = std::path::Path::new("/Users/test");
-    let agent_dirs = cplt::agent::Agent::Gemini.config_dirs(home);
-    // The whole config dir, not just the file: the wider grant is the one that
-    // used to swallow the denies.
-    let settings = home.join(".gemini");
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: home,
-        extra_read: &[],
-        extra_write: std::slice::from_ref(&settings),
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Gemini,
-        agent_dirs: &agent_dirs,
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
+    temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
+        let home = std::path::Path::new("/Users/test");
+        let agent_dirs = cplt::agent::Agent::Claude.config_dirs(home);
+        // The whole config dir, not just the file: the wider grant is the one that
+        // used to swallow the denies.
+        let settings = home.join(".claude");
+        let p = generate_profile(&ProfileOptions {
+            project_dir: std::path::Path::new("/projects/app"),
+            home_dir: home,
+            extra_read: &[],
+            extra_write: std::slice::from_ref(&settings),
+            allow_socket: &[],
+            extra_deny: &[],
+            existing_home_tool_dirs: None,
+            existing_app_dirs: None,
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            proxy_forced: false,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            allow_tmp_exec: false,
+            copilot_install_dir: None,
+            java_home: None,
+            dotnet_root: None,
+            git_hooks_path: None,
+            git_common_dir: None,
+            extra_git_dirs: &[],
+            allow_gpg_signing: false,
+            deny_clipboard: false,
+            allow_jvm_attach: false,
+            allow_msbuild: false,
+            allow_docker: false,
+            electron_app_dir: None,
+            agent: cplt::agent::Agent::Claude,
+            agent_dirs: &agent_dirs,
+            allow_cache_exec: &[],
+            allow_cache_exec_any: false,
+            allow_browser: false,
+        });
+        // rfind, not find: emit_home_access emits the identical allow line for the
+        // agent-dir grant itself, so the LAST occurrence is the user's allow.write
+        // and the one the denies have to outlive.
+        let allow = p
+            .rfind("(allow file-write* (subpath \"/Users/test/.claude\"))")
+            .expect("user allow.write must be emitted");
+        for sub in cplt::agent::Agent::Claude.host_persistence_denies() {
+            let line = format!("(deny file-write* (subpath \"/Users/test/.claude/{sub}\"))");
+            let deny = p.find(&line).expect("persistence deny must be emitted");
+            assert!(
+                deny > allow,
+                "{line} must come AFTER the user allow.write, or last-match-wins reopens it"
+            );
+        }
     });
-    // rfind, not find: emit_home_access emits the identical allow line for the
-    // agent-dir grant itself, so the LAST occurrence is the user's allow.write
-    // and the one the denies have to outlive.
-    let allow = p
-        .rfind("(allow file-write* (subpath \"/Users/test/.gemini\"))")
-        .expect("user allow.write must be emitted");
-    for sub in cplt::agent::Agent::Gemini.host_persistence_denies() {
-        let line = format!("(deny file-write* (subpath \"/Users/test/.gemini/{sub}\"))");
-        let deny = p.find(&line).expect("persistence deny must be emitted");
-        assert!(
-            deny > allow,
-            "{line} must come AFTER the user allow.write, or last-match-wins reopens it"
-        );
-    }
 }
 
 #[test]

@@ -678,22 +678,14 @@ Each agent's global config dir is mounted read/write, but the files in it that *
 
 | Agent | Denied | What breaks |
 | --- | --- | --- |
-| Gemini | `~/.gemini/settings.json`, `extensions/`, `policies/`, `hooks/` | ❌ **First login.** Gemini records the auth method it picked as `selectedAuthType` in `settings.json`, so signing in from inside cplt fails with `Failed to save settings: …`. cplt warns about this before launching — run `gemini` once outside cplt. Also blocks editing user-level hooks, extensions and policies from inside a session |
 | Pi | `~/.pi/agent/settings.json`, `extensions/`, `npm/`, `git/` | ⚠️ `pi install`, and every in-session setting that persists to `settings.json`: `/model` (Ctrl+S), `/thinking`, `/settings`. Do those outside cplt. Auth is unaffected — Pi uses provider API keys via `--pass-env` |
 | Claude Code | `~/.claude/settings.json`, `statusline.sh`, `plugins/` | ⚠️ Editing `settings.json` (including `hooks`) from inside a session. `commands/`, `agents/` and `skills/` stay writable. Auth is unaffected — the OAuth token is in the Keychain or `.credentials.json` |
 | Antigravity | `~/.gemini/config/hooks.json`, `config/mcp_config.json`, `antigravity-cli/bin/` | ⚠️ Editing hooks or MCP server config from inside a session. Auth is unaffected |
 | Copilot, OpenCode | — | Nothing denied |
 
-**There is no flag that reopens these.** The denies are emitted at the very end of the profile, after every user `allow.write`, so even `--allow-write ~/.gemini/settings.json` does not override them. That is deliberate: before this, `allow.write = ["~/.gemini"]` silently reopened the whole set.
+**There is no flag that reopens these.** The denies are emitted at the very end of the profile, after every user `allow.write`, so even `--allow-write ~/.claude/settings.json` does not override them. That is deliberate: before this, `allow.write = ["~/.claude"]` silently reopened the whole set.
 
 **Linux is weaker than macOS here.** Landlock cannot deny a subpath inside an allowed directory, so the denies are carried by the bubblewrap read-only overlay. They hold only when `bwrap` is installed, and only for paths that **already exist** — bubblewrap cannot bind a missing source, so a `extensions/` directory that does not exist yet is unprotected until something creates it. Without bubblewrap the guard does not apply on Linux at all.
-
-**Fix (Gemini first login):**
-
-```bash
-gemini          # once, outside cplt — complete the sign-in
-cplt --agent gemini
-```
 
 ## AI agent telemetry
 
