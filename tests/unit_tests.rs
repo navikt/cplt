@@ -6959,6 +6959,8 @@ fn set_repo_value_unset_removes_array_element() {
 // Chromium runtime rules (allow_cache_exec = ["ms-playwright"] or subpath)
 // ============================================================
 
+const CHROME_FOR_TESTING_MACH_REGISTER_RULE: &str = r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#;
+
 #[test]
 fn chromium_runtime_rules_emitted_for_ms_playwright() {
     let p = generate_profile(&ProfileOptions {
@@ -7013,6 +7015,10 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
         "mach-register must be anchored with ^...$ and scoped to org.chromium.*"
     );
     assert!(
+        p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must be fully anchored with a numeric PID suffix"
+    );
+    assert!(
         p.contains(r#"(regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")"#),
         "SingletonSocket regex must use [^/]+/[^/]+ for var/folders segments and be fully anchored"
     );
@@ -7054,7 +7060,7 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
         agent_dirs: &[],
-        allow_cache_exec: &["ms-playwright/chromium-1217".to_string()],
+        allow_cache_exec: &["ms-playwright/chromium-1243".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
     });
@@ -7069,6 +7075,10 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
     assert!(
         p.contains(r#"(regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")"#),
         "SingletonSocket regex must use [^/]+/[^/]+ for subpath entry"
+    );
+    assert!(
+        p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must be present for versioned subpath entry"
     );
 }
 
@@ -7116,6 +7126,10 @@ fn chromium_runtime_rules_absent_by_default() {
     assert!(
         !p.contains("SingletonSocket"),
         "SingletonSocket rules must not be emitted by default"
+    );
+    assert!(
+        !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must not be emitted by default"
     );
 }
 
@@ -7165,6 +7179,10 @@ fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
         !p.contains("SingletonSocket"),
         "SingletonSocket rules must not be emitted for unrelated allow_cache_exec entry"
     );
+    assert!(
+        !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must not be emitted for unrelated allow_cache_exec entry"
+    );
 }
 
 #[test]
@@ -7213,6 +7231,10 @@ fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
     assert!(
         !p.contains("SingletonSocket"),
         "SingletonSocket rules must not be emitted when only allow_cache_exec_any is set"
+    );
+    assert!(
+        !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must not be emitted when only allow_cache_exec_any is set"
     );
 }
 
@@ -7271,6 +7293,74 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
         assert!(
             !p.contains("SingletonSocket"),
             "SingletonSocket must not be emitted for near-miss entry {name:?}"
+        );
+        assert!(
+            !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+            "Chrome for Testing mach-register must not be emitted for near-miss entry {name:?}"
+        );
+    }
+}
+
+#[test]
+fn chromium_runtime_mach_register_rules_remain_narrow() {
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        extra_git_dirs: &[],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &["ms-playwright".to_string()],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+
+    let mach_register_rules: Vec<_> = p
+        .lines()
+        .filter(|line| line.starts_with("(allow mach-register"))
+        .collect();
+    assert_eq!(
+        mach_register_rules,
+        [
+            r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#,
+            CHROME_FOR_TESTING_MACH_REGISTER_RULE,
+        ],
+        "only the two approved, fully anchored Chromium namespaces may be registered"
+    );
+    for broader_rule in [
+        "(allow mach-register)",
+        r#"(allow mach-register (global-name-regex #"^com\.google\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\..+$"))"#,
+    ] {
+        assert!(
+            !p.lines().any(|line| line == broader_rule),
+            "broader mach-register rule must not be emitted: {broader_rule}"
         );
     }
 }
