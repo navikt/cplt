@@ -1060,7 +1060,138 @@ fn profile_grants_claude_config_access() {
         // lets it override.
         assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/statusline.sh\"))"));
         assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/plugins\"))"));
+        // settings.json carries `hooks`, which auto-fire on SessionStart /
+        // UserPromptSubmit — it is a persistence vector, not a user-invoked file.
+        assert!(p.contains("(deny file-write* (subpath \"/Users/test/.claude/settings.json\"))"));
     });
+}
+
+/// Every agent's `host_persistence_denies` entries must actually reach the
+/// profile as write-denies under each of its writable config-dir grants.
+#[test]
+fn profile_denies_host_persistence_paths_for_every_agent() {
+    temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
+        let home = std::path::Path::new("/Users/test");
+        for agent in [
+            cplt::agent::Agent::Copilot,
+            cplt::agent::Agent::OpenCode,
+            cplt::agent::Agent::Gemini,
+            cplt::agent::Agent::Antigravity,
+            cplt::agent::Agent::Pi,
+            cplt::agent::Agent::Claude,
+            cplt::agent::Agent::Shell,
+        ] {
+            let agent_dirs = agent.config_dirs(home);
+            let p = generate_profile(&ProfileOptions {
+                project_dir: std::path::Path::new("/projects/app"),
+                home_dir: home,
+                extra_read: &[],
+                extra_write: &[],
+                allow_socket: &[],
+                extra_deny: &[],
+                existing_home_tool_dirs: None,
+                existing_app_dirs: None,
+                extra_ports: &[],
+                localhost_ports: &[],
+                proxy_port: None,
+                proxy_forced: false,
+                allow_env_files: false,
+                allow_localhost_any: false,
+                scratch_dir: None,
+                allow_tmp_exec: false,
+                copilot_install_dir: None,
+                java_home: None,
+                dotnet_root: None,
+                git_hooks_path: None,
+                git_common_dir: None,
+                extra_git_dirs: &[],
+                allow_gpg_signing: false,
+                deny_clipboard: false,
+                allow_jvm_attach: false,
+                allow_msbuild: false,
+                allow_docker: false,
+                electron_app_dir: None,
+                agent,
+                agent_dirs: &agent_dirs,
+                allow_cache_exec: &[],
+                allow_cache_exec_any: false,
+                allow_browser: false,
+            });
+            for dir in agent_dirs.iter().filter(|d| d.write) {
+                for sub in agent.host_persistence_denies() {
+                    let path = dir.path.join(sub).display().to_string();
+                    let line = format!("(deny file-write* (subpath \"{path}\"))");
+                    assert!(p.contains(&line), "{agent:?} profile missing: {line}");
+                }
+            }
+        }
+    });
+}
+
+/// A user `allow.write` must NOT reopen the host-persistence denies.
+///
+/// `allow.write = ["~/.gemini"]` is an ordinary thing to write — `is_unsafe_root`
+/// only rejects `~` itself — and while these denies lived beside the dir-wide
+/// allow in `emit_home_access` it silently reopened every one of them, including
+/// Claude's pre-existing `statusline.sh`/`plugins`. SBPL is last-match-wins, so
+/// the fix is placement: `emit_host_persistence_denies` runs at the tail, after
+/// `emit_user_allows`. This test fails if it is ever moved back before it.
+#[test]
+fn host_persistence_denies_survive_a_later_user_allow_write() {
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = cplt::agent::Agent::Gemini.config_dirs(home);
+    // The whole config dir, not just the file: the wider grant is the one that
+    // used to swallow the denies.
+    let settings = home.join(".gemini");
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: home,
+        extra_read: &[],
+        extra_write: std::slice::from_ref(&settings),
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        extra_git_dirs: &[],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Gemini,
+        agent_dirs: &agent_dirs,
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+    });
+    // rfind, not find: emit_home_access emits the identical allow line for the
+    // agent-dir grant itself, so the LAST occurrence is the user's allow.write
+    // and the one the denies have to outlive.
+    let allow = p
+        .rfind("(allow file-write* (subpath \"/Users/test/.gemini\"))")
+        .expect("user allow.write must be emitted");
+    for sub in cplt::agent::Agent::Gemini.host_persistence_denies() {
+        let line = format!("(deny file-write* (subpath \"/Users/test/.gemini/{sub}\"))");
+        let deny = p.find(&line).expect("persistence deny must be emitted");
+        assert!(
+            deny > allow,
+            "{line} must come AFTER the user allow.write, or last-match-wins reopens it"
+        );
+    }
 }
 
 #[test]
@@ -8653,5 +8784,84 @@ fn repo_config_state_not_a_git_repo() {
     assert!(
         state.explain().unwrap().contains("not a git repository"),
         "must say it is not a git repo"
+    );
+}
+
+// ── Linux UNIX-socket mount masks (Finding A) ──────────────────
+//
+// The path list is pure data, so it is tested here (cross-platform) rather
+// than in the Linux-only bubblewrap module. What the masks are *for* is
+// documented on `socket_mask_paths`; these tests pin the contents, because a
+// dropped entry is a silent hole.
+
+#[test]
+fn socket_masks_cover_the_escape_sockets() {
+    let masks = cplt::sandbox::socket_mask_paths(1000, false);
+    for expected in [
+        "/run/user/1000/bus",          // D-Bus session bus -> systemd-run --user
+        "/run/user/1000/systemd",      // systemd's private socket
+        "/run/dbus/system_bus_socket", // D-Bus system bus
+        "/run/docker.sock",            // docker daemon == host root
+        "/var/run/docker.sock",
+        "/run/user/1000/docker.sock", // rootless docker
+        "/run/user/1000/podman",      // podman.sock lives beneath
+        "/run/podman",
+    ] {
+        assert!(
+            masks.iter().any(|p| p == std::path::Path::new(expected)),
+            "socket mask list must contain {expected}, got {masks:?}"
+        );
+    }
+}
+
+#[test]
+fn allow_docker_lifts_only_the_container_masks() {
+    let with_docker = cplt::sandbox::socket_mask_paths(1000, true);
+    let docker_paths = cplt::sandbox::linux_docker_socket_paths(1000);
+
+    for p in &docker_paths {
+        assert!(
+            !with_docker.contains(p),
+            "--allow-docker must lift the mask on {}",
+            p.display()
+        );
+    }
+    // The escape sockets that have nothing to do with containers are never
+    // lifted: --allow-docker is not a general socket escape hatch.
+    for expected in [
+        "/run/user/1000/bus",
+        "/run/user/1000/systemd",
+        "/run/dbus/system_bus_socket",
+    ] {
+        assert!(
+            with_docker
+                .iter()
+                .any(|p| p == std::path::Path::new(expected)),
+            "--allow-docker must NOT lift the mask on {expected}"
+        );
+    }
+    assert_eq!(
+        with_docker.len() + docker_paths.len(),
+        cplt::sandbox::socket_mask_paths(1000, false).len(),
+        "allow_docker must differ from the default set by exactly the container sockets"
+    );
+}
+
+#[test]
+fn socket_masks_follow_the_uid() {
+    // The runtime-dir entries are per-user; a hardcoded uid would mask nothing
+    // on any host but the developer's.
+    let masks = cplt::sandbox::socket_mask_paths(4242, false);
+    assert!(
+        masks
+            .iter()
+            .any(|p| p == std::path::Path::new("/run/user/4242/bus")),
+        "runtime-dir masks must use the caller's uid, got {masks:?}"
+    );
+    assert!(
+        !masks
+            .iter()
+            .any(|p| p.to_string_lossy().contains("/run/user/1000/")),
+        "no other uid may leak into the list, got {masks:?}"
     );
 }

@@ -689,6 +689,18 @@ pub fn exec(
                         wrapper.deny_mask_count
                     ));
                 }
+                if wrapper.socket_mask_count > 0 {
+                    // Security-relevant, not just a downgrade: below Landlock
+                    // ABI v9 (kernel 7.1) nothing else restricts connect(2) to
+                    // a pathname UNIX socket, so losing the masks re-opens the
+                    // D-Bus / systemd / container-daemon escape entirely.
+                    ui::warn(&format!(
+                        "{} UNIX-socket mask(s) are NOT applied in this run (D-Bus, systemd, \
+                         container runtimes). Below kernel 7.1 Landlock cannot gate connect(2) \
+                         to a pathname socket, so those sockets are reachable from the agent.",
+                        wrapper.socket_mask_count
+                    ));
+                }
                 // fall through to the direct path
             }
         }

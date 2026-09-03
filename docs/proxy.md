@@ -76,7 +76,7 @@ forced = true
 **What it changes:**
 
 - **The proxy becomes mandatory.** It is forced on regardless of other proxy defaults.
-- **Kernel TCP egress is restricted to the proxy port.** Instead of allowing outbound `*:443`, the sandbox allows outbound only to the proxy's listening port, plus any configured localhost ports. Direct `:443` connections that skip the proxy are blocked in the kernel, so raw sockets and `env`-unset attempts can no longer reach the network that way. Traffic that does get out goes through the proxy, which applies domain allow/block filtering as usual. How complete this is depends on the platform, and on Linux UDP is not restricted at all.
+- **Kernel TCP egress is restricted to the proxy port.** Instead of allowing outbound `*:443`, the sandbox allows outbound only to the proxy's listening port, plus any configured localhost ports. Direct `:443` connections that skip the proxy are blocked in the kernel, so raw sockets and `env`-unset attempts can no longer reach the network that way. Traffic that does get out goes through the proxy, which applies domain allow/block filtering as usual. How complete this is depends on the platform. On Linux, Landlock restricts TCP only, so a seccomp rule in this mode permits just `SOCK_STREAM` with protocol 0 or `IPPROTO_TCP` for `AF_INET`/`AF_INET6`, closing UDP, raw, SCTP and DCCP; outside proxy-forced they stay unrestricted.
 
 **Platform asymmetry.** Enforcement is not equal on the two platforms:
 

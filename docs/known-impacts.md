@@ -172,7 +172,7 @@ cplt does not restrict outbound *domains* by default, but the proxy still enforc
 
 Docker is **intentionally blocked**. `~/.docker` is denied, and on macOS the Docker socket is not reachable, since `(deny default)` covers `network-outbound` to unix sockets. Docker gives near-root access to the host system, which defeats the purpose of sandboxing.
 
-**On Linux the socket is not blocked.** Unix socket `connect()` is not gated at the Landlock ABI cplt targets, and a read-only bwrap bind does not stop a `connect()` either, so an agent that can speak HTTP over `/var/run/docker.sock` has near-root access to the host regardless of `allow_docker`, itself a macOS flag that is ignored with a warning on Linux. See [Linux limitations](../SECURITY.md#linux-specific-limitations).
+**On Linux it depends on bubblewrap.** Unix socket `connect()` is not gated by Landlock before ABI v9 (kernel 7.1), and a read-only bwrap bind does not stop a `connect()` either, so the only thing that removes the daemon socket on a current kernel is bubblewrap's mount mask over `/run/docker.sock`, `/var/run/docker.sock`, `/run/user/<uid>/docker.sock`, `/run/user/<uid>/podman` and `/run/podman`. Without bubblewrap an agent that can speak HTTP over the socket has near-root access to the host. `--allow-docker` lifts those masks and grants the sockets in Landlock (it is no longer ignored on Linux); `~/.docker` stays denied either way, so CLI contexts and registry auth remain unavailable. See [Linux limitations](../SECURITY.md#linux-specific-limitations).
 
 - Docker commands, `docker compose`, and Testcontainers will fail
 - Local databases via Docker Compose need `--allow-localhost <PORT>` for the exposed port (the database container runs outside the sandbox)
@@ -194,7 +194,7 @@ SSH agent access is blocked on macOS (the agent socket is not reachable — the 
 - `ssh` commands spawned by the agent fail
 - `gh` CLI uses HTTPS by default and is unaffected
 
-**Linux caveat — this is not kernel-enforced.** Unix socket `connect()` is not gated at the Landlock ABI cplt targets (see [Linux limitations](../SECURITY.md#linux-specific-limitations)), so the withheld `SSH_AUTH_SOCK` is the whole barrier: `/tmp` is readable, so `ls /tmp/ssh-*/agent.*` finds a stock OpenSSH socket and `SSH_AUTH_SOCK=... ssh-add -l` uses the loaded keys.
+**Linux caveat — this is not kernel-enforced below kernel 7.1.** Landlock gains the unix-socket `connect()` right only at ABI v9, and the SSH agent socket is not in the set bubblewrap masks (see [Linux limitations](../SECURITY.md#linux-specific-limitations)), so the withheld `SSH_AUTH_SOCK` is the whole barrier: without bubblewrap `/tmp` is readable, so `ls /tmp/ssh-*/agent.*` finds a stock OpenSSH socket and `SSH_AUTH_SOCK=... ssh-add -l` uses the loaded keys. bubblewrap's private `/tmp` hides that one, but not a gnome-keyring or systemd agent at a fixed `$XDG_RUNTIME_DIR` path.
 
 Bubblewrap's private `/tmp` helps only for that stock layout. The desktop agents put their socket under `$XDG_RUNTIME_DIR` — `gcr/ssh` (gnome-keyring), `keyring/ssh`, `openssh_agent` (systemd) — a fixed path under `/run/user/<uid>` that bwrap's read-only bind of `/` leaves visible and that needs no enumeration. On GNOME or KDE, bwrap adds nothing here.
 
@@ -202,17 +202,20 @@ If your keys must be unusable by a compromised agent on Linux, unload them (`ssh
 
 ## D-Bus and systemd (Linux) — the session manager is reachable
 
-`XDG_RUNTIME_DIR` is on the environment allowlist, and `connect()` to a pathname unix socket is not restricted on Linux at the Landlock ABI cplt targets, so `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox. This is established by reading the code, not by running it on a host — treat it as reachable rather than demonstrated. `systemd-run --user <cmd>` therefore hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
+`XDG_RUNTIME_DIR` is on the environment allowlist, and Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1), so on a current kernel `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox unless bubblewrap masks it. This is established by reading the code, not by running it on a host — treat it as reachable rather than demonstrated. `systemd-run --user <cmd>` hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
 
-- This works with and without bubblewrap — bwrap does not give the sandbox its own `/run` or a private session bus
-- cplt has no mitigation today; there is no flag that closes it
-- If your threat model needs it closed, run cplt inside a container or VM, or on a session with no user D-Bus instance
+- **With bubblewrap** (the default when `bwrap` is installed) `$XDG_RUNTIME_DIR/bus`, `$XDG_RUNTIME_DIR/systemd` and `/run/dbus/system_bus_socket` are mount-masked, which closes this path
+- **Without it** — not installed, `--no-bubblewrap`, or an auto-detect fallback at spawn time — nothing closes it below kernel 7.1
+- From kernel 7.1 (Landlock ABI v9) the `connect()` is denied outright, bubblewrap or not
+- If your threat model needs it closed today, install bubblewrap, or run cplt inside a container or VM
 
-## UDP is unrestricted (Linux)
+## UDP is unrestricted outside proxy-forced (Linux)
 
-Landlock gates UDP only at ABI v10 and cplt handles TCP connect alone, so outbound UDP to any host and port — and inbound UDP bind — is unrestricted at the kernel in **every** Linux mode, `proxy.forced` included. The CONNECT proxy carries TCP only, so UDP traffic never reaches it and never appears in the proxy log.
+Landlock gates UDP only at ABI v10 and cplt handles TCP connect alone, so outbound UDP to any host and port — and inbound UDP bind — is unrestricted at the kernel in every Linux mode except `proxy.forced`. The CONNECT proxy carries TCP only, so UDP traffic never reaches it and never appears in the proxy log.
 
-- DNS tunnelling, QUIC/HTTP-3, and plain UDP exfiltration are not covered by any cplt layer on Linux
+- Under **`proxy.forced`** a seccomp rule permits only `SOCK_STREAM` with protocol 0 or `IPPROTO_TCP` for `AF_INET`/`AF_INET6`, which removes UDP, raw, SCTP and DCCP on any kernel. Anything that opens such a socket gets `EPERM` from `socket()`, not just code that sends UDP: the JDK enumerates interfaces via `socket(AF_INET, SOCK_DGRAM, 0)` + `SIOCGIFCONF` and throws `SocketException`, which Gradle propagates (already moot under `proxy.forced`, where the port lock breaks Gradle anyway). seccomp cannot see the destination address at `socket(2)`, so no loopback exemption is possible
+- Outside `proxy.forced` the rule is deliberately not applied — denying `SOCK_DGRAM` would break `getaddrinfo(3)`, and so all DNS, for every non-proxied tool
+- DNS tunnelling, QUIC/HTTP-3, and plain UDP exfiltration are not covered by any cplt layer on Linux outside `proxy.forced`
 - The proxy log is therefore not a complete record of what left the machine on Linux
 - macOS restricts UDP but does not route it through the proxy either: `remote ip "*:443"` covers UDP as well as TCP, so in default mode QUIC/HTTP-3 on 443 leaves without being logged there too. Only under `proxy.forced`, where the `*:443` allow is dropped and `(deny default)` closes the rest, is the macOS proxy log complete
 
@@ -671,6 +674,29 @@ Plenty of developer tools phone home with default-on usage analytics: build syst
 | `posthog.com` | AI agent analytics (PostHog, all subdomains) |
 
 Tools keep working normally. These are non-essential telemetry endpoints.
+
+## Agent config-dir host-persistence denies
+
+Each agent's global config dir is mounted read/write, but the files in it that **auto-execute on the host** the next time you run that agent outside cplt are write-denied. A sandboxed agent never needs to write them mid-session, and anything it did write there would run unsandboxed on your next launch.
+
+| Agent | Denied | What breaks |
+| --- | --- | --- |
+| Gemini | `~/.gemini/settings.json`, `extensions/`, `policies/`, `hooks/` | ❌ **First login.** Gemini records the auth method it picked as `selectedAuthType` in `settings.json`, so signing in from inside cplt fails with `Failed to save settings: …`. cplt warns about this before launching — run `gemini` once outside cplt. Also blocks editing user-level hooks, extensions and policies from inside a session |
+| Pi | `~/.pi/agent/settings.json`, `extensions/`, `npm/`, `git/` | ⚠️ `pi install`, and every in-session setting that persists to `settings.json`: `/model` (Ctrl+S), `/thinking`, `/settings`. Do those outside cplt. Auth is unaffected — Pi uses provider API keys via `--pass-env` |
+| Claude Code | `~/.claude/settings.json`, `statusline.sh`, `plugins/` | ⚠️ Editing `settings.json` (including `hooks`) from inside a session. `commands/`, `agents/` and `skills/` stay writable. Auth is unaffected — the OAuth token is in the Keychain or `.credentials.json` |
+| Antigravity | `~/.gemini/config/hooks.json`, `config/mcp_config.json`, `antigravity-cli/bin/` | ⚠️ Editing hooks or MCP server config from inside a session. Auth is unaffected |
+| Copilot, OpenCode | — | Nothing denied |
+
+**There is no flag that reopens these.** The denies are emitted at the very end of the profile, after every user `allow.write`, so even `--allow-write ~/.gemini/settings.json` does not override them. That is deliberate: before this, `allow.write = ["~/.gemini"]` silently reopened the whole set.
+
+**Linux is weaker than macOS here.** Landlock cannot deny a subpath inside an allowed directory, so the denies are carried by the bubblewrap read-only overlay. They hold only when `bwrap` is installed, and only for paths that **already exist** — bubblewrap cannot bind a missing source, so a `extensions/` directory that does not exist yet is unprotected until something creates it. Without bubblewrap the guard does not apply on Linux at all.
+
+**Fix (Gemini first login):**
+
+```bash
+gemini          # once, outside cplt — complete the sign-in
+cplt --agent gemini
+```
 
 ## AI agent telemetry
 

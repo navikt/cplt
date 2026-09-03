@@ -1574,17 +1574,48 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             ));
         }
 
+        // #237: the host-persistence guard write-denies the agent's own
+        // settings.json, which for Gemini is also where first-run login records
+        // the auth method. Warn up front rather than letting the user meet it
+        // as an opaque permission error from inside the agent, with nothing
+        // naming cplt anywhere in it.
+        //
+        // A warning, not a refusal: the login may well be the only thing that
+        // breaks, and blocking the launch over it takes the choice away. The
+        // cost is that the user can still walk into the failure, so the text
+        // has to be complete enough to be *recognised* later, not just read
+        // now — see `Agent::login_warning`.
+        //
+        // Skipped only where the premise is wrong: a provider API key passed
+        // through authenticates without touching the file, and --inherit-env
+        // may carry one we cannot see. Diagnostic paths (`cplt check`,
+        // --print-profile, --doctor) are NOT exempt — now that nothing is
+        // blocked, the warning is information there too.
+        //
+        // Emitted BEFORE the --allow-browser hint below, deliberately: telling
+        // someone to add a flag for a login that cannot succeed in here is the
+        // contradiction this warning exists to remove.
+        if !has_api_key
+            && !resolved.inherit_env
+            && let Some(msg) = active_agent.login_warning(&home_dir)
+        {
+            ui::warn(&msg);
+        }
+
         // Suppressing the API-key hint for OAuth-first agents leaves the
         // browser-flow ones with no signal at all: Google's login opens a
-        // browser, and --allow-browser is off by default, so a first-time user
-        // hits a dead end. Point at the flag rather than the key.
+        // browser, and --allow-browser is off by default, so a user who hits a
+        // sign-in prompt hits a dead end. Point at the flag rather than the key.
+        // Says "if you are prompted", not "on first run": for Gemini the
+        // warning above already covers first run, so the prompts this is
+        // really about are re-auth and OAuth from an MCP server.
         if active_agent.oauth_first()
             && active_agent.oauth_needs_browser()
             && !resolved.allow_browser
         {
             ui::warn(&format!(
-                "{} signs in through a browser on first run. Add --allow-browser \
-                 if you have not authenticated yet.",
+                "{} signs in through a browser. Add --allow-browser if you are \
+                 prompted to sign in.",
                 active_agent.display_name()
             ));
         }

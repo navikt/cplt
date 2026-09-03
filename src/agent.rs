@@ -289,6 +289,80 @@ impl Agent {
         matches!(self, Agent::Copilot)
     }
 
+    /// Paths inside this agent's writable config dir(s) that auto-execute on
+    /// the HOST the next time the agent runs *outside* cplt — a persistence
+    /// vector the agent never needs to write mid-session. Each entry is joined
+    /// onto every writable [`Agent::config_dirs`] grant and denied for writing.
+    ///
+    /// - Claude: `statusline.sh` runs on every prompt render, `plugins/` loads
+    ///   at startup, and `settings.json` carries `hooks` (`SessionStart`,
+    ///   `UserPromptSubmit`, …) which fire automatically. `commands/`,
+    ///   `agents/` and `skills/` stay writable — those do require explicit user
+    ///   invocation.
+    /// - Gemini: `settings.json` holds `hooks.SessionStart[]`, which fires on
+    ///   startup, on resume and after `/clear`; folder trust is workspace-scoped
+    ///   and does not gate user-level hooks. `extensions/` is auto-loaded.
+    ///   `policies/*.toml` is the user policy tier, also not trust-gated, where
+    ///   `decision = "allow"` on `run_shell_command` makes the next host run
+    ///   auto-execute without confirmation — nothing legitimate writes it from
+    ///   inside a session. `hooks/` is where the scripts `settings.json` names
+    ///   conventionally live: denying the settings file stops a *new* hook
+    ///   being pointed at, but an existing entry's script body would still be
+    ///   rewritable in place (same reasoning as Pi's `npm`/`git`).
+    /// - Antigravity: its own grants carry the same class. `config/hooks.json`
+    ///   names host commands, `config/mcp_config.json` holds `mcpServers` that
+    ///   auto-start, and `antigravity-cli/bin/` holds binaries (`agentapi`,
+    ///   `webm_encoder`) Antigravity runs on the host.
+    /// - Pi: `extensions/*.ts` and `extensions/*/index.ts` are auto-discovered
+    ///   at startup (the trust gate covers only the project-local path), and
+    ///   `settings.json` can name extension paths and npm/git packages, so
+    ///   denying the directory alone is not enough. `npm/` and `git/` hold the
+    ///   code of packages already installed by `pi install`: denying only
+    ///   `settings.json` stops a *new* entry being added but leaves installed
+    ///   package code editable in place, and it loads on the next host run.
+    ///
+    /// Cost: denying `settings.json` breaks *first-run login inside the
+    /// sandbox* for Gemini (it writes `selectedAuthType` there). For Pi it
+    /// breaks package management and every in-session setting that persists
+    /// there — `/model` Ctrl+S, `/thinking`, `/settings`. Do those outside
+    /// cplt — see SECURITY.md.
+    ///
+    /// Enforcement is macOS-first: Seatbelt emits these as write-denies after
+    /// the dir-wide allow (last match wins). Landlock cannot sub-deny inside an
+    /// allowed tree, so on Linux they are re-bound read-only when bubblewrap is
+    /// available and are **unenforced** when it is not.
+    pub fn host_persistence_denies(&self) -> &'static [&'static str] {
+        match self {
+            Agent::Claude => &["statusline.sh", "plugins", "settings.json"],
+            Agent::Gemini => &["settings.json", "extensions", "policies", "hooks"],
+            Agent::Pi => &["settings.json", "extensions", "npm", "git"],
+            // Antigravity's grants are ~/.gemini/config and
+            // ~/.gemini/antigravity-cli, not ~/.gemini itself, so Gemini's own
+            // entries would not match; these are its equivalents. Each name is
+            // joined onto BOTH grants, and the join that does not correspond to
+            // a real path is inert (same as ~/.claude.json/statusline.sh).
+            Agent::Antigravity => &["hooks.json", "mcp_config.json", "bin"],
+            Agent::Copilot | Agent::OpenCode | Agent::Shell => &[],
+        }
+    }
+
+    /// The concrete paths [`Agent::host_persistence_denies`] resolves to for a
+    /// given set of grants: every entry joined onto every **writable** dir.
+    ///
+    /// Both backends need exactly this list — Seatbelt turns it into
+    /// `(deny file-write*)` rules, the Linux path re-binds it read-only under
+    /// bubblewrap — so it lives here rather than being joined twice.
+    pub fn host_persistence_paths(&self, dirs: &[AgentDir]) -> Vec<PathBuf> {
+        dirs.iter()
+            .filter(|d| d.write)
+            .flat_map(|d| {
+                self.host_persistence_denies()
+                    .iter()
+                    .map(|sub| d.path.join(sub))
+            })
+            .collect()
+    }
+
     /// The agent's built-in default domain allowlist — the set of domains the
     /// agent legitimately needs to reach.
     ///
@@ -597,6 +671,75 @@ impl Agent {
             // Not OAuth-first at all.
             Agent::Pi | Agent::Shell => false,
         }
+    }
+
+    /// Warning for the case where this agent's **first-run login** would have
+    /// to write a file that [`Agent::host_persistence_denies`] blocks, and that
+    /// login has not happened yet on this host. `None` means nothing to say.
+    ///
+    /// Warn-and-launch, not refuse: the login may be the only thing the deny
+    /// breaks, and blocking the run takes that judgement away from the user.
+    /// The trade is that they can still walk into the failure — Gemini's
+    /// `saveSettings` catches the `EPERM` and prints "Failed to save settings:
+    /// …" with no mention of cplt — so this text is written to be **recognised
+    /// later**, not merely read at startup: it names the exact file, the reason
+    /// it is denied, what will fail, the one-time fix, and why no flag helps.
+    /// Shortening it defeats the point.
+    ///
+    /// Only Gemini is affected. It records the auth method it picked as
+    /// `selectedAuthType` in `~/.gemini/settings.json` — denied because the
+    /// same file carries auto-firing `SessionStart` hooks. Pi has no
+    /// interactive login at all (see `oauth_first`: provider API keys only) and
+    /// Claude Code's OAuth token lands in the macOS Keychain or
+    /// `~/.claude/.credentials.json`, neither of which is denied. For those two
+    /// the deny costs package management and statusline/plugin authoring, not
+    /// sign-in.
+    ///
+    /// "Authenticated" for Gemini means either `~/.gemini/oauth_creds.json`
+    /// exists (the browser OAuth flow completed) or `settings.json` already
+    /// records a `selectedAuthType` (any auth method — API key, Vertex, OAuth).
+    /// Callers additionally skip this when a provider API key is passed
+    /// through, which authenticates without touching the file.
+    ///
+    /// Deliberately cheap and infallible: one `exists()` and at most one small
+    /// read. Any I/O error is read as "assume authenticated", so a filesystem
+    /// hiccup can never turn into a spurious warning.
+    pub fn login_warning(&self, home: &Path) -> Option<String> {
+        if !matches!(self, Agent::Gemini) {
+            return None;
+        }
+        let dir = home.join(".gemini");
+        // Only a genuinely missing file proves "not signed in". Any other
+        // error — permissions, invalid UTF-8, a flaky mount — is read as
+        // "assume authenticated" so a filesystem hiccup stays silent.
+        let authenticated = dir.join("oauth_creds.json").try_exists().unwrap_or(true)
+            || match std::fs::read_to_string(dir.join("settings.json")) {
+                Ok(s) => s.contains("selectedAuthType"),
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            };
+        if authenticated {
+            return None;
+        }
+        let settings = dir.join("settings.json").display().to_string();
+        Some(format!(
+            "Gemini is not signed in yet, and cplt write-denies {settings}.\n\
+             That file is where Gemini records the auth method you pick on first \
+             login, but it also holds `hooks.SessionStart[]`, which auto-fires the \
+             next time `gemini` starts outside the sandbox — so cplt denies writes \
+             to it.\n\
+             \n\
+             Launching anyway. If you sign in from in here, Gemini will fail to \
+             save the choice and print something like \"Failed to save settings\" \
+             — that error is this deny, not a Gemini bug.\n\
+             \n\
+             To fix it, sign in once outside cplt — a one-time step:\n\
+             \n\
+             \x20   gemini\n\
+             \n\
+             Then run cplt as normal. There is deliberately no flag for doing it \
+             in here: the deny is emitted after every user allow, so not even \
+             `--allow-write` reopens the file."
+        ))
     }
 
     /// Environment variable names this agent may need for authentication.
@@ -1468,6 +1611,146 @@ mod tests {
         assert!(Agent::Gemini.needs_keychain());
         assert!(Agent::Antigravity.needs_keychain());
         assert!(!Agent::OpenCode.needs_keychain());
+    }
+
+    #[test]
+    fn host_persistence_denies_per_agent() {
+        assert_eq!(
+            Agent::Claude.host_persistence_denies(),
+            ["statusline.sh", "plugins", "settings.json"],
+            "Claude's settings.json hooks auto-fire — it must be denied (#237)"
+        );
+        assert_eq!(
+            Agent::Gemini.host_persistence_denies(),
+            ["settings.json", "extensions", "policies", "hooks"]
+        );
+        assert_eq!(
+            Agent::Pi.host_persistence_denies(),
+            // npm/ and git/ hold already-installed package code, editable in
+            // place: denying settings.json alone only stops a NEW entry.
+            ["settings.json", "extensions", "npm", "git"]
+        );
+        assert_eq!(
+            Agent::Antigravity.host_persistence_denies(),
+            ["hooks.json", "mcp_config.json", "bin"]
+        );
+        // No writable dir that hosts auto-executing config for these.
+        assert!(Agent::Copilot.host_persistence_denies().is_empty());
+        assert!(Agent::OpenCode.host_persistence_denies().is_empty());
+        assert!(Agent::Shell.host_persistence_denies().is_empty());
+    }
+
+    /// `host_persistence_paths` is what BOTH backends consume — Seatbelt turns
+    /// it into deny rules, the Linux path re-binds it read-only — so pinning it
+    /// here covers the bubblewrap assembly without needing a Linux host.
+    #[test]
+    fn host_persistence_paths_join_only_writable_grants() {
+        let home = Path::new("/Users/test");
+
+        let dirs = Agent::Pi.config_dirs(home);
+        assert_eq!(
+            Agent::Pi.host_persistence_paths(&dirs),
+            vec![
+                home.join(".pi/agent/settings.json"),
+                home.join(".pi/agent/extensions"),
+                home.join(".pi/agent/npm"),
+                home.join(".pi/agent/git"),
+            ],
+            "exec-only ~/.pi/agent/bin must contribute nothing — its write-deny \
+             comes from the exec-only rule instead"
+        );
+
+        // Antigravity has two writable grants and its entries belong to one
+        // each; the crossed joins are inert but harmless.
+        let dirs = Agent::Antigravity.config_dirs(home);
+        let paths = Agent::Antigravity.host_persistence_paths(&dirs);
+        assert!(paths.contains(&home.join(".gemini/config/hooks.json")));
+        assert!(paths.contains(&home.join(".gemini/config/mcp_config.json")));
+        assert!(paths.contains(&home.join(".gemini/antigravity-cli/bin")));
+
+        // No denies declared → nothing joined, whatever the grants look like.
+        let dirs = Agent::OpenCode.config_dirs(home);
+        assert!(Agent::OpenCode.host_persistence_paths(&dirs).is_empty());
+    }
+
+    #[test]
+    fn login_warning_only_for_unauthenticated_gemini() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".gemini")).expect("mkdir");
+
+        // Nothing on disk: warn, and say enough to be recognised later. cplt
+        // launches anyway, so the user may well meet the failure inside Gemini
+        // with this text already scrolled off — every one of these parts is
+        // what lets them connect the two.
+        let msg = Agent::Gemini
+            .login_warning(home)
+            .expect("unauthenticated Gemini must warn");
+        assert!(msg.contains("not signed in"), "{msg}");
+        assert!(
+            msg.contains("hooks.SessionStart[]"),
+            "why it is denied: {msg}"
+        );
+        assert!(
+            msg.contains("Failed to save settings"),
+            "must quote the error Gemini will actually print: {msg}"
+        );
+        assert!(msg.contains("one-time"), "{msg}");
+        assert!(msg.contains("gemini"), "{msg}");
+        assert!(
+            msg.contains(&home.join(".gemini/settings.json").display().to_string()),
+            "message must name the denied file: {msg}"
+        );
+        // No in-cplt escape hatch is offered, because there is none: the deny
+        // is emitted after every user allow. Advertising one would be a lie.
+        assert!(
+            !msg.contains("cplt --agent"),
+            "must not hand out an in-cplt command that cannot work: {msg}"
+        );
+        assert!(msg.contains("no flag"), "{msg}");
+
+        // Agents whose login does not touch a denied file never refuse, even
+        // with an equally empty home.
+        for agent in [
+            Agent::Pi,
+            Agent::Claude,
+            Agent::Copilot,
+            Agent::OpenCode,
+            Agent::Antigravity,
+            Agent::Shell,
+        ] {
+            assert!(
+                agent.login_warning(home).is_none(),
+                "{agent:?} must not warn"
+            );
+        }
+
+        // Any recorded auth method counts as authenticated (API key, Vertex, …).
+        std::fs::write(
+            home.join(".gemini/settings.json"),
+            r#"{"security":{"auth":{"selectedAuthType":"gemini-api-key"}}}"#,
+        )
+        .expect("write settings");
+        assert!(Agent::Gemini.login_warning(home).is_none());
+
+        // So does a completed browser OAuth flow, even with no settings.json.
+        let tmp2 = tempfile::tempdir().expect("tempdir");
+        let home2 = tmp2.path();
+        std::fs::create_dir_all(home2.join(".gemini")).expect("mkdir");
+        std::fs::write(home2.join(".gemini/oauth_creds.json"), "{}").expect("write creds");
+        assert!(Agent::Gemini.login_warning(home2).is_none());
+
+        // A read that fails for any reason other than "not there" is a
+        // filesystem problem, not proof of a missing login: a directory where
+        // settings.json belongs makes read_to_string fail with EISDIR, and the
+        // documented contract is to assume authenticated and stay quiet.
+        let tmp3 = tempfile::tempdir().expect("tempdir");
+        let home3 = tmp3.path();
+        std::fs::create_dir_all(home3.join(".gemini/settings.json")).expect("mkdir");
+        assert!(
+            Agent::Gemini.login_warning(home3).is_none(),
+            "an unreadable settings.json must not produce a spurious warning"
+        );
     }
 
     #[test]

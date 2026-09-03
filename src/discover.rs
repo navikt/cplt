@@ -805,6 +805,15 @@ fn print_sandbox_mechanism_status() -> bool {
                 );
                 println!("      Network security provided by proxy only.");
             }
+            if abi_version < ABI::V9 {
+                println!(
+                    "  {}⚠{} Landlock ABI < v9: UNIX-socket connect() unavailable (kernel < 7.1)",
+                    ui::stdout_color(ui::YELLOW),
+                    ui::stdout_color(ui::RESET)
+                );
+                println!("      Known escape sockets (D-Bus, systemd, container daemons) are only");
+                println!("      masked when Bubblewrap is active; otherwise unrestricted.");
+            }
             true
         } else {
             println!(
