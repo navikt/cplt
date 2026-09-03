@@ -3198,55 +3198,55 @@ mod tests {
         panic!("{host} must complete a 200 tunnel once allowed");
     }
 
-    /// CONNECT to `host`, then wait for the proxy to record it — retrying the
-    /// CONNECT itself, not only the observation.
+    /// CONNECT to `host`, then wait for *this attempt's* observation.
     ///
-    /// Two separate races, and polling alone only covers one. The connection
-    /// thread records the host *after* the client's CONNECT returns, so
-    /// snapshotting immediately loses it — that is what the polling handles.
-    /// But `record_observation` fires only once the proxy has PARSED a CONNECT
-    /// and reached a verdict, so a transient transport close before that
-    /// (`403 EOF` / `403 ECONNRESET` from `proxy_connect`, neither of which
-    /// carries "Forbidden") means nothing is ever recorded and the poll just
-    /// spins out its deadline. Retrying the connect is the only thing that
-    /// recovers it — the same transient `assert_connect_allowed` retries for.
+    /// Two races, and the status of the connect distinguishes neither of them.
+    /// `log_connection` records BEFORE the 403 is written to the client, so a
+    /// `403 EOF` / `403 ECONNRESET` does not mean nothing was recorded — the
+    /// proxy may have parsed, recorded, and then failed to write. Retrying on
+    /// that basis is how `status` and `rec` end up describing different
+    /// attempts.
     ///
-    /// The returned status always describes the attempt that produced the
-    /// record: a connect is only re-issued after one that provably recorded
-    /// nothing, so `status` and `rec` cannot come from different attempts.
+    /// So it does not guess. `record_observation` increments a per-host count,
+    /// so waiting for the count to exceed what it was before this connect is an
+    /// exact test for "this attempt was recorded" — a record left by an earlier
+    /// attempt cannot satisfy it. Only when an attempt leaves the count
+    /// unchanged is another connect issued.
     fn connect_and_await_observed(proxy: &ProxyHandle, host: &str) -> (String, ObservedDomain) {
-        // Only `403 EOF` / `403 ECONNRESET` mean the proxy never parsed a
-        // CONNECT, so nothing will ever be recorded for that attempt and the
-        // only recovery is another connect. Any other status was reached by
-        // parsing a CONNECT, so the record is on its way and re-issuing would
-        // leave `status` describing a different attempt than `rec`.
-        fn never_parsed(status: &str) -> bool {
-            status.contains("EOF") || status.contains("ECONNRESET")
-        }
-
         let key = normalize_hostname(host);
-        let overall = Instant::now() + Duration::from_secs(5);
-        let mut status = proxy_connect(proxy.port, &format!("{host}:443"));
-        loop {
-            // `record_observation` stores the normalized host, so match on that
-            // rather than on the spelling the caller passed.
-            if let Some(rec) = proxy
-                .observed_domains()
+        let count_for = |p: &ProxyHandle| {
+            p.observed_domains()
                 .into_iter()
                 .find(|o| o.host == key)
-            {
-                return (status, rec);
-            }
-            assert!(
-                Instant::now() < overall,
-                "{host} was never recorded in the observed set (last status: {status})"
-            );
-            if never_parsed(&status) {
-                std::thread::sleep(Duration::from_millis(25));
-                status = proxy_connect(proxy.port, &format!("{host}:443"));
-            } else {
+                .map_or(0, |o| o.count)
+        };
+
+        let overall = Instant::now() + Duration::from_secs(5);
+        loop {
+            let before = count_for(proxy);
+            let status = proxy_connect(proxy.port, &format!("{host}:443"));
+
+            let attempt = Instant::now() + Duration::from_millis(500);
+            loop {
+                if let Some(rec) = proxy
+                    .observed_domains()
+                    .into_iter()
+                    .find(|o| o.host == key && o.count > before)
+                {
+                    return (status, rec);
+                }
+                if Instant::now() >= attempt {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
+            // `{status:?}` escapes the proxy's response line rather than
+            // interpolating it raw (same reasoning as the escape_debug calls on
+            // the production log path).
+            assert!(
+                Instant::now() < overall,
+                "{host} was never recorded in the observed set (last status: {status:?})"
+            );
         }
     }
 
