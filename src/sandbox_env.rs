@@ -306,6 +306,22 @@ pub fn npmrc_userconfig_override(
     Some(scratch_dir?.join("npmrc"))
 }
 
+/// The cplt-owned Playwright socket base to inject, unless the caller overrides it.
+///
+/// An explicit `--pass-env PWTEST_SOCKETS_DIR` is an override signal even when
+/// the parent has no value. Ambient values are not considered: callers apply
+/// this after normal environment filtering so the short automatic value replaces
+/// inherited or allowlisted values unless the user explicitly passed the key.
+pub fn playwright_sockets_dir_override<'a>(
+    extra_pass_env: &[String],
+    playwright_socket_dir: Option<&'a Path>,
+) -> Option<&'a Path> {
+    if extra_pass_env.iter().any(|var| var == "PWTEST_SOCKETS_DIR") {
+        return None;
+    }
+    playwright_socket_dir
+}
+
 /// Keys in `parent_env` that name the same npm setting as `NPM_CONFIG_USERCONFIG`
 /// but are spelled differently, and so must be dropped when the override is injected.
 ///

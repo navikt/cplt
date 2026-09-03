@@ -1829,6 +1829,7 @@ mod tests {
             allow_env_files: false,
             allow_localhost_any: false,
             scratch_dir: None,
+            playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
             java_home: None,

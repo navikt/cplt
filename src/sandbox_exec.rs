@@ -66,6 +66,7 @@ fn configure_command(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     npmrc_allowed: bool,
+    playwright_socket_dir: Option<&Path>,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -96,6 +97,16 @@ fn configure_command(
         for (key, val) in &sandbox_env.vars {
             cmd.env(key, val);
         }
+    }
+
+    // Playwright's internal control server binds Unix sockets below this short,
+    // random, policy-authorized per-session directory.
+    // This runs after filtering so ambient values cannot displace the safe
+    // default; only an explicit --pass-env requests a caller override.
+    if let Some(path) =
+        super::env::playwright_sockets_dir_override(extra_pass_env, playwright_socket_dir)
+    {
+        cmd.env("PWTEST_SOCKETS_DIR", path);
     }
 
     // Default DOTNET_CLI_HOME to the already-resolved, already-validated sandbox
@@ -574,6 +585,7 @@ pub fn exec(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        sandbox.playwright_socket_dir.as_deref(),
     );
 
     // Strip repo-config denied env vars
@@ -725,6 +737,7 @@ pub fn exec(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        sandbox.playwright_socket_dir.as_deref(),
     );
 
     // Strip repo-config denied env vars
@@ -863,6 +876,7 @@ fn exec_bwrap(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        sandbox.playwright_socket_dir.as_deref(),
     );
     for var in deny_env {
         cmd.env_remove(var);

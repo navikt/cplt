@@ -52,20 +52,23 @@ mod profile;
 pub use policy::{
     AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
     ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
-    HomeToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs, current_uid,
-    home_tool_dirs, linux_docker_socket_paths, socket_mask_paths, tool_override_path_is_safe,
-    tool_path_env_overrides, validate_sbpl_path,
+    HomeToolDir, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
+    PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
+    TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs, current_uid, home_tool_dirs,
+    linux_docker_socket_paths, playwright_runtime_intent, socket_mask_paths,
+    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
+    validate_sbpl_path,
 };
 
 // SBPL profile generation — kept public for unit tests.
 // The SBPL module is pure string manipulation with no macOS dependencies,
 // so tests run cross-platform even though the output is macOS-specific.
-pub use profile::{ProfileOptions, generate_profile};
+pub use profile::{ProfileOptions, generate_profile, generate_profile_with_playwright_socket_dir};
 
 // Environment construction — already platform-agnostic.
 pub use env::{
     SandboxEnv, build_sandbox_env, npmrc_explicitly_allowed, npmrc_userconfig_override,
-    npmrc_userconfig_stale_variants,
+    npmrc_userconfig_stale_variants, playwright_sockets_dir_override,
 };
 
 // Landlock policy types — cross-platform for testing.
@@ -113,6 +116,9 @@ pub struct SandboxConfig<'a> {
     pub allow_env_files: bool,
     pub allow_localhost_any: bool,
     pub scratch_dir: Option<&'a Path>,
+    /// Validated cplt-owned macOS directory for Playwright control sockets.
+    /// Always `None` on non-macOS platforms and for caller-owned overrides.
+    pub playwright_socket_dir: Option<&'a Path>,
     pub allow_tmp_exec: bool,
     /// Copilot CLI package directory (resolved from the binary location).
     pub copilot_install_dir: Option<&'a Path>,
@@ -166,6 +172,8 @@ pub struct PreparedSandbox {
     /// Linux: human-readable Landlock policy summary.
     profile_text: String,
     scratch_dir: Option<PathBuf>,
+    /// Exact automatic Playwright socket base authorized by the macOS profile.
+    playwright_socket_dir: Option<PathBuf>,
     proxy_port: Option<u16>,
     agent: Agent,
     /// Specific localhost ports the user has explicitly opened.
@@ -204,8 +212,10 @@ impl PreparedSandbox {
 ///
 /// Returns an error if:
 /// - A path contains characters that could cause profile injection (macOS)
+/// - A Playwright socket directory is supplied on a non-macOS platform
 /// - The platform does not support sandboxing
 pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
+    validate_playwright_socket_capability(config.playwright_socket_dir)?;
     prepare_impl(config, &extra_git_dirs(config.extra_write))
 }
 
@@ -302,8 +312,12 @@ fn prepare_impl(
     for p in extra_git_dirs {
         policy::validate_sbpl_path(p).map_err(|e| format!("Granted repo .git dir: {e}"))?;
     }
+    let playwright_socket_dir =
+        policy::playwright_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any)
+            .then_some(config.playwright_socket_dir)
+            .flatten();
 
-    let profile_text = profile::generate_profile(&profile::ProfileOptions {
+    let profile_options = profile::ProfileOptions {
         project_dir: config.project_dir,
         home_dir: config.home_dir,
         extra_read: config.extra_read,
@@ -337,13 +351,18 @@ fn prepare_impl(
         allow_cache_exec: config.allow_cache_exec,
         allow_cache_exec_any: config.allow_cache_exec_any,
         allow_browser: config.allow_browser,
-    });
+    };
+    let profile_text = profile::generate_profile_with_playwright_socket_dir(
+        &profile_options,
+        playwright_socket_dir,
+    );
 
     Ok(PreparedSandbox {
         project_dir: config.project_dir.to_path_buf(),
         home_dir: config.home_dir.to_path_buf(),
         profile_text,
         scratch_dir: config.scratch_dir.map(Path::to_path_buf),
+        playwright_socket_dir: playwright_socket_dir.map(Path::to_path_buf),
         proxy_port: config.proxy_port,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
@@ -575,6 +594,9 @@ fn prepare_impl(
         home_dir: config.home_dir.to_path_buf(),
         profile_text,
         scratch_dir: config.scratch_dir.map(Path::to_path_buf),
+        // The automatic capability is macOS-only; direct Linux callers cannot
+        // introduce a new /tmp path lifecycle or child environment override.
+        playwright_socket_dir: None,
         proxy_port: config.proxy_port,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
@@ -665,9 +687,128 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate the platform-specific automatic Playwright socket capability.
+///
+/// macOS rechecks both the path shape and the created directory before adding
+/// its narrow SBPL rules. Other platforms fail closed instead of accepting a
+/// path whose lifecycle and policy grant they do not implement.
+#[cfg(target_os = "macos")]
+fn validate_playwright_socket_capability(path: Option<&Path>) -> Result<(), String> {
+    if let Some(path) = path {
+        policy::validate_playwright_socket_dir(path)
+            .map_err(|e| format!("Playwright socket dir: {e}"))?;
+        validate_created_playwright_socket_dir(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn validate_playwright_socket_capability(path: Option<&Path>) -> Result<(), String> {
+    if path.is_some() {
+        return Err(
+            "Playwright socket directories are supported only on macOS; refusing configured path"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Recheck the filesystem object represented by the automatic capability.
+///
+/// Shape validation prevents SBPL interpolation/path widening; this check
+/// prevents a direct library caller or stale guard from authorizing a symlink,
+/// caller-owned replacement, or permissive pre-existing directory.
+#[cfg(target_os = "macos")]
+fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|_| "Playwright socket dir does not exist".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Playwright socket dir must be a real directory".to_string());
+    }
+    if metadata.uid() != policy::current_uid() {
+        return Err("Playwright socket dir must be owned by the current user".to_string());
+    }
+    if metadata.mode() & 0o777 != 0o700 {
+        return Err("Playwright socket dir must have mode 0700".to_string());
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| "Playwright socket dir cannot be canonicalized".to_string())?;
+    if canonical != path {
+        return Err("Playwright socket dir must not resolve through a symlink".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validates_only_a_live_created_playwright_socket_capability() {
+        let guard = crate::scratch::PlaywrightSocketDir::create().expect("create socket dir");
+        let path = guard.path().to_path_buf();
+
+        validate_playwright_socket_capability(Some(&path)).expect("live capability must validate");
+        drop(guard);
+
+        assert_eq!(
+            validate_playwright_socket_capability(Some(&path)).unwrap_err(),
+            "Playwright socket dir does not exist"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn prepare_rejects_playwright_socket_capability_off_macos() {
+        let config = SandboxConfig {
+            project_dir: Path::new("/project"),
+            home_dir: Path::new("/home/test"),
+            extra_read: &[],
+            extra_write: &[],
+            extra_socket: &[],
+            extra_deny: &[],
+            existing_home_tool_dirs: None,
+            existing_app_dirs: None,
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            proxy_forced: false,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            playwright_socket_dir: Some(Path::new(
+                "/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef",
+            )),
+            allow_tmp_exec: false,
+            copilot_install_dir: None,
+            java_home: None,
+            dotnet_root: None,
+            git_hooks_path: None,
+            git_common_dir: None,
+            allow_gpg_signing: false,
+            deny_clipboard: false,
+            allow_jvm_attach: false,
+            allow_msbuild: false,
+            allow_docker: false,
+            electron_app_dir: None,
+            agent: Agent::Copilot,
+            agent_dirs: &[],
+            allow_cache_exec: &[],
+            allow_cache_exec_any: false,
+            allow_browser: false,
+            use_bubblewrap: None,
+        };
+
+        let error = prepare(&config).err().expect("non-macOS must fail closed");
+        assert_eq!(
+            error,
+            "Playwright socket directories are supported only on macOS; refusing configured path"
+        );
+    }
 
     /// `extra_git_dirs` is the wiring between `prepare()` and the profile: the
     /// emitter test proves the denies get written, this proves the right

@@ -7,10 +7,12 @@ use cplt::discover::copilot_pkg_dir;
 use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
-    HardeningCategory, ProfileOptions, SandboxConfig, build_sandbox_env, generate_policy,
-    generate_profile, npmrc_explicitly_allowed, npmrc_userconfig_override,
-    npmrc_userconfig_stale_variants, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_sbpl_path,
+    HardeningCategory, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_PATH_LIMIT,
+    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, ProfileOptions, SandboxConfig, build_sandbox_env,
+    generate_policy, generate_profile, generate_profile_with_playwright_socket_dir,
+    npmrc_explicitly_allowed, npmrc_userconfig_override, npmrc_userconfig_stale_variants,
+    playwright_runtime_intent, playwright_sockets_dir_override, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 // ============================================================
@@ -850,6 +852,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_env_files: false,
         allow_localhost_any: false,
         scratch_dir: None,
+        playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
         java_home: None,
@@ -3093,6 +3096,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_env_files: false,
         allow_localhost_any: true,
         scratch_dir: None,
+        playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
         java_home: None,
@@ -3149,6 +3153,7 @@ fn config_options_parity_across_backends() {
         allow_env_files: false,
         allow_localhost_any: false,
         scratch_dir: Some(&scratch),
+        playwright_socket_dir: None,
         allow_tmp_exec: true,
         copilot_install_dir: None,
         java_home: None,
@@ -5570,8 +5575,81 @@ fn profile_gpg_signing_allows_socket_file_read() {
 }
 
 // ============================================================
-// build_sandbox_env — scratch dir env injection
+// Playwright runtime intent and child environment
 // ============================================================
+
+#[test]
+fn playwright_runtime_intent_is_exact_and_does_not_follow_cache_exec_any() {
+    for cache_entry in ["ms-playwright", "ms-playwright/chromium-1243"] {
+        let allow_cache_exec = [cache_entry.to_string()];
+        assert!(
+            playwright_runtime_intent(&allow_cache_exec, false),
+            "{cache_entry:?} must enable Playwright runtime intent"
+        );
+    }
+
+    for (label, allow_cache_exec) in [
+        ("no cache opt-in", Vec::<String>::new()),
+        (
+            "unrelated cache opt-in",
+            vec!["some-other-tool".to_string()],
+        ),
+        (
+            "near-miss cache opt-in",
+            vec!["ms-playwright-evil".to_string()],
+        ),
+    ] {
+        assert!(
+            !playwright_runtime_intent(&allow_cache_exec, false),
+            "{label} must not imply Playwright intent"
+        );
+    }
+
+    assert!(
+        !playwright_runtime_intent(&[], true),
+        "allow_cache_exec_any alone must not imply Playwright intent"
+    );
+}
+
+#[test]
+fn playwright_socket_dir_override_uses_only_the_automatic_path() {
+    let socket_dir = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        playwright_sockets_dir_override(&[], Some(socket_dir)),
+        Some(socket_dir)
+    );
+    assert_eq!(playwright_sockets_dir_override(&[], None), None);
+}
+
+#[test]
+fn playwright_socket_dir_respects_explicit_pass_env_value() {
+    let parent = make_env(&[("PWTEST_SOCKETS_DIR", "/caller/playwright-sockets")]);
+    let extra_pass_env = ["PWTEST_SOCKETS_DIR".to_string()];
+    let scratch = std::path::Path::new("/scratch/session");
+    let socket_dir = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+
+    let env = build_sandbox_env(
+        &parent,
+        &extra_pass_env,
+        false,
+        &[],
+        Some(scratch),
+        cplt::agent::Agent::Copilot,
+    );
+    assert_eq!(
+        env.vars
+            .iter()
+            .find(|(key, _)| key == "PWTEST_SOCKETS_DIR")
+            .map(|(_, value)| value.as_str()),
+        Some("/caller/playwright-sockets"),
+        "explicit --pass-env must preserve the caller's parent value"
+    );
+    assert_eq!(
+        playwright_sockets_dir_override(&extra_pass_env, Some(socket_dir)),
+        None,
+        "explicit --pass-env must suppress cplt's automatic injection"
+    );
+}
 
 // #180: the sandbox denies ~/.npmrc, and yarn 1 aborts on EACCES/EPERM where it
 // tolerates ENOENT. Redirecting NPM_CONFIG_USERCONFIG at a nonexistent scratch
@@ -7089,6 +7167,177 @@ fn set_repo_value_unset_removes_array_element() {
 // ============================================================
 // Chromium runtime rules (allow_cache_exec = ["ms-playwright"] or subpath)
 // ============================================================
+
+fn playwright_profile(
+    allow_cache_exec: &[String],
+    allow_cache_exec_any: bool,
+    socket_dir: Option<&std::path::Path>,
+) -> String {
+    generate_profile_with_playwright_socket_dir(
+        &ProfileOptions {
+            project_dir: std::path::Path::new("/projects/app"),
+            home_dir: std::path::Path::new("/Users/test"),
+            extra_read: &[],
+            extra_write: &[],
+            allow_socket: &[],
+            extra_deny: &[],
+            existing_home_tool_dirs: None,
+            existing_app_dirs: None,
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            proxy_forced: false,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            allow_tmp_exec: false,
+            copilot_install_dir: None,
+            java_home: None,
+            dotnet_root: None,
+            git_hooks_path: None,
+            git_common_dir: None,
+            extra_git_dirs: &[],
+            allow_gpg_signing: false,
+            deny_clipboard: false,
+            allow_jvm_attach: false,
+            allow_msbuild: false,
+            allow_docker: false,
+            electron_app_dir: None,
+            agent: cplt::agent::Agent::Copilot,
+            agent_dirs: &[],
+            allow_cache_exec,
+            allow_cache_exec_any,
+            allow_browser: false,
+        },
+        socket_dir,
+    )
+}
+
+#[test]
+fn playwright_socket_dir_validation_enforces_shape_and_length_budget() {
+    let valid = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+    validate_playwright_socket_dir(valid).unwrap();
+    assert!(valid.as_os_str().len() <= PLAYWRIGHT_SOCKET_BASE_MAX_BYTES);
+    assert!(
+        valid.as_os_str().len() + PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX.len()
+            < PLAYWRIGHT_SOCKET_PATH_LIMIT
+    );
+
+    for invalid in [
+        "/private/tmp",
+        "/private/tmp/cplt-pw-0123456789ABCDEF0123456789ABCDEF",
+        "/private/tmp/cplt-pw-0123456789abcdef",
+        "/private/tmp/not-cplt-pw-0123456789abcdef0123456789abcdef",
+        "/projects/app/cplt-pw-0123456789abcdef0123456789abcdef",
+        "/private/tmp/nested/cplt-pw-0123456789abcdef0123456789abcdef",
+        "/private/tmp/cplt-pw-0123456789abcdef0123456789abcde\"",
+    ] {
+        assert!(
+            validate_playwright_socket_dir(std::path::Path::new(invalid)).is_err(),
+            "unsafe Playwright socket path must be rejected: {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn playwright_socket_rules_are_exactly_scoped_for_runtime_intent() {
+    let socket_dir = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+    let socket_path = socket_dir.to_string_lossy();
+    let expected = [
+        format!("(allow network-bind (local unix-socket (subpath \"{socket_path}\")))"),
+        format!("(allow network-inbound (local unix-socket (subpath \"{socket_path}\")))"),
+        format!("(allow network-outbound (remote unix-socket (subpath \"{socket_path}\")))"),
+    ];
+
+    for cache_entry in ["ms-playwright", "ms-playwright/chromium-1243"] {
+        let profile = playwright_profile(&[cache_entry.to_string()], false, Some(socket_dir));
+        let scoped_rules: Vec<_> = profile
+            .lines()
+            .filter(|line| line.contains(socket_path.as_ref()))
+            .collect();
+        assert_eq!(
+            scoped_rules,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "{cache_entry:?} must emit only the three concrete socket operations"
+        );
+        assert!(
+            !profile
+                .contains("(allow network-bind (local unix-socket (subpath \"/private/tmp\")))")
+        );
+        assert!(
+            !profile
+                .contains("(allow network-inbound (local unix-socket (subpath \"/private/tmp\")))")
+        );
+        assert!(
+            !profile.contains(
+                "(allow network-outbound (remote unix-socket (subpath \"/private/tmp\")))"
+            )
+        );
+        assert!(!profile.contains("/private/tmp/cplt-pw-fedcba9876543210fedcba9876543210"));
+        assert!(
+            !profile
+                .contains("(allow network-bind (local unix-socket (subpath \"/projects/app\")))")
+        );
+        assert!(
+            !profile.contains(
+                "(allow network-bind (local unix-socket (subpath \"/scratch/session\")))"
+            )
+        );
+        assert!(!profile.contains("/private/tmp/unrelated.sock"));
+        assert!(!profile.contains("(allow process-exec (subpath \"/private/tmp/cplt-pw-"));
+        assert!(!profile.contains("(allow file-map-executable (subpath \"/private/tmp/cplt-pw-"));
+        assert!(profile.contains("(deny process-exec (subpath \"/private/tmp\"))"));
+        assert!(profile.contains("(deny file-map-executable (subpath \"/private/tmp\"))"));
+    }
+}
+
+#[test]
+fn playwright_socket_rules_require_both_exact_intent_and_automatic_path() {
+    let socket_dir = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+    for (label, allow_cache_exec, allow_cache_exec_any, automatic_path) in [
+        ("no intent", Vec::<String>::new(), false, Some(socket_dir)),
+        (
+            "unrelated intent",
+            vec!["some-other-tool".to_string()],
+            false,
+            Some(socket_dir),
+        ),
+        (
+            "near miss",
+            vec!["ms-playwright-evil".to_string()],
+            false,
+            Some(socket_dir),
+        ),
+        (
+            "allow cache exec any alone",
+            Vec::<String>::new(),
+            true,
+            Some(socket_dir),
+        ),
+        (
+            "no automatic path",
+            vec!["ms-playwright".to_string()],
+            false,
+            None,
+        ),
+        (
+            "unsafe automatic path",
+            vec!["ms-playwright".to_string()],
+            false,
+            Some(std::path::Path::new("/private/tmp")),
+        ),
+    ] {
+        let profile = playwright_profile(&allow_cache_exec, allow_cache_exec_any, automatic_path);
+        assert!(
+            !profile.contains("Per-session Playwright control sockets"),
+            "{label} must not emit automatic Playwright socket rules"
+        );
+        assert!(
+            !profile.contains(socket_dir.to_string_lossy().as_ref()),
+            "{label} must not grant the candidate path"
+        );
+    }
+}
 
 const CHROME_FOR_TESTING_MACH_REGISTER_RULE: &str = r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#;
 const CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX: &str =

@@ -383,11 +383,23 @@ mod macos_tests {
     // full pipeline: profile generation → SBPL → kernel enforcement.
     // ============================================================
 
-    use cplt::sandbox::{ProfileOptions, generate_profile};
+    use cplt::sandbox::{
+        ProfileOptions, generate_profile, generate_profile_with_playwright_socket_dir,
+    };
 
     /// Write a real cplt-generated profile to a temp file.
     fn write_real_profile(opts: &ProfileOptions) -> PathBuf {
         let profile = generate_profile(opts);
+        let path = unique_profile_path();
+        fs::write(&path, &profile).unwrap();
+        path
+    }
+
+    fn write_real_profile_with_playwright_socket(
+        opts: &ProfileOptions,
+        socket_dir: &Path,
+    ) -> PathBuf {
+        let profile = generate_profile_with_playwright_socket_dir(opts, Some(socket_dir));
         let path = unique_profile_path();
         fs::write(&path, &profile).unwrap();
         path
@@ -2202,6 +2214,109 @@ finally:
         assert!(
             output.contains("BLOCKED"),
             "Arbitrary unix sockets in /tmp must be blocked, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_scopes_playwright_unix_sockets_to_owned_directory() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let mut opts = default_opts(&project, &home);
+        let allow_cache_exec = ["ms-playwright".to_string()];
+        opts.allow_cache_exec = &allow_cache_exec;
+        let socket_guard = cplt::scratch::PlaywrightSocketDir::create().unwrap();
+        let sibling = tempfile::Builder::new()
+            .prefix("cplt-pw-integration-sibling-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let profile = write_real_profile_with_playwright_socket(&opts, socket_guard.path());
+        let allowed_socket = socket_guard.path().join("browser/allowed.sock");
+        let sibling_socket = sibling.path().join("blocked.sock");
+
+        let command = format!(
+            r#"python3 -c "
+import os, socket, threading
+allowed = {allowed_socket:?}
+sibling = {sibling_socket:?}
+timeout = 2.0
+server = None
+client = None
+thread = None
+accept_result = []
+owned_ok = False
+
+try:
+    os.makedirs(os.path.dirname(allowed), exist_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.settimeout(timeout)
+    server.bind(allowed)
+    server.listen(1)
+
+    def accept():
+        connection = None
+        try:
+            connection, _ = server.accept()
+            connection.settimeout(timeout)
+            connection.sendall(b'OK')
+            accept_result.append('OK')
+        except Exception:
+            accept_result.append('ERROR')
+        finally:
+            if connection is not None:
+                connection.close()
+
+    thread = threading.Thread(target=accept, daemon=True)
+    thread.start()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    client.connect(allowed)
+    payload = client.recv(2)
+    thread.join(timeout)
+    owned_ok = payload == b'OK' and accept_result == ['OK'] and not thread.is_alive()
+except Exception:
+    pass
+finally:
+    if client is not None:
+        client.close()
+    if server is not None:
+        server.close()
+
+print('OWNED_OK' if owned_ok else 'OWNED_ERROR')
+
+probe = None
+sibling_result = 'SIBLING_ERROR'
+try:
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    probe.bind(sibling)
+    sibling_result = 'SIBLING_EXPOSED'
+except PermissionError:
+    sibling_result = 'SIBLING_BLOCKED'
+except OSError as error:
+    if error.errno == 1:
+        sibling_result = 'SIBLING_BLOCKED'
+finally:
+    if probe is not None:
+        probe.close()
+
+print(sibling_result)
+if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
+    raise SystemExit(1)
+""#,
+            allowed_socket = allowed_socket.to_string_lossy(),
+            sibling_socket = sibling_socket.to_string_lossy(),
+        );
+        let (output, _) = run_sandboxed(&profile, &command);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("OWNED_OK"),
+            "all three socket operations must work in the owned directory, got: {output}"
+        );
+        assert!(
+            output.contains("SIBLING_BLOCKED") && !output.contains("SIBLING_EXPOSED"),
+            "a sibling /private/tmp directory must remain outside the grant, got: {output}"
         );
     }
 

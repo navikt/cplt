@@ -22,7 +22,8 @@ macro_rules! sbpl {
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     GPG_SIGNING_ALLOW_FILES, HOME_TOOL_DIRS, HomeToolDir, SENSITIVE_PROJECT_PATTERNS,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS, app_dirs, validate_sbpl_path,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, app_dirs, playwright_runtime_intent,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Options for generating an SBPL sandbox profile.
@@ -124,6 +125,18 @@ pub struct ProfileOptions<'a> {
 /// so deny rules must come after their corresponding allows. Each `emit_*` helper
 /// writes a contiguous block; their call order must not be changed.
 pub fn generate_profile(opts: &ProfileOptions) -> String {
+    generate_profile_with_playwright_socket_dir(opts, None)
+}
+
+/// Generate an SBPL profile with one validated, cplt-owned Playwright socket base.
+///
+/// The path is kept separate from [`ProfileOptions`] because it is ephemeral
+/// per process. It is honored only for exact Playwright runtime intent; callers
+/// must validate it with `validate_playwright_socket_dir` before interpolation.
+pub fn generate_profile_with_playwright_socket_dir(
+    opts: &ProfileOptions,
+    playwright_socket_dir: Option<&Path>,
+) -> String {
     let mut sb = String::with_capacity(4096);
     let home = opts.home_dir.to_string_lossy();
     let project = opts.project_dir.to_string_lossy();
@@ -144,10 +157,10 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     // allow_cache_exec_any does NOT trigger these rules: it grants process-exec
     // broadly, but Chromium's extra IPC/syscall permissions should only be
     // emitted when the user explicitly signals browser testing intent.
-    let allow_chromium_runtime = opts
-        .allow_cache_exec
-        .iter()
-        .any(|s| s == "ms-playwright" || s.starts_with("ms-playwright/"));
+    let allow_chromium_runtime =
+        playwright_runtime_intent(opts.allow_cache_exec, opts.allow_cache_exec_any);
+    let playwright_socket_dir =
+        playwright_socket_dir.filter(|path| validate_playwright_socket_dir(path).is_ok());
 
     emit_header(&mut sb, &project);
     emit_process_rules(&mut sb);
@@ -184,6 +197,9 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         opts.allow_msbuild,
         opts.scratch_dir,
         allow_chromium_runtime,
+        allow_chromium_runtime
+            .then_some(playwright_socket_dir)
+            .flatten(),
     );
     emit_user_allows(&mut sb, opts.extra_read, opts.extra_write);
     emit_deny_rules(&mut sb, &home, opts.extra_deny);
@@ -1190,12 +1206,34 @@ fn emit_temp_rules(
     allow_msbuild: bool,
     scratch_dir: Option<&Path>,
     allow_chromium_runtime: bool,
+    playwright_socket_dir: Option<&Path>,
 ) {
     sbpl!(sb, ";; Temp directories");
     sbpl!(sb, "(allow file-read* (subpath \"/private/tmp\"))");
     sbpl!(sb, "(allow file-write* (subpath \"/private/tmp\"))");
     sbpl!(sb, "(allow file-read* (subpath \"/private/var/folders\"))");
     sbpl!(sb, "(allow file-write* (subpath \"/private/var/folders\"))");
+    if let Some(socket_dir) = playwright_socket_dir {
+        let socket_path = socket_dir.to_string_lossy();
+        // SECURITY: this grants only AF_UNIX operations below the one random,
+        // cplt-owned directory validated before profile generation. The
+        // existing /private/tmp file rules are sufficient; no temp execution
+        // or additional file permission accompanies this capability.
+        sbpl!(sb, ";; Per-session Playwright control sockets");
+        sbpl!(
+            sb,
+            "(allow network-bind (local unix-socket (subpath \"{socket_path}\")))"
+        );
+        sbpl!(
+            sb,
+            "(allow network-inbound (local unix-socket (subpath \"{socket_path}\")))"
+        );
+        sbpl!(
+            sb,
+            "(allow network-outbound (remote unix-socket (subpath \"{socket_path}\")))"
+        );
+        sbpl!(sb);
+    }
     if allow_chromium_runtime {
         // Chrome's ProcessSingleton binds a Unix socket in the macOS user temp dir
         // to prevent multiple Chrome instances sharing the same profile directory.
