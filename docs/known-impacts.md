@@ -299,11 +299,12 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth token` provides credentials            |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked on macOS | SSH agent socket denied, use HTTPS. On Linux only `SSH_AUTH_SOCK` is withheld |
-| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
+| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every `allow.write` grant, and to any repository nested under one. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
 | `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`, which stays writable on Linux |
 | `git submodule add`                | ❌ Blocked on macOS | `.gitmodules` is write-protected on macOS. Writable on Linux, same Landlock limit (supply chain vector) |
-| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project and in every `allow.write` grant, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, see [security.md](security.md) |
+| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project, in every `allow.write` grant, and in any repository nested under one, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, see [security.md](security.md) |
+| `git init` / `git clone`           | ❌ Blocked on macOS | Both write `.git/config` and `.git/hooks/`, which are protected anywhere under a writable root. Clone outside the sandbox, then point cplt at the result. Writable on Linux, same Landlock limit |
 | Signed commits/tags                | ❌ Disabled  | `commit.gpgsign` and `tag.gpgsign` overridden to `false` via env; use `--allow-gpg-signing` to enable |
 
 **Global git hooks:** if `core.hooksPath` is set in `~/.gitconfig`, cplt auto-detects the hooks directory and allows reading it so git operations succeed. Write access is explicitly denied, to stop persistence attacks. The hooks path must be under `$HOME` with at least 3 path components (`~/.config/git/hooks`, for instance) to keep the read grant from being overly broad.

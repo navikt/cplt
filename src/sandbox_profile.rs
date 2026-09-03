@@ -291,16 +291,11 @@ fn emit_project_access(sb: &mut String, project: &str) {
 /// non-repo grant, and it covers a repo the agent creates mid-session with
 /// `git init` **at the grant root itself**.
 ///
-/// KNOWN GAP — only the root is ever covered, never a subdirectory of it.
-/// `--allow-write ~/work` denies `~/work/.git/hooks`, but
-/// `~/work/proj/.git/hooks` stays writable, whether `proj` was already a repo
-/// at launch or the agent creates one there during the session. This is the
-/// same shape as granting a directory that merely *contains* repos (#212's
-/// third scope bullet) and is not closed here: it needs either a repo walk at
-/// launch or a global path regex, and the regex is macOS-only — it would give
-/// Landlock nothing and widen the platform divergence. There is no dedicated
-/// issue for it: it is tracked as a checklist item under the multi-repo work in
-/// #165, alongside the same gap for a `--project-dir` that contains repos.
+/// The path rules here cover the root only. Repositories nested *beneath* a
+/// writable root — `~/work/proj/.git/hooks` under `--allow-write ~/work` — are
+/// covered by `emit_nested_gitdir_denies` instead (#247), which is a regex and
+/// therefore macOS only: on Linux that gap stays open outside bubblewrap, the
+/// same limitation already documented for the root case.
 fn writable_roots(project: &str, extra_write: &[PathBuf]) -> Vec<String> {
     let mut roots = vec![project.to_string()];
     for p in extra_write {
@@ -794,6 +789,76 @@ fn emit_git_persistence_denies(
     // free only because nothing legitimate ever writes it.
     sbpl!(sb, ";; Per-worktree git config (core.hooksPath vector)");
     sbpl!(sb, "(deny file-write* (regex #\"/config\\.worktree$\"))");
+    sbpl!(sb);
+
+    for root in writable_roots(project, extra_write) {
+        emit_nested_gitdir_denies(sb, &root);
+    }
+}
+
+/// Escape the regex metacharacters that can still appear in a path.
+///
+/// `validate_sbpl_path` already rejects `"`, `(`, `)`, `;`, `\` and newlines, so
+/// what is left is the set below. Without this a project directory like
+/// `~/code/v1.0+rc` would compile to a rule matching more than it names.
+fn escape_regex(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(
+            c,
+            '.' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Extend the git-persistence denies to repositories nested *beneath* a
+/// writable root (#247).
+///
+/// `emit_gitdir_denies` names paths, so it can only cover gitdirs known when
+/// the profile is generated: the project's own, and `<root>/.git` for every
+/// writable root. With `--project-dir ~/code`, or an `allow.write` on a
+/// directory that contains repositories, `~/code/other-repo/.git/hooks/…` stayed
+/// writable — and hooks planted there run outside the sandbox on the user's next
+/// git operation in that repo. A path rule cannot express "any depth", so this
+/// is the one place a regex earns its keep.
+///
+/// The alternation mirrors `emit_gitdir_denies` exactly — `hooks`, `config`,
+/// `commondir`, `modules` — with `($|/)` so the directory entry itself is
+/// covered too (otherwise the agent could plant a *symlink* named `hooks`
+/// pointing at a writable directory). `file-write-unlink` and `file-write-data`
+/// on the `.git` entry close the rename-away trick and the worktree pointer-file
+/// rewrite, for the same reasons spelled out on `emit_gitdir_denies`.
+///
+/// Deliberately narrow: the leading `.+/` means the root's own `.git` is not
+/// matched here (it already has the stronger literal rules), and nothing outside
+/// a path component spelled exactly `.git` can match — `.github/workflows` does
+/// not, because `\.git/` requires the separator immediately after `.git`.
+/// Ordinary work inside a nested repo — source files, build output, and every
+/// git internal except the four names above — is untouched.
+///
+/// Cost: `git clone` and `git init` into a nested directory now fail on their
+/// `.git/config` write. That is the same trade already accepted at the root, and
+/// the alternative is leaving hook execution open.
+///
+/// macOS only. Landlock cannot deny a subpath inside an allowed tree, so on
+/// Linux this gap stays open outside bubblewrap — the same limitation already
+/// documented for the root case. Nothing here implies Linux coverage.
+fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
+    let r = escape_regex(root);
+    sbpl!(
+        sb,
+        ";; Git persistence prevention — repos nested under {root}"
+    );
+    sbpl!(
+        sb,
+        "(deny file-write* (regex #\"^{r}/.+/\\.git/(hooks|config|commondir|modules)($|/)\"))"
+    );
+    sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/.+/\\.git$\"))");
+    sbpl!(sb, "(deny file-write-data (regex #\"^{r}/.+/\\.git$\"))");
     sbpl!(sb);
 }
 
@@ -2029,6 +2094,65 @@ mod tests {
         assert!(
             !p.contains("\"*:443\""),
             "fail-closed: proxy_forced without a port must not emit *:443"
+        );
+    }
+
+    /// Issue #247: a repo nested under a writable root got no git-persistence
+    /// denies at all, so `~/code/other-repo/.git/hooks/post-checkout` was
+    /// writable and ran unsandboxed on the user's next git operation there.
+    ///
+    /// The kernel behaviour behind these strings was verified with
+    /// `sandbox-exec` against a real nested repository: the hook plant, the
+    /// `.git/config` append, the `mv .git .gitbak` rename and the pointer-file
+    /// rewrite are all refused, while `git add`/`commit`/`checkout -b`/`stash`/
+    /// `gc` inside that repo — and every write under `src/`, `target/`,
+    /// `.github/` — still succeed.
+    #[test]
+    fn nested_repos_under_every_writable_root_get_git_denies() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = root.replace('.', r"\.");
+            for rule in [
+                format!(
+                    "(deny file-write* (regex #\"^{esc}/.+/\\.git/(hooks|config|commondir|modules)($|/)\"))"
+                ),
+                format!("(deny file-write-unlink (regex #\"^{esc}/.+/\\.git$\"))"),
+                format!("(deny file-write-data (regex #\"^{esc}/.+/\\.git$\"))"),
+            ] {
+                assert!(p.contains(&rule), "missing for {root}: {rule}\n{p}");
+            }
+        }
+
+        // Last-match-wins: nothing may re-open write after these.
+        let nested_deny = p
+            .rfind("/.+/\\.git/(hooks|config|commondir|modules)")
+            .expect("nested deny missing");
+        let last_write_allow = p.rfind("(allow file-write*").expect("no write allows");
+        assert!(
+            last_write_allow < nested_deny,
+            "a write allow @ {last_write_allow} comes after the nested git deny @ {nested_deny}"
+        );
+    }
+
+    /// A path is interpolated into a regex, so its metacharacters must not be.
+    /// `~/code/v1.0+rc` would otherwise match `v1X0rc`, `v1X00rc`, and more.
+    #[test]
+    fn nested_gitdir_regex_escapes_path_metacharacters() {
+        let project = std::path::Path::new("/projects/v1.0+rc[x]");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home));
+
+        assert!(
+            p.contains(
+                r#"(deny file-write-unlink (regex #"^/projects/v1\.0\+rc\[x\]/.+/\.git$"))"#
+            ),
+            "path metacharacters not escaped:\n{p}"
         );
     }
 }
