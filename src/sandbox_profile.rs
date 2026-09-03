@@ -549,9 +549,12 @@ fn emit_system_access(
             sb,
             r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#
         );
+        // Seatbelt does not match counted repetition here, so preserve the
+        // exact SHA-256 length with 64 explicit uppercase-hex atoms.
+        let apps_hash_pattern = "[0-9A-F]".repeat(64);
         sbpl!(
             sb,
-            r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{{64}}$"))"#
+            r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.{apps_hash_pattern}$"))"#
         );
         sbpl!(sb);
     }

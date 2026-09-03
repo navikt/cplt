@@ -7091,10 +7091,22 @@ fn set_repo_value_unset_removes_array_element() {
 // ============================================================
 
 const CHROME_FOR_TESTING_MACH_REGISTER_RULE: &str = r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#;
-const CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE: &str = r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{64}$"))"#;
+const CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX: &str =
+    r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\."#;
+const CHROME_FOR_TESTING_APPS_MACH_REGISTER_SUFFIX: &str = r#"$"))"#;
+const CHROME_FOR_TESTING_APPS_HASH_ATOM: &str = "[0-9A-F]";
+const CHROME_FOR_TESTING_APPS_HASH_LENGTH: usize = 64;
+
+fn chrome_for_testing_apps_mach_register_rule() -> String {
+    format!(
+        "{CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX}{}{CHROME_FOR_TESTING_APPS_MACH_REGISTER_SUFFIX}",
+        CHROME_FOR_TESTING_APPS_HASH_ATOM.repeat(CHROME_FOR_TESTING_APPS_HASH_LENGTH)
+    )
+}
 
 #[test]
 fn chromium_runtime_rules_emitted_for_ms_playwright() {
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7151,7 +7163,7 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
         "Chrome for Testing mach-register must be fully anchored with a numeric PID suffix"
     );
     assert!(
-        p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        p.contains(&apps_mach_register_rule),
         "Chrome for Testing apps mach-register must be fully anchored with an uppercase SHA-256 suffix"
     );
     assert!(
@@ -7165,6 +7177,7 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
     // A user who pins a versioned subdirectory in allow_cache_exec should also
     // get the Chromium runtime rules — without them, Chrome segfaults even though
     // process-exec is allowed for the binary.
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7217,13 +7230,14 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
         "Chrome for Testing mach-register must be present for versioned subpath entry"
     );
     assert!(
-        p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        p.contains(&apps_mach_register_rule),
         "Chrome for Testing apps mach-register must be present for versioned subpath entry"
     );
 }
 
 #[test]
 fn chromium_runtime_rules_absent_by_default() {
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7272,7 +7286,7 @@ fn chromium_runtime_rules_absent_by_default() {
         "Chrome for Testing mach-register must not be emitted by default"
     );
     assert!(
-        !p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        !p.contains(&apps_mach_register_rule),
         "Chrome for Testing apps mach-register must not be emitted by default"
     );
 }
@@ -7280,6 +7294,7 @@ fn chromium_runtime_rules_absent_by_default() {
 #[test]
 fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
     // An unrelated allow_cache_exec entry must not trigger Chromium runtime rules.
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7328,7 +7343,7 @@ fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
         "Chrome for Testing mach-register must not be emitted for unrelated allow_cache_exec entry"
     );
     assert!(
-        !p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        !p.contains(&apps_mach_register_rule),
         "Chrome for Testing apps mach-register must not be emitted for unrelated allow_cache_exec entry"
     );
 }
@@ -7337,6 +7352,7 @@ fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
 fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
     // allow_cache_exec_any grants broad process-exec but must NOT trigger the
     // Chromium-specific IPC/syscall rules without an explicit "ms-playwright" entry.
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7385,7 +7401,7 @@ fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
         "Chrome for Testing mach-register must not be emitted when only allow_cache_exec_any is set"
     );
     assert!(
-        !p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        !p.contains(&apps_mach_register_rule),
         "Chrome for Testing apps mach-register must not be emitted when only allow_cache_exec_any is set"
     );
 }
@@ -7403,6 +7419,7 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
         "not-ms-playwright",
         "xms-playwright",
     ] {
+        let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
         let p = generate_profile(&ProfileOptions {
             project_dir: std::path::Path::new("/projects/app"),
             home_dir: std::path::Path::new("/Users/test"),
@@ -7451,7 +7468,7 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
             "Chrome for Testing mach-register must not be emitted for near-miss entry {name:?}"
         );
         assert!(
-            !p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+            !p.contains(&apps_mach_register_rule),
             "Chrome for Testing apps mach-register must not be emitted for near-miss entry {name:?}"
         );
     }
@@ -7459,6 +7476,7 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
 
 #[test]
 fn chromium_runtime_mach_register_rules_remain_narrow() {
+    let expected_apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7504,11 +7522,39 @@ fn chromium_runtime_mach_register_rules_remain_narrow() {
         [
             r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#,
             CHROME_FOR_TESTING_MACH_REGISTER_RULE,
-            CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE,
+            expected_apps_mach_register_rule.as_str(),
         ],
         "only the three approved, fully anchored Chromium namespaces may be registered"
     );
-    for broader_rule in [
+    let apps_mach_register_rule = mach_register_rules
+        .iter()
+        .copied()
+        .find(|rule| rule.starts_with(CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX))
+        .expect("generated profile must contain the Chrome for Testing apps rule");
+    let apps_hash_pattern = apps_mach_register_rule
+        .strip_prefix(CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX)
+        .and_then(|suffix| suffix.strip_suffix(CHROME_FOR_TESTING_APPS_MACH_REGISTER_SUFFIX))
+        .expect("test helper must delimit the Chrome for Testing apps hash pattern");
+    assert_eq!(
+        apps_hash_pattern,
+        CHROME_FOR_TESTING_APPS_HASH_ATOM.repeat(CHROME_FOR_TESTING_APPS_HASH_LENGTH),
+        "apps hash pattern must contain exactly 64 adjacent uppercase-hex atoms"
+    );
+    assert_eq!(
+        apps_hash_pattern
+            .matches(CHROME_FOR_TESTING_APPS_HASH_ATOM)
+            .count(),
+        CHROME_FOR_TESTING_APPS_HASH_LENGTH,
+        "apps hash pattern must contain exactly 64 uppercase-hex atoms"
+    );
+    assert!(
+        !apps_hash_pattern
+            .chars()
+            .any(|character| matches!(character, '{' | '}' | '+' | '*' | '?')),
+        "apps hash pattern must not use counted or variable-length quantifiers"
+    );
+
+    for disallowed_rule in [
         "(allow mach-register)",
         r#"(allow mach-register (global-name-regex #"^com\.google\..+$"))"#,
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\..+$"))"#,
@@ -7516,6 +7562,7 @@ fn chromium_runtime_mach_register_rules_remain_narrow() {
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\..+$"))"#,
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\..+$"))"#,
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{64}$"))"#,
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{63}$"))"#,
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{65}$"))"#,
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9a-f]{32}$"))"#,
@@ -7527,8 +7574,8 @@ fn chromium_runtime_mach_register_rules_remain_narrow() {
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.canary\.apps\.[0-9A-F]{64}$"))"#,
     ] {
         assert!(
-            !p.lines().any(|line| line == broader_rule),
-            "broader mach-register rule must not be emitted: {broader_rule}"
+            !p.lines().any(|line| line == disallowed_rule),
+            "broader or unsupported mach-register rule must not be emitted: {disallowed_rule}"
         );
     }
 }
