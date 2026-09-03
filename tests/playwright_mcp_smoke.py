@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -25,6 +26,8 @@ NAVIGATE_TIMEOUT_SECONDS = 20.0
 STDOUT_LINE_LIMIT = 1024 * 1024
 STDOUT_QUEUE_LIMIT = 256
 STDERR_CAPTURE_LIMIT = 64 * 1024
+TOOL_RESULT_TEXT_INSPECT_LIMIT = 8 * 1024
+TOOL_RESULT_DIAGNOSTIC_LIMIT = 2 * 1024
 GRACEFUL_EXIT_SECONDS = 3.0
 SIGNAL_EXIT_SECONDS = 3.0
 
@@ -35,6 +38,10 @@ class SmokeFailure(Exception):
 
 class NaturalProcessExitFailure(SmokeFailure):
     """A generic process-exit failure that must not include child diagnostics."""
+
+
+class NavigationToolResultFailure(SmokeFailure):
+    """A navigation result failure that must not expose child stderr."""
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -528,25 +535,219 @@ ABOUT_BLANK_CONFIRMATION = re.compile(
     r"(?m)^\s*-\s*Page URL:\s*about:blank\s*$"
 )
 
+ANSI_ESCAPE = re.compile(
+    r"\x1b(?:"
+    r"\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|P[^\x1b]*(?:\x1b\\)"
+    r"|\[[0-?]*[ -/]*[@-~]"
+    r"|[@-Z\\-_]"
+    r")"
+)
+SENSITIVE_TOOL_RESULT_LINE = re.compile(
+    r"(?i)(?:"
+    r"authori[sz]ation|bearer|cookie|credential|pass(?:word|wd)|"
+    r"secret|session|token|api[\s_-]*key|access[\s_-]*key|"
+    r"private[\s_-]*key"
+    r")"
+)
+SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(?:^|[\s,;{])"
+    r"[a-z0-9_.-]*(?:key|auth|pwd|password|secret|token|credential|"
+    r"cookie|session|signature)\s*[:=]\s*\S"
+)
+ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{1,63}\s*=\s*\S")
+ENVIRONMENT_LABEL = re.compile(r"(?i)(?:^|\s)(?:env|environment)\s*[:=]")
+HEADER_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}\s*:\s*\S")
+SAFE_DIAGNOSTIC_HEADER = re.compile(
+    r"(?i)^(?:error|failure|failed|exception|cause|message|errno|code)\s*:"
+)
+FILE_URL_PREFIX = re.compile(r"(?i)\bfile://[^/\s]*")
+SCHEME_URL = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s<>\"']+")
+QUERY_OR_FRAGMENT_MATERIAL = re.compile(r"(?<=\S)[?#][^\s]*")
+ABSOLUTE_OR_PRIVATE_PATH_START = re.compile(
+    r"(?<![A-Za-z0-9_])/(?![/\s])"
+    r"|(?<![A-Za-z0-9_])(?:~|\$(?:HOME|RUNNER_TEMP|GITHUB_WORKSPACE))/"
+    r"(?!\s)"
+)
+SAFE_PATH_SUFFIX_SIGNAL = re.compile(
+    r"(?i)(?:"
+    r"\b(?:EACCES|EPERM|ENOENT|ENOTDIR|EISDIR|EIO|ENOMEM|EAGAIN|"
+    r"EMFILE|ENFILE|EBUSY|EEXIST|ENOSPC|EROFS|ENOSYS|EINVAL|"
+    r"ETIMEDOUT|ECONNREFUSED|ECONNRESET|EPIPE)\b|"
+    r"\berrno\s*(?::|=)?\s*-?\d+\b|"
+    r"\b(?:permission denied|operation not permitted|"
+    r"no such file or directory)\b|"
+    r"\b[A-Za-z][A-Za-z0-9_.-]{0,40}(?:Error|Exception)(?:Domain)?\b|"
+    r"\b(?:[a-z][a-z0-9_-]*\.){2,}[a-z][a-z0-9_-]*\b"
+    r")"
+)
+PLAYWRIGHT_DIAGNOSTIC_TAG = re.compile(
+    r"(?i)<((?:launch(?:ed|ing)?|process\b|gracefully close\b)[^>]*)>"
+)
+HTML_LINE = re.compile(r"(?i)<\s*!|<\s*/?\s*[a-z][^>]*>")
+JSON_LIKE_LINE = re.compile(r"^\s*[\[{].*[\]}]\s*$")
+JSON_FIELD_LINE = re.compile(r'^"[^"]+"\s*:')
+TOOL_DIAGNOSTIC_SIGNAL = re.compile(
+    r"(?i)(?:"
+    r"\b[A-Za-z][A-Za-z0-9_.-]{0,40}(?:Error|Exception)(?:Domain)?\b|"
+    r"\berror\b|\bfail(?:ed|ure|ing)?\b|\bexception\b|"
+    r"\blaunch(?:ed|ing)?\b|\bspawn(?:ed|ing)?\b|\bexec(?:ve)?\b|"
+    r"\bbootstrap\b|\bmach\b|\bservice\b|\bsandbox\b|\bprocess\b|"
+    r"\bcrash(?:ed|ing)?\b|\bpermission denied\b|"
+    r"\boperation not permitted\b|\berrno\b|"
+    r"\b(?:EACCES|EPERM|ENOENT|ENOTDIR|EISDIR|EIO|ENOMEM|EAGAIN|"
+    r"EMFILE|ENFILE|EBUSY|EEXIST|ENOSPC|EROFS|ENOSYS|EINVAL|"
+    r"ETIMEDOUT|ECONNREFUSED|ECONNRESET|EPIPE)\b|"
+    r"\b(?:[a-z][a-z0-9_-]*\.){2,}[a-z][a-z0-9_-]*\b"
+    r")"
+)
+
+
+def _bounded_tool_result_text(result: Dict[str, Any]) -> str:
+    content = result.get("content")
+    if not isinstance(content, list):
+        return ""
+
+    remaining = TOOL_RESULT_TEXT_INSPECT_LIMIT
+    text_items = []
+    for item in content:
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "text"
+            or not isinstance(item.get("text"), str)
+        ):
+            continue
+        text = item["text"]
+        if not text:
+            continue
+        encoded = text[:remaining].encode("utf-8")
+        consumed = min(len(encoded), remaining)
+        bounded = encoded[:remaining].decode("utf-8", errors="ignore")
+        if bounded:
+            text_items.append(bounded)
+        remaining -= consumed
+        if remaining == 0:
+            break
+    return "\n".join(text_items)
+
+
+def _strip_ansi_and_controls(text: str) -> str:
+    text = ANSI_ESCAPE.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    return "".join(
+        character
+        for character in text
+        if character in "\n\t"
+        or not unicodedata.category(character).startswith("C")
+    )
+
+
+def _redact_path_tail(line: str) -> str:
+    match = ABSOLUTE_OR_PRIVATE_PATH_START.search(line)
+    if match is None:
+        return line
+
+    prefix = line[: match.start()].rstrip("\"'")
+    suffix = line[match.start() :]
+    safe_signals = []
+    for signal_match in SAFE_PATH_SUFFIX_SIGNAL.finditer(suffix):
+        signal_text = re.sub(r"\s+", " ", signal_match.group(0)).strip()
+        if signal_text not in safe_signals:
+            safe_signals.append(signal_text)
+        if len(safe_signals) == 4:
+            break
+    if safe_signals:
+        return "{}<path> {}".format(prefix, " ".join(safe_signals))
+    return "{}<path>".format(prefix)
+
+
+def _truncate_utf8(text: str, limit: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    suffix = " [truncated]"
+    prefix_limit = limit - len(suffix.encode("utf-8"))
+    prefix = encoded[:prefix_limit].decode("utf-8", errors="ignore").rstrip()
+    return "{}{}".format(prefix, suffix)
+
+
+def _safe_tool_result_diagnostic(text: str) -> str:
+    text = _strip_ansi_and_controls(text)
+    safe_lines = []
+    skip_section = False
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+
+        heading = re.match(r"^#{1,6}\s*(.*)$", line)
+        if heading is not None:
+            heading_text = heading.group(1).strip()
+            if re.search(
+                r"(?i)\b(?:page state|(?:page )?snapshot|ran playwright code)\b",
+                heading_text,
+            ):
+                skip_section = True
+                continue
+            skip_section = False
+            line = heading_text
+        if skip_section:
+            continue
+        if re.match(r"(?i)^-\s*Page (?:URL|Title|Snapshot)\s*:", line):
+            if re.search(r"(?i)Snapshot", line):
+                skip_section = True
+            continue
+        if SENSITIVE_TOOL_RESULT_LINE.search(line) or SECRET_ASSIGNMENT.search(line):
+            continue
+        unbulleted_line = re.sub(r"^(?:[-*]|\d+\.)\s+", "", line)
+        if ENV_ASSIGNMENT.match(unbulleted_line) or ENVIRONMENT_LABEL.search(line):
+            continue
+        if HEADER_LINE.match(unbulleted_line) and not SAFE_DIAGNOSTIC_HEADER.match(
+            unbulleted_line
+        ):
+            continue
+        line = PLAYWRIGHT_DIAGNOSTIC_TAG.sub(r"\1", line)
+        if HTML_LINE.search(line):
+            continue
+        if JSON_LIKE_LINE.match(line) or JSON_FIELD_LINE.match(line):
+            continue
+
+        line = FILE_URL_PREFIX.sub("", line)
+        line = SCHEME_URL.sub("<url>", line)
+        line = QUERY_OR_FRAGMENT_MATERIAL.sub("<url-material>", line)
+        line = _redact_path_tail(line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if line and TOOL_DIAGNOSTIC_SIGNAL.search(line):
+            safe_lines.append(line)
+
+    diagnostic = " | ".join(safe_lines)
+    return _truncate_utf8(diagnostic, TOOL_RESULT_DIAGNOSTIC_LIMIT)
+
+
+def _navigation_result_failure(reason: str, text: str) -> NavigationToolResultFailure:
+    diagnostic = _safe_tool_result_diagnostic(text)
+    if not diagnostic:
+        return NavigationToolResultFailure(reason)
+    message = "{}: {}".format(reason, diagnostic)
+    return NavigationToolResultFailure(
+        _truncate_utf8(message, TOOL_RESULT_DIAGNOSTIC_LIMIT)
+    )
+
 
 def _validate_navigation_result(result: Dict[str, Any]) -> None:
+    text = _bounded_tool_result_text(result)
     if result.get("isError") is True:
-        raise SmokeFailure("browser_navigate returned isError true")
+        raise _navigation_result_failure(
+            "browser_navigate returned isError true", text
+        )
     content = result.get("content")
     if not isinstance(content, list):
         raise SmokeFailure("browser_navigate returned no content")
-    text_items = [
-        item.get("text")
-        for item in content
-        if isinstance(item, dict)
-        and item.get("type") == "text"
-        and isinstance(item.get("text"), str)
-        and item.get("text")
-    ]
-    if not text_items:
+    if not text:
         raise SmokeFailure("browser_navigate returned no text content")
-    if not any(ABOUT_BLANK_CONFIRMATION.search(text) for text in text_items):
-        raise SmokeFailure("browser_navigate did not confirm the about:blank URL")
+    if not ABOUT_BLANK_CONFIRMATION.search(text):
+        raise _navigation_result_failure(
+            "browser_navigate did not confirm the about:blank URL", text
+        )
 
 
 def _process_group_exists(process_group_id: int) -> bool:
@@ -671,6 +872,81 @@ def _self_test_natural_zero_exit() -> None:
     cleanup_error, natural_exit_failure = _cleanup_process_group(process, process.pid)
     assert cleanup_error is None
     assert natural_exit_failure is None
+
+
+def _self_test_navigation_diagnostic() -> None:
+    harmless_marker = "HarmlessBrowserLaunchErrorMarker"
+    hostile_text = (
+        "\x1b[31mError: {} spawn "
+        "/Users/runner/Library/Caches/ms-playwright/chromium-1243/"
+        "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/"
+        "Google Chrome for Testing EACCES\x1b[0m\n"
+        "browser launch request "
+        "https://example.invalid/start?private-query-value#private-fragment-value\n"
+        "Authorization: Bearer private-bearer-value\n"
+        "token=private-token-value\n"
+        "apiKey=private-api-key-value\n"
+        "Cookie: private-cookie-value\n"
+        "browser launch control\x00marker\n"
+    ).format(harmless_marker)
+    content = [
+        {"type": "image", "text": "private-non-text-value"},
+        {"type": "text", "text": hostile_text},
+    ]
+
+    for result, expected_reason in (
+        (
+            {"isError": True, "content": content},
+            "browser_navigate returned isError true",
+        ),
+        (
+            {"content": content},
+            "browser_navigate did not confirm the about:blank URL",
+        ),
+    ):
+        try:
+            _validate_navigation_result(result)
+        except NavigationToolResultFailure as failure:
+            diagnostic = str(failure)
+        else:
+            raise AssertionError("hostile navigation result unexpectedly passed")
+
+        assert diagnostic.startswith(expected_reason)
+        assert harmless_marker in diagnostic
+        assert "EACCES" in diagnostic
+        assert "<path>" in diagnostic
+        assert "<url>" in diagnostic
+        assert len(diagnostic.encode("utf-8")) <= TOOL_RESULT_DIAGNOSTIC_LIMIT
+        for private_value in (
+            "/Users/runner",
+            "Library/Caches",
+            "ms-playwright",
+            "Google Chrome",
+            "private-query-value",
+            "private-fragment-value",
+            "private-bearer-value",
+            "private-token-value",
+            "private-api-key-value",
+            "private-cookie-value",
+            "private-non-text-value",
+        ):
+            assert private_value not in diagnostic
+        assert "\x1b" not in diagnostic
+        assert "\x00" not in diagnostic
+
+    try:
+        _validate_navigation_result(
+            {
+                "isError": True,
+                "content": [
+                    {"type": "text", "text": "Authorization: Bearer private-value"}
+                ],
+            }
+        )
+    except NavigationToolResultFailure as failure:
+        assert str(failure) == "browser_navigate returned isError true"
+    else:
+        raise AssertionError("sensitive-only navigation result unexpectedly passed")
 
 
 def _run_protocol_smoke(
@@ -820,6 +1096,7 @@ def _run_protocol_smoke(
 def _run_self_test() -> None:
     _self_test_natural_nonzero_exit()
     _self_test_natural_zero_exit()
+    _self_test_navigation_diagnostic()
 
     root = Path("/ci/project")
     prefix = Path("/ci/runner-temp/playwright-mcp-0.0.80")
@@ -947,7 +1224,7 @@ def main() -> int:
     except SmokeFailure as failure:
         print("playwright MCP smoke failed: {}".format(failure), file=sys.stderr)
         if stderr_capture is not None and not isinstance(
-            failure, NaturalProcessExitFailure
+            failure, (NaturalProcessExitFailure, NavigationToolResultFailure)
         ):
             diagnostic = stderr_capture.diagnostic()
             if diagnostic:
