@@ -3198,30 +3198,40 @@ mod tests {
         panic!("{host} must complete a 200 tunnel once allowed");
     }
 
-    /// Block until `host` appears in the proxy's observed set, then return it.
+    /// CONNECT to `host`, then wait for the proxy to record it — retrying the
+    /// CONNECT itself, not only the observation.
     ///
-    /// The connection thread records the host *after* the client's CONNECT has
-    /// already returned, so snapshotting straight after `proxy_connect` races
-    /// it. A fixed `sleep(50ms)` hid that race until a loaded CI runner ran
-    /// past the window and failed the run for #158. Polling to a deadline is
-    /// both faster in the common case and reliable under load — same reasoning
-    /// as `assert_connect_allowed`'s retry loop above.
-    fn await_observed(proxy: &ProxyHandle, host: &str) -> ObservedDomain {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(rec) = proxy
-                .observed_domains()
-                .into_iter()
-                .find(|o| o.host == host)
-            {
-                return rec;
+    /// Two separate races, and polling alone only covers one. The connection
+    /// thread records the host *after* the client's CONNECT returns, so
+    /// snapshotting immediately loses it — that is what the polling handles.
+    /// But `record_observation` fires only once the proxy has PARSED a CONNECT
+    /// and reached a verdict, so a transient transport close before that
+    /// (`403 EOF` / `403 ECONNRESET` from `proxy_connect`, neither of which
+    /// carries "Forbidden") means nothing is ever recorded and the poll just
+    /// spins out its deadline. Retrying the connect is the only thing that
+    /// recovers it — the same transient `assert_connect_allowed` retries for.
+    ///
+    /// Returns the status of the attempt that was recorded, so callers still
+    /// assert on the verdict the proxy actually reached.
+    fn connect_and_await_observed(proxy: &ProxyHandle, host: &str) -> (String, ObservedDomain) {
+        for _ in 0..5 {
+            let status = proxy_connect(proxy.port, &format!("{host}:443"));
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Some(rec) = proxy
+                    .observed_domains()
+                    .into_iter()
+                    .find(|o| o.host == host)
+                {
+                    return (status, rec);
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(
-                Instant::now() < deadline,
-                "{host} was never recorded in the observed set"
-            );
-            std::thread::sleep(Duration::from_millis(5));
         }
+        panic!("{host} was never recorded in the observed set");
     }
 
     #[test]
@@ -3312,8 +3322,7 @@ mod tests {
         // Allow-all: empty default allowlist + no file — exactly what observe forces.
         let proxy = make_proxy_default_allowlist(Vec::new(), None, upstream);
 
-        let status = proxy_connect(proxy.port, "would-be-blocked.example:443");
-        let rec = await_observed(&proxy, "would-be-blocked.example");
+        let (status, rec) = connect_and_await_observed(&proxy, "would-be-blocked.example");
         proxy.shutdown();
         up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -3337,8 +3346,7 @@ mod tests {
         let upstream = UpstreamProxy::parse(&format!("http://127.0.0.1:{}", up.port)).unwrap();
         let proxy = make_proxy_default_allowlist(copilot_defaults(), None, upstream);
 
-        let status = proxy_connect(proxy.port, "evil.com:443");
-        let rec = await_observed(&proxy, "evil.com");
+        let (status, rec) = connect_and_await_observed(&proxy, "evil.com");
         proxy.shutdown();
         up.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
 
