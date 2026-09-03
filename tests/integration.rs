@@ -429,14 +429,56 @@ mod macos_tests {
         }
     }
 
-    fn chrome_probe_args(user_data_dir: &Path) -> Vec<OsString> {
+    /// A unique, grep-safe token embedded in the render probe document.
+    ///
+    /// Alphanumeric only so it survives DOM serialization verbatim and cannot
+    /// be confused with unrelated Chrome log output.
+    fn unique_render_token() -> String {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("CPLTRENDEROK{}x{id}", std::process::id())
+    }
+
+    /// A deterministic, network-free `data:` document whose *rendered* DOM only
+    /// contains `token` if the renderer actually parsed the document AND
+    /// executed its script. Dumping this via `--dump-dom` therefore proves
+    /// functional rendering/evaluation, not merely main-process startup, a
+    /// DevTools port, or a target listing.
+    ///
+    /// The token is split across a runtime JS concatenation so the *contiguous*
+    /// token never appears in the document source. `--dump-dom` serializes the
+    /// live DOM, including `<script>` text, so a verbatim token in the script
+    /// could satisfy the assertion even if the script never ran; assembling it
+    /// at runtime means the whole token can only surface in the rendered
+    /// `<div>` — the work a denied renderer process cannot perform.
+    ///
+    /// A `data:` URL (never `about:blank`) is used deliberately: earlier
+    /// attempts showed `--dump-dom about:blank` could hang on the GitHub macOS
+    /// runner. The document contains no spaces so it passes as a single argv
+    /// entry without shell/URL quoting surprises.
+    fn render_probe_document(token: &str) -> String {
+        // token is ASCII alphanumeric, so a byte split lands on a char boundary
+        // and yields two non-empty halves.
+        let (head, tail) = token.split_at(token.len() / 2);
+        let url = format!(
+            "data:text/html,<html><body><div id=cplt-probe></div>\
+             <script>document.getElementById('cplt-probe').textContent='{head}'+'{tail}'</script>\
+             </body></html>"
+        );
+        assert!(
+            !url.contains(token),
+            "render token must not appear contiguously in the unexecuted document source"
+        );
+        url
+    }
+
+    fn chrome_probe_args(user_data_dir: &Path, render_url: &str) -> Vec<OsString> {
         vec![
             "--headless".into(),
             "--disable-gpu".into(),
             "--no-first-run".into(),
             format!("--user-data-dir={}", user_data_dir.display()).into(),
-            "--remote-debugging-port=0".into(),
-            "about:blank".into(),
+            "--dump-dom".into(),
+            render_url.into(),
         ]
     }
 
@@ -525,26 +567,32 @@ mod macos_tests {
         }
 
         fn diagnostics(&mut self) -> String {
-            fn read_file(file: &mut File) -> String {
-                if let Err(error) = file.seek(SeekFrom::Start(0)) {
-                    return format!("<failed to rewind capture file: {error}>");
-                }
-                let mut bytes = Vec::new();
-                if let Err(error) = file.read_to_end(&mut bytes) {
-                    return format!("<failed to read capture file: {error}>");
-                }
-                String::from_utf8_lossy(&bytes).into_owned()
-            }
-
             let status = self
                 .status
                 .as_ref()
                 .map_or_else(|| "not reaped".to_string(), ToString::to_string);
             format!(
                 "status: {status}\nstdout:\n{}\nstderr:\n{}",
-                read_file(&mut self.stdout_file),
-                read_file(&mut self.stderr_file),
+                Self::read_capture(&mut self.stdout_file),
+                Self::read_capture(&mut self.stderr_file),
             )
+        }
+
+        /// The full `--dump-dom` output captured so far. File-backed so a large
+        /// or slow dump can never dead-lock on a full stdout pipe.
+        fn captured_stdout(&mut self) -> String {
+            Self::read_capture(&mut self.stdout_file)
+        }
+
+        fn read_capture(file: &mut File) -> String {
+            if let Err(error) = file.seek(SeekFrom::Start(0)) {
+                return format!("<failed to rewind capture file: {error}>");
+            }
+            let mut bytes = Vec::new();
+            if let Err(error) = file.read_to_end(&mut bytes) {
+                return format!("<failed to read capture file: {error}>");
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
         }
     }
 
@@ -566,105 +614,43 @@ mod macos_tests {
         }
     }
 
-    enum DevToolsProbe {
-        Ready,
-        Pending(String),
-        Failed(String),
-    }
-
-    fn probe_devtools_page(user_data_dir: &Path, deadline: Instant) -> DevToolsProbe {
-        const HTTP_TIMEOUT: Duration = Duration::from_secs(1);
-
-        let active_port_path = user_data_dir.join("DevToolsActivePort");
-        let active_port = match fs::read_to_string(&active_port_path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return DevToolsProbe::Pending("DevToolsActivePort not observed".to_string());
-            }
-            Err(error) => {
-                return DevToolsProbe::Failed(format!(
-                    "failed to read DevToolsActivePort: {error}"
-                ));
-            }
-        };
-        let Some(port_text) = active_port.lines().next().filter(|line| !line.is_empty()) else {
-            return DevToolsProbe::Pending("DevToolsActivePort was empty".to_string());
-        };
-        let port = match port_text.parse::<u16>() {
-            Ok(0) => {
-                return DevToolsProbe::Failed("DevToolsActivePort contained port zero".to_string());
-            }
-            Ok(port) => port,
-            Err(error) => {
-                return DevToolsProbe::Failed(format!(
-                    "DevToolsActivePort contained an invalid port: {error}"
-                ));
-            }
-        };
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining < Duration::from_millis(1) {
-            return DevToolsProbe::Pending("deadline reached before DevTools request".to_string());
-        }
-        let timeout = std::cmp::min(remaining, HTTP_TIMEOUT);
-        let output = match Command::new("/usr/bin/curl")
-            .args(["--silent", "--show-error", "--fail", "--max-time"])
-            .arg(format!("{:.3}", timeout.as_secs_f64()))
-            .arg(format!("http://127.0.0.1:{port}/json/list"))
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return DevToolsProbe::Failed(format!("failed to launch /usr/bin/curl: {error}"));
-            }
-        };
-        if !output.status.success() {
-            return DevToolsProbe::Pending(format!(
-                "DevTools curl exited with {}; stderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-
-        let targets: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-            Ok(targets) => targets,
-            Err(error) => {
-                return DevToolsProbe::Failed(format!(
-                    "DevTools /json/list returned malformed JSON: {error}"
-                ));
-            }
-        };
-        let Some(targets) = targets.as_array() else {
-            return DevToolsProbe::Failed(
-                "DevTools /json/list did not return a JSON array".to_string(),
-            );
-        };
-        if targets.iter().any(|target| {
-            target.get("url").and_then(serde_json::Value::as_str) == Some("about:blank")
-        }) {
-            DevToolsProbe::Ready
-        } else {
-            DevToolsProbe::Pending(format!(
-                "DevTools reported {} page target(s), none at about:blank",
-                targets.len()
-            ))
-        }
-    }
-
-    fn run_chrome_probe(stage: &str, command: &mut Command, user_data_dir: &Path) {
+    /// Launch Chrome with `--dump-dom`, wait (bounded) for it to render the
+    /// deterministic probe document, and assert the dumped DOM contains the
+    /// exact probe element populated with `expected_token`.
+    ///
+    /// The token only appears if the renderer parsed the document and executed
+    /// its script, so success proves functional rendering/evaluation — not just
+    /// main-process startup, a DevTools port, or a target listing. Under the
+    /// current cplt profile the renderer's `bootstrap_check_in
+    /// com.google.chrome.for.testing.apps.<hash>` is denied, so this probe is
+    /// expected to fail or time out (that Mach service name surfaces in the
+    /// captured stderr diagnostics below), giving the red kernel baseline.
+    fn run_chrome_probe(stage: &str, command: &mut Command, expected_token: &str) {
         const TIMEOUT: Duration = Duration::from_secs(15);
-        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+        const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+        let expected_dom = format!("<div id=\"cplt-probe\">{expected_token}</div>");
         let mut browser = ChromeProcess::spawn(stage, command);
         let deadline = Instant::now() + TIMEOUT;
-        let mut last_observation = "DevToolsActivePort not observed".to_string();
 
         let failure = loop {
             match browser.try_wait() {
                 Ok(Some(status)) => {
-                    break Some(format!(
-                        "Chrome exited before reporting about:blank ({status})"
-                    ));
+                    let stdout = browser.captured_stdout();
+                    break if !status.success() {
+                        Some(format!(
+                            "Chrome exited unsuccessfully ({status}) before rendering the \
+                             expected DOM element `{expected_dom}`"
+                        ))
+                    } else if stdout.contains(&expected_dom) {
+                        None
+                    } else {
+                        Some(format!(
+                            "Chrome exited successfully but its dumped DOM did not contain the \
+                             expected element `{expected_dom}` — the document was not \
+                             rendered/evaluated"
+                        ))
+                    };
                 }
                 Err(error) => break Some(format!("failed while polling Chrome: {error}")),
                 Ok(None) => {}
@@ -672,15 +658,10 @@ mod macos_tests {
 
             if Instant::now() >= deadline {
                 break Some(format!(
-                    "timed out after {}s; last observation: {last_observation}",
+                    "timed out after {}s waiting for `--dump-dom` to render the expected DOM \
+                     element `{expected_dom}`",
                     TIMEOUT.as_secs()
                 ));
-            }
-
-            match probe_devtools_page(user_data_dir, deadline) {
-                DevToolsProbe::Ready => break None,
-                DevToolsProbe::Pending(observation) => last_observation = observation,
-                DevToolsProbe::Failed(error) => break Some(error),
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -707,7 +688,7 @@ mod macos_tests {
     }
 
     #[test]
-    fn real_profile_launches_chrome_for_testing() {
+    fn real_profile_renders_page_in_chrome_for_testing() {
         require_sandbox!();
 
         let Some(chrome) = std::env::var_os("CPLT_CHROME_FOR_TESTING") else {
@@ -732,11 +713,13 @@ mod macos_tests {
         );
 
         let control_data_dir = tempfile::tempdir().expect("create control browser state");
+        let control_token = unique_render_token();
+        let control_url = render_probe_document(&control_token);
         eprintln!("chrome-for-testing stage: unsandboxed control");
         run_chrome_probe(
             "unsandboxed Chrome for Testing control",
-            Command::new(&chrome).args(chrome_probe_args(control_data_dir.path())),
-            control_data_dir.path(),
+            Command::new(&chrome).args(chrome_probe_args(control_data_dir.path(), &control_url)),
+            &control_token,
         );
         eprintln!("chrome-for-testing stage: unsandboxed control ready");
 
@@ -750,6 +733,8 @@ mod macos_tests {
             .into_temp_path();
         fs::write(&profile, generate_profile(&opts)).expect("write generated Chrome test profile");
         let sandbox_data_dir = tempfile::tempdir().expect("create sandboxed browser state");
+        let sandbox_token = unique_render_token();
+        let sandbox_url = render_probe_document(&sandbox_token);
         eprintln!("chrome-for-testing stage: sandboxed launch");
         run_chrome_probe(
             "sandboxed Chrome for Testing launch",
@@ -757,8 +742,8 @@ mod macos_tests {
                 .arg("-f")
                 .arg(profile.as_os_str())
                 .arg(&chrome)
-                .args(chrome_probe_args(sandbox_data_dir.path())),
-            sandbox_data_dir.path(),
+                .args(chrome_probe_args(sandbox_data_dir.path(), &sandbox_url)),
+            &sandbox_token,
         );
         eprintln!("chrome-for-testing stage: sandboxed launch ready");
     }
