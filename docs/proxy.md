@@ -175,6 +175,7 @@ Each agent adds its own endpoints on top of that shared registry base:
 - **Claude:** the Anthropic API, console/login, and feature-flag telemetry.
 - **OpenCode:** only OpenCode's own infra (`opencode.ai`, `models.dev`). OpenCode is provider-agnostic, so you must add your chosen model provider's domain via `allowed_domains` (`api.anthropic.com`, `api.openai.com`, or `generativelanguage.googleapis.com`, for example) before its model traffic is permitted.
 - **Pi:** no infrastructure defaults yet. Add its endpoints via `allowed_domains` when enabling the allowlist. Contributions welcome.
+- **goose:** registry base only, and that is an observed result rather than a gap. A session captured with `--observe-domains` (goose 1.48.0, 2026-09-03) contacted no goose-owned host at all — only the configured model provider. goose is provider-agnostic, so add your provider's domain via `allowed_domains` the same way you would for OpenCode. Two hosts were seen but deliberately left out because neither is on a default path: `us.i.posthog.com` (telemetry, opt-in — add it if you turn telemetry on) and `github.com` (only reached by `goose update`, which is a self-update inside the sandbox).
 - **Shell:** registry base only, since it is not an AI agent.
 
 These infra lists are best-effort defaults for an opt-in feature. Anything missing shows up as `BLOCKED-ALLOWLIST`, so you can add it.

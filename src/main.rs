@@ -105,7 +105,7 @@ EXAMPLES:
 struct Cli {
     /// Which AI coding agent to sandbox. This flag wins over the sandbox.agent
     /// config key, which wins over auto-detection from PATH.
-    /// Supported: copilot, opencode, antigravity, pi, claude, shell
+    /// Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 
@@ -579,7 +579,7 @@ grants exec to every binary cached by any application. Prefer
     resume: Option<String>,
 
     /// Resume the most recent session in this directory.
-    /// Supported for Copilot, OpenCode, and Antigravity (--continue).
+    /// Supported for Copilot, OpenCode, Antigravity and goose (--continue).
     /// Ignored for other agents.
     #[arg(long = "continue", conflicts_with = "resume")]
     continue_session: bool,
@@ -590,8 +590,10 @@ grants exec to every binary cached by any application. Prefer
     #[arg(long)]
     remote: bool,
 
-    /// Name the Copilot session for later resumption with --resume=NAME.
-    /// Copilot-only (ignored for other agents).
+    /// Name the session for later resumption with --resume=NAME.
+    /// Copilot and goose (goose maps it to `session --name`); ignored for
+    /// other agents. An explicit --resume=ID wins over --name for goose,
+    /// which treats them as alternative selectors.
     #[arg(long = "name", value_name = "SESSION")]
     session_name: Option<String>,
 
@@ -1624,9 +1626,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         // browser-flow ones with no signal at all: Google's login opens a
         // browser, and --allow-browser is off by default, so a user who hits a
         // sign-in prompt hits a dead end. Point at the flag rather than the key.
-        // Says "if you are prompted", not "on first run": for Gemini the
-        // warning above already covers first run, so the prompts this is
-        // really about are re-auth and OAuth from an MCP server.
+        // Says "if you are prompted", not "on first run": the login warning
+        // above already covers first run for the agents that have one, so the
+        // prompts this is really about are re-auth and OAuth from an MCP
+        // server.
         if active_agent.oauth_first()
             && active_agent.oauth_needs_browser()
             && !resolved.allow_browser
