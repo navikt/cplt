@@ -1204,14 +1204,24 @@ mod tests {
             provenance: std::collections::BTreeMap::new(),
         };
 
-        let generated = generate_toml(&report);
+        // A comment after the block, to prove the extraction is bounded.
+        let generated = generate_toml(&report) + "\n# unrelated trailing note\n";
 
         // Take the commented machine-specific block and uncomment it, exactly as
         // a user copying those lines out of the file would.
+        //
+        // Bounded to the contiguous comment run that starts at the header:
+        // scanning to end-of-file would uncomment any later `#` line too, so an
+        // unrelated comment added below would break this test while the emitted
+        // block stayed correct.
         let pasted: String = generated
             .lines()
-            .skip_while(|l| !l.starts_with("# Machine-specific"))
-            .filter_map(|l| l.strip_prefix("# ").or_else(|| l.strip_prefix('#')))
+            .skip_while(|l| !l.trim_start().starts_with("# Machine-specific"))
+            .take_while(|l| l.trim_start().starts_with('#'))
+            .filter_map(|l| {
+                let l = l.trim_start();
+                l.strip_prefix("# ").or_else(|| l.strip_prefix('#'))
+            })
             .filter(|l| !l.starts_with("Machine-specific") && !l.starts_with("Copy the"))
             .filter(|l| !l.contains("scoped by whichever"))
             .collect::<Vec<_>>()
@@ -1220,6 +1230,10 @@ mod tests {
         assert!(
             pasted.contains("[allow]"),
             "hint block must carry its own section header, got:\n{pasted}"
+        );
+        assert!(
+            !pasted.contains("unrelated trailing note"),
+            "extraction must stop at the end of the machine-specific block"
         );
 
         // Reproduce the reporter's file: a section header, then the paste.
