@@ -978,7 +978,19 @@ pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
 /// hostile `filter.*.clean` in a granted repo would make the hardened invoker
 /// refuse, and that repo's `.git/hooks` would lose its deny.
 pub fn git_dir_of(dir: &Path) -> Option<PathBuf> {
-    let Some(mut cmd) = crate::git::command(dir, &["rev-parse", "--git-common-dir"]) else {
+    git_dir_of_with(
+        crate::git::command(dir, &["rev-parse", "--git-common-dir"]),
+        dir,
+    )
+}
+
+/// [`git_dir_of`] with the hardened invoker's result injected.
+///
+/// Exists so the no-trusted-git arm is reachable in a test: `trusted_git()`
+/// caches in a `OnceLock`, so on a host that has git the fallback branch is
+/// otherwise unreachable and a revert of the wiring goes unnoticed.
+fn git_dir_of_with(cmd: Option<std::process::Command>, dir: &Path) -> Option<PathBuf> {
+    let Some(mut cmd) = cmd else {
         // No trusted git on this machine. Before this fallback existed, that
         // returned `None` and every gitdir-derived deny for a worktree or a
         // separate-gitdir repo silently vanished — the fail-open the doc
@@ -1029,11 +1041,22 @@ pub fn git_dir_of(dir: &Path) -> Option<PathBuf> {
 /// and accepted only if it is a directory — matching what the git-backed path
 /// returns. Deliberately no validation beyond that: the result is turned into
 /// write denies by the caller, so a wrong answer can only over-deny, never
-/// grant. (`git_common_dir` applies its own $HOME and steering checks before
-/// using this for anything that *grants*.)
+/// grant. (`git_common_dir` returns before granting whenever there is no
+/// trusted git, because its commondir-steering check runs the invoker too.)
+///
+/// The residual that buys: an agent that can write `<root>/.git` can point this
+/// at any existing directory and get that directory's `hooks`/`config`/`modules`
+/// write-denied next session. Real git refuses a pointer to a non-gitdir; this
+/// does not. It is self-denial-of-service only — it can subtract access, never
+/// add it — and the alternative is validating a gitdir's shape without git,
+/// which is more code for a worse failure mode.
 fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
     let dot_git = dir.join(".git");
-    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    // `metadata`, not `symlink_metadata`: git follows a `.git` symlink to a
+    // directory, and the git-backed path canonicalizes to the target. Not
+    // following it here would drop straight to the `read_to_string` branch,
+    // fail with EISDIR, and lose the target's denies.
+    let meta = std::fs::metadata(&dot_git).ok()?;
     if meta.is_dir() {
         return std::fs::canonicalize(&dot_git).ok().or(Some(dot_git));
     }
@@ -1051,7 +1074,33 @@ fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
         dir.join(pointer)
     };
     let resolved = std::fs::canonicalize(&path).unwrap_or(path);
-    resolved.is_dir().then_some(resolved)
+    if !resolved.is_dir() {
+        return None;
+    }
+    // A worktree's pointer names `<main>/.git/worktrees/<name>`, which is NOT
+    // the directory that holds `hooks/` and `config` — those live in the shared
+    // dir, which `git rev-parse --git-common-dir` returns and which the
+    // per-worktree dir names in its own `commondir` file (git writes literally
+    // `../..`). Returning the per-worktree dir would satisfy nothing: the denies
+    // would land on paths that do not exist while the real hooks stayed open.
+    //
+    // Submodules and `--separate-git-dir` repos have no `commondir`; their
+    // pointer already names the common dir, so they fall through unchanged.
+    if let Ok(raw) = std::fs::read_to_string(resolved.join("commondir")) {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            let common = if Path::new(raw).is_absolute() {
+                PathBuf::from(raw)
+            } else {
+                resolved.join(raw)
+            };
+            let common = std::fs::canonicalize(&common).unwrap_or(common);
+            if common.is_dir() {
+                return Some(common);
+            }
+        }
+    }
+    Some(resolved)
 }
 
 /// Detect if the project is a git worktree and return the shared `.git` directory.
@@ -1434,16 +1483,60 @@ mod tests {
     /// where the real hooks live, and losing it means losing their write deny.
     /// The `.git` file is read directly; nothing is spawned.
     #[test]
-    fn gitdir_without_git_follows_a_worktree_pointer() {
+    fn gitdir_without_git_follows_a_worktree_to_the_shared_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
-        let real = root.join("main/.git/worktrees/wt");
-        std::fs::create_dir_all(&real).expect("mkdir");
+        let main_git = root.join("main/.git");
+        let per_worktree = main_git.join("worktrees/wt");
+        std::fs::create_dir_all(&per_worktree).expect("mkdir");
+        // What `git worktree add` writes: the pointer names the per-worktree
+        // dir, which names the shared dir in its own `commondir`.
+        std::fs::write(per_worktree.join("commondir"), "../..\n").expect("write commondir");
         let wt = root.join("wt");
         std::fs::create_dir_all(&wt).expect("mkdir");
-        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", real.display())).expect("write");
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", per_worktree.display()),
+        )
+        .expect("write");
 
-        assert_eq!(gitdir_without_git(&wt).as_deref(), Some(real.as_path()));
+        // The SHARED dir, not the per-worktree one: `hooks/` and `config` live
+        // there, and it is what `git rev-parse --git-common-dir` returns.
+        assert_eq!(gitdir_without_git(&wt).as_deref(), Some(main_git.as_path()));
+    }
+
+    /// The wiring, not just the helper: with no trusted git, `git_dir_of` must
+    /// fall back rather than return `None`. Untestable through `git_dir_of`
+    /// itself on a host that has git — `trusted_git()` caches — so the invoker
+    /// result is injected.
+    #[test]
+    fn git_dir_of_falls_back_when_there_is_no_trusted_git() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(proj.join(".git")).expect("mkdir");
+
+        assert_eq!(
+            git_dir_of_with(None, &proj).as_deref(),
+            Some(proj.join(".git").as_path()),
+            "no trusted git must fall back to reading .git, not fail open"
+        );
+    }
+
+    /// A `.git` symlink to a real gitdir is a supported layout, and git follows
+    /// it. Reading link metadata instead would take the pointer-file branch and
+    /// fail with EISDIR, losing the target's denies.
+    #[test]
+    fn gitdir_without_git_follows_a_dot_git_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let real = root.join("elsewhere.git");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        std::os::unix::fs::symlink(&real, proj.join(".git")).expect("symlink");
+
+        assert_eq!(gitdir_without_git(&proj).as_deref(), Some(real.as_path()));
     }
 
     /// A relative pointer is the form git actually writes for a submodule.

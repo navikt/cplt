@@ -1472,15 +1472,17 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         // a grant *in* a trusted dir is the direct hole, a grant on an
         // ancestor (`/usr` over `/usr/bin`) hands out the same hole by
         // containment. Same danger, different thing to go edit.
+        // "path", not "directory": a hit can be a bin directory OR the resolved
+        // binary itself, which is where a Homebrew-style symlink target lands.
         let overlap = if trusted.iter().any(|t| granted.starts_with(t)) {
             format!(
-                "allow.write grants {} — inside the trusted binary directory {dirs}.",
+                "allow.write grants {} — inside the trusted binary path {dirs}.",
                 granted.display()
             )
         } else {
-            let plural = if trusted.len() == 1 { "y" } else { "ies" };
+            let plural = if trusted.len() == 1 { "" } else { "s" };
             format!(
-                "allow.write grants {}, which contains the trusted binary director{plural} {dirs}.",
+                "allow.write grants {}, which contains the trusted binary path{plural} {dirs}.",
                 granted.display()
             )
         };

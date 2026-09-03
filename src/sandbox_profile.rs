@@ -1718,9 +1718,10 @@ mod tests {
     /// must not depend on it: `<root>/.git` is seeded for every writable root
     /// unconditionally, so the hooks and config denies stand with no git at all.
     ///
-    /// Pins the boundary of that guarantee — a worktree's *shared* gitdir does
-    /// still need resolving, which is what `discover::gitdir_without_git`
-    /// recovers without spawning anything.
+    /// Pins the boundary of that guarantee — a worktree's *shared* gitdir, and
+    /// any grant whose repo data is not at `<root>/.git`, still need resolving.
+    /// `discover::gitdir_without_git` recovers those by reading the `.git`
+    /// pointer (and its `commondir`) without spawning anything.
     #[test]
     fn git_persistence_denies_do_not_depend_on_a_resolved_git() {
         let project = std::path::Path::new("/projects/app");
