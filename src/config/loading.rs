@@ -696,19 +696,31 @@ impl Resolved {
     /// Both directions of `starts_with` count. A grant *inside* a trusted dir
     /// is the direct hole; a grant on an ancestor (`/usr`, or `/`) is the same
     /// hole one level up.
+    ///
+    /// [`crate::git::TRUSTED_BIN_ROOTS`] counts too, not just the bin dirs.
+    /// `trusted_binary` follows a symlink and accepts any final target under a
+    /// root, which is what makes Homebrew's `bin/git -> ../Cellar/git/*/bin/git`
+    /// work — so a grant on `/opt/homebrew/Cellar` never touches a *bin* dir yet
+    /// still lets the agent rewrite the file the trusted `git` resolves to.
+    /// Checking only the bin dirs missed exactly the layout the roots exist for.
     #[must_use]
     pub fn write_grants_over_trusted_bins(&self) -> Vec<(PathBuf, Vec<&'static str>)> {
         self.allow_write
             .iter()
             .filter_map(|granted| {
-                let hit: Vec<&'static str> = crate::git::TRUSTED_BIN_DIRS
+                let mut hit: Vec<&'static str> = crate::git::TRUSTED_BIN_DIRS
                     .iter()
+                    .chain(crate::git::TRUSTED_BIN_ROOTS.iter())
                     .filter(|d| {
                         let dir = Path::new(*d);
                         dir.starts_with(granted) || granted.starts_with(dir)
                     })
                     .copied()
                     .collect();
+                // A bin dir usually sits under a root, so one grant can match
+                // both spellings of the same place; report each path once.
+                hit.sort_unstable();
+                hit.dedup();
                 (!hit.is_empty()).then(|| (granted.clone(), hit))
             })
             .collect()
@@ -1826,7 +1838,9 @@ validate = false
             found
                 .iter()
                 .any(|(g, dirs)| g == Path::new("/opt/homebrew/bin")
-                    && dirs == &["/opt/homebrew/bin"]),
+                    && dirs.contains(&"/opt/homebrew/bin")
+                    // The bin dir sits under the root, so both are named.
+                    && dirs.contains(&"/opt/homebrew")),
             "the exact-match grant must be reported: {found:?}"
         );
         assert!(
@@ -1853,10 +1867,37 @@ validate = false
         resolved.allow_write = vec![PathBuf::from("/")];
         let found = resolved.write_grants_over_trusted_bins();
         assert_eq!(found.len(), 1, "one logical overlap, one row: {found:?}");
+        for expected in crate::git::TRUSTED_BIN_DIRS
+            .iter()
+            .chain(crate::git::TRUSTED_BIN_ROOTS.iter())
+        {
+            assert!(
+                found[0].1.contains(expected),
+                "the row must name every trusted path it swallows, missing {expected}: {found:?}"
+            );
+        }
+        let mut deduped = found[0].1.clone();
+        deduped.dedup();
+        assert_eq!(deduped, found[0].1, "each path named once: {found:?}");
+    }
+
+    /// The F3 case: `trusted_binary` follows `/opt/homebrew/bin/git` to its
+    /// target under `Cellar`, so a grant there lets the agent rewrite the file
+    /// the parent executes — without ever naming a *bin* directory. Checking
+    /// only `TRUSTED_BIN_DIRS` waved this through.
+    #[test]
+    fn a_write_grant_over_a_symlink_target_root_is_reported() {
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        resolved.allow_write = vec![PathBuf::from("/opt/homebrew/Cellar")];
+        let found = resolved.write_grants_over_trusted_bins();
         assert_eq!(
-            found[0].1.len(),
-            crate::git::TRUSTED_BIN_DIRS.len(),
-            "the row must name every trusted dir it swallows: {found:?}"
+            found.len(),
+            1,
+            "a grant under a trusted root must be reported: {found:?}"
+        );
+        assert!(
+            found[0].1.contains(&"/opt/homebrew"),
+            "the row must name the root it sits under: {found:?}"
         );
     }
 
