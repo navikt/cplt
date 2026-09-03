@@ -214,6 +214,10 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         opts.git_common_dir,
         opts.extra_git_dirs,
     );
+    // Same reason, and the fix for the same bug one tree over: keeps the
+    // agent's own auto-executing config unwritable even when a user
+    // `allow.write` covers the whole config dir.
+    emit_host_persistence_denies(&mut sb, opts.agent, opts.agent_dirs);
     // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
     // when a user allow.write covers them (write-then-exec).
     emit_dotnet_exec_denies(&mut sb, opts.dotnet_root);
@@ -409,37 +413,12 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
             if dir.write && !dir.map_exec {
                 sbpl!(sb, "(deny file-map-executable (subpath \"{path}\"))");
             }
-            // Explicitly deny writes on exec-only dirs (prevents write+exec persistence
-            // even when a parent dir is writable — this deny is emitted after the
-            // parent allow, so SBPL last-match-wins lets it override)
-            if !dir.write && dir.process_exec {
-                sbpl!(sb, "(deny file-write* (subpath \"{path}\"))");
-            }
+            // Writes on exec-only dirs (Pi's bin/, OpenCode's cache bin/) are
+            // denied by emit_host_persistence_denies at the tail of the
+            // profile, not here: a later user allow.write would otherwise
+            // reopen them.
         }
         sbpl!(sb);
-    }
-
-    // Claude Code: the config dir is writable (sessions, history, credentials),
-    // but a few artifacts auto-execute on the HOST the next time `claude` runs
-    // outside the sandbox — a persistence vector the agent never needs to write
-    // mid-session. Deny those specifically (emitted after the dir-wide allow
-    // above, so SBPL last-match-wins lets the deny override). settings.json,
-    // commands/, agents/, skills/ stay
-    // writable: Claude legitimately authors them and they require user invocation.
-    // macOS only — Landlock cannot deny a subpath within an allowed dir (see SECURITY.md).
-    //
-    // Apply to every writable grant rather than the first one: the default layout
-    // grants both ~/.claude (the data dir these subpaths live under) and the
-    // ~/.claude.json file, and we must not depend on their ordering. The deny on
-    // a file grant (~/.claude.json/statusline.sh) can never match a real path, so
-    // it is a harmless no-op; the deny on the data dir is the one that matters.
-    if matches!(agent, Agent::Claude) {
-        for cfg in agent_dirs.iter().filter(|d| d.write) {
-            for sub in ["statusline.sh", "plugins"] {
-                let p = cfg.path.join(sub).display().to_string();
-                sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
-            }
-        }
     }
 
     // GitHub CLI auth — Copilot spawns `gh auth token` which reads these specific files.
@@ -720,6 +699,55 @@ fn emit_gitdir_denies(sb: &mut String, gitdir: &str) {
 /// `<root>/.git` is emitted for every writable root unconditionally, even one
 /// that is not a repo today, so a repo the agent creates mid-session with
 /// `git init` at the grant root is covered too.
+/// Write-denies the agent's own host-persistence paths, plus writes on any
+/// exec-only agent dir.
+///
+/// The paths come from [`Agent::host_persistence_paths`]: files inside a
+/// writable agent config dir that auto-execute on the HOST the next time the
+/// agent runs outside the sandbox — hooks, extensions, plugins, installed
+/// package code — which the agent never needs to write mid-session.
+///
+/// **Emitted at the tail of the profile, after `emit_user_allows`, and that
+/// placement is the whole point.** SBPL is last-match-wins, so while these
+/// lived next to the dir-wide allow in `emit_home_access` a user
+/// `allow.write = ["~/.gemini"]` (or `["~/.claude"]`) silently reopened every
+/// one of them — the same bug #212 fixed for the git-persistence denies by
+/// moving them here. `is_unsafe_root` only rejects `~` itself, so a
+/// whole-config-dir grant is an ordinary thing for a user to write.
+///
+/// The consequence is that there is no `allow.write` escape hatch for these
+/// paths any more: a first-run login that needs to write a denied file has to
+/// happen outside cplt (see `Agent::login_warning`, which says so up front).
+///
+/// Applies to every writable grant rather than the first one: Claude's default
+/// layout grants both `~/.claude` (the data dir these subpaths live under) and
+/// the `~/.claude.json` file, and we must not depend on their ordering. A deny
+/// on a file grant (`~/.claude.json/statusline.sh`) can never match a real
+/// path, so it is a harmless no-op; the deny on the data dir is what matters.
+/// Same for Antigravity's two grants, whose entries belong to one dir each.
+///
+/// macOS only — Landlock cannot deny a subpath within an allowed dir, so on
+/// Linux the bubblewrap read-only overlay carries this (see SECURITY.md).
+fn emit_host_persistence_denies(sb: &mut String, agent: Agent, agent_dirs: &[AgentDir]) {
+    let paths = agent.host_persistence_paths(agent_dirs);
+    let exec_only = agent_dirs.iter().filter(|d| !d.write && d.process_exec);
+    let mut wrote_header = false;
+    for path in paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .chain(exec_only.map(|d| d.path.display().to_string()))
+    {
+        if !wrote_header {
+            sbpl!(sb, ";; Agent config-dir host-persistence denies");
+            wrote_header = true;
+        }
+        sbpl!(sb, "(deny file-write* (subpath \"{path}\"))");
+    }
+    if wrote_header {
+        sbpl!(sb);
+    }
+}
+
 fn emit_git_persistence_denies(
     sb: &mut String,
     project: &str,
@@ -1325,18 +1353,36 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
     sbpl!(sb);
 }
 
+/// Resolve symlinks in a path built from `$HOME`, falling back to the path
+/// itself when it does not exist.
+///
+/// `extra_read` / `extra_write` entries are already canonicalized (`--allow-read`
+/// through `canonicalize_paths`, config `allow.read` through
+/// `resolve_config_path`), so any comparison against a path we construct from
+/// `$HOME` must resolve that side too. Without it a dotfile-managed home — where
+/// `~/.npmrc` is a symlink into `~/dotfiles` — never matches, and the user's
+/// explicit grant is silently dropped.
+fn resolved(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
 /// Re-allow credential files from `DENIED_HOME_SUBPATHS` when the user
 /// explicitly opts in via `--allow-read` or `allow.read` in config.toml.
 ///
 /// Emitted AFTER `emit_deny_rules` so SBPL last-match-wins re-allows the file.
 /// Only matches exact paths from `DENIED_HOME_SUBPATHS` — hard denies
 /// (DENIED_FILES, DENIED_DOTFILES) cannot be overridden this way.
+///
+/// The re-allow names the `$HOME` path, not the resolved one: the deny it
+/// overrides names `$HOME` too, and the macOS sandbox matches a rule against
+/// the path as opened, so the literal has to line up with the deny. The
+/// resolved target is separately allowed by `emit_user_allows`.
 fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[PathBuf]) {
     let home_path = Path::new(home);
     let mut overrides: Vec<&str> = Vec::new();
 
     for &file in DENIED_HOME_SUBPATHS {
-        let full_path = home_path.join(file);
+        let full_path = resolved(home_path.join(file));
         if extra_read.iter().any(|p| p == &full_path) {
             overrides.push(file);
         }
@@ -1368,10 +1414,21 @@ fn emit_denied_dotfile_overrides(sb: &mut String, home: &str, extra_read: &[Path
     for path in extra_read {
         for &dotfile in DENIED_DOTFILES {
             let denied_dir = home_path.join(dotfile);
-            if path.starts_with(&denied_dir) && *path != denied_dir {
-                overrides.push(path.to_string_lossy().into_owned());
-                break;
+            let resolved_dir = resolved(denied_dir.clone());
+            let Ok(rel) = path.strip_prefix(&resolved_dir) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
             }
+            overrides.push(path.to_string_lossy().into_owned());
+            // When `~/<dotfile>` is itself a symlink the deny names the $HOME
+            // path, and the macOS sandbox matches a rule against the path as
+            // opened — so the re-allow has to cover that form as well.
+            if resolved_dir != denied_dir {
+                overrides.push(denied_dir.join(rel).to_string_lossy().into_owned());
+            }
+            break;
         }
     }
 
@@ -2001,6 +2058,62 @@ mod tests {
         assert!(
             !p.contains("\"*:443\""),
             "fail-closed: proxy_forced without a port must not emit *:443"
+        );
+    }
+
+    /// Issue #244: `allow.read` entries are canonicalized, so a dotfile-managed
+    /// `~/.npmrc` symlink used to miss the `home.join(file)` comparison and the
+    /// re-allow was silently never emitted.
+    #[test]
+    fn symlinked_credential_file_still_gets_its_reallow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        std::fs::create_dir_all(home.join("dotfiles")).expect("mkdir");
+        std::fs::write(home.join("dotfiles/npmrc"), "//r/:_authToken=x\n").expect("write");
+        std::os::unix::fs::symlink(home.join("dotfiles/npmrc"), home.join(".npmrc"))
+            .expect("symlink");
+
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let mut opts = test_options(&project, &home);
+        // What canonicalize_paths / resolve_config_path would put in extra_read.
+        let extra_read = [std::fs::canonicalize(home.join(".npmrc")).expect("canonicalize")];
+        assert_eq!(extra_read[0], home.join("dotfiles/npmrc"));
+        opts.extra_read = &extra_read;
+        let p = generate_profile(&opts);
+
+        let home_str = home.display();
+        assert!(
+            p.contains(&format!(
+                "(allow file-read* (literal \"{home_str}/.npmrc\"))"
+            )),
+            "re-allow for the symlinked ~/.npmrc missing from profile:\n{p}"
+        );
+    }
+
+    /// Same class, `DENIED_DOTFILES` half: a symlinked `~/.aws` must still get
+    /// the targeted re-allow, and it must name the `$HOME` path the deny uses.
+    #[test]
+    fn symlinked_denied_dotfile_dir_still_gets_its_reallow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        std::fs::create_dir_all(home.join("dotfiles/aws")).expect("mkdir");
+        std::fs::write(home.join("dotfiles/aws/config"), "[default]\n").expect("write");
+        std::os::unix::fs::symlink(home.join("dotfiles/aws"), home.join(".aws")).expect("symlink");
+
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let mut opts = test_options(&project, &home);
+        let extra_read = [std::fs::canonicalize(home.join(".aws/config")).expect("canonicalize")];
+        opts.extra_read = &extra_read;
+        let p = generate_profile(&opts);
+
+        let home_str = home.display();
+        assert!(
+            p.contains(&format!(
+                "(allow file-read* (literal \"{home_str}/.aws/config\"))"
+            )),
+            "re-allow naming the $HOME path missing from profile:\n{p}"
         );
     }
 }

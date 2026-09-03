@@ -52,8 +52,9 @@ mod profile;
 pub use policy::{
     AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
     ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
-    HomeToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs, home_tool_dirs,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_sbpl_path,
+    HomeToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs, current_uid,
+    home_tool_dirs, linux_docker_socket_paths, socket_mask_paths, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_sbpl_path,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -351,6 +352,46 @@ fn prepare_impl(
     })
 }
 
+/// Report which of the three UNIX-socket regimes this run lands in.
+///
+/// Pathname UNIX sockets are the one part of the Linux policy where the
+/// protection depends on *both* the kernel version and whether bubblewrap
+/// wrapped the run, and the three outcomes are genuinely different:
+///
+/// | Kernel      | bwrap | Outcome                                          |
+/// |-------------|-------|--------------------------------------------------|
+/// | >= 7.1 (v9) | any   | `connect(2)` is kernel-mediated: only granted paths |
+/// | < 7.1       | yes   | listed sockets are mount-masked; others reachable |
+/// | < 7.1       | no    | no restriction at all                             |
+///
+/// Kernel 7.1 lands mid-2026, so the third row is the common case today and
+/// the message must not pretend otherwise. This mirrors the style of the other
+/// Linux enforceability notes above rather than adding a new surface.
+#[cfg(target_os = "linux")]
+fn report_unix_socket_regime(bwrap_active: bool, socket_masks: usize) {
+    use landlock::ABI;
+
+    if landlock_mod::check_availability().is_ok_and(|abi| abi >= ABI::V9) {
+        ui::info(
+            "UNIX-socket connect is kernel-enforced (Landlock ABI v9+): the agent can \
+             only reach sockets the policy grants.",
+        );
+    } else if bwrap_active {
+        ui::info(&format!(
+            "UNIX-socket connect is NOT kernel-enforced (needs Landlock ABI v9 / kernel 7.1). \
+             Bubblewrap masks {socket_masks} known escape socket(s) (D-Bus, systemd, \
+             container runtimes); any other pathname socket on the host stays reachable."
+        ));
+    } else {
+        ui::warn(
+            "UNIX sockets are NOT restricted in this run: Landlock cannot gate connect(2) \
+             below ABI v9 (kernel 7.1) and Bubblewrap is not active, so nothing masks them. \
+             An agent can reach the D-Bus session bus or a container daemon socket and \
+             execute code outside the sandbox. Install bubblewrap to close the known paths.",
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -377,10 +418,25 @@ fn prepare_impl(
              Use --with-proxy for localhost SSRF protection.",
         );
     }
+    // proxy.forced now denies every non-TCP IP socket at the seccomp layer.
+    // Without this line the failure is a bare "Operation not permitted" from
+    // socket(2) with nothing naming cplt, which is a miserable thing to debug.
+    if config.proxy_forced {
+        ui::info(
+            "proxy.forced also blocks non-TCP IP sockets (UDP, raw, SCTP): they would \
+             bypass the proxy entirely. Anything that opens one gets EPERM from \
+             socket() — a UDP tool reached via --allow-localhost, and also code that \
+             merely enumerates network interfaces through an AF_INET datagram socket \
+             (the JDK's SIOCGIFCONF path, so Gradle). seccomp cannot see the \
+             destination address, so there is no loopback exemption.",
+        );
+    }
     if config.allow_docker {
         ui::warn(
-            "--allow-docker has no effect on Linux: \
-             Docker socket access is not yet implemented in the Landlock backend.",
+            "--allow-docker on Linux grants the Docker/Podman daemon sockets and \
+             exempts them from the Bubblewrap socket masks — daemon socket access is \
+             effectively host root. ~/.docker stays denied, so Docker CLI contexts and \
+             registry auth are still unavailable (#155).",
         );
     }
     // Finding 2: on Linux, allow_localhost_any drops EVERY Landlock TCP-connect
@@ -415,13 +471,47 @@ fn prepare_impl(
     write_roots.extend(config.extra_write.iter().map(PathBuf::as_path));
     let mut git_dirs: Vec<&Path> = config.git_common_dir.into_iter().collect();
     git_dirs.extend(extra_git_dirs.iter().map(PathBuf::as_path));
-    let ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
+    let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
+
+    // #237: same class, different tree — the agent's own config dir is granted
+    // writable, and some files in it auto-execute on the host the next time the
+    // agent runs outside cplt (Claude/Gemini hooks, Pi/Gemini extensions). macOS
+    // emits these as SBPL write-denies; Landlock cannot carve a sub-deny out of
+    // an allowed tree, so the bwrap read-only overlay is the only mechanism here
+    // — WITHOUT bwrap this is unenforced on Linux.
+    //
+    // KNOWN GAP: even with bwrap, `build_bwrap_args` skips a path that does not
+    // exist, because bwrap cannot bind a missing source. `.git/hooks` rarely
+    // hits this (`git init` creates it) but `extensions/` does not exist until
+    // the first extension is installed, so that deny is nominal in the common
+    // case. Masking a missing path with the `deny_masks` machinery (a `--tmpfs`
+    // over a directory, a mode-000 placeholder `--ro-bind` over a file) would
+    // close it, but it also makes the path *appear to exist* as an empty dir or
+    // empty file, which changes what the agent reads at startup. That is not a
+    // change to make untested, and this is a macOS host. Documented in
+    // SECURITY.md instead of half-done.
+    ro_protect.extend(config.agent.host_persistence_paths(config.agent_dirs));
+    ro_protect.sort();
+    ro_protect.dedup();
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied
     // files read as EACCES, denied dirs read as empty (macOS gives EACCES for
     // both; the content is unreachable either way).
-    let deny_masks = bubblewrap::build_deny_masks(config.extra_deny, config.scratch_dir);
+    // Built-in UNIX-socket masks (Finding A): D-Bus, systemd's private socket
+    // and — unless --allow-docker — the container-runtime sockets. Each is an
+    // escape *out of* the sandbox, and below kernel 7.1 Landlock cannot gate
+    // connect(2) to a pathname socket at all, so a bwrap mount mask is the only
+    // thing that can take them away. Non-existent entries are dropped here so
+    // they never show up in the "could not be mount-masked" warning; the masks
+    // are only ever applied when bwrap actually wraps the run.
+    let socket_masks: Vec<PathBuf> =
+        policy::socket_mask_paths(policy::current_uid(), config.allow_docker)
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+    let deny_masks =
+        bubblewrap::build_deny_masks(config.extra_deny, &socket_masks, config.scratch_dir);
 
     // Decide bubblewrap wrapping before `precompute()` consumes `policy`.
     // `resolve()` only clones `fs_rules`/`net_rules` on the arms that actually
@@ -432,9 +522,15 @@ fn prepare_impl(
         &policy.fs_rules,
         &policy.net_rules,
         policy.restrict_net_connect,
+        config.proxy_forced,
         &ro_protect,
         &deny_masks,
     )?;
+
+    // UNIX-socket reachability has three distinct regimes and they are not
+    // interchangeable, so say which one this run is in rather than implying the
+    // hole is closed (or that it is still open when it is not).
+    report_unix_socket_regime(bwrap_wrapper.is_some(), deny_masks.socket_mask_count());
 
     if !config.extra_deny.is_empty() {
         if bwrap_wrapper.is_some() {

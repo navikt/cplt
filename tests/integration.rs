@@ -1923,4 +1923,53 @@ except Exception as e:
             "`--proxy-forced --print-profile` must not allow direct *:443 egress, got:\n{stdout}"
         );
     }
+
+    /// #237: the unauthenticated-Gemini warning must actually reach the user.
+    ///
+    /// `Agent::login_warning` has its own unit test, but that only proves the
+    /// string is built — not that anything emits it. cplt warns and launches
+    /// rather than refusing, so a call site quietly dropped in a refactor would
+    /// leave no failing test and no visible symptom: the user just walks into
+    /// `Failed to save settings` with nothing connecting it to cplt. This runs
+    /// the real binary against a HOME with no `~/.gemini` and asserts the
+    /// warning is on stderr, then against one with credentials and asserts it
+    /// is not.
+    #[test]
+    fn binary_warns_about_unauthenticated_gemini_login() {
+        let project = fs::canonicalize(".").unwrap();
+        let run = |home: &std::path::Path| {
+            let output = Command::new(binary_path())
+                .args([
+                    "--agent",
+                    "gemini",
+                    "--print-profile",
+                    "--project-dir",
+                    &project.to_string_lossy(),
+                ])
+                .env("HOME", home)
+                .output()
+                .expect("Failed to run cplt --print-profile");
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        let stderr = run(empty.path());
+        assert!(
+            stderr.contains("not signed in"),
+            "unauthenticated Gemini must warn, got stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Failed to save settings"),
+            "warning must quote the error Gemini prints, got stderr:\n{stderr}"
+        );
+
+        let authed = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(authed.path().join(".gemini")).expect("mkdir");
+        fs::write(authed.path().join(".gemini/oauth_creds.json"), "{}").expect("write creds");
+        let stderr = run(authed.path());
+        assert!(
+            !stderr.contains("not signed in"),
+            "an authenticated Gemini must not warn, got stderr:\n{stderr}"
+        );
+    }
 }

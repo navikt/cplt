@@ -49,6 +49,98 @@ pub const DENIED_HOME_SUBPATHS: &[&str] = &[
     ".npmrc",
 ];
 
+/// Real UID of this process.
+///
+/// Used only to spell per-user runtime paths (`/run/user/<uid>/…`) in the
+/// policy. `getuid(2)` has no failure mode.
+pub fn current_uid() -> u32 {
+    // SAFETY: getuid() takes no arguments, touches no memory, and always
+    // succeeds.
+    unsafe { libc::getuid() }
+}
+
+/// Pathname UNIX-socket paths that must be mount-masked on Linux.
+///
+/// # Why this exists
+///
+/// Landlock cannot gate `connect(2)` to a **pathname** UNIX socket before ABI
+/// v9 (kernel 7.1) — `AccessFs::ResolveUnix` simply does not exist below that,
+/// and a read-only bind mount does not stop `connect()` either (the `MS_RDONLY`
+/// check runs in `mnt_want_write()`, which UNIX-socket connect never calls; it
+/// only needs inode write permission via DAC). seccomp cannot help: the socket
+/// path lives behind a pointer argument, which BPF cannot dereference.
+///
+/// So on every kernel below 7.1 — i.e. essentially every deployed kernel today
+/// (Ubuntu 24.04 = 6.8, Debian 13 = 6.12, Fedora 42 ≈ 6.15) — the only thing
+/// that can take these sockets away from the agent is making them *not present
+/// in its mount namespace*. That is Bubblewrap's job, and **only** Bubblewrap's:
+/// when bwrap is absent, disabled, or falls back at spawn time, none of this
+/// applies and the sockets are reachable.
+///
+/// # Why these paths
+///
+/// Each one hands out arbitrary code execution **outside** the sandbox, because
+/// the service on the other end is not a descendant of the sandboxed process
+/// and therefore inherits neither the Landlock domain, the seccomp filter, nor
+/// the namespaces:
+///
+/// - `/run/user/<uid>/bus`, `/run/dbus/system_bus_socket` — the D-Bus session
+///   and system buses. `systemd-run --user` (or hand-rolled D-Bus) starts a
+///   unit as the user, unsandboxed.
+/// - `/run/user/<uid>/systemd` — systemd's private socket
+///   (`.../systemd/private`), same escape without going through D-Bus.
+/// - Docker/Podman daemon sockets — socket access is effectively host root.
+///
+/// `allow_docker` punches through the container-runtime entries only (#155):
+/// the D-Bus and systemd masks are never lifted. On Linux `--allow-docker` was
+/// previously a documented no-op; it now means exactly two things — *do not
+/// mask the daemon sockets*, and *grant Landlock read+write on them* (see
+/// [`linux_docker_socket_paths`]) so `connect(2)` still works once the kernel
+/// gates it at ABI v9. It grants nothing else: `~/.docker` stays denied.
+///
+/// Abstract-namespace sockets have no path and cannot be masked this way; they
+/// are covered (kernel ≥ 6.12 only) by `Scope::AbstractUnixSocket`.
+pub fn socket_mask_paths(uid: u32, allow_docker: bool) -> Vec<PathBuf> {
+    let run_user = format!("/run/user/{uid}");
+    let mut paths = vec![
+        PathBuf::from(format!("{run_user}/bus")),
+        PathBuf::from(format!("{run_user}/systemd")),
+        PathBuf::from("/run/dbus/system_bus_socket"),
+    ];
+    if !allow_docker {
+        paths.extend(linux_docker_socket_paths(uid));
+    }
+    paths
+}
+
+/// Docker/Podman daemon endpoints on Linux.
+///
+/// Two uses, deliberately sharing one list so they cannot drift: they are
+/// mount-masked when `--allow-docker` is off (see [`socket_mask_paths`]), and
+/// granted as Landlock read+write rules when it is on — which is what makes
+/// `--allow-docker` mean something on Linux for the first time (#155).
+///
+/// The grant is not a widening on kernels below 7.1: there, `connect(2)` to a
+/// pathname socket needs no Landlock right at all, so an ungranted socket was
+/// already reachable. It matters from ABI v9 up, where an ungranted socket
+/// would otherwise be refused.
+///
+/// Directory entries (`.../podman`) are intentional: Podman's socket sits at
+/// `<dir>/podman.sock`, and a `PathBeneath` rule covers the subtree.
+///
+/// Not granted, and out of scope here: `~/.docker` (in [`DENIED_DOTFILES`], so
+/// the Docker CLI runs without its config file — contexts and registry auth
+/// stay unavailable on Linux; that is #155's remaining half, not this one).
+pub fn linux_docker_socket_paths(uid: u32) -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/run/docker.sock"),
+        PathBuf::from("/var/run/docker.sock"),
+        PathBuf::from(format!("/run/user/{uid}/docker.sock")),
+        PathBuf::from(format!("/run/user/{uid}/podman")),
+        PathBuf::from("/run/podman"),
+    ]
+}
+
 /// Sensitive file patterns in the project directory that are denied by default.
 /// These often contain secrets (API keys, database passwords, private keys).
 /// A rogue agent could read and exfiltrate these via HTTPS.
