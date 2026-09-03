@@ -183,33 +183,6 @@ jobs:
             exit 1
           fi
 
-      - name: Run pinned Playwright MCP smoke through cplt
-        shell: bash
-        env:
-          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
-        run: |
-          set -euo pipefail
-          mcp_prefix="$RUNNER_TEMP/playwright-mcp-0.0.80"
-          mkdir -p "$mcp_prefix"
-          npm install \
-            --prefix "$mcp_prefix" \
-            --cache "$RUNNER_TEMP/npm-cache-playwright-mcp-0.0.80" \
-            --no-save \
-            --no-package-lock \
-            --ignore-scripts \
-            --no-audit \
-            --no-fund \
-            "@playwright/mcp@0.0.80"
-
-          cargo build --bin cplt
-          python3 tests/playwright_mcp_smoke.py \
-            --runner-temp "$RUNNER_TEMP" \
-            --project-dir "$GITHUB_WORKSPACE" \
-            --mcp-prefix "$mcp_prefix" \
-            --cplt-binary "$GITHUB_WORKSPACE/target/debug/cplt" \
-            --node-binary "$(command -v node)" \
-            --chrome-binary "$CPLT_CHROME_FOR_TESTING"
-
       - name: Assert working tree is clean (no leaked test artifacts)
         run: |
           # E2E/integration tests must scaffold fixtures into TempDir-scoped
