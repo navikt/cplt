@@ -561,12 +561,25 @@ fn install_command_wrappers(
     if gh_guard.enabled
         && let Some(real_gh) = which_binary("gh")
     {
-        let repo_scope = if gh_guard.scope_check {
+        let real_git = if gh_guard.scope_check {
             // Trusted, not PATH: this git runs in the UNSANDBOXED parent, at
             // launch. A `git` the previous session planted in ~/.bun/bin (or any
             // other write+exec grant on PATH) would otherwise execute as the
             // user here, one session later.
             if let Some(real_git) = crate::git::trusted_git() {
+                Some(real_git.to_path_buf())
+            } else {
+                ui::warn(
+                    "gh guard could not find Git to capture repository scope. \
+                     Scope-checked commands will be blocked.",
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let repo_scope = if gh_guard.scope_check {
+            if let Some(real_git) = real_git.as_deref() {
                 match crate::gh_proxy::detect_current_repo(real_git, project_dir) {
                     Ok(repo) => Some(repo),
                     Err(reason) => {
@@ -578,18 +591,18 @@ fn install_command_wrappers(
                     }
                 }
             } else {
-                ui::warn(
-                    "gh guard could not find Git to capture repository scope. \
-                     Scope-checked commands will be blocked.",
-                );
                 None
             }
         } else {
             None
         };
+        let real_git_str = real_git
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
         let script = crate::gh_proxy::generate_wrapper_script(
             &real_gh.to_string_lossy(),
             repo_scope.as_deref(),
+            real_git_str.as_deref(),
             &cplt_str,
             gh_guard,
         );
