@@ -1735,8 +1735,24 @@ finally:
 
         for listener in [allowed, denied] {
             std::thread::spawn(move || {
-                for mut s in listener.incoming().flatten() {
-                    let _ = s.write_all(b"ok");
+                // Bounded, not `incoming()`: a blocking accept loop never
+                // returns, so both threads and both sockets would stay alive
+                // for the rest of the test binary. The denied listener never
+                // gets a connection at all — that is the point of the test —
+                // so it can only be ended by a deadline.
+                listener.set_nonblocking(true).ok();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut s, _)) => {
+                            let _ = s.write_all(b"ok");
+                            break;
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
                 }
             });
         }

@@ -2748,7 +2748,10 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             .is_some_and(|t| !t.trim().is_empty())
     {
         ui::warn(
-            "`gh auth token` returned a classic personal access token (ghp_), which Copilot              does not accept. Keeping Keychain access so Copilot can use its own credential.              Run `gh auth login` for an OAuth token, or use a fine-grained PAT, to drop the              Keychain grant.",
+            "`gh auth token` returned a classic personal access token (ghp_), which \
+             Copilot does not accept. Keeping Keychain access so Copilot can use \
+             its own credential. Run `gh auth login` for an OAuth token, or use a \
+             fine-grained PAT, to drop the Keychain grant.",
         );
     }
 
