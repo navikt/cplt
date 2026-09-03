@@ -422,19 +422,24 @@ fn install_command_wrappers(
     }
 
     // Install git guard wrapper (only if git_guard enabled)
-    // Trusted, not PATH: this path is baked into the wrapper the agent's own
-    // shell then runs, so a planted `git` would be handed the guard's identity.
-    if git_guard.enabled && crate::git::trusted_git().is_none() {
-        // Say so. Skipping the wrapper silently leaves the user believing
-        // push/force-push are guarded when they are not — the gh branch above
-        // warns in the equivalent situation, and this one did not.
-        ui::warn(
-            "git guard could not find Git in a trusted directory — the git wrapper \
-             is not installed, so push and force-push are NOT blocked in this session.",
-        );
-    }
+    // Trusted first, then PATH — the same call the gh wrapper above makes, and
+    // for the same reason.
+    //
+    // This path is baked into a wrapper the agent's own shell runs INSIDE the
+    // sandbox; it is never executed by the parent. A planted `git` there gains
+    // the agent nothing it does not already have: it can invoke any git by
+    // absolute path and skip the PATH wrapper entirely, so the guard is a policy
+    // on intent, not a boundary. Requiring a trusted git instead removed the
+    // guard outright on every machine whose git comes from mise, asdf,
+    // nix-profile or snap — the agent's PATH still had that git, so `git push`
+    // simply went unguarded. That is a loss with no matching gain.
+    //
+    // Parent-side git (audit, repo-config trust, gh guard scope) stays on
+    // `trusted_git()`, where a planted binary WOULD run unsandboxed.
     if git_guard.enabled
         && let Some(real_git) = crate::git::trusted_git()
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| which_binary("git"))
     {
         let script = crate::gh_proxy::generate_git_wrapper_script(
             &real_git.to_string_lossy(),
