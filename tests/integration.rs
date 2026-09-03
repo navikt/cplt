@@ -178,6 +178,50 @@ mod macos_tests {
         (combined, output.status.success())
     }
 
+    fn python_path_literal(path: &Path) -> String {
+        serde_json::to_string(
+            path.to_str()
+                .expect("generated Playwright socket paths must be valid UTF-8"),
+        )
+        .expect("serialize generated Playwright socket path")
+    }
+
+    fn python_inline_command(source: &str) -> String {
+        format!("python3 -c '{}'", source.replace('\'', "'\\''"))
+    }
+
+    #[test]
+    fn python_path_literal_survives_inline_shell_command() {
+        for path in [
+            Path::new("/private/tmp/cplt-pw-089a0123456789abcdef0123456789ab/browser/allowed.sock"),
+            Path::new("/private/tmp/cplt-pw quoted/quo'te-\"-back\\slash-\n.sock"),
+        ] {
+            let source = format!(
+                "import os\npath = {}\nprint(os.fsencode(path).hex())",
+                python_path_literal(path)
+            );
+            let output = Command::new("/bin/bash")
+                .arg("-c")
+                .arg(python_inline_command(&source))
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .expect("run generated Python source");
+
+            assert!(
+                output.status.success(),
+                "generated Python source failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected: String = path
+                .as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
+    }
+
     // ============================================================
     // File system isolation tests
     // ============================================================
@@ -655,7 +699,7 @@ mod macos_tests {
     }
 
     const CHROME_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-    const CDP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+    const CDP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
     const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
     const CDP_IO_TIMEOUT: Duration = Duration::from_secs(1);
     const CDP_MAX_MESSAGE_SIZE: usize = 256 * 1024;
@@ -679,6 +723,21 @@ mod macos_tests {
             return Err("the Chrome CDP probe reached its total deadline".to_string());
         }
         Ok(std::cmp::min(remaining, maximum))
+    }
+
+    fn cdp_discovery_deadline(start: Instant, total_deadline: Instant) -> Instant {
+        std::cmp::min(total_deadline, start + CDP_DISCOVERY_TIMEOUT)
+    }
+
+    #[test]
+    fn cdp_discovery_budget_covers_observed_slow_start_and_stays_bounded() {
+        let start = Instant::now();
+        let total_deadline = start + CHROME_PROBE_TIMEOUT;
+        let observed_slow_start = start + Duration::from_millis(5_050);
+        let discovery_deadline = cdp_discovery_deadline(start, total_deadline);
+
+        assert!(observed_slow_start < discovery_deadline);
+        assert!(discovery_deadline <= total_deadline);
     }
 
     fn read_debug_port(user_data_dir: &Path) -> Result<u16, String> {
@@ -705,8 +764,7 @@ mod macos_tests {
         const POLL_INTERVAL: Duration = Duration::from_millis(50);
         const MAX_DISCOVERY_BYTES: usize = 256 * 1024;
 
-        let discovery_deadline =
-            std::cmp::min(total_deadline, Instant::now() + CDP_DISCOVERY_TIMEOUT);
+        let discovery_deadline = cdp_discovery_deadline(Instant::now(), total_deadline);
         let mut last_error = "Chrome has not published its DevTools port".to_string();
 
         loop {
@@ -2234,11 +2292,11 @@ finally:
         let allowed_socket = socket_guard.path().join("browser/allowed.sock");
         let sibling_socket = sibling.path().join("blocked.sock");
 
-        let command = format!(
-            r#"python3 -c "
+        let source = format!(
+            r"
 import os, socket, threading
-allowed = {allowed_socket:?}
-sibling = {sibling_socket:?}
+allowed = {allowed_socket}
+sibling = {sibling_socket}
 timeout = 2.0
 server = None
 client = None
@@ -2303,10 +2361,11 @@ finally:
 print(sibling_result)
 if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
     raise SystemExit(1)
-""#,
-            allowed_socket = allowed_socket.to_string_lossy(),
-            sibling_socket = sibling_socket.to_string_lossy(),
+",
+            allowed_socket = python_path_literal(&allowed_socket),
+            sibling_socket = python_path_literal(&sibling_socket),
         );
+        let command = python_inline_command(&source);
         let (output, _) = run_sandboxed(&profile, &command);
 
         fs::remove_file(&profile).ok();
