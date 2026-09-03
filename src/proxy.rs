@@ -3188,7 +3188,7 @@ mod tests {
             let status = proxy_connect(proxy_port, &format!("{host}:443"));
             assert!(
                 !status.contains("Forbidden"),
-                "{host} must NOT be blocked by policy; got {status}"
+                "{host} must NOT be blocked by policy; got {status:?}"
             );
             if status.contains("200") {
                 return;
@@ -3221,9 +3221,33 @@ mod tests {
                 .map_or(0, |o| o.count)
         };
 
+        // Sample only once the count has stopped moving. A record from the
+        // previous attempt that lands between the sample and the next connect
+        // would otherwise leave `before` stale-low, and that attempt's record
+        // could then satisfy this attempt's wait — pairing one attempt's status
+        // with another attempt's record, which is the whole thing being avoided.
+        let settled_count = |p: &ProxyHandle| {
+            let mut last = count_for(p);
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                let now = count_for(p);
+                if now == last {
+                    return now;
+                }
+                last = now;
+            }
+        };
+
         let overall = Instant::now() + Duration::from_secs(5);
+        let mut first = true;
         loop {
-            let before = count_for(proxy);
+            // The first attempt has no predecessor to settle after.
+            let before = if first {
+                count_for(proxy)
+            } else {
+                settled_count(proxy)
+            };
+            first = false;
             let status = proxy_connect(proxy.port, &format!("{host}:443"));
 
             let attempt = Instant::now() + Duration::from_millis(500);
@@ -3265,7 +3289,7 @@ mod tests {
 
         assert!(
             status.contains("403"),
-            "evil.com must be blocked (BLOCKED-ALLOWLIST) under the default allowlist; got {status}"
+            "evil.com must be blocked (BLOCKED-ALLOWLIST) under the default allowlist; got {status:?}"
         );
         assert!(
             !contacted,
@@ -3344,7 +3368,7 @@ mod tests {
 
         assert!(
             !status.contains("Forbidden"),
-            "allow-all (observe) must NOT block would-be-blocked.example; got {status}"
+            "allow-all (observe) must NOT block would-be-blocked.example; got {status:?}"
         );
         assert_eq!(
             rec.verdict,
@@ -3368,7 +3392,7 @@ mod tests {
 
         assert!(
             status.contains("403"),
-            "evil.com must be blocked under the allowlist; got {status}"
+            "evil.com must be blocked under the allowlist; got {status:?}"
         );
         assert_eq!(rec.verdict, DomainVerdict::Blocked);
     }
@@ -3649,7 +3673,7 @@ mod tests {
 
         assert!(
             status.contains("403"),
-            "CONNECT to localhost should be blocked without --allow-localhost; got: {status}"
+            "CONNECT to localhost should be blocked without --allow-localhost; got: {status:?}"
         );
     }
 
@@ -3679,7 +3703,7 @@ mod tests {
 
         assert!(
             status.contains("200"),
-            "CONNECT to localhost:{port} should succeed with --allow-localhost {port}; got: {status}"
+            "CONNECT to localhost:{port} should succeed with --allow-localhost {port}; got: {status:?}"
         );
     }
 
@@ -3699,7 +3723,7 @@ mod tests {
 
         assert!(
             status.contains("403"),
-            "CONNECT to localhost:{blocked_port} should be blocked when only {allowed_port} is allowed; got: {status}"
+            "CONNECT to localhost:{blocked_port} should be blocked when only {allowed_port} is allowed; got: {status:?}"
         );
     }
 
@@ -3725,7 +3749,7 @@ mod tests {
 
         assert!(
             status.contains("200"),
-            "CONNECT to localhost:{port} should succeed with --allow-localhost-any; got: {status}"
+            "CONNECT to localhost:{port} should succeed with --allow-localhost-any; got: {status:?}"
         );
     }
 
@@ -3805,7 +3829,7 @@ mod tests {
 
         assert!(
             status.contains("403"),
-            "DNS rebinding: evil.localhost:8080 resolves to 169.254.169.254 — must block even though port 8080 is in allow_localhost_ports; got: {status}"
+            "DNS rebinding: evil.localhost:8080 resolves to 169.254.169.254 — must block even though port 8080 is in allow_localhost_ports; got: {status:?}"
         );
     }
 
@@ -3865,7 +3889,7 @@ mod tests {
         assert!(
             status.contains("403"),
             "corp.internal resolves to 10.0.0.1 (private) and is not allow-listed — \
-             the resolved-IP guard must block it with 403; got: {status}"
+             the resolved-IP guard must block it with 403; got: {status:?}"
         );
     }
 
@@ -3930,7 +3954,7 @@ mod tests {
         // flipped the decision.)
         assert!(
             !status.contains("403"),
-            "allow_private_domains must lift the private-IP block for corp.internal; got: {status}"
+            "allow_private_domains must lift the private-IP block for corp.internal; got: {status:?}"
         );
     }
 
@@ -3962,7 +3986,7 @@ mod tests {
 
         assert!(
             status.contains("200"),
-            "localhost:{port} with allow_localhost must succeed (resolves to 127.0.0.1); got: {status}"
+            "localhost:{port} with allow_localhost must succeed (resolves to 127.0.0.1); got: {status:?}"
         );
     }
 
@@ -3993,7 +4017,7 @@ mod tests {
 
         assert!(
             status.contains("403"),
-            "carve-out: evil.localhost:8080 resolving to a public IP must be blocked (resolved IP is not loopback); got: {status}"
+            "carve-out: evil.localhost:8080 resolving to a public IP must be blocked (resolved IP is not loopback); got: {status:?}"
         );
     }
 
@@ -4064,7 +4088,7 @@ mod tests {
         assert!(
             status.contains("200"),
             "lvh.me:443 resolving to loopback must be ALLOWED with --allow-localhost-any \
-             even though the name isn't literally 'localhost'; got: {status}"
+             even though the name isn't literally 'localhost'; got: {status:?}"
         );
     }
 
@@ -4091,7 +4115,7 @@ mod tests {
 
         assert!(
             status.contains("403"),
-            "lvh.me:443 resolving to loopback must be BLOCKED without any localhost opt-in; got: {status}"
+            "lvh.me:443 resolving to loopback must be BLOCKED without any localhost opt-in; got: {status:?}"
         );
     }
 
@@ -4120,7 +4144,7 @@ mod tests {
         assert!(
             status.contains("403"),
             "corp.internal → 10.0.0.5 (RFC1918, not allow-listed) must stay BLOCKED even with \
-             --allow-localhost-any; localhost opt-in must not open private networks; got: {status}"
+             --allow-localhost-any; localhost opt-in must not open private networks; got: {status:?}"
         );
     }
 
@@ -4484,7 +4508,7 @@ mod tests {
         reader.read_line(&mut status).unwrap();
         assert!(
             status.contains("200"),
-            "cplt should return 200 once upstream tunnel is up; got: {status}"
+            "cplt should return 200 once upstream tunnel is up; got: {status:?}"
         );
         // Consume cplt's response header terminator (blank line).
         let mut blank = String::new();
@@ -4528,7 +4552,7 @@ mod tests {
         let status = proxy_connect(proxy.port, "blocked.example.com:443");
         assert!(
             status.contains("403"),
-            "blocked domain must be rejected; got: {status}"
+            "blocked domain must be rejected; got: {status:?}"
         );
 
         // Give any (erroneous) upstream connect a chance to land, then assert
@@ -4656,7 +4680,7 @@ mod tests {
         let status = proxy_connect(proxy.port, "notallowed.example.com:443");
         assert!(
             status.contains("403"),
-            "domain not in allowlist must be rejected; got: {status}"
+            "domain not in allowlist must be rejected; got: {status:?}"
         );
 
         std::thread::sleep(Duration::from_millis(100));
@@ -4696,7 +4720,7 @@ mod tests {
         let status = proxy_connect(proxy.port, "example.com:22");
         assert!(
             status.contains("403"),
-            "disallowed port must be rejected; got: {status}"
+            "disallowed port must be rejected; got: {status:?}"
         );
 
         std::thread::sleep(Duration::from_millis(100));
@@ -4733,7 +4757,7 @@ mod tests {
         let status = proxy_connect(proxy.port, "example.com:443");
         assert!(
             status.contains("502"),
-            "upstream 403 refusal must surface as 502 to the client; got: {status}"
+            "upstream 403 refusal must surface as 502 to the client; got: {status:?}"
         );
 
         proxy.shutdown();
@@ -4760,7 +4784,7 @@ mod tests {
         let status = proxy_connect(proxy.port, "example.com:443");
         assert!(
             status.contains("502"),
-            "upstream closing early must surface as 502 to the client; got: {status}"
+            "upstream closing early must surface as 502 to the client; got: {status:?}"
         );
 
         proxy.shutdown();
@@ -4800,7 +4824,7 @@ mod tests {
         let status = proxy_connect(proxy.port, "evil.example.com:443");
         assert!(
             status.contains("403"),
-            "public name resolving to a private IP must be blocked; got: {status}"
+            "public name resolving to a private IP must be blocked; got: {status:?}"
         );
 
         std::thread::sleep(Duration::from_millis(100));
@@ -5108,7 +5132,7 @@ mod tests {
         let status = proxy_connect(proxy.port, "blocked.example.com:443");
         assert!(
             status.contains("403"),
-            "a blocklisted no-proxy host must still be 403; got: {status}"
+            "a blocklisted no-proxy host must still be 403; got: {status:?}"
         );
 
         std::thread::sleep(Duration::from_millis(100));
@@ -5163,7 +5187,7 @@ mod tests {
         assert!(
             status.contains("403"),
             "a no-proxy host resolving to a private IP without allow_private_domains \
-             must be 403; got: {status}"
+             must be 403; got: {status:?}"
         );
 
         std::thread::sleep(Duration::from_millis(100));
