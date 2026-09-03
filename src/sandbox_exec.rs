@@ -239,51 +239,44 @@ fn configure_command(
     }
 }
 
-/// Locate a `gh` binary that is safe to run *unsandboxed* in a project dir.
+/// `gh`, resolved from [`crate::git::TRUSTED_BIN_DIRS`], warning once when the
+/// only `gh` on this machine is somewhere else.
 ///
-/// Callers spawn `gh` as the user, outside the sandbox — token pre-extraction
-/// before the agent starts, or the `cplt doctor` auth probe — so a `gh` planted
-/// by hostile repo content must never be the one that runs. A bare
-/// `Command::new("gh")` does an OS `PATH` lookup that would happily pick up
-/// `./bin/gh`, `node_modules/.bin/gh`, or anything reachable through a relative
-/// `PATH` entry (`.`, `bin`, an empty segment). Instead we walk `PATH` ourselves
-/// and accept only a directory that is absolute and outside the project tree,
-/// and only a `gh` whose symlink-resolved target is also outside it.
+/// Before the trusted-lookup change, `gh` came off `PATH`, so an installation in
+/// `~/.local/bin` or a mise shim worked. It no longer does — correctly, since a
+/// planted `gh` hands the agent both unsandboxed execution and a channel into
+/// the next agent's environment. But the failure is invisible: no token is
+/// injected, and the user sees Copilot's GitHub API calls fail with nothing
+/// pointing at cplt. A `gh` that exists on `PATH` and is not trusted is the one
+/// case worth a line on stderr.
 ///
-/// Returns `None` when nothing qualifies; the caller then behaves exactly as if
-/// `gh` were not installed (token extraction falls back to Keychain under
-/// `auto`, or fails closed under `env_only` / `gh_only`).
-pub(crate) fn resolve_trusted_gh(project_dir: &Path) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    let project_canon =
-        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
-
-    for dir in std::env::split_paths(&path_var) {
-        // Skip empty segments (POSIX-equivalent to the cwd) and any relative
-        // entry — both let repo content decide what `gh` resolves to.
-        if dir.as_os_str().is_empty() || !dir.is_absolute() {
-            continue;
-        }
-        let dir_canon = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        if dir_canon.starts_with(&project_canon) {
-            continue;
-        }
-        let candidate = dir.join("gh");
-        if !candidate.is_file() {
-            continue;
-        }
-        // A trusted-looking dir may still hold a symlink into the repo.
-        let target = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-        if target.starts_with(&project_canon) {
-            continue;
-        }
-        return Some(candidate);
+/// Warned once per process: both token paths call this, and two identical
+/// warnings at launch read like two different problems.
+pub(crate) fn trusted_gh() -> Option<PathBuf> {
+    if let Some(gh) = crate::git::trusted_binary("gh") {
+        return Some(gh);
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if let Some(untrusted) = which_binary("gh") {
+        WARNED.call_once(|| {
+            ui::warn(&format!(
+                "gh is installed at {} — outside the directories cplt trusts for \
+                 unsandboxed helpers ({}).\n  \
+                 The GitHub token is NOT injected, so the agent's GitHub API calls \
+                 will fail. cplt runs `gh auth token` as you, outside the sandbox, \
+                 so it will not run a `gh` a previous session could have replaced.\n  \
+                 Install gh into one of those directories (`brew install gh`, or your \
+                 distro's package), or export GH_TOKEN yourself before launching.",
+                untrusted.display(),
+                crate::git::TRUSTED_BIN_DIRS.join(", ")
+            ));
+        });
     }
     None
 }
 
-fn extract_gh_token_from_cli(project_dir: &Path) -> Option<String> {
-    let gh = resolve_trusted_gh(project_dir)?;
+fn extract_gh_token_from_cli() -> Option<String> {
+    let gh = trusted_gh()?;
     let mut cmd = std::process::Command::new(&gh);
     // Pin the host: with several hosts logged in (github.com plus a GHES
     // instance) a bare `gh auth token` resolves against the *active* host, so
@@ -390,12 +383,12 @@ fn extract_gh_token_from_command(
     if token.is_empty() { None } else { Some(token) }
 }
 
-fn resolve_gh_token_from_cli_if_needed(agent: Agent, project_dir: &Path) -> Option<String> {
+fn resolve_gh_token_from_cli_if_needed(agent: Agent) -> Option<String> {
     if agent != Agent::Copilot {
         return None;
     }
 
-    extract_gh_token_from_cli(project_dir)
+    extract_gh_token_from_cli()
 }
 
 fn evaluate_exec_github_token_presence(
@@ -463,7 +456,7 @@ pub fn resolve_gh_token_for_exec(
         has_effective_env_token,
         needs_runtime_gh_token,
         agent,
-        |agent| resolve_gh_token_from_cli_if_needed(agent, project_dir),
+        |agent| resolve_gh_token_from_cli_if_needed(agent),
     )
 }
 
@@ -570,8 +563,12 @@ fn install_command_wrappers(
         && let Some(real_gh) = which_binary("gh")
     {
         let repo_scope = if gh_guard.scope_check {
-            if let Some(real_git) = which_binary("git") {
-                match crate::gh_proxy::detect_current_repo(&real_git, project_dir) {
+            // Trusted, not PATH: this git runs in the UNSANDBOXED parent, at
+            // launch. A `git` the previous session planted in ~/.bun/bin (or any
+            // other write+exec grant on PATH) would otherwise execute as the
+            // user here, one session later.
+            if let Some(real_git) = crate::git::trusted_git() {
+                match crate::gh_proxy::detect_current_repo(real_git, project_dir) {
                     Ok(repo) => Some(repo),
                     Err(reason) => {
                         ui::warn(&format!(
@@ -605,8 +602,14 @@ fn install_command_wrappers(
     }
 
     // Install git guard wrapper (only if git_guard enabled)
+    // Trusted first, then PATH — the same call the gh wrapper above makes. The
+    // wrapper's real_git runs INSIDE the sandbox, never in the parent, so a
+    // planted git there gains the agent nothing it does not already have.
+    // Requiring a trusted git removed the guard outright on mise/asdf/nix hosts.
     if git_guard.enabled
-        && let Some(real_git) = which_binary("git")
+        && let Some(real_git) = crate::git::trusted_git()
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| which_binary("git"))
     {
         let script = crate::gh_proxy::generate_git_wrapper_script(
             &real_git.to_string_lossy(),
@@ -1399,45 +1402,6 @@ mod tests {
             false,
             &[],
         ));
-    }
-
-    #[test]
-    fn resolve_trusted_gh_rejects_gh_inside_project_dir() {
-        let project = exec_tempdir(".cplt-trusted-gh-project-");
-        let bin = project.path().join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let gh = bin.join("gh");
-        fs::write(&gh, "#!/bin/sh\necho pwned\n").unwrap();
-        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
-
-        temp_env::with_var("PATH", Some(bin.as_os_str()), || {
-            assert_eq!(super::resolve_trusted_gh(project.path()), None);
-        });
-    }
-
-    #[test]
-    fn resolve_trusted_gh_rejects_relative_and_empty_path_entries() {
-        let project = exec_tempdir(".cplt-trusted-gh-rel-");
-        // `.`, a bare `bin`, and the empty segment are all repo-influenced.
-        temp_env::with_var("PATH", Some(".:bin:"), || {
-            assert_eq!(super::resolve_trusted_gh(project.path()), None);
-        });
-    }
-
-    #[test]
-    fn resolve_trusted_gh_accepts_absolute_dir_outside_project() {
-        let project = exec_tempdir(".cplt-trusted-gh-ok-project-");
-        let trusted = exec_tempdir(".cplt-trusted-gh-ok-bin-");
-        let gh = trusted.path().join("gh");
-        fs::write(&gh, "#!/bin/sh\ntrue\n").unwrap();
-        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
-
-        temp_env::with_var("PATH", Some(trusted.path().as_os_str()), || {
-            assert_eq!(
-                super::resolve_trusted_gh(project.path()).as_deref(),
-                Some(gh.as_path())
-            );
-        });
     }
 
     #[test]
