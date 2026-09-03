@@ -1551,8 +1551,13 @@ fn arg_reveals_token(arg: &str) -> bool {
 
 /// Evaluate a full command and return a human-friendly verdict.
 ///
-/// This is the entry point used by the `gh-gate` subcommand.
-/// Returns the verified repository scope when allowed, or an error when blocked.
+/// Used by `cplt check` (`check.rs`), which explains what the guard would do.
+/// The `gh-gate` subcommand does not come through here: it has the startup
+/// scope captured before launch and calls `gate_with_repo_scope` instead.
+///
+/// Returns the repository scope when one could be resolved, or an error when
+/// the command is blocked. An allowed decision does not imply a scope — a
+/// command that needs none is allowed without resolving one.
 pub fn gate(
     args: &[&str],
     project_dir: &Path,
