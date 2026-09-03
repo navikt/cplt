@@ -117,7 +117,7 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 
 | Tier | Behavior | Examples |
 |------|----------|----------|
-| **Allow** | Read-only; repo-scoped reads must still be invoked from the startup repo | `pr list`, `issue view`, `run list`, `search` |
+| **Allow** | Read-only; repo-scoped reads resolve against the startup repo, and an unverifiable cwd is pinned there rather than refused | `pr list`, `issue view`, `run list`, `search` |
 | **ScopeCheck** | Permitted only for the startup repo; implicit targets must resolve there from cwd | `pr create`, `issue comment`, `pr close` |
 | **Block** | Never permitted | `repo delete`, `pr merge`, `release create`, `workflow run` |
 | **Unknown** | Not in the policy table, blocked by default | anything GitHub adds to `gh` after the table was last updated |

@@ -391,27 +391,11 @@ fn gh_gate_rejects_nested_repo_retargeting() {
 
 #[test]
 fn gh_gate_blocks_implicit_repo_scope_from_sibling_repo() {
-    let startup_repo = tempfile::tempdir().unwrap();
-    let sibling_repo = tempfile::tempdir().unwrap();
+    // Only the sibling is needed: the startup scope reaches gh-gate through
+    // --repo-scope, not through a directory, so a second repo on disk was
+    // setup nothing read.
+    let sibling_repo = temp_repo("evil-org/other-repo");
     let git = binary_in_path("git");
-
-    let init_repo = |dir: &std::path::Path, remote: &str| {
-        let remote_url = format!("https://github.com/{remote}.git");
-        let run_git = |args: &[&str]| {
-            Command::new(&git)
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .status()
-                .expect("git should run")
-        };
-        assert!(run_git(&["init", "--quiet"]).success());
-        assert!(run_git(&["remote", "add", "origin", &remote_url]).success());
-    };
-
-    init_repo(startup_repo.path(), "navikt/cplt");
-    init_repo(sibling_repo.path(), "evil-org/other-repo");
 
     let output = Command::new(binary_path())
         .arg("gh-gate")
@@ -1609,7 +1593,7 @@ mod sandbox_integration {
         let git_bin = binary_in_path("git");
         let git_str = git_bin.to_string_lossy();
         let wrapper_content = format!(
-            "#!/bin/sh\nexec {cplt_str} gh-gate --real-gh /usr/bin/true --real-git '{git_str}' --repo-scope navikt/cplt --mode=block --scope-check --block-auth-token --unknown-command=block -- \"$@\"\n"
+            "#!/bin/sh\nexec '{cplt_str}' gh-gate --real-gh /usr/bin/true --real-git '{git_str}' --repo-scope navikt/cplt --mode=block --scope-check --block-auth-token --unknown-command=block -- \"$@\"\n"
         );
         let bin_dir = tmp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
