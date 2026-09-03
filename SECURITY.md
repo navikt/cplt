@@ -23,7 +23,7 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
 - **Copilot env vars are suppressed.** `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, and every `COPILOT_*` variable are stripped for OpenCode, Gemini, Antigravity, Pi, Claude Code, and goose. OpenCode's Copilot provider uses its own auth file instead.
 - **Third-party API keys are opt-in.** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), and the Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`) are never passed through by default. You have to name each one with `--pass-env`. That keeps credentials from reaching a sandboxed process by accident.
 
-- **Host-persistence guard on the agent's own config dir.** Every agent gets its global config dir mounted read/write, and some files in there auto-execute the next time the agent runs *outside* the sandbox. Those paths are write-denied (`Agent::host_persistence_denies`):
+- **Host-persistence guard on the agent's own config dir.** Most agents get their global config dir mounted read/write, and some files in there auto-execute the next time the agent runs *outside* the sandbox. goose is the exception: its config dir is read-only, because it rewrites `config.yaml` by rename, which needs directory write and would hand back the whole vector. Those paths are write-denied (`Agent::host_persistence_denies`):
 
   | Agent | Denied inside the granted config dir |
   | --- | --- |

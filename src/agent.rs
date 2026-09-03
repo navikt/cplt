@@ -283,6 +283,10 @@ impl Agent {
                 // `--resume=ID` wins over `--name`.
                 let resuming = resume.is_some() || continue_session;
                 let selector = resume.filter(|s| !s.is_empty());
+                // Same emptiness filter as `selector` above: `--name ""` is not
+                // a session goose can select, and emitting it would turn a bare
+                // run into a rejected `session --name ""`.
+                let session_name = session_name.filter(|s| !s.is_empty());
                 if resuming || session_name.is_some() {
                     args.push("session".to_string());
                 }
@@ -2449,6 +2453,24 @@ mod tests {
                     assert!(!d.process_exec && !d.map_exec);
                 }
             },
+        );
+    }
+
+    /// `--name ""` is not a session goose can select. Without the emptiness
+    /// filter it emits `session --name ""`, turning a bare run into one goose
+    /// rejects. `--resume=""` is already filtered the same way.
+    #[test]
+    fn goose_ignores_an_empty_session_name() {
+        assert!(
+            Agent::Goose
+                .session_args(None, false, Some(""), false)
+                .is_empty(),
+            "an empty --name must not produce a session subcommand"
+        );
+        assert_eq!(
+            Agent::Goose.session_args(None, false, Some("work"), false),
+            vec!["session", "--name", "work"],
+            "a real name still selects by name"
         );
     }
 

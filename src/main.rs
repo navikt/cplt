@@ -579,7 +579,7 @@ grants exec to every binary cached by any application. Prefer
     resume: Option<String>,
 
     /// Resume the most recent session in this directory.
-    /// Supported for Copilot, OpenCode, and Antigravity (--continue).
+    /// Supported for Copilot, OpenCode, Antigravity and goose (--continue).
     /// Ignored for other agents.
     #[arg(long = "continue", conflicts_with = "resume")]
     continue_session: bool,
@@ -590,8 +590,10 @@ grants exec to every binary cached by any application. Prefer
     #[arg(long)]
     remote: bool,
 
-    /// Name the Copilot session for later resumption with --resume=NAME.
-    /// Copilot-only (ignored for other agents).
+    /// Name the session for later resumption with --resume=NAME.
+    /// Copilot and goose (goose maps it to `session --name`); ignored for
+    /// other agents. An explicit --resume=ID wins over --name for goose,
+    /// which treats them as alternative selectors.
     #[arg(long = "name", value_name = "SESSION")]
     session_name: Option<String>,
 
