@@ -450,13 +450,12 @@ pub fn resolve_gh_token_for_exec(
     has_effective_env_token: bool,
     needs_runtime_gh_token: bool,
     agent: Agent,
-    project_dir: &Path,
 ) -> Option<String> {
     resolve_gh_token_for_exec_with_resolver(
         has_effective_env_token,
         needs_runtime_gh_token,
         agent,
-        |agent| resolve_gh_token_from_cli_if_needed(agent),
+        resolve_gh_token_from_cli_if_needed,
     )
 }
 

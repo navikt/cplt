@@ -2752,7 +2752,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         has_env_token_for_resolution,
         auth_plan.needs_runtime_gh_token,
         active_agent,
-        &project_dir,
     );
     // A classic PAT does not count as a credential here: Copilot refuses `ghp_`
     // tokens outright, so trading the Keychain grant away for one would launch
