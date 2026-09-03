@@ -6,7 +6,7 @@
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-**Kernel-enforced sandbox for AI coding agents.** cplt wraps GitHub Copilot CLI, OpenCode, Antigravity CLI, Pi, Claude Code, or any shell, so the agent can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
+**Kernel-enforced sandbox for AI coding agents.** cplt wraps GitHub Copilot CLI, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, goose, or any shell, so the agent can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
 - **Linux**: Landlock LSM + seccomp-BPF + optional Bubblewrap namespace isolation (kernel 5.13+, full network filtering on 6.7+)
@@ -135,7 +135,7 @@ For the full security model, threat analysis, and test strategy, read [SECURITY.
 | Environment handling | Allowlist plus hardening env injection | More basic pass-through model |
 | Secret file protection | Deny patterns such as `.env*`, `.pem`, `.key` inside the repo | Primarily directory-scoped access |
 | Repo policy | [`.cplt.toml`](docs/configuration.md#per-repo-configuration-cplttoml) with an explicit trust/approval flow | No repo-level policy file |
-| Agent support | Copilot, OpenCode, Antigravity CLI, Pi, Claude Code, or shell | Codex only |
+| Agent support | Copilot, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, goose, or shell | Codex only |
 
 cplt is not stronger everywhere. Codex CLI has Linux namespace isolation today, and it already exposes explicit sandbox modes such as read-only and workspace-write. cplt does not yet have that mode matrix.
 
@@ -174,7 +174,7 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
 | SSH git | Blocked at kernel on macOS (agent socket denied); on Linux only `SSH_AUTH_SOCK` is withheld | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`) | Not blocked |
-| Agent support | Copilot, OpenCode, Antigravity, Pi, Claude Code, Shell | Claude Code |
+| Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, goose, Shell | Claude Code |
 | Config | TOML (global + per-repo) | JSON (global only) + `--control-fd` live updates |
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |
 
@@ -362,7 +362,7 @@ Same pattern mise, direnv, and starship use.
 cplt [OPTIONS] [-- <AGENT_ARGS>...]
 ```
 
-Everything after `--` goes straight to the agent process (copilot, opencode, antigravity, pi, claude, or shell).
+Everything after `--` goes straight to the agent process (copilot, opencode, gemini, antigravity, pi, claude, goose, or shell).
 
 ### Policy presets
 
@@ -524,6 +524,34 @@ Pick one with `--agent <name>`, or make it the default with `cplt config set san
 - OpenCode is [an officially supported Copilot client](https://github.blog/changelog/2026-01-16-github-copilot-now-supports-opencode/), so your existing Copilot subscription works with `/connect` inside OpenCode.
 
 Per-agent config dirs, Keychain use, exec permissions, and env isolation are in [SECURITY.md](SECURITY.md#supported-agents).
+
+### goose support
+
+cplt can sandbox [goose](https://github.com/aaif-goose/goose), the open-source AI agent (binary `goose`). Verified against goose 1.48.0.
+
+```bash
+# Run goose (must be explicit — not auto-detected)
+cplt --agent goose
+
+# goose is provider-agnostic — pass your provider's API key
+cplt --agent goose --pass-env ANTHROPIC_API_KEY
+cplt --agent goose --pass-env OPENAI_API_KEY
+
+# Skip the keyring entirely: keep the key in the environment
+GOOSE_DISABLE_KEYRING=1 cplt --agent goose --pass-env OPENAI_API_KEY --pass-env GOOSE_DISABLE_KEYRING
+
+# Set goose as your default agent
+cplt config set sandbox.agent goose
+```
+
+**Security notes for goose:**
+- **Not auto-detected**: select explicitly with `--agent goose` or set `sandbox.agent = "goose"` in config
+- **Provider-agnostic**: goose routes model traffic to a user-configured provider (Anthropic, OpenAI, Google, Databricks, OpenRouter, …). Common provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`, `GOOGLE_API_KEY`, `DATABRICKS_HOST`/`DATABRICKS_TOKEN`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`) are recognized auth hints and must be passed via `--pass-env`. goose reads `GOOGLE_API_KEY`, not `GEMINI_API_KEY`. Any provider outside this subset still works: name its variable with `--pass-env`
+- **No default domains**: goose contacted no host of its own in an `--observe-domains` capture, so its built-in allowlist is the shared package-registry base only. Add your provider's domain via `allowed_domains` before enabling `--default-allowlist`
+- **Keychain is granted, and you can avoid it**: goose stores provider secrets in the macOS login Keychain by default, so cplt grants it — but that grant is broader than goose's own entry ([#242](https://github.com/navikt/cplt/issues/242)). `GOOSE_DISABLE_KEYRING=1` makes goose use a `secrets.yaml` in its config dir instead, and passing the key with `--pass-env` avoids stored secrets altogether. On Linux goose uses the D-Bus Secret Service, which the Keychain grant does not affect
+- **Config dir is read-only**: `~/.config/goose/config.yaml` declares `extensions:` entries whose `cmd` goose spawns on every session start, so a writable config dir is a host-persistence vector. Normal sessions do not write it; `/mode` changes and persisted tool permissions do not survive a sandboxed run. Reconfigure with `goose configure` outside cplt
+- goose's data (`~/.local/share/goose/`) and state (`~/.local/state/goose/`) dirs are writable, with exec denied. goose uses these XDG paths on macOS too, and honours the `XDG_*` overrides there
+- `--continue` and bare `--resume` map to `goose session --resume`; `--resume=ID` to `goose session --resume --session-id ID`; `--name X` to `goose session --name X`. These are subcommand flags, so cplt injects the `session` subcommand with them. `--remote` is ignored (no goose equivalent)
 
 ### Shell mode
 
