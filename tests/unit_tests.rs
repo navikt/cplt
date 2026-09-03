@@ -7143,6 +7143,16 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
         p.contains(r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#),
         "mach-register must be anchored with ^...$ and scoped to org.chromium.*"
     );
+    // #263: the browser Playwright actually downloads is Chrome for Testing,
+    // which registers under its own bundle ID. Without this the launch dies on
+    // `bootstrap_check_in ... MachPortRendezvousServer: Permission denied (1100)`
+    // even with --allow-cache-exec ms-playwright.
+    assert!(
+        p.contains(
+            r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\..+$"))"#
+        ),
+        "Chrome for Testing registers under com.google.chrome.for.testing.*, not org.chromium.*"
+    );
     assert!(
         p.contains(r#"(regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")"#),
         "SingletonSocket regex must use [^/]+/[^/]+ for var/folders segments and be fully anchored"
@@ -7247,6 +7257,12 @@ fn chromium_runtime_rules_absent_by_default() {
     assert!(
         !p.contains("SingletonSocket"),
         "SingletonSocket rules must not be emitted by default"
+    );
+    // The Chrome for Testing namespace is behind the same opt-in as the rest of
+    // the browser runtime — widening it for #263 must not widen the default.
+    assert!(
+        !p.contains("mach-register"),
+        "no mach-register namespace may be granted by default"
     );
 }
 

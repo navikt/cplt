@@ -506,8 +506,12 @@ fn emit_system_access(
     //    user clients during renderer init, even in headless mode (SwiftShader
     //    fallback still queries IOKit before deciding to use software rendering).
     //
-    // 4. mach-register — Chromium registers Mach services under the org.chromium.*
-    //    namespace for IPC between browser, renderer, GPU, and Crashpad processes.
+    // 4. mach-register — Chromium registers Mach services for IPC between
+    //    browser, renderer, GPU, and Crashpad processes. The namespace is the
+    //    build's bundle ID, not a fixed string: an upstream Chromium build uses
+    //    org.chromium.*, while the Chrome for Testing build Playwright actually
+    //    downloads uses com.google.chrome.for.testing.* (#263). Both are
+    //    allowed; anything else still cannot register.
     //    Crashpad's child_port_handshake uses bootstrap_check_in() which requires
     //    this permission; without it, EPERM (1100) cascades into a segfault.
     //    Scoped to ^org\.chromium\..+$ — the trailing \. prevents matching
@@ -522,8 +526,8 @@ fn emit_system_access(
     // iokit-open-user-client is unscoped because IOKit class names vary by GPU
     // hardware and macOS version; scoping would break on different machines.
     // system-socket is scoped to AF_UNIX — only Unix domain sockets, not TCP/UDP.
-    // mach-register is scoped to ^org\.chromium\..+$ to prevent registration
-    // of arbitrary global Mach services.
+    // mach-register is scoped to the two known browser namespaces to prevent
+    // registration of arbitrary global Mach services.
     if allow_chromium_runtime {
         sbpl!(
             sb,
@@ -532,9 +536,19 @@ fn emit_system_access(
         sbpl!(sb, "(allow syscall*)");
         sbpl!(sb, "(allow system-socket (socket-domain AF_UNIX))");
         sbpl!(sb, "(allow iokit-open-user-client)");
+        // Two alternations rather than one loose pattern: each anchors the
+        // literal namespace and requires at least one character after the dot,
+        // so neither "org.chromiumevil" nor "com.google.chrome.for.testingX"
+        // matches. Chromium uses variable-depth subnamespaces (crashpad.*,
+        // Chromium.*) and Chrome for Testing appends a pid to
+        // MachPortRendezvousServer, so the tail stays open.
         sbpl!(
             sb,
             r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#
+        );
+        sbpl!(
+            sb,
+            r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\..+$"))"#
         );
         sbpl!(sb);
     }
