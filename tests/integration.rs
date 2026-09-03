@@ -457,11 +457,13 @@ mod macos_tests {
         // and yields two non-empty halves.
         let (head, tail) = token.split_at(token.len() / 2);
         let url = format!(
-            "data:text/html,<html><body><div id=cplt-probe></div><script>\
-             const e=document.getElementById('cplt-probe');\
-             e.textContent='{head}'+'{tail}';e.dataset.cpltReady='yes'\
-             </script>\
-             </body></html>"
+            concat!(
+                "data:text/html,<html><body><div id=cplt-probe></div><script>",
+                "const e=document.getElementById('cplt-probe');",
+                "e.textContent='{}'+'{}';e.dataset.cpltReady='yes'",
+                "</script></body></html>"
+            ),
+            head, tail
         );
         assert!(
             !url.contains(token),
@@ -535,8 +537,16 @@ mod macos_tests {
         }
 
         fn terminate_and_reap(&mut self) -> Result<String, String> {
+            if self.status.is_some() {
+                self.cleaned_up = true;
+                return Ok(
+                    "Chrome child was already reaped; process group was not signaled".to_string(),
+                );
+            }
+
             // SAFETY: The child was placed in its own process group, and killpg
-            // does not dereference pointers. The group ID is the child's PID.
+            // does not dereference pointers. The group ID is the child's PID,
+            // which cannot be reused while the child remains unreaped.
             let kill_result = unsafe { libc::killpg(self.process_group, libc::SIGKILL) };
             let kill_error = (kill_result == -1)
                 .then(std::io::Error::last_os_error)
@@ -552,6 +562,7 @@ mod macos_tests {
                         .map_err(|error| format!("failed to reap Chrome child: {error}"))?,
                 );
             }
+            self.cleaned_up = true;
 
             if let Some(error) = kill_error {
                 return Err(format!(
@@ -559,7 +570,6 @@ mod macos_tests {
                 ));
             }
 
-            self.cleaned_up = true;
             Ok(format!(
                 "sent SIGKILL to process group {} and reaped the child",
                 self.process_group
@@ -608,15 +618,27 @@ mod macos_tests {
                 return;
             }
 
+            match self.try_wait() {
+                Ok(Some(_)) => {
+                    self.cleaned_up = true;
+                    return;
+                }
+                Ok(None) => {}
+                Err(_) => return,
+            }
+
             // SAFETY: See terminate_and_reap. Drop is the last-resort cleanup
             // path for an unexpected panic while the browser probe is running.
+            // try_wait above established that the child is still running, so its
+            // process-group ID cannot have been reaped and reused.
             let kill_result = unsafe { libc::killpg(self.process_group, libc::SIGKILL) };
-            if kill_result == -1 && self.status.is_none() {
+            if kill_result == -1 && matches!(self.try_wait(), Ok(None)) {
                 let _ = self.child.kill();
             }
             if self.status.is_none() {
                 let _ = self.child.wait();
             }
+            self.cleaned_up = true;
         }
     }
 
@@ -715,17 +737,26 @@ mod macos_tests {
                             serde_json::from_slice(&output.stdout).map_err(|error| {
                                 format!("Chrome returned invalid /json/list JSON: {error}")
                             })?;
-                        let websocket_url = targets
+                        let initial_page = targets
                             .as_array()
                             .into_iter()
                             .flatten()
                             .find(|target| {
                                 target.get("type").and_then(Value::as_str) == Some("page")
+                                    && target.get("url").and_then(Value::as_str)
+                                        == Some("about:blank")
                             })
-                            .and_then(|target| target.get("webSocketDebuggerUrl"))
+                            .ok_or_else(|| {
+                                "Chrome /json/list had no initial about:blank page target"
+                                    .to_string()
+                            })?;
+                        let websocket_url = initial_page
+                            .get("webSocketDebuggerUrl")
                             .and_then(Value::as_str)
                             .ok_or_else(|| {
-                                "Chrome /json/list had no page webSocketDebuggerUrl".to_string()
+                                "Chrome's initial about:blank page target had no \
+                                 webSocketDebuggerUrl"
+                                    .to_string()
                             })?
                             .to_string();
                         let expected_prefix = format!("ws://127.0.0.1:{port}/");
@@ -1035,15 +1066,18 @@ mod macos_tests {
         let control_data_dir = tempfile::tempdir().expect("create control browser state");
         let control_token = unique_render_token();
         let control_url = render_probe_document(&control_token);
-        eprintln!("chrome-for-testing stage: unsandboxed control");
+        eprintln!(
+            "chrome-for-testing stage: direct control \
+             (Chromium sandbox enabled, no cplt Seatbelt)"
+        );
         run_chrome_probe(
-            "unsandboxed Chrome for Testing control",
+            "direct Chrome for Testing control (Chromium sandbox enabled, no cplt Seatbelt)",
             Command::new(&chrome).args(chrome_probe_args(control_data_dir.path())),
             control_data_dir.path(),
             &control_url,
             &control_token,
         );
-        eprintln!("chrome-for-testing stage: unsandboxed control ready");
+        eprintln!("chrome-for-testing stage: direct control ready");
 
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
@@ -1064,6 +1098,7 @@ mod macos_tests {
                 .arg("-f")
                 .arg(profile.as_os_str())
                 .arg(&chrome)
+                .arg("--no-sandbox")
                 .args(chrome_probe_args(sandbox_data_dir.path())),
             sandbox_data_dir.path(),
             &sandbox_url,

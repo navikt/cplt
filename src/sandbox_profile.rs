@@ -131,10 +131,11 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     // Detect Chromium browser runtime: the user has opted in to executing
     // Playwright's Chromium binaries from ~/Library/Caches/ via allow_cache_exec.
     // When true, extra system-level permissions (syscall*, system-socket,
-    // iokit-open-user-client, mach-register) are emitted so Chromium can start.
+    // iokit-open-user-client, mach-register) are emitted for Chromium startup.
+    // The caller must separately disable Chromium's nested OS sandbox on macOS.
     //
     // Detection matches "ms-playwright" exactly or any subpath entry whose first
-    // component is "ms-playwright" (e.g. "ms-playwright/chromium-1217"). This
+    // component is "ms-playwright" (e.g. "ms-playwright/chromium-<version>"). This
     // covers users who pin a specific versioned subdirectory in allow_cache_exec.
     // Substring matching (e.g. contains("playwright")) is intentionally avoided:
     // matching on the first path component prevents a rogue agent from escalating
@@ -533,6 +534,11 @@ fn emit_system_access(
     // mach-register is limited to the anchored org.chromium.* namespace and the
     // two exact Chrome for Testing namespaces and suffix formats above,
     // preventing registration of arbitrary global Mach services.
+    // Chrome helpers inherit cplt's Seatbelt profile and cannot reinitialize
+    // Seatbelt inside it (`forbidden-sandbox-reinit`). The caller must launch
+    // Chrome with its nested OS sandbox disabled; cplt does not rewrite child
+    // arguments. cplt remains the outer enforcing boundary, but a compromised
+    // renderer then receives this complete opt-in Chromium profile.
     if allow_chromium_runtime {
         sbpl!(
             sb,

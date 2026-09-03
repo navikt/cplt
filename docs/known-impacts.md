@@ -120,7 +120,7 @@ Some tools unpack and execute binaries straight out of `~/Library/Caches` (macOS
 
 | Tool | Cache path | Fix |
 |---|---|---|
-| Playwright (browsers) | `~/Library/Caches/ms-playwright/` · `~/.cache/ms-playwright/` | `--allow-cache-exec ms-playwright` |
+| Playwright Chromium | `~/Library/Caches/ms-playwright/` · `~/.cache/ms-playwright/` | Allow cache exec and disable Chromium's nested sandbox; see below |
 | pnpm dlx | `~/Library/Caches/pnpm/dlx/` · `~/.cache/pnpm/dlx/` | `--allow-cache-exec pnpm/dlx` |
 
 **Fix:**
@@ -134,12 +134,18 @@ Or for a single run: `cplt --allow-cache-exec ms-playwright --allow-cache-exec p
 
 `--allow-cache-exec-any` opens exec for the entire cache tree (`~/Library/Caches` on macOS, `~/.cache` on Linux). Last resort only.
 
-> **Playwright on Linux:** also run Chromium with its own sandbox disabled
-> (`chromiumSandbox: false`, or launch with `--no-sandbox`). cplt's seccomp filter
-> blocks the `unshare`/`setns` syscalls Chromium's nested namespace sandbox needs,
-> and cplt's Landlock + seccomp is the enforcing boundary, so the nested sandbox is
-> redundant. The cache-exec subdir is validated to be traversal-free before a
-> Landlock execute rule is granted.
+> **Playwright Chromium on macOS and Linux:** also launch with `--no-sandbox`,
+> or set Playwright `chromiumSandbox: false`. On macOS, Chrome helpers inherit
+> cplt's profile and cannot initialize another Seatbelt sandbox
+> (`forbidden-sandbox-reinit`). On Linux, cplt's seccomp filter blocks the
+> `unshare`/`setns` syscalls used by Chromium's nested namespace sandbox. cplt
+> remains the enforcing kernel boundary on both platforms. Launching Chromium
+> with its sandbox disabled means a compromised renderer receives the full cplt
+> Playwright profile instead of Chromium's narrower child profile; cache opt-in
+> alone does not disable Chromium's sandbox, and cplt does not inject either
+> setting. cplt still validates the cache-exec subdir as traversal-free before
+> Landlock grants execute access. See
+> [SECURITY.md](../SECURITY.md#out-of-scope).
 
 ## Localhost blocking
 
