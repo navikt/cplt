@@ -1060,6 +1060,13 @@ fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
     if meta.is_dir() {
         return std::fs::canonicalize(&dot_git).ok().or(Some(dot_git));
     }
+    // Regular file only. `read_to_string` opens O_RDONLY, which blocks forever
+    // on a FIFO with no writer — an agent that can write `<root>/.git` could
+    // otherwise `mkfifo` it and hang the next launch before the sandbox exists.
+    // Real git checks the same thing and exits rather than blocking.
+    if !meta.is_file() {
+        return None;
+    }
     let contents = std::fs::read_to_string(&dot_git).ok()?;
     let pointer = contents
         .lines()
@@ -1520,6 +1527,31 @@ mod tests {
             git_dir_of_with(None, &proj).as_deref(),
             Some(proj.join(".git").as_path()),
             "no trusted git must fall back to reading .git, not fail open"
+        );
+    }
+
+    /// `read_to_string` on a FIFO blocks forever with no writer. An agent that
+    /// can write `<root>/.git` could `mkfifo` it and hang the next launch
+    /// before the sandbox exists. Real git exits rather than blocking.
+    #[test]
+    fn gitdir_without_git_refuses_a_non_regular_dot_git() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        let fifo = proj.join(".git");
+
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return; // no mkfifo on this machine — nothing to assert
+        }
+        assert_eq!(
+            gitdir_without_git(&proj),
+            None,
+            "a FIFO .git must be refused, not read"
         );
     }
 

@@ -751,7 +751,13 @@ impl Resolved {
     pub fn write_grants_over_trusted_bins(&self) -> Vec<(PathBuf, Vec<String>)> {
         // Resolution is filesystem-only (no spawn), so this is safe to do while
         // building the warning. `None` for a binary that is not installed.
-        let resolved: Vec<String> = ["git", "gh", "bwrap"]
+        // Every helper the unsandboxed parent resolves this way and then
+        // spawns. `mise`/`asdf` matter as much as git: `resolve_mise_shim`
+        // runs them in the parent, and the warning text names mise explicitly,
+        // so leaving them out promises coverage the check does not deliver.
+        // `sandbox-exec` is absent deliberately — it is the fixed
+        // /usr/bin/sandbox-exec, never resolved.
+        let resolved: Vec<String> = ["git", "gh", "bwrap", "mise", "asdf"]
             .iter()
             .filter_map(|n| crate::git::trusted_binary(n))
             .map(|p| {
