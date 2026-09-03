@@ -22,6 +22,14 @@
 //! That is a straight sandbox escape, and for [`crate::repo_config`] it is
 //! worse still: those invocations are the input to the trust decision.
 //!
+//! The repository's config is not the only thing an agent can aim at these
+//! invocations. The *binary* is the other one: any program looked up by name is
+//! resolved from the parent's `PATH` at spawn time, after the agent has
+//! finished writing to directories that are on it. [`TRUSTED_BIN_DIRS`] and
+//! [`trusted_binary`] are the answer, and are used for every parent-side spawn
+//! in cplt, not only git's — this module is where the reasoning lives, so it is
+//! where they live. [`TRUSTED_BIN_DIRS`] also spells out what that does not fix.
+//!
 //! # What is actually reachable
 //!
 //! Measured against git 2.55 for exactly the subcommands cplt runs
@@ -90,8 +98,211 @@
 //! is a loud "could not verify", never a forged clean session, so denial of the
 //! *report* is the correct trade against execution of the *payload*.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+/// Absolute directories a parent-side binary may be resolved from.
+///
+/// `Command::new("git")` resolves through `execvp` **at spawn time**, using the
+/// *parent's* `PATH`. cplt spawns binaries in the parent both after the agent
+/// has exited (`audit::Baseline::finish`) and before the next one starts (the
+/// gh-guard scope check, the bwrap probe). The sandbox grants write **and**
+/// exec to several directories that are on a developer's `PATH` (mise shims,
+/// `PNPM_HOME`, `~/.deno/bin`, `~/.bun/bin` — see
+/// `sandbox_policy::HOME_TOOL_DIRS` and `APP_DIRS`), so an agent can drop a file
+/// named `git` (or `bwrap`, or `mise`) into one of them and have the parent
+/// execute it unsandboxed — at the end of this session, or at the start of the
+/// next one.
+///
+/// Every entry is a directory the sandbox exposes **read-only**
+/// (`sandbox_policy::TOOL_READ_DIRS` on macOS,
+/// `sandbox_landlock::LINUX_TOOL_DIRS` on Linux), so nothing inside the sandbox
+/// can write to it — an invariant `sandbox.rs`'s
+/// `every_trusted_dir_is_covered_by_a_tool_read_grant` enforces. `/usr/bin`
+/// first: it
+/// is the only one that is SIP-protected on macOS and root-owned on Linux.
+///
+/// # What this does not fix
+///
+/// This closes the "attacker prepends a directory that wins `PATH` resolution"
+/// half of the problem, and nothing more. If the user's own `git` lives in an
+/// agent-writable tree that also happens to be one of these directories — a
+/// Homebrew prefix owned by the user, say, that a `sandbox.allow.write` grant
+/// opened up — then resolving to a fixed absolute path still finds the
+/// trojaned file. Nor does it cover the agent binary itself, which cplt spawns
+/// from wherever it was discovered (commonly an npm global under a mise node
+/// install, i.e. a writable+exec tree). Making the whole class safe means not
+/// granting write to directories that also carry exec, which is a separate
+/// decision.
+pub const TRUSTED_BIN_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    // NixOS: the activated system profile, root-owned and read-only granted.
+    // Without it a NixOS user has no trusted git at all, which costs more than
+    // the audit — `repo_config::load_repo_config` reads `.cplt.toml` with
+    // `git cat-file` and reports "no repo config" when git cannot run.
+    "/run/current-system/sw/bin",
+    // Homebrew on Linux; same trust level as /opt/homebrew/bin.
+    "/home/linuxbrew/.linuxbrew/bin",
+];
+
+/// An existing regular file that **this process** may execute.
+///
+/// `which` and `execvp` both require `X_OK` for the calling user, so mode bits
+/// alone are the wrong question: a root-owned `0700` `git` has an execute bit
+/// set, yet every spawn of it fails with `EACCES` — and accepting it here would
+/// shadow a genuinely executable `git` later in [`TRUSTED_BIN_DIRS`], which is
+/// the failure mode this predicate exists to prevent. `faccessat` with
+/// `AT_EACCESS` asks the kernel the same question the spawn will, owner, group,
+/// supplementary groups, other and any ACL included.
+///
+/// This is a shadowing filter, not a security guarantee. The answer describes
+/// the file as it was at this instant; it can be replaced, chmod'ed or
+/// unmounted before the spawn (TOCTOU), and nothing here proves the file is
+/// the binary it claims to be. Trust comes from the directory being read-only
+/// to the sandbox — see [`TRUSTED_BIN_DIRS`] — never from this call.
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    // `X_OK` on its own would also accept a *searchable directory*, so the
+    // regular-file check stays. It runs first: it is the cheap rejection.
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false; // An interior NUL cannot name a real file.
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the call.
+    unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::X_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
+}
+
+/// Read-only prefixes a trusted binary is allowed to **resolve into**.
+///
+/// [`TRUSTED_BIN_DIRS`] constrains the *path*, which is not the same thing as
+/// the file. `/usr/local/bin/git` and `/opt/homebrew/bin/git` are symlinks on
+/// every Homebrew install, and on Homebrew-for-Intel `/usr/local` is owned by
+/// the invoking user — so the link can point anywhere, including into a
+/// directory the sandbox grants **write** to. Checking only the path would call
+/// that trusted and hand the agent the unsandboxed exec this module exists to
+/// prevent.
+///
+/// Rejecting symlinks outright is not the answer: the legitimate targets are
+/// real (`/opt/homebrew/bin/git` → `/opt/homebrew/Cellar/git/*/bin/git`,
+/// `/run/current-system/sw/bin/git` → `/nix/store/*/bin/git`, `/bin` → `/usr/bin`
+/// on a usrmerge distro, Debian's `/etc/alternatives` hop landing back in
+/// `/usr/bin`), and refusing them would leave most installs with no trusted git
+/// at all. So the target is checked against the *containing* read-only prefixes
+/// rather than [`TRUSTED_BIN_DIRS`] itself.
+///
+/// Every entry is a prefix the sandbox never grants write to: the macOS
+/// `sandbox_policy::TOOL_READ_DIRS` and Linux `sandbox_landlock::LINUX_TOOL_DIRS`
+/// read-only tool grants, plus the Nix store (root-owned and mounted read-only,
+/// and never named by any cplt write grant).
+///
+/// Only the *final* target is checked, not every hop. A chain whose middle link
+/// sits in an agent-writable directory would still pass — but arranging that
+/// means the user's own `git` already routes through an agent-writable path,
+/// which no supported install does.
+pub(crate) const TRUSTED_BIN_ROOTS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/local",
+    "/opt/homebrew",
+    "/run/current-system",
+    "/nix/store",
+    "/snap",
+    "/home/linuxbrew/.linuxbrew",
+];
+
+/// Does `path` resolve to a file under one of `roots`?
+///
+/// Both sides are canonicalized: the roots because several are themselves
+/// symlinks (`/run/current-system` into the Nix store, `/var` into `/private/var`
+/// on macOS), and a textual prefix test against an unresolved root answers the
+/// wrong question.
+fn resolves_into(path: &Path, roots: &[&str]) -> bool {
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .any(|root| target.starts_with(root))
+}
+
+/// First executable `name` found in `dirs` that resolves into `roots`. Split out
+/// of [`trusted_binary`] so the not-found path is testable without depending on
+/// the host's `/usr/bin`.
+///
+/// `name` must be a single normal path component. `Path::join` drops the base
+/// entirely for an absolute `name` and happily walks out of it for `../x`, so
+/// without this check `trusted_binary` could return a path outside
+/// [`TRUSTED_BIN_DIRS`] — the one guarantee it exists to make.
+///
+/// A candidate whose target escapes `roots` is skipped like a non-executable
+/// shadow, not fatal: the search goes on to the next directory, so a repointed
+/// `/usr/local/bin/git` still lets a genuine `/opt/homebrew/bin/git` win.
+fn find_in(dirs: &[&str], roots: &[&str], name: &str) -> Option<PathBuf> {
+    let mut parts = Path::new(name).components();
+    if !matches!(parts.next(), Some(std::path::Component::Normal(_))) || parts.next().is_some() {
+        return None;
+    }
+    dirs.iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|p| is_executable_file(p) && resolves_into(p, roots))
+}
+
+/// Resolve `name` from [`TRUSTED_BIN_DIRS`], never from `PATH`, and only when
+/// it resolves into [`TRUSTED_BIN_ROOTS`].
+///
+/// For every parent-side spawn. `None` means "not installed anywhere the agent
+/// cannot reach"; callers degrade as they already do when the tool is missing.
+/// Deliberately no `PATH` fallback: a fallback would restore the exact lookup
+/// this exists to remove, and would do so precisely on the machines where the
+/// attacker's directory is the only match.
+pub(crate) fn trusted_binary(name: &str) -> Option<PathBuf> {
+    find_in(TRUSTED_BIN_DIRS, TRUSTED_BIN_ROOTS, name)
+}
+
+/// The `git` binary, resolved once from [`TRUSTED_BIN_DIRS`].
+///
+/// Resolved once per process so a directory that appears *during* a session
+/// cannot change the answer between two calls, and so the warning below is
+/// emitted at most once.
+///
+/// `None` when no trusted `git` exists. Callers then degrade exactly as they do
+/// when git is missing: `Baseline::capture` records no baseline and no
+/// untracked set, and the report is `AuditReport::Unavailable` ("change audit
+/// unavailable"). Never a clean bill of health — but note it is `Unavailable`,
+/// not `Incomplete`, because both capture queries fail together.
+pub(crate) fn trusted_git() -> Option<&'static Path> {
+    static GIT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    GIT.get_or_init(|| {
+        let found = trusted_binary("git");
+        if found.is_none() {
+            crate::ui::warn(&format!(
+                "no git found in {} — parent-side git queries (audit, repo config \
+                 trust, gh guard scope) are skipped rather than resolved through \
+                 PATH, which a sandboxed agent can write to. The git-persistence \
+                 denies still cover <root>/.git for every writable root; a bare \
+                 repository's gitdir cannot be resolved without git and loses them",
+                TRUSTED_BIN_DIRS.join(", ")
+            ));
+        }
+        found
+    })
+    .as_deref()
+}
 
 /// `-c key=value` overrides prepended to every parent-side git invocation.
 ///
@@ -360,7 +571,7 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
         warn_refused_once();
         return None;
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(trusted_git()?);
     harden(&mut cmd);
     for arg in insert_diff_flags(args) {
         cmd.arg(arg);
@@ -384,7 +595,10 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
 /// on its own terms.
 #[must_use]
 pub fn repo_defines_content_filter(project_dir: &Path) -> bool {
-    let mut cmd = Command::new("git");
+    let Some(git) = trusted_git() else {
+        return false;
+    };
+    let mut cmd = Command::new(git);
     harden(&mut cmd);
     let Ok(out) = cmd
         .args(["config", "--list", "--show-scope", "--includes", "-z"])
@@ -474,6 +688,250 @@ mod tests {
             "CONFIG_OVERRIDES changed. Removing an entry weakens #210 hardening; \
              adding one needs a reviewed cost note. Update this list deliberately."
         );
+    }
+
+    /// Fails if [`command`] goes back to `Command::new("git")`. The bare name
+    /// is resolved by `execvp` at spawn time from the *parent's* `PATH`, and the
+    /// parent spawns git after the agent has exited — so any agent-writable
+    /// directory on `PATH` (mise shims, `PNPM_HOME`, `~/.bun/bin`) is an
+    /// unsandboxed exec.
+    #[test]
+    fn git_is_resolved_from_a_trusted_absolute_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(cmd) = command(dir.path(), &["rev-parse", "HEAD"]) else {
+            // No trusted git on this machine: the call must be refused, never
+            // degraded to the bare name. That is the other half of the contract.
+            assert!(trusted_git().is_none(), "refused despite a resolved git");
+            return;
+        };
+        let program = PathBuf::from(cmd.get_program());
+        assert_eq!(program.file_name().and_then(|n| n.to_str()), Some("git"));
+        assert!(
+            program.is_absolute(),
+            "git must not be resolved through PATH: {program:?}"
+        );
+        assert!(
+            TRUSTED_BIN_DIRS.iter().any(|d| program.starts_with(d)),
+            "{program:?} is outside TRUSTED_BIN_DIRS"
+        );
+    }
+
+    /// Spelled out independently of the const, like the override table above: a
+    /// test that only iterates it cannot notice a writable directory being added
+    /// or `/usr/bin` being dropped.
+    #[test]
+    fn the_trusted_bin_dirs_are_exactly_this() {
+        assert_eq!(
+            TRUSTED_BIN_DIRS,
+            &[
+                "/usr/bin",
+                "/bin",
+                "/usr/local/bin",
+                "/opt/homebrew/bin",
+                "/run/current-system/sw/bin",
+                "/home/linuxbrew/.linuxbrew/bin",
+            ],
+            "TRUSTED_BIN_DIRS changed. Every entry must be absolute and read-only \
+             to the sandbox — see `every_trusted_dir_is_covered_by_a_tool_read_grant` \
+             in sandbox.rs."
+        );
+    }
+
+    /// The not-found path, which the host's real `/usr/bin/git` would otherwise
+    /// hide: no `git` in the searched dirs must yield `None`, never a bare name.
+    #[test]
+    fn find_in_returns_none_when_the_binary_is_absent() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let populated = tempfile::tempdir().expect("tempdir");
+        let planted = populated.path().join("git");
+        plant_executable(&planted);
+        let dirs = [empty.path().to_str().expect("utf8")];
+        assert_eq!(find_in(&dirs, &dirs, "git"), None);
+        let dirs = [
+            empty.path().to_str().expect("utf8"),
+            populated.path().to_str().expect("utf8"),
+        ];
+        // First match wins, and the earlier directory is searched first.
+        assert_eq!(find_in(&dirs, &dirs, "git"), Some(planted));
+    }
+
+    fn plant_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// A non-executable file named `git` in an earlier trusted directory must
+    /// not shadow the real one: `execvp` needs `X_OK`, so matching it would turn
+    /// every parent-side spawn into `EACCES` instead of searching on.
+    #[test]
+    fn find_in_skips_a_non_executable_shadow() {
+        let shadow = tempfile::tempdir().expect("tempdir");
+        let real = tempfile::tempdir().expect("tempdir");
+        std::fs::write(shadow.path().join("git"), "not executable").expect("write");
+        let planted = real.path().join("git");
+        plant_executable(&planted);
+
+        let dirs = [shadow.path().to_str().expect("utf8")];
+        assert_eq!(find_in(&dirs, &dirs, "git"), None);
+        let dirs = [
+            shadow.path().to_str().expect("utf8"),
+            real.path().to_str().expect("utf8"),
+        ];
+        assert_eq!(find_in(&dirs, &dirs, "git"), Some(planted));
+    }
+
+    /// A file with an execute bit that does **not** apply to us is still a
+    /// shadow. Mode `0o011` (exec for group and other, not owner) on a file we
+    /// own is the reproducible stand-in for the real case — a root-owned `0700`
+    /// `git` — which needs a second uid to create. `mode & 0o111 != 0` accepts
+    /// both; `faccessat(X_OK)` rejects both.
+    #[test]
+    fn find_in_skips_a_binary_we_may_not_execute() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: a plain getuid(), no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            // root bypasses the permission check whenever *any* execute bit is
+            // set, so there is no shadow to observe. The root-owned-0700 case
+            // this stands in for is likewise unreachable while we are root.
+            return;
+        }
+        let shadow = tempfile::tempdir().expect("tempdir");
+        let real = tempfile::tempdir().expect("tempdir");
+        let denied = shadow.path().join("git");
+        std::fs::write(&denied, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o011)).expect("chmod");
+        assert!(!is_executable_file(&denied), "execute bit is not our bit");
+
+        let planted = real.path().join("git");
+        plant_executable(&planted);
+        let dirs = [
+            shadow.path().to_str().expect("utf8"),
+            real.path().to_str().expect("utf8"),
+        ];
+        assert_eq!(find_in(&dirs, &dirs, "git"), Some(planted));
+    }
+
+    /// The Homebrew shape, which must keep working: `bin/git` is a symlink and
+    /// its target lives elsewhere under the same read-only prefix
+    /// (`/opt/homebrew/bin/git` → `/opt/homebrew/Cellar/git/*/bin/git`).
+    /// Rejecting symlinks outright would leave those installs with no trusted
+    /// git at all.
+    #[test]
+    fn find_in_accepts_a_symlink_that_stays_inside_a_trusted_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let bin = root.path().join("bin");
+        let cellar = root.path().join("Cellar/git/2.55/bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        std::fs::create_dir_all(&cellar).expect("mkdir");
+        let real = cellar.join("git");
+        plant_executable(&real);
+        let link = bin.join("git");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let dirs = [bin.to_str().expect("utf8")];
+        let roots = [root.path().to_str().expect("utf8")];
+        assert_eq!(find_in(&dirs, &roots, "git"), Some(link));
+    }
+
+    /// The hole this closes: the *path* is in a trusted directory but the file
+    /// is not. `/usr/local/bin` is user-owned on a Homebrew-for-Intel install,
+    /// so its `git` symlink can be repointed into an agent-writable tree — and a
+    /// path-only check would call that trusted and execute it unsandboxed.
+    ///
+    /// The escape is skipped like a non-executable shadow, not fatal: a genuine
+    /// binary in a later trusted directory still wins.
+    #[test]
+    fn find_in_rejects_a_symlink_that_escapes_the_trusted_roots() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let payload = outside.path().join("git");
+        plant_executable(&payload);
+        std::os::unix::fs::symlink(&payload, bin.join("git")).expect("symlink");
+
+        let roots = [root.path().to_str().expect("utf8")];
+        let dirs = [bin.to_str().expect("utf8")];
+        assert_eq!(
+            find_in(&dirs, &roots, "git"),
+            None,
+            "a symlink out of the trusted roots must not resolve"
+        );
+
+        let real_dir = root.path().join("sbin");
+        std::fs::create_dir_all(&real_dir).expect("mkdir");
+        let real = real_dir.join("git");
+        plant_executable(&real);
+        let dirs = [
+            bin.to_str().expect("utf8"),
+            real_dir.to_str().expect("utf8"),
+        ];
+        assert_eq!(
+            find_in(&dirs, &roots, "git"),
+            Some(real),
+            "the search must continue past an escaping symlink"
+        );
+    }
+
+    /// Spelled out independently of the const, like [`TRUSTED_BIN_DIRS`]: every
+    /// root must be a prefix the sandbox never grants write to, and a widened
+    /// entry (`/`, `/home`, `$HOME`) would silently re-admit the symlink escape.
+    #[test]
+    fn the_trusted_bin_roots_are_exactly_this() {
+        assert_eq!(
+            TRUSTED_BIN_ROOTS,
+            &[
+                "/usr/bin",
+                "/bin",
+                "/usr/local",
+                "/opt/homebrew",
+                "/run/current-system",
+                "/nix/store",
+                "/snap",
+                "/home/linuxbrew/.linuxbrew",
+            ],
+            "TRUSTED_BIN_ROOTS changed. Every entry must be an absolute prefix the \
+             sandbox exposes read-only — see `sandbox_policy::TOOL_READ_DIRS` and \
+             `sandbox_landlock::LINUX_TOOL_DIRS`."
+        );
+        for dir in TRUSTED_BIN_DIRS {
+            assert!(
+                TRUSTED_BIN_ROOTS
+                    .iter()
+                    .any(|r| Path::new(dir).starts_with(r)),
+                "{dir} has no containing root, so nothing in it can ever resolve"
+            );
+        }
+    }
+
+    /// A directory named `git` is searchable, so `X_OK` alone would accept it.
+    #[test]
+    fn is_executable_file_rejects_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("git");
+        std::fs::create_dir(&sub).expect("mkdir");
+        assert!(!is_executable_file(&sub));
+    }
+
+    /// `Path::join` drops the base for an absolute `name` and walks out of it
+    /// for `../x`, either of which would return a path outside
+    /// [`TRUSTED_BIN_DIRS`] — the guarantee `trusted_binary` exists to make.
+    #[test]
+    fn find_in_refuses_anything_but_a_bare_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("git");
+        plant_executable(&outside);
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        let dirs = [sub.to_str().expect("utf8")];
+
+        assert_eq!(find_in(&dirs, &dirs, outside.to_str().expect("utf8")), None);
+        assert_eq!(find_in(&dirs, &dirs, "../git"), None);
+        assert_eq!(find_in(&dirs, &dirs, "./git"), None);
+        assert_eq!(find_in(&dirs, &dirs, ""), None);
+        assert_eq!(trusted_binary("/bin/sh"), None);
     }
 
     #[test]

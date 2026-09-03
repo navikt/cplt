@@ -132,7 +132,7 @@ pub fn default_config_contents() -> String {
 # ─── Sandbox behavior ───────────────────────────────────────
 [sandbox]
 # Preferred AI coding agent. Auto-detected from PATH if not set.
-# Supported: copilot, opencode, gemini, antigravity, pi, claude, shell
+# Supported: copilot, opencode, antigravity, pi, claude, shell
 # agent = "copilot"
 #
 # Named policy preset. Sets a baseline for the five sandbox toggles below
@@ -246,7 +246,7 @@ pub fn default_config_contents() -> String {
 # allow_cache_exec_any = false
 #
 # Allow the agent to open URLs in your default browser.
-# Needed for OAuth code flows (MCP servers, Gemini CLI, gh auth login).
+# Needed for OAuth code flows (MCP servers, Antigravity, gh auth login).
 # Disabled by default because it lets the agent use your browser session.
 # allow_browser = false
 #

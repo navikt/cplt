@@ -1,7 +1,7 @@
 //! Agent abstraction for different AI coding tools.
 //!
 //! cplt can sandbox multiple AI coding agents — currently GitHub Copilot CLI,
-//! OpenCode, Google Gemini CLI, Antigravity, Pi, and Claude Code. Each agent has
+//! OpenCode, Antigravity, Pi, and Claude Code. Each agent has
 //! different binary names, config directories, and runtime requirements, but
 //! shares the same core sandbox infrastructure.
 
@@ -65,14 +65,14 @@ const COPILOT_INFRA_DOMAINS: &[&str] = &[
     "default.exp2.cds.s9ch.io",
 ];
 
-/// Google AI infrastructure shared by the Gemini CLI and Antigravity (both are
-/// Google products; Antigravity stores its config under `~/.gemini`). Covers
-/// the Gemini API, the Code Assist backend, and Google OAuth for login.
+/// Google AI infrastructure used by Antigravity (a Google product, which stores
+/// its config under `~/.gemini`). Covers the Gemini API, the Code Assist
+/// backend, and Google OAuth for login.
 ///
 /// BARE domains, matched exact-or-subdomain by `crate::proxy::is_domain_match`.
 /// Do not add a leading `*.`; the matcher does not interpret glob syntax.
 ///
-/// Google Gemini API + Code Assist backend + Google OAuth. High confidence.
+/// Gemini API + Code Assist backend + Google OAuth. High confidence.
 const GOOGLE_AI_DOMAINS: &[&str] = &[
     "generativelanguage.googleapis.com",
     "cloudcode-pa.googleapis.com",
@@ -150,8 +150,6 @@ pub enum Agent {
     Copilot,
     /// OpenCode (anomalyco/opencode) — open source AI coding agent.
     OpenCode,
-    /// Google Gemini CLI — AI coding agent powered by Gemini models.
-    Gemini,
     /// Antigravity CLI (`antigravity` / `agy`).
     Antigravity,
     /// Pi coding agent (https://github.com/earendil-works/pi).
@@ -167,7 +165,6 @@ impl Agent {
     pub const ALL: &'static [Agent] = &[
         Agent::Copilot,
         Agent::OpenCode,
-        Agent::Gemini,
         Agent::Antigravity,
         Agent::Pi,
         Agent::Claude,
@@ -179,7 +176,6 @@ impl Agent {
         match self {
             Agent::Copilot => "copilot",
             Agent::OpenCode => "opencode",
-            Agent::Gemini => "gemini",
             Agent::Antigravity => "antigravity",
             Agent::Pi => "pi",
             Agent::Claude => "claude",
@@ -192,7 +188,6 @@ impl Agent {
         match self {
             Agent::Copilot => "Copilot",
             Agent::OpenCode => "OpenCode",
-            Agent::Gemini => "Gemini",
             Agent::Antigravity => "Antigravity",
             Agent::Pi => "Pi",
             Agent::Claude => "Claude Code",
@@ -212,12 +207,7 @@ impl Agent {
     pub fn extra_args(&self) -> &'static [&'static str] {
         match self {
             Agent::Copilot => &["--no-auto-update"],
-            Agent::OpenCode
-            | Agent::Gemini
-            | Agent::Antigravity
-            | Agent::Pi
-            | Agent::Claude
-            | Agent::Shell => &[],
+            Agent::OpenCode | Agent::Antigravity | Agent::Pi | Agent::Claude | Agent::Shell => &[],
         }
     }
 
@@ -309,9 +299,9 @@ impl Agent {
                 }
                 // --remote and --name have no claude equivalent; dropped.
             }
-            // Gemini still receives auto-resume handling in main.rs; Pi and Shell
-            // have no recognized session flags. None get explicit translation here.
-            Agent::Gemini | Agent::Pi | Agent::Shell => {}
+            // Pi and Shell have no recognized session flags, so they get no
+            // explicit translation here.
+            Agent::Pi | Agent::Shell => {}
         }
         args
     }
@@ -331,10 +321,7 @@ impl Agent {
     /// This is the *base* term only. Whether a given run actually gets the grant
     /// is decided at launch by [`Agent::credential_outside_keychain`] (#242).
     pub fn needs_keychain(&self) -> bool {
-        matches!(
-            self,
-            Agent::Copilot | Agent::Gemini | Agent::Antigravity | Agent::Claude
-        )
+        matches!(self, Agent::Copilot | Agent::Antigravity | Agent::Claude)
     }
 
     /// Environment variables that fully replace this agent's Keychain
@@ -362,15 +349,6 @@ impl Agent {
             // `["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]` once a run
             // under a grant-dropped profile has been confirmed to authenticate.
             Agent::Copilot => &[],
-            // Gemini CLI gets no substitute. `GEMINI_API_KEY` is a documented
-            // auth method, but whether it *outranks* an existing Google OAuth
-            // login is undocumented, and the same shape burned us on Claude:
-            // `ANTHROPIC_API_KEY` is present-but-unused when a subscription
-            // login exists, so trading the grant away for it would silently move
-            // the user onto per-token billing. Gemini CLI is not installed on
-            // any machine cplt has been able to test against, so that precedence
-            // has never been exercised. Until it is, the grant stays.
-            Agent::Gemini => &[],
             // Antigravity has no env substitute either — its credential lives in
             // a file instead, see `credential_outside_keychain`.
             Agent::Antigravity => &[],
@@ -479,16 +457,6 @@ impl Agent {
     ///   `UserPromptSubmit`, …) which fire automatically. `commands/`,
     ///   `agents/` and `skills/` stay writable — those do require explicit user
     ///   invocation.
-    /// - Gemini: `settings.json` holds `hooks.SessionStart[]`, which fires on
-    ///   startup, on resume and after `/clear`; folder trust is workspace-scoped
-    ///   and does not gate user-level hooks. `extensions/` is auto-loaded.
-    ///   `policies/*.toml` is the user policy tier, also not trust-gated, where
-    ///   `decision = "allow"` on `run_shell_command` makes the next host run
-    ///   auto-execute without confirmation — nothing legitimate writes it from
-    ///   inside a session. `hooks/` is where the scripts `settings.json` names
-    ///   conventionally live: denying the settings file stops a *new* hook
-    ///   being pointed at, but an existing entry's script body would still be
-    ///   rewritable in place (same reasoning as Pi's `npm`/`git`).
     /// - Antigravity: its own grants carry the same class. `config/hooks.json`
     ///   names host commands, `config/mcp_config.json` holds `mcpServers` that
     ///   auto-start, and `antigravity-cli/bin/` holds binaries (`agentapi`,
@@ -501,11 +469,9 @@ impl Agent {
     ///   `settings.json` stops a *new* entry being added but leaves installed
     ///   package code editable in place, and it loads on the next host run.
     ///
-    /// Cost: denying `settings.json` breaks *first-run login inside the
-    /// sandbox* for Gemini (it writes `selectedAuthType` there). For Pi it
-    /// breaks package management and every in-session setting that persists
-    /// there — `/model` Ctrl+S, `/thinking`, `/settings`. Do those outside
-    /// cplt — see SECURITY.md.
+    /// Cost: for Pi this breaks package management and every in-session
+    /// setting that persists to `settings.json` — `/model` Ctrl+S,
+    /// `/thinking`, `/settings`. Do those outside cplt — see SECURITY.md.
     ///
     /// Enforcement is macOS-first: Seatbelt emits these as write-denies after
     /// the dir-wide allow (last match wins). Landlock cannot sub-deny inside an
@@ -514,7 +480,6 @@ impl Agent {
     pub fn host_persistence_denies(&self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &["statusline.sh", "plugins", "settings.json"],
-            Agent::Gemini => &["settings.json", "extensions", "policies", "hooks"],
             Agent::Pi => &["settings.json", "extensions", "npm", "git"],
             // Antigravity's grants are ~/.gemini/config and
             // ~/.gemini/antigravity-cli, not ~/.gemini itself, so Gemini's own
@@ -553,8 +518,8 @@ impl Agent {
     ///
     /// Every agent gets the shared package-registry base. On top of that, each
     /// agent with documented infrastructure gets its own endpoints: Copilot the
-    /// GitHub Copilot infra (#52), Gemini/Antigravity the Google AI infra
-    /// (Antigravity additionally its own domain), Claude the Anthropic infra,
+    /// GitHub Copilot infra (#52), Antigravity the Google AI infra plus its own
+    /// domain, Claude the Anthropic infra,
     /// and OpenCode only its own infra (see below). Entries are bare domains
     /// matched by `crate::proxy::is_domain_match` (exact or subdomain).
     ///
@@ -575,7 +540,6 @@ impl Agent {
         // is not an AI agent so it has no model/auth traffic of its own.
         let infra: &[&[&str]] = match self {
             Agent::Copilot => &[COPILOT_INFRA_DOMAINS],
-            Agent::Gemini => &[GOOGLE_AI_DOMAINS],
             Agent::Antigravity => &[GOOGLE_AI_DOMAINS, ANTIGRAVITY_DOMAINS],
             Agent::Claude => &[ANTHROPIC_DOMAINS],
             Agent::OpenCode => &[OPENCODE_DOMAINS],
@@ -707,16 +671,6 @@ impl Agent {
                     },
                 ]
             }
-            Agent::Gemini => {
-                // ~/.gemini stores auth, settings, sessions, and agents
-                vec![AgentDir {
-                    path: home.join(".gemini"),
-                    write: true,
-                    map_exec: false,
-                    process_exec: false,
-                    write_files: vec![],
-                }]
-            }
             Agent::Antigravity => {
                 // Antigravity stores project config under ~/.gemini/config
                 // and runtime/session data under ~/.gemini/antigravity-cli.
@@ -819,8 +773,6 @@ impl Agent {
             // `/connect` device flow against a GitHub Copilot subscription;
             // credentials stored in ~/.local/share/opencode/auth.json.
             Agent::OpenCode => true,
-            // Google OAuth browser flow by default; credentials in ~/.gemini/.
-            Agent::Gemini => true,
             // Google OAuth with keychain/session storage.
             Agent::Antigravity => true,
             // Subscription OAuth token in ~/.claude (.credentials.json on
@@ -845,81 +797,12 @@ impl Agent {
     pub fn oauth_needs_browser(&self) -> bool {
         match self {
             // Google OAuth browser flow on first run.
-            Agent::Gemini | Agent::Antigravity => true,
+            Agent::Antigravity => true,
             // Device flow: a code and a URL, no browser required from here.
             Agent::Copilot | Agent::OpenCode | Agent::Claude => false,
             // Not OAuth-first at all.
             Agent::Pi | Agent::Shell => false,
         }
-    }
-
-    /// Warning for the case where this agent's **first-run login** would have
-    /// to write a file that [`Agent::host_persistence_denies`] blocks, and that
-    /// login has not happened yet on this host. `None` means nothing to say.
-    ///
-    /// Warn-and-launch, not refuse: the login may be the only thing the deny
-    /// breaks, and blocking the run takes that judgement away from the user.
-    /// The trade is that they can still walk into the failure — Gemini's
-    /// `saveSettings` catches the `EPERM` and prints "Failed to save settings:
-    /// …" with no mention of cplt — so this text is written to be **recognised
-    /// later**, not merely read at startup: it names the exact file, the reason
-    /// it is denied, what will fail, the one-time fix, and why no flag helps.
-    /// Shortening it defeats the point.
-    ///
-    /// Only Gemini is affected. It records the auth method it picked as
-    /// `selectedAuthType` in `~/.gemini/settings.json` — denied because the
-    /// same file carries auto-firing `SessionStart` hooks. Pi has no
-    /// interactive login at all (see `oauth_first`: provider API keys only) and
-    /// Claude Code's OAuth token lands in the macOS Keychain or
-    /// `~/.claude/.credentials.json`, neither of which is denied. For those two
-    /// the deny costs package management and statusline/plugin authoring, not
-    /// sign-in.
-    ///
-    /// "Authenticated" for Gemini means either `~/.gemini/oauth_creds.json`
-    /// exists (the browser OAuth flow completed) or `settings.json` already
-    /// records a `selectedAuthType` (any auth method — API key, Vertex, OAuth).
-    /// Callers additionally skip this when a provider API key is passed
-    /// through, which authenticates without touching the file.
-    ///
-    /// Deliberately cheap and infallible: one `exists()` and at most one small
-    /// read. Any I/O error is read as "assume authenticated", so a filesystem
-    /// hiccup can never turn into a spurious warning.
-    pub fn login_warning(&self, home: &Path) -> Option<String> {
-        if !matches!(self, Agent::Gemini) {
-            return None;
-        }
-        let dir = home.join(".gemini");
-        // Only a genuinely missing file proves "not signed in". Any other
-        // error — permissions, invalid UTF-8, a flaky mount — is read as
-        // "assume authenticated" so a filesystem hiccup stays silent.
-        let authenticated = dir.join("oauth_creds.json").try_exists().unwrap_or(true)
-            || match std::fs::read_to_string(dir.join("settings.json")) {
-                Ok(s) => s.contains("selectedAuthType"),
-                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-            };
-        if authenticated {
-            return None;
-        }
-        let settings = dir.join("settings.json").display().to_string();
-        Some(format!(
-            "Gemini is not signed in yet, and cplt write-denies {settings}.\n\
-             That file is where Gemini records the auth method you pick on first \
-             login, but it also holds `hooks.SessionStart[]`, which auto-fires the \
-             next time `gemini` starts outside the sandbox — so cplt denies writes \
-             to it.\n\
-             \n\
-             Launching anyway. If you sign in from in here, Gemini will fail to \
-             save the choice and print something like \"Failed to save settings\" \
-             — that error is this deny, not a Gemini bug.\n\
-             \n\
-             To fix it, sign in once outside cplt — a one-time step:\n\
-             \n\
-             \x20   gemini\n\
-             \n\
-             Then run cplt as normal. There is deliberately no flag for doing it \
-             in here: the deny is emitted after every user allow, so not even \
-             `--allow-write` reopens the file."
-        ))
     }
 
     /// Environment variable names this agent may need for authentication.
@@ -957,9 +840,6 @@ impl Agent {
                 "CLOUDFLARE_API_TOKEN",
                 "GITLAB_TOKEN",
             ],
-            // Gemini uses Google OAuth by default (browser flow, stored in ~/.gemini/).
-            // API key or Vertex AI project are alternatives.
-            Agent::Gemini => &["GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"],
             // Antigravity uses Google OAuth with keychain/session storage.
             Agent::Antigravity => &[],
             // Pi supports many LLM providers via API keys.
@@ -1121,9 +1001,6 @@ impl Agent {
             Agent::OpenCode => {
                 "Install OpenCode: npm i -g opencode-ai, or brew install anomalyco/tap/opencode"
             }
-            Agent::Gemini => {
-                "Install Gemini CLI: npm i -g @google/gemini-cli, or brew install gemini-cli"
-            }
             Agent::Antigravity => {
                 "Install Antigravity CLI: see https://antigravity.google/docs/cli-getting-started"
             }
@@ -1156,8 +1033,8 @@ impl Agent {
     }
 
     /// Auto-detect which agent to use based on what's available in PATH.
-    /// Returns Copilot if found (backward compat), else OpenCode, else Gemini,
-    /// else Antigravity.
+    /// Returns Copilot if found (backward compat), else OpenCode, else
+    /// Antigravity.
     /// Pi and Claude are explicit-only (`--agent pi` / `--agent claude`) and are
     /// never auto-detected, to avoid silently changing the default for existing users.
     /// Returns None if none are found.
@@ -1176,7 +1053,6 @@ impl Agent {
 
         let mut found_copilot = false;
         let mut found_opencode = false;
-        let mut found_gemini = false;
         let mut found_antigravity = false;
 
         for dir in path_var.split(':') {
@@ -1200,16 +1076,6 @@ impl Agent {
                     }
                 }
             }
-            if !found_gemini {
-                let candidate = PathBuf::from(dir).join("gemini");
-                if candidate.is_file() {
-                    let resolved =
-                        std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-                    if usable(&resolved) {
-                        found_gemini = true;
-                    }
-                }
-            }
             if !found_antigravity {
                 let antigravity_bin = PathBuf::from(dir).join("antigravity");
                 let agy_bin = PathBuf::from(dir).join("agy");
@@ -1230,8 +1096,6 @@ impl Agent {
             Some(Agent::Copilot)
         } else if found_opencode {
             Some(Agent::OpenCode)
-        } else if found_gemini {
-            Some(Agent::Gemini)
         } else if found_antigravity {
             Some(Agent::Antigravity)
         } else {
@@ -1247,13 +1111,21 @@ impl FromStr for Agent {
         match s.to_lowercase().as_str() {
             "copilot" => Ok(Agent::Copilot),
             "opencode" => Ok(Agent::OpenCode),
-            "gemini" | "gem" => Ok(Agent::Gemini),
+            // Removed in favour of Antigravity, which is Google's supported
+            // successor and shares the same ~/.gemini tree. A plain "unknown
+            // agent" would be unhelpful for a value that worked before.
+            "gemini" | "gem" => Err(
+                "The Gemini CLI agent was removed from cplt — Google deprecated it in \
+                 favour of Antigravity. Use `--agent agy` (or `sandbox.agent = \
+                 \"antigravity\"`) instead."
+                    .to_string(),
+            ),
             "antigravity" | "agy" | "agi" => Ok(Agent::Antigravity),
             "pi" => Ok(Agent::Pi),
             "claude" | "cc" | "claude-code" => Ok(Agent::Claude),
             "shell" | "sh" | "bash" | "zsh" => Ok(Agent::Shell),
             _ => Err(format!(
-                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, shell"
+                "Unknown agent '{s}'. Supported: copilot, opencode, antigravity, pi, claude, shell"
             )),
         }
     }
@@ -1409,19 +1281,23 @@ fn resolve_mise_shim(candidate: &Path, binary_name: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok();
     let cwd = home.as_deref().unwrap_or("/");
 
-    let output = std::process::Command::new("mise")
-        .arg("which")
-        .arg(binary_name)
-        .current_dir(cwd)
-        .output()
-        .or_else(|_| {
-            std::process::Command::new("asdf")
+    // Trusted paths, not PATH: this runs in the unsandboxed parent before the
+    // agent starts, and mise's own shims directory is one of the write+exec
+    // grants an agent can plant into. When neither is found in a trusted
+    // directory the installs-dir scan below covers the same case, so nothing is
+    // lost beyond mise's own version resolution.
+    let output = ["mise", "asdf"]
+        .iter()
+        .filter_map(|tool| crate::git::trusted_binary(tool))
+        .filter_map(|tool| {
+            std::process::Command::new(&tool)
                 .arg("which")
                 .arg(binary_name)
                 .current_dir(cwd)
                 .output()
+                .ok()
         })
-        .ok();
+        .find(|out| out.status.success());
 
     if let Some(ref out) = output
         && out.status.success()
@@ -1633,9 +1509,6 @@ mod tests {
         assert_eq!(Agent::from_str("Copilot").unwrap(), Agent::Copilot);
         assert_eq!(Agent::from_str("opencode").unwrap(), Agent::OpenCode);
         assert_eq!(Agent::from_str("OpenCode").unwrap(), Agent::OpenCode);
-        assert_eq!(Agent::from_str("gemini").unwrap(), Agent::Gemini);
-        assert_eq!(Agent::from_str("Gemini").unwrap(), Agent::Gemini);
-        assert_eq!(Agent::from_str("gem").unwrap(), Agent::Gemini);
         assert_eq!(Agent::from_str("antigravity").unwrap(), Agent::Antigravity);
         assert_eq!(Agent::from_str("agi").unwrap(), Agent::Antigravity);
         assert_eq!(Agent::from_str("agy").unwrap(), Agent::Antigravity);
@@ -1653,11 +1526,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_binary_name() {
-        assert_eq!(Agent::Gemini.binary_name(), "gemini");
-    }
-
-    #[test]
     fn antigravity_binary_name() {
         assert_eq!(Agent::Antigravity.binary_name(), "antigravity");
     }
@@ -1666,7 +1534,6 @@ mod tests {
     fn copilot_needs_sea_extraction() {
         assert!(Agent::Copilot.needs_sea_extraction());
         assert!(!Agent::OpenCode.needs_sea_extraction());
-        assert!(!Agent::Gemini.needs_sea_extraction());
         assert!(!Agent::Antigravity.needs_sea_extraction());
     }
 
@@ -1674,7 +1541,6 @@ mod tests {
     fn copilot_extra_args() {
         assert_eq!(Agent::Copilot.extra_args(), &["--no-auto-update"]);
         assert!(Agent::OpenCode.extra_args().is_empty());
-        assert!(Agent::Gemini.extra_args().is_empty());
         assert!(Agent::Antigravity.extra_args().is_empty());
     }
 
@@ -1775,7 +1641,7 @@ mod tests {
 
     #[test]
     fn session_args_unsupported_agents_drop_all() {
-        for agent in [Agent::Gemini, Agent::Pi, Agent::Shell] {
+        for agent in [Agent::Pi, Agent::Shell] {
             assert!(
                 agent
                     .session_args(Some("id"), true, Some("name"), true)
@@ -1794,19 +1660,18 @@ mod tests {
             match a {
                 Agent::Copilot => 0,
                 Agent::OpenCode => 1,
-                Agent::Gemini => 2,
-                Agent::Antigravity => 3,
-                Agent::Pi => 4,
-                Agent::Claude => 5,
-                Agent::Shell => 6,
+                Agent::Antigravity => 2,
+                Agent::Pi => 3,
+                Agent::Claude => 4,
+                Agent::Shell => 5,
             }
         }
-        assert_eq!(Agent::ALL.len(), 7, "add the new variant to Agent::ALL");
+        assert_eq!(Agent::ALL.len(), 6, "add the new variant to Agent::ALL");
         let mut seen: Vec<u8> = Agent::ALL.iter().copied().map(tag).collect();
         seen.sort_unstable();
         assert_eq!(
             seen,
-            (0..7).collect::<Vec<u8>>(),
+            (0..6).collect::<Vec<u8>>(),
             "Agent::ALL has a gap or a duplicate"
         );
     }
@@ -1816,37 +1681,9 @@ mod tests {
         // All four are the *base* term — the grant is still conditional on
         // `credential_outside_keychain` at launch (#242).
         assert!(Agent::Copilot.needs_keychain());
-        assert!(Agent::Gemini.needs_keychain());
         assert!(Agent::Antigravity.needs_keychain());
         assert!(Agent::Claude.needs_keychain());
         assert!(!Agent::OpenCode.needs_keychain());
-    }
-
-    #[test]
-    fn host_persistence_denies_per_agent() {
-        assert_eq!(
-            Agent::Claude.host_persistence_denies(),
-            ["statusline.sh", "plugins", "settings.json"],
-            "Claude's settings.json hooks auto-fire — it must be denied (#237)"
-        );
-        assert_eq!(
-            Agent::Gemini.host_persistence_denies(),
-            ["settings.json", "extensions", "policies", "hooks"]
-        );
-        assert_eq!(
-            Agent::Pi.host_persistence_denies(),
-            // npm/ and git/ hold already-installed package code, editable in
-            // place: denying settings.json alone only stops a NEW entry.
-            ["settings.json", "extensions", "npm", "git"]
-        );
-        assert_eq!(
-            Agent::Antigravity.host_persistence_denies(),
-            ["hooks.json", "mcp_config.json", "bin"]
-        );
-        // No writable dir that hosts auto-executing config for these.
-        assert!(Agent::Copilot.host_persistence_denies().is_empty());
-        assert!(Agent::OpenCode.host_persistence_denies().is_empty());
-        assert!(Agent::Shell.host_persistence_denies().is_empty());
     }
 
     /// `host_persistence_paths` is what BOTH backends consume — Seatbelt turns
@@ -1880,274 +1717,6 @@ mod tests {
         // No denies declared → nothing joined, whatever the grants look like.
         let dirs = Agent::OpenCode.config_dirs(home);
         assert!(Agent::OpenCode.host_persistence_paths(&dirs).is_empty());
-    }
-
-    #[test]
-    fn login_warning_only_for_unauthenticated_gemini() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path();
-        std::fs::create_dir_all(home.join(".gemini")).expect("mkdir");
-
-        // Nothing on disk: warn, and say enough to be recognised later. cplt
-        // launches anyway, so the user may well meet the failure inside Gemini
-        // with this text already scrolled off — every one of these parts is
-        // what lets them connect the two.
-        let msg = Agent::Gemini
-            .login_warning(home)
-            .expect("unauthenticated Gemini must warn");
-        assert!(msg.contains("not signed in"), "{msg}");
-        assert!(
-            msg.contains("hooks.SessionStart[]"),
-            "why it is denied: {msg}"
-        );
-        assert!(
-            msg.contains("Failed to save settings"),
-            "must quote the error Gemini will actually print: {msg}"
-        );
-        assert!(msg.contains("one-time"), "{msg}");
-        assert!(msg.contains("gemini"), "{msg}");
-        assert!(
-            msg.contains(&home.join(".gemini/settings.json").display().to_string()),
-            "message must name the denied file: {msg}"
-        );
-        // No in-cplt escape hatch is offered, because there is none: the deny
-        // is emitted after every user allow. Advertising one would be a lie.
-        assert!(
-            !msg.contains("cplt --agent"),
-            "must not hand out an in-cplt command that cannot work: {msg}"
-        );
-        assert!(msg.contains("no flag"), "{msg}");
-
-        // Agents whose login does not touch a denied file never refuse, even
-        // with an equally empty home.
-        for agent in [
-            Agent::Pi,
-            Agent::Claude,
-            Agent::Copilot,
-            Agent::OpenCode,
-            Agent::Antigravity,
-            Agent::Shell,
-        ] {
-            assert!(
-                agent.login_warning(home).is_none(),
-                "{agent:?} must not warn"
-            );
-        }
-
-        // Any recorded auth method counts as authenticated (API key, Vertex, …).
-        std::fs::write(
-            home.join(".gemini/settings.json"),
-            r#"{"security":{"auth":{"selectedAuthType":"gemini-api-key"}}}"#,
-        )
-        .expect("write settings");
-        assert!(Agent::Gemini.login_warning(home).is_none());
-
-        // So does a completed browser OAuth flow, even with no settings.json.
-        let tmp2 = tempfile::tempdir().expect("tempdir");
-        let home2 = tmp2.path();
-        std::fs::create_dir_all(home2.join(".gemini")).expect("mkdir");
-        std::fs::write(home2.join(".gemini/oauth_creds.json"), "{}").expect("write creds");
-        assert!(Agent::Gemini.login_warning(home2).is_none());
-
-        // A read that fails for any reason other than "not there" is a
-        // filesystem problem, not proof of a missing login: a directory where
-        // settings.json belongs makes read_to_string fail with EISDIR, and the
-        // documented contract is to assume authenticated and stay quiet.
-        let tmp3 = tempfile::tempdir().expect("tempdir");
-        let home3 = tmp3.path();
-        std::fs::create_dir_all(home3.join(".gemini/settings.json")).expect("mkdir");
-        assert!(
-            Agent::Gemini.login_warning(home3).is_none(),
-            "an unreadable settings.json must not produce a spurious warning"
-        );
-    }
-
-    #[test]
-    fn keychain_substitutes_are_scoped_to_agents_that_need_the_keychain() {
-        // Claude Code builds its credential straight from CLAUDE_CODE_OAUTH_TOKEN
-        // and never reads secure storage — verified against claude 2.1.258:
-        // `claude auth status` reports `authMethod: oauth_token` with
-        // ~/Library/Keychains denied.
-        assert_eq!(
-            Agent::Claude.keychain_substitute_env_vars(),
-            &["CLAUDE_CODE_OAUTH_TOKEN"]
-        );
-        // ANTHROPIC_API_KEY is NOT a substitute: with a claude.ai login present
-        // Claude Code reports `authMethod: claude.ai` and only lists the key as
-        // `apiKeySource`, so dropping the grant would switch billing silently.
-        assert!(
-            !Agent::Claude
-                .keychain_substitute_env_vars()
-                .contains(&"ANTHROPIC_API_KEY")
-        );
-        // Gemini CLI: precedence of GEMINI_API_KEY over an existing Google OAuth
-        // login is undocumented and unverified, so it gets no substitute.
-        assert!(Agent::Gemini.keychain_substitute_env_vars().is_empty());
-        // Agents with no env substitute: OpenCode never wanted the Keychain,
-        // Antigravity substitutes via a file instead, and Copilot is held back
-        // until its precedence over the Keychain is actually probed.
-        assert!(Agent::OpenCode.keychain_substitute_env_vars().is_empty());
-        assert!(Agent::Antigravity.keychain_substitute_env_vars().is_empty());
-        assert!(Agent::Copilot.keychain_substitute_env_vars().is_empty());
-    }
-
-    /// A directory at the token path is not a credential. `metadata().len()`
-    /// is non-zero for a directory (64 on macOS, 4096 on ext4), so without an
-    /// `is_file()` check a stray directory drops the Keychain grant and leaves
-    /// the agent with nothing to authenticate with.
-    #[test]
-    fn a_directory_at_the_token_path_is_not_a_credential() {
-        let tmp = std::env::temp_dir().join(format!("cplt-agy-dir-{}", std::process::id()));
-        let token = tmp.join(".gemini/antigravity-cli/antigravity-oauth-token");
-        std::fs::create_dir_all(&token).unwrap();
-
-        assert_eq!(
-            Agent::Antigravity.credential_outside_keychain_on(&tmp, &[], true, true),
-            None,
-            "a directory must not count as the fallback token file"
-        );
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// #242: `agy`'s token file is a keyring *fallback*, not a mirror. A user
-    /// whose keyring works has no such file, and dropping the grant for them
-    /// would strand the session at a browser re-login (which needs
-    /// `--allow-browser`, off by default). So presence of the file — not the
-    /// agent's identity — is what allows the trade.
-    #[test]
-    fn antigravity_keeps_the_grant_until_its_fallback_token_file_exists() {
-        let tmp = std::env::temp_dir().join(format!("cplt-agy-{}", std::process::id()));
-        let token = tmp.join(".gemini/antigravity-cli/antigravity-oauth-token");
-        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
-
-        assert_eq!(
-            Agent::Antigravity.credential_outside_keychain_on(&tmp, &[], true, true),
-            None,
-            "no fallback file — the grant must stay"
-        );
-
-        std::fs::write(&token, "").unwrap();
-        assert_eq!(
-            Agent::Antigravity.credential_outside_keychain_on(&tmp, &[], true, true),
-            None,
-            "an empty fallback file is not a credential"
-        );
-
-        std::fs::write(&token, "{\"token\":{}}").unwrap();
-        assert!(
-            Agent::Antigravity
-                .credential_outside_keychain_on(&tmp, &[], true, true)
-                .is_some(),
-            "a populated fallback file means agy can authenticate without the keyring"
-        );
-
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// A repo `.cplt.toml` `deny.env` entry strips the var from the child
-    /// environment, so it must not count as a substitute — otherwise the run
-    /// gets neither Keychain nor token, which is the #173 failure reachable
-    /// from a checked-in file (#242).
-    #[test]
-    fn deny_env_disqualifies_a_substitute_credential() {
-        let home = Path::new("/Users/test");
-        temp_env::with_var("CLAUDE_CODE_OAUTH_TOKEN", Some("sk-ant-oat01-x"), || {
-            assert!(
-                Agent::Claude
-                    .credential_outside_keychain_on(home, &[], true, true)
-                    .is_some(),
-                "an env token normally allows the trade"
-            );
-            assert_eq!(
-                Agent::Claude.credential_outside_keychain_on(
-                    home,
-                    &["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
-                    true,
-                    true
-                ),
-                None,
-                "a denied var is not a substitute — keep the grant"
-            );
-        });
-        // Blank is not a credential either.
-        temp_env::with_var("CLAUDE_CODE_OAUTH_TOKEN", Some("   "), || {
-            assert_eq!(
-                Agent::Claude.credential_outside_keychain_on(home, &[], true, true),
-                None
-            );
-        });
-    }
-
-    /// The whole trade is gated on `sandbox.keychain_substitute`, default off.
-    /// With it off nothing is traded, whatever the environment or the filesystem
-    /// says — the property that makes the default-off build byte-identical to
-    /// the behaviour before this key existed (#242).
-    /// Off macOS the trade never applies, for any agent and any input.
-    ///
-    /// There is no whole-Keychain grant to drop on Linux — those agents read
-    /// credential files the sandbox already grants — so forwarding a token
-    /// there would change the environment and buy nothing. Asserted from either
-    /// host via the platform parameter, because a `#[cfg]`-gated test would
-    /// leave exactly one of the two answers checked on exactly one of the two
-    /// CI runners.
-    #[test]
-    fn the_trade_never_applies_off_macos() {
-        let tmp = std::env::temp_dir().join(format!("cplt-nonmac-{}", std::process::id()));
-        let token = tmp.join(".gemini/antigravity-cli/antigravity-oauth-token");
-        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
-        std::fs::write(&token, "{\"token\":{}}").unwrap();
-
-        temp_env::with_var("CLAUDE_CODE_OAUTH_TOKEN", Some("sk-ant-oat01-x"), || {
-            for agent in Agent::ALL {
-                assert_eq!(
-                    agent.credential_outside_keychain_on(&tmp, &[], true, false),
-                    None,
-                    "{agent:?}: no trade off macOS, even with the key on and a credential present"
-                );
-            }
-            // Same inputs, macOS: the two eligible agents do trade. Without this
-            // half the assertion above would also pass if the function were
-            // simply broken.
-            assert!(
-                Agent::Claude
-                    .credential_outside_keychain_on(&tmp, &[], true, true)
-                    .is_some()
-            );
-            assert!(
-                Agent::Antigravity
-                    .credential_outside_keychain_on(&tmp, &[], true, true)
-                    .is_some()
-            );
-        });
-
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn keychain_substitute_disabled_never_trades_the_grant() {
-        let home = Path::new("/Users/test");
-        temp_env::with_var("CLAUDE_CODE_OAUTH_TOKEN", Some("sk-ant-oat01-x"), || {
-            assert_eq!(
-                Agent::Claude.credential_outside_keychain_on(home, &[], false, true),
-                None
-            );
-        });
-        // Antigravity's fallback file present, gate off: still no trade.
-        let tmp = std::env::temp_dir().join(format!("cplt-gate-{}", std::process::id()));
-        let token = tmp.join(".gemini/antigravity-cli/antigravity-oauth-token");
-        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
-        std::fs::write(&token, "{\"token\":{}}").unwrap();
-        assert_eq!(
-            Agent::Antigravity.credential_outside_keychain_on(&tmp, &[], false, true),
-            None
-        );
-        assert!(
-            Agent::Antigravity
-                .credential_outside_keychain_on(&tmp, &[], true, true)
-                .is_some(),
-            "...but the same state does trade once the key is on"
-        );
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -2206,16 +1775,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_config_dirs() {
-        let home = Path::new("/Users/test");
-        let dirs = Agent::Gemini.config_dirs(home);
-        assert_eq!(dirs.len(), 1, "should have ~/.gemini dir");
-        assert_eq!(dirs[0].path, home.join(".gemini"));
-        assert!(dirs[0].write, "gemini dir should be writable");
-        assert!(!dirs[0].process_exec && !dirs[0].map_exec);
-    }
-
-    #[test]
     fn antigravity_config_dirs() {
         let home = Path::new("/Users/test");
         let dirs = Agent::Antigravity.config_dirs(home);
@@ -2257,13 +1816,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_auth_env_hints() {
-        let hints = Agent::Gemini.auth_env_hint();
-        assert!(hints.contains(&"GEMINI_API_KEY"));
-        assert!(hints.contains(&"GOOGLE_CLOUD_PROJECT"));
-    }
-
-    #[test]
     fn every_agent_declares_its_auth_model() {
         // Pinned per agent so a new one has to make a deliberate choice: the
         // exhaustive match in `oauth_first` forces the decision at compile
@@ -2273,7 +1825,6 @@ mod tests {
         for (agent, expected) in [
             (Agent::Copilot, true),     // GitHub device flow + Keychain
             (Agent::OpenCode, true),    // /connect device flow -> auth.json
-            (Agent::Gemini, true),      // Google OAuth browser flow
             (Agent::Antigravity, true), // Google OAuth + keychain
             (Agent::Claude, true),      // subscription OAuth token
             (Agent::Pi, false),         // provider API keys only
@@ -2318,7 +1869,6 @@ mod tests {
     fn display_names() {
         assert_eq!(format!("{}", Agent::Copilot), "Copilot");
         assert_eq!(format!("{}", Agent::OpenCode), "OpenCode");
-        assert_eq!(format!("{}", Agent::Gemini), "Gemini");
         assert_eq!(format!("{}", Agent::Antigravity), "Antigravity");
         assert_eq!(format!("{}", Agent::Pi), "Pi");
     }
@@ -2395,6 +1945,18 @@ mod tests {
         );
         assert!(err.contains("pi"), "error should mention pi: {err}");
         assert!(err.contains("claude"), "error should mention claude: {err}");
+    }
+
+    /// `--agent gemini` / `sandbox.agent = "gemini"` worked until the agent was
+    /// removed, so the error has to say that rather than "unknown agent".
+    #[test]
+    fn removed_gemini_agent_points_at_antigravity() {
+        for name in ["gemini", "Gemini", "gem"] {
+            let err = Agent::from_str(name).unwrap_err();
+            assert!(err.contains("removed"), "{name}: {err}");
+            assert!(err.contains("agy"), "{name}: {err}");
+            assert!(err.contains("antigravity"), "{name}: {err}");
+        }
     }
 
     #[test]
@@ -2553,28 +2115,11 @@ mod tests {
     }
 
     #[test]
-    fn gemini_default_domains_include_google_ai_and_registry() {
-        let domains = Agent::Gemini.default_allowed_domains();
-        assert!(
-            domains.contains(&"generativelanguage.googleapis.com"),
-            "Gemini must include the Gemini API endpoint"
-        );
-        assert!(domains.contains(&"accounts.google.com"));
-        assert!(
-            domains.contains(&"registry.npmjs.org"),
-            "Gemini must include the package-registry base"
-        );
-        assert!(
-            !domains.contains(&"githubcopilot.com"),
-            "Gemini must not get Copilot infra"
-        );
-    }
-
-    #[test]
     fn antigravity_default_domains_include_google_and_own_domain() {
         let domains = Agent::Antigravity.default_allowed_domains();
-        // Google AI infra (shared with Gemini)...
+        // Google AI infra...
         assert!(domains.contains(&"generativelanguage.googleapis.com"));
+        assert!(domains.contains(&"accounts.google.com"));
         // ...plus Antigravity's own domain.
         assert!(
             domains.contains(&"antigravity.google"),
@@ -2634,7 +2179,6 @@ mod tests {
         for agent in [
             Agent::Copilot,
             Agent::OpenCode,
-            Agent::Gemini,
             Agent::Antigravity,
             Agent::Pi,
             Agent::Claude,
@@ -2681,5 +2225,27 @@ mod tests {
         let candidate = Path::new("/home/user/.asdf/shims/copilot");
         let result = resolve_mise_shim(candidate, "copilot");
         let _ = result;
+    }
+    #[test]
+    fn host_persistence_denies_per_agent() {
+        assert_eq!(
+            Agent::Claude.host_persistence_denies(),
+            ["statusline.sh", "plugins", "settings.json"],
+            "Claude's settings.json hooks auto-fire — it must be denied (#237)"
+        );
+        assert_eq!(
+            Agent::Pi.host_persistence_denies(),
+            // npm/ and git/ hold already-installed package code, editable in
+            // place: denying settings.json alone only stops a NEW entry.
+            ["settings.json", "extensions", "npm", "git"]
+        );
+        assert_eq!(
+            Agent::Antigravity.host_persistence_denies(),
+            ["hooks.json", "mcp_config.json", "bin"]
+        );
+        // No writable dir that hosts auto-executing config for these.
+        assert!(Agent::Copilot.host_persistence_denies().is_empty());
+        assert!(Agent::OpenCode.host_persistence_denies().is_empty());
+        assert!(Agent::Shell.host_persistence_denies().is_empty());
     }
 }

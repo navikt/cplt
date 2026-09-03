@@ -3,7 +3,7 @@
 Rust project. A kernel-enforced sandbox for AI coding agents, using macOS
 Seatbelt (SBPL) and Linux Landlock plus seccomp-BPF and optional bubblewrap,
 with an HTTP CONNECT proxy in front of outbound traffic. It wraps Copilot,
-OpenCode, Gemini, Antigravity, Pi, Claude Code, and a plain shell.
+OpenCode, Antigravity, Pi, Claude Code, and a plain shell.
 
 ## Build and test
 
@@ -73,7 +73,7 @@ set.
 - `src/subscriptions.rs` blocklist subscriptions
 - `src/update.rs` self-update check and download
 - `src/scratch.rs` per-session scratch directory
-- `src/agent.rs` agent abstraction (Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, Shell). Binary discovery, config dirs, session flag translation, default domain allowlists, auth hints. Also holds the agent unit tests, which run as lib tests
+- `src/agent.rs` agent abstraction (Copilot, OpenCode, Antigravity, Pi, Claude Code, Shell). Binary discovery, config dirs, session flag translation, default domain allowlists, auth hints. Also holds the agent unit tests, which run as lib tests
 - `src/main.rs` CLI entry point, orchestration
 - `src/lib.rs` library crate root (re-exports modules for test access)
 - `src/proxy.rs` CONNECT proxy, domain blocking, audit log

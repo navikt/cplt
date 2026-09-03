@@ -196,7 +196,7 @@ const LINUX_SYSTEM_READ_PATHS: &[&str] = &[
 
 /// Tool directories with read + execute access.
 /// Linux equivalent of macOS `TOOL_READ_DIRS` in sandbox_policy.rs.
-const LINUX_TOOL_DIRS: &[&str] = &[
+pub(super) const LINUX_TOOL_DIRS: &[&str] = &[
     "/bin",
     "/sbin",
     "/usr/bin",
