@@ -347,11 +347,15 @@ pub fn generate_toml(report: &DetectionReport) -> String {
     // `git_guard.allow.read`, is reported as an unknown key, and the grant is
     // dropped. That is #228, and it was this hint that produced it.
     if !personal_read.is_empty() || !personal_write.is_empty() || !personal_cache_exec.is_empty() {
+        // The prose is double-commented, the TOML single-commented. Uncommenting
+        // the whole block once — which is what someone copying it actually does —
+        // then leaves the prose as ordinary `#` comments and the TOML live. A
+        // single `#` on the prose would turn it into invalid keys on paste.
         writeln!(
             out,
-            "# Machine-specific — these belong in ~/.config/cplt/config.toml, not here.\n\
-             # Copy the [section] headers too: keys pasted at the end of that file are\n\
-             # scoped by whichever header precedes them, which silently drops the grant."
+            "## Machine-specific — these belong in ~/.config/cplt/config.toml, not here.\n\
+             ## Copy the [section] headers too: keys pasted at the end of that file are\n\
+             ## scoped by whichever header precedes them, which silently drops the grant."
         )
         .unwrap();
         if !personal_read.is_empty() || !personal_write.is_empty() {
@@ -1216,14 +1220,12 @@ mod tests {
         // block stayed correct.
         let pasted: String = generated
             .lines()
-            .skip_while(|l| !l.trim_start().starts_with("# Machine-specific"))
+            .skip_while(|l| !l.trim_start().starts_with("## Machine-specific"))
             .take_while(|l| l.trim_start().starts_with('#'))
             .filter_map(|l| {
                 let l = l.trim_start();
                 l.strip_prefix("# ").or_else(|| l.strip_prefix('#'))
             })
-            .filter(|l| !l.starts_with("Machine-specific") && !l.starts_with("Copy the"))
-            .filter(|l| !l.contains("scoped by whichever"))
             .collect::<Vec<_>>()
             .join("\n");
 
