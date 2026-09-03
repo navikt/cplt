@@ -385,7 +385,6 @@ flow needs access cplt does not grant by default.
 |---|---|---|---|
 | Copilot | never (unverified) | — | — |
 | Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` is set | that OAuth token | none — see below |
-| Gemini CLI | never | — | — |
 | Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` exists and is non-empty | that file | refreshes into that file |
 
 The trade is not free. Whole-Keychain read+write is exchanged for a full OAuth
@@ -445,16 +444,6 @@ Copilot. Only credentials that are durable for a whole session qualify.
   believes is revoked. Every other way the file goes bad — missing, empty,
   unreadable, corrupt, expired past its refresh token — surfaces as a plain sign-in
   error.
-- **Gemini CLI** — keeps the grant. It bundles `@github/keytar` with the service
-  name `gemini-cli-oauth` and refreshes that token in place, so a one-shot
-  extraction breaks refresh. `GEMINI_API_KEY` is a documented alternative auth
-  method, but whether it *outranks* an existing Google OAuth login is undocumented,
-  and that is exactly the shape that makes `ANTHROPIC_API_KEY` unsafe for Claude.
-  Nobody has exercised it: the CLI was not installed on any machine cplt has been
-  tested on. Dropping Gemini's grant needs one of: a verified precedence check on a
-  real logged-in install, or `GEMINI_FORCE_FILE_STORAGE` (which moves the token to
-  gemini-cli's encrypted file store inside the already-granted `~/.gemini`, at the
-  cost of forcing a re-login for existing keychain-stored sessions).
 
 **Copilot is deliberately not eligible.** Claude Code's substitute was
 confirmed by running the agent under a profile with the grant dropped; Copilot's
@@ -463,7 +452,7 @@ point at these vars, but asserting is not probing — and Copilot is the default
 priority-1 agent, while `GITHUB_TOKEN` is the most commonly exported token on a
 developer machine. A fine-grained PAT exported for something unrelated would have
 dropped the grant, and if Copilot rejected it the session would have neither. That
-is the same precedence question this trade declines to assume for Gemini, so
+is the same precedence question this trade declines to assume, so
 Copilot gets the same answer until someone probes it. Re-enabling it is one line
 in `Agent::keychain_substitute_env_vars`.
 
