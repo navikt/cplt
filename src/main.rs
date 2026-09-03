@@ -1459,6 +1459,23 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         );
     }
 
+    // A write grant on a directory the parent executes from cancels the
+    // trusted-binary lookup (#236). Warned, not refused: it would break configs
+    // that work today. Here, after every source is merged, so a repo-proposed
+    // grant is covered too, and not gated on `quiet` — it is a sandbox-boundary
+    // warning, not progress chatter.
+    for (granted, trusted) in resolved.write_grants_over_trusted_bins() {
+        ui::warn(&format!(
+            "allow.write grants {} — inside the trusted binary directory {trusted}.\n  \
+             cplt resolves its own git, bwrap and sandbox-exec from {trusted} and runs them \
+             OUTSIDE the sandbox, as you, around every agent session. An agent that can write \
+             there replaces one of those binaries and gets unsandboxed execution on your next \
+             cplt launch — no approval, no prompt.\n  \
+             Grant a directory cplt never executes from, or drop this grant.",
+            granted.display()
+        ));
+    }
+
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         ui::warn(&format!(

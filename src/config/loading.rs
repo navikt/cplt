@@ -673,6 +673,38 @@ impl Resolved {
         false
     }
 
+    /// Write grants that overlap a [`crate::git::TRUSTED_BIN_DIRS`] entry, as
+    /// `(granted path, trusted dir)` pairs. Empty is the normal case.
+    ///
+    /// `allow.write` accepts an absolute path as-is — `resolve_config_path`
+    /// only expands `~` and canonicalizes — so nothing stops a grant on
+    /// `/opt/homebrew/bin`, which is exactly what a user reaches for to make
+    /// `brew install` work from inside the sandbox. cplt resolves its own
+    /// `git`, `bwrap` and `sandbox-exec` from those directories and runs them
+    /// in the **unsandboxed parent**, so such a grant hands the agent
+    /// unsandboxed execution on the next launch and undoes the whole point of
+    /// [`crate::git::trusted_binary`].
+    ///
+    /// A warning, not a refusal: erroring would break configs that work today.
+    /// Call after `apply_repo_config`, so the repo-proposed grants are in too.
+    ///
+    /// Both directions of `starts_with` count. A grant *inside* a trusted dir
+    /// is the direct hole; a grant on an ancestor (`/usr`, or `/`) is the same
+    /// hole one level up.
+    #[must_use]
+    pub fn write_grants_over_trusted_bins(&self) -> Vec<(PathBuf, &'static str)> {
+        self.allow_write
+            .iter()
+            .flat_map(|granted| {
+                crate::git::TRUSTED_BIN_DIRS.iter().filter_map(move |d| {
+                    let dir = Path::new(d);
+                    (dir.starts_with(granted) || granted.starts_with(dir))
+                        .then(|| (granted.clone(), *d))
+                })
+            })
+            .collect()
+    }
+
     /// Print comprehensive sandbox configuration summary to stderr.
     ///
     /// Shows ALL effective settings including defaults so the user can make
@@ -1766,6 +1798,55 @@ validate = false
     fn config_parse_invalid() {
         let result = Config::parse("[broken");
         assert!(result.is_err());
+    }
+
+    /// The grant that reopens #236: `trusted_binary` refuses `PATH` so the
+    /// parent's `git` can only come from a root-owned directory, and a write
+    /// grant on that directory hands it straight back. Warned about, not
+    /// blocked, so this asserts on the pairs the warning is built from.
+    #[test]
+    fn write_grant_over_a_trusted_bin_dir_is_reported() {
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        resolved.allow_write = vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr"), // ancestor: same hole, one level up
+            PathBuf::from("/usr/bin/subdir"), // inside: the direct hole
+        ];
+        let found = resolved.write_grants_over_trusted_bins();
+        assert!(
+            found
+                .iter()
+                .any(|(g, d)| g == Path::new("/opt/homebrew/bin") && *d == "/opt/homebrew/bin"),
+            "the exact-match grant must be reported: {found:?}"
+        );
+        assert!(
+            found.iter().any(|(g, _)| g == Path::new("/usr")),
+            "a grant on an ancestor of a trusted dir must be reported: {found:?}"
+        );
+        assert!(
+            found.iter().any(|(g, _)| g == Path::new("/usr/bin/subdir")),
+            "a grant inside a trusted dir must be reported: {found:?}"
+        );
+    }
+
+    /// The other direction, so the warning stays rare enough to be read: an
+    /// ordinary build-output or cache grant must produce nothing.
+    #[test]
+    fn ordinary_write_grants_are_not_reported() {
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        resolved.allow_write = vec![
+            PathBuf::from("/home/u/project/build"),
+            PathBuf::from("/tmp/sandbox-out"),
+            PathBuf::from("/home/u/.cache/go-build"),
+            // Neither a prefix of a trusted dir nor prefixed by one: `starts_with`
+            // is component-wise, so this must not match `/usr/bin`.
+            PathBuf::from("/usr/binaries"),
+        ];
+        assert_eq!(
+            resolved.write_grants_over_trusted_bins(),
+            vec![],
+            "an ordinary write grant must not warn"
+        );
     }
 
     #[test]
