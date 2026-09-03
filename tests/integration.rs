@@ -7,11 +7,12 @@
 mod macos_tests {
     use std::ffi::OsString;
     use std::fs::{self, File};
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
+    use std::net::{SocketAddr, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, ExitStatus, Output, Stdio};
+    use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -429,103 +430,320 @@ mod macos_tests {
         }
     }
 
-    fn chrome_dump_dom_args(user_data_dir: &Path) -> Vec<OsString> {
+    fn chrome_probe_args(user_data_dir: &Path) -> Vec<OsString> {
         vec![
             "--headless".into(),
             "--disable-gpu".into(),
             "--no-first-run".into(),
             format!("--user-data-dir={}", user_data_dir.display()).into(),
-            "--dump-dom".into(),
+            "--remote-debugging-port=0".into(),
             "about:blank".into(),
         ]
     }
 
-    fn chrome_output(output: &Output) -> String {
-        format!(
-            "status: {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        )
+    struct ChromeProcess {
+        child: Child,
+        process_group: libc::pid_t,
+        stdout_file: File,
+        stderr_file: File,
+        status: Option<ExitStatus>,
+        cleaned_up: bool,
     }
 
-    fn read_chrome_output(
-        status: ExitStatus,
-        mut stdout_file: File,
-        mut stderr_file: File,
-    ) -> Output {
-        fn read_file(file: &mut File) -> Vec<u8> {
-            file.seek(SeekFrom::Start(0))
-                .expect("rewind Chrome capture file");
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .expect("read Chrome capture file");
-            bytes
+    impl ChromeProcess {
+        fn spawn(stage: &str, command: &mut Command) -> Self {
+            let stdout_file = tempfile::tempfile().expect("create Chrome stdout capture file");
+            let stderr_file = tempfile::tempfile().expect("create Chrome stderr capture file");
+            command
+                .process_group(0)
+                .stdout(Stdio::from(
+                    stdout_file
+                        .try_clone()
+                        .expect("clone Chrome stdout capture file"),
+                ))
+                .stderr(Stdio::from(
+                    stderr_file
+                        .try_clone()
+                        .expect("clone Chrome stderr capture file"),
+                ));
+
+            let mut child = command
+                .spawn()
+                .unwrap_or_else(|error| panic!("{stage}: failed to launch command: {error}"));
+            let process_group = libc::pid_t::try_from(child.id()).unwrap_or_else(|_| {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{stage}: Chrome process ID does not fit pid_t");
+            });
+
+            Self {
+                child,
+                process_group,
+                stdout_file,
+                stderr_file,
+                status: None,
+                cleaned_up: false,
+            }
         }
 
-        Output {
-            status,
-            stdout: read_file(&mut stdout_file),
-            stderr: read_file(&mut stderr_file),
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            if self.status.is_none() {
+                self.status = self.child.try_wait()?;
+            }
+            Ok(self.status)
         }
-    }
 
-    fn run_chrome_command(stage: &str, command: &mut Command) -> Output {
-        const TIMEOUT: Duration = Duration::from_secs(15);
-        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+        fn terminate_and_reap(&mut self) -> Result<String, String> {
+            // SAFETY: The child was placed in its own process group, and killpg
+            // does not dereference pointers. The group ID is the child's PID.
+            let kill_result = unsafe { libc::killpg(self.process_group, libc::SIGKILL) };
+            let kill_error = (kill_result == -1)
+                .then(std::io::Error::last_os_error)
+                .filter(|error| error.raw_os_error() != Some(libc::ESRCH));
 
-        let stdout_file = tempfile::tempfile().expect("create Chrome stdout capture file");
-        let stderr_file = tempfile::tempfile().expect("create Chrome stderr capture file");
-        command
-            .process_group(0)
-            .stdout(Stdio::from(
-                stdout_file
-                    .try_clone()
-                    .expect("clone Chrome stdout capture file"),
+            if kill_error.is_some() && self.status.is_none() {
+                let _ = self.child.kill();
+            }
+            if self.status.is_none() {
+                self.status = Some(
+                    self.child
+                        .wait()
+                        .map_err(|error| format!("failed to reap Chrome child: {error}"))?,
+                );
+            }
+
+            if let Some(error) = kill_error {
+                return Err(format!(
+                    "process-group SIGKILL failed ({error}); attempted direct child cleanup"
+                ));
+            }
+
+            self.cleaned_up = true;
+            Ok(format!(
+                "sent SIGKILL to process group {} and reaped the child",
+                self.process_group
             ))
-            .stderr(Stdio::from(
-                stderr_file
-                    .try_clone()
-                    .expect("clone Chrome stderr capture file"),
-            ));
+        }
 
-        let mut child = command
-            .spawn()
-            .unwrap_or_else(|error| panic!("{stage}: failed to launch command: {error}"));
-        let process_group =
-            libc::pid_t::try_from(child.id()).expect("Chrome process ID must fit pid_t");
-        let deadline = Instant::now() + TIMEOUT;
-
-        let failure = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    return read_chrome_output(status, stdout_file, stderr_file);
+        fn diagnostics(&mut self) -> String {
+            fn read_file(file: &mut File) -> String {
+                if let Err(error) = file.seek(SeekFrom::Start(0)) {
+                    return format!("<failed to rewind capture file: {error}>");
                 }
-                Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
-                Ok(None) => break format!("timed out after {}s", TIMEOUT.as_secs()),
-                Err(error) => break format!("failed while polling command: {error}"),
+                let mut bytes = Vec::new();
+                if let Err(error) = file.read_to_end(&mut bytes) {
+                    return format!("<failed to read capture file: {error}>");
+                }
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+
+            let status = self
+                .status
+                .as_ref()
+                .map_or_else(|| "not reaped".to_string(), ToString::to_string);
+            format!(
+                "status: {status}\nstdout:\n{}\nstderr:\n{}",
+                read_file(&mut self.stdout_file),
+                read_file(&mut self.stderr_file),
+            )
+        }
+    }
+
+    impl Drop for ChromeProcess {
+        fn drop(&mut self) {
+            if self.cleaned_up {
+                return;
+            }
+
+            // SAFETY: See terminate_and_reap. Drop is the last-resort cleanup
+            // path for an unexpected panic while the browser probe is running.
+            let kill_result = unsafe { libc::killpg(self.process_group, libc::SIGKILL) };
+            if kill_result == -1 && self.status.is_none() {
+                let _ = self.child.kill();
+            }
+            if self.status.is_none() {
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    enum DevToolsProbe {
+        Ready,
+        Pending(String),
+        Failed(String),
+    }
+
+    fn probe_devtools_page(user_data_dir: &Path, deadline: Instant) -> DevToolsProbe {
+        const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+        const IO_TIMEOUT: Duration = Duration::from_millis(500);
+
+        let active_port_path = user_data_dir.join("DevToolsActivePort");
+        let active_port = match fs::read_to_string(&active_port_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return DevToolsProbe::Pending("DevToolsActivePort not observed".to_string());
+            }
+            Err(error) => {
+                return DevToolsProbe::Failed(format!(
+                    "failed to read DevToolsActivePort: {error}"
+                ));
+            }
+        };
+        let Some(port_text) = active_port.lines().next().filter(|line| !line.is_empty()) else {
+            return DevToolsProbe::Pending("DevToolsActivePort was empty".to_string());
+        };
+        let port = match port_text.parse::<u16>() {
+            Ok(0) => {
+                return DevToolsProbe::Failed("DevToolsActivePort contained port zero".to_string());
+            }
+            Ok(port) => port,
+            Err(error) => {
+                return DevToolsProbe::Failed(format!(
+                    "DevToolsActivePort contained an invalid port: {error}"
+                ));
             }
         };
 
-        // SAFETY: The child was placed in its own process group, and killpg does
-        // not dereference pointers. The group ID is the spawned child's PID.
-        let kill_result = unsafe { libc::killpg(process_group, libc::SIGKILL) };
-        let kill_error = (kill_result == -1)
-            .then(std::io::Error::last_os_error)
-            .filter(|error| error.raw_os_error() != Some(libc::ESRCH));
-        if kill_error.is_some() {
-            let _ = child.kill();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return DevToolsProbe::Pending("deadline reached before DevTools request".to_string());
         }
-        let status = child.wait().expect("reap failed Chrome process");
-        let output = read_chrome_output(status, stdout_file, stderr_file);
-        let kill_diagnostic = kill_error.map_or_else(
-            || format!("sent SIGKILL to process group {process_group}"),
-            |error| format!("process-group SIGKILL failed ({error}); attempted direct child kill"),
-        );
-        panic!(
-            "{stage}: {failure}; {kill_diagnostic} and reaped the child:\n{}",
-            chrome_output(&output)
-        );
+        let timeout = std::cmp::min(remaining, IO_TIMEOUT);
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut stream = match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => stream,
+            Err(error) => {
+                return DevToolsProbe::Pending(format!(
+                    "DevTools endpoint was not accepting connections: {error}"
+                ));
+            }
+        };
+        if let Err(error) = stream.set_read_timeout(Some(timeout)) {
+            return DevToolsProbe::Failed(format!("failed to set DevTools read timeout: {error}"));
+        }
+        if let Err(error) = stream.set_write_timeout(Some(timeout)) {
+            return DevToolsProbe::Failed(format!("failed to set DevTools write timeout: {error}"));
+        }
+        if let Err(error) = stream
+            .write_all(b"GET /json/list HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        {
+            return DevToolsProbe::Pending(format!("DevTools request failed: {error}"));
+        }
+
+        let mut response = Vec::new();
+        if let Err(error) = stream
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut response)
+        {
+            return DevToolsProbe::Pending(format!("DevTools response failed: {error}"));
+        }
+        if response.len() > 1024 * 1024 {
+            return DevToolsProbe::Failed("DevTools response exceeded 1 MiB".to_string());
+        }
+
+        let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return DevToolsProbe::Failed(
+                "DevTools endpoint returned a malformed HTTP response".to_string(),
+            );
+        };
+        let headers = match std::str::from_utf8(&response[..header_end]) {
+            Ok(headers) => headers,
+            Err(error) => {
+                return DevToolsProbe::Failed(format!(
+                    "DevTools endpoint returned non-UTF-8 HTTP headers: {error}"
+                ));
+            }
+        };
+        let status_code = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1));
+        if status_code != Some("200") {
+            return DevToolsProbe::Failed(format!(
+                "DevTools /json/list returned HTTP status {}",
+                status_code.unwrap_or("<missing>")
+            ));
+        }
+
+        let body = &response[header_end + 4..];
+        let targets: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(targets) => targets,
+            Err(error) => {
+                return DevToolsProbe::Failed(format!(
+                    "DevTools /json/list returned malformed JSON: {error}"
+                ));
+            }
+        };
+        let Some(targets) = targets.as_array() else {
+            return DevToolsProbe::Failed(
+                "DevTools /json/list did not return a JSON array".to_string(),
+            );
+        };
+        if targets.iter().any(|target| {
+            target.get("url").and_then(serde_json::Value::as_str) == Some("about:blank")
+        }) {
+            DevToolsProbe::Ready
+        } else {
+            DevToolsProbe::Pending(format!(
+                "DevTools reported {} page target(s), none at about:blank",
+                targets.len()
+            ))
+        }
+    }
+
+    fn run_chrome_probe(stage: &str, command: &mut Command, user_data_dir: &Path) {
+        const TIMEOUT: Duration = Duration::from_secs(15);
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+        let mut browser = ChromeProcess::spawn(stage, command);
+        let deadline = Instant::now() + TIMEOUT;
+        let mut last_observation = "DevToolsActivePort not observed".to_string();
+
+        let failure = loop {
+            match browser.try_wait() {
+                Ok(Some(status)) => {
+                    break Some(format!(
+                        "Chrome exited before reporting about:blank ({status})"
+                    ));
+                }
+                Err(error) => break Some(format!("failed while polling Chrome: {error}")),
+                Ok(None) => {}
+            }
+
+            if Instant::now() >= deadline {
+                break Some(format!(
+                    "timed out after {}s; last observation: {last_observation}",
+                    TIMEOUT.as_secs()
+                ));
+            }
+
+            match probe_devtools_page(user_data_dir, deadline) {
+                DevToolsProbe::Ready => break None,
+                DevToolsProbe::Pending(observation) => last_observation = observation,
+                DevToolsProbe::Failed(error) => break Some(error),
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(std::cmp::min(POLL_INTERVAL, remaining));
+        };
+
+        let cleanup = browser.terminate_and_reap();
+        let diagnostics = browser.diagnostics();
+        match (failure, cleanup) {
+            (None, Ok(_)) => {}
+            (None, Err(cleanup_error)) => {
+                panic!(
+                    "{stage}: browser was ready but cleanup failed: \
+                     {cleanup_error}\n{diagnostics}"
+                )
+            }
+            (Some(failure), Ok(cleanup)) => {
+                panic!("{stage}: {failure}; {cleanup}:\n{diagnostics}")
+            }
+            (Some(failure), Err(cleanup_error)) => {
+                panic!("{stage}: {failure}; cleanup failed: {cleanup_error}\n{diagnostics}")
+            }
+        }
     }
 
     #[test]
@@ -555,49 +773,34 @@ mod macos_tests {
 
         let control_data_dir = tempfile::tempdir().expect("create control browser state");
         eprintln!("chrome-for-testing stage: unsandboxed control");
-        let control = run_chrome_command(
+        run_chrome_probe(
             "unsandboxed Chrome for Testing control",
-            Command::new(&chrome).args(chrome_dump_dom_args(control_data_dir.path())),
+            Command::new(&chrome).args(chrome_probe_args(control_data_dir.path())),
+            control_data_dir.path(),
         );
-        assert!(
-            control.status.success(),
-            "unsandboxed Chrome for Testing control must succeed:\n{}",
-            chrome_output(&control)
-        );
-        assert!(
-            String::from_utf8_lossy(&control.stdout).contains("<html"),
-            "unsandboxed Chrome for Testing control must dump the about:blank DOM:\n{}",
-            chrome_output(&control)
-        );
+        eprintln!("chrome-for-testing stage: unsandboxed control ready");
 
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
         let allow_cache_exec = ["ms-playwright".to_string()];
         let mut opts = default_opts(&project, &home);
         opts.allow_cache_exec = &allow_cache_exec;
-        let profile = write_real_profile(&opts);
+        let profile = tempfile::NamedTempFile::new()
+            .expect("create generated Chrome test profile")
+            .into_temp_path();
+        fs::write(&profile, generate_profile(&opts)).expect("write generated Chrome test profile");
         let sandbox_data_dir = tempfile::tempdir().expect("create sandboxed browser state");
         eprintln!("chrome-for-testing stage: sandboxed launch");
-        let sandboxed = run_chrome_command(
+        run_chrome_probe(
             "sandboxed Chrome for Testing launch",
             Command::new("sandbox-exec")
                 .arg("-f")
-                .arg(&profile)
+                .arg(profile.as_os_str())
                 .arg(&chrome)
-                .args(chrome_dump_dom_args(sandbox_data_dir.path())),
+                .args(chrome_probe_args(sandbox_data_dir.path())),
+            sandbox_data_dir.path(),
         );
-        fs::remove_file(&profile).expect("remove generated Chrome test profile");
-
-        assert!(
-            sandboxed.status.success(),
-            "Chrome for Testing must launch through the real cplt profile:\n{}",
-            chrome_output(&sandboxed)
-        );
-        assert!(
-            String::from_utf8_lossy(&sandboxed.stdout).contains("<html"),
-            "sandboxed Chrome for Testing must dump the about:blank DOM:\n{}",
-            chrome_output(&sandboxed)
-        );
+        eprintln!("chrome-for-testing stage: sandboxed launch ready");
     }
 
     #[test]
