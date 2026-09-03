@@ -6,11 +6,15 @@
 #[cfg(target_os = "macos")]
 mod macos_tests {
     use std::ffi::OsString;
-    use std::fs;
+    use std::fs::{self, File};
+    use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Command, ExitStatus, Output, Stdio};
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -445,6 +449,85 @@ mod macos_tests {
         )
     }
 
+    fn read_chrome_output(
+        status: ExitStatus,
+        mut stdout_file: File,
+        mut stderr_file: File,
+    ) -> Output {
+        fn read_file(file: &mut File) -> Vec<u8> {
+            file.seek(SeekFrom::Start(0))
+                .expect("rewind Chrome capture file");
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .expect("read Chrome capture file");
+            bytes
+        }
+
+        Output {
+            status,
+            stdout: read_file(&mut stdout_file),
+            stderr: read_file(&mut stderr_file),
+        }
+    }
+
+    fn run_chrome_command(stage: &str, command: &mut Command) -> Output {
+        const TIMEOUT: Duration = Duration::from_secs(15);
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+        let stdout_file = tempfile::tempfile().expect("create Chrome stdout capture file");
+        let stderr_file = tempfile::tempfile().expect("create Chrome stderr capture file");
+        command
+            .process_group(0)
+            .stdout(Stdio::from(
+                stdout_file
+                    .try_clone()
+                    .expect("clone Chrome stdout capture file"),
+            ))
+            .stderr(Stdio::from(
+                stderr_file
+                    .try_clone()
+                    .expect("clone Chrome stderr capture file"),
+            ));
+
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("{stage}: failed to launch command: {error}"));
+        let process_group =
+            libc::pid_t::try_from(child.id()).expect("Chrome process ID must fit pid_t");
+        let deadline = Instant::now() + TIMEOUT;
+
+        let failure = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return read_chrome_output(status, stdout_file, stderr_file);
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
+                Ok(None) => break format!("timed out after {}s", TIMEOUT.as_secs()),
+                Err(error) => break format!("failed while polling command: {error}"),
+            }
+        };
+
+        // SAFETY: The child was placed in its own process group, and killpg does
+        // not dereference pointers. The group ID is the spawned child's PID.
+        let kill_result = unsafe { libc::killpg(process_group, libc::SIGKILL) };
+        let kill_error = (kill_result == -1)
+            .then(std::io::Error::last_os_error)
+            .filter(|error| error.raw_os_error() != Some(libc::ESRCH));
+        if kill_error.is_some() {
+            let _ = child.kill();
+        }
+        let status = child.wait().expect("reap failed Chrome process");
+        let output = read_chrome_output(status, stdout_file, stderr_file);
+        let kill_diagnostic = kill_error.map_or_else(
+            || format!("sent SIGKILL to process group {process_group}"),
+            |error| format!("process-group SIGKILL failed ({error}); attempted direct child kill"),
+        );
+        panic!(
+            "{stage}: {failure}; {kill_diagnostic} and reaped the child:\n{}",
+            chrome_output(&output)
+        );
+    }
+
     #[test]
     fn real_profile_launches_chrome_for_testing() {
         require_sandbox!();
@@ -471,10 +554,11 @@ mod macos_tests {
         );
 
         let control_data_dir = tempfile::tempdir().expect("create control browser state");
-        let control = Command::new(&chrome)
-            .args(chrome_dump_dom_args(control_data_dir.path()))
-            .output()
-            .expect("launch unsandboxed Chrome for Testing control");
+        eprintln!("chrome-for-testing stage: unsandboxed control");
+        let control = run_chrome_command(
+            "unsandboxed Chrome for Testing control",
+            Command::new(&chrome).args(chrome_dump_dom_args(control_data_dir.path())),
+        );
         assert!(
             control.status.success(),
             "unsandboxed Chrome for Testing control must succeed:\n{}",
@@ -493,14 +577,16 @@ mod macos_tests {
         opts.allow_cache_exec = &allow_cache_exec;
         let profile = write_real_profile(&opts);
         let sandbox_data_dir = tempfile::tempdir().expect("create sandboxed browser state");
-        let sandboxed = Command::new("sandbox-exec")
-            .arg("-f")
-            .arg(&profile)
-            .arg(&chrome)
-            .args(chrome_dump_dom_args(sandbox_data_dir.path()))
-            .output();
+        eprintln!("chrome-for-testing stage: sandboxed launch");
+        let sandboxed = run_chrome_command(
+            "sandboxed Chrome for Testing launch",
+            Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile)
+                .arg(&chrome)
+                .args(chrome_dump_dom_args(sandbox_data_dir.path())),
+        );
         fs::remove_file(&profile).expect("remove generated Chrome test profile");
-        let sandboxed = sandboxed.expect("launch Chrome for Testing through sandbox-exec");
 
         assert!(
             sandboxed.status.success(),
