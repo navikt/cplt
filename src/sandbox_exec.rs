@@ -203,6 +203,42 @@ fn configure_command(
 /// the gh proxy to safely block `gh auth token` inside the sandbox
 /// while still giving the agent API access.
 ///
+/// `gh`, resolved from [`crate::git::TRUSTED_BIN_DIRS`], warning once when the
+/// only `gh` on this machine is somewhere else.
+///
+/// Before the trusted-lookup change, `gh` came off `PATH`, so an installation in
+/// `~/.local/bin` or a mise shim worked. It no longer does — correctly, since a
+/// planted `gh` hands the agent both unsandboxed execution and a channel into
+/// the next agent's environment. But the failure is invisible: no token is
+/// injected, and the user sees Copilot's GitHub API calls fail with nothing
+/// pointing at cplt. A `gh` that exists on `PATH` and is not trusted is the one
+/// case worth a line on stderr.
+///
+/// Warned once per process: both token paths call this, and two identical
+/// warnings at launch read like two different problems.
+fn trusted_gh() -> Option<PathBuf> {
+    if let Some(gh) = crate::git::trusted_binary("gh") {
+        return Some(gh);
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if let Some(untrusted) = which_binary("gh") {
+        WARNED.call_once(|| {
+            ui::warn(&format!(
+                "gh is installed at {} — outside the directories cplt trusts for \
+                 unsandboxed helpers ({}).\n  \
+                 The GitHub token is NOT injected, so the agent's GitHub API calls \
+                 will fail. cplt runs `gh auth token` as you, outside the sandbox, \
+                 so it will not run a `gh` a previous session could have replaced.\n  \
+                 Install gh into one of those directories (`brew install gh`, or your \
+                 distro's package), or export GH_TOKEN yourself before launching.",
+                untrusted.display(),
+                crate::git::TRUSTED_BIN_DIRS.join(", ")
+            ));
+        });
+    }
+    None
+}
+
 /// Only injects for agents that need GitHub access (Copilot).
 fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
     // Only inject for Copilot — other agents have their own auth
@@ -220,7 +256,7 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
     // PATH: this runs in the unsandboxed parent at launch and its stdout is
     // treated as a GitHub token, so a planted `gh` gets both code execution as
     // the user and a free channel into the agent's environment.
-    let Some(gh) = crate::git::trusted_binary("gh") else {
+    let Some(gh) = trusted_gh() else {
         return;
     };
     let Ok(output) = std::process::Command::new(&gh)
@@ -278,7 +314,7 @@ fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent) {
     // PATH: this runs in the unsandboxed parent at launch and its stdout is
     // treated as a GitHub token, so a planted `gh` gets both code execution as
     // the user and a free channel into the agent's environment.
-    let Some(gh) = crate::git::trusted_binary("gh") else {
+    let Some(gh) = trusted_gh() else {
         return;
     };
     let Ok(output) = std::process::Command::new(&gh)
