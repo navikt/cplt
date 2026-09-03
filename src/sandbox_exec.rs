@@ -514,7 +514,7 @@ fn restore_terminal_stop_signals() {
     }
 }
 
-/// Forward SIGTERM/SIGHUP to an already-spawned child and wait for it,
+/// Forward SIGINT/SIGTERM/SIGHUP to an already-spawned child and wait for it,
 /// translating the exit status to a u8 exit code (128 + signal if killed).
 fn forward_and_wait(mut child: std::process::Child) -> u8 {
     let child_pid = child.id() as i32;
@@ -537,7 +537,7 @@ fn forward_and_wait(mut child: std::process::Child) -> u8 {
 /// Spawn a sandboxed command, forward signals, and wait for exit.
 ///
 /// Handles SIGTTOU/SIGTTIN suppression (Node.js terminal raw mode),
-/// SIGTERM/SIGHUP forwarding to the child, and cleanup on exit.
+/// SIGINT/SIGTERM/SIGHUP forwarding to the child, and cleanup on exit.
 fn spawn_and_wait(cmd: &mut Command) -> u8 {
     ignore_terminal_stop_signals();
 
@@ -575,6 +575,10 @@ fn install_signal_forwarding(child_pid: i32) {
     }
 
     unsafe {
+        libc::signal(
+            libc::SIGINT,
+            forward_signal as *const () as libc::sighandler_t,
+        );
         libc::signal(
             libc::SIGTERM,
             forward_signal as *const () as libc::sighandler_t,
