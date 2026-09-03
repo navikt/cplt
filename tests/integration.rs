@@ -7,8 +7,7 @@
 mod macos_tests {
     use std::ffi::OsString;
     use std::fs::{self, File};
-    use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
-    use std::net::{SocketAddr, TcpStream};
+    use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -574,8 +573,7 @@ mod macos_tests {
     }
 
     fn probe_devtools_page(user_data_dir: &Path, deadline: Instant) -> DevToolsProbe {
-        const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
-        const IO_TIMEOUT: Duration = Duration::from_millis(500);
+        const HTTP_TIMEOUT: Duration = Duration::from_secs(1);
 
         let active_port_path = user_data_dir.join("DevToolsActivePort");
         let active_port = match fs::read_to_string(&active_port_path) {
@@ -605,68 +603,30 @@ mod macos_tests {
         };
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if remaining < Duration::from_millis(1) {
             return DevToolsProbe::Pending("deadline reached before DevTools request".to_string());
         }
-        let timeout = std::cmp::min(remaining, IO_TIMEOUT);
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
-        let mut stream = match TcpStream::connect_timeout(&address, timeout) {
-            Ok(stream) => stream,
+        let timeout = std::cmp::min(remaining, HTTP_TIMEOUT);
+        let output = match Command::new("/usr/bin/curl")
+            .args(["--silent", "--show-error", "--fail", "--max-time"])
+            .arg(format!("{:.3}", timeout.as_secs_f64()))
+            .arg(format!("http://127.0.0.1:{port}/json/list"))
+            .output()
+        {
+            Ok(output) => output,
             Err(error) => {
-                return DevToolsProbe::Pending(format!(
-                    "DevTools endpoint was not accepting connections: {error}"
-                ));
+                return DevToolsProbe::Failed(format!("failed to launch /usr/bin/curl: {error}"));
             }
         };
-        if let Err(error) = stream.set_read_timeout(Some(timeout)) {
-            return DevToolsProbe::Failed(format!("failed to set DevTools read timeout: {error}"));
-        }
-        if let Err(error) = stream.set_write_timeout(Some(timeout)) {
-            return DevToolsProbe::Failed(format!("failed to set DevTools write timeout: {error}"));
-        }
-        if let Err(error) = stream
-            .write_all(b"GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        {
-            return DevToolsProbe::Pending(format!("DevTools request failed: {error}"));
-        }
-
-        let mut response = Vec::new();
-        if let Err(error) = stream
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_end(&mut response)
-        {
-            return DevToolsProbe::Pending(format!("DevTools response failed: {error}"));
-        }
-        if response.len() > 1024 * 1024 {
-            return DevToolsProbe::Failed("DevTools response exceeded 1 MiB".to_string());
-        }
-
-        let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-            return DevToolsProbe::Failed(
-                "DevTools endpoint returned a malformed HTTP response".to_string(),
-            );
-        };
-        let headers = match std::str::from_utf8(&response[..header_end]) {
-            Ok(headers) => headers,
-            Err(error) => {
-                return DevToolsProbe::Failed(format!(
-                    "DevTools endpoint returned non-UTF-8 HTTP headers: {error}"
-                ));
-            }
-        };
-        let status_code = headers
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1));
-        if status_code != Some("200") {
-            return DevToolsProbe::Failed(format!(
-                "DevTools /json/list returned HTTP status {}",
-                status_code.unwrap_or("<missing>")
+        if !output.status.success() {
+            return DevToolsProbe::Pending(format!(
+                "DevTools curl exited with {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
-        let body = &response[header_end + 4..];
-        let targets: serde_json::Value = match serde_json::from_slice(body) {
+        let targets: serde_json::Value = match serde_json::from_slice(&output.stdout) {
             Ok(targets) => targets,
             Err(error) => {
                 return DevToolsProbe::Failed(format!(
