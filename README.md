@@ -6,7 +6,7 @@
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-**Kernel-enforced sandbox for AI coding agents.** cplt wraps GitHub Copilot CLI, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, or any shell, so the agent can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
+**Kernel-enforced sandbox for AI coding agents.** cplt wraps GitHub Copilot CLI, OpenCode, Antigravity CLI, Pi, Claude Code, or any shell, so the agent can write code but cannot steal credentials, push to main, merge PRs, or exfiltrate secrets.
 
 - **macOS**: Apple Seatbelt/SBPL via `sandbox-exec`
 - **Linux**: Landlock LSM + seccomp-BPF + optional Bubblewrap namespace isolation (kernel 5.13+, full network filtering on 6.7+)
@@ -135,7 +135,7 @@ For the full security model, threat analysis, and test strategy, read [SECURITY.
 | Environment handling | Allowlist plus hardening env injection | More basic pass-through model |
 | Secret file protection | Deny patterns such as `.env*`, `.pem`, `.key` inside the repo | Primarily directory-scoped access |
 | Repo policy | [`.cplt.toml`](docs/configuration.md#per-repo-configuration-cplttoml) with an explicit trust/approval flow | No repo-level policy file |
-| Agent support | Copilot, OpenCode, Gemini CLI, Antigravity CLI, Pi, Claude Code, or shell | Codex only |
+| Agent support | Copilot, OpenCode, Antigravity CLI, Pi, Claude Code, or shell | Codex only |
 
 cplt is not stronger everywhere. Codex CLI has Linux namespace isolation today, and it already exposes explicit sandbox modes such as read-only and workspace-write. cplt does not yet have that mode matrix.
 
@@ -174,7 +174,7 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | Network proxy | HTTP CONNECT + domain allow/block | HTTP + SOCKS5 + experimental TLS MITM |
 | SSH git | Blocked at kernel on macOS (agent socket denied); on Linux only `SSH_AUTH_SOCK` is withheld | Proxied via SOCKS5 |
 | Package manager scripts | Blocked by default (`npm_config_ignore_scripts`) | Not blocked |
-| Agent support | Copilot, OpenCode, Gemini, Antigravity, Pi, Claude Code, Shell | Claude Code |
+| Agent support | Copilot, OpenCode, Antigravity, Pi, Claude Code, Shell | Claude Code |
 | Config | TOML (global + per-repo) | JSON (global only) + `--control-fd` live updates |
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |
 
@@ -362,7 +362,7 @@ Same pattern mise, direnv, and starship use.
 cplt [OPTIONS] [-- <AGENT_ARGS>...]
 ```
 
-Everything after `--` goes straight to the agent process (copilot, opencode, gemini, antigravity, pi, claude, or shell).
+Everything after `--` goes straight to the agent process (copilot, opencode, antigravity, pi, claude, or shell).
 
 ### Policy presets
 
@@ -432,7 +432,7 @@ What passes through:
 | `--allow-tmp-exec` | ⚠️ Dangerous. Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer the scratch dir |
 | `--allow-cache-exec <SUBDIR>` | Allow exec from one `~/Library/Caches/<SUBDIR>`. Repeatable. For tools that cache compiled binaries there, such as Playwright and pnpm dlx |
 | `--allow-cache-exec-any` | ⚠️ Dangerous. Allow exec from all of `~/Library/Caches`. Prefer `--allow-cache-exec <SUBDIR>` |
-| `--allow-browser` | ⚠️ Dangerous. Emits an unscoped `(allow lsopen)`, which lets the agent hand any file or URL to Launch Services. launchd starts the target **outside** the Seatbelt profile, so `open -a Terminal /tmp/x.sh` is an immediate sandbox escape, not just browser-session access. Only turn it on when a sign-in prompt actually appears (MCP server OAuth, re-auth), then turn it back off. Not for a Gemini *first* login — the file it records the auth method in is write-denied, so that login fails in here (cplt warns about it up front); sign in once outside cplt instead. Off by default |
+| `--allow-browser` | ⚠️ Dangerous. Emits an unscoped `(allow lsopen)`, which lets the agent hand any file or URL to Launch Services. launchd starts the target **outside** the Seatbelt profile, so `open -a Terminal /tmp/x.sh` is an immediate sandbox escape, not just browser-session access. Only turn it on when a sign-in prompt actually appears (MCP server OAuth, re-auth), then turn it back off. Off by default |
 | `--deny-clipboard` | Block the agent from reading or writing the macOS clipboard (`pbpaste`/`pbcopy`) by denying the `com.apple.pasteboard` Mach service. Every other Mach service (Keychain, DNS, Security framework) is unaffected |
 | `--use-bubblewrap` | Linux only. Require the bubblewrap namespace layer (PID, mount, IPC, UTS, cgroup, user namespaces plus a private `/tmp`) on top of Landlock and seccomp. Errors out if `bwrap` is missing. Auto-detected when neither flag is given |
 | `--no-bubblewrap` | Linux only. Never use bubblewrap, even when installed. Falls back to Landlock and seccomp. Use it when bwrap breaks a specific tool |
@@ -493,7 +493,7 @@ These translate into the agent's own session flags, so you do not need a `--` se
 
 ¹ Neither OpenCode nor Antigravity has an interactive session picker, so a bare `--resume` means "continue last session". Claude Code has one, so it maps straight across.
 
-`--remote` and `--name` are Copilot-only. Gemini, Pi, and shell mode get no translation at all, so all four flags are dropped for them. Auto-resume is a separate mechanism: when you invoke cplt with no pass-through args and no session flags, it appends `--resume` for you, and that applies to Copilot and Gemini only.
+`--remote` and `--name` are Copilot-only. Pi and shell mode get no translation at all, so all four flags are dropped for them. Auto-resume is a separate mechanism: when you invoke cplt with no pass-through args and no session flags, it appends `--resume` for you, and that applies to Copilot only.
 
 Combine them with sandbox flags and `--` pass-through args:
 
@@ -504,14 +504,13 @@ cplt --remote --name my-task -- -p "fix tests" # remote + named + prompt
 
 ### Agents
 
-Pick one with `--agent <name>`, or make it the default with `cplt config set sandbox.agent <name>`. Copilot, OpenCode, Gemini, and Antigravity are auto-detected from `PATH` in that order when you do not name one.
+Pick one with `--agent <name>`, or make it the default with `cplt config set sandbox.agent <name>`. Copilot, OpenCode, and Antigravity are auto-detected from `PATH` in that order when you do not name one.
 
 | Agent | `--agent` value | Auto-detected | Auth |
 | --- | --- | --- | --- |
 | GitHub Copilot CLI | `copilot` | yes, priority 1 | GitHub token, from the Keychain or `gh` |
 | [OpenCode](https://opencode.ai/) | `opencode` | yes, priority 2 | Copilot subscription via `/connect`, or `--pass-env ANTHROPIC_API_KEY` |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | yes, priority 3 | Google OAuth in the browser, or `--pass-env GEMINI_API_KEY` |
-| [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) | `antigravity`, aliases `agy` and `agi` | yes, priority 4 | Google OAuth in the browser |
+| [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) | `antigravity`, aliases `agy` and `agi` | yes, priority 3 | Google OAuth in the browser |
 | [Pi](https://github.com/earendil-works/pi) | `pi` | no | `--pass-env ANTHROPIC_API_KEY` and friends |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude`, aliases `cc` and `claude-code` | no | Subscription OAuth in `~/.claude` or the Keychain, or `--pass-env ANTHROPIC_API_KEY` |
 | Your shell | `shell` | no | none |
@@ -519,8 +518,7 @@ Pick one with `--agent <name>`, or make it the default with `cplt config set san
 - **Pi and Claude Code are never auto-detected.** `pi` is a generic binary name that could collide with something else on your machine, and Claude Code has to be chosen on purpose.
 - **Third-party API keys are opt-in.** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and the Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`) never pass through unless you name them with `--pass-env`.
 - **Subscription auth needs no env var.** OpenCode's `/connect` device flow stores its token in `~/.local/share/opencode/auth.json`, and Claude Code's OAuth token lives in `~/.claude` (`.credentials.json` on Linux) or the macOS Keychain. Both are reachable inside the sandbox, so cplt does not nag about a missing API key for either.
-- **OAuth browser flows need `--allow-browser`** when a sign-in prompt appears. That covers Gemini CLI and Antigravity.
-- **Gemini's *first* login has to happen outside cplt.** It records the auth method it picked in `~/.gemini/settings.json`, which cplt write-denies because the same file carries auto-firing `SessionStart` hooks. cplt detects this before launching and says so rather than letting the write fail inside the agent. Run `gemini` once normally, then use cplt as usual — see [Known impacts](docs/known-impacts.md#agent-config-dir-host-persistence-denies).
+- **OAuth browser flows need `--allow-browser`** when a sign-in prompt appears. That covers Antigravity.
 - **Claude Code auto-update is disabled** with `DISABLE_AUTOUPDATER=1`. Claude Code has no `--no-auto-update` flag, self-updating inside the sandbox is a persistence vector, and it would fail against read-only install paths anyway.
 - **`CLAUDE_CONFIG_DIR` is honored.** When it is set, cplt grants that directory instead of `~/.claude` and passes the variable through, so a relocated config root keeps working.
 - OpenCode is [an officially supported Copilot client](https://github.blog/changelog/2026-01-16-github-copilot-now-supports-opencode/), so your existing Copilot subscription works with `/connect` inside OpenCode.
