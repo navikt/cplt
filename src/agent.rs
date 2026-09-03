@@ -1229,19 +1229,23 @@ fn resolve_mise_shim(candidate: &Path, binary_name: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok();
     let cwd = home.as_deref().unwrap_or("/");
 
-    let output = std::process::Command::new("mise")
-        .arg("which")
-        .arg(binary_name)
-        .current_dir(cwd)
-        .output()
-        .or_else(|_| {
-            std::process::Command::new("asdf")
+    // Trusted paths, not PATH: this runs in the unsandboxed parent before the
+    // agent starts, and mise's own shims directory is one of the write+exec
+    // grants an agent can plant into. When neither is found in a trusted
+    // directory the installs-dir scan below covers the same case, so nothing is
+    // lost beyond mise's own version resolution.
+    let output = ["mise", "asdf"]
+        .iter()
+        .filter_map(|tool| crate::git::trusted_binary(tool))
+        .filter_map(|tool| {
+            std::process::Command::new(&tool)
                 .arg("which")
                 .arg(binary_name)
                 .current_dir(cwd)
                 .output()
+                .ok()
         })
-        .ok();
+        .find(|out| out.status.success());
 
     if let Some(ref out) = output
         && out.status.success()

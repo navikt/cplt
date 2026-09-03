@@ -68,6 +68,10 @@ pub use env::{
     npmrc_userconfig_stale_variants,
 };
 
+// The in-process PATH lookup. Re-exported (rather than opening the whole `exec`
+// module) for `discover::which_resolved`, which must not spawn `which`.
+pub(crate) use exec::which_binary;
+
 // Landlock policy types — cross-platform for testing.
 pub use landlock_mod::{
     FsAccess, FsRule, LandlockPolicy, NetRule, blocked_syscall_names, describe_policy,
@@ -668,6 +672,91 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant behind [`crate::git::TRUSTED_BIN_DIRS`], not just its
+    /// contents: every directory cplt resolves a parent-side binary from must be
+    /// one the sandbox grants **read** access to and nothing more. A directory
+    /// the sandbox also granted write to would be planted into exactly as easily
+    /// as a `PATH` directory, and the whole fix would be theatre.
+    ///
+    /// Lives here rather than in `git.rs` because both grant lists are private
+    /// to this module, and one test reaching in is cheaper than opening them to
+    /// the crate.
+    ///
+    /// Checked against both platform lists because the resolver is shared; each
+    /// entry only has to be covered by one of them (`/opt/homebrew/bin` is
+    /// macOS-only, `/run/current-system/sw/bin` NixOS-only).
+    ///
+    /// Scope, so the name does not promise more than it checks: this asserts
+    /// membership in the read-only tool-dir grants, and it only covers the
+    /// **built-in** grant lists. It does not scan those for a write overlap
+    /// because every built-in write grant is `$HOME`-relative or a per-tool
+    /// config dir, so none of them can name an absolute system bin dir; if a
+    /// built-in absolute write grant is ever added, extend this.
+    ///
+    /// User configuration is outside that scope. `allow.write` paths go through
+    /// `resolve_config_path`, which accepts an absolute path as-is, so a user
+    /// can grant write on `/usr/local/bin` and overlap a trusted directory. No
+    /// test can see that from here — it is a property of the running config, not
+    /// of the constants.
+    #[test]
+    fn every_trusted_dir_is_covered_by_a_tool_read_grant() {
+        let granted: Vec<&str> = policy::TOOL_READ_DIRS
+            .iter()
+            .chain(landlock_mod::LINUX_TOOL_DIRS)
+            .copied()
+            .collect();
+        for dir in crate::git::TRUSTED_BIN_DIRS {
+            assert!(
+                Path::new(dir).is_absolute(),
+                "{dir} must be an absolute path"
+            );
+            assert!(
+                granted.iter().any(|g| Path::new(dir).starts_with(g)),
+                "{dir} is not covered by a read-only tool dir grant — either it is \
+                 unreachable from the sandbox's own view or, worse, it is writable"
+            );
+        }
+    }
+
+    /// Linux only, and it actually runs in CI: `bwrap` is the sandbox driver,
+    /// executed by the unsandboxed parent, so it must never come off `PATH`.
+    ///
+    /// Asserting only "the result is inside TRUSTED_BIN_DIRS" does not test
+    /// anything: every distro installs bwrap to `/usr/bin`, which is itself
+    /// trusted, so a `PATH` lookup satisfies it on every ordinary host. This
+    /// plants a decoy `bwrap` first on `PATH` instead — a `PATH` lookup returns
+    /// the decoy, trusted resolution cannot, whether or not a real bwrap exists.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_is_never_resolved_from_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let decoy = tmp.path().join("bwrap");
+        std::fs::write(&decoy, "#!/bin/sh\nexit 0\n").expect("write decoy");
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod decoy");
+
+        let path = format!(
+            "{}:{}",
+            tmp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let found = temp_env::with_var("PATH", Some(&path), bubblewrap::check_availability);
+
+        assert_ne!(
+            found.as_deref(),
+            Some(decoy.as_path()),
+            "bwrap was resolved from PATH — a planted binary would drive the sandbox"
+        );
+        assert!(
+            found.as_ref().is_none_or(|p| crate::git::TRUSTED_BIN_DIRS
+                .iter()
+                .any(|d| p.starts_with(d))),
+            "bwrap resolved to {found:?}, outside TRUSTED_BIN_DIRS"
+        );
+    }
 
     /// `extra_git_dirs` is the wiring between `prepare()` and the profile: the
     /// emitter test proves the denies get written, this proves the right
