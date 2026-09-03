@@ -625,7 +625,7 @@ mod macos_tests {
             return DevToolsProbe::Failed(format!("failed to set DevTools write timeout: {error}"));
         }
         if let Err(error) = stream
-            .write_all(b"GET /json/list HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .write_all(b"GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         {
             return DevToolsProbe::Pending(format!("DevTools request failed: {error}"));
         }
