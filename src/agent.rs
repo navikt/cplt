@@ -292,7 +292,7 @@ impl Agent {
     /// Paths inside this agent's writable config dir(s) that auto-execute on
     /// the HOST the next time the agent runs *outside* cplt — a persistence
     /// vector the agent never needs to write mid-session. Each entry is joined
-    /// onto every writable [`Agent::agent_dirs`] grant and denied for writing.
+    /// onto every writable [`Agent::config_dirs`] grant and denied for writing.
     ///
     /// - Claude: `statusline.sh` runs on every prompt render, `plugins/` loads
     ///   at startup, and `settings.json` carries `hooks` (`SessionStart`,
@@ -709,9 +709,14 @@ impl Agent {
             return None;
         }
         let dir = home.join(".gemini");
-        let authenticated = dir.join("oauth_creds.json").exists()
-            || std::fs::read_to_string(dir.join("settings.json"))
-                .is_ok_and(|s| s.contains("selectedAuthType"));
+        // Only a genuinely missing file proves "not signed in". Any other
+        // error — permissions, invalid UTF-8, a flaky mount — is read as
+        // "assume authenticated" so a filesystem hiccup stays silent.
+        let authenticated = dir.join("oauth_creds.json").try_exists().unwrap_or(true)
+            || match std::fs::read_to_string(dir.join("settings.json")) {
+                Ok(s) => s.contains("selectedAuthType"),
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            };
         if authenticated {
             return None;
         }
@@ -1734,6 +1739,18 @@ mod tests {
         std::fs::create_dir_all(home2.join(".gemini")).expect("mkdir");
         std::fs::write(home2.join(".gemini/oauth_creds.json"), "{}").expect("write creds");
         assert!(Agent::Gemini.login_warning(home2).is_none());
+
+        // A read that fails for any reason other than "not there" is a
+        // filesystem problem, not proof of a missing login: a directory where
+        // settings.json belongs makes read_to_string fail with EISDIR, and the
+        // documented contract is to assume authenticated and stay quiet.
+        let tmp3 = tempfile::tempdir().expect("tempdir");
+        let home3 = tmp3.path();
+        std::fs::create_dir_all(home3.join(".gemini/settings.json")).expect("mkdir");
+        assert!(
+            Agent::Gemini.login_warning(home3).is_none(),
+            "an unreadable settings.json must not produce a spurious warning"
+        );
     }
 
     #[test]
