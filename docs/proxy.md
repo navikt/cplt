@@ -171,8 +171,7 @@ plugins.gradle.org  crates.io  static.crates.io  pypi.org  files.pythonhosted.or
 Each agent adds its own endpoints on top of that shared registry base:
 
 - **Copilot:** GitHub Copilot infrastructure, above.
-- **Gemini:** Google Gemini API, Code Assist backend, and Google OAuth.
-- **Antigravity:** the same Google AI infrastructure as Gemini, plus `antigravity.google`.
+- **Antigravity:** Google Gemini API, Code Assist backend, and Google OAuth, plus `antigravity.google`.
 - **Claude:** the Anthropic API, console/login, and feature-flag telemetry.
 - **OpenCode:** only OpenCode's own infra (`opencode.ai`, `models.dev`). OpenCode is provider-agnostic, so you must add your chosen model provider's domain via `allowed_domains` (`api.anthropic.com`, `api.openai.com`, or `generativelanguage.googleapis.com`, for example) before its model traffic is permitted.
 - **Pi:** no infrastructure defaults yet. Add its endpoints via `allowed_domains` when enabling the allowlist. Contributions welcome.

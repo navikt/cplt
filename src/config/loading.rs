@@ -621,6 +621,42 @@ impl Config {
     }
 }
 
+/// Which `allow.write` grants overlap a path the unsandboxed parent executes.
+///
+/// Split out from [`Resolved::write_grants_over_trusted_bins`] so the predicate
+/// can be tested against an injected list. Resolving the real binaries makes the
+/// caller machine-dependent; the rule itself is not, and the rule is the part
+/// worth pinning.
+///
+/// `extra` holds already-resolved binary paths (a Homebrew `bin/git` symlink
+/// followed into `Cellar`, say) — matching those, rather than whole trusted
+/// roots, is what keeps the warning off ordinary `/opt/homebrew/var` grants.
+fn grants_over_trusted_paths(
+    allow_write: &[PathBuf],
+    extra: &[String],
+) -> Vec<(PathBuf, Vec<String>)> {
+    allow_write
+        .iter()
+        .filter_map(|granted| {
+            let mut hit: Vec<String> = crate::git::TRUSTED_BIN_DIRS
+                .iter()
+                .map(|d| (*d).to_string())
+                .chain(extra.iter().cloned())
+                .filter(|d| {
+                    let dir = Path::new(d);
+                    dir.starts_with(granted) || granted.starts_with(dir)
+                })
+                .collect();
+            // A resolved binary usually lives under a bin dir, so one grant can
+            // match both; report each path once. Sorted first because `dedup`
+            // only collapses adjacent duplicates.
+            hit.sort_unstable();
+            hit.dedup();
+            (!hit.is_empty()).then(|| (granted.clone(), hit))
+        })
+        .collect()
+}
+
 /// Read the ambient `NO_PROXY`/`no_proxy` environment value, if any. Kept as a
 /// tiny standalone fn so there is a single place cplt reaches into the process
 /// environment for upstream-proxy-bypass configuration. cplt runs OUTSIDE the
@@ -671,6 +707,67 @@ impl Resolved {
             return true;
         }
         false
+    }
+
+    /// Write grants that overlap [`crate::git::TRUSTED_BIN_DIRS`], as
+    /// `(granted path, every trusted dir it overlaps)`. Empty is the normal case.
+    ///
+    /// Grouped by grant, not one row per pair: a grant on `/usr` or `/` overlaps
+    /// several trusted directories at once, and that is still **one** thing the
+    /// user has to go edit. Emitting a warning per pair would print the same
+    /// advice six times for one line of config.
+    ///
+    /// `allow.write` accepts an absolute path as-is — `resolve_config_path`
+    /// only expands `~` and canonicalizes — so nothing stops a grant on
+    /// `/opt/homebrew/bin`, which is exactly what a user reaches for to make
+    /// `brew install` work from inside the sandbox. cplt resolves its own
+    /// `git`, `bwrap` and `sandbox-exec` from those directories and runs them
+    /// in the **unsandboxed parent**, so such a grant hands the agent
+    /// unsandboxed execution on the next launch and undoes the whole point of
+    /// [`crate::git::trusted_binary`].
+    ///
+    /// A warning, not a refusal: erroring would break configs that work today.
+    /// Call after `apply_repo_config`, so the repo-proposed grants are in too.
+    ///
+    /// Both directions of `starts_with` count. A grant *inside* a trusted dir
+    /// is the direct hole; a grant on an ancestor (`/usr`, or `/`) is the same
+    /// hole one level up.
+    ///
+    /// The *resolved* helper binaries count too, not just the bin dirs.
+    /// `trusted_binary` follows a symlink and accepts any final target under
+    /// [`crate::git::TRUSTED_BIN_ROOTS`], which is what makes Homebrew's
+    /// `bin/git -> ../Cellar/git/*/bin/git` work — so a grant on the Cellar path
+    /// that binary actually resolves to never touches a *bin* dir yet still lets
+    /// the agent rewrite the file the parent executes.
+    ///
+    /// Matched against those resolved paths rather than the roots wholesale.
+    /// The roots are an acceptance filter for symlink targets, and reusing them
+    /// as a warning predicate fires on every ordinary grant under
+    /// `/opt/homebrew` or `/usr/local` — `var/` for a brew-managed database,
+    /// `lib/node_modules` for `npm -g` — none of which can reach the parent's
+    /// git unless the bin symlink already points there. A warning nobody can
+    /// act on is a warning everybody learns to skip.
+    #[must_use]
+    pub fn write_grants_over_trusted_bins(&self) -> Vec<(PathBuf, Vec<String>)> {
+        // Resolution is filesystem-only (no spawn), so this is safe to do while
+        // building the warning. `None` for a binary that is not installed.
+        // Every helper the unsandboxed parent resolves this way and then
+        // spawns. `mise`/`asdf` matter as much as git: `resolve_mise_shim`
+        // runs them in the parent, and the warning text names mise explicitly,
+        // so leaving them out promises coverage the check does not deliver.
+        // `sandbox-exec` is absent deliberately — it is the fixed
+        // /usr/bin/sandbox-exec, never resolved.
+        let resolved: Vec<String> = ["git", "gh", "bwrap", "mise", "asdf"]
+            .iter()
+            .filter_map(|n| crate::git::trusted_binary(n))
+            .map(|p| {
+                std::fs::canonicalize(&p)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        grants_over_trusted_paths(&self.allow_write, &resolved)
     }
 
     /// Print comprehensive sandbox configuration summary to stderr.
@@ -1766,6 +1863,142 @@ validate = false
     fn config_parse_invalid() {
         let result = Config::parse("[broken");
         assert!(result.is_err());
+    }
+
+    /// The grant that reopens #236: `trusted_binary` refuses `PATH` so the
+    /// parent's `git` can only come from a root-owned directory, and a write
+    /// grant on that directory hands it straight back. Warned about, not
+    /// blocked, so this asserts on the pairs the warning is built from.
+    ///
+    /// Driven through `grants_over_trusted_paths` with an injected resolved
+    /// binary: resolving the real one would make the expectations depend on
+    /// whether this machine has Homebrew.
+    #[test]
+    fn write_grant_over_a_trusted_bin_dir_is_reported() {
+        let grants = vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr"), // ancestor: same hole, one level up
+            PathBuf::from("/usr/bin/subdir"), // inside: the direct hole
+        ];
+        let found = grants_over_trusted_paths(&grants, &[]);
+        assert!(
+            found
+                .iter()
+                .any(|(g, dirs)| g == Path::new("/opt/homebrew/bin")
+                    && dirs == &["/opt/homebrew/bin".to_string()]),
+            "the exact-match grant must be reported: {found:?}"
+        );
+        assert!(
+            found.iter().any(|(g, _)| g == Path::new("/usr")),
+            "a grant on an ancestor of a trusted dir must be reported: {found:?}"
+        );
+        assert!(
+            found.iter().any(|(g, _)| g == Path::new("/usr/bin/subdir")),
+            "a grant inside a trusted dir must be reported: {found:?}"
+        );
+        assert_eq!(
+            found.len(),
+            3,
+            "one row per grant, not per (grant, trusted dir) pair: {found:?}"
+        );
+    }
+
+    /// One grant, many overlaps, one warning: `/` contains every trusted
+    /// directory, and six copies of the same advice is how a real warning gets
+    /// scrolled past.
+    #[test]
+    fn a_grant_over_many_trusted_dirs_is_reported_once() {
+        let found = grants_over_trusted_paths(&[PathBuf::from("/")], &[]);
+        assert_eq!(found.len(), 1, "one logical overlap, one row: {found:?}");
+        for expected in crate::git::TRUSTED_BIN_DIRS {
+            assert!(
+                found[0].1.iter().any(|h| h == expected),
+                "the row must name every trusted dir it swallows, missing {expected}: {found:?}"
+            );
+        }
+        // Set-based, not `dedup`-based: `dedup` only collapses ADJACENT
+        // duplicates, so asserting on it would pass if the sort were dropped.
+        let unique: std::collections::BTreeSet<&String> = found[0].1.iter().collect();
+        assert_eq!(
+            unique.len(),
+            found[0].1.len(),
+            "each path named once: {found:?}"
+        );
+    }
+
+    /// The F3 case: `trusted_binary` follows `/opt/homebrew/bin/git` to its
+    /// target under `Cellar`, so a grant there lets the agent rewrite the file
+    /// the parent executes — without ever naming a *bin* directory.
+    ///
+    /// Matched against the resolved binary, not the whole `/opt/homebrew` root:
+    /// warning on the root would also fire on `/opt/homebrew/var`, which cannot
+    /// reach the parent's git at all.
+    #[test]
+    fn a_write_grant_over_a_resolved_binary_is_reported() {
+        let resolved = vec!["/opt/homebrew/Cellar/git/2.51.0/bin/git".to_string()];
+        let found = grants_over_trusted_paths(&[PathBuf::from("/opt/homebrew/Cellar")], &resolved);
+        assert_eq!(
+            found.len(),
+            1,
+            "a grant containing the resolved binary must be reported: {found:?}"
+        );
+        assert!(
+            found[0].1.iter().any(|h| h.contains("Cellar")),
+            "the row must name the resolved binary it covers: {found:?}"
+        );
+    }
+
+    /// A resolved binary that IS a trusted bin dir entry (a `git` living
+    /// directly in `/usr/bin`, no symlink) puts the same string in the chain
+    /// twice, non-adjacently. `dedup` alone only collapses adjacent duplicates,
+    /// so this fails if the sort before it is ever dropped.
+    #[test]
+    fn a_path_reachable_two_ways_is_named_once() {
+        let resolved = vec!["/usr/bin".to_string()];
+        let found = grants_over_trusted_paths(&[PathBuf::from("/")], &resolved);
+        assert_eq!(found.len(), 1);
+        let hits = &found[0].1;
+        assert_eq!(
+            hits.iter().filter(|h| *h == "/usr/bin").count(),
+            1,
+            "/usr/bin arrives from both the dir list and the resolved binary, \
+             and must still be named once: {hits:?}"
+        );
+    }
+
+    /// The counterpart, and the reason this is matched on resolved binaries
+    /// rather than on `TRUSTED_BIN_ROOTS`: a brew-managed database directory is
+    /// an ordinary grant that cannot reach the parent's git.
+    #[test]
+    fn an_ordinary_grant_under_a_trusted_root_is_not_reported() {
+        let resolved = vec!["/opt/homebrew/Cellar/git/2.51.0/bin/git".to_string()];
+        for ordinary in ["/opt/homebrew/var", "/usr/local/lib/node_modules"] {
+            let found = grants_over_trusted_paths(&[PathBuf::from(ordinary)], &resolved);
+            assert!(
+                found.is_empty(),
+                "{ordinary} cannot reach the parent's binaries and must not warn: {found:?}"
+            );
+        }
+    }
+
+    /// The other direction, so the warning stays rare enough to be read: an
+    /// ordinary build-output or cache grant must produce nothing.
+    #[test]
+    fn ordinary_write_grants_are_not_reported() {
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        resolved.allow_write = vec![
+            PathBuf::from("/home/u/project/build"),
+            PathBuf::from("/tmp/sandbox-out"),
+            PathBuf::from("/home/u/.cache/go-build"),
+            // Neither a prefix of a trusted dir nor prefixed by one: `starts_with`
+            // is component-wise, so this must not match `/usr/bin`.
+            PathBuf::from("/usr/binaries"),
+        ];
+        assert_eq!(
+            resolved.write_grants_over_trusted_bins(),
+            vec![],
+            "an ordinary write grant must not warn"
+        );
     }
 
     #[test]

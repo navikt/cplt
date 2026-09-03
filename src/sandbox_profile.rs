@@ -291,16 +291,11 @@ fn emit_project_access(sb: &mut String, project: &str) {
 /// non-repo grant, and it covers a repo the agent creates mid-session with
 /// `git init` **at the grant root itself**.
 ///
-/// KNOWN GAP — only the root is ever covered, never a subdirectory of it.
-/// `--allow-write ~/work` denies `~/work/.git/hooks`, but
-/// `~/work/proj/.git/hooks` stays writable, whether `proj` was already a repo
-/// at launch or the agent creates one there during the session. This is the
-/// same shape as granting a directory that merely *contains* repos (#212's
-/// third scope bullet) and is not closed here: it needs either a repo walk at
-/// launch or a global path regex, and the regex is macOS-only — it would give
-/// Landlock nothing and widen the platform divergence. There is no dedicated
-/// issue for it: it is tracked as a checklist item under the multi-repo work in
-/// #165, alongside the same gap for a `--project-dir` that contains repos.
+/// The path rules here cover the root only. Repositories nested *beneath* a
+/// writable root — `~/work/proj/.git/hooks` under `--allow-write ~/work` — are
+/// covered by `emit_nested_gitdir_denies` instead (#247), which is a regex and
+/// therefore macOS only: on Linux that gap stays open outside bubblewrap, the
+/// same limitation already documented for the root case.
 fn writable_roots(project: &str, extra_write: &[PathBuf]) -> Vec<String> {
     let mut roots = vec![project.to_string()];
     for p in extra_write {
@@ -506,8 +501,12 @@ fn emit_system_access(
     //    user clients during renderer init, even in headless mode (SwiftShader
     //    fallback still queries IOKit before deciding to use software rendering).
     //
-    // 4. mach-register — Chromium registers Mach services under the org.chromium.*
-    //    namespace for IPC between browser, renderer, GPU, and Crashpad processes.
+    // 4. mach-register — Chromium registers Mach services for IPC between
+    //    browser, renderer, GPU, and Crashpad processes. The namespace is the
+    //    build's bundle ID, not a fixed string: an upstream Chromium build uses
+    //    org.chromium.*, while the Chrome for Testing build Playwright actually
+    //    downloads uses com.google.chrome.for.testing.* (#263). Both are
+    //    allowed; anything else still cannot register.
     //    Crashpad's child_port_handshake uses bootstrap_check_in() which requires
     //    this permission; without it, EPERM (1100) cascades into a segfault.
     //    Scoped to ^org\.chromium\..+$ — the trailing \. prevents matching
@@ -522,8 +521,8 @@ fn emit_system_access(
     // iokit-open-user-client is unscoped because IOKit class names vary by GPU
     // hardware and macOS version; scoping would break on different machines.
     // system-socket is scoped to AF_UNIX — only Unix domain sockets, not TCP/UDP.
-    // mach-register is scoped to ^org\.chromium\..+$ to prevent registration
-    // of arbitrary global Mach services.
+    // mach-register is scoped to the two known browser namespaces to prevent
+    // registration of arbitrary global Mach services.
     if allow_chromium_runtime {
         sbpl!(
             sb,
@@ -532,9 +531,19 @@ fn emit_system_access(
         sbpl!(sb, "(allow syscall*)");
         sbpl!(sb, "(allow system-socket (socket-domain AF_UNIX))");
         sbpl!(sb, "(allow iokit-open-user-client)");
+        // Two alternations rather than one loose pattern: each anchors the
+        // literal namespace and requires at least one character after the dot,
+        // so neither "org.chromiumevil" nor "com.google.chrome.for.testingX"
+        // matches. Chromium uses variable-depth subnamespaces (crashpad.*,
+        // Chromium.*) and Chrome for Testing appends a pid to
+        // MachPortRendezvousServer, so the tail stays open.
         sbpl!(
             sb,
             r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#
+        );
+        sbpl!(
+            sb,
+            r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\..+$"))"#
         );
         sbpl!(sb);
     }
@@ -548,7 +557,7 @@ fn emit_system_access(
     sbpl!(sb);
 
     // Launch Services — allows `open` to launch URLs in the default browser.
-    // Needed for OAuth code flows (MCP servers, Gemini CLI, gh auth).
+    // Needed for OAuth code flows (MCP servers, Antigravity, gh auth).
     // Opt-in because it lets the agent leverage the user's browser session state.
     if allow_browser {
         sbpl!(sb, ";; Launch Services (OAuth browser flows)");
@@ -794,6 +803,76 @@ fn emit_git_persistence_denies(
     // free only because nothing legitimate ever writes it.
     sbpl!(sb, ";; Per-worktree git config (core.hooksPath vector)");
     sbpl!(sb, "(deny file-write* (regex #\"/config\\.worktree$\"))");
+    sbpl!(sb);
+
+    for root in writable_roots(project, extra_write) {
+        emit_nested_gitdir_denies(sb, &root);
+    }
+}
+
+/// Escape the regex metacharacters that can still appear in a path.
+///
+/// `validate_sbpl_path` already rejects `"`, `(`, `)`, `;`, `\` and newlines, so
+/// what is left is the set below. Without this a project directory like
+/// `~/code/v1.0+rc` would compile to a rule matching more than it names.
+fn escape_regex(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(
+            c,
+            '.' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Extend the git-persistence denies to repositories nested *beneath* a
+/// writable root (#247).
+///
+/// `emit_gitdir_denies` names paths, so it can only cover gitdirs known when
+/// the profile is generated: the project's own, and `<root>/.git` for every
+/// writable root. With `--project-dir ~/code`, or an `allow.write` on a
+/// directory that contains repositories, `~/code/other-repo/.git/hooks/…` stayed
+/// writable — and hooks planted there run outside the sandbox on the user's next
+/// git operation in that repo. A path rule cannot express "any depth", so this
+/// is the one place a regex earns its keep.
+///
+/// The alternation mirrors `emit_gitdir_denies` exactly — `hooks`, `config`,
+/// `commondir`, `modules` — with `($|/)` so the directory entry itself is
+/// covered too (otherwise the agent could plant a *symlink* named `hooks`
+/// pointing at a writable directory). `file-write-unlink` and `file-write-data`
+/// on the `.git` entry close the rename-away trick and the worktree pointer-file
+/// rewrite, for the same reasons spelled out on `emit_gitdir_denies`.
+///
+/// Deliberately narrow: the leading `.+/` means the root's own `.git` is not
+/// matched here (it already has the stronger literal rules), and nothing outside
+/// a path component spelled exactly `.git` can match — `.github/workflows` does
+/// not, because `\.git/` requires the separator immediately after `.git`.
+/// Ordinary work inside a nested repo — source files, build output, and every
+/// git internal except the four names above — is untouched.
+///
+/// Cost: `git clone` and `git init` into a nested directory now fail on their
+/// `.git/config` write. That is the same trade already accepted at the root, and
+/// the alternative is leaving hook execution open.
+///
+/// macOS only. Landlock cannot deny a subpath inside an allowed tree, so on
+/// Linux this gap stays open outside bubblewrap — the same limitation already
+/// documented for the root case. Nothing here implies Linux coverage.
+fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
+    let r = escape_regex(root);
+    sbpl!(
+        sb,
+        ";; Git persistence prevention — repos nested under {root}"
+    );
+    sbpl!(
+        sb,
+        "(deny file-write* (regex #\"^{r}/.+/\\.git/(hooks|config|commondir|modules)($|/)\"))"
+    );
+    sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/.+/\\.git$\"))");
+    sbpl!(sb, "(deny file-write-data (regex #\"^{r}/.+/\\.git$\"))");
     sbpl!(sb);
 }
 
@@ -1353,18 +1432,36 @@ fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
     sbpl!(sb);
 }
 
+/// Resolve symlinks in a path built from `$HOME`, falling back to the path
+/// itself when it does not exist.
+///
+/// `extra_read` / `extra_write` entries are already canonicalized (`--allow-read`
+/// through `canonicalize_paths`, config `allow.read` through
+/// `resolve_config_path`), so any comparison against a path we construct from
+/// `$HOME` must resolve that side too. Without it a dotfile-managed home — where
+/// `~/.npmrc` is a symlink into `~/dotfiles` — never matches, and the user's
+/// explicit grant is silently dropped.
+fn resolved(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
 /// Re-allow credential files from `DENIED_HOME_SUBPATHS` when the user
 /// explicitly opts in via `--allow-read` or `allow.read` in config.toml.
 ///
 /// Emitted AFTER `emit_deny_rules` so SBPL last-match-wins re-allows the file.
 /// Only matches exact paths from `DENIED_HOME_SUBPATHS` — hard denies
 /// (DENIED_FILES, DENIED_DOTFILES) cannot be overridden this way.
+///
+/// The re-allow names the `$HOME` path, not the resolved one: the deny it
+/// overrides names `$HOME` too, and the macOS sandbox matches a rule against
+/// the path as opened, so the literal has to line up with the deny. The
+/// resolved target is separately allowed by `emit_user_allows`.
 fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[PathBuf]) {
     let home_path = Path::new(home);
     let mut overrides: Vec<&str> = Vec::new();
 
     for &file in DENIED_HOME_SUBPATHS {
-        let full_path = home_path.join(file);
+        let full_path = resolved(home_path.join(file));
         if extra_read.iter().any(|p| p == &full_path) {
             overrides.push(file);
         }
@@ -1396,10 +1493,21 @@ fn emit_denied_dotfile_overrides(sb: &mut String, home: &str, extra_read: &[Path
     for path in extra_read {
         for &dotfile in DENIED_DOTFILES {
             let denied_dir = home_path.join(dotfile);
-            if path.starts_with(&denied_dir) && *path != denied_dir {
-                overrides.push(path.to_string_lossy().into_owned());
-                break;
+            let resolved_dir = resolved(denied_dir.clone());
+            let Ok(rel) = path.strip_prefix(&resolved_dir) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
             }
+            overrides.push(path.to_string_lossy().into_owned());
+            // When `~/<dotfile>` is itself a symlink the deny names the $HOME
+            // path, and the macOS sandbox matches a rule against the path as
+            // opened — so the re-allow has to cover that form as well.
+            if resolved_dir != denied_dir {
+                overrides.push(denied_dir.join(rel).to_string_lossy().into_owned());
+            }
+            break;
         }
     }
 
@@ -1741,6 +1849,30 @@ mod tests {
     use super::*;
 
     /// Build a minimal `ProfileOptions` for SBPL-string tests.
+    /// Resolving git from trusted directories means `git_common_dir` is `None`
+    /// on a machine whose git lives elsewhere. The denies for an ordinary repo
+    /// must not depend on it: `<root>/.git` is seeded for every writable root
+    /// unconditionally, so the hooks and config denies stand with no git at all.
+    ///
+    /// Pins the boundary of that guarantee — a worktree's *shared* gitdir, and
+    /// any grant whose repo data is not at `<root>/.git`, still need resolving.
+    /// `discover::gitdir_without_git` recovers those by reading the `.git`
+    /// pointer (and its `commondir`) without spawning anything.
+    #[test]
+    fn git_persistence_denies_do_not_depend_on_a_resolved_git() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        opts.git_common_dir = None;
+        let p = generate_profile(&opts);
+        for rule in [
+            r#"(deny file-write* (subpath "/projects/app/.git/hooks"))"#,
+            r#"(deny file-write* (literal "/projects/app/.git/config"))"#,
+        ] {
+            assert!(p.contains(rule), "MISSING without git_common_dir: {rule}");
+        }
+    }
+
     fn test_options<'a>(
         project_dir: &'a std::path::Path,
         home_dir: &'a std::path::Path,
@@ -2029,6 +2161,121 @@ mod tests {
         assert!(
             !p.contains("\"*:443\""),
             "fail-closed: proxy_forced without a port must not emit *:443"
+        );
+    }
+
+    /// Issue #247: a repo nested under a writable root got no git-persistence
+    /// denies at all, so `~/code/other-repo/.git/hooks/post-checkout` was
+    /// writable and ran unsandboxed on the user's next git operation there.
+    ///
+    /// The kernel behaviour behind these strings was verified with
+    /// `sandbox-exec` against a real nested repository: the hook plant, the
+    /// `.git/config` append, the `mv .git .gitbak` rename and the pointer-file
+    /// rewrite are all refused, while `git add`/`commit`/`checkout -b`/`stash`/
+    /// `gc` inside that repo — and every write under `src/`, `target/`,
+    /// `.github/` — still succeed.
+    #[test]
+    fn nested_repos_under_every_writable_root_get_git_denies() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = root.replace('.', r"\.");
+            for rule in [
+                format!(
+                    "(deny file-write* (regex #\"^{esc}/.+/\\.git/(hooks|config|commondir|modules)($|/)\"))"
+                ),
+                format!("(deny file-write-unlink (regex #\"^{esc}/.+/\\.git$\"))"),
+                format!("(deny file-write-data (regex #\"^{esc}/.+/\\.git$\"))"),
+            ] {
+                assert!(p.contains(&rule), "missing for {root}: {rule}\n{p}");
+            }
+        }
+
+        // Last-match-wins: nothing may re-open write after these.
+        let nested_deny = p
+            .rfind("/.+/\\.git/(hooks|config|commondir|modules)")
+            .expect("nested deny missing");
+        let last_write_allow = p.rfind("(allow file-write*").expect("no write allows");
+        assert!(
+            last_write_allow < nested_deny,
+            "a write allow @ {last_write_allow} comes after the nested git deny @ {nested_deny}"
+        );
+    }
+
+    /// A path is interpolated into a regex, so its metacharacters must not be.
+    /// `~/code/v1.0+rc` would otherwise match `v1X0rc`, `v1X00rc`, and more.
+    #[test]
+    fn nested_gitdir_regex_escapes_path_metacharacters() {
+        let project = std::path::Path::new("/projects/v1.0+rc[x]");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home));
+
+        assert!(
+            p.contains(
+                r#"(deny file-write-unlink (regex #"^/projects/v1\.0\+rc\[x\]/.+/\.git$"))"#
+            ),
+            "path metacharacters not escaped:\n{p}"
+        );
+    }
+
+    /// Issue #244: `allow.read` entries are canonicalized, so a dotfile-managed
+    /// `~/.npmrc` symlink used to miss the `home.join(file)` comparison and the
+    /// re-allow was silently never emitted.
+    #[test]
+    fn symlinked_credential_file_still_gets_its_reallow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        std::fs::create_dir_all(home.join("dotfiles")).expect("mkdir");
+        std::fs::write(home.join("dotfiles/npmrc"), "//r/:_authToken=x\n").expect("write");
+        std::os::unix::fs::symlink(home.join("dotfiles/npmrc"), home.join(".npmrc"))
+            .expect("symlink");
+
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let mut opts = test_options(&project, &home);
+        // What canonicalize_paths / resolve_config_path would put in extra_read.
+        let extra_read = [std::fs::canonicalize(home.join(".npmrc")).expect("canonicalize")];
+        assert_eq!(extra_read[0], home.join("dotfiles/npmrc"));
+        opts.extra_read = &extra_read;
+        let p = generate_profile(&opts);
+
+        let home_str = home.display();
+        assert!(
+            p.contains(&format!(
+                "(allow file-read* (literal \"{home_str}/.npmrc\"))"
+            )),
+            "re-allow for the symlinked ~/.npmrc missing from profile:\n{p}"
+        );
+    }
+
+    /// Same class, `DENIED_DOTFILES` half: a symlinked `~/.aws` must still get
+    /// the targeted re-allow, and it must name the `$HOME` path the deny uses.
+    #[test]
+    fn symlinked_denied_dotfile_dir_still_gets_its_reallow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        std::fs::create_dir_all(home.join("dotfiles/aws")).expect("mkdir");
+        std::fs::write(home.join("dotfiles/aws/config"), "[default]\n").expect("write");
+        std::os::unix::fs::symlink(home.join("dotfiles/aws"), home.join(".aws")).expect("symlink");
+
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let mut opts = test_options(&project, &home);
+        let extra_read = [std::fs::canonicalize(home.join(".aws/config")).expect("canonicalize")];
+        opts.extra_read = &extra_read;
+        let p = generate_profile(&opts);
+
+        let home_str = home.display();
+        assert!(
+            p.contains(&format!(
+                "(allow file-read* (literal \"{home_str}/.aws/config\"))"
+            )),
+            "re-allow naming the $HOME path missing from profile:\n{p}"
         );
     }
 }

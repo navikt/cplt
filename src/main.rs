@@ -29,10 +29,10 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 /// Apple Seatbelt (SBPL) via sandbox-exec. On Linux it is Landlock LSM plus
 /// seccomp-BPF, needing kernel 5.13+, or 6.7+ for full network filtering.
 ///
-/// cplt sandboxes GitHub Copilot CLI, OpenCode, Google Gemini CLI, Antigravity
-/// CLI, Pi, and Claude Code. It auto-detects Copilot, OpenCode, Gemini, and
-/// Antigravity from PATH. Pick Pi or Claude Code with --agent, which also
-/// overrides the detected agent at any time.
+/// cplt sandboxes GitHub Copilot CLI, OpenCode, Antigravity CLI, Pi, and
+/// Claude Code. It auto-detects Copilot, OpenCode, and Antigravity from PATH.
+/// Pick Pi or Claude Code with --agent, which also overrides the detected agent
+/// at any time.
 ///
 /// Save your defaults in ~/.config/cplt/config.toml to stop passing flags every
 /// time. Run `cplt config init` for a starter config, or `cplt config validate`
@@ -50,8 +50,8 @@ EXAMPLES:
   cplt --agent opencode --pass-env ANTHROPIC_API_KEY
     Run OpenCode in sandbox with Anthropic API key
 
-  cplt --agent gemini
-    Run Gemini CLI in sandbox (uses Google OAuth or GEMINI_API_KEY)
+  cplt --agent agy
+    Run Antigravity CLI in sandbox (uses Google OAuth)
 
   cplt --with-proxy -- -p \"fix the tests\"
     Run with proxy for connection logging and domain blocking
@@ -437,7 +437,7 @@ grants exec to every binary cached by any application. Prefer
     allow_cache_exec_any: bool,
 
     /// Allow the agent to open URLs in your default browser.
-    /// Needed for OAuth code flows (MCP servers, Gemini CLI, gh auth login).
+    /// Needed for OAuth code flows (MCP servers, Antigravity, gh auth login).
     /// Disabled by default because it lets the agent use your browser session.
     #[arg(long)]
     allow_browser: bool,
@@ -1461,6 +1461,53 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         );
     }
 
+    // A write grant on a directory the parent executes from cancels the
+    // trusted-binary lookup (#236). Warned, not refused: it would break configs
+    // that work today. Here, after every source is merged, so a repo-proposed
+    // grant is covered too, and not gated on `quiet` — it is a sandbox-boundary
+    // warning, not progress chatter.
+    // One warning per grant, however many trusted directories it swallows — the
+    // grant is the single line of config the user has to go change.
+    for (granted, trusted) in resolved.write_grants_over_trusted_bins() {
+        let dirs = trusted.join(", ");
+        // Two different overlaps, and the user can only act on the right one:
+        // a grant *in* a trusted dir is the direct hole, a grant on an
+        // ancestor (`/usr` over `/usr/bin`) hands out the same hole by
+        // containment. Same danger, different thing to go edit.
+        // "path", not "directory": a hit can be a bin directory OR the resolved
+        // binary itself, which is where a Homebrew-style symlink target lands.
+        let overlap = if trusted.iter().any(|t| granted.starts_with(t)) {
+            format!(
+                "allow.write grants {} — inside the trusted binary path {dirs}.",
+                granted.display()
+            )
+        } else {
+            let plural = if trusted.len() == 1 { "" } else { "s" };
+            format!(
+                "allow.write grants {}, which contains the trusted binary path{plural} {dirs}.",
+                granted.display()
+            )
+        };
+        // Named per platform, and only the helpers actually resolved this way:
+        // `sandbox-exec` is macOS-only and is not resolved at all (it is the
+        // fixed /usr/bin/sandbox-exec), `bwrap` is Linux-only. Naming the wrong
+        // one is how a security warning gets dismissed as not applying.
+        let helpers = if cfg!(target_os = "macos") {
+            "git, gh and mise"
+        } else {
+            "git, gh, mise and bwrap"
+        };
+        ui::warn(&format!(
+            "{overlap}\n  \
+             cplt resolves its parent-side helpers ({helpers}) from a fixed set of trusted \
+             directories — {} — and runs them OUTSIDE the sandbox, as you, around every agent \
+             session. An agent that can write to any of them replaces one of those binaries and \
+             gets unsandboxed execution on your next cplt launch — no approval, no prompt.\n  \
+             Grant a directory cplt never executes from, or drop this grant.",
+            cplt::git::TRUSTED_BIN_DIRS.join(", ")
+        ));
+    }
+
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         ui::warn(&format!(
@@ -1525,11 +1572,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                              Install one of:\n\
                              [cplt]   Copilot CLI: brew install --cask copilot-cli\n\
                              [cplt]   OpenCode:    npm i -g opencode-ai\n\
-                             [cplt]   Gemini CLI:  npm i -g @google/gemini-cli\n\
                              [cplt]   Antigravity: https://antigravity.google/docs/cli-getting-started\n\
                              [cplt]   Pi:          npm i -g @earendil-works/pi-coding-agent\n\
                              [cplt]   Claude Code: npm i -g @anthropic-ai/claude-code\n\
-                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|gemini|antigravity|pi|claude|shell"
+                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|antigravity|pi|claude|shell"
                         );
                     }
                 }
@@ -1548,8 +1594,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         let has_api_key = hints.iter().any(|key| {
             parent_env.iter().any(|(k, _)| k == *key) && resolved.pass_env.iter().any(|v| v == *key)
         });
-        // OAuth-first agents (Copilot, OpenCode, Gemini, Antigravity, Claude
-        // Code) keep their credentials on disk in a granted config dir or the
+        // OAuth-first agents (Copilot, OpenCode, Antigravity, Claude Code)
+        // keep their credentials on disk in a granted config dir or the
         // macOS Keychain after an interactive login, so they authenticate with
         // no env var. Don't nag them about API keys: they prompt for login
         // themselves when unauthenticated, and the warning otherwise fires for
@@ -1576,41 +1622,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             ));
         }
 
-        // #237: the host-persistence guard write-denies the agent's own
-        // settings.json, which for Gemini is also where first-run login records
-        // the auth method. Warn up front rather than letting the user meet it
-        // as an opaque permission error from inside the agent, with nothing
-        // naming cplt anywhere in it.
-        //
-        // A warning, not a refusal: the login may well be the only thing that
-        // breaks, and blocking the launch over it takes the choice away. The
-        // cost is that the user can still walk into the failure, so the text
-        // has to be complete enough to be *recognised* later, not just read
-        // now — see `Agent::login_warning`.
-        //
-        // Skipped only where the premise is wrong: a provider API key passed
-        // through authenticates without touching the file, and --inherit-env
-        // may carry one we cannot see. Diagnostic paths (`cplt check`,
-        // --print-profile, --doctor) are NOT exempt — now that nothing is
-        // blocked, the warning is information there too.
-        //
-        // Emitted BEFORE the --allow-browser hint below, deliberately: telling
-        // someone to add a flag for a login that cannot succeed in here is the
-        // contradiction this warning exists to remove.
-        if !has_api_key
-            && !resolved.inherit_env
-            && let Some(msg) = active_agent.login_warning(&home_dir)
-        {
-            ui::warn(&msg);
-        }
-
         // Suppressing the API-key hint for OAuth-first agents leaves the
         // browser-flow ones with no signal at all: Google's login opens a
         // browser, and --allow-browser is off by default, so a user who hits a
         // sign-in prompt hits a dead end. Point at the flag rather than the key.
-        // Says "if you are prompted", not "on first run": for Gemini the
-        // warning above already covers first run, so the prompts this is
-        // really about are re-auth and OAuth from an MCP server.
+        // Says "if you are prompted", not "on first run": the login warning
+        // above already covers first run for the agents that have one, so the
+        // prompts this is really about are re-auth and OAuth from an MCP
+        // server.
         if active_agent.oauth_first()
             && active_agent.oauth_needs_browser()
             && !resolved.allow_browser
@@ -2623,14 +2642,11 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 
     // Auto-resume: when no explicit args are given and no session flags are set,
     // default to --resume so the agent continues the previous session.
-    // Applies to Copilot and Gemini. Skipped if user passes -- args or uses
-    // explicit session management flags (--resume, --continue, --name).
+    // Applies to Copilot. Skipped if user passes -- args or uses explicit
+    // session management flags (--resume, --continue, --name).
     let has_session_flags =
         cli.resume.is_some() || cli.continue_session || cli.session_name.is_some();
-    if matches!(agent, agent::Agent::Copilot | agent::Agent::Gemini)
-        && cli.copilot_args.is_empty()
-        && !has_session_flags
-    {
+    if matches!(agent, agent::Agent::Copilot) && cli.copilot_args.is_empty() && !has_session_flags {
         args.push("--resume".into());
     }
 
@@ -5486,7 +5502,10 @@ fn start_denial_stream() -> Option<std::process::Child> {
     #[cfg(target_os = "macos")]
     {
         ui::info("Streaming sandbox denial logs (--show-denials)...");
-        match std::process::Command::new("log")
+        // Absolute: a bare name is resolved from the parent's PATH at spawn
+        // time, and the sandbox grants the agent write+exec on directories that
+        // sit on it. /usr/bin/log is the only valid location.
+        match std::process::Command::new("/usr/bin/log")
             .args([
                 "stream",
                 "--predicate",
@@ -6400,20 +6419,6 @@ mod tests {
         let cli = parse(&["--", "run", "fix tests"]);
         let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
         assert_eq!(args, vec!["run", "fix tests"]);
-    }
-
-    #[test]
-    fn gemini_auto_resume_when_no_args() {
-        let cli = parse(&[]);
-        let args = build_copilot_args(&cli, &agent::Agent::Gemini);
-        assert_eq!(args, vec!["--resume"]);
-    }
-
-    #[test]
-    fn gemini_no_auto_resume_when_args_given() {
-        let cli = parse(&["--", "-p", "fix tests"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Gemini);
-        assert_eq!(args, vec!["-p", "fix tests"]);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

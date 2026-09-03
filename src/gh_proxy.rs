@@ -1311,9 +1311,10 @@ fn extract_repo_from_api_path(endpoint: &str) -> Option<String> {
 /// variables are ignored because they could retarget the guard's scope.
 ///
 /// Deliberately does **not** route through [`crate::git::command`] (#210).
-/// That builder resolves `git` through `PATH`; this one must use the
-/// caller-validated `real_git` binary, and it needs `--local --no-includes`,
-/// which is stricter than the shared path. `git config` executes nothing, so
+/// It needs `--local --no-includes`, which is stricter than the shared path.
+/// `real_git` must be a [`crate::git::trusted_git`] path — this runs in the
+/// unsandboxed parent at launch, so a `PATH`-resolved binary here is a previous
+/// session's planted `git` executing as the user. `git config` executes nothing, so
 /// the shared `-c` overrides would add no security here. If this ever grows a
 /// subcommand that reads working-tree content, move it onto the shared path.
 pub fn detect_current_repo(real_git: &Path, project_dir: &Path) -> Result<String, String> {

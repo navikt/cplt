@@ -198,7 +198,6 @@ pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
 const AGENTS_TO_CHECK: &[(&str, &[&str], &[&str])] = &[
     ("Copilot", &["copilot"], &["--version"]),
     ("OpenCode", &["opencode"], &["--version"]),
-    ("Gemini", &["gemini"], &["--version"]),
     ("Antigravity", &["antigravity", "agy"], &["--version"]),
     ("Claude", &["claude"], &["--version"]),
 ];
@@ -987,9 +986,36 @@ pub fn git_hooks_path(home_dir: &Path) -> Option<PathBuf> {
 /// hostile `filter.*.clean` in a granted repo would make the hardened invoker
 /// refuse, and that repo's `.git/hooks` would lose its deny.
 pub fn git_dir_of(dir: &Path) -> Option<PathBuf> {
-    let output = crate::git::command(dir, &["rev-parse", "--git-common-dir"])?
-        .output()
-        .ok()?;
+    git_dir_of_with(
+        crate::git::command(dir, &["rev-parse", "--git-common-dir"]),
+        dir,
+    )
+}
+
+/// [`git_dir_of`] with the hardened invoker's result injected.
+///
+/// Exists so the no-trusted-git arm is reachable in a test: `trusted_git()`
+/// caches in a `OnceLock`, so on a host that has git the fallback branch is
+/// otherwise unreachable and a revert of the wiring goes unnoticed.
+fn git_dir_of_with(cmd: Option<std::process::Command>, dir: &Path) -> Option<PathBuf> {
+    let Some(mut cmd) = cmd else {
+        // No trusted git on this machine. Before this fallback existed, that
+        // returned `None` and every gitdir-derived deny for a worktree or a
+        // separate-gitdir repo silently vanished — the fail-open the doc
+        // comment above warns about, now reachable on an ordinary machine
+        // whose git simply lives outside the trusted directories.
+        //
+        // `<dir>/.git` is enough to recover the common cases without running
+        // anything: a plain repo has it as a directory, and a worktree or
+        // submodule has it as a file holding `gitdir: <path>`. Reading a file
+        // is not a PATH-hijack surface, which is the whole reason git is
+        // resolved from trusted directories in the first place.
+        //
+        // Still `None` for a bare repo (no `.git` entry at all); that case has
+        // no working tree for an agent to be sandboxed into.
+        return gitdir_without_git(dir);
+    };
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1010,6 +1036,86 @@ pub fn git_dir_of(dir: &Path) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// Resolve `<dir>`'s git directory by reading `<dir>/.git`, without running git.
+///
+/// Used only when no trusted git binary exists. Handles the two layouts that
+/// matter for the persistence denies:
+/// - directory → an ordinary repo, the gitdir is `<dir>/.git`
+/// - file      → a worktree or submodule, holding `gitdir: <path>`
+///
+/// The pointer is resolved relative to `<dir>` when relative, canonicalized,
+/// and accepted only if it is a directory — matching what the git-backed path
+/// returns. Deliberately no validation beyond that: the result is turned into
+/// write denies by the caller, so a wrong answer can only over-deny, never
+/// grant. (`git_common_dir` returns before granting whenever there is no
+/// trusted git, because its commondir-steering check runs the invoker too.)
+///
+/// The residual that buys: an agent that can write `<root>/.git` can point this
+/// at any existing directory and get that directory's `hooks`/`config`/`modules`
+/// write-denied next session. Real git refuses a pointer to a non-gitdir; this
+/// does not. It is self-denial-of-service only — it can subtract access, never
+/// add it — and the alternative is validating a gitdir's shape without git,
+/// which is more code for a worse failure mode.
+fn gitdir_without_git(dir: &Path) -> Option<PathBuf> {
+    let dot_git = dir.join(".git");
+    // `metadata`, not `symlink_metadata`: git follows a `.git` symlink to a
+    // directory, and the git-backed path canonicalizes to the target. Not
+    // following it here would drop straight to the `read_to_string` branch,
+    // fail with EISDIR, and lose the target's denies.
+    let meta = std::fs::metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        return std::fs::canonicalize(&dot_git).ok().or(Some(dot_git));
+    }
+    // Regular file only. `read_to_string` opens O_RDONLY, which blocks forever
+    // on a FIFO with no writer — an agent that can write `<root>/.git` could
+    // otherwise `mkfifo` it and hang the next launch before the sandbox exists.
+    // Real git checks the same thing and exits rather than blocking.
+    if !meta.is_file() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let pointer = contents
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim();
+    if pointer.is_empty() {
+        return None;
+    }
+    let path = if Path::new(pointer).is_absolute() {
+        PathBuf::from(pointer)
+    } else {
+        dir.join(pointer)
+    };
+    let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+    if !resolved.is_dir() {
+        return None;
+    }
+    // A worktree's pointer names `<main>/.git/worktrees/<name>`, which is NOT
+    // the directory that holds `hooks/` and `config` — those live in the shared
+    // dir, which `git rev-parse --git-common-dir` returns and which the
+    // per-worktree dir names in its own `commondir` file (git writes literally
+    // `../..`). Returning the per-worktree dir would satisfy nothing: the denies
+    // would land on paths that do not exist while the real hooks stayed open.
+    //
+    // Submodules and `--separate-git-dir` repos have no `commondir`; their
+    // pointer already names the common dir, so they fall through unchanged.
+    if let Ok(raw) = std::fs::read_to_string(resolved.join("commondir")) {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            let common = if Path::new(raw).is_absolute() {
+                PathBuf::from(raw)
+            } else {
+                resolved.join(raw)
+            };
+            let common = std::fs::canonicalize(&common).unwrap_or(common);
+            if common.is_dir() {
+                return Some(common);
+            }
+        }
+    }
+    Some(resolved)
 }
 
 /// Detect if the project is a git worktree and return the shared `.git` directory.
@@ -1196,17 +1302,23 @@ fn find_app_contents(path: &Path) -> Option<PathBuf> {
 }
 
 /// Resolve a command name to its real path (following symlinks).
+///
+/// Reads `PATH` in-process rather than spawning `which`. `discover_tools` runs
+/// on every launch, in the unsandboxed parent, before the agent starts — and it
+/// called this once per tool plus once per app dir. Spawning a bare `which`
+/// there means a `which` planted in one of the write+exec grants a previous
+/// session had (mise shims, `PNPM_HOME`, `~/.bun/bin`) executes as the user.
+/// A pure-Rust lookup has nothing to hijack. Same reasoning as
+/// `git::TRUSTED_BIN_DIRS`, one rung better: no spawn beats a trusted spawn.
+///
+/// Not a trusted-directory lookup, deliberately: the point of discovery is to
+/// report what is on the user's `PATH`, wherever it lives. The returned path is
+/// only ever *reported* or turned into a sandbox grant, never executed — except
+/// by `discover_agents`/`discover_copilot`, which run version probes for
+/// `cplt doctor` only.
 fn which_resolved(name: &str) -> Option<PathBuf> {
-    let output = std::process::Command::new("which")
-        .arg(name)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    // Follow symlinks to get the real path
-    std::fs::canonicalize(&path).ok().or(Some(path))
+    let path = crate::sandbox::which_binary(name)?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 /// Find native `.node` modules matching a name in `~/.copilot/pkg/`.
@@ -1380,6 +1492,137 @@ mod tests {
             "an unquotable common dir must be skipped, not returned for \
              prepare() to hard-error on"
         );
+    }
+
+    /// Without a trusted git, a worktree's gitdir must still resolve — it is
+    /// where the real hooks live, and losing it means losing their write deny.
+    /// The `.git` file is read directly; nothing is spawned.
+    #[test]
+    fn gitdir_without_git_follows_a_worktree_to_the_shared_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let main_git = root.join("main/.git");
+        let per_worktree = main_git.join("worktrees/wt");
+        std::fs::create_dir_all(&per_worktree).expect("mkdir");
+        // What `git worktree add` writes: the pointer names the per-worktree
+        // dir, which names the shared dir in its own `commondir`.
+        std::fs::write(per_worktree.join("commondir"), "../..\n").expect("write commondir");
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).expect("mkdir");
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", per_worktree.display()),
+        )
+        .expect("write");
+
+        // The SHARED dir, not the per-worktree one: `hooks/` and `config` live
+        // there, and it is what `git rev-parse --git-common-dir` returns.
+        assert_eq!(gitdir_without_git(&wt).as_deref(), Some(main_git.as_path()));
+    }
+
+    /// The wiring, not just the helper: with no trusted git, `git_dir_of` must
+    /// fall back rather than return `None`. Untestable through `git_dir_of`
+    /// itself on a host that has git — `trusted_git()` caches — so the invoker
+    /// result is injected.
+    #[test]
+    fn git_dir_of_falls_back_when_there_is_no_trusted_git() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(proj.join(".git")).expect("mkdir");
+
+        assert_eq!(
+            git_dir_of_with(None, &proj).as_deref(),
+            Some(proj.join(".git").as_path()),
+            "no trusted git must fall back to reading .git, not fail open"
+        );
+    }
+
+    /// `read_to_string` on a FIFO blocks forever with no writer. An agent that
+    /// can write `<root>/.git` could `mkfifo` it and hang the next launch
+    /// before the sandbox exists. Real git exits rather than blocking.
+    #[test]
+    fn gitdir_without_git_refuses_a_non_regular_dot_git() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        let fifo = proj.join(".git");
+
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return; // no mkfifo on this machine — nothing to assert
+        }
+        assert_eq!(
+            gitdir_without_git(&proj),
+            None,
+            "a FIFO .git must be refused, not read"
+        );
+    }
+
+    /// A `.git` symlink to a real gitdir is a supported layout, and git follows
+    /// it. Reading link metadata instead would take the pointer-file branch and
+    /// fail with EISDIR, losing the target's denies.
+    #[test]
+    fn gitdir_without_git_follows_a_dot_git_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let real = root.join("elsewhere.git");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        std::os::unix::fs::symlink(&real, proj.join(".git")).expect("symlink");
+
+        assert_eq!(gitdir_without_git(&proj).as_deref(), Some(real.as_path()));
+    }
+
+    /// A relative pointer is the form git actually writes for a submodule.
+    #[test]
+    fn gitdir_without_git_resolves_a_relative_pointer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let real = root.join(".git/modules/sub");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").expect("write");
+
+        assert_eq!(gitdir_without_git(&sub).as_deref(), Some(real.as_path()));
+    }
+
+    #[test]
+    fn gitdir_without_git_handles_a_plain_repo_and_a_non_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+
+        let plain = root.join("plain");
+        std::fs::create_dir_all(plain.join(".git")).expect("mkdir");
+        assert_eq!(
+            gitdir_without_git(&plain).as_deref(),
+            Some(plain.join(".git").as_path())
+        );
+
+        let bare = root.join("nothing");
+        std::fs::create_dir_all(&bare).expect("mkdir");
+        assert_eq!(gitdir_without_git(&bare), None, "no .git entry at all");
+    }
+
+    /// A pointer that does not resolve to a directory is refused rather than
+    /// returned — the git-backed path applies the same `is_dir` check.
+    #[test]
+    fn gitdir_without_git_refuses_a_dangling_pointer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let dir = root.join("proj");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(".git"), "gitdir: /nonexistent/elsewhere\n").expect("write");
+        assert_eq!(gitdir_without_git(&dir), None);
+
+        std::fs::write(dir.join(".git"), "not a pointer at all\n").expect("write");
+        assert_eq!(gitdir_without_git(&dir), None);
     }
 
     /// `git_dir_of` is the resolver behind the #212 sibling-repo protections;

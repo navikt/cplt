@@ -209,6 +209,42 @@ fn configure_command(
 /// the gh proxy to safely block `gh auth token` inside the sandbox
 /// while still giving the agent API access.
 ///
+/// `gh`, resolved from [`crate::git::TRUSTED_BIN_DIRS`], warning once when the
+/// only `gh` on this machine is somewhere else.
+///
+/// Before the trusted-lookup change, `gh` came off `PATH`, so an installation in
+/// `~/.local/bin` or a mise shim worked. It no longer does — correctly, since a
+/// planted `gh` hands the agent both unsandboxed execution and a channel into
+/// the next agent's environment. But the failure is invisible: no token is
+/// injected, and the user sees Copilot's GitHub API calls fail with nothing
+/// pointing at cplt. A `gh` that exists on `PATH` and is not trusted is the one
+/// case worth a line on stderr.
+///
+/// Warned once per process: both token paths call this, and two identical
+/// warnings at launch read like two different problems.
+fn trusted_gh() -> Option<PathBuf> {
+    if let Some(gh) = crate::git::trusted_binary("gh") {
+        return Some(gh);
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if let Some(untrusted) = which_binary("gh") {
+        WARNED.call_once(|| {
+            ui::warn(&format!(
+                "gh is installed at {} — outside the directories cplt trusts for \
+                 unsandboxed helpers ({}).\n  \
+                 The GitHub token is NOT injected, so the agent's GitHub API calls \
+                 will fail. cplt runs `gh auth token` as you, outside the sandbox, \
+                 so it will not run a `gh` a previous session could have replaced.\n  \
+                 Install gh into one of those directories (`brew install gh`, or your \
+                 distro's package), or export GH_TOKEN yourself before launching.",
+                untrusted.display(),
+                crate::git::TRUSTED_BIN_DIRS.join(", ")
+            ));
+        });
+    }
+    None
+}
+
 /// Only injects for agents that need GitHub access (Copilot).
 fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
     // Only inject for Copilot — other agents have their own auth
@@ -222,8 +258,14 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
         return;
     }
 
-    // Extract token from gh CLI config (outside sandbox)
-    let Ok(output) = std::process::Command::new("gh")
+    // Extract token from gh CLI config (outside sandbox). Trusted path, not
+    // PATH: this runs in the unsandboxed parent at launch and its stdout is
+    // treated as a GitHub token, so a planted `gh` gets both code execution as
+    // the user and a free channel into the agent's environment.
+    let Some(gh) = trusted_gh() else {
+        return;
+    };
+    let Ok(output) = std::process::Command::new(&gh)
         .args(["auth", "token"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -274,8 +316,14 @@ fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent) {
         return;
     }
 
-    // Extract token from gh CLI config (outside sandbox)
-    let Ok(output) = std::process::Command::new("gh")
+    // Extract token from gh CLI config (outside sandbox). Trusted path, not
+    // PATH: this runs in the unsandboxed parent at launch and its stdout is
+    // treated as a GitHub token, so a planted `gh` gets both code execution as
+    // the user and a free channel into the agent's environment.
+    let Some(gh) = trusted_gh() else {
+        return;
+    };
+    let Ok(output) = std::process::Command::new(&gh)
         .args(["auth", "token"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -341,8 +389,12 @@ fn install_command_wrappers(
         && let Some(real_gh) = which_binary("gh")
     {
         let repo_scope = if gh_guard.scope_check {
-            if let Some(real_git) = which_binary("git") {
-                match crate::gh_proxy::detect_current_repo(&real_git, project_dir) {
+            // Trusted, not PATH: this git runs in the UNSANDBOXED parent, at
+            // launch. A `git` the previous session planted in ~/.bun/bin (or any
+            // other write+exec grant on PATH) would otherwise execute as the
+            // user here, one session later.
+            if let Some(real_git) = crate::git::trusted_git() {
+                match crate::gh_proxy::detect_current_repo(real_git, project_dir) {
                     Ok(repo) => Some(repo),
                     Err(reason) => {
                         ui::warn(&format!(
@@ -376,8 +428,24 @@ fn install_command_wrappers(
     }
 
     // Install git guard wrapper (only if git_guard enabled)
+    // Trusted first, then PATH — the same call the gh wrapper above makes, and
+    // for the same reason.
+    //
+    // This path is baked into a wrapper the agent's own shell runs INSIDE the
+    // sandbox; it is never executed by the parent. A planted `git` there gains
+    // the agent nothing it does not already have: it can invoke any git by
+    // absolute path and skip the PATH wrapper entirely, so the guard is a policy
+    // on intent, not a boundary. Requiring a trusted git instead removed the
+    // guard outright on every machine whose git comes from mise, asdf,
+    // nix-profile or snap — the agent's PATH still had that git, so `git push`
+    // simply went unguarded. That is a loss with no matching gain.
+    //
+    // Parent-side git (audit, repo-config trust, gh guard scope) stays on
+    // `trusted_git()`, where a planted binary WOULD run unsandboxed.
     if git_guard.enabled
-        && let Some(real_git) = which_binary("git")
+        && let Some(real_git) = crate::git::trusted_git()
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| which_binary("git"))
     {
         let script = crate::gh_proxy::generate_git_wrapper_script(
             &real_git.to_string_lossy(),
@@ -403,16 +471,19 @@ fn install_command_wrappers(
     }
 }
 
-/// Find a binary in PATH by name.
+/// Find an executable in PATH by name.
+///
+/// Executability matters: `which` and `execvp` both skip a file the caller may
+/// not execute, so accepting one here would report a stub as the tool's
+/// location (`cplt doctor`) or hand a caller a path that can only ever fail
+/// with `EACCES`. Deliberately the same predicate as the trusted-directory
+/// lookup — [`crate::git::is_executable_file`], an `X_OK` check, not a
+/// mode-bit test — so the two resolvers cannot disagree about what counts.
 pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|p| crate::git::is_executable_file(p))
 }
 
 /// Ignore SIGTTOU/SIGTTIN — copilot (Node.js) may manipulate terminal
@@ -506,11 +577,20 @@ fn install_signal_forwarding(child_pid: i32) {
 
 // ── macOS: Seatbelt / sandbox-exec ────────────────────────────
 
+/// The Seatbelt driver. Absolute on purpose: a bare program name is resolved
+/// from the parent's PATH at spawn time, and the sandbox grants the agent
+/// write+exec on directories that sit on it (see `TRUSTED_BIN_DIRS` in git.rs).
+#[cfg(target_os = "macos")]
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
 /// Verify the SBPL profile works by running `/usr/bin/true` inside sandbox-exec.
 #[cfg(target_os = "macos")]
 pub fn preflight(sandbox: &super::PreparedSandbox) -> Result<(), String> {
     let profile_path = write_temp_profile(&sandbox.profile_text)?;
-    let output = Command::new("sandbox-exec")
+    // Absolute: `sandbox-exec` only ever lives in /usr/bin (SIP-protected), and
+    // resolving it by name would go through the parent's PATH, which contains
+    // directories the sandbox itself grants the agent write+exec on.
+    let output = Command::new(SANDBOX_EXEC)
         .arg("-f")
         .arg(&profile_path)
         .arg("/usr/bin/true")
@@ -555,7 +635,7 @@ pub fn exec(
         }
     };
 
-    let mut cmd = Command::new("sandbox-exec");
+    let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-f").arg(&profile_path).arg(copilot_bin);
 
     configure_command(
