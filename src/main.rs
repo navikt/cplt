@@ -1464,29 +1464,43 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // that work today. Here, after every source is merged, so a repo-proposed
     // grant is covered too, and not gated on `quiet` — it is a sandbox-boundary
     // warning, not progress chatter.
+    // One warning per grant, however many trusted directories it swallows — the
+    // grant is the single line of config the user has to go change.
     for (granted, trusted) in resolved.write_grants_over_trusted_bins() {
+        let dirs = trusted.join(", ");
         // Two different overlaps, and the user can only act on the right one:
-        // a grant *in* the trusted dir is the direct hole, a grant on an
+        // a grant *in* a trusted dir is the direct hole, a grant on an
         // ancestor (`/usr` over `/usr/bin`) hands out the same hole by
         // containment. Same danger, different thing to go edit.
-        let overlap = if granted.starts_with(trusted) {
+        let overlap = if trusted.iter().any(|t| granted.starts_with(t)) {
             format!(
-                "allow.write grants {} — inside the trusted binary directory {trusted}.",
+                "allow.write grants {} — inside the trusted binary directory {dirs}.",
                 granted.display()
             )
         } else {
+            let plural = if trusted.len() == 1 { "y" } else { "ies" };
             format!(
-                "allow.write grants {}, which contains the trusted binary directory {trusted}.",
+                "allow.write grants {}, which contains the trusted binary director{plural} {dirs}.",
                 granted.display()
             )
         };
+        // Named per platform, and only the helpers actually resolved this way:
+        // `sandbox-exec` is macOS-only and is not resolved at all (it is the
+        // fixed /usr/bin/sandbox-exec), `bwrap` is Linux-only. Naming the wrong
+        // one is how a security warning gets dismissed as not applying.
+        let helpers = if cfg!(target_os = "macos") {
+            "git, gh and mise"
+        } else {
+            "git, gh, mise and bwrap"
+        };
         ui::warn(&format!(
             "{overlap}\n  \
-             cplt resolves its own git, bwrap and sandbox-exec from {trusted} and runs them \
-             OUTSIDE the sandbox, as you, around every agent session. An agent that can write \
-             there replaces one of those binaries and gets unsandboxed execution on your next \
-             cplt launch — no approval, no prompt.\n  \
-             Grant a directory cplt never executes from, or drop this grant."
+             cplt resolves its parent-side helpers ({helpers}) from a fixed set of trusted \
+             directories — {} — and runs them OUTSIDE the sandbox, as you, around every agent \
+             session. An agent that can write to any of them replaces one of those binaries and \
+             gets unsandboxed execution on your next cplt launch — no approval, no prompt.\n  \
+             Grant a directory cplt never executes from, or drop this grant.",
+            cplt::git::TRUSTED_BIN_DIRS.join(", ")
         ));
     }
 

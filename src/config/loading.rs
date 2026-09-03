@@ -673,8 +673,13 @@ impl Resolved {
         false
     }
 
-    /// Write grants that overlap a [`crate::git::TRUSTED_BIN_DIRS`] entry, as
-    /// `(granted path, trusted dir)` pairs. Empty is the normal case.
+    /// Write grants that overlap [`crate::git::TRUSTED_BIN_DIRS`], as
+    /// `(granted path, every trusted dir it overlaps)`. Empty is the normal case.
+    ///
+    /// Grouped by grant, not one row per pair: a grant on `/usr` or `/` overlaps
+    /// several trusted directories at once, and that is still **one** thing the
+    /// user has to go edit. Emitting a warning per pair would print the same
+    /// advice six times for one line of config.
     ///
     /// `allow.write` accepts an absolute path as-is — `resolve_config_path`
     /// only expands `~` and canonicalizes — so nothing stops a grant on
@@ -692,15 +697,19 @@ impl Resolved {
     /// is the direct hole; a grant on an ancestor (`/usr`, or `/`) is the same
     /// hole one level up.
     #[must_use]
-    pub fn write_grants_over_trusted_bins(&self) -> Vec<(PathBuf, &'static str)> {
+    pub fn write_grants_over_trusted_bins(&self) -> Vec<(PathBuf, Vec<&'static str>)> {
         self.allow_write
             .iter()
-            .flat_map(|granted| {
-                crate::git::TRUSTED_BIN_DIRS.iter().filter_map(move |d| {
-                    let dir = Path::new(d);
-                    (dir.starts_with(granted) || granted.starts_with(dir))
-                        .then(|| (granted.clone(), *d))
-                })
+            .filter_map(|granted| {
+                let hit: Vec<&'static str> = crate::git::TRUSTED_BIN_DIRS
+                    .iter()
+                    .filter(|d| {
+                        let dir = Path::new(*d);
+                        dir.starts_with(granted) || granted.starts_with(dir)
+                    })
+                    .copied()
+                    .collect();
+                (!hit.is_empty()).then(|| (granted.clone(), hit))
             })
             .collect()
     }
@@ -1816,7 +1825,8 @@ validate = false
         assert!(
             found
                 .iter()
-                .any(|(g, d)| g == Path::new("/opt/homebrew/bin") && *d == "/opt/homebrew/bin"),
+                .any(|(g, dirs)| g == Path::new("/opt/homebrew/bin")
+                    && dirs == &["/opt/homebrew/bin"]),
             "the exact-match grant must be reported: {found:?}"
         );
         assert!(
@@ -1826,6 +1836,27 @@ validate = false
         assert!(
             found.iter().any(|(g, _)| g == Path::new("/usr/bin/subdir")),
             "a grant inside a trusted dir must be reported: {found:?}"
+        );
+        assert_eq!(
+            found.len(),
+            3,
+            "one row per grant, not per (grant, trusted dir) pair: {found:?}"
+        );
+    }
+
+    /// One grant, many overlaps, one warning: `/` contains every trusted
+    /// directory, and six copies of the same advice is how a real warning gets
+    /// scrolled past.
+    #[test]
+    fn a_grant_over_many_trusted_dirs_is_reported_once() {
+        let mut resolved = Config::default().merge(CliFlags::default()).unwrap();
+        resolved.allow_write = vec![PathBuf::from("/")];
+        let found = resolved.write_grants_over_trusted_bins();
+        assert_eq!(found.len(), 1, "one logical overlap, one row: {found:?}");
+        assert_eq!(
+            found[0].1.len(),
+            crate::git::TRUSTED_BIN_DIRS.len(),
+            "the row must name every trusted dir it swallows: {found:?}"
         );
     }
 
