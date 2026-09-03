@@ -1255,13 +1255,22 @@ mod tests {
     use std::time::Duration;
 
     fn write_script(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
+        // Write to a staging name and rename into place. `Command::spawn` forks,
+        // and on Linux a fork that happens while ANOTHER thread holds this file
+        // open for writing inherits that writable fd, so the exec fails with
+        // ETXTBSY ("Text file busy"). The tests in this module run in parallel
+        // and several of them write scripts, so that race is reachable — it
+        // failed CI here. A rename publishes a path that never had a writable
+        // descriptor, which closes it.
+        let staged = dir.path().join(format!("{name}.staged"));
         let script_path = dir.path().join(name);
-        fs::write(&script_path, body).expect("should write script");
-        let mut permissions = fs::metadata(&script_path)
+        fs::write(&staged, body).expect("should write script");
+        let mut permissions = fs::metadata(&staged)
             .expect("script metadata should exist")
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("script should be executable");
+        fs::set_permissions(&staged, permissions).expect("script should be executable");
+        fs::rename(&staged, &script_path).expect("script should be published atomically");
         script_path
     }
 
