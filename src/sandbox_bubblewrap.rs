@@ -124,10 +124,18 @@ pub(crate) struct BubblewrapWrapper {
 
 /// Check if bubblewrap is available on this system.
 ///
-/// Returns the path to the `bwrap` binary if found in PATH. Reuses the
-/// project's own PATH resolver so no extra crate is needed.
+/// Returns the path to the `bwrap` binary if it exists in one of
+/// [`crate::git::TRUSTED_BIN_DIRS`]. **Not** a `PATH` lookup: `bwrap` is the
+/// sandbox driver, executed by the unsandboxed parent, so a `bwrap` a previous
+/// session planted in a write+exec grant on `PATH` (mise shims, `PNPM_HOME`,
+/// `~/.bun/bin`) would be a complete bypass at the next launch. Resolving at
+/// prepare time does not help — the plant happens a whole session earlier.
+///
+/// Cost: a `bwrap` installed outside those directories is not found, and
+/// auto-detect falls back to Landlock-only with its existing warning. Every
+/// distro package installs it into `/usr/bin`.
 pub(crate) fn check_availability() -> Option<PathBuf> {
-    super::exec::which_binary("bwrap")
+    crate::git::trusted_binary("bwrap")
 }
 
 /// Test that bubblewrap can actually create the namespaces we use.
@@ -662,7 +670,12 @@ fn build_wrapper(
     deny_masks: &DenyMasks,
     strict: bool,
 ) -> Result<BubblewrapWrapper, String> {
-    let bwrap_path = check_availability().ok_or_else(|| "bwrap not found in PATH".to_string())?;
+    let bwrap_path = check_availability().ok_or_else(|| {
+        format!(
+            "bwrap not found in {}",
+            crate::git::TRUSTED_BIN_DIRS.join(", ")
+        )
+    })?;
     test_functionality(&bwrap_path, fs_rules, ro_protect, deny_masks)?;
     let bwrap_args = build_bwrap_args(fs_rules, ro_protect, deny_masks);
     Ok(BubblewrapWrapper {

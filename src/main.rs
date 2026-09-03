@@ -1459,6 +1459,53 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         );
     }
 
+    // A write grant on a directory the parent executes from cancels the
+    // trusted-binary lookup (#236). Warned, not refused: it would break configs
+    // that work today. Here, after every source is merged, so a repo-proposed
+    // grant is covered too, and not gated on `quiet` — it is a sandbox-boundary
+    // warning, not progress chatter.
+    // One warning per grant, however many trusted directories it swallows — the
+    // grant is the single line of config the user has to go change.
+    for (granted, trusted) in resolved.write_grants_over_trusted_bins() {
+        let dirs = trusted.join(", ");
+        // Two different overlaps, and the user can only act on the right one:
+        // a grant *in* a trusted dir is the direct hole, a grant on an
+        // ancestor (`/usr` over `/usr/bin`) hands out the same hole by
+        // containment. Same danger, different thing to go edit.
+        // "path", not "directory": a hit can be a bin directory OR the resolved
+        // binary itself, which is where a Homebrew-style symlink target lands.
+        let overlap = if trusted.iter().any(|t| granted.starts_with(t)) {
+            format!(
+                "allow.write grants {} — inside the trusted binary path {dirs}.",
+                granted.display()
+            )
+        } else {
+            let plural = if trusted.len() == 1 { "" } else { "s" };
+            format!(
+                "allow.write grants {}, which contains the trusted binary path{plural} {dirs}.",
+                granted.display()
+            )
+        };
+        // Named per platform, and only the helpers actually resolved this way:
+        // `sandbox-exec` is macOS-only and is not resolved at all (it is the
+        // fixed /usr/bin/sandbox-exec), `bwrap` is Linux-only. Naming the wrong
+        // one is how a security warning gets dismissed as not applying.
+        let helpers = if cfg!(target_os = "macos") {
+            "git, gh and mise"
+        } else {
+            "git, gh, mise and bwrap"
+        };
+        ui::warn(&format!(
+            "{overlap}\n  \
+             cplt resolves its parent-side helpers ({helpers}) from a fixed set of trusted \
+             directories — {} — and runs them OUTSIDE the sandbox, as you, around every agent \
+             session. An agent that can write to any of them replaces one of those binaries and \
+             gets unsandboxed execution on your next cplt launch — no approval, no prompt.\n  \
+             Grant a directory cplt never executes from, or drop this grant.",
+            cplt::git::TRUSTED_BIN_DIRS.join(", ")
+        ));
+    }
+
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         ui::warn(&format!(
@@ -5534,7 +5581,10 @@ fn start_denial_stream() -> Option<std::process::Child> {
     #[cfg(target_os = "macos")]
     {
         ui::info("Streaming sandbox denial logs (--show-denials)...");
-        match std::process::Command::new("log")
+        // Absolute: a bare name is resolved from the parent's PATH at spawn
+        // time, and the sandbox grants the agent write+exec on directories that
+        // sit on it. /usr/bin/log is the only valid location.
+        match std::process::Command::new("/usr/bin/log")
             .args([
                 "stream",
                 "--predicate",
