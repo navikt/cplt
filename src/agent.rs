@@ -107,6 +107,41 @@ const ANTHROPIC_DOMAINS: &[&str] = &[
 /// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
 const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 
+/// A credential an agent can use instead of the macOS login Keychain (#242).
+///
+/// Returned by [`Agent::credential_outside_keychain`]. The variants exist
+/// because the two kinds need different handling downstream: an env var has to
+/// be forwarded into the sandbox explicitly (credential vars that were not
+/// already in `ENV_ALLOWLIST` on main are deliberately still not in it, so they
+/// reach the agent only as part of this trade), while a file the agent reads
+/// itself needs nothing forwarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeychainSubstitute {
+    /// A credential already set in the parent environment.
+    EnvVar(&'static str),
+    /// A credential file inside a directory the sandbox already grants.
+    File(PathBuf),
+}
+
+impl KeychainSubstitute {
+    /// The variable to forward into the sandbox, if this substitute is one.
+    pub fn env_var(&self) -> Option<&'static str> {
+        match self {
+            KeychainSubstitute::EnvVar(v) => Some(v),
+            KeychainSubstitute::File(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for KeychainSubstitute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeychainSubstitute::EnvVar(v) => write!(f, "${v}"),
+            KeychainSubstitute::File(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
+
 /// Supported AI coding agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -128,6 +163,17 @@ pub enum Agent {
 }
 
 impl Agent {
+    /// Every agent variant, for exhaustive iteration in tests and lookups.
+    pub const ALL: &'static [Agent] = &[
+        Agent::Copilot,
+        Agent::OpenCode,
+        Agent::Antigravity,
+        Agent::Pi,
+        Agent::Claude,
+        Agent::Goose,
+        Agent::Shell,
+    ];
+
     /// The binary name to search for in PATH.
     pub fn binary_name(&self) -> &'static str {
         match self {
@@ -305,7 +351,12 @@ impl Agent {
     }
 
     /// Whether this agent needs macOS Keychain access for auth tokens.
-    /// Copilot stores GitHub auth tokens in the Keychain.
+    ///
+    /// Copilot stores GitHub auth tokens in the Keychain (`copilot-cli`).
+    /// Gemini CLI bundles `@github/keytar` with the service name
+    /// `gemini-cli-oauth` and refreshes that token in place.
+    /// Antigravity's `agy` stores its Google OAuth token under
+    /// `gemini`/`antigravity` and refreshes it there.
     /// Claude Code stores its OAuth token in the login Keychain on macOS
     /// ("Claude Code-credentials"); on Linux it uses ~/.claude/.credentials.json.
     /// OpenCode authenticates via the `/connect` device flow by default;
@@ -313,6 +364,9 @@ impl Agent {
     /// goose stores provider API keys in the OS keyring by default (the macOS
     /// login Keychain); `GOOSE_DISABLE_KEYRING=1` switches it to a plaintext
     /// `secrets.yaml` in the config dir instead, which needs no grant.
+    ///
+    /// This is the *base* term only. Whether a given run actually gets the grant
+    /// is decided at launch by [`Agent::credential_outside_keychain`] (#242).
     pub fn needs_keychain(&self) -> bool {
         matches!(
             self,
@@ -320,6 +374,124 @@ impl Agent {
         )
     }
 
+    /// Environment variables that fully replace this agent's Keychain
+    /// credential, in the agent's own precedence order.
+    ///
+    /// Only variables carrying a credential that is **durable for a session**
+    /// belong here. The Keychain items themselves are refresh blobs: Claude
+    /// Code's `Claude Code-credentials` holds an access token that expires in
+    /// hours and is rewritten in place, and Antigravity's `gemini`/`antigravity`
+    /// item is likewise rewritten. Pre-extracting *those* would hand the agent a
+    /// token that dies mid-session with no way to refresh and no Keychain left
+    /// to re-authenticate against, so cplt does not do it.
+    ///
+    /// `ANTHROPIC_AUTH_TOKEN` is omitted deliberately: Claude Code treats it as a
+    /// gateway token it may itself try to refresh, so it is not a safe stand-in.
+    pub fn keychain_substitute_env_vars(&self) -> &'static [&'static str] {
+        match self {
+            // Copilot gets no substitute until somebody probes it. It is the
+            // default, priority-1 agent, GITHUB_TOKEN is the most commonly
+            // exported token on a developer machine, and whether Copilot CLI
+            // prefers the env var over the Keychain is exactly the precedence
+            // question this trade declines to assume for Gemini. PR #173 asserts
+            // an injected token suffices; asserting is not probing, and the
+            // default agent is the wrong place to find out. Re-enable this with
+            // `["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]` once a run
+            // under a grant-dropped profile has been confirmed to authenticate.
+            Agent::Copilot => &[],
+            // Antigravity has no env substitute either — its credential lives in
+            // a file instead, see `credential_outside_keychain`.
+            Agent::Antigravity => &[],
+            // `claude setup-token` mints a long-lived token for
+            // CLAUDE_CODE_OAUTH_TOKEN. Verified against claude 2.1.258: with it
+            // set, `claude auth status` reports `authMethod: oauth_token`
+            // whether the Keychain is reachable or not — the Keychain item is
+            // never consulted, so dropping the grant changes nothing.
+            //
+            // ANTHROPIC_API_KEY is deliberately NOT here. Claude Code *prefers*
+            // the Keychain claude.ai login over it (`authMethod: claude.ai` with
+            // the key merely listed as `apiKeySource`), so dropping the grant
+            // would silently move a subscription user onto per-token API
+            // billing. Users who want that can pass it explicitly with
+            // `--pass-env ANTHROPIC_API_KEY`.
+            Agent::Claude => &["CLAUDE_CODE_OAUTH_TOKEN"],
+            _ => &[],
+        }
+    }
+
+    /// Where this agent's credential can be read from *without* the login
+    /// Keychain, if anywhere. `Some(_)` means the whole-Keychain grant can be
+    /// dropped for this run; `None` means the grant must stay (#242).
+    ///
+    /// `enabled` is `sandbox.keychain_substitute`, off by default. The whole
+    /// trade is gated on it because the failure mode when it misjudges an agent
+    /// is that the user can neither authenticate nor recover from inside the
+    /// sandbox — the recovery path *is* the credential store the trade removed.
+    /// With it off this always returns `None`, so both the emitted profile and
+    /// the environment reaching the agent are what they were before this key
+    /// existed.
+    ///
+    /// `deny_env` is the resolved `deny.env` list. A repo `.cplt.toml` can name
+    /// a credential var there, and it is stripped from the child environment —
+    /// so a var listed there is NOT a substitute, or the run would end up with
+    /// no Keychain *and* no token. That is the exact failure PR #173 hit, and
+    /// here it would be reachable from a checked-in file.
+    pub fn credential_outside_keychain(
+        &self,
+        home: &Path,
+        deny_env: &[String],
+        enabled: bool,
+    ) -> Option<KeychainSubstitute> {
+        self.credential_outside_keychain_on(home, deny_env, enabled, cfg!(target_os = "macos"))
+    }
+
+    /// [`Agent::credential_outside_keychain`] with the platform as a parameter.
+    ///
+    /// The only reason this is separate: `cfg!` is read in exactly one place
+    /// (the wrapper above), so callers cannot drift, while tests can assert
+    /// *both* platform outcomes from either host. A `#[cfg]`-gated test would
+    /// leave the Linux answer — "the trade never applies" — asserted nowhere.
+    pub(crate) fn credential_outside_keychain_on(
+        &self,
+        home: &Path,
+        deny_env: &[String],
+        enabled: bool,
+        macos: bool,
+    ) -> Option<KeychainSubstitute> {
+        // The whole trade is about the macOS login Keychain. On Linux these
+        // agents read credential files the sandbox already grants, so there is
+        // no grant to drop — and forwarding a token there would be a change with
+        // nothing bought for it.
+        if !enabled || !macos {
+            return None;
+        }
+        if let Some(var) = self
+            .keychain_substitute_env_vars()
+            .iter()
+            .filter(|k| !deny_env.iter().any(|d| d == *k))
+            .find(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+        {
+            return Some(KeychainSubstitute::EnvVar(var));
+        }
+        // Antigravity's `agy` falls back to a plaintext token file when its
+        // keyring is unavailable ("Failed to load token from keyring, falling
+        // back to file"). The file is a *fallback*, not a mirror: a healthy
+        // keyring is written in place and the file is never created, so its mere
+        // existence is the only safe signal that the agent can still
+        // authenticate without the grant. cplt already grants
+        // `~/.gemini/antigravity-cli` read+write, so refreshes persist there.
+        if *self == Agent::Antigravity {
+            let token = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+            // `is_file()` as well as non-empty: a directory reports a non-zero
+            // len (64 on macOS, 4096 on ext4), so a stray directory at this path
+            // would read as a valid credential and drop the Keychain grant,
+            // stranding the agent at a browser re-login it cannot reach.
+            if std::fs::metadata(&token).is_ok_and(|m| m.is_file() && m.len() > 0) {
+                return Some(KeychainSubstitute::File(token));
+            }
+        }
+        None
+    }
     /// Whether this agent needs access to ~/.copilot directory.
     pub fn needs_copilot_dir(&self) -> bool {
         matches!(self, Agent::Copilot)
@@ -1760,10 +1932,39 @@ mod tests {
         }
     }
 
+    /// `Agent::ALL` must list every variant. The wildcard-free `match` makes a
+    /// new variant a compile error here rather than a silently-skipped agent in
+    /// every caller that iterates `ALL`.
+    #[test]
+    fn agent_all_covers_every_variant() {
+        fn tag(a: Agent) -> u8 {
+            match a {
+                Agent::Copilot => 0,
+                Agent::OpenCode => 1,
+                Agent::Antigravity => 2,
+                Agent::Pi => 3,
+                Agent::Claude => 4,
+                Agent::Goose => 5,
+                Agent::Shell => 6,
+            }
+        }
+        assert_eq!(Agent::ALL.len(), 7, "add the new variant to Agent::ALL");
+        let mut seen: Vec<u8> = Agent::ALL.iter().copied().map(tag).collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..7).collect::<Vec<u8>>(),
+            "Agent::ALL has a gap or a duplicate"
+        );
+    }
+
     #[test]
     fn keychain_needs() {
+        // All four are the *base* term — the grant is still conditional on
+        // `credential_outside_keychain` at launch (#242).
         assert!(Agent::Copilot.needs_keychain());
         assert!(Agent::Antigravity.needs_keychain());
+        assert!(Agent::Claude.needs_keychain());
         assert!(Agent::Goose.needs_keychain());
         assert!(!Agent::OpenCode.needs_keychain());
     }

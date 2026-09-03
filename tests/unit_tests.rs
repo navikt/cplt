@@ -779,6 +779,7 @@ fn profile_contains_deny_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(p.contains("(deny default)"));
 }
@@ -819,6 +820,7 @@ fn profile_allows_tty_ioctl() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-ioctl)"),
@@ -868,6 +870,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        keychain_substitute: None,
     });
 
     let device_paths = ["/dev/tty", "/dev/ptmx", "/dev/pts"];
@@ -935,6 +938,7 @@ fn profile_grants_project_access() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(p.contains("(allow file-read* (subpath \"/projects/app\"))"));
     assert!(p.contains("(allow file-write* (subpath \"/projects/app\"))"));
@@ -1004,6 +1008,7 @@ fn profile_grants_copilot_config_access() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(p.contains("(allow file-read* (subpath \"/Users/test/.copilot\"))"));
 }
@@ -1047,6 +1052,7 @@ fn profile_grants_claude_config_access() {
             allow_cache_exec: &[],
             allow_cache_exec_any: false,
             allow_browser: false,
+            credential_outside_keychain: false,
         });
         // Config dir + top-level config file are readable and writable.
         assert!(p.contains("(allow file-read* (subpath \"/Users/test/.claude\"))"));
@@ -1116,6 +1122,7 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
                 allow_cache_exec: &[],
                 allow_cache_exec_any: false,
                 allow_browser: false,
+                credential_outside_keychain: false,
             });
             for dir in agent_dirs.iter().filter(|d| d.write) {
                 for sub in agent.host_persistence_denies() {
@@ -1177,6 +1184,7 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // rfind, not find: emit_home_access emits the identical allow line for the
     // agent-dir grant itself, so the LAST occurrence is the user's allow.write
@@ -1230,6 +1238,7 @@ fn profile_denies_sensitive_dirs() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     for dir in &[
         ".ssh",
@@ -1295,6 +1304,7 @@ fn profile_denies_sensitive_files() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     for file in &[".netrc", ".pypirc", ".gem/credentials", ".vault-token"] {
         assert!(
@@ -1342,6 +1352,7 @@ fn profile_denies_credential_files_in_tool_dirs() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // These credential files inside allowed tool dirs must be denied
@@ -1420,6 +1431,7 @@ fn profile_allows_credential_files_when_user_opts_in() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // The deny should still be present (defense in depth)
@@ -1514,6 +1526,7 @@ fn profile_extra_read_overrides_denied_dotfile_directory() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // The deny for .config/gcloud (DENIED_DOTFILES) should still exist
@@ -1576,6 +1589,7 @@ fn profile_extra_read_overrides_multiple_denied_dotfile_dirs() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // Both denied dotfile dirs should still have their deny rules
@@ -1636,6 +1650,7 @@ fn profile_restricts_outbound_tcp() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(deny network-outbound (remote tcp))"),
@@ -1703,6 +1718,7 @@ fn profile_extra_ports_adds_allows() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
@@ -1754,6 +1770,7 @@ fn profile_allow_browser_enables_lsopen() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: true,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow lsopen)"),
@@ -1797,6 +1814,7 @@ fn profile_proxy_port_allows_localhost() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:18080\"))"),
@@ -1844,6 +1862,7 @@ fn profile_allow_localhost_opens_specific_ports() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:3000\"))"),
@@ -1906,6 +1925,7 @@ fn profile_deny_rules_come_after_allow_rules() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let allow_pos = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -1955,6 +1975,7 @@ fn profile_allows_gh_config_read_only() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.config/gh/hosts.yml\"))"),
@@ -2006,6 +2027,7 @@ fn profile_allows_file_map_executable_for_copilot() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.copilot\"))"),
@@ -2053,6 +2075,7 @@ fn profile_denies_env_files_by_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(r#"(deny file-read* (regex #"/\.env$"))"#),
@@ -2124,6 +2147,7 @@ fn profile_allows_env_files_when_flag_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains(r#"deny file-read* (regex #"/projects/app/"#),
@@ -2167,6 +2191,7 @@ fn profile_env_deny_comes_after_project_allow() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let project_allow = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -2222,6 +2247,7 @@ fn profile_env_deny_comes_after_user_allows() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let user_read_allow = p
         .find("(allow file-read* (subpath \"/projects\"))")
@@ -2330,6 +2356,7 @@ fn profile_denies_resolved_git_dirs_of_granted_repos() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // The last user write allow in the profile — every deny below must follow
@@ -2418,6 +2445,7 @@ fn profile_allows_all_localhost_when_flag_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
@@ -2479,6 +2507,7 @@ fn profile_allows_all_tcp_outbound_when_jvm_and_localhost_any() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // With preferIPv4Stack=true in JAVA_TOOL_OPTIONS, Java uses AF_INET4 and
     // "localhost:*" works. No need for the old "*:*" nuclear option.
@@ -2536,6 +2565,7 @@ fn profile_denies_write_to_copilot_pkg() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must allow write to ~/.copilot (session state, config)
     assert!(
@@ -2783,6 +2813,7 @@ fn profile_denies_exec_from_tmp() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must allow read+write to /tmp (needed for temp files)
     assert!(
@@ -2855,6 +2886,7 @@ fn profile_allows_jvm_attach_when_flag_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must allow unix socket bind+inbound+connect for JVM Attach API (.java_pid*)
     // Three operations needed: bind (create socket), inbound (accept), outbound (connect)
@@ -2938,6 +2970,7 @@ fn profile_allows_msbuild_when_flag_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must allow unix socket bind+inbound+connect for the MSBuild worker-node
     // pipe (MSBuild<pid>). Three operations needed: bind (worker node creates
@@ -3012,6 +3045,7 @@ fn profile_allows_localhost_tcp_bind() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // We use "*:*" instead of "localhost:*" because Java NIO uses IPv6 sockets
     // with IPv4-mapped addresses (::ffff:127.0.0.1) which "localhost" doesn't match.
@@ -3066,6 +3100,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // macOS SBPL should allow all localhost ports.
     // #126 Tier 2: dropped the always-true `|| p.contains("network-outbound")`
@@ -3111,6 +3146,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        keychain_substitute: None,
     });
     assert!(
         !landlock_policy.restrict_net_connect,
@@ -3167,6 +3203,7 @@ fn config_options_parity_across_backends() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        keychain_substitute: None,
     };
 
     // ── Landlock policy ──
@@ -3256,6 +3293,7 @@ fn config_options_parity_across_backends() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // extra_ports → SBPL port allow
@@ -3340,6 +3378,7 @@ fn profile_denies_git_persistence_vectors() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must deny writes to .git/hooks (post-checkout etc. run outside sandbox)
     assert!(
@@ -3405,6 +3444,7 @@ fn profile_denies_write_to_cplt_toml() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(deny file-write* (literal \"/projects/app/.cplt.toml\"))"),
@@ -3452,6 +3492,7 @@ fn default_profile() -> String {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     })
 }
 
@@ -4312,6 +4353,7 @@ fn profile_scratch_dir_adds_all_permissions() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     let scratch_str = scratch.to_string_lossy();
@@ -4384,6 +4426,7 @@ fn profile_allow_tmp_exec_removes_denies() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -4553,6 +4596,7 @@ fn profile_allows_copilot_install_dir() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(
@@ -4607,6 +4651,7 @@ fn profile_allows_vscode_copilot_path() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{vscode_dir}\"))")),
@@ -4668,6 +4713,7 @@ fn profile_allows_dotnet_root_when_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{dotnet_root}\"))")),
@@ -4773,6 +4819,7 @@ fn profile_dotnet_exec_paths_stay_readonly_under_user_allow_write() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     let user_write = p
@@ -4840,6 +4887,7 @@ fn profile_allows_electron_app_bundle() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{electron_dir}\"))")),
@@ -5002,6 +5050,7 @@ fn profile_allows_git_hooks_path() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-read* (subpath \"/Users/test/.config/git/hooks\"))"),
@@ -5066,6 +5115,7 @@ fn profile_allows_git_worktree_common_dir() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-read* (subpath \"/Users/test/repos/main-repo/.git\"))"),
@@ -5222,6 +5272,7 @@ fn profile_gpg_signing_allows_public_keyring() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.gnupg/pubring.kbx\"))"),
@@ -5273,6 +5324,7 @@ fn profile_gpg_signing_allows_agent_socket() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow network-outbound (literal \"/Users/test/.gnupg/S.gpg-agent\"))"),
@@ -5321,6 +5373,7 @@ fn profile_gpg_signing_denies_private_keys() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(deny file-read* (subpath \"/Users/test/.gnupg/private-keys-v1.d\"))"),
@@ -5368,6 +5421,7 @@ fn profile_gpg_signing_rules_come_after_deny() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let deny_pos = p
         .find("(deny file-read* (subpath \"/Users/test/.gnupg\"))")
@@ -5425,6 +5479,7 @@ fn profile_gpg_signing_uses_literal_not_subpath() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must use literal (exact file), never subpath (recursive) for GPG allows
     assert!(
@@ -5470,6 +5525,7 @@ fn profile_gpg_signing_deny_path_wins() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // When user explicitly denies ~/.gnupg, GPG allows should NOT appear
     assert!(
@@ -5518,6 +5574,7 @@ fn profile_gpg_signing_denies_legacy_secring() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(deny file-read* (literal \"/Users/test/.gnupg/secring.gpg\"))"),
@@ -5561,6 +5618,7 @@ fn profile_gpg_signing_allows_socket_file_read() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Socket needs file-read* for inode lookup before connect(2)
     assert!(
@@ -6250,6 +6308,7 @@ fn profile_docker_disabled_by_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // .docker should be denied
     assert!(
@@ -6299,6 +6358,7 @@ fn profile_docker_enabled_allows_config_and_sockets() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Should allow read of ~/.docker
     assert!(
@@ -6380,6 +6440,7 @@ fn profile_docker_skipped_when_deny_path_overlaps() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Docker allows should be skipped — deny-path wins
     assert!(
@@ -6430,6 +6491,7 @@ fn profile_socket_allows_rules() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6496,6 +6558,7 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6556,6 +6619,7 @@ fn profile_allow_cache_exec_subdir_adds_carveout() {
         allow_cache_exec: &["ms-playwright".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6610,6 +6674,7 @@ fn profile_allow_cache_exec_any_allows_all_caches() {
         allow_cache_exec: &[],
         allow_cache_exec_any: true,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6658,6 +6723,7 @@ fn profile_default_denies_cache_exec() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6702,6 +6768,7 @@ fn profile_allow_cache_exec_multiple_subdirs() {
         allow_cache_exec: &["ms-playwright".to_string(), "pnpm/dlx".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6829,6 +6896,7 @@ fn profile_cache_exec_carveout_comes_after_exec_deny() {
         allow_cache_exec: &["ms-playwright".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let deny_pos = p
         .find("(deny process-exec")
@@ -7126,6 +7194,7 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
         allow_cache_exec: &["ms-playwright".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow syscall*)"),
@@ -7198,6 +7267,7 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
         allow_cache_exec: &["ms-playwright/chromium-1217".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow syscall*)"),
@@ -7249,6 +7319,7 @@ fn chromium_runtime_rules_absent_by_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("(allow syscall*)"),
@@ -7303,6 +7374,7 @@ fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
         allow_cache_exec: &["some-other-tool".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("(allow syscall*)"),
@@ -7352,6 +7424,7 @@ fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
         allow_cache_exec: &[],
         allow_cache_exec_any: true,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("(allow syscall*)"),
@@ -7410,6 +7483,7 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
             allow_cache_exec: &[name.to_string()],
             allow_cache_exec_any: false,
             allow_browser: false,
+            credential_outside_keychain: false,
         });
         assert!(
             !p.contains("(allow syscall*)"),
@@ -7471,6 +7545,7 @@ fn existing_app_dirs_none_includes_all() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&data_str),
@@ -7522,6 +7597,7 @@ fn existing_app_dirs_matching_includes_dir() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&data_str),
@@ -7574,6 +7650,7 @@ fn existing_app_dirs_nonmatching_excludes_dir() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains(&data_str),
@@ -7634,6 +7711,7 @@ fn existing_app_dirs_per_path_filtering() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&data_str),
@@ -7727,6 +7805,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // Config dir should be readable but NOT writable at subpath level
@@ -7813,6 +7892,7 @@ fn deny_clipboard_emits_pasteboard_deny_after_allow() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let allow = p
         .find("(allow mach-lookup)")
@@ -7863,6 +7943,7 @@ fn no_deny_clipboard_by_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("com.apple.pasteboard"),
@@ -7965,6 +8046,7 @@ allow_docker = false
 allow_cache_exec = []
 allow_cache_exec_any = false
 allow_browser = false
+keychain_substitute = false
 git_push_prevention = false
 
 [gh_guard]
@@ -8790,4 +8872,115 @@ fn socket_masks_follow_the_uid() {
             .any(|p| p.to_string_lossy().contains("/run/user/1000/")),
         "no other uid may leak into the list, got {masks:?}"
     );
+}
+
+// ── Keychain credential brokering (#242) ──────────────────
+
+/// Minimal `ProfileOptions` for the #242 keychain-grant assertions.
+fn profile_opts<'a>(project: &'a std::path::Path, home: &'a std::path::Path) -> ProfileOptions<'a> {
+    ProfileOptions {
+        project_dir: project,
+        home_dir: home,
+        extra_read: &[],
+        extra_write: &[],
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        extra_git_dirs: &[],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+        credential_outside_keychain: false,
+    }
+}
+
+/// A substitute credential must NOT be in `ENV_ALLOWLIST`.
+///
+/// That is the whole default-off property at the environment layer (#242): the
+/// variable reaches the agent only because `apply_deny_env_and_credential`
+/// forwards it as part of the trade. Allowlisting it would deliver it on every
+/// run with `sandbox.keychain_substitute` off, silently switching a user with
+/// the variable exported off their Keychain login — the exact change this trade
+/// refuses to make unasked.
+#[test]
+fn keychain_substitute_vars_are_never_allowlisted() {
+    use cplt::agent::Agent;
+    use cplt::sandbox::{ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST};
+
+    for agent in Agent::ALL {
+        for var in agent.keychain_substitute_env_vars() {
+            assert!(
+                agent.needs_keychain(),
+                "{agent:?} lists substitute credentials but never wanted the Keychain"
+            );
+            assert!(
+                !ENV_ALLOWLIST.contains(var),
+                "{agent:?}: {var} is allowlisted, so it reaches the agent even with \
+                 sandbox.keychain_substitute off — forward it in sandbox_exec instead"
+            );
+            assert!(
+                !ENV_PREFIX_ALLOWLIST.iter().any(|p| var.starts_with(p)),
+                "{agent:?}: {var} passes the prefix allowlist, same problem"
+            );
+        }
+    }
+}
+
+/// Profile level: the grant tracks the resolved credential, not the agent alone.
+#[test]
+fn profile_keychain_grant_follows_resolved_credential() {
+    use cplt::agent::Agent;
+    let project = std::path::Path::new("/projects/app");
+    let home = std::path::Path::new("/Users/test");
+
+    for agent in [Agent::Claude, Agent::Copilot, Agent::Antigravity] {
+        let mut opts = profile_opts(project, home);
+        opts.agent = agent;
+        opts.credential_outside_keychain = false;
+        assert!(
+            generate_profile(&opts).contains("/Users/test/Library/Keychains"),
+            "{agent:?}: grant must be kept when no substitute credential resolved"
+        );
+
+        let mut opts = profile_opts(project, home);
+        opts.agent = agent;
+        opts.credential_outside_keychain = true;
+        assert!(
+            !generate_profile(&opts).contains("/Users/test/Library/Keychains"),
+            "{agent:?}: grant must be dropped once the credential came from the environment"
+        );
+    }
+
+    // An agent that never needed it stays denied either way.
+    for (agent, in_env) in [(Agent::OpenCode, false), (Agent::OpenCode, true)] {
+        let mut opts = profile_opts(project, home);
+        opts.agent = agent;
+        opts.credential_outside_keychain = in_env;
+        assert!(
+            !generate_profile(&opts).contains("/Users/test/Library/Keychains"),
+            "{agent:?} never gets the Keychain grant"
+        );
+    }
 }

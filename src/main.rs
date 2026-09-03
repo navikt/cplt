@@ -799,6 +799,10 @@ NOTE:
         #[arg(long)]
         repo_scope: Option<String>,
 
+        /// Trusted Git binary used to verify implicit repository targets from cwd.
+        #[arg(long)]
+        real_git: Option<PathBuf>,
+
         /// Enforcement mode: block, warn, or audit.
         #[arg(long, default_value = "block")]
         mode: String,
@@ -2238,6 +2242,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::GhGate {
                 real_gh,
                 repo_scope,
+                real_git,
                 mode,
                 scope_check,
                 no_scope_check,
@@ -2263,7 +2268,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     },
                     allow_api_write: allow_api_write && !no_allow_api_write,
                 };
-                run_gh_gate(&real_gh, repo_scope.as_deref(), &args, &policy)
+                run_gh_gate(
+                    &real_gh,
+                    repo_scope.as_deref(),
+                    real_git.as_deref(),
+                    &args,
+                    &policy,
+                )
             }
             Command::GitGate {
                 real_git,
@@ -2442,6 +2453,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // by prepare(), so callers don't need to know about backend-specific risks.
     // proxy_port comes from the running handle so the actual ephemeral port is embedded.
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
+    // #242: drop the whole-Keychain grant only when the agent can authenticate
+    // without it. Resolved against `deny_env` because that list is stripped from
+    // the child environment later — a repo `.cplt.toml` naming the token var
+    // must not leave the run with neither Keychain nor token.
+    let keychain_substitute = active_agent.credential_outside_keychain(
+        &home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
     let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
         project_dir: &project_dir,
         home_dir: &home_dir,
@@ -2475,6 +2495,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         allow_cache_exec: &resolved.allow_cache_exec,
         allow_cache_exec_any: resolved.allow_cache_exec_any,
         allow_browser: resolved.allow_browser,
+        keychain_substitute,
         use_bubblewrap: resolved.use_bubblewrap,
     }) {
         Ok(s) => s,
@@ -2654,6 +2675,19 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
     args
 }
 
+/// Restate a block-mode policy message for warn mode.
+///
+/// Policy errors are written for block mode and lead with `⚠️ BLOCKED by
+/// sandbox:`. In warn mode the command is allowed to run, so that prefix is
+/// swapped for the warning label instead of being stacked behind it — otherwise
+/// the user reads "WARNING … BLOCKED" for a command that just ran.
+fn warn_mode_message(msg: &str) -> String {
+    match msg.strip_prefix("⚠️ BLOCKED by sandbox:") {
+        Some(rest) => format!("⚠️  WARNING (would block):{rest}"),
+        None => format!("⚠️  WARNING (would block): {msg}"),
+    }
+}
+
 /// Handle `cplt gh-gate` — evaluate a gh command and exec the real binary if allowed.
 ///
 /// Called from the wrapper script placed in the sandbox's PATH. If the command
@@ -2662,6 +2696,7 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 fn run_gh_gate(
     real_gh: &Path,
     repo_scope: Option<&str>,
+    real_git: Option<&Path>,
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
@@ -2674,7 +2709,7 @@ fn run_gh_gate(
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope) {
+    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope, real_git) {
         Ok(approval) => exec_gh(real_gh, args, approval.repo_scope.as_deref()),
         Err(msg) => match policy.mode {
             config::EnforcementMode::Block => {
@@ -2682,7 +2717,7 @@ fn run_gh_gate(
                 ExitCode::FAILURE
             }
             config::EnforcementMode::Warn => {
-                eprintln!("⚠️  WARNING (would block): {msg}");
+                eprintln!("{}", warn_mode_message(&msg));
                 // Allow through in warn mode
                 exec_gh(real_gh, args, None)
             }
@@ -2792,7 +2827,7 @@ fn run_git_gate(
                 ExitCode::FAILURE
             }
             config::EnforcementMode::Warn => {
-                eprintln!("⚠️  WARNING (would block): {msg}");
+                eprintln!("{}", warn_mode_message(&msg));
                 use std::os::unix::process::CommandExt;
                 let err = std::process::Command::new(real_git).args(args).exec();
                 ui::error(&format!("Failed to exec git: {err}"));
@@ -2941,6 +2976,12 @@ fn prepare_shell_sandbox(
     // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
     merge_tool_path_env_overrides(resolved, home_dir);
 
+    // See the #242 note at the other `SandboxConfig` construction.
+    let keychain_substitute = active_agent.credential_outside_keychain(
+        home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
     let sandbox_config = sandbox::SandboxConfig {
         project_dir,
         home_dir,
@@ -2975,6 +3016,7 @@ fn prepare_shell_sandbox(
         allow_cache_exec: &resolved.allow_cache_exec,
         allow_cache_exec_any: resolved.allow_cache_exec_any,
         allow_browser: resolved.allow_browser,
+        keychain_substitute,
         use_bubblewrap: resolved.use_bubblewrap,
     };
 
@@ -6164,6 +6206,26 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("cplt").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn warn_mode_message_replaces_the_block_prefix() {
+        let blocked = "\u{26a0}\u{fe0f} BLOCKED by sandbox: 'gh pr merge' is not allowed.\nReason: needs a human.";
+        let warned = warn_mode_message(blocked);
+        assert!(
+            !warned.contains("BLOCKED"),
+            "warn mode must not tell the user the command was blocked: {warned}"
+        );
+        assert!(warned.starts_with("\u{26a0}\u{fe0f}  WARNING (would block): 'gh pr merge'"));
+        assert!(
+            warned.ends_with("Reason: needs a human."),
+            "the body must survive: {warned}"
+        );
+        // A message without the block prefix still gets labelled.
+        assert_eq!(
+            warn_mode_message("nope"),
+            "\u{26a0}\u{fe0f}  WARNING (would block): nope"
+        );
     }
 
     #[test]

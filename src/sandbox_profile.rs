@@ -116,6 +116,16 @@ pub struct ProfileOptions<'a> {
     pub allow_cache_exec_any: bool,
     /// Allow Launch Services (`open` command) for OAuth browser flows.
     pub allow_browser: bool,
+    /// The agent's credential was resolved outside the Keychain before launch —
+    /// from an environment variable, or from a credential file the sandbox
+    /// already grants (Antigravity's `agy` keyring fallback) — so the macOS
+    /// Keychain grant is dropped for this run (#242).
+    ///
+    /// The grant is emitted when `agent.needs_keychain()` and this is `false`.
+    /// `false` is the fail-open default: no substitute credential resolved means
+    /// keep the grant, rather than launching an agent that cannot authenticate
+    /// and — with the Keychain gone — cannot re-authenticate either.
+    pub credential_outside_keychain: bool,
 }
 
 /// Generate a complete SBPL sandbox profile from the given options.
@@ -151,7 +161,13 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     emit_header(&mut sb, &project);
     emit_process_rules(&mut sb);
     emit_project_access(&mut sb, &project);
-    emit_home_access(&mut sb, &home, opts.agent, opts.agent_dirs);
+    emit_home_access(
+        &mut sb,
+        &home,
+        opts.agent,
+        opts.agent_dirs,
+        opts.credential_outside_keychain,
+    );
     emit_git_hooks(&mut sb, opts.git_hooks_path);
     emit_git_worktree(&mut sb, opts.git_common_dir);
     emit_system_access(
@@ -360,7 +376,13 @@ fn emit_sensitive_project_denies(
     }
 }
 
-fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[AgentDir]) {
+fn emit_home_access(
+    sb: &mut String,
+    home: &str,
+    agent: Agent,
+    agent_dirs: &[AgentDir],
+    credential_outside_keychain: bool,
+) {
     // Agent-specific directories (Copilot: ~/.copilot, OpenCode: ~/.config/opencode, etc.)
     if agent.needs_copilot_dir() {
         // Copilot config — the CLI needs its auth tokens and settings.
@@ -440,8 +462,12 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
     // macOS Keychain access — Copilot stores auth tokens here.
     // OpenCode stores its /connect credentials in its own data dir, and
     // third-party providers use env/config files — no Keychain needed.
-    if agent.needs_keychain() {
-        sbpl!(sb, ";; macOS Keychain (Copilot auth tokens)");
+    //
+    // Dropped for this run when the agent's credential already came from the
+    // environment (#242): the grant reaches every item in the login keychain
+    // whose ACL lets `/usr/bin/security` through, not just the agent's own.
+    if agent.needs_keychain() && !credential_outside_keychain {
+        sbpl!(sb, ";; macOS Keychain (agent auth tokens)");
         sbpl!(
             sb,
             "(allow file-read* (subpath \"{home}/Library/Keychains\"))"
@@ -1911,6 +1937,7 @@ mod tests {
             allow_cache_exec: &[],
             allow_cache_exec_any: false,
             allow_browser: false,
+            credential_outside_keychain: false,
         }
     }
 

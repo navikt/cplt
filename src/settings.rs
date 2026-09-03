@@ -541,6 +541,7 @@ fn resolved_values(
                 ("sandbox", "allow_cache_exec") => format_strings(&resolved.allow_cache_exec),
                 ("sandbox", "allow_cache_exec_any") => resolved.allow_cache_exec_any.to_string(),
                 ("sandbox", "allow_browser") => resolved.allow_browser.to_string(),
+                ("sandbox", "keychain_substitute") => resolved.keychain_substitute.to_string(),
                 ("sandbox", "gh_proxy") => resolved.gh_guard.enabled.to_string(),
                 ("sandbox", "git_push_prevention") => resolved.git_guard.enabled.to_string(),
                 ("gh_guard", "enabled") => resolved.gh_guard.enabled.to_string(),

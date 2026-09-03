@@ -468,8 +468,9 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Blocked,
                 reason: first_line(&msg),
                 fix: Some(
-                    "use a read-only / in-scope gh command, or relax the gh guard \
-                     (e.g. [sandbox] gh_proxy settings)."
+                    "use a read-only / in-scope gh command, run it from the startup \
+                     repository's checkout, or relax the gh guard (e.g. [sandbox] \
+                     gh_proxy settings)."
                         .to_string(),
                 ),
             },
