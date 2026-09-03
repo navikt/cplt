@@ -513,21 +513,25 @@ fn emit_system_access(
     //    Scoped to ^org\.chromium\..+$ — the trailing \. prevents matching
     //    "org.chromiumevil" and the .+$ ensures at least one character follows
     //    (Chromium uses variable-depth subnamespaces like crashpad.*, Chromium.*).
-    //    Playwright's Chrome for Testing also registers the exact namespace
-    //    com.google.chrome.for.testing.MachPortRendezvousServer.<pid>. Denied
-    //    registration produces EPERM (1100), so it is allowed with a fully
-    //    anchored regex whose suffix accepts numeric PIDs only.
+    //    Playwright's Chrome for Testing also registers two exact namespaces:
+    //    com.google.chrome.for.testing.MachPortRendezvousServer.<pid> and
+    //    com.google.chrome.for.testing.apps.<user-data-dir-hash>. The first
+    //    suffix accepts numeric PIDs only. The apps suffix is exactly the
+    //    uppercase, 64-character hexadecimal SHA-256 of the user data directory.
+    //    Denied registration produces EPERM (1100), so both regexes are fully
+    //    anchored and limited to their observed suffix formats.
     //
     // SECURITY: these rules only activate when the user has explicitly opted in
     // to browser execution via allow_cache_exec containing "ms-playwright" or a
-    // subpath like "ms-playwright/chromium-1217" (first component must match exactly).
+    // subpath like "ms-playwright/chromium-<version>" (first component must match
+    // exactly).
     // syscall* is the broadest rule — Chrome uses undocumented Mach traps that
     // cannot be individually enumerated in a stable allowlist across OS versions.
     // iokit-open-user-client is unscoped because IOKit class names vary by GPU
     // hardware and macOS version; scoping would break on different machines.
     // system-socket is scoped to AF_UNIX — only Unix domain sockets, not TCP/UDP.
     // mach-register is limited to the anchored org.chromium.* namespace and the
-    // exact Chrome for Testing rendezvous namespace with a numeric PID suffix,
+    // two exact Chrome for Testing namespaces and suffix formats above,
     // preventing registration of arbitrary global Mach services.
     if allow_chromium_runtime {
         sbpl!(
@@ -544,6 +548,10 @@ fn emit_system_access(
         sbpl!(
             sb,
             r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#
+        );
+        sbpl!(
+            sb,
+            r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{{64}}$"))"#
         );
         sbpl!(sb);
     }

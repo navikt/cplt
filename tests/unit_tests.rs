@@ -7091,6 +7091,7 @@ fn set_repo_value_unset_removes_array_element() {
 // ============================================================
 
 const CHROME_FOR_TESTING_MACH_REGISTER_RULE: &str = r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#;
+const CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE: &str = r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{64}$"))"#;
 
 #[test]
 fn chromium_runtime_rules_emitted_for_ms_playwright() {
@@ -7148,6 +7149,10 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
     assert!(
         p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
         "Chrome for Testing mach-register must be fully anchored with a numeric PID suffix"
+    );
+    assert!(
+        p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        "Chrome for Testing apps mach-register must be fully anchored with an uppercase SHA-256 suffix"
     );
     assert!(
         p.contains(r#"(regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")"#),
@@ -7211,6 +7216,10 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
         p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
         "Chrome for Testing mach-register must be present for versioned subpath entry"
     );
+    assert!(
+        p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        "Chrome for Testing apps mach-register must be present for versioned subpath entry"
+    );
 }
 
 #[test]
@@ -7261,6 +7270,10 @@ fn chromium_runtime_rules_absent_by_default() {
     assert!(
         !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
         "Chrome for Testing mach-register must not be emitted by default"
+    );
+    assert!(
+        !p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        "Chrome for Testing apps mach-register must not be emitted by default"
     );
 }
 
@@ -7314,6 +7327,10 @@ fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
         !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
         "Chrome for Testing mach-register must not be emitted for unrelated allow_cache_exec entry"
     );
+    assert!(
+        !p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        "Chrome for Testing apps mach-register must not be emitted for unrelated allow_cache_exec entry"
+    );
 }
 
 #[test]
@@ -7366,6 +7383,10 @@ fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
     assert!(
         !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
         "Chrome for Testing mach-register must not be emitted when only allow_cache_exec_any is set"
+    );
+    assert!(
+        !p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+        "Chrome for Testing apps mach-register must not be emitted when only allow_cache_exec_any is set"
     );
 }
 
@@ -7429,6 +7450,10 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
             !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
             "Chrome for Testing mach-register must not be emitted for near-miss entry {name:?}"
         );
+        assert!(
+            !p.contains(CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE),
+            "Chrome for Testing apps mach-register must not be emitted for near-miss entry {name:?}"
+        );
     }
 }
 
@@ -7479,8 +7504,9 @@ fn chromium_runtime_mach_register_rules_remain_narrow() {
         [
             r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#,
             CHROME_FOR_TESTING_MACH_REGISTER_RULE,
+            CHROME_FOR_TESTING_APPS_MACH_REGISTER_RULE,
         ],
-        "only the two approved, fully anchored Chromium namespaces may be registered"
+        "only the three approved, fully anchored Chromium namespaces may be registered"
     );
     for broader_rule in [
         "(allow mach-register)",
@@ -7488,6 +7514,17 @@ fn chromium_runtime_mach_register_rules_remain_narrow() {
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\..+$"))"#,
         r#"(allow mach-register (global-name-regex #"com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#,
         r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{63}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{65}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9a-f]{32}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9a-f]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-Z]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.Chrome\.apps\.[0-9A-F]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.beta\.apps\.[0-9A-F]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.dev\.apps\.[0-9A-F]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.canary\.apps\.[0-9A-F]{64}$"))"#,
     ] {
         assert!(
             !p.lines().any(|line| line == broader_rule),
