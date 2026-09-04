@@ -2859,7 +2859,7 @@ mod tests {
             policy
                 .fs_rules
                 .iter()
-                .any(|r| r.path == exe && r.access.execute && !r.access.write),
+                .any(|r| r.path == exe && r.access.read && r.access.execute && !r.access.write),
             "the cplt binary must be granted read+execute and not write"
         );
     }
