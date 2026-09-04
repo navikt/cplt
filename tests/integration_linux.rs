@@ -1355,6 +1355,60 @@ print('CONNECTED')
         assert!(stdout.contains("init"));
     }
 
+    /// The git guard must not break git on Linux.
+    ///
+    /// Its wrapper is `exec <cplt> git-gate ... -- "$@"`, so the guard only
+    /// works if the sandbox lets the agent re-execute the cplt binary. Landlock
+    /// grants EXECUTE per path and has no blanket allow, so this fails wherever
+    /// cplt is not inside `LINUX_TOOL_DIRS` — which includes `install.sh`'s
+    /// default of `~/.local/bin`, and the `target/debug` build CI runs from.
+    ///
+    /// Read-only subcommands are what makes it obvious: the guard blocks pushes,
+    /// so a broken wrapper shows up as `git log` failing, not as policy.
+    #[test]
+    fn project_git_read_ops_work_under_the_git_guard() {
+        require_landlock!();
+        let project = create_test_project();
+        let script = r#"
+            git init . &&
+            git config user.email "test@test.com" &&
+            git config user.name "Test" &&
+            echo "hello" > file.txt &&
+            git add file.txt &&
+            git -c commit.gpgSign=false commit -m "init" &&
+            git --version &&
+            git status --porcelain &&
+            git log --oneline
+        "#;
+        let (code, stdout, stderr) =
+            run_sandboxed_with_flags(project.path(), &["--git-guard"], script);
+        assert_eq!(
+            code, 0,
+            "read-only git must work with the git guard on — stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(stdout.contains("init"), "stdout: {stdout}");
+
+        // Without this the test passes vacuously: `install_command_wrappers`
+        // installs nothing and warns about nothing when it cannot resolve a git,
+        // so the agent would fall through to its bare PATH git and every command
+        // above would still succeed — proving only that git works.
+        //
+        // Either verdict counts. `--git-guard` sets `enabled`, not `mode`, so
+        // which one appears follows the mode default. Both strings are written
+        // by the guard and appear in neither git's output nor the shell's.
+        let (_, push_stdout, push_stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--git-guard"],
+            "git push origin main 2>&1 || true",
+        );
+        let combined = format!("{push_stdout}{push_stderr}");
+        assert!(
+            combined.contains("BLOCKED by sandbox") || combined.contains("WARNING (would block)"),
+            "the guard must have ruled on the push, or the assertions above prove \
+             nothing about the wrapper — stdout: {push_stdout}, stderr: {push_stderr}"
+        );
+    }
+
     #[test]
     fn project_env_vars_sanitized() {
         require_landlock!();
