@@ -396,6 +396,15 @@ fn emit_sensitive_project_denies(
             sb,
             "(deny file-write* (subpath \"{root}/.agents/plugins\"))"
         );
+        // A repo nested under a writable root needs this too: `allow.write
+        // ~/code` leaves `~/code/other-repo/.agents/plugins` writable, and a
+        // manifest there fires whichever agent next opens THAT repo. Same
+        // reasoning and the same regex shape as the nested gitdir denies.
+        let r = escape_regex(root);
+        sbpl!(
+            sb,
+            "(deny file-write* (regex #\"^{r}/.+/\\.agents/plugins($|/)\"))"
+        );
     }
     sbpl!(sb);
 
@@ -2345,6 +2354,25 @@ mod tests {
             last_allow < deny,
             "a write allow at {last_allow} comes after the plugins deny at {deny}"
         );
+    }
+
+    /// A repo nested under a writable root has the same exposure: the manifest
+    /// fires whichever agent next opens THAT repo, not the granted one. Same
+    /// gap #247 found for `.git/hooks`, and the same regex shape closes it.
+    #[test]
+    fn agents_plugins_is_denied_in_nested_repos_too() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = root.replace('.', r"\.");
+            let rule = format!("(deny file-write* (regex #\"^{esc}/.+/\\.agents/plugins($|/)\"))");
+            assert!(p.contains(&rule), "missing nested deny for {root}: {rule}");
+        }
     }
 
     /// The rest of `.agents/` is ordinary state with no auto-execution. Denying
