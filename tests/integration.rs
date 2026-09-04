@@ -2848,7 +2848,10 @@ except Exception as e:
             return; // no git on this machine — nothing to assert
         }
 
-        let config = project.join("cplt-config.toml");
+        // Outside the project: cplt refuses a CPLT_CONFIG the repo controls
+        // (issue #261).
+        let config_home = tempfile::tempdir().unwrap();
+        let config = config_home.path().join("cplt-config.toml");
         fs::write(&config, "[sandbox]\nbrief = true\nagents_md = true\n").unwrap();
 
         let output = Command::new(binary_path())
