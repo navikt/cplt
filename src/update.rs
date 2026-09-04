@@ -878,18 +878,18 @@ mod tests {
         let a = create_stage_dir(home.path()).expect("first stage dir");
         let b = create_stage_dir(home.path()).expect("second stage dir");
 
-        // Under cplt's own config dir, never the world-writable system temp:
-        // every sandbox can write throughout /tmp and /var/folders.
+        // Under cplt's own config dir, never the system temp dir: every cplt
+        // sandbox can write throughout /tmp and /var/folders, and `.config/cplt`
+        // is a hard deny (see `profile_denies_write_to_cplt_config_dir`).
+        // Asserted against the caller's home rather than `env::temp_dir()`,
+        // because the fake home in this test is itself a temp directory.
+        assert_eq!(STAGE_BASE, ".config/cplt/update");
         let base = std::fs::canonicalize(home.path()).unwrap().join(STAGE_BASE);
         assert!(
             a.starts_with(&base),
             "stage dir {} is not under {}",
             a.display(),
             base.display()
-        );
-        assert!(
-            !a.starts_with(std::env::temp_dir()),
-            "stage dir must not live in the system temp directory"
         );
 
         // Unpredictable: two runs must not collide, and the name must not be
