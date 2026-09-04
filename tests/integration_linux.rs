@@ -335,9 +335,11 @@ mod linux_tests {
         );
     }
 
-    /// `--allow-docker` grants `~/.docker` read-only on Linux (#155).
+    /// `--allow-docker` makes `~/.docker` readable on Linux (#155). The
+    /// read-only half of that grant is checked against the generated policy,
+    /// not here — see the comment at the end of this test.
     #[test]
-    fn landlock_allow_docker_reads_docker_config_but_not_write() {
+    fn landlock_allow_docker_reads_docker_config() {
         require_landlock!();
         let project = create_test_project();
         let fake_home = create_fake_home_with_secrets();
@@ -353,30 +355,17 @@ mod linux_tests {
         );
         assert!(stdout.contains("registry.example.com"), "{stdout}");
 
-        // No `2>&1` here. The shell applies redirections left to right, so the
-        // failing one aborts the command and its error goes to the real stderr
-        // — a merge into stdout would never see it. Check both the exit status
-        // and the message, so an unrelated non-zero exit cannot pass this.
-        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
-            project.path(),
-            fake_home.path(),
-            &["--allow-docker"],
-            "echo x > ~/.docker/pwned",
-        );
-        assert_ne!(
-            code, 0,
-            "writing into ~/.docker must fail under --allow-docker — stdout: {stdout}, stderr: {stderr}"
-        );
-        assert!(
-            stderr.contains("Permission denied"),
-            "the write must fail on permissions, not something else — stderr: {stderr}"
-        );
-        // fake_home is a real directory on the host, so the strongest check is
-        // simply that nothing landed there.
-        assert!(
-            !fake_home.path().join(".docker/pwned").exists(),
-            "the denied write must leave no file behind"
-        );
+        // The write half cannot be asserted here, and the reason is worth
+        // stating rather than leaving as a missing case. The Landlock policy
+        // grants /tmp read+write unconditionally, `create_fake_home_with_secrets`
+        // builds the home under /tmp, and Landlock unions a path's ancestor
+        // rights — so no rule beneath a writable /tmp can be read-only, whatever
+        // this backend emits. On a real machine $HOME gets no blanket write
+        // grant and the read-only rule does hold.
+        //
+        // The generated policy is where that is checked instead:
+        // `allow_docker_grants_docker_config_read_only` asserts the rule carries
+        // read without write, and fails if the grant is removed.
     }
 
     #[test]
