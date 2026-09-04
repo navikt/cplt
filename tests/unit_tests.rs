@@ -1111,6 +1111,134 @@ fn exec_write_deny_comes_after_every_write_allow() {
     );
 }
 
+/// #243: `process-exec` is granted profile-wide, so an `allow.write` tree was
+/// writable *and* executable — the binary-drop pair `validate_exec_grants`
+/// refuses when an `allow.exec` grant creates it the other way round.
+/// `HOME_TOOL_DIRS` entries have had the compensating deny for years; user
+/// grants never did.
+#[test]
+fn write_grant_is_not_also_an_exec_grant() {
+    let write = [std::path::PathBuf::from("/Users/test/work")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &write,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    assert!(
+        p.contains("(deny process-exec (subpath \"/Users/test/work\"))"),
+        "an allow.write tree must not stay executable\n{p}"
+    );
+}
+
+/// Placement, for the same reason `exec_write_deny_comes_after_every_write_allow`
+/// asserts it for the other direction: a `(deny process-exec)` emitted next to
+/// its own allow is reopened by any later `(allow process-exec)` covering the
+/// same tree, and the profile has plenty of those.
+#[test]
+fn write_exec_deny_comes_after_every_broad_exec_allow() {
+    let write = [std::path::PathBuf::from("/Users/test")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &write,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let deny = p
+        .find("(deny process-exec (subpath \"/Users/test\"))")
+        .expect("allow.write tree must get an exec-deny");
+    // Every exec allow that is not one of the deliberate carve-outs re-issued
+    // after the deny.
+    let carve_outs = ["/Users/test/.gradle/jdks", "/Users/test/.bun/install"];
+    const PREFIX: &str = "(allow process-exec (subpath \"";
+    for (i, _) in p.match_indices(PREFIX) {
+        let path = p[i + PREFIX.len()..].split('"').next().unwrap_or_default();
+        if carve_outs.contains(&path) {
+            continue;
+        }
+        assert!(
+            i < deny,
+            "{path} is exec-allowed after the allow.write exec-deny, which \
+             last-match-wins reopens the whole granted tree\n{p}"
+        );
+    }
+}
+
+/// The deny must not silently take back an execute right that was already
+/// there before the grant. The project dir, the scratch dir and the
+/// `EXEC_IN_WRITABLE` trees are write+exec by design; an `allow.write` on a
+/// parent must leave them alone.
+#[test]
+fn write_grant_keeps_the_documented_write_exec_trees() {
+    let write = [std::path::PathBuf::from("/Users/test")];
+    let p = generate_profile(
+        &SandboxConfig {
+            project_dir: std::path::Path::new("/Users/test/repos/app"),
+            extra_write: &write,
+            scratch_dir: Some(std::path::Path::new(
+                "/Users/test/Library/Caches/cplt/tmp/x",
+            )),
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let deny = p
+        .find("(deny process-exec (subpath \"/Users/test\"))")
+        .expect("allow.write tree must get an exec-deny");
+    let mut expected = vec![
+        "/Users/test/repos/app".to_string(),
+        "/Users/test/Library/Caches/cplt/tmp/x".to_string(),
+    ];
+    expected.extend(
+        cplt::sandbox::EXEC_IN_WRITABLE
+            .iter()
+            .filter(|e| e.macos)
+            .map(|e| format!("/Users/test/{}", e.path)),
+    );
+    for path in expected {
+        let line = format!("(allow process-exec (subpath \"{path}\"))");
+        let at = p
+            .rfind(&line)
+            .unwrap_or_else(|| panic!("{path} must keep process-exec\n{p}"));
+        assert!(at > deny, "{path} must be re-allowed AFTER the deny\n{p}");
+    }
+}
+
+/// A carve-out is re-issued only where it actually falls inside a granted tree.
+/// An unconditional re-allow at the tail of the profile would override the
+/// `/private/tmp` exec deny for a scratch or project dir that lives there.
+#[test]
+fn write_exec_carve_outs_are_scoped_to_the_granted_tree() {
+    let write = [std::path::PathBuf::from("/Users/test/work")];
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &write,
+            scratch_dir: Some(std::path::Path::new("/private/tmp/cplt-scratch")),
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let deny = p
+        .find("(deny process-exec (subpath \"/Users/test/work\"))")
+        .expect("allow.write tree must get an exec-deny");
+    let tail = &p[deny..];
+    assert!(
+        !tail.contains("(allow process-exec (subpath \"/private/tmp/cplt-scratch\"))"),
+        "a scratch dir outside the granted tree must not be re-allowed at the \
+         tail, where it would outrank the /private/tmp exec deny\n{p}"
+    );
+    assert!(
+        !tail.contains("(allow process-exec (subpath \"/projects/app\"))"),
+        "a project dir outside the granted tree needs no re-allow\n{p}"
+    );
+}
+
 #[test]
 fn profile_denies_sensitive_dirs() {
     let p = generate_profile(

@@ -1534,6 +1534,46 @@ mod macos_tests {
         );
     }
 
+    /// #243: `process-exec` is granted profile-wide, so an `allow.write` tree
+    /// was writable *and* executable — the agent could drop a binary and run
+    /// it. Proven against the kernel, not only the profile text, because the
+    /// deny has to outrank the blanket allow at the top of the profile.
+    #[test]
+    fn real_profile_write_grant_is_not_executable() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        // Under $HOME rather than temp: `/private/var/folders` is exec-denied
+        // anyway, which would make the test pass for the wrong reason.
+        let granted = home.join(format!(".cplt-write-exec-test-{}", std::process::id()));
+        fs::create_dir_all(&granted).unwrap();
+        fs::copy("/usr/bin/true", granted.join("dropped")).unwrap();
+
+        let write = [granted.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_write = &write;
+        let profile = write_real_profile(&opts);
+
+        let g = granted.to_string_lossy();
+        let (output, _) = run_sandboxed(
+            &profile,
+            &format!("'{g}/dropped' 2>&1; echo EXIT:$?; touch '{g}/w' && echo WRITE_OK"),
+        );
+
+        fs::remove_file(&profile).ok();
+        fs::remove_dir_all(&granted).ok();
+
+        assert!(
+            !output.contains("EXIT:0"),
+            "a binary inside an allow.write tree must not execute, or the grant \
+             is a binary-drop staging path, got: {output}"
+        );
+        assert!(
+            output.contains("WRITE_OK"),
+            "the write grant itself must still work, got: {output}"
+        );
+    }
+
     // ── Scratch dir ───────────────────────────────────────────────
 
     #[test]

@@ -1990,6 +1990,113 @@ pub fn nested_alternation(set: &[Protected]) -> String {
         .join("|")
 }
 
+// ── Execute rights inside a writable tree ──────────────────────────────────
+//
+// [`PROTECTED_IN_ROOT`] and [`PROTECTED_IN_GITDIR`] cover the other direction:
+// persistence-vector paths that must stay unwritable inside a tree the sandbox
+// makes writable. This table covers execute rights that overlap a writable
+// tree — the write-then-exec pair `validate_exec_grants` refuses for
+// `allow.exec` (#295) and that cplt itself creates in a handful of places.
+
+/// A tree that is executable *and* writable, and the reason it stays that way.
+///
+/// Two rules keep the rest of the policy free of such pairs. On macOS every
+/// `HOME_TOOL_DIRS` entry with `write && !process_exec` gets a compensating
+/// `(deny process-exec)`, and since #243 so does every `allow.write` tree. On
+/// Linux, Landlock's `EXECUTE` follows `process_exec` alone: it is checked only
+/// on `execve()` (`file_open` with `FMODE_EXEC`) and has no hook for
+/// `mmap(PROT_EXEC)`, which a dynamic loader reaches with `READ_FILE` alone —
+/// so honouring `map_exec` as an `EXECUTE` right granted full execve to every
+/// `write: true, map_exec: true` dependency store (`.cargo/registry`,
+/// `.cargo/git`, `.m2`, `.nuget`, `go/pkg`, the pnpm stores) for a right none
+/// of them needed.
+///
+/// What is left is this table: trees that really do run binaries out of
+/// themselves. Each entry says why, and its [`LinuxCoverage`] says what
+/// contains the write side there — for all of them, nothing does, because
+/// Landlock cannot subtract a write grant from an ancestor and the bubblewrap
+/// read-only bind that could is absent on hosts without user namespaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecInWritable {
+    /// Home-relative tree.
+    pub path: &'static str,
+    /// macOS grants `process-exec` here too, so an `allow.write` covering the
+    /// tree must not silently take it away. `false` means the execute right
+    /// exists only on Linux, where it cannot be expressed more narrowly.
+    pub macos: bool,
+    pub why: &'static str,
+    pub linux: LinuxCoverage,
+}
+
+/// The trees whose execute right survives sitting inside a writable one.
+///
+/// The Linux entries with `macos: false` are the ones #243 could not settle:
+/// the fix was written and verified on macOS, where the tree is already
+/// `process-exec`-denied, and neither Gradle nor .NET nor Kotlin/Native could
+/// be run on a Linux host to show whether dropping `EXECUTE` breaks them. The
+/// pre-existing right is kept rather than guessed away — a wrong carve-out
+/// either reopens the hole or breaks every user of the tool, and the second is
+/// invisible from a macOS checkout.
+pub const EXEC_IN_WRITABLE: &[ExecInWritable] = &[
+    // Gradle provisions toolchain JDKs into `~/.gradle/jdks` and execs them.
+    // macOS emits the matching `(allow process-exec)` in
+    // `emit_gradle_toolchain_exec` and takes the write back at the tail of the
+    // profile in `emit_gradle_toolchain_write_deny`; Landlock has no way to do
+    // the second half.
+    ExecInWritable {
+        path: ".gradle/jdks",
+        macos: true,
+        why: "Gradle toolchain JDKs — auto-provisioned and exec'd by the daemon",
+        linux: LinuxCoverage::Gap(
+            "Landlock cannot subtract the ~/.gradle write grant from this subtree, and \
+             the bubblewrap read-only bind that could is absent on hosts without user \
+             namespaces — so the control would be silently missing exactly where it is \
+             needed. macOS denies the write at the tail of the profile instead.",
+        ),
+    },
+    // `bunx` resolves and runs packages straight out of the global install
+    // cache that `bun install` writes, so the pair is the feature.
+    ExecInWritable {
+        path: ".bun/install",
+        macos: true,
+        why: "bunx runs packages out of the global install cache bun writes",
+        linux: LinuxCoverage::Gap(
+            "write+execute by design on both backends; recorded here so the pair is \
+             reviewable rather than an absence. `.bun/bin`, the PATH-resolved half, is \
+             write-denied separately.",
+        ),
+    },
+    // The `.dotnet` HOME_TOOL_DIRS entry is `process_exec: false` because the
+    // SDK normally lives in a system path. When it does not — `dotnet-install.sh`
+    // puts it here — macOS re-grants execute through the configured
+    // `dotnet_root`, and Landlock has no counterpart to that rule.
+    ExecInWritable {
+        path: ".dotnet",
+        macos: false,
+        why: "DOTNET_ROOT for dotnet-install.sh installs; macOS re-grants exec via \
+              `dotnet_root`, Landlock has no equivalent rule",
+        linux: LinuxCoverage::Gap(
+            "not verified against a real .NET run (#243). Dropping EXECUTE here would \
+             break every user who installed the SDK with dotnet-install.sh, and that \
+             failure is not visible from a macOS checkout, so the pre-existing right is \
+             kept until a Linux host can settle it.",
+        ),
+    },
+    // Kotlin/Native downloads an LLVM and clang toolchain into
+    // `~/.konan/dependencies` and execs it during a native build.
+    ExecInWritable {
+        path: ".konan",
+        macos: false,
+        why: "Kotlin/Native execs the LLVM toolchain it downloads into ~/.konan/dependencies",
+        linux: LinuxCoverage::Gap(
+            "not verified against a real Kotlin/Native build (#243). macOS denies \
+             process-exec here, so K/N may already be broken there — that could not be \
+             demonstrated either way from macOS, and guessing in either direction is \
+             what this entry exists to avoid.",
+        ),
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
