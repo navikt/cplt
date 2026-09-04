@@ -21,9 +21,10 @@ macro_rules! sbpl {
 
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
-    GPG_SIGNING_ALLOW_FILES, PathBinDir, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS, active_tool_dirs, app_dirs, path_bin_dirs,
-    playwright_runtime_intent, validate_playwright_socket_dir, validate_sbpl_path,
+    GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
+    ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
+    active_tool_dirs, app_dirs, nested_alternation, path_bin_dirs, playwright_runtime_intent,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Options for generating an SBPL sandbox profile.
@@ -371,59 +372,29 @@ fn emit_sensitive_project_denies(
 
     let roots = writable_roots(project, extra_write);
 
-    // .gitmodules — submodule URLs are a supply chain vector (git submodule update clones them).
-    // The rules naming paths inside a git directory live in `emit_gitdir_denies`,
-    // which runs for the project's `.git`, for a worktree's shared common dir,
-    // and — since #212 — for every other writable root and its resolved gitdir.
+    // Paths inside every writable root that must stay unwritable. The list is
+    // [`PROTECTED_IN_ROOT`]; this only chooses the SBPL shape for each entry.
+    // Paths *inside* a git directory are not here — they come from
+    // [`PROTECTED_IN_GITDIR`] via `emit_gitdir_denies`, which runs later so no
+    // user allow can reopen them.
     //
     // Emitted for EVERY writable root, not just the project (#212).
-    sbpl!(sb, ";; Git submodule config");
-    for root in &roots {
-        sbpl!(sb, "(deny file-write* (literal \"{root}/.gitmodules\"))");
+    for p in PROTECTED_IN_ROOT {
+        let why = p.why;
+        sbpl!(sb, ";; {why}");
+        for root in &roots {
+            emit_protected(sb, root, p);
+            // A repo nested under a writable root needs this too: `allow.write
+            // ~/code` leaves `~/code/other-repo/.agents/plugins` writable, and a
+            // manifest there fires whichever agent next opens THAT repo.
+            if p.nested {
+                let r = escape_regex(root);
+                let rel = escape_regex(p.rel);
+                sbpl!(sb, "(deny file-write* (regex #\"^{r}/.+/{rel}($|/)\"))");
+            }
+        }
+        sbpl!(sb);
     }
-    sbpl!(sb);
-
-    // Repo config tamper prevention — agent cannot modify its own sandbox config.
-    // The agent has project write access, but .cplt.toml controls sandbox relaxation.
-    // Writing it would let the agent prepare malicious config for the next session.
-    // A granted sibling repo is a future `--project-dir`, so it needs this too.
-    sbpl!(sb, ";; Repo config — deny write to prevent tampering");
-    for root in &roots {
-        sbpl!(sb, "(deny file-write* (literal \"{root}/.cplt.toml\"))");
-    }
-    sbpl!(sb);
-
-    // In-project plugin manifests (#267). goose auto-spawns the MCP servers
-    // declared under `.agents/plugins/`, so a manifest the agent writes in one
-    // session runs on the HOST the next time the user starts an agent in this
-    // repo. Same class as `.git/hooks`, and the same reason it belongs here
-    // rather than in a per-agent rule: `.agents/` is a cross-agent convention,
-    // the payload fires whichever agent reads it, and a granted sibling repo is
-    // as exposed as the project.
-    //
-    // Scoped to `plugins/` rather than all of `.agents/`: the rest of that tree
-    // is ordinary agent state with no auto-execution, and denying it would
-    // break writes nothing has asked to break.
-    sbpl!(
-        sb,
-        ";; Plugin manifests — auto-spawned on the host next session"
-    );
-    for root in &roots {
-        sbpl!(
-            sb,
-            "(deny file-write* (subpath \"{root}/.agents/plugins\"))"
-        );
-        // A repo nested under a writable root needs this too: `allow.write
-        // ~/code` leaves `~/code/other-repo/.agents/plugins` writable, and a
-        // manifest there fires whichever agent next opens THAT repo. Same
-        // reasoning and the same regex shape as the nested gitdir denies.
-        let r = escape_regex(root);
-        sbpl!(
-            sb,
-            "(deny file-write* (regex #\"^{r}/.+/\\.agents/plugins($|/)\"))"
-        );
-    }
-    sbpl!(sb);
 
     // Sensitive project files — deny read AND write of .env*, .pem, .key etc.
     // Read deny: prevents exfiltration of secrets via HTTPS.
@@ -816,29 +787,25 @@ fn emit_gitdir_denies(sb: &mut String, gitdir: &str) {
     // Pins the name to the directory: no rename, no rmdir (see fn docs).
     sbpl!(sb, "(deny file-write-unlink (literal \"{gitdir}\"))");
     sbpl!(sb, "(deny file-write-data (literal \"{gitdir}\"))");
-    // hooks/ — post-checkout, pre-push etc. run outside the sandbox on the
-    // user's next git operation.
-    sbpl!(sb, "(deny file-write* (subpath \"{gitdir}/hooks\"))");
-    // config — core.hooksPath redirects hooks to a writable directory,
-    // url.*.insteadOf hijacks remotes, include.path loads arbitrary config.
-    sbpl!(sb, "(deny file-write* (literal \"{gitdir}/config\"))");
-    // commondir — git reads it for ANY gitdir, not just worktrees, and its
-    // contents become `git rev-parse --git-common-dir`. cplt feeds that value
-    // into the profile as a read+write grant, so a planted commondir is an
-    // input to cplt's own policy: it points the next run's grant at another
-    // repository. `discover::git_common_dir` rejects a steered value at the
-    // source; this stops it being planted in the first place.
-    sbpl!(sb, "(deny file-write* (literal \"{gitdir}/commondir\"))");
-    // modules/<name>/ is a full gitdir per submodule, with the same hooks and
-    // config vectors one level down — `<gitdir>/modules/sub/hooks/post-checkout`
-    // and `<gitdir>/modules/sub/config` were both writable. The whole subtree is
-    // denied rather than those two names: submodule gitdirs nest arbitrarily
-    // deep (`modules/a/modules/b/...`) and SBPL subpaths have no wildcard.
-    // Nothing is lost by being broad — `git submodule add` and
-    // `update --init` already fail inside the sandbox, because both write
-    // `<gitdir>/config`, which has been denied since long before this change.
-    sbpl!(sb, "(deny file-write* (subpath \"{gitdir}/modules\"))");
+    // The names come from [`PROTECTED_IN_GITDIR`]; each entry's rationale lives
+    // with it. This function only picks the SBPL shape.
+    for p in PROTECTED_IN_GITDIR {
+        emit_protected(sb, gitdir, p);
+    }
     sbpl!(sb);
+}
+
+/// Emit one [`Protected`] entry as an SBPL write-deny under `base`.
+///
+/// The only per-backend decision: a tree becomes a `subpath` rule, a file a
+/// `literal` one.
+fn emit_protected(sb: &mut String, base: &str, p: &Protected) {
+    let rel = p.rel;
+    if p.tree {
+        sbpl!(sb, "(deny file-write* (subpath \"{base}/{rel}\"))");
+    } else {
+        sbpl!(sb, "(deny file-write* (literal \"{base}/{rel}\"))");
+    }
 }
 
 /// All git-directory denies, emitted last so no earlier allow can reopen them.
@@ -985,8 +952,8 @@ fn escape_regex(path: &str) -> String {
 /// git operation in that repo. A path rule cannot express "any depth", so this
 /// is the one place a regex earns its keep.
 ///
-/// The alternation mirrors `emit_gitdir_denies` exactly — `hooks`, `config`,
-/// `commondir`, `modules` — with `($|/)` so the directory entry itself is
+/// The alternation is derived from `PROTECTED_IN_GITDIR`, so it cannot drift
+/// from what `emit_gitdir_denies` emits — with `($|/)` so the directory entry itself is
 /// covered too (otherwise the agent could plant a *symlink* named `hooks`
 /// pointing at a writable directory). `file-write-unlink` and `file-write-data`
 /// on the `.git` entry close the rename-away trick and the worktree pointer-file
@@ -1008,13 +975,16 @@ fn escape_regex(path: &str) -> String {
 /// documented for the root case. Nothing here implies Linux coverage.
 fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
     let r = escape_regex(root);
+    // Derived from [`PROTECTED_IN_GITDIR`] rather than written out, so the
+    // alternation cannot drift from the table the way a hand-copied list did.
+    let names = nested_alternation(PROTECTED_IN_GITDIR);
     sbpl!(
         sb,
         ";; Git persistence prevention — repos nested under {root}"
     );
     sbpl!(
         sb,
-        "(deny file-write* (regex #\"^{r}/.+/\\.git/(hooks|config|commondir|modules)($|/)\"))"
+        "(deny file-write* (regex #\"^{r}/.+/\\.git/({names})($|/)\"))"
     );
     sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/.+/\\.git$\"))");
     sbpl!(sb, "(deny file-write-data (regex #\"^{r}/.+/\\.git$\"))");

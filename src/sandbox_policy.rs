@@ -1740,6 +1740,191 @@ pub fn validate_sbpl_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ── Protected paths inside writable roots ──────────────────────
+//
+// One list, three backends. Every backend reads the two tables below and
+// chooses only how to enforce them; none of them decides *what* is on the
+// list. Before this existed the same question — "which paths under a writable
+// root must stay unwritable?" — was answered independently in the SBPL
+// generator, in the bubblewrap ro-protect set, and (by omission) in Landlock,
+// and they disagreed: #276 had to add `.agents/plugins` to two backends by
+// hand, #240 found a bubblewrap mask naming a path that did not exist, and
+// #207 found a deny list silently effective on macOS and silently ineffective
+// on Linux. All three are the same defect.
+
+/// How Linux enforces a [`Protected`] entry.
+///
+/// Landlock never enforces any of them: it is purely additive, so a write rule
+/// on a tree cannot have a sub-path subtracted from it. Anything Linux does
+/// enforce is enforced by the bubblewrap read-only overlay, which is only
+/// present on hosts with user namespaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxCoverage {
+    /// Bubblewrap re-binds the path read-only, restoring macOS parity when
+    /// bubblewrap is available.
+    Bwrap,
+    /// Not enforced on Linux at all. The payload is the reason, so the gap is
+    /// reviewable in one place rather than being an absence nobody can see.
+    Gap(&'static str),
+}
+
+/// A path that must stay unwritable even though it sits inside a tree the
+/// sandbox deliberately makes writable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Protected {
+    /// Path relative to the writable root ([`PROTECTED_IN_ROOT`]) or to the git
+    /// directory ([`PROTECTED_IN_GITDIR`]) the entry hangs off.
+    pub rel: &'static str,
+    /// `true` → the whole subtree is protected; `false` → a single file.
+    pub tree: bool,
+    /// Also protect the same relative path under repositories nested *beneath*
+    /// a writable root (#247). macOS expresses this with a regex; no other
+    /// backend can express it at all.
+    pub nested: bool,
+    /// One-line rationale. macOS emits it as the SBPL section comment for
+    /// [`PROTECTED_IN_ROOT`]; for [`PROTECTED_IN_GITDIR`] it is documentation
+    /// only, since those share one section header per git directory.
+    pub why: &'static str,
+    pub linux: LinuxCoverage,
+}
+
+/// Protected paths relative to every writable root — the project directory and
+/// every `allow.write` grant (#212). A granted sibling repo is a future
+/// `--project-dir`, so it needs everything the project needs.
+///
+/// Paths *inside* a git directory live in [`PROTECTED_IN_GITDIR`] instead;
+/// `<root>/.git` is one of the git directories every root contributes.
+pub const PROTECTED_IN_ROOT: &[Protected] = &[
+    // Submodule URLs are a supply-chain vector: `git submodule update` clones
+    // whatever this file names.
+    //
+    // Not nested: a nested repo's `.gitmodules` is only reachable through that
+    // repo's own `.git/config`, which is already denied at every depth.
+    Protected {
+        rel: ".gitmodules",
+        tree: false,
+        nested: false,
+        why: "Git submodule config — URLs are a supply-chain vector",
+        linux: LinuxCoverage::Gap(
+            "not in the bubblewrap ro-protect set. Exploiting a rewritten URL needs \
+             a later `git submodule update`, and the bind would also have to skip \
+             repos that have no `.gitmodules` yet, which is where `git submodule add` \
+             writes it. Adding it would break that command on Linux, so the parity \
+             gap is recorded rather than closed silently.",
+        ),
+    },
+    // cplt's own config controls how relaxed the *next* session's sandbox is.
+    // Writing it would let the agent prepare a permissive profile for itself.
+    Protected {
+        rel: ".cplt.toml",
+        tree: false,
+        nested: false,
+        why: "Repo config — deny write to prevent sandbox tampering",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // #267: goose auto-spawns the MCP servers declared under `.agents/plugins/`,
+    // so a manifest the agent writes in one session runs on the HOST the next
+    // time the user starts an agent in this repo. Same class as `.git/hooks`,
+    // and cross-agent: the payload fires whichever agent reads it.
+    //
+    // Scoped to `plugins/` rather than all of `.agents/` — the rest of that tree
+    // is ordinary agent state with no auto-execution.
+    Protected {
+        rel: ".agents/plugins",
+        tree: true,
+        nested: true,
+        why: "Plugin manifests — auto-spawned on the host next session",
+        linux: LinuxCoverage::Bwrap,
+    },
+];
+
+/// Protected paths relative to a git directory.
+///
+/// The git directories are `<root>/.git` for every writable root (emitted even
+/// for a root that is not a repo today, so a mid-session `git init` is covered),
+/// plus a worktree's shared common dir and the resolved gitdir of any grant
+/// whose repo data does not live at `<root>/.git` — a worktree, a bare repo, or
+/// a grant pointing inside a repo (see `discover::git_dir_of`).
+///
+/// Pinning the git directory *itself* against rename and unlink is a mechanism,
+/// not a path, so it stays with the backend that can express it (macOS
+/// `file-write-unlink` / `file-write-data` on the directory entry).
+pub const PROTECTED_IN_GITDIR: &[Protected] = &[
+    // The primary persistence escape: a planted hook runs *unsandboxed* on the
+    // user's next git operation, including one run outside cplt entirely.
+    Protected {
+        rel: "hooks",
+        tree: true,
+        nested: true,
+        why: "hooks run unsandboxed on the user's next git operation",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // `core.hooksPath` redirects hooks to a writable directory, `url.*.insteadOf`
+    // hijacks remotes, `include.path` loads arbitrary config.
+    Protected {
+        rel: "config",
+        tree: false,
+        nested: true,
+        why: "core.hooksPath / url.insteadOf / include.path all redirect trust",
+        linux: LinuxCoverage::Gap(
+            "deliberate, not an oversight. A read-only bind here breaks `git config \
+             user.email` (without which the next commit fails), `git remote add` and \
+             `git push -u`; worse, git rewrites config through `.git/config.lock` + \
+             rename, so a denied write can leave a stale lock that blocks the user's \
+             next out-of-sandbox git. RESIDUAL: because config stays writable on \
+             Linux, `core.hooksPath` can still redirect hooks away from the \
+             read-only `hooks` bind. See SECURITY.md.",
+        ),
+    },
+    // git reads `commondir` for ANY gitdir, not just worktrees, and its contents
+    // become `git rev-parse --git-common-dir` — a value cplt feeds back into its
+    // own profile as a read+write grant. A planted one points the next run's
+    // grant at another repository. `discover::git_common_dir` rejects a steered
+    // value at the source; this stops it being planted in the first place.
+    Protected {
+        rel: "commondir",
+        tree: false,
+        nested: true,
+        why: "steers `git rev-parse --git-common-dir`, an input to cplt's own policy",
+        linux: LinuxCoverage::Gap(
+            "not in the bubblewrap ro-protect set. `discover::git_common_dir` rejects \
+             a steered value at the source on every platform, so the escalation is \
+             closed there; only the plant-in-place half is macOS-only.",
+        ),
+    },
+    // `modules/<name>/` is a full gitdir per submodule, with the same hooks and
+    // config vectors one level down. The whole subtree is denied rather than
+    // those two names: submodule gitdirs nest arbitrarily deep
+    // (`modules/a/modules/b/...`) and SBPL subpaths have no wildcard. Nothing is
+    // lost by being broad — `git submodule add` and `update --init` already fail
+    // inside the sandbox, because both write `<gitdir>/config`.
+    Protected {
+        rel: "modules",
+        tree: true,
+        nested: true,
+        why: "a full gitdir per submodule, same hooks and config vectors one level down",
+        linux: LinuxCoverage::Gap(
+            "not in the bubblewrap ro-protect set, and reaching it needs the same \
+             `<gitdir>/config` write that is itself only denied on macOS.",
+        ),
+    },
+];
+
+/// The `nested: true` entries of a table, as a regex alternation.
+///
+/// macOS is the only backend that can protect repositories nested at unknown
+/// depth beneath a writable root, and it does so with one regex per table. The
+/// alternation is derived here rather than written out next to the regex, so it
+/// cannot drift from the table the way it did before #247's comment had to
+/// promise it "mirrors `emit_gitdir_denies` exactly".
+pub fn nested_alternation(set: &[Protected]) -> String {
+    set.iter()
+        .filter(|p| p.nested)
+        .map(|p| p.rel)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1815,5 +2000,55 @@ mod tests {
             );
             assert!(result.unwrap().is_absolute());
         });
+    }
+
+    /// The protected-path set is the one place three backends agree, so a new
+    /// entry must not slip in with its Linux story unstated. Pinning the whole
+    /// table here makes any addition a visible diff on this test, where the
+    /// reviewer has to say which side of the platform line it falls on.
+    ///
+    /// This is also the only cross-platform check of what bubblewrap binds:
+    /// `sandbox::bubblewrap` is `cfg(target_os = "linux")`, so its own tests
+    /// cannot run on a macOS host, but it consumes exactly this subset.
+    #[test]
+    fn protected_paths_state_their_linux_coverage() {
+        let bwrap = |set: &[Protected]| {
+            set.iter()
+                .filter(|p| p.linux == LinuxCoverage::Bwrap)
+                .map(|p| p.rel)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bwrap(PROTECTED_IN_ROOT),
+            [".cplt.toml", ".agents/plugins"],
+            "bubblewrap re-binds these read-only under every writable root"
+        );
+        assert_eq!(
+            bwrap(PROTECTED_IN_GITDIR),
+            ["hooks"],
+            "`config`, `commondir` and `modules` are macOS-only; each entry \
+             carries the reason in its LinuxCoverage::Gap"
+        );
+        // Every entry says something either way — a Gap with an empty reason is
+        // an undocumented gap, which is the failure this table exists to stop.
+        for p in PROTECTED_IN_ROOT.iter().chain(PROTECTED_IN_GITDIR) {
+            assert!(!p.why.is_empty(), "{} has no rationale", p.rel);
+            if let LinuxCoverage::Gap(reason) = p.linux {
+                assert!(
+                    reason.len() > 40,
+                    "{} is unenforced on Linux with no stated reason",
+                    p.rel
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_alternation_covers_the_nested_entries() {
+        assert_eq!(
+            nested_alternation(PROTECTED_IN_GITDIR),
+            "hooks|config|commondir|modules"
+        );
+        assert_eq!(nested_alternation(PROTECTED_IN_ROOT), ".agents/plugins");
     }
 }

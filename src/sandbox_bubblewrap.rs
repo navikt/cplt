@@ -72,6 +72,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::sandbox::landlock_mod::{FsAccess, FsRule, NetRule};
+use crate::sandbox::policy::{LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected};
 
 /// Environment variable carrying the read end of the policy pipe (a decimal fd
 /// number) from which the bwrap re-entry helper reads the serialized Landlock
@@ -534,44 +535,12 @@ fn create_mask_placeholder(scratch: &Path) -> Result<PathBuf, String> {
 /// of). Only paths that exist on disk are ultimately bound (see
 /// [`build_bwrap_args`]).
 ///
-/// The set is deliberately **narrow** — only paths an agent has no legitimate
-/// reason to write *and* that are real persistence vectors:
-///
-/// - `.git/hooks` — the primary persistence escape. A planted hook runs
-///   *unsandboxed* on the next `git` invocation; agents do not normally write
-///   here.
-/// - `.cplt.toml` — relaxes the next session's sandbox; agents do not normally
-///   write it, and any `[propose]` block needs explicit trust approval anyway.
-///
-/// `.git/config` and `.gitmodules` are **deliberately left writable**: read-only
-/// binding them would break common, legitimate in-sandbox git operations
-/// (`git config user.email/user.name` identity setup — without it the next
-/// `git commit` fails "Please tell me who you are" — plus `git remote add`,
-/// `git push -u` upstream tracking, and `git submodule add`, which writes
-/// `.gitmodules`). Worse, git rewrites config via a `.git/config.lock` +
-/// rename-over-file; a denied write can leave a STALE `.git/config.lock` that
-/// blocks the user's *next* out-of-sandbox git. This also matches the git
-/// command guard, which explicitly allows `git config user.name`.
-///
-/// This trade was made for the *project's own* repository, so it is worth
-/// asking whether it still holds for a `git_common_dir` the agent had a hand in
-/// choosing. It does, now: `commondir` inside a gitdir is agent-writable and
-/// git reads it for any gitdir, so a planted one used to make
-/// `git rev-parse --git-common-dir` name a different repository — and this ro-
-/// protect set follows `git_common_dir`, so on Linux that yielded a writable
-/// `.git/config` in a repo the user will later `git pull`, i.e. `core.hooksPath`
-/// in someone else's repo. `discover::git_common_dir` now rejects a steered
-/// value, so the only common dir that reaches here is the main repo of a real
-/// worktree of the user's own project — exactly the case the trade above is
-/// about, where `git config user.email` is a normal thing for an agent to do.
-/// The set is therefore left as it is. Were the source-level check ever
-/// removed, `config` would have to be added here.
-///
-/// RESIDUAL: because `.git/config` stays writable, an agent can still set
-/// `core.hooksPath` to redirect hooks to a writable directory. The read-only
-/// `.git/hooks` bind therefore only mitigates the *direct* persistence vector
-/// (planting a hook file); it is not a complete closure of git-hook
-/// persistence. See SECURITY.md for the full residual discussion.
+/// **The set itself is not decided here.** It is the `LinuxCoverage::Bwrap`
+/// subset of [`PROTECTED_IN_ROOT`] and [`PROTECTED_IN_GITDIR`], which macOS
+/// reads too; every entry those tables mark `LinuxCoverage::Gap` records, in
+/// place, why Linux does not carry it. Notably `.git/config` stays writable
+/// here by deliberate trade — with the residual that `core.hooksPath` can
+/// still redirect hooks away from the read-only `hooks` bind. See SECURITY.md.
 ///
 /// # Every writable root, not just the project
 ///
@@ -587,20 +556,30 @@ fn create_mask_placeholder(scratch: &Path) -> Result<PathBuf, String> {
 /// common dir; in a **bare** repo they live at `<root>/hooks`. `git_dirs`
 /// carries those resolved `.git` directories (the project's `git_common_dir`
 /// plus one per granted path that needs it — see `discover::git_dir_of`), and
-/// each contributes a `hooks` protection. Non-existent paths are skipped
-/// downstream (see [`build_bwrap_args`]), and the result is deduplicated, so
-/// overlapping roots never double-bind.
+/// each contributes the same gitdir-relative set. Non-existent paths are
+/// skipped downstream (see [`build_bwrap_args`]), and the result is
+/// deduplicated, so overlapping roots never double-bind.
 pub(crate) fn git_persistence_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(write_roots.len() * 3 + git_dirs.len());
+    // Which paths are protected is decided once, in `policy::PROTECTED_IN_ROOT`
+    // and `policy::PROTECTED_IN_GITDIR`. This function decides only *how*:
+    // a read-only bind, for the subset Linux can carry. Entries marked
+    // `LinuxCoverage::Gap` are skipped on purpose and each carries the reason.
+    //
+    // `<root>/.git` is one of the git directories every writable root
+    // contributes, exactly as on macOS, so `.git/hooks` falls out of the gitdir
+    // table rather than being named again here.
+    let bwrap = |set: &'static [Protected]| {
+        set.iter()
+            .filter(|p| p.linux == LinuxCoverage::Bwrap)
+            .map(|p| p.rel)
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
     for root in write_roots {
-        paths.push(root.join(".git/hooks"));
-        paths.push(root.join(".cplt.toml"));
-        // #267: goose auto-spawns MCP servers declared here on the next host
-        // run, so a manifest written this session executes outside the sandbox.
-        paths.push(root.join(".agents/plugins"));
+        paths.extend(bwrap(PROTECTED_IN_ROOT).map(|rel| root.join(rel)));
+        paths.extend(bwrap(PROTECTED_IN_GITDIR).map(|rel| root.join(".git").join(rel)));
     }
     for dir in git_dirs {
-        paths.push(dir.join("hooks"));
+        paths.extend(bwrap(PROTECTED_IN_GITDIR).map(|rel| dir.join(rel)));
     }
     paths.sort();
     paths.dedup();
