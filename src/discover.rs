@@ -322,9 +322,9 @@ const TOOLS_TO_CHECK: &[&str] = &[
 /// These are the tools cplt itself and the agents depend on: a Windows `npm`
 /// installs the win32 platform package into the Windows tree, which is exactly
 /// how a user ended up with a Copilot CLI that could not start (#271). The
-/// build tools (`gradle`, `yarn`, `java`, ...) are only warned about: a build
-/// started from one runs as a Windows process outside the sandbox, which is
-/// worth saying but is not a broken install.
+/// rest — build tools, language runtimes, the `app_dirs()` applications — are
+/// only warned about: running one starts a Windows process outside the sandbox,
+/// which is worth saying but is not a broken install.
 const WSL_CRITICAL_TOOLS: &[&str] = &["gh", "git", "node", "npm"];
 
 use crate::sandbox::app_dirs;
@@ -485,7 +485,7 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool) -> (Vec<String>, bool) {
             } else {
                 format!(
                     "  {}\u{26a0}{} {}: {} is a Windows install reached through WSL interop; \
-                     a build started from it runs as a Windows process, outside the sandbox.",
+                     running it starts a Windows process, outside the sandbox.",
                     ui::stdout_color(ui::YELLOW),
                     ui::stdout_color(ui::RESET),
                     tool.name,
@@ -2193,7 +2193,7 @@ mod wsl_tool_report_tests {
         );
     }
 
-    /// A build tool is only warned about — it is not a broken install.
+    /// A non-critical tool is only warned about — it is not a broken install.
     #[test]
     fn windows_side_build_tool_is_warned_not_failed() {
         let tools = vec![tool(
