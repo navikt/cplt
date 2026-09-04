@@ -1759,8 +1759,7 @@ print('CONNECTED')
         Command::new("which")
             .arg("bwrap")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Skip guard for tests that need a working bubblewrap.

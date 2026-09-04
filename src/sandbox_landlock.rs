@@ -270,6 +270,23 @@ const DEVICE_FILES: &[&str] = &[
 ///
 /// Returns a `LandlockPolicy` that can be applied with `apply_policy()`
 /// on Linux, or described with `describe_policy()` on any platform.
+///
+/// # Protected paths: Landlock enforces none of them
+///
+/// `policy::PROTECTED_IN_ROOT` and `policy::PROTECTED_IN_GITDIR` name the paths
+/// that must stay unwritable inside a tree the sandbox makes writable —
+/// `.git/hooks`, `.cplt.toml`, `.agents/plugins`, `<gitdir>/config` and the
+/// rest. **This function emits no rule for any of them, and cannot.** Landlock
+/// is purely additive: a `FsRule` granting write on a directory cannot have a
+/// sub-path subtracted from it, and there is no deny form to express one.
+///
+/// So on Linux the whole set is carried by the bubblewrap read-only overlay
+/// (`bubblewrap::git_persistence_paths`) — for the subset those tables mark
+/// `LinuxCoverage::Bwrap` — and by nothing at all on a host without user
+/// namespaces, where bubblewrap is unavailable. That is a real gap, not an
+/// oversight, and it is stated here so the absence is visible from the backend
+/// that has it. #207 survived for months precisely because a control that was
+/// effective on macOS and ineffective on Linux looked identical in the code.
 /// True if `subdir` is a safe relative cache subdirectory: non-empty and every
 /// path component is a normal name (rejects `..`, `.`, an absolute root, or a
 /// Windows-style prefix).
