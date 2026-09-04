@@ -1446,8 +1446,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         deny_clipboard: cli.deny_clipboard,
         allow_jvm_attach: cli.allow_jvm_attach,
         allow_msbuild: cli.allow_msbuild,
-        // Config-only opt-in; no CLI flag.
-        gradle_init: false,
         allow_docker: config::FeatureToggle::from_pair(cli.allow_docker, cli.no_allow_docker),
         allow_tmp_exec: config::FeatureToggle::from_pair(cli.allow_tmp_exec, cli.no_allow_tmp_exec),
         allow_cache_exec: cli.allow_cache_exec.clone(),
@@ -1580,6 +1578,25 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
              traffic must go through the proxy. Allowing any localhost port would disable \
              kernel network restriction and defeat forced egress.",
         );
+    }
+
+    // Same reconciliation, one flag over (#297). Under proxy.forced the sandbox
+    // no longer opens a direct kernel path to `*:<port>` for `allow.ports`, so
+    // say so instead of letting the user believe the port is reachable raw. The
+    // ports stay in the proxy's allowed-port policy, so anything that honours
+    // HTTP_PROXY/HTTPS_PROXY still reaches them by CONNECT.
+    if resolved.proxy_forced && !resolved.allow_ports.is_empty() {
+        let ports = resolved
+            .allow_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui::warn(&format!(
+            "proxy.forced is active, so allow.ports ({ports}) opens no direct socket. \
+             Proxy-aware tools still reach those ports through the proxy; a direct \
+             socket does not. See docs/proxy.md, \"Raw-TCP tradeoff\"."
+        ));
     }
 
     // A write grant on a directory the parent executes from cancels the

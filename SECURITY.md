@@ -135,6 +135,8 @@ On Linux, cplt can optionally layer **Bubblewrap** (`bwrap`) on top of Landlock 
 
 #### The git-persistence re-bind
 
+The set of paths that must stay unwritable inside a writable tree is defined once, in `sandbox_policy.rs` (`PROTECTED_IN_ROOT` and `PROTECTED_IN_GITDIR`). Each entry states its own Linux coverage: `Bwrap` if the read-only overlay carries it, or `Gap(reason)` if Linux does not enforce it at all. Seatbelt turns the whole set into deny rules, bubblewrap re-binds the `Bwrap` subset read-only, and **Landlock enforces none of it** — it is additive, so a sub-path cannot be subtracted from an allowed writable tree. The backends choose the mechanism; they no longer each decide the list.
+
 The project's `.git/hooks` and `.cplt.toml` live *inside* the writable project tree, and Landlock cannot carve a sub-deny out of it, so on the Landlock-only path they stay writable. That is a persistence-escape gap against macOS. When bwrap is active, those two pre-existing paths are re-bound **read-only** (`--ro-bind`, emitted after the writable project bind so it shadows it), so an agent can no longer plant a `.git/hooks/post-commit` that runs unsandboxed on the next `git` run, nor drop a `.cplt.toml` that relaxes the next session's sandbox. In a git **worktree** the project's `.git` is a gitdir *pointer file*, so `<project>/.git/hooks` does not exist and the real hooks live under the shared common dir that the sandbox grants write access to; `<git_common_dir>/hooks` is therefore re-bound read-only too, otherwise the worktree persistence vector would be missed.
 
 The set is deliberately narrow. `.git/config` and `.gitmodules` are left writable on purpose, because read-only binding them would break legitimate in-sandbox git operations: `git config user.email` / `user.name` identity setup, without which the next `git commit` fails with "Please tell me who you are", plus `git remote add`, `git push -u` upstream tracking, and `git submodule add`, which writes `.gitmodules`. There is a second reason. Git rewrites config via a `.git/config.lock` plus rename, so a denied write could leave a **stale `.git/config.lock`** that blocks the user's next out-of-sandbox git. This matches the git command guard, which explicitly allows `git config user.name`.
@@ -202,7 +204,7 @@ sudo pacman -S bubblewrap
 - **Interpreter-based temp execution.** The sandbox blocks *direct* exec from `/tmp` (Mach-O/ELF binaries, dlopen), but it cannot block `bash /tmp/evil.sh` or `node /tmp/evil.js`, because the exec target is the interpreter (`/bin/bash`, `/usr/bin/node`), not the script file. Sandboxing interpreters would break Copilot.
 - **`.vscode/` project configs.** The agent can write `.vscode/tasks.json`, `launch.json`, and `settings.json`, which VS Code may auto-execute outside the sandbox. This is an IDE trust boundary issue, not a sandbox scope issue. Mitigation: review `.vscode/` changes in `git diff` before committing, and set `"task.autoRunTasks": "off"` in VS Code.
 - **Write+exec in home cache dirs.** `~/.gradle`, `~/.m2`, and `~/Library/pnpm` (macOS) / `~/.local/share/pnpm` (Linux) have both write and exec, because build tools need write for dependency downloads and exec for build plugins. A rogue agent could write a malicious JAR to `~/.m2` or a Gradle plugin to `~/.gradle`, but the executed code stays sandboxed. `~/Library/Caches` (macOS) is broadly allowed for dev tool caches (go-build, Homebrew, pip), while browser and app caches (Chrome, Firefox, Discord) are denied via regex prefix rules, so new dev tools need no allowlist maintenance. `--allow-cache-exec <SUBDIR>` opts into the same write+exec trade-off for one named subdir such as `ms-playwright` or `pnpm/dlx`, under `~/Library/Caches` (macOS) or `~/.cache` (Linux). A rogue agent could write a binary there and execute it, but execution stays sandboxed. On Linux the subdir is validated as a traversal-free relative path before a Landlock execute rule is granted, so `../../bin` cannot escape the cache dir. Prefer it over `--allow-cache-exec-any`, which opens the entire cache tree.
-- **User-granted exec trees** (`allow.exec` / `--allow-exec`). A tool prefix outside the default tool directories — a relocated Homebrew or toolchain root — gets read and execute, never write. Two grants are refused outright rather than granted narrowly: an unsafe root — `/`, `/tmp`, `$HOME` and any ancestor of it, or a platform system directory such as `/usr` or `/etc` — and any tree overlapping a writable one — the project directory, an `allow.write` grant, or a writable tool directory such as `~/.cache` (use `--allow-cache-exec` there). The overlap is refused because writable plus executable is a binary-drop staging path, and neither backend can subtract the write from the exec: Landlock unions a write rule on an ancestor with an exec rule on a child with no way to remove it, and the only Linux alternative — a bubblewrap `ro_protect` mount — is absent on any host without user namespaces. Refusing is also the one answer both backends give alike. On macOS the write-deny for the granted tree is emitted last in the profile, after every allow, because SBPL is last-match-wins. Code executed from the tree still runs inside the sandbox.
+- **User-granted exec trees** (`allow.exec` / `--allow-exec`). A tool prefix outside the default tool directories — a relocated Homebrew or toolchain root — gets read and execute, never write. Two grants are refused outright rather than granted narrowly: an unsafe root — `/`, `/tmp`, `$HOME` and any ancestor of it, or a platform system directory such as `/usr` or `/etc` — and any tree overlapping a writable one — the project directory, an `allow.write` grant, a writable tool directory such as `~/.cache` (use `--allow-cache-exec` there), or a **system temp dir**, which the backends make writable with no `allow.write` at all: `/tmp` on Linux, `/private/tmp` and `/private/var/folders` on macOS ([#299](https://github.com/navikt/cplt/issues/299); use the scratch dir, or `--allow-tmp-exec` if you really mean all of temp). The overlap is refused because writable plus executable is a binary-drop staging path, and neither backend can subtract the write from the exec: Landlock unions a write rule on an ancestor with an exec rule on a child with no way to remove it, and the only Linux alternative — a bubblewrap `ro_protect` mount — is absent on any host without user namespaces. Refusing is also the one answer both backends give alike. On macOS the write-deny for the granted tree is emitted last in the profile, after every allow, because SBPL is last-match-wins. Code executed from the tree still runs inside the sandbox.
 - **Playwright Chromium runtime** (macOS, `allow_cache_exec = ["ms-playwright"]`). Enabling browser testing grants system permissions well beyond the normal `process-exec` and `file-map-executable` rules:
   - `(allow syscall*)`, meaning all syscalls including Mach traps. Chromium uses undocumented traps that vary by macOS version and cannot be enumerated in a stable allowlist.
   - `(allow system-socket (socket-domain AF_UNIX))` for IPC between the browser, renderer, and GPU processes.
@@ -502,6 +504,29 @@ file.
 
 ## Defense layers
 
+### A property that holds across all of them: no silent grants
+
+A grant or setting that cannot be honoured fails loudly at the point it is
+written. It is never accepted and then quietly dropped.
+
+This is a security property, not a usability one. A restriction that silently
+does nothing leaves an operator believing a path is closed when it is open, and
+nothing in the tool contradicts that belief. The failure is invisible by
+construction: the config still lists the setting, `cplt config show` still prints
+it, and the sandbox still starts.
+
+The property has been broken in both directions and fixed each time: `allow.read`
+on a hard-denied file worked on Linux while being silently overridden on macOS
+(#207); `--allow-socket` emitted file rules that `connect()` never consults, so
+it granted and denied nothing on Linux (#240); `allow.write` inside a credential
+directory was inert on macOS while working on Linux (#291); read-only grants
+under `/tmp` disappeared inside bubblewrap's private tmpfs (#299); the `[audit]`
+section was settable and displayed while no code consumed it (#309).
+
+Where a control genuinely cannot be enforced on a platform, that is documented as
+a stated gap with the kernel reason for it, not left as an absence. The Linux
+sections below say where those gaps are.
+
 ### Layer 0: Environment variable sanitization
 
 By default `cplt` clears the child process environment and re-adds only safe variables from an allowlist, so credentials cannot leak through inherited env vars.
@@ -749,7 +774,7 @@ Proxy-forced mode restricts **kernel-level TCP egress to the proxy port only**, 
 - **macOS (Seatbelt):** the SBPL profile replaces the `*:443` allow with `localhost:<proxy_port>` only. Seatbelt *can* pin to localhost, so there is **no residual**. No direct-network path exists and the `env -u HTTPS_PROXY` and raw-socket bypasses are fully closed.
 - **Linux (Landlock):** Landlock drops the `:443` rule and allows only the proxy port. This blocks direct **TCP** `:443` to any host and forces HTTPS through the proxy, but two things stay open. Landlock is **port-based and cannot pin to localhost**, so a narrow `evil.com:<proxy_port>` channel stays reachable if a remote host answers on that exact port. Landlock's own restriction is **TCP-only** — it gates UDP at ABI v10 and cplt handles `AccessNet::ConnectTcp` alone — but in this mode a seccomp rule permits only `SOCK_STREAM` with protocol 0 or `IPPROTO_TCP` for `AF_INET`/`AF_INET6`, so UDP, raw, SCTP and DCCP are closed here on any kernel. DNS tunnelling and QUIC/HTTP-3 leave without touching the proxy in every *other* Linux mode. So this is "no direct TCP `:443` bypass and no non-TCP egress", **not** "no egress except the proxy": the proxy-port channel remains. Closing that residual requires a network namespace, tracked in [#114](https://github.com/navikt/cplt/issues/114).
 
-> **Escape-hatch caveat:** `--allow-port <PORT>` still opens a **direct** kernel egress channel on that port that does not pass through the proxy, on both platforms. Using it under proxy-forced reopens exactly the kind of unfiltered bypass this mode exists to close.
+> **Escape-hatch caveat:** `--allow-port <PORT>` opens a **direct** kernel egress channel on that port, to any remote host, that does not pass through the proxy. Under proxy-forced that channel is not opened ([#297](https://github.com/navikt/cplt/issues/297)): the port is dropped from the SBPL profile and from the Landlock ruleset, and cplt warns that it did so. The port stays in the *proxy's* allowed-port policy, so a proxy-aware tool still reaches `remote:<PORT>` by CONNECT, logged and domain-filtered. A tool that opens a raw socket does not, which is the whole point of the mode; run it without proxy-forced.
 
 ### Layer 1L: Landlock + seccomp kernel sandbox (Linux)
 
@@ -978,7 +1003,7 @@ This is **not key theft**. The attacker cannot take the key with them, and opera
 
 Port filtering works. The host part is what SBPL cannot express.
 
-**Ports are filterable, and cplt relies on it.** `src/sandbox_profile.rs` emits a blanket `(deny network-outbound (remote tcp))`, then `*:443` unless proxy-forced mode drops it, then one `*:PORT` per `--allow-port`, then the localhost deny or allow, then a `localhost:PORT` carve-out per proxy port and per `--allow-localhost` port. SBPL is last-match-wins, so the ordering is the policy.
+**Ports are filterable, and cplt relies on it.** `src/sandbox_profile.rs` emits a blanket `(deny network-outbound (remote tcp))`, then `*:443` unless proxy-forced mode drops it, then one `*:PORT` per `--allow-port` — dropped by proxy-forced mode too, for the same reason ([#297](https://github.com/navikt/cplt/issues/297)) — then the localhost deny or allow, then a `localhost:PORT` carve-out per proxy port and per `--allow-localhost` port. SBPL is last-match-wins, so the ordering is the policy.
 
 `real_profile_port_filtering_is_enforced_by_the_kernel` in `tests/integration.rs` runs a generated profile under `sandbox-exec` against two loopback listeners on ephemeral ports, one named in the profile and one not, and asserts the named one connects while the other does not. It is the only test here that proves the filtering filters rather than that the rule parses.
 

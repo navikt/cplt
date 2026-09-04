@@ -52,11 +52,12 @@ mod profile;
 pub use policy::{
     AppDir, AppDirKind, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, ENV_ALLOWLIST,
     ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
-    HomeToolDir, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
+    HomeToolDir, LinuxCoverage, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
     PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
-    PathBinDir, ResolvedToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
-    active_tool_dirs, app_dirs, current_uid, home_tool_dirs, linux_docker_socket_paths,
-    linux_runtime_dirs, mise_ro_protect_paths, path_bin_dirs, playwright_runtime_intent,
+    PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir,
+    TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
+    current_uid, home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs,
+    mise_ro_protect_paths, nested_alternation, path_bin_dirs, playwright_runtime_intent,
     relocatable_tool_prefix, socket_mask_paths, tool_override_path_is_safe,
     tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
     xdg_runtime_dir_env,
@@ -250,7 +251,8 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     prepare_impl(config, &extra_git_dirs(config.extra_write))
 }
 
-/// Refuse to launch when a grant names a file on the hard-deny list.
+/// Refuse to launch when a grant names a hard-denied file or a credential
+/// directory.
 ///
 /// [`policy::DENIED_FILES`] is documented as not overridable, unlike
 /// [`policy::DENIED_HOME_SUBPATHS`], which `allow.read` is meant to reopen.
@@ -259,6 +261,14 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 /// in force when it is not is exactly the failure this list exists to prevent.
 /// It also lands on both backends at once — silently ineffective on macOS,
 /// silently effective on Linux, which is how #207 stayed invisible.
+///
+/// [`policy::DENIED_DOTFILES`] directories are refused for the same reason
+/// pointing the other way (#291): the grant was silently ineffective on macOS
+/// and silently *effective* on Linux, where it opened `~/.ssh` wholesale. The
+/// error names the per-file grant, which is supported on both backends, so the
+/// Linux behaviour change arrives as a message with its own fix rather than as
+/// a rule that quietly stopped applying. Only the directory itself matches —
+/// a grant on a file inside it is the supported override and still works.
 fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
     for (key, paths) in [
         ("allow.read", config.extra_read),
@@ -270,6 +280,16 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
             if let Some(file) = policy::hard_denied_file(config.home_dir, p) {
                 return Err(format!(
                     "{key} names {} (~/{file}), which is on the hard-deny list and cannot be granted explicitly. Remove it from your config or command line.",
+                    p.display()
+                ));
+            }
+            if let Some(dir) = policy::denied_dotfile_dir(config.home_dir, p) {
+                return Err(format!(
+                    "{key} names {} (~/{dir}), a credential directory that cannot be granted \
+                     whole: macOS denies it whatever the grant says, so honouring it on Linux \
+                     alone would mean the same config opens every key in it on one platform \
+                     and nothing on the other. Name the specific files you need instead, e.g. \
+                     ~/{dir}/<file> — that grant works on both.",
                     p.display()
                 ));
             }
@@ -321,12 +341,22 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
             if !(exec.starts_with(write) || write.starts_with(exec)) {
                 continue;
             }
+            // The temp dirs cannot be narrowed — they are writable with no
+            // grant to withdraw — so that case needs its own remedy or the
+            // message tells the user to do something impossible.
+            let remedy = if source == TEMP_DIR_SOURCE {
+                "Move the tree somewhere the sandbox does not make writable, or use the \
+                 scratch dir, which is write+exec by design. `--allow-tmp-exec` opens \
+                 execute on all of temp if that is really what you want."
+            } else {
+                "Narrow one of the two so they do not overlap \u{2014} exec grants belong \
+                 on read-only tool prefixes."
+            };
             return Err(format!(
                 "allow.exec {} overlaps {source} {}: a tree that is both writable and \
                  executable lets the agent drop a binary and run it. Neither backend can \
                  subtract the write grant from the exec grant, so cplt refuses the pair \
-                 instead of pretending to. Narrow one of the two so they do not overlap \
-                 \u{2014} exec grants belong on read-only tool prefixes.",
+                 instead of pretending to. {remedy}",
                 exec.display(),
                 write.display()
             ));
@@ -364,8 +394,38 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
                 .map(|d| (config.home_dir.join(d.path), "the writable tool directory")),
         ),
     }
+    // The system temp dirs are made writable by the backends themselves, not by
+    // config, which is why they were missing here (#299). An exec grant under
+    // one is the same writable-plus-executable staging pair as a grant under
+    // `~/.cache`, and the three code paths disagree about it today: on macOS
+    // the grant wins (`emit_user_allows` runs after `emit_temp_rules`, and
+    // last-match-wins), on Linux without bubblewrap it unions with the
+    // always-writable `/tmp` rule into exactly the binary-drop pair this
+    // function exists to refuse, and under bubblewrap the private `/tmp` tmpfs
+    // hides it so the grant does nothing at all. Refusing is the one answer
+    // that is the same on all three.
+    trees.extend(
+        SYSTEM_TEMP_DIRS
+            .iter()
+            .map(|d| (PathBuf::from(d), TEMP_DIR_SOURCE)),
+    );
     trees
 }
+
+/// Names the temp-dir collision in the refusal, and selects its remedy: a temp
+/// dir is writable with no grant to withdraw, so "narrow one of the two" is not
+/// advice a user can act on there.
+const TEMP_DIR_SOURCE: &str = "the always-writable system temp dir";
+
+/// Temp roots the backends grant write on unconditionally: Landlock seeds a
+/// read+write rule for `/tmp`, and the SBPL profile does the same for
+/// `/private/tmp` and `/private/var/folders` (the canonical form of the macOS
+/// `TMPDIR`). Grants reach [`validate_exec_grants`] canonicalized, so the
+/// macOS entries are the `/private` forms.
+#[cfg(target_os = "macos")]
+const SYSTEM_TEMP_DIRS: &[&str] = &["/private/tmp", "/private/var/folders"];
+#[cfg(not(target_os = "macos"))]
+const SYSTEM_TEMP_DIRS: &[&str] = &["/tmp"];
 
 /// Resolve the real `.git` directory of every writable granted path whose repo
 /// data does NOT live at `<path>/.git` — a worktree, a bare repo, or a grant
@@ -1029,6 +1089,83 @@ mod tests {
         }
     }
 
+    /// A grant naming a `DENIED_DOTFILES` directory is refused on every key and
+    /// on both backends (#291).
+    ///
+    /// It was never honoured on macOS — the generic allow is emitted before the
+    /// subpath deny and loses to it — while Linux granted it for real. Refusing
+    /// is what makes the two the same; the error has to name the per-file grant,
+    /// because that is the route that still works.
+    #[test]
+    fn prepare_rejects_a_grant_on_a_denied_dotfile_directory() {
+        let home = Path::new("/home/test");
+        for &dir in policy::DENIED_DOTFILES {
+            let granted = vec![home.join(dir)];
+
+            let mut config = test_config(home, &granted);
+            let error = prepare(&config).err().expect("allow.read must be refused");
+            assert!(error.contains("allow.read"), "{error}");
+            assert!(error.contains(dir), "{error}");
+            assert!(
+                error.contains("Name the specific files"),
+                "the error must point at the grant that does work: {error}"
+            );
+
+            config.extra_read = &[];
+            config.extra_write = &granted;
+            let error = prepare(&config).err().expect("allow.write must be refused");
+            assert!(error.contains("allow.write"), "{error}");
+
+            config.extra_write = &[];
+            config.extra_socket = &granted;
+            let error = prepare(&config)
+                .err()
+                .expect("allow.socket must be refused");
+            assert!(error.contains("allow.socket"), "{error}");
+
+            config.extra_socket = &[];
+            config.extra_exec = &granted;
+            let error = prepare(&config).err().expect("allow.exec must be refused");
+            assert!(error.contains("allow.exec"), "{error}");
+        }
+    }
+
+    /// The per-file grant is the supported route and must survive: refusing it
+    /// would close the only door SSH has left on macOS, `~/.ssh/known_hosts`
+    /// included.
+    #[test]
+    fn prepare_accepts_a_grant_inside_a_denied_dotfile_directory() {
+        let home = Path::new("/home/test");
+        let granted = vec![
+            home.join(".ssh/id_ed25519"),
+            home.join(".ssh/known_hosts"),
+            home.join(".config/gcloud/application_default_credentials.json"),
+        ];
+
+        let mut config = test_config(home, &granted);
+        assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+        config.extra_read = &[];
+        config.extra_write = &granted;
+        assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+    }
+
+    /// `--allow-docker` grants `~/.docker` read-only, and `~/.docker` is a
+    /// `DENIED_DOTFILES` entry. It is a first-party rule the backends emit, not
+    /// a user grant, so the #291 refusal must not be able to see it — otherwise
+    /// the flag would refuse every run it is set on.
+    #[test]
+    fn prepare_does_not_refuse_the_allow_docker_dotfile_grant() {
+        let home = Path::new("/home/test");
+        let mut config = test_config(home, &[]);
+        config.allow_docker = true;
+
+        assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+        assert!(
+            prepare(&config).is_ok(),
+            "--allow-docker must not be caught by the denied-dotfile refusal"
+        );
+    }
+
     /// `/` and `$HOME` are refused: an exec grant that wide is not a sandbox.
     /// `$HOME`'s ancestors go with it — granting `/home` reaches every user.
     #[test]
@@ -1045,6 +1182,66 @@ mod tests {
             assert!(error.contains("allow.exec"), "{error}");
             assert!(error.contains("defeats the sandbox"), "{error}");
         }
+    }
+
+    /// The system temp dirs are writable without any `allow.write`, so an exec
+    /// grant under one is the same write+exec staging pair (#299). It has to be
+    /// refused rather than honoured because the three code paths otherwise
+    /// disagree: macOS honours it (the user allow is emitted after
+    /// `emit_temp_rules`), Linux without bubblewrap honours it *and* unions it
+    /// with the always-writable `/tmp` rule, and Linux under bubblewrap drops it
+    /// silently behind the private tmpfs.
+    ///
+    /// The roots are spelled out rather than read from `SYSTEM_TEMP_DIRS`, so
+    /// emptying that constant fails this test instead of vacuously passing it.
+    #[test]
+    fn prepare_refuses_an_exec_grant_under_the_system_temp_dir() {
+        #[cfg(target_os = "macos")]
+        let roots = ["/private/tmp", "/private/var/folders"];
+        #[cfg(not(target_os = "macos"))]
+        let roots = ["/tmp"];
+
+        let home = Path::new("/home/test");
+        for root in roots {
+            let exec = Path::new(root).join("build-xyz/bin");
+            let exec_paths = vec![exec.clone()];
+            let mut config = test_config(home, &[]);
+            config.extra_exec = &exec_paths;
+
+            let error = prepare(&config).err().unwrap_or_else(|| {
+                panic!("allow.exec under {root} must be refused, not silently honoured")
+            });
+            assert!(error.contains("allow.exec"), "{error}");
+            assert!(
+                error.contains(&exec.display().to_string()),
+                "the refusal must name the grant: {error}"
+            );
+            assert!(
+                error.contains(root),
+                "the refusal must name the temp dir it collides with: {error}"
+            );
+            // "Narrow one of the two" is not actionable for a tree that is
+            // writable with no grant to withdraw — the message must say where
+            // to put the binaries instead.
+            assert!(
+                error.contains("Move the tree") && error.contains("scratch dir"),
+                "the refusal must tell the user what to do instead: {error}"
+            );
+        }
+    }
+
+    /// A grant on a sibling path that merely *starts with* the temp root's name
+    /// is not under it, and must still be accepted.
+    #[test]
+    fn prepare_accepts_an_exec_grant_beside_the_system_temp_dir() {
+        let home = Path::new("/home/test");
+        let exec_paths = vec![PathBuf::from("/tmpfoo/bin")];
+        let mut config = test_config(home, &[]);
+        config.extra_exec = &exec_paths;
+        assert!(
+            prepare(&config).is_ok(),
+            "/tmpfoo is not under /tmp and must not be refused"
+        );
     }
 
     /// The overlap refusal, in both directions and against both sources of

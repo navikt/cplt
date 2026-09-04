@@ -103,21 +103,19 @@ impl Config {
         // safety features on.
         let baseline = preset.unwrap_or(Preset::Standard).baseline();
 
-        // Proxy: FeatureToggle resolves --with-proxy/--no-proxy against config default (true).
-        let with_proxy = cli.proxy.resolve(self.proxy.enabled.unwrap_or(true));
+        // Every boolean setting, resolved by the registry-driven ladder in
+        // `registry.rs` (CLI flag > config > preset baseline > default). The
+        // ladder is written once, there; nothing below re-implements it.
+        let bools = super::registry::ResolvedBools::resolve(&cli, self, baseline);
 
-        // Proxy-forced: FeatureToggle resolves --proxy-forced/--no-proxy-forced,
-        // then the explicit config value, then the preset baseline (false unless
-        // `strict`). Precedence: CLI flag > config > preset > default(off) —
-        // mirrors the toggle pattern, with the preset threaded in as the lowest
-        // layer. When true, the proxy is mandatory and kernel egress is locked
-        // to the proxy port (#53). Orchestration in main.rs enforces proxy-on +
-        // fail-closed; the conflict with an explicitly disabled proxy is
-        // reported there (so `--preset strict` with proxy.enabled=false fails
-        // closed rather than silently).
-        let proxy_forced = cli
-            .proxy_forced
-            .resolve(self.proxy.forced.unwrap_or(baseline.proxy_forced));
+        let with_proxy = bools.with_proxy;
+
+        // Forced-proxy egress (#53): when true the proxy is mandatory and kernel
+        // egress is locked to the proxy port. Orchestration in main.rs enforces
+        // proxy-on + fail-closed; the conflict with an explicitly disabled proxy
+        // is reported there, so `--preset strict` with `proxy.enabled = false`
+        // fails closed rather than silently.
+        let proxy_forced = bools.proxy_forced;
 
         // Port: CLI (if provided) > config > 0 (OS-assigned ephemeral port)
         let proxy_port = cli.proxy_port.or(self.proxy.port).unwrap_or(0);
@@ -132,25 +130,13 @@ impl Config {
             .allowed_domains
             .or_else(|| self.proxy.allowed_domains.as_ref().map(|s| expand_tilde(s)));
 
-        // Fail-closed networking opt-in (#52). `cli.default_allowlist` is a
-        // FeatureToggle where `--default-allowlist` is the ON side and
-        // `--allow-all-domains` is the OFF side (off wins), resolved against the
-        // explicit `proxy.default_allowlist` config, then the preset baseline
-        // (true only for `strict`, false otherwise). Precedence: CLI flag /
-        // `--allow-all-domains` escape hatch > config > preset > default(off) —
-        // mirrors `proxy_forced`, with the preset threaded in as the lowest
-        // layer. So `--preset strict` fails closed to the domain allowlist,
-        // while an explicit `--allow-all-domains` (OFF wins) or
-        // `proxy.default_allowlist = false` still overrides strict's baseline.
+        // Fail-closed networking opt-in (#52). The CLI layer is a pair:
+        // `--default-allowlist` is the ON side and `--allow-all-domains` the OFF
+        // side (off wins), assembled into the `FeatureToggle` in main.rs.
         // `--allow-all-domains` additionally forces allow-all: main.rs uses
         // `allow_all_domains` to clear any explicit `allowed_domains` file for
-        // the run. With no preset the baseline is Standard (false), so this
-        // resolves exactly as before — no regression.
-        let default_allowlist = cli.default_allowlist.resolve(
-            self.proxy
-                .default_allowlist
-                .unwrap_or(baseline.default_allowlist),
-        );
+        // the run.
+        let default_allowlist = bools.default_allowlist;
         let allow_all_domains = cli.allow_all_domains;
 
         // Proxy log file: CLI > config
@@ -351,12 +337,9 @@ impl Config {
         }
         deny_paths.extend(cli.deny_paths);
 
-        // Validate: --no-validate wins, then config, then true (validate by default)
-        let no_validate = if cli.no_validate {
-            true
-        } else {
-            !self.sandbox.validate.unwrap_or(true)
-        };
+        // Validation is stored inverted: the registry key is `sandbox.validate`
+        // (default on), `Resolved` carries `no_validate`.
+        let no_validate = !bools.validate;
 
         // Brief: off unless asked for. `--brief` turns it on for one run,
         // `sandbox.brief = true` for good. cplt writing files an agent then
@@ -365,23 +348,14 @@ impl Config {
         // `--no-brief` is the way back out for one run: without it, config-on
         // could only be undone by editing the config, which is no use in a
         // shared repo or a CI job. Flag beats config in both directions.
-        let brief = cli.brief.resolve(self.sandbox.brief.unwrap_or(false));
+        let brief = bools.brief;
         // AGENTS.md injection additionally writes into the user's repo, so it
         // is a second opt-in gated on `brief` — with the brief off, the
         // AGENTS.md block can never be written, whichever layer turned the
         // brief off.
-        let agents_md = brief
-            && cli
-                .agents_md
-                .resolve(self.sandbox.agents_md.unwrap_or(false));
+        let agents_md = brief && bools.agents_md;
 
-        // Allow-env-files: explicit CLI flag wins, then explicit config value,
-        // then the preset baseline (false when no preset — deny by default).
-        let allow_env_files = cli
-            .allow_env_files
-            .to_option()
-            .or(self.sandbox.allow_env_files)
-            .unwrap_or(baseline.allow_env_files);
+        let allow_env_files = bools.allow_env_files;
 
         // Allow-ports: merge config + CLI
         let mut allow_ports = self.allow.ports.clone();
@@ -395,13 +369,7 @@ impl Config {
         allow_localhost.sort_unstable();
         allow_localhost.dedup();
 
-        // Allow-localhost-any: explicit CLI flag wins, then explicit config
-        // value, then the preset baseline (false when no preset).
-        let allow_localhost_any = cli
-            .allow_localhost_any
-            .to_option()
-            .or(self.sandbox.allow_localhost_any)
-            .unwrap_or(baseline.allow_localhost_any);
+        let allow_localhost_any = bools.allow_localhost_any;
 
         // Pass-env: merge config + CLI
         let mut pass_env = self.sandbox.pass_env.clone();
@@ -409,65 +377,27 @@ impl Config {
         pass_env.sort_unstable();
         pass_env.dedup();
 
-        // Inherit-env: CLI flag wins, then config, then false (secure by default)
-        let inherit_env = if cli.inherit_env {
-            true
-        } else {
-            self.sandbox.inherit_env.unwrap_or(false)
-        };
+        let inherit_env = bools.inherit_env;
 
-        // Allow-lifecycle-scripts: explicit CLI flag wins, then explicit config
-        // value, then the preset baseline (false when no preset — blocked).
-        let allow_lifecycle_scripts = cli
-            .allow_lifecycle_scripts
-            .to_option()
-            .or(self.sandbox.allow_lifecycle_scripts)
-            .unwrap_or(baseline.allow_lifecycle_scripts);
+        let allow_lifecycle_scripts = bools.allow_lifecycle_scripts;
 
-        // Allow-gpg-signing: CLI flag wins, then config, then false (blocked by default)
-        let allow_gpg_signing = if cli.allow_gpg_signing {
-            true
-        } else {
-            self.sandbox.allow_gpg_signing.unwrap_or(false)
-        };
+        let allow_gpg_signing = bools.allow_gpg_signing;
 
         // Deny-clipboard: CLI-only tightening flag (defaults to false).
         let deny_clipboard = cli.deny_clipboard;
 
-        // Allow-jvm-attach: CLI flag wins, then config, then false (blocked by default)
-        let allow_jvm_attach = if cli.allow_jvm_attach {
-            true
-        } else {
-            self.sandbox.allow_jvm_attach.unwrap_or(false)
-        };
+        let allow_jvm_attach = bools.allow_jvm_attach;
 
-        // Allow-msbuild: CLI flag wins, then config, then false (blocked by default)
-        let allow_msbuild = if cli.allow_msbuild {
-            true
-        } else {
-            self.sandbox.allow_msbuild.unwrap_or(false)
-        };
+        let allow_msbuild = bools.allow_msbuild;
 
-        // Gradle init script: config-only opt-in (default false). Writes a
-        // cplt-managed file into the Gradle user home — behavior change the
-        // user must explicitly ask for.
-        let gradle_init = self.sandbox.gradle_init.unwrap_or(false);
+        // Config-only opt-in: writes a cplt-managed file into the Gradle user
+        // home, a behaviour change the user must explicitly ask for, so there is
+        // no CLI flag.
+        let gradle_init = bools.gradle_init;
 
-        // Allow-docker: explicit CLI flag wins, then explicit config value,
-        // then the preset baseline (false when no preset — blocked).
-        let allow_docker = cli
-            .allow_docker
-            .to_option()
-            .or(self.sandbox.allow_docker)
-            .unwrap_or(baseline.allow_docker);
+        let allow_docker = bools.allow_docker;
 
-        // Allow-tmp-exec: explicit CLI flag wins, then explicit config value,
-        // then the preset baseline (false when no preset — blocked).
-        let allow_tmp_exec = cli
-            .allow_tmp_exec
-            .to_option()
-            .or(self.sandbox.allow_tmp_exec)
-            .unwrap_or(baseline.allow_tmp_exec);
+        let allow_tmp_exec = bools.allow_tmp_exec;
 
         // Allow-cache-exec: merge config + CLI (list of subdir names)
         let mut allow_cache_exec = self.sandbox.allow_cache_exec.clone();
@@ -475,29 +405,15 @@ impl Config {
         allow_cache_exec.sort_unstable();
         allow_cache_exec.dedup();
 
-        // Allow-cache-exec-any: CLI flag wins, then config, then false (blocked by default)
-        let allow_cache_exec_any = if cli.allow_cache_exec_any {
-            true
-        } else {
-            self.sandbox.allow_cache_exec_any.unwrap_or(false)
-        };
+        let allow_cache_exec_any = bools.allow_cache_exec_any;
 
-        // Allow-browser: CLI flag wins, then config, then false (blocked by default)
-        let allow_browser = if cli.allow_browser {
-            true
-        } else {
-            self.sandbox.allow_browser.unwrap_or(false)
-        };
+        let allow_browser = bools.allow_browser;
 
-        // Keychain substitution (#242): experimental, config-only, default off.
-        // With it off the Keychain grant is exactly what `needs_keychain()` says,
-        // matching every release before this key existed.
-        let keychain_substitute = self.sandbox.keychain_substitute.unwrap_or(false);
+        // Experimental, config-only (#242). With it off the Keychain grant is
+        // exactly what `needs_keychain()` says.
+        let keychain_substitute = bools.keychain_substitute;
 
-        // Scratch-dir: FeatureToggle resolves --scratch-dir/--no-scratch-dir (default: on)
-        let scratch_dir = cli
-            .scratch
-            .resolve(self.sandbox.scratch_dir.unwrap_or(true));
+        let scratch_dir = bools.scratch_dir;
 
         // Use-bubblewrap: tri-state. --use-bubblewrap/--no-bubblewrap resolve via
         // FeatureToggle (off wins if both set); otherwise fall through to config,
@@ -507,58 +423,35 @@ impl Config {
             .to_option()
             .or(self.sandbox.use_bubblewrap);
 
-        // Quiet: FeatureToggle resolves --quiet/--no-quiet (default: off)
-        let quiet = cli.quiet.resolve(self.sandbox.quiet.unwrap_or(false));
+        let quiet = bools.quiet;
+        let audit = bools.audit;
+        let yes = bools.yes;
 
-        // Audit: FeatureToggle resolves --no-audit against config (default: on).
-        // The post-session report is on by default; --no-audit forces it off.
-        let audit = cli.audit.resolve(self.sandbox.audit.unwrap_or(true));
-
-        // Yes: FeatureToggle resolves --yes/--no-yes (default: off)
-        let yes = cli.yes.resolve(self.sandbox.yes.unwrap_or(false));
-
-        // gh-guard: CLI flag overrides enabled; sub-options come from [gh_proxy] config.
-        // Backward compat: old `sandbox.gh_proxy = true` is treated as `gh_guard.enabled = true`.
-        // Precedence: CLI flag > config value > preset baseline > default(off).
-        // Only `strict` sets the baseline on — every other preset (and none)
-        // leaves it at `false`, so resolution is unchanged for them.
-        let gh_guard_enabled_default = self
-            .gh_guard
-            .enabled
-            .or(self.sandbox.gh_proxy)
-            .unwrap_or(baseline.gh_guard_enabled);
-        let gh_guard_enabled = cli.gh_guard.resolve(gh_guard_enabled_default);
+        // gh-guard. `gh_guard.enabled` folds in the deprecated
+        // `sandbox.gh_proxy` spelling at the config layer of the ladder; the
+        // sub-options are config-only booleans on the same ladder, so a future
+        // `--gh-guard-no-scope-check` only has to grow a CLI column.
         let gh_guard = GhGuardPolicy {
-            enabled: gh_guard_enabled,
+            enabled: bools.gh_guard_enabled,
             mode: self.gh_guard.mode.unwrap_or(EnforcementMode::Block),
-            scope_check: self.gh_guard.scope_check.unwrap_or(true),
-            block_auth_token: self.gh_guard.block_auth_token.unwrap_or(true),
-            inject_token: self.gh_guard.inject_token.unwrap_or(false),
+            scope_check: bools.gh_scope_check,
+            block_auth_token: bools.gh_block_auth_token,
+            inject_token: bools.gh_inject_token,
             unknown_command: self
                 .gh_guard
                 .unknown_command
                 .unwrap_or(UnknownCommandPolicy::Block),
-            allow_api_write: self.gh_guard.allow_api_write.unwrap_or(false),
+            allow_api_write: bools.gh_allow_api_write,
         };
 
-        // git-guard: CLI flag overrides enabled. Backward compat from sandbox.git_push_prevention.
-        // Precedence: CLI flag > config value > preset baseline > default(off).
-        // Only `strict` sets the baseline on; unchanged for every other case.
-        let git_guard_enabled_default = self
-            .git_guard
-            .enabled
-            .or(self.sandbox.git_push_prevention)
-            .unwrap_or(baseline.git_guard_enabled);
-        let git_guard_enabled = cli.git_push_prevention.resolve(git_guard_enabled_default);
+        // git-guard. `git_guard.enabled` folds in the deprecated
+        // `sandbox.git_push_prevention` spelling at the config layer.
         let git_guard = GitGuardPolicy {
-            enabled: git_guard_enabled,
+            enabled: bools.git_guard_enabled,
             mode: self.git_guard.mode.unwrap_or(EnforcementMode::Block),
-            prevent_push: self.git_guard.prevent_push.unwrap_or(true),
-            prevent_force_push: self.git_guard.prevent_force_push.unwrap_or(true),
-            protect_default_branch_only: self
-                .git_guard
-                .protect_default_branch_only
-                .unwrap_or(false),
+            prevent_push: bools.git_prevent_push,
+            prevent_force_push: bools.git_prevent_force_push,
+            protect_default_branch_only: bools.git_protect_default_branch_only,
             allow_push: self
                 .git_guard
                 .allow_push
@@ -1215,48 +1108,11 @@ impl Resolved {
         let is_approved = |key: &str| approved_keys.contains(&key);
         let all_proposed = crate::repo_config::proposed_keys(&repo_config.propose);
 
-        // Boolean proposals (additive: false→true only)
-        if repo_config.propose.allow_localhost_any == Some(true)
-            && is_approved("allow_localhost_any")
-        {
-            self.allow_localhost_any = true;
-        }
-        if repo_config.propose.allow_jvm_attach == Some(true) && is_approved("allow_jvm_attach") {
-            self.allow_jvm_attach = true;
-        }
-        if repo_config.propose.allow_msbuild == Some(true) && is_approved("allow_msbuild") {
-            self.allow_msbuild = true;
-        }
-        if repo_config.propose.gradle_init == Some(true) && is_approved("gradle_init") {
-            self.gradle_init = true;
-        }
-        if repo_config.propose.allow_docker == Some(true) && is_approved("allow_docker") {
-            self.allow_docker = true;
-        }
-        if repo_config.propose.allow_tmp_exec == Some(true) && is_approved("allow_tmp_exec") {
-            self.allow_tmp_exec = true;
-        }
-        if repo_config.propose.allow_gpg_signing == Some(true) && is_approved("allow_gpg_signing") {
-            self.allow_gpg_signing = true;
-        }
-        if repo_config.propose.allow_lifecycle_scripts == Some(true)
-            && is_approved("allow_lifecycle_scripts")
-        {
-            self.allow_lifecycle_scripts = true;
-        }
-        if repo_config.propose.allow_browser == Some(true) && is_approved("allow_browser") {
-            self.allow_browser = true;
-        }
-        if repo_config.propose.allow_env_files == Some(true) && is_approved("allow_env_files") {
-            self.allow_env_files = true;
-        }
-        if repo_config.propose.gh_guard == Some(true) && is_approved("gh_guard") {
-            self.gh_guard.enabled = true;
-        }
-        if repo_config.propose.git_push_prevention == Some(true)
-            && is_approved("git_push_prevention")
-        {
-            self.git_guard.enabled = true;
+        // Boolean proposals, driven by `PROPOSE_BOOLS` (additive: false→true only).
+        for row in super::repo::PROPOSE_BOOLS {
+            if (row.propose)(&repo_config.propose) == Some(true) && is_approved(row.key) {
+                (row.apply)(self);
+            }
         }
 
         // Path proposals
@@ -2947,5 +2803,525 @@ validate = false
             !resolved.allow_localhost_any,
             "proxy.forced wins: localhost-any forced off"
         );
+    }
+}
+
+/// Per-key precedence: CLI flag > config file > preset baseline > default.
+///
+/// One row per boolean key, exercised through the real `Config::merge` — the
+/// registry table is what merge uses, so a row that stops holding means the
+/// ladder for that key actually changed, not that a mirror of it drifted.
+#[cfg(test)]
+mod precedence {
+    use super::super::registry::{BOOL_KEYS, BOOL_KEYS_EXEMPT};
+    use super::super::types::{CliFlags, Config, FeatureToggle, Preset, Resolved};
+    use super::super::{ConfigValueType, all_config_keys};
+
+    struct Ladder {
+        /// `section.key`, exactly as the registry names it.
+        key: &'static str,
+        /// The CLI flag that forces this key ON, if there is one.
+        cli_on: Option<fn(&mut CliFlags)>,
+        /// The CLI flag that forces this key OFF, if there is one. A key with
+        /// only one of the two has a one-way flag — a deliberate deviation,
+        /// recorded here rather than implied by the shape of some `if`.
+        cli_off: Option<fn(&mut CliFlags)>,
+        get: fn(&Resolved) -> bool,
+        /// Value with nothing set anywhere.
+        default: bool,
+        /// A preset that moves this key off its default, and the value it moves
+        /// it to. `None` for a key no preset controls.
+        preset: Option<(Preset, bool)>,
+    }
+
+    fn toml_for(key: &str, value: bool) -> String {
+        let (section, name) = key.split_once('.').expect("section.key");
+        format!("[{section}]\n{name} = {value}\n")
+    }
+
+    fn merge(toml: &str, cli: CliFlags) -> Resolved {
+        toml::from_str::<Config>(toml)
+            .expect("test config parses")
+            .merge(cli)
+            .expect("test config merges")
+    }
+
+    fn ladders() -> Vec<Ladder> {
+        vec![
+            Ladder {
+                key: "proxy.enabled",
+                cli_on: Some(|c| c.proxy = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.proxy = FeatureToggle::ForceOff),
+                get: |r| r.with_proxy,
+                default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "proxy.forced",
+                cli_on: Some(|c| c.proxy_forced = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.proxy_forced = FeatureToggle::ForceOff),
+                get: |r| r.proxy_forced,
+                default: false,
+                preset: Some((Preset::Strict, true)),
+            },
+            Ladder {
+                key: "proxy.default_allowlist",
+                cli_on: Some(|c| c.default_allowlist = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.default_allowlist = FeatureToggle::ForceOff),
+                get: |r| r.default_allowlist,
+                default: false,
+                preset: Some((Preset::Strict, true)),
+            },
+            Ladder {
+                key: "sandbox.validate",
+                // Deviation, deliberate: one-way `--no-validate`, and the
+                // resolved value is stored inverted.
+                cli_on: None,
+                cli_off: Some(|c| c.no_validate = true),
+                get: |r| !r.no_validate,
+                default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.brief",
+                cli_on: Some(|c| c.brief = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.brief = FeatureToggle::ForceOff),
+                get: |r| r.brief,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_env_files",
+                cli_on: Some(|c| c.allow_env_files = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.allow_env_files = FeatureToggle::ForceOff),
+                get: |r| r.allow_env_files,
+                default: false,
+                preset: Some((Preset::FullTrust, true)),
+            },
+            Ladder {
+                key: "sandbox.allow_localhost_any",
+                cli_on: Some(|c| c.allow_localhost_any = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.allow_localhost_any = FeatureToggle::ForceOff),
+                get: |r| r.allow_localhost_any,
+                default: false,
+                preset: Some((Preset::Permissive, true)),
+            },
+            Ladder {
+                key: "sandbox.inherit_env",
+                // Deviation, deliberate: one-way `--inherit-env`, no `--no-*`.
+                cli_on: Some(|c| c.inherit_env = true),
+                cli_off: None,
+                get: |r| r.inherit_env,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_lifecycle_scripts",
+                cli_on: Some(|c| c.allow_lifecycle_scripts = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.allow_lifecycle_scripts = FeatureToggle::ForceOff),
+                get: |r| r.allow_lifecycle_scripts,
+                default: false,
+                preset: Some((Preset::Permissive, true)),
+            },
+            Ladder {
+                key: "sandbox.allow_gpg_signing",
+                // Deviation, deliberate: one-way `--allow-gpg-signing`.
+                cli_on: Some(|c| c.allow_gpg_signing = true),
+                cli_off: None,
+                get: |r| r.allow_gpg_signing,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_tmp_exec",
+                cli_on: Some(|c| c.allow_tmp_exec = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.allow_tmp_exec = FeatureToggle::ForceOff),
+                get: |r| r.allow_tmp_exec,
+                default: false,
+                preset: Some((Preset::Permissive, true)),
+            },
+            Ladder {
+                key: "sandbox.scratch_dir",
+                cli_on: Some(|c| c.scratch = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.scratch = FeatureToggle::ForceOff),
+                get: |r| r.scratch_dir,
+                default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.audit",
+                // Deviation, deliberate: only the OFF side (`--no-audit`) exists.
+                cli_on: None,
+                cli_off: Some(|c| c.audit = FeatureToggle::ForceOff),
+                get: |r| r.audit,
+                default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.quiet",
+                cli_on: Some(|c| c.quiet = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.quiet = FeatureToggle::ForceOff),
+                get: |r| r.quiet,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.yes",
+                cli_on: Some(|c| c.yes = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.yes = FeatureToggle::ForceOff),
+                get: |r| r.yes,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_jvm_attach",
+                cli_on: Some(|c| c.allow_jvm_attach = true),
+                cli_off: None,
+                get: |r| r.allow_jvm_attach,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_msbuild",
+                cli_on: Some(|c| c.allow_msbuild = true),
+                cli_off: None,
+                get: |r| r.allow_msbuild,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.gradle_init",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.gradle_init,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_docker",
+                cli_on: Some(|c| c.allow_docker = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.allow_docker = FeatureToggle::ForceOff),
+                get: |r| r.allow_docker,
+                default: false,
+                preset: Some((Preset::FullTrust, true)),
+            },
+            Ladder {
+                key: "sandbox.allow_cache_exec_any",
+                cli_on: Some(|c| c.allow_cache_exec_any = true),
+                cli_off: None,
+                get: |r| r.allow_cache_exec_any,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.allow_browser",
+                cli_on: Some(|c| c.allow_browser = true),
+                cli_off: None,
+                get: |r| r.allow_browser,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "sandbox.keychain_substitute",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.keychain_substitute,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "gh_guard.enabled",
+                cli_on: Some(|c| c.gh_guard = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.gh_guard = FeatureToggle::ForceOff),
+                get: |r| r.gh_guard.enabled,
+                default: false,
+                preset: Some((Preset::Strict, true)),
+            },
+            Ladder {
+                key: "gh_guard.scope_check",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.gh_guard.scope_check,
+                default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "gh_guard.block_auth_token",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.gh_guard.block_auth_token,
+                default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "gh_guard.inject_token",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.gh_guard.inject_token,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "gh_guard.allow_api_write",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.gh_guard.allow_api_write,
+                default: false,
+                preset: None,
+            },
+            Ladder {
+                key: "git_guard.enabled",
+                cli_on: Some(|c| c.git_push_prevention = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.git_push_prevention = FeatureToggle::ForceOff),
+                get: |r| r.git_guard.enabled,
+                default: false,
+                preset: Some((Preset::Strict, true)),
+            },
+            Ladder {
+                key: "git_guard.prevent_push",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.git_guard.prevent_push,
+                default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "git_guard.prevent_force_push",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.git_guard.prevent_force_push,
+                default: true,
+                preset: None,
+            },
+            Ladder {
+                key: "git_guard.protect_default_branch_only",
+                cli_on: None,
+                cli_off: None,
+                get: |r| r.git_guard.protect_default_branch_only,
+                default: false,
+                preset: None,
+            },
+            // `sandbox.agents_md` is exercised separately: its resolved value is
+            // additionally gated on `brief`, so it does not follow the plain
+            // ladder.
+        ]
+    }
+
+    #[test]
+    fn nothing_set_gives_the_default() {
+        for l in ladders() {
+            let r = merge("", CliFlags::default());
+            assert_eq!((l.get)(&r), l.default, "{} with nothing set", l.key);
+        }
+    }
+
+    #[test]
+    fn config_beats_the_default() {
+        for l in ladders() {
+            for value in [false, true] {
+                let r = merge(&toml_for(l.key, value), CliFlags::default());
+                assert_eq!((l.get)(&r), value, "{} = {value} in config", l.key);
+            }
+        }
+    }
+
+    #[test]
+    fn preset_baseline_beats_the_default() {
+        for l in ladders() {
+            let Some((preset, value)) = l.preset else {
+                continue;
+            };
+            let r = merge(
+                "",
+                CliFlags {
+                    preset: Some(preset),
+                    ..Default::default()
+                },
+            );
+            assert_eq!((l.get)(&r), value, "{} under {preset}", l.key);
+        }
+    }
+
+    #[test]
+    fn config_beats_the_preset_baseline() {
+        for l in ladders() {
+            let Some((preset, value)) = l.preset else {
+                continue;
+            };
+            // Config says the opposite of what the preset's baseline says.
+            let r = merge(
+                &toml_for(l.key, !value),
+                CliFlags {
+                    preset: Some(preset),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                (l.get)(&r),
+                !value,
+                "{} = {} in config must override the {preset} baseline",
+                l.key,
+                !value
+            );
+        }
+    }
+
+    #[test]
+    fn cli_beats_config_and_preset() {
+        for l in ladders() {
+            // ON side: config says off, CLI says on.
+            if let Some(set_on) = l.cli_on {
+                let mut cli = CliFlags::default();
+                set_on(&mut cli);
+                let r = merge(&toml_for(l.key, false), cli);
+                assert!((l.get)(&r), "{}: CLI on must beat config off", l.key);
+            }
+
+            // OFF side: config says on, CLI says off. With the preset in play
+            // too, so this pins CLI above both lower layers at once.
+            if let Some(set_off) = l.cli_off {
+                let mut cli = CliFlags::default();
+                set_off(&mut cli);
+                cli.preset = l.preset.map(|(preset, _)| preset);
+                let r = merge(&toml_for(l.key, true), cli);
+                assert!(
+                    !(l.get)(&r),
+                    "{}: CLI off must beat config on (and the preset)",
+                    l.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_way_cli_flags_are_declared_as_such() {
+        // Every key must have at least one CLI flag or none at all; a key with
+        // exactly one side is a deliberate one-way flag, and the list of those
+        // is pinned here so growing one silently is not possible.
+        let one_way: Vec<&str> = ladders()
+            .iter()
+            .filter(|l| l.cli_on.is_some() != l.cli_off.is_some())
+            .map(|l| l.key)
+            .collect();
+        assert_eq!(
+            one_way,
+            [
+                "sandbox.validate",
+                "sandbox.inherit_env",
+                "sandbox.allow_gpg_signing",
+                "sandbox.audit",
+                "sandbox.allow_jvm_attach",
+                "sandbox.allow_msbuild",
+                "sandbox.allow_cache_exec_any",
+                "sandbox.allow_browser",
+            ],
+            "one-way CLI flags changed"
+        );
+    }
+
+    #[test]
+    fn agents_md_follows_the_ladder_but_stays_gated_on_brief() {
+        // The gate is deliberate: writing into the user's AGENTS.md is a second
+        // opt-in on top of the brief, so `--no-brief` suppresses it whichever
+        // layer turned agents_md on.
+        let r = merge(
+            "[sandbox]\nbrief = true\nagents_md = true\n",
+            CliFlags::default(),
+        );
+        assert!(r.agents_md, "config on + brief on");
+
+        let r = merge("[sandbox]\nagents_md = true\n", CliFlags::default());
+        assert!(!r.agents_md, "brief off must suppress agents_md");
+
+        let r = merge(
+            "[sandbox]\nbrief = true\nagents_md = true\n",
+            CliFlags {
+                brief: FeatureToggle::ForceOff,
+                ..Default::default()
+            },
+        );
+        assert!(!r.agents_md, "--no-brief must suppress agents_md");
+
+        let r = merge(
+            "[sandbox]\nbrief = true\nagents_md = true\n",
+            CliFlags {
+                agents_md: FeatureToggle::ForceOff,
+                ..Default::default()
+            },
+        );
+        assert!(!r.agents_md, "--no-agents-md must beat config on");
+    }
+
+    #[test]
+    fn legacy_spellings_feed_the_guard_keys_config_layer() {
+        let r = merge("[sandbox]\ngh_proxy = true\n", CliFlags::default());
+        assert!(
+            r.gh_guard.enabled,
+            "sandbox.gh_proxy still enables gh_guard"
+        );
+        let r = merge(
+            "[sandbox]\ngit_push_prevention = true\n",
+            CliFlags::default(),
+        );
+        assert!(r.git_guard.enabled);
+
+        // The modern key wins over the legacy one when both are set.
+        let r = merge(
+            "[sandbox]\ngh_proxy = true\n[gh_guard]\nenabled = false\n",
+            CliFlags::default(),
+        );
+        assert!(!r.gh_guard.enabled);
+    }
+
+    #[test]
+    fn every_ladder_row_is_a_real_registry_key() {
+        for l in ladders() {
+            let (section, key) = l.key.split_once('.').unwrap();
+            assert!(
+                super::super::registry::bool_key(section, key).is_some(),
+                "{} has a precedence test but no registry row",
+                l.key
+            );
+        }
+    }
+
+    #[test]
+    fn every_registry_bool_is_on_the_ladder_or_exempt() {
+        // The anti-drift net: a new boolean config key cannot be added without
+        // either joining the one precedence ladder or being listed, with a
+        // reason, in BOOL_KEYS_EXEMPT.
+        for info in all_config_keys() {
+            if info.value_type != ConfigValueType::Bool {
+                continue;
+            }
+            let on_ladder = BOOL_KEYS
+                .iter()
+                .any(|row| row.section == info.section && row.key == info.key);
+            let exempt = BOOL_KEYS_EXEMPT
+                .iter()
+                .any(|(section, key, _)| *section == info.section && *key == info.key);
+            assert!(
+                on_ladder != exempt,
+                "{}.{} must be on the precedence ladder or exempt, exactly one",
+                info.section,
+                info.key
+            );
+        }
+    }
+
+    #[test]
+    fn every_bool_key_row_names_a_registry_key() {
+        for row in BOOL_KEYS {
+            assert!(
+                all_config_keys()
+                    .iter()
+                    .any(|info| info.section == row.section
+                        && info.key == row.key
+                        && info.value_type == ConfigValueType::Bool),
+                "{}.{} is on the ladder but is not a boolean registry key",
+                row.section,
+                row.key
+            );
+        }
     }
 }

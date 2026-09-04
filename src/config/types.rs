@@ -892,7 +892,6 @@ pub struct CliFlags {
     pub deny_clipboard: bool,
     pub allow_jvm_attach: bool,
     pub allow_msbuild: bool,
-    pub gradle_init: bool,
     /// Preset-controlled toggle (see `allow_localhost_any`).
     pub allow_docker: FeatureToggle,
     /// Preset-controlled toggle (see `allow_localhost_any`).

@@ -163,10 +163,10 @@ pub fn generate_session_brief(resolved: &Resolved, agent: Agent, home: &Path) ->
          and similar) are unreadable by design (EPERM). Don't retry; tell the \
          user.\n",
     );
-    // `allow.read` of a path inside one of those directories is a supported
-    // configuration — the backends re-allow it after the blanket deny — so the
-    // blanket claim above needs its exceptions spelled out, or the agent will
-    // report a working read as blocked.
+    // `allow.read` or `allow.write` of a path inside one of those directories is
+    // a supported configuration — the backends re-allow it after the blanket
+    // deny — so the blanket claim above needs its exceptions spelled out, or the
+    // agent will report a working access as blocked.
     let credential_overrides = denied_dotfile_overrides(home, &resolved.allow_read);
     if !credential_overrides.is_empty() {
         let _ = writeln!(
@@ -175,6 +175,16 @@ pub fn generate_session_brief(resolved: &Resolved, agent: Agent, home: &Path) ->
              ARE readable: {}. Use them for what they are for and don't send \
              their contents anywhere.",
             credential_overrides.join(", ")
+        );
+    }
+    let credential_writes = denied_dotfile_overrides(home, &resolved.allow_write);
+    if !credential_writes.is_empty() {
+        let _ = writeln!(
+            out,
+            "- Also writable this session (`allow.write`), and readable with it: \
+             {}. `~/.ssh/known_hosts` is the usual one — `ssh` appends to it on \
+             a first connection.",
+            credential_writes.join(", ")
         );
     }
     if cfg!(target_os = "linux") {
@@ -215,30 +225,38 @@ pub fn generate_session_brief(resolved: &Resolved, agent: Agent, home: &Path) ->
 /// `permissive` and `full-trust` presets both set it, so this is not a corner
 /// case. macOS is unaffected — SBPL denies `(remote tcp)` by default and can
 /// pin localhost, so its port list holds either way.
+///
+/// Under `proxy.forced` no port is open to a direct socket at all (#297):
+/// `allow.ports` no longer emits a kernel egress rule, and `ssh` does not
+/// speak `HTTP_PROXY`, so the CONNECT tunnel that keeps proxy-aware tools
+/// working does nothing for it. `reconcile_proxy_forced` has already forced
+/// `allow_localhost_any` off by the time this runs, so the Linux clause cannot
+/// reopen it either.
 fn ssh_port_open(resolved: &Resolved) -> bool {
-    resolved.allow_ports.contains(&22)
-        || (cfg!(target_os = "linux") && resolved.allow_localhost_any)
+    !resolved.proxy_forced
+        && (resolved.allow_ports.contains(&22)
+            || (cfg!(target_os = "linux") && resolved.allow_localhost_any))
 }
 
 /// Is a private key under `~/.ssh` actually readable?
 ///
-/// The two backends disagree, so this does too:
+/// A grant naming a *file* inside `~/.ssh` opens it on both backends: macOS
+/// re-allows it after the blanket deny (`emit_denied_dotfile_overrides`), Linux
+/// emits it as a plain Landlock rule. A grant naming `~/.ssh` itself opens it on
+/// neither — `sandbox::prepare` refuses the run (#291).
 ///
-/// - **macOS**: `~/.ssh` is denied as a subpath, and `emit_denied_dotfile_overrides`
-///   re-allows approved paths afterwards — but it skips `*path == denied_dir`
-///   and emits `(literal ...)`, never a subpath. Only a grant naming a *file*
-///   inside `~/.ssh` opens anything.
-/// - **Linux**: Landlock has no denied-dotfile layer at all. Every `extra_read`
-///   path becomes a plain read rule, so a grant of `~/.ssh` — or of `~` — really
-///   does make the keys readable, and the brief must not claim otherwise.
+/// One divergence is left, and it is the ancestor gap #207 documents: a grant on
+/// `~` (or any parent of `~/.ssh`) really does make the keys readable on Linux,
+/// because Landlock cannot deny a subpath inside an allowed directory. macOS
+/// denies the subpath regardless. The brief must not claim otherwise on Linux.
 fn ssh_key_readable(allow_read: &[std::path::PathBuf], home: &Path) -> bool {
     let ssh_dir = home.join(".ssh");
     allow_read.iter().any(|p| {
-        if cfg!(target_os = "macos") {
-            p.starts_with(&ssh_dir) && *p != ssh_dir
-        } else {
-            p.starts_with(&ssh_dir) || ssh_dir.starts_with(p)
-        }
+        // The directory itself counts on neither backend, whichever side of the
+        // prefix test it lands on.
+        *p != ssh_dir
+            && (p.starts_with(&ssh_dir)
+                || (cfg!(not(target_os = "macos")) && ssh_dir.starts_with(p)))
     })
 }
 
@@ -264,26 +282,24 @@ fn ssh_agent_reaches(resolved: &Resolved) -> bool {
         && (!cfg!(target_os = "macos") || !resolved.allow_socket.is_empty())
 }
 
-/// The `allow.read` paths that defeat a `DENIED_DOTFILES` deny, rendered with
-/// `~` for the home prefix.
+/// The granted paths that defeat a `DENIED_DOTFILES` deny, rendered with `~`
+/// for the home prefix.
 ///
 /// The Credentials section claims those directories are unreadable; this is
-/// what keeps the claim honest by naming the exceptions. Which grants count is
-/// per-backend, exactly as in [`ssh_key_readable`]: macOS re-allows approved
-/// paths per file via `emit_denied_dotfile_overrides` (which skips the
-/// directory itself), while Linux has no denied-dotfile layer at all, so a
-/// grant *at or above* the directory — `~/.aws`, or plain `~` — opens it.
-fn denied_dotfile_overrides(home: &Path, allow_read: &[std::path::PathBuf]) -> Vec<String> {
-    allow_read
+/// what keeps the claim honest by naming the exceptions. A grant on a file
+/// inside one counts on both backends, and a grant on the directory itself
+/// counts on neither (`sandbox::prepare` refuses it, #291). The one divergence
+/// left is the ancestor gap from [`ssh_key_readable`]: on Linux a grant *above*
+/// the directory — plain `~` — opens it, and Landlock cannot take it back.
+fn denied_dotfile_overrides(home: &Path, granted: &[std::path::PathBuf]) -> Vec<String> {
+    granted
         .iter()
         .filter(|p| {
             crate::sandbox::DENIED_DOTFILES.iter().any(|d| {
                 let denied = home.join(d);
-                if cfg!(target_os = "macos") {
-                    p.starts_with(&denied) && **p != denied
-                } else {
-                    p.starts_with(&denied) || denied.starts_with(p)
-                }
+                **p != denied
+                    && (p.starts_with(&denied)
+                        || (cfg!(not(target_os = "macos")) && denied.starts_with(p)))
             })
         })
         .map(|p| match p.strip_prefix(home) {
@@ -700,6 +716,31 @@ mod tests {
         assert!(brief.contains("`~/.ssh/id_ed25519`"), "{brief}");
     }
 
+    /// #297: under `proxy.forced` `allow.ports` emits no kernel egress rule, and
+    /// `ssh` cannot use the CONNECT tunnel that keeps proxy-aware tools working.
+    /// The same `allow.ports = [22]` that opens the port in default mode must
+    /// not be reported as open here, or the brief promises the agent an SSH
+    /// path the kernel denies.
+    #[test]
+    fn brief_does_not_claim_port_22_is_open_under_proxy_forced() {
+        let mut resolved = base_resolved();
+        resolved.allow_ports = vec![22];
+        resolved.allow_read = vec![home().join(".ssh/id_ed25519")];
+
+        let default_mode = generate_session_brief(&resolved, Agent::Claude, home());
+        assert!(
+            default_mode.contains("SSH may work this session"),
+            "default mode still opens port 22:\n{default_mode}"
+        );
+
+        resolved.proxy_forced = true;
+        let forced = generate_session_brief(&resolved, Agent::Claude, home());
+        assert!(
+            forced.contains("SSH is blocked"),
+            "proxy.forced closes the direct path port 22 needs:\n{forced}"
+        );
+    }
+
     /// Port open, nothing to authenticate with: the blocker is the keys, and
     /// the brief must not blame the port it just said was open.
     #[test]
@@ -741,12 +782,12 @@ mod tests {
         assert!(brief.contains("SSH may work this session"), "{brief}");
     }
 
-    /// macOS re-allows approved paths inside `~/.ssh` per file
-    /// (`emit_denied_dotfile_overrides` skips the directory itself and emits
-    /// `(literal ...)`), so a grant of the bare directory opens nothing.
+    /// A bare `~/.ssh` grant opens nothing on either backend now: macOS never
+    /// honoured it, and since #291 `sandbox::prepare` refuses the run outright
+    /// rather than letting Linux honour it alone. The brief must not promise
+    /// keys on the strength of a grant that cannot start a session.
     #[test]
-    #[cfg(target_os = "macos")]
-    fn brief_treats_bare_ssh_dir_grant_as_no_grant_on_macos() {
+    fn brief_treats_a_bare_ssh_dir_grant_as_no_grant() {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.allow_read = vec![home().join(".ssh")];
@@ -757,32 +798,47 @@ mod tests {
         );
         assert!(
             !brief.contains("Exceptions the user granted"),
-            "a bare directory grant is not a readable exception on macOS:\n{brief}"
+            "a bare directory grant is not a readable exception:\n{brief}"
         );
     }
 
-    /// Linux has no denied-dotfile layer — every extra_read path becomes a
-    /// plain Landlock read rule — so a grant of `~/.ssh`, or of `~`, really
-    /// does make the keys readable, and the brief must say so.
+    /// A grant on a *file* inside `~/.ssh` is the supported route on both
+    /// backends, and `allow.write` counts as well as `allow.read` — that is what
+    /// lets `ssh` append to `known_hosts` on a first connection. Before this the
+    /// write grant was inert on macOS, so the brief would have called a working
+    /// write blocked.
+    #[test]
+    fn brief_names_a_write_grant_inside_a_credential_dir() {
+        let mut resolved = base_resolved();
+        resolved.allow_ports = vec![22];
+        resolved.allow_write = vec![home().join(".ssh/known_hosts")];
+        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        assert!(
+            brief.contains("Also writable this session"),
+            "the credentials claim must name the write exception:\n{brief}"
+        );
+        assert!(brief.contains("`~/.ssh/known_hosts`"), "{brief}");
+    }
+
+    /// The one divergence left, and the one #291 deliberately did not close:
+    /// Landlock cannot deny a subpath inside an allowed directory, so a grant on
+    /// `~` really does expose the keys on Linux. macOS's subpath deny beats it.
+    /// The brief must not claim otherwise on Linux.
     #[test]
     #[cfg(target_os = "linux")]
-    fn brief_honours_a_directory_grant_on_linux() {
-        for grant in [home().join(".ssh"), home().to_path_buf()] {
-            let mut resolved = base_resolved();
-            resolved.allow_ports = vec![22];
-            resolved.allow_read = vec![grant.clone()];
-            let brief = generate_session_brief(&resolved, Agent::Claude, home());
-            assert!(
-                brief.contains("SSH may work this session"),
-                "Landlock grants {} outright:\n{brief}",
-                grant.display()
-            );
-            assert!(
-                brief.contains("Exceptions the user granted"),
-                "the credentials claim must name {}:\n{brief}",
-                grant.display()
-            );
-        }
+    fn brief_honours_an_ancestor_grant_on_linux() {
+        let mut resolved = base_resolved();
+        resolved.allow_ports = vec![22];
+        resolved.allow_read = vec![home().to_path_buf()];
+        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        assert!(
+            brief.contains("SSH may work this session"),
+            "Landlock grants $HOME outright:\n{brief}"
+        );
+        assert!(
+            brief.contains("Exceptions the user granted"),
+            "the credentials claim must name the ancestor grant:\n{brief}"
+        );
     }
 
     /// Linux + allow_localhost_any sets restrict_net_connect = false, so

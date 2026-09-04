@@ -21,8 +21,9 @@ macro_rules! sbpl {
 
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
-    GPG_SIGNING_ALLOW_FILES, PathBinDir, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS, active_tool_dirs, app_dirs, path_bin_dirs,
+    GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
+    ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
+    active_tool_dirs, app_dirs, escape_regex, nested_alternation, path_bin_dirs,
     playwright_runtime_intent, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
@@ -229,7 +230,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     emit_user_allows(&mut sb, opts.extra_read, opts.extra_write, opts.extra_exec);
     emit_deny_rules(&mut sb, &home, opts.extra_deny);
     emit_registry_config_overrides(&mut sb, &home, opts.extra_read);
-    emit_denied_dotfile_overrides(&mut sb, &home, opts.extra_read);
+    emit_denied_dotfile_overrides(&mut sb, &home, opts.extra_read, opts.extra_write);
     emit_gpg_signing_rules(&mut sb, &home, opts.allow_gpg_signing, opts.extra_deny);
     emit_docker_rules(&mut sb, &home, opts.allow_docker, opts.extra_deny);
     emit_socket_rules(&mut sb, opts.allow_socket, opts.extra_deny);
@@ -371,59 +372,29 @@ fn emit_sensitive_project_denies(
 
     let roots = writable_roots(project, extra_write);
 
-    // .gitmodules — submodule URLs are a supply chain vector (git submodule update clones them).
-    // The rules naming paths inside a git directory live in `emit_gitdir_denies`,
-    // which runs for the project's `.git`, for a worktree's shared common dir,
-    // and — since #212 — for every other writable root and its resolved gitdir.
+    // Paths inside every writable root that must stay unwritable. The list is
+    // [`PROTECTED_IN_ROOT`]; this only chooses the SBPL shape for each entry.
+    // Paths *inside* a git directory are not here — they come from
+    // [`PROTECTED_IN_GITDIR`] via `emit_gitdir_denies`, which runs later so no
+    // user allow can reopen them.
     //
     // Emitted for EVERY writable root, not just the project (#212).
-    sbpl!(sb, ";; Git submodule config");
-    for root in &roots {
-        sbpl!(sb, "(deny file-write* (literal \"{root}/.gitmodules\"))");
+    for p in PROTECTED_IN_ROOT {
+        let why = p.why;
+        sbpl!(sb, ";; {why}");
+        for root in &roots {
+            emit_protected(sb, root, p);
+            // A repo nested under a writable root needs this too: `allow.write
+            // ~/code` leaves `~/code/other-repo/.agents/plugins` writable, and a
+            // manifest there fires whichever agent next opens THAT repo.
+            if p.nested {
+                let r = escape_regex(root);
+                let rel = escape_regex(p.rel);
+                sbpl!(sb, "(deny file-write* (regex #\"^{r}/.+/{rel}($|/)\"))");
+            }
+        }
+        sbpl!(sb);
     }
-    sbpl!(sb);
-
-    // Repo config tamper prevention — agent cannot modify its own sandbox config.
-    // The agent has project write access, but .cplt.toml controls sandbox relaxation.
-    // Writing it would let the agent prepare malicious config for the next session.
-    // A granted sibling repo is a future `--project-dir`, so it needs this too.
-    sbpl!(sb, ";; Repo config — deny write to prevent tampering");
-    for root in &roots {
-        sbpl!(sb, "(deny file-write* (literal \"{root}/.cplt.toml\"))");
-    }
-    sbpl!(sb);
-
-    // In-project plugin manifests (#267). goose auto-spawns the MCP servers
-    // declared under `.agents/plugins/`, so a manifest the agent writes in one
-    // session runs on the HOST the next time the user starts an agent in this
-    // repo. Same class as `.git/hooks`, and the same reason it belongs here
-    // rather than in a per-agent rule: `.agents/` is a cross-agent convention,
-    // the payload fires whichever agent reads it, and a granted sibling repo is
-    // as exposed as the project.
-    //
-    // Scoped to `plugins/` rather than all of `.agents/`: the rest of that tree
-    // is ordinary agent state with no auto-execution, and denying it would
-    // break writes nothing has asked to break.
-    sbpl!(
-        sb,
-        ";; Plugin manifests — auto-spawned on the host next session"
-    );
-    for root in &roots {
-        sbpl!(
-            sb,
-            "(deny file-write* (subpath \"{root}/.agents/plugins\"))"
-        );
-        // A repo nested under a writable root needs this too: `allow.write
-        // ~/code` leaves `~/code/other-repo/.agents/plugins` writable, and a
-        // manifest there fires whichever agent next opens THAT repo. Same
-        // reasoning and the same regex shape as the nested gitdir denies.
-        let r = escape_regex(root);
-        sbpl!(
-            sb,
-            "(deny file-write* (regex #\"^{r}/.+/\\.agents/plugins($|/)\"))"
-        );
-    }
-    sbpl!(sb);
 
     // Sensitive project files — deny read AND write of .env*, .pem, .key etc.
     // Read deny: prevents exfiltration of secrets via HTTPS.
@@ -816,29 +787,25 @@ fn emit_gitdir_denies(sb: &mut String, gitdir: &str) {
     // Pins the name to the directory: no rename, no rmdir (see fn docs).
     sbpl!(sb, "(deny file-write-unlink (literal \"{gitdir}\"))");
     sbpl!(sb, "(deny file-write-data (literal \"{gitdir}\"))");
-    // hooks/ — post-checkout, pre-push etc. run outside the sandbox on the
-    // user's next git operation.
-    sbpl!(sb, "(deny file-write* (subpath \"{gitdir}/hooks\"))");
-    // config — core.hooksPath redirects hooks to a writable directory,
-    // url.*.insteadOf hijacks remotes, include.path loads arbitrary config.
-    sbpl!(sb, "(deny file-write* (literal \"{gitdir}/config\"))");
-    // commondir — git reads it for ANY gitdir, not just worktrees, and its
-    // contents become `git rev-parse --git-common-dir`. cplt feeds that value
-    // into the profile as a read+write grant, so a planted commondir is an
-    // input to cplt's own policy: it points the next run's grant at another
-    // repository. `discover::git_common_dir` rejects a steered value at the
-    // source; this stops it being planted in the first place.
-    sbpl!(sb, "(deny file-write* (literal \"{gitdir}/commondir\"))");
-    // modules/<name>/ is a full gitdir per submodule, with the same hooks and
-    // config vectors one level down — `<gitdir>/modules/sub/hooks/post-checkout`
-    // and `<gitdir>/modules/sub/config` were both writable. The whole subtree is
-    // denied rather than those two names: submodule gitdirs nest arbitrarily
-    // deep (`modules/a/modules/b/...`) and SBPL subpaths have no wildcard.
-    // Nothing is lost by being broad — `git submodule add` and
-    // `update --init` already fail inside the sandbox, because both write
-    // `<gitdir>/config`, which has been denied since long before this change.
-    sbpl!(sb, "(deny file-write* (subpath \"{gitdir}/modules\"))");
+    // The names come from [`PROTECTED_IN_GITDIR`]; each entry's rationale lives
+    // with it. This function only picks the SBPL shape.
+    for p in PROTECTED_IN_GITDIR {
+        emit_protected(sb, gitdir, p);
+    }
     sbpl!(sb);
+}
+
+/// Emit one [`Protected`] entry as an SBPL write-deny under `base`.
+///
+/// The only per-backend decision: a tree becomes a `subpath` rule, a file a
+/// `literal` one.
+fn emit_protected(sb: &mut String, base: &str, p: &Protected) {
+    let rel = p.rel;
+    if p.tree {
+        sbpl!(sb, "(deny file-write* (subpath \"{base}/{rel}\"))");
+    } else {
+        sbpl!(sb, "(deny file-write* (literal \"{base}/{rel}\"))");
+    }
 }
 
 /// All git-directory denies, emitted last so no earlier allow can reopen them.
@@ -955,25 +922,6 @@ fn emit_git_persistence_denies(
     }
 }
 
-/// Escape the regex metacharacters that can still appear in a path.
-///
-/// `validate_sbpl_path` already rejects `"`, `(`, `)`, `;`, `\` and newlines, so
-/// what is left is the set below. Without this a project directory like
-/// `~/code/v1.0+rc` would compile to a rule matching more than it names.
-fn escape_regex(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for c in path.chars() {
-        if matches!(
-            c,
-            '.' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
-        ) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Extend the git-persistence denies to repositories nested *beneath* a
 /// writable root (#247).
 ///
@@ -985,8 +933,8 @@ fn escape_regex(path: &str) -> String {
 /// git operation in that repo. A path rule cannot express "any depth", so this
 /// is the one place a regex earns its keep.
 ///
-/// The alternation mirrors `emit_gitdir_denies` exactly — `hooks`, `config`,
-/// `commondir`, `modules` — with `($|/)` so the directory entry itself is
+/// The alternation is derived from `PROTECTED_IN_GITDIR`, so it cannot drift
+/// from what `emit_gitdir_denies` emits — with `($|/)` so the directory entry itself is
 /// covered too (otherwise the agent could plant a *symlink* named `hooks`
 /// pointing at a writable directory). `file-write-unlink` and `file-write-data`
 /// on the `.git` entry close the rename-away trick and the worktree pointer-file
@@ -1008,13 +956,16 @@ fn escape_regex(path: &str) -> String {
 /// documented for the root case. Nothing here implies Linux coverage.
 fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
     let r = escape_regex(root);
+    // Derived from [`PROTECTED_IN_GITDIR`] rather than written out, so the
+    // alternation cannot drift from the table the way a hand-copied list did.
+    let names = nested_alternation(PROTECTED_IN_GITDIR);
     sbpl!(
         sb,
         ";; Git persistence prevention — repos nested under {root}"
     );
     sbpl!(
         sb,
-        "(deny file-write* (regex #\"^{r}/.+/\\.git/(hooks|config|commondir|modules)($|/)\"))"
+        "(deny file-write* (regex #\"^{r}/.+/\\.git/({names})($|/)\"))"
     );
     sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/.+/\\.git$\"))");
     sbpl!(sb, "(deny file-write-data (regex #\"^{r}/.+/\\.git$\"))");
@@ -1734,48 +1685,83 @@ fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[Pat
     }
 }
 
-/// Re-allow specific files inside DENIED_DOTFILES directories when the user
-/// has explicitly approved them via `allow.read`.
+/// Every spelling of `path` that needs a re-allow, when it names a file *inside*
+/// a [`DENIED_DOTFILES`] directory. Empty when it does not.
 ///
-/// DENIED_DOTFILES uses `(deny file-read* (subpath ...))` which blocks entire
-/// directories. When a user explicitly approves a file inside one of these dirs,
-/// we emit a targeted `(allow file-read* (literal ...))` AFTER the deny so
-/// SBPL last-match-wins grants access to that specific file only.
-fn emit_denied_dotfile_overrides(sb: &mut String, home: &str, extra_read: &[PathBuf]) {
+/// A grant naming the directory itself is not an override — `sandbox::prepare`
+/// refuses it outright (#291), and honouring it here would reopen a whole
+/// credential directory on the strength of one config line.
+fn denied_dotfile_override_paths(home: &Path, path: &Path) -> Vec<String> {
+    for &dotfile in DENIED_DOTFILES {
+        let denied_dir = home.join(dotfile);
+        let resolved_dir = resolved(denied_dir.clone());
+        let Ok(rel) = path.strip_prefix(&resolved_dir) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            return Vec::new();
+        }
+        let mut forms = vec![path.to_string_lossy().into_owned()];
+        // When `~/<dotfile>` is itself a symlink the deny names the $HOME
+        // path, and the macOS sandbox matches a rule against the path as
+        // opened — so the re-allow has to cover that form as well.
+        if resolved_dir != denied_dir {
+            forms.push(denied_dir.join(rel).to_string_lossy().into_owned());
+        }
+        return forms;
+    }
+    Vec::new()
+}
+
+/// Re-allow specific files inside DENIED_DOTFILES directories when the user
+/// has explicitly approved them via `allow.read` or `allow.write`.
+///
+/// DENIED_DOTFILES uses `(deny file-read* (subpath ...))` and the matching
+/// `file-write*` deny, which block entire directories. When a user explicitly
+/// approves a file inside one of these dirs, we emit a targeted
+/// `(allow ... (literal ...))` AFTER the deny so SBPL last-match-wins grants
+/// access to that specific file only.
+///
+/// A write grant gets read as well, matching [`emit_user_allows`]: a write
+/// grant that cannot read the file it writes is not a usable grant. That is
+/// what makes `~/.ssh/known_hosts` appendable, which stock `ssh` needs on a
+/// first connection under the default `StrictHostKeyChecking`. Before this,
+/// `emit_user_allows` emitted the write grant *before* `emit_deny_rules`, the
+/// deny won, and the grant silently did nothing on macOS while working on
+/// Linux — the same shape as #291, pointing the other way.
+fn emit_denied_dotfile_overrides(
+    sb: &mut String,
+    home: &str,
+    extra_read: &[PathBuf],
+    extra_write: &[PathBuf],
+) {
     let home_path = Path::new(home);
-    let mut overrides: Vec<String> = Vec::new();
+    // A path granted both ways is emitted once, from the write list.
+    let read_only: Vec<String> = extra_read
+        .iter()
+        .filter(|p| !extra_write.contains(p))
+        .flat_map(|p| denied_dotfile_override_paths(home_path, p))
+        .collect();
+    let writable: Vec<String> = extra_write
+        .iter()
+        .flat_map(|p| denied_dotfile_override_paths(home_path, p))
+        .collect();
 
-    for path in extra_read {
-        for &dotfile in DENIED_DOTFILES {
-            let denied_dir = home_path.join(dotfile);
-            let resolved_dir = resolved(denied_dir.clone());
-            let Ok(rel) = path.strip_prefix(&resolved_dir) else {
-                continue;
-            };
-            if rel.as_os_str().is_empty() {
-                continue;
-            }
-            overrides.push(path.to_string_lossy().into_owned());
-            // When `~/<dotfile>` is itself a symlink the deny names the $HOME
-            // path, and the macOS sandbox matches a rule against the path as
-            // opened — so the re-allow has to cover that form as well.
-            if resolved_dir != denied_dir {
-                overrides.push(denied_dir.join(rel).to_string_lossy().into_owned());
-            }
-            break;
-        }
+    if read_only.is_empty() && writable.is_empty() {
+        return;
     }
-
-    if !overrides.is_empty() {
-        sbpl!(
-            sb,
-            ";; User-overridden files in sensitive directories (allow.read)"
-        );
-        for path in &overrides {
-            sbpl!(sb, "(allow file-read* (literal \"{path}\"))");
-        }
-        sbpl!(sb);
+    sbpl!(
+        sb,
+        ";; User-overridden files in sensitive directories (allow.read / allow.write)"
+    );
+    for path in &read_only {
+        sbpl!(sb, "(allow file-read* (literal \"{path}\"))");
     }
+    for path in &writable {
+        sbpl!(sb, "(allow file-read* (literal \"{path}\"))");
+        sbpl!(sb, "(allow file-write* (literal \"{path}\"))");
+    }
+    sbpl!(sb);
 }
 
 /// Allow GPG commit signing when `--allow-gpg-signing` is set.
@@ -2020,13 +2006,25 @@ fn emit_network_rules(
     // contradiction the orchestration already prevents), we emit NO outbound-443
     // rule and NO localhost proxy carve-out — the deny-by-default profile then
     // blocks all remote TCP, which is the safe failure rather than an open one.
+    //
+    // `extra_ports` (#297) is gated on the same condition, and for the same
+    // reason. `(remote ip "*:{port}")` is a direct path to ANY remote host on
+    // that port, family-agnostic so it carries UDP too — a channel the proxy
+    // never sees, that `allowed_domains`/`blocked_domains` never filter, and
+    // that no cooperating localhost process is needed to reach. Leaving it
+    // ungated made the "no residual" claim above false for every user who
+    // passed `--allow-port`. The port stays in the *proxy's* allowed-port
+    // policy, so a proxy-aware tool still reaches `remote:{port}` by CONNECT,
+    // logged and domain-filtered; only non-proxy-aware raw TCP loses the path,
+    // which is precisely what this mode exists to take away. `main.rs` warns
+    // when the two are combined, so the narrowing is never silent.
     if !proxy_forced {
         sbpl!(sb, "(allow network-outbound (remote ip \"*:443\"))");
-    }
 
-    // Extra ports (e.g., MCP servers, custom services)
-    for port in extra_ports {
-        sbpl!(sb, "(allow network-outbound (remote ip \"*:{port}\"))");
+        // Extra ports (e.g., MCP servers, custom services)
+        for port in extra_ports {
+            sbpl!(sb, "(allow network-outbound (remote ip \"*:{port}\"))");
+        }
     }
 
     // Block localhost outbound — prevents SSRF to local dev servers, databases, etc.
@@ -2125,6 +2123,78 @@ mod tests {
             r#"(deny file-write* (literal "/projects/app/.git/config"))"#,
         ] {
             assert!(p.contains(rule), "MISSING without git_common_dir: {rule}");
+        }
+    }
+
+    /// `allow.write` on a file inside a `DENIED_DOTFILES` directory must reach
+    /// the profile as a post-deny re-allow, exactly as `allow.read` does.
+    ///
+    /// The concrete case: stock `ssh` appends to `~/.ssh/known_hosts` on a first
+    /// connection under the default `StrictHostKeyChecking`. Before this, the
+    /// write grant was emitted by `emit_user_allows` — i.e. *before*
+    /// `emit_deny_rules` — lost to the subpath deny, and did nothing at all on
+    /// macOS while working on Linux. Verified against the live sandbox with
+    /// `cplt check path --write`, which reported the model/probe mismatch.
+    ///
+    /// Read comes with write deliberately: a grant that can write a file it
+    /// cannot read is not a usable grant, and `emit_user_allows` pairs them the
+    /// same way.
+    #[test]
+    fn profile_extra_write_overrides_a_denied_dotfile_file() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let granted = [PathBuf::from("/Users/test/.ssh/known_hosts")];
+        let mut opts = test_options(project, home);
+        opts.extra_write = &granted;
+        let p = generate_profile(&opts);
+
+        let deny = p
+            .find(r#"(deny file-write* (subpath "/Users/test/.ssh"))"#)
+            .expect("the blanket ~/.ssh write deny must still be emitted");
+        for rule in [
+            r#"(allow file-read* (literal "/Users/test/.ssh/known_hosts"))"#,
+            r#"(allow file-write* (literal "/Users/test/.ssh/known_hosts"))"#,
+        ] {
+            let at = p
+                .find(rule)
+                .unwrap_or_else(|| panic!("missing post-deny re-allow: {rule}"));
+            assert!(
+                at > deny,
+                "re-allow must come AFTER the subpath deny (SBPL last-match-wins): {rule}"
+            );
+        }
+        // Scoped to the granted file: a sibling key stays denied.
+        assert!(
+            !p.contains(r#"(literal "/Users/test/.ssh/id_ed25519")"#),
+            "a write grant must not reopen anything but the file it names:\n{p}"
+        );
+    }
+
+    /// A grant naming the directory itself is not an override. `sandbox::prepare`
+    /// refuses such a run outright (#291), and this is the second line: even if
+    /// one reached `generate_profile`, it must not turn into a subpath re-allow
+    /// that reopens every key in `~/.ssh`.
+    #[test]
+    fn profile_never_reopens_a_denied_dotfile_directory_itself() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let granted = [PathBuf::from("/Users/test/.ssh")];
+        for (read, write) in [(true, false), (false, true)] {
+            let mut opts = test_options(project, home);
+            if read {
+                opts.extra_read = &granted;
+            }
+            if write {
+                opts.extra_write = &granted;
+            }
+            let p = generate_profile(&opts);
+            let deny = p
+                .find(r#"(deny file-read* (subpath "/Users/test/.ssh"))"#)
+                .expect("the blanket ~/.ssh deny must still be emitted");
+            assert!(
+                !p[deny..].contains(r#"(literal "/Users/test/.ssh")"#),
+                "a directory grant must produce no post-deny re-allow:\n{p}"
+            );
         }
     }
 
@@ -2238,6 +2308,37 @@ mod tests {
         assert!(
             !p.contains("\"*:443\""),
             "proxy_forced must drop the broad *:443 allowance"
+        );
+    }
+
+    #[test]
+    fn extra_ports_are_direct_egress_in_default_mode_only() {
+        // #297: `--allow-port 9999` emits `(remote ip "*:9999")`, a direct path
+        // to any remote host on that port. Under proxy_forced that path must be
+        // gone, or the "no residual" claim on the rule above is false. The same
+        // options run both ways, so the assertion can only pass by the gate.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let ports = [9999u16];
+
+        let mut opts = test_options(project, home);
+        opts.extra_ports = &ports;
+        let default_mode = generate_profile(&opts);
+        assert!(
+            default_mode.contains("(allow network-outbound (remote ip \"*:9999\"))"),
+            "default mode must still honour --allow-port"
+        );
+
+        opts.proxy_forced = true;
+        opts.proxy_port = Some(8080);
+        let forced = generate_profile(&opts);
+        assert!(
+            !forced.contains("*:9999"),
+            "proxy_forced must not emit a direct remote path for an extra port"
+        );
+        assert!(
+            forced.contains("(allow network-outbound (remote ip \"localhost:8080\"))"),
+            "proxy_forced still pins egress to the localhost proxy port"
         );
     }
 

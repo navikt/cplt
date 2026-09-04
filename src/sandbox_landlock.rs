@@ -270,6 +270,23 @@ const DEVICE_FILES: &[&str] = &[
 ///
 /// Returns a `LandlockPolicy` that can be applied with `apply_policy()`
 /// on Linux, or described with `describe_policy()` on any platform.
+///
+/// # Protected paths: Landlock enforces none of them
+///
+/// `policy::PROTECTED_IN_ROOT` and `policy::PROTECTED_IN_GITDIR` name the paths
+/// that must stay unwritable inside a tree the sandbox makes writable —
+/// `.git/hooks`, `.cplt.toml`, `.agents/plugins`, `<gitdir>/config` and the
+/// rest. **This function emits no rule for any of them, and cannot.** Landlock
+/// is purely additive: a `FsRule` granting write on a directory cannot have a
+/// sub-path subtracted from it, and there is no deny form to express one.
+///
+/// So on Linux the whole set is carried by the bubblewrap read-only overlay
+/// (`bubblewrap::git_persistence_paths`) — for the subset those tables mark
+/// `LinuxCoverage::Bwrap` — and by nothing at all on a host without user
+/// namespaces, where bubblewrap is unavailable. That is a real gap, not an
+/// oversight, and it is stated here so the absence is visible from the backend
+/// that has it. #207 survived for months precisely because a control that was
+/// effective on macOS and ineffective on Linux looked identical in the code.
 /// True if `subdir` is a safe relative cache subdirectory: non-empty and every
 /// path component is a normal name (rejects `..`, `.`, an absolute root, or a
 /// Windows-style prefix).
@@ -535,13 +552,15 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 
     // ── Extra read paths from config ──
-    // Hard-denied files (policy::DENIED_FILES) are filtered out: Landlock is
-    // grant-only, so a grant on ~/.netrc has no deny to lose to and would make
-    // the documented "not overridable" guarantee false on Linux only (#207).
-    // `prepare()` rejects such a grant before we get here — this keeps the
-    // ruleset invariant true for every caller of `generate_policy`.
+    // Hard-denied files (policy::DENIED_FILES) and credential directories
+    // (policy::DENIED_DOTFILES) are filtered out: Landlock is grant-only, so a
+    // grant on ~/.netrc or ~/.ssh has no deny to lose to and would make the
+    // documented guarantee false on Linux only (#207, #291). A grant on a file
+    // *inside* a denied dotfile directory is the supported override and passes
+    // through. `prepare()` rejects the refused forms before we get here — this
+    // keeps the ruleset invariant true for every caller of `generate_policy`.
     for p in config.extra_read {
-        if policy::hard_denied_file(home, p).is_some() {
+        if policy::grant_is_refused(home, p) {
             continue;
         }
         fs_rules.push(FsRule {
@@ -557,7 +576,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     // ── Extra write paths from config ──
     for p in config.extra_write {
-        if policy::hard_denied_file(home, p).is_some() {
+        if policy::grant_is_refused(home, p) {
             continue;
         }
         fs_rules.push(FsRule {
@@ -578,7 +597,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // refuses an exec grant that overlaps a writable tree precisely because
     // Landlock unions the two and cannot subtract one from the other.
     for p in config.extra_exec {
-        if policy::hard_denied_file(home, p).is_some() {
+        if policy::grant_is_refused(home, p) {
             continue;
         }
         fs_rules.push(FsRule {
@@ -594,7 +613,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     // ── Extra socket paths from config ──
     for p in config.extra_socket {
-        if policy::hard_denied_file(home, p).is_some() {
+        if policy::grant_is_refused(home, p) {
             continue;
         }
         fs_rules.push(FsRule {
@@ -792,9 +811,18 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     {
         net_rules.push(NetRule { port });
     }
-    for &port in config.extra_ports {
-        if !net_rules.iter().any(|r| r.port == port) {
-            net_rules.push(NetRule { port });
+    // `extra_ports` (#297) is dropped under proxy-forced for the same reason the
+    // 443 seed is: a port rule here is a direct kernel egress path to any remote
+    // host on that port, outside the proxy and so outside its domain filtering
+    // and its log. Keeping it would widen the documented `evil.com:<proxy_port>`
+    // residual to a port the user has already announced. The proxy still allows
+    // CONNECT tunnels on these ports, so proxy-aware tools keep working; only
+    // raw TCP loses the path. `main.rs` warns when the two are combined.
+    if !config.proxy_forced {
+        for &port in config.extra_ports {
+            if !net_rules.iter().any(|r| r.port == port) {
+                net_rules.push(NetRule { port });
+            }
         }
     }
     for &port in config.localhost_ports {
@@ -1940,6 +1968,76 @@ mod tests {
         }
     }
 
+    /// The other half of `denied_dotfiles_not_in_ruleset`: deny-by-omission is
+    /// not enough once the user *grants* the directory. Landlock is grant-only,
+    /// so an unfiltered `allow.read = "~/.ssh"` became a working read rule and
+    /// opened every key in it — on Linux only, since macOS's subpath deny beat
+    /// the same grant (#291). `prepare()` refuses the run, and this keeps the
+    /// invariant true for every other caller of `generate_policy`.
+    #[test]
+    fn a_granted_denied_dotfile_directory_stays_out_of_the_ruleset() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let granted: Vec<PathBuf> = policy::DENIED_DOTFILES
+            .iter()
+            .map(|d| home.join(d))
+            .collect();
+
+        let mut config = test_config(&project, &home);
+        for (read, write, exec, socket) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            config.extra_read = if read { &granted } else { &[] };
+            config.extra_write = if write { &granted } else { &[] };
+            config.extra_exec = if exec { &granted } else { &[] };
+            config.extra_socket = if socket { &granted } else { &[] };
+            let policy = generate_policy(&config);
+
+            for path in &granted {
+                assert!(
+                    !policy.fs_rules.iter().any(|r| &r.path == path),
+                    "granted denied dotfile {} must not enter the ruleset",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// A grant on a file *inside* one of those directories is the supported
+    /// override and must still reach the ruleset — the route the refusal above
+    /// tells users to take. `~/.ssh/known_hosts` needs write for `ssh` to append
+    /// to it on a first connection.
+    #[test]
+    fn a_granted_file_inside_a_denied_dotfile_directory_survives() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let key = vec![home.join(".ssh/id_ed25519")];
+        let known_hosts = vec![home.join(".ssh/known_hosts")];
+
+        let mut config = test_config(&project, &home);
+        config.extra_read = &key;
+        config.extra_write = &known_hosts;
+        let policy = generate_policy(&config);
+
+        let read = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == key[0])
+            .expect("~/.ssh/id_ed25519 must be in the ruleset");
+        assert!(read.access.read);
+        assert!(!read.access.write, "a read grant must not become writable");
+
+        let write = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == known_hosts[0])
+            .expect("~/.ssh/known_hosts must be in the ruleset");
+        assert!(write.access.read && write.access.write);
+    }
+
     /// `--allow-docker` on Linux grants `~/.docker` read-only (#155). Off, the
     /// dir stays out of the ruleset (covered by `denied_dotfiles_not_in_ruleset`).
     #[test]
@@ -2816,6 +2914,38 @@ mod tests {
 
         assert!(policy.net_rules.iter().any(|r| r.port == 443));
         assert!(policy.net_rules.iter().any(|r| r.port == 8443));
+    }
+
+    #[test]
+    fn extra_ports_dropped_under_proxy_forced() {
+        // #297: a Landlock port rule is a direct egress path to any remote host
+        // on that port, outside the proxy's log and domain filtering. Under
+        // proxy_forced the allowed set must be the proxy port alone. Same config
+        // both ways, so only the gate can make this pass.
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let ports = vec![9999];
+        let mut config = test_config(&project, &home);
+        config.extra_ports = &ports;
+
+        let default_mode = generate_policy(&config);
+        assert!(
+            default_mode.net_rules.iter().any(|r| r.port == 9999),
+            "default mode must still honour --allow-port"
+        );
+
+        config.proxy_forced = true;
+        config.proxy_port = Some(8080);
+        let forced = generate_policy(&config);
+        assert!(
+            !forced.net_rules.iter().any(|r| r.port == 9999),
+            "proxy_forced must not open an extra port at the kernel level"
+        );
+        assert_eq!(
+            forced.net_rules.iter().map(|r| r.port).collect::<Vec<_>>(),
+            vec![8080],
+            "proxy_forced allows the proxy port and nothing else"
+        );
     }
 
     #[test]

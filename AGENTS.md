@@ -144,6 +144,43 @@ This is a security tool. Changes to sandbox rules, env handling, or network poli
 
 Do not modify `blocked-domains.txt` without reviewing the domain's purpose.
 
+### No silent grants
+
+**A grant or setting that cannot be honoured must fail loudly at the point it is
+written. It must never be accepted and then quietly dropped.**
+
+Accepting a line the user wrote and ignoring it is worse than refusing it. The
+user believes they have the access, or the restriction, that they asked for.
+Nothing tells them otherwise, and the belief survives until something breaks in a
+way that never points back here.
+
+This holds in both directions. A grant that silently does nothing leaves someone
+thinking a path is reachable when it is not. A restriction that silently does
+nothing leaves someone thinking a path is closed when it is open. The second is
+the one that gets people hurt.
+
+It has been rediscovered repeatedly rather than reasoned about, which is why it
+is written down: `allow.read` on a hard-denied file worked on Linux and was
+silently overridden on macOS (#207); `--allow-socket` emitted rules `connect()`
+never consults, granting and denying nothing on Linux (#240); `allow.write`
+inside a credential directory was inert on macOS while working on Linux (#291);
+read-only grants under `/tmp` vanished inside bubblewrap's private tmpfs (#299);
+`cplt config set` accepted a path the next launch refuses (#306); `--inherit-env`
+cancelled an explicit `--pass-env` (#307); the entire `[audit]` section was
+settable, displayed, and consumed by nothing (#309).
+
+So, when adding a config key, a flag, or a grant kind:
+
+- Refuse at the earliest point that can refuse — config-set time beats
+  resolve time beats launch time. Say what is wrong and what to do instead.
+- Never let a backend difference decide whether a setting works. If it cannot be
+  enforced on one platform, that is a stated gap with a reason, not an absence.
+  `LinuxCoverage::Gap(reason)` in the protected-path tables is the pattern.
+- A key with no consumer does not ship. If it must exist ahead of its
+  implementation, mark it unimplemented everywhere it surfaces.
+- Cover it with a test that fails when the setting stops taking effect. Every
+  case above was found by a person tripping over it, never by the suite.
+
 ## Key patterns
 
 - `(deny default)` plus specific allows, so the sandbox is deny-by-default

@@ -215,6 +215,22 @@ Bubblewrap's private `/tmp` helps only for that stock layout. The desktop agents
 
 If your keys must be unusable by a compromised agent on Linux, unload them (`ssh-add -D`) before starting the session.
 
+### If you do need SSH inside the sandbox
+
+Three things have to line up, and the same configuration works on both platforms:
+
+```bash
+cplt config set allow.ports 22                      # outbound is 443-only by default
+cplt config set allow.read  "~/.ssh/id_ed25519"     # the key, by name
+cplt config set allow.write "~/.ssh/known_hosts"    # ssh appends on a first connection
+```
+
+Port 22 is the first gate: without it no key grant matters, because the connection never opens. `~/.ssh/config` needs its own `allow.read` if you have one. `known_hosts` needs **write**, not read — under the default `StrictHostKeyChecking` a first connection to a host appends to it, and a read-only grant fails the connection.
+
+**The directory itself cannot be granted.** `allow.read = "~/.ssh"` (or `~/.aws`, `~/.gnupg`, any of the credential directories) is refused at startup with an error naming this per-file route. macOS never honoured such a grant — the blanket subpath deny beats it whatever the config says — while Linux granted it for real, so the same config file opened every key on one platform and nothing on the other. Refusing is the only answer both backends give alike.
+
+One gap remains on Linux, unchanged and the same limitation described under [private registries](#private-registries): a grant on a *parent* — `$HOME` itself — still exposes everything under it, because Landlock cannot deny a subpath inside an allowed directory.
+
 ## D-Bus and systemd (Linux) — the session manager is reachable
 
 `XDG_RUNTIME_DIR` is on the environment allowlist, and Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1), so on a current kernel `$XDG_RUNTIME_DIR/bus` is reachable from inside the sandbox unless bubblewrap masks it. This is established by reading the code, not by running it on a host — treat it as reachable rather than demonstrated. `systemd-run --user <cmd>` hands the command to the user's systemd instance, which starts it as a new unit **outside** Landlock, seccomp and the bubblewrap namespaces. The same applies to any other D-Bus service on the session bus that can start a process.
@@ -504,6 +520,8 @@ cplt config set allow.ports 8443
 - `npm install` from private registries on non-standard ports
 - API calls to services not on 443
 - FTP, SMTP, or other protocol connections
+
+Under `proxy.forced` an extra port opens no direct socket ([#297](https://github.com/navikt/cplt/issues/297)). The proxy still tunnels it, so the first two work; a tool that speaks its own protocol on a raw socket, such as FTP or SMTP, does not. Run those without proxy-forced — see [the proxy docs](proxy.md#proxy-forced-mode).
 
 ## Private registries
 

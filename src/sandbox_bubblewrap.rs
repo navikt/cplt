@@ -72,6 +72,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::sandbox::landlock_mod::{FsAccess, FsRule, NetRule};
+use crate::sandbox::policy::{LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected};
 
 /// Environment variable carrying the read end of the policy pipe (a decimal fd
 /// number) from which the bwrap re-entry helper reads the serialized Landlock
@@ -199,6 +200,16 @@ pub(crate) fn test_functionality(
 /// itself are skipped in step 4 — binding host `/tmp` back over the tmpfs would
 /// re-expose host temp files and re-break the exec guarantee.
 ///
+/// 4b. For every **non-writable** rule whose path lives under `/tmp`,
+///    `--ro-bind <path> <path>`, after the tmpfs so it shadows it (#299).
+///    Step 1 covers read-only rules everywhere else, but not under the private
+///    tmpfs, so an `allow.read` or `allow.exec` grant naming a path there used
+///    to be in the Landlock ruleset and absent from the namespace: accepted,
+///    and silently doing nothing. Read-only keeps the "exec from `/tmp` is
+///    denied" guarantee — the agent still cannot write a payload into `/tmp`
+///    and run it; an `allow.exec` grant only reaches what already existed at
+///    launch, on a mount that stays EROFS.
+///
 /// 5. Finally, for every path in `ro_protect` that exists, `--ro-bind <p> <p>`
 ///    is emitted *after* the writable binds so it shadows them read-only. This
 ///    is the Finding 1 persistence mitigation: the project's `.git/hooks` lives
@@ -258,6 +269,7 @@ pub(crate) fn build_bwrap_args(
     //    children (bwrap applies operations in order). ──
     let mut writable: Vec<&FsRule> = fs_rules.iter().filter(|r| r.access.write).collect();
     writable.sort_by_key(|r| r.path.components().count());
+    let mut bound_writable: Vec<&Path> = Vec::new();
 
     for rule in writable {
         let path = &rule.path;
@@ -276,6 +288,47 @@ pub(crate) fn build_bwrap_args(
         }
         let path_str = path.to_string_lossy().into_owned();
         args.extend(["--bind".to_string(), path_str.clone(), path_str]);
+        bound_writable.push(path.as_path());
+    }
+
+    // ── Read-only overlays for non-writable rules under /tmp (#299) ──
+    // `--ro-bind / /` covers every read-only rule *outside* /tmp, but the
+    // private `--tmpfs /tmp` above hides the host's, so a grant naming a path
+    // under it was present in the Landlock ruleset and absent from the
+    // namespace — accepted at the CLI, silently doing nothing. Only user
+    // grants land here: `allow.read` and `allow.exec` are the sole non-writable
+    // rules that can name a path under /tmp (`allow.socket` and the /tmp rule
+    // itself are writable and handled above).
+    //
+    // Read-only, not writable, so the "exec from /tmp is denied" guarantee
+    // survives intact: an agent still cannot write a payload into /tmp and run
+    // it. What an `allow.exec` grant buys is exec on a path that already
+    // existed at launch and stays EROFS — which is what the same grant already
+    // does on macOS and on the Landlock-only Linux path, so this makes bwrap
+    // agree with the other two rather than opening a new door.
+    //
+    // Skipped when a writable bind already covers the path: that bind makes it
+    // visible, and a read-only bind on top would downgrade a write grant the
+    // user also asked for.
+    //
+    // `bound_writable` is the set that actually got a `--bind`, not every
+    // writable rule: the `/tmp` rule itself is writable and is deliberately
+    // never bound, so testing against the rules would skip every path under it.
+    for rule in fs_rules.iter().filter(|r| !r.access.write) {
+        let path = &rule.path;
+        if !path.starts_with("/tmp") || path == Path::new("/tmp") {
+            continue;
+        }
+        if bound_writable.iter().any(|w| path.starts_with(w)) {
+            continue;
+        }
+        // bwrap errors on a bind source that does not exist; Landlock drops
+        // such rules too, so mirror that rather than sinking the wrapper.
+        if !path.exists() {
+            continue;
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        args.extend(["--ro-bind".to_string(), path_str.clone(), path_str]);
     }
 
     // ── Read-only overlays for git-persistence paths (Finding 1) ──
@@ -534,44 +587,12 @@ fn create_mask_placeholder(scratch: &Path) -> Result<PathBuf, String> {
 /// of). Only paths that exist on disk are ultimately bound (see
 /// [`build_bwrap_args`]).
 ///
-/// The set is deliberately **narrow** — only paths an agent has no legitimate
-/// reason to write *and* that are real persistence vectors:
-///
-/// - `.git/hooks` — the primary persistence escape. A planted hook runs
-///   *unsandboxed* on the next `git` invocation; agents do not normally write
-///   here.
-/// - `.cplt.toml` — relaxes the next session's sandbox; agents do not normally
-///   write it, and any `[propose]` block needs explicit trust approval anyway.
-///
-/// `.git/config` and `.gitmodules` are **deliberately left writable**: read-only
-/// binding them would break common, legitimate in-sandbox git operations
-/// (`git config user.email/user.name` identity setup — without it the next
-/// `git commit` fails "Please tell me who you are" — plus `git remote add`,
-/// `git push -u` upstream tracking, and `git submodule add`, which writes
-/// `.gitmodules`). Worse, git rewrites config via a `.git/config.lock` +
-/// rename-over-file; a denied write can leave a STALE `.git/config.lock` that
-/// blocks the user's *next* out-of-sandbox git. This also matches the git
-/// command guard, which explicitly allows `git config user.name`.
-///
-/// This trade was made for the *project's own* repository, so it is worth
-/// asking whether it still holds for a `git_common_dir` the agent had a hand in
-/// choosing. It does, now: `commondir` inside a gitdir is agent-writable and
-/// git reads it for any gitdir, so a planted one used to make
-/// `git rev-parse --git-common-dir` name a different repository — and this ro-
-/// protect set follows `git_common_dir`, so on Linux that yielded a writable
-/// `.git/config` in a repo the user will later `git pull`, i.e. `core.hooksPath`
-/// in someone else's repo. `discover::git_common_dir` now rejects a steered
-/// value, so the only common dir that reaches here is the main repo of a real
-/// worktree of the user's own project — exactly the case the trade above is
-/// about, where `git config user.email` is a normal thing for an agent to do.
-/// The set is therefore left as it is. Were the source-level check ever
-/// removed, `config` would have to be added here.
-///
-/// RESIDUAL: because `.git/config` stays writable, an agent can still set
-/// `core.hooksPath` to redirect hooks to a writable directory. The read-only
-/// `.git/hooks` bind therefore only mitigates the *direct* persistence vector
-/// (planting a hook file); it is not a complete closure of git-hook
-/// persistence. See SECURITY.md for the full residual discussion.
+/// **The set itself is not decided here.** It is the `LinuxCoverage::Bwrap`
+/// subset of [`PROTECTED_IN_ROOT`] and [`PROTECTED_IN_GITDIR`], which macOS
+/// reads too; every entry those tables mark `LinuxCoverage::Gap` records, in
+/// place, why Linux does not carry it. Notably `.git/config` stays writable
+/// here by deliberate trade — with the residual that `core.hooksPath` can
+/// still redirect hooks away from the read-only `hooks` bind. See SECURITY.md.
 ///
 /// # Every writable root, not just the project
 ///
@@ -587,20 +608,30 @@ fn create_mask_placeholder(scratch: &Path) -> Result<PathBuf, String> {
 /// common dir; in a **bare** repo they live at `<root>/hooks`. `git_dirs`
 /// carries those resolved `.git` directories (the project's `git_common_dir`
 /// plus one per granted path that needs it — see `discover::git_dir_of`), and
-/// each contributes a `hooks` protection. Non-existent paths are skipped
-/// downstream (see [`build_bwrap_args`]), and the result is deduplicated, so
-/// overlapping roots never double-bind.
+/// each contributes the same gitdir-relative set. Non-existent paths are
+/// skipped downstream (see [`build_bwrap_args`]), and the result is
+/// deduplicated, so overlapping roots never double-bind.
 pub(crate) fn git_persistence_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(write_roots.len() * 3 + git_dirs.len());
+    // Which paths are protected is decided once, in `policy::PROTECTED_IN_ROOT`
+    // and `policy::PROTECTED_IN_GITDIR`. This function decides only *how*:
+    // a read-only bind, for the subset Linux can carry. Entries marked
+    // `LinuxCoverage::Gap` are skipped on purpose and each carries the reason.
+    //
+    // `<root>/.git` is one of the git directories every writable root
+    // contributes, exactly as on macOS, so `.git/hooks` falls out of the gitdir
+    // table rather than being named again here.
+    let bwrap = |set: &'static [Protected]| {
+        set.iter()
+            .filter(|p| p.linux == LinuxCoverage::Bwrap)
+            .map(|p| p.rel)
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
     for root in write_roots {
-        paths.push(root.join(".git/hooks"));
-        paths.push(root.join(".cplt.toml"));
-        // #267: goose auto-spawns MCP servers declared here on the next host
-        // run, so a manifest written this session executes outside the sandbox.
-        paths.push(root.join(".agents/plugins"));
+        paths.extend(bwrap(PROTECTED_IN_ROOT).map(|rel| root.join(rel)));
+        paths.extend(bwrap(PROTECTED_IN_GITDIR).map(|rel| root.join(".git").join(rel)));
     }
     for dir in git_dirs {
-        paths.push(dir.join("hooks"));
+        paths.extend(bwrap(PROTECTED_IN_GITDIR).map(|rel| dir.join(rel)));
     }
     paths.sort();
     paths.dedup();
@@ -989,6 +1020,107 @@ mod tests {
     }
 
     #[test]
+    fn read_only_rules_under_tmp_are_bound_back() {
+        // #299: the private --tmpfs /tmp hid the host's, so a non-writable rule
+        // under /tmp (allow.read, and allow.exec since #295) was in the policy
+        // and absent from the namespace. It must get a --ro-bind, after the
+        // tmpfs so it shadows it.
+        let dir = tempfile::TempDir::new_in("/tmp").expect("tempdir under /tmp");
+        let granted = dir.path().to_path_buf();
+        let rules = vec![FsRule {
+            path: granted.clone(),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: true,
+                ioctl: false,
+            },
+        }];
+        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+
+        let g = granted.to_string_lossy().into_owned();
+        let bind_idx = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == g && w[2] == g)
+            .expect("a non-writable rule under /tmp must be bound back read-only");
+        let tmpfs_idx = args
+            .windows(2)
+            .position(|w| w == ["--tmpfs", "/tmp"])
+            .expect("tmpfs");
+        assert!(
+            bind_idx > tmpfs_idx,
+            "the bind must come after --tmpfs /tmp to shadow it"
+        );
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == g && w[2] == g),
+            "a read/exec grant must never be bound writable"
+        );
+    }
+
+    #[test]
+    fn read_only_rules_outside_tmp_are_not_bound_back() {
+        // `--ro-bind / /` already covers them; emitting a bind per read rule
+        // would be hundreds of redundant arguments.
+        let dir = non_tmp_tempdir();
+        let granted = dir.path().to_path_buf();
+        let rules = vec![FsRule {
+            path: granted.clone(),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: false,
+                ioctl: false,
+            },
+        }];
+        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let g = granted.to_string_lossy().into_owned();
+        assert!(
+            !args.windows(3).any(|w| w[1] == g && w[2] == g),
+            "a read-only rule outside /tmp needs no bind of its own"
+        );
+    }
+
+    #[test]
+    fn a_writable_bind_under_tmp_is_not_downgraded_to_read_only() {
+        // A read grant nested inside a write grant must not produce a ro-bind
+        // over the writable one — the user asked for both.
+        let dir = tempfile::TempDir::new_in("/tmp").expect("tempdir under /tmp");
+        let writable = dir.path().to_path_buf();
+        let nested = writable.join("nested");
+        std::fs::create_dir(&nested).expect("nested dir");
+        let rules = vec![
+            FsRule {
+                path: writable.clone(),
+                access: FsAccess {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    ioctl: false,
+                },
+            },
+            FsRule {
+                path: nested.clone(),
+                access: FsAccess {
+                    read: true,
+                    write: false,
+                    execute: false,
+                    ioctl: false,
+                },
+            },
+        ];
+        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let n = nested.to_string_lossy().into_owned();
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == n && w[2] == n),
+            "a path already covered by a writable bind must not be re-bound read-only"
+        );
+    }
+
+    #[test]
     fn nothing_shadows_tmp_mount_point() {
         // SECURITY (exec-from-/tmp guarantee): /tmp inside the namespace must
         // be the bare tmpfs — in particular the scratch dir (whose Landlock
@@ -1089,12 +1221,15 @@ mod tests {
 
     #[test]
     fn ro_protect_set_is_narrow_and_leaves_git_config_writable() {
-        // The protected set is deliberately narrow: only .git/hooks and
-        // .cplt.toml. .git/config / .gitmodules must stay writable so legit
-        // in-sandbox git config/remote/submodule ops (and their lock files)
-        // are not broken — even when those files exist on disk.
+        // The protected set is deliberately narrow: exactly the
+        // `LinuxCoverage::Bwrap` entries of `PROTECTED_IN_ROOT` and
+        // `PROTECTED_IN_GITDIR` — .git/hooks, .cplt.toml, .agents/plugins.
+        // .git/config / .gitmodules must stay writable so legit in-sandbox git
+        // config/remote/submodule ops (and their lock files) are not broken —
+        // even when those files exist on disk.
         let proj = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(proj.path().join(".git/hooks")).expect("create .git/hooks");
+        std::fs::create_dir_all(proj.path().join(".agents/plugins")).expect("create plugins");
         std::fs::write(proj.path().join(".git/config"), "").expect("create .git/config");
         std::fs::write(proj.path().join(".gitmodules"), "").expect("create .gitmodules");
         std::fs::write(proj.path().join(".cplt.toml"), "").expect("create .cplt.toml");
@@ -1116,6 +1251,14 @@ mod tests {
                 .any(|w| w[0] == "--ro-bind"
                     && w[1] == proj.path().join(".cplt.toml").to_string_lossy()),
             ".cplt.toml must be re-bound read-only"
+        );
+        // #267: goose auto-spawns MCP servers declared here on the next host
+        // run. It is `LinuxCoverage::Bwrap`, so the bind must actually reach
+        // `build_bwrap_args` — this is the end-to-end pin for the table.
+        assert!(
+            args.windows(2).any(|w| w[0] == "--ro-bind"
+                && w[1] == proj.path().join(".agents/plugins").to_string_lossy()),
+            ".agents/plugins must be re-bound read-only"
         );
         // .git/config and .gitmodules are NOT re-bound (stay writable), even
         // though both exist on disk — the narrowing, not the exists-check, is
