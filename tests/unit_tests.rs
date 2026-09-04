@@ -8962,7 +8962,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
     let rule = |p: &str| {
         ll.fs_rules
             .iter()
-            .find(|r| r.path == PathBuf::from(p))
+            .find(|r| r.path == std::path::Path::new(p))
             .unwrap_or_else(|| panic!("{p} should have a rule"))
     };
     let bin = rule("/home/tester/.local/share/cargo/bin");
@@ -8980,7 +8980,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
     assert!(
         !ll.fs_rules
             .iter()
-            .any(|r| r.path == PathBuf::from("/home/tester/.cargo/bin"))
+            .any(|r| r.path == std::path::Path::new("/home/tester/.cargo/bin"))
     );
 }
 
