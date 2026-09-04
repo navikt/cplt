@@ -597,6 +597,12 @@ pub struct SandboxConfig {
     /// Private keys remain protected — only the agent socket and public
     /// keyring are accessible. See SECURITY.md for risk analysis.
     pub allow_gpg_signing: Option<bool>,
+    /// Deny the macOS pasteboard (`com.apple.pasteboard`) to the sandboxed
+    /// agent (default: true). Whatever was last copied — a password out of a
+    /// password manager, most of the time — is otherwise readable with a bare
+    /// `pbpaste`. Turn it off with `--allow-clipboard` or `deny_clipboard =
+    /// false`. No effect on Linux, which has no pasteboard Mach service.
+    pub deny_clipboard: Option<bool>,
     /// Allow JVM Attach API unix sockets in /tmp (default: false).
     /// Needed for JVM testing frameworks that use runtime self-attach
     /// (MockK inline mocking, Mockito inline, ByteBuddy agent loading).
@@ -889,7 +895,7 @@ pub struct CliFlags {
     /// Preset-controlled toggle (see `allow_localhost_any`).
     pub allow_lifecycle_scripts: FeatureToggle,
     pub allow_gpg_signing: bool,
-    pub deny_clipboard: bool,
+    pub deny_clipboard: FeatureToggle,
     pub allow_jvm_attach: bool,
     pub allow_msbuild: bool,
     /// Preset-controlled toggle (see `allow_localhost_any`).

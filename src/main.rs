@@ -360,9 +360,15 @@ esbuild native, etc.) and `npm install` fails without it. Prefer using
     #[arg(long)]
     allow_gpg_signing: bool,
 
-    /// Deny the sandboxed agent access to the macOS clipboard (pasteboard)
+    /// Deny the sandboxed agent access to the macOS clipboard (pasteboard).
+    /// On by default; this flag restates the default.
     #[arg(long = "deny-clipboard")]
     deny_clipboard: bool,
+
+    /// Allow the sandboxed agent to read and write the macOS clipboard
+    /// (pasteboard), which cplt denies by default
+    #[arg(long = "allow-clipboard")]
+    allow_clipboard: bool,
 
     /// Allow JVM Attach API unix sockets in /tmp.
     /// Needed for JVM testing frameworks that use runtime self-attach:
@@ -1443,7 +1449,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             cli.no_allow_lifecycle_scripts,
         ),
         allow_gpg_signing: cli.allow_gpg_signing,
-        deny_clipboard: cli.deny_clipboard,
+        deny_clipboard: config::FeatureToggle::from_pair(cli.deny_clipboard, cli.allow_clipboard),
         allow_jvm_attach: cli.allow_jvm_attach,
         allow_msbuild: cli.allow_msbuild,
         allow_docker: config::FeatureToggle::from_pair(cli.allow_docker, cli.no_allow_docker),
@@ -1896,6 +1902,30 @@ struct DomainAllowlistDecision {
     force_proxy_on: bool,
 }
 
+/// Floor the proxy's stderr verbosity at `blocked` whenever a domain allowlist
+/// is enforcing.
+///
+/// `proxy.log_level` defaults to `none`, which is fine while the proxy lets
+/// everything through: there is nothing to explain. Under an allowlist it is a
+/// debuggability hole — the agent gets a bare 403 from a host that worked
+/// yesterday, and stderr says nothing at all about why. That is also the
+/// precondition for ever making an allowlist the default (#147 Stage 3): a
+/// fail-closed network nobody can diagnose is one people turn off.
+///
+/// `max` only ever raises. An explicit `all` survives untouched, and the level
+/// this overrides is `none` — silence about refusals the user did not ask for
+/// so much as inherit from a default written for the allow-all case.
+fn proxy_log_level(
+    configured: proxy::ProxyLogLevel,
+    allowlist_active: bool,
+) -> proxy::ProxyLogLevel {
+    if allowlist_active {
+        configured.max(proxy::ProxyLogLevel::Blocked)
+    } else {
+        configured
+    }
+}
+
 /// Compute the domain-allowlist decision from the two allow-all escape hatches
 /// and whether the agent default allowlist is enabled.
 ///
@@ -2173,6 +2203,12 @@ fn start_proxy_if_enabled(
     // timeout. Empty when no subscriptions are configured (unchanged behaviour).
     let subscription_blocklist = load_subscription_blocklist(resolved, resolved.quiet);
 
+    // An allowlist is active when either source of one produced domains: the
+    // agent's built-in default list (`proxy.default_allowlist`) or a configured
+    // `allowed_domains` file. Either one makes the proxy fail closed on
+    // everything else.
+    let allowlist_active = !default_allowlist.is_empty() || allowed_domains_file.is_some();
+
     let port_hint = if resolved.proxy_port == 0 {
         "ephemeral port".to_string()
     } else {
@@ -2211,7 +2247,7 @@ fn start_proxy_if_enabled(
         repo_private_domains: resolved.repo_private_domains.clone(),
         config_file: config_path.cloned(),
         log_file: resolved.proxy_log_file.clone(),
-        log_level: resolved.proxy_log_level,
+        log_level: proxy_log_level(resolved.proxy_log_level, allowlist_active),
         timeout: resolved.proxy_timeout,
         upstream: resolved.proxy_upstream.clone(),
         upstream_no_proxy: resolved.proxy_upstream_no_proxy.clone(),
@@ -5980,6 +6016,22 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("cplt").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn an_active_allowlist_floors_the_proxy_log_level_at_blocked() {
+        use proxy::ProxyLogLevel::{All, Blocked, Error, None as Silent};
+
+        // The whole point: the `none` default stops hiding refusals.
+        assert_eq!(proxy_log_level(Silent, true), Blocked);
+        assert_eq!(proxy_log_level(Error, true), Blocked);
+        // Never lowers a level the user asked for.
+        assert_eq!(proxy_log_level(All, true), All);
+        assert_eq!(proxy_log_level(Blocked, true), Blocked);
+        // No allowlist, no floor — every level passes through untouched.
+        for level in [Silent, Error, Blocked, All] {
+            assert_eq!(proxy_log_level(level, false), level);
+        }
     }
 
     #[test]

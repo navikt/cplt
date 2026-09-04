@@ -5231,6 +5231,7 @@ pass_env = []
 inherit_env = false
 allow_lifecycle_scripts = false
 allow_gpg_signing = false
+deny_clipboard = true
 allow_tmp_exec = false
 scratch_dir = false
 quiet = false
@@ -6568,17 +6569,22 @@ fn deny_clipboard_emits_pasteboard_deny_after_allow() {
     assert!(p.contains(r#"global-name-regex #"^com\.apple\.pasteboard(\.|$)""#));
 }
 
+/// The profile generator emits the pasteboard deny only when asked. cplt now
+/// asks by default (`sandbox.deny_clipboard = true`, resolved in `merge` and
+/// pinned by `clipboard_is_denied_with_no_config_and_no_flags`); this pins the
+/// other direction, that `--allow-clipboard` really does drop the rule.
 #[test]
-fn no_deny_clipboard_by_default() {
+fn no_pasteboard_rule_when_deny_clipboard_is_off() {
     let p = generate_profile(
         &SandboxConfig {
+            deny_clipboard: false,
             ..base_profile_options()
         },
         &[],
     );
     assert!(
         !p.contains("com.apple.pasteboard"),
-        "pasteboard deny rule must not appear by default"
+        "pasteboard deny rule must not appear when deny_clipboard is off"
     );
 }
 
@@ -6667,6 +6673,7 @@ pass_env = []
 inherit_env = false
 allow_lifecycle_scripts = false
 allow_gpg_signing = false
+deny_clipboard = true
 allow_tmp_exec = false
 scratch_dir = false
 audit = false
