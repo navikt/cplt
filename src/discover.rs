@@ -2019,8 +2019,19 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     #[test]
     fn version_probe_gives_up_on_a_binary_that_never_exits() {
         let dir = tempfile::tempdir().unwrap();
-        // An unusual duration doubles as a marker for the orphan check below.
-        let bin = fake_binary(dir.path(), "wedged", "exec sleep 3298");
+        // The fake ticks a file for as long as it lives, so its liveness is
+        // observable from the filesystem: no `pgrep`, no `ps`, nothing that can
+        // be absent from the machine and turn the orphan check below into a
+        // silent pass.
+        let heartbeat = dir.path().join("alive");
+        let bin = fake_binary(
+            dir.path(),
+            "wedged",
+            &format!(
+                "exec sh -c 'while : ; do printf x >> \"{}\" ; sleep 0.2 ; done'",
+                heartbeat.display()
+            ),
+        );
 
         let start = Instant::now();
         let outcome = probe_version(&bin, &["--version"]);
@@ -2038,16 +2049,16 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
 
         // Killing without reaping turns one hang into an orphan that outlives
         // the command — the exact state found on the machine in #298. Dropping
-        // the Child handle does not do this, so assert the process is gone.
-        let orphans = std::process::Command::new("pgrep")
-            .args(["-f", "sleep 3298"])
-            .output();
-        if let Ok(out) = orphans {
-            assert!(
-                String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-                "timed-out probe left the child running"
-            );
-        }
+        // the Child handle does not do this, so prove the process is gone: a
+        // dead ticker stops growing its file.
+        let ticks = || std::fs::metadata(&heartbeat).map_or(0, |m| m.len());
+        let before = ticks();
+        assert!(
+            before > 0,
+            "the fake never ran, so the check proves nothing"
+        );
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(ticks(), before, "timed-out probe left the child running");
     }
 
     /// A probe that exits but leaves a child holding its stdout must still
@@ -2057,7 +2068,10 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     #[test]
     fn version_probe_gives_up_when_a_grandchild_holds_the_pipe() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_binary(dir.path(), "forker", "sleep 3297 &\nexit 0");
+        // Bounded on purpose: the grandchild only has to outlive the probe's
+        // read grace, and a short sleep cleans itself up instead of needing a
+        // `pkill` this test cannot guarantee exists.
+        let bin = fake_binary(dir.path(), "forker", "sleep 30 &\nexit 0");
 
         let start = Instant::now();
         let outcome = probe_version(&bin, &["--version"]);
@@ -2067,12 +2081,6 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
             "a held-open pipe must not extend the probe, took {:?}",
             start.elapsed()
         );
-
-        // Not ours to reap — the probe exited cleanly and this is its child —
-        // but leave the machine as we found it.
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "sleep 3297"])
-            .status();
     }
 
     /// The happy path still parses, and a binary that answers is never
