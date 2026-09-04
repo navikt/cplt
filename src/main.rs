@@ -2550,41 +2550,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         unapproved_proposals: _,
     } = resolve_context(&cli, false)?;
 
-    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
-    let tool_roots = merge_tool_path_env_overrides(&mut resolved, &home_dir);
-
-    // Run auto-discovery to tighten the sandbox profile
-    let tool_discovery = discover::discover_tools(&home_dir, &tool_roots);
-    let existing_home_tool_dirs = tool_discovery.existing_home_tool_dirs;
-    let existing_app_dirs = tool_discovery.existing_app_dirs;
-
-    // Create per-session scratch directory if enabled
-    let scratch_guard = if resolved.scratch_dir {
-        // GC stale scratch dirs from previous sessions (best-effort)
-        scratch::ScratchDir::gc_stale(&home_dir);
-
-        match scratch::ScratchDir::create(&home_dir) {
-            Ok(s) => {
-                if !resolved.quiet {
-                    ui::ok(&format!("Scratch dir: {}", s.path().display()));
-                }
-                Some(s)
-            }
-            Err(e) => bail!("Cannot create scratch dir: {e}"),
-        }
-    } else {
-        None
-    };
-    let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
-
-    #[cfg(target_os = "macos")]
-    let playwright_socket_guard = create_playwright_socket_dir(&resolved)?;
-    #[cfg(target_os = "macos")]
-    let playwright_socket_path = playwright_socket_guard
-        .as_ref()
-        .map(cplt::scratch::PlaywrightSocketDir::path);
-    #[cfg(not(target_os = "macos"))]
-    let playwright_socket_path = None;
+    // Probe the host for everything the sandbox profile depends on.
+    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
 
     // Resolve the agent binary early so its installation directory
     // can be included in the sandbox profile. Failure is deferred —
@@ -2612,127 +2579,30 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             .filter(|d| !crate::is_unsafe_root(d, &home_dir))
     };
 
-    // Discover global git hooks path from core.hooksPath
-    let git_hooks_path = discover::git_hooks_path(&home_dir);
-
-    // Discover git worktree common directory (shared .git for worktrees)
-    let git_common_dir = discover::git_common_dir(&home_dir, &project_dir);
-
     // Discover Electron app bundle when Copilot CLI is installed via VS Code.
     // macOS-only: the shim invokes VS Code's Electron runtime, which needs
     // dyld access to load Electron Framework from within the .app bundle.
     let electron_app_dir = discover_electron_app_dir(&agent_bin_result, active_agent);
 
-    // Discover JAVA_HOME for JDK read access when installed outside TOOL_READ_DIRS.
-    // Covers: sdkman (~/.sdkman/candidates/java/), actions/setup-java (hostedtoolcache),
-    // jabba, or any other version manager that places JDK under HOME.
-    let java_home_dir = std::env::var("JAVA_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .filter(|p| !crate::is_unsafe_root(p, &home_dir));
-
-    // Discover DOTNET_ROOT for .NET SDK read access when installed outside
-    // TOOL_READ_DIRS (e.g. actions/setup-dotnet hostedtoolcache, or
-    // dotnet-install.sh into a custom directory under $HOME).
-    let dotnet_root_dir = std::env::var("DOTNET_ROOT")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .filter(|p| !crate::is_unsafe_root(p, &home_dir));
-
-    // Compute agent-specific sandbox directories
-    let mut agent_dirs = active_agent.config_dirs(&home_dir);
-
-    // Pre-create agent directories before entering sandbox.
-    // Agents like OpenCode crash if their data/config dirs don't exist,
-    // and the sandbox may block mkdir on parent paths.
-    for dir in &agent_dirs {
-        if !dir.path.exists() {
-            let _ = std::fs::create_dir_all(&dir.path);
-        }
-    }
-    // After pre-creation, so a dir we just made resolves too. See #171.
-    agent::canonicalize_agent_dirs(&mut agent_dirs);
-
-    // Agent-facing sandbox brief (issue #148), session layer only. The
-    // AGENTS.md layer writes into the user's repo and must not run until the
-    // launch is confirmed — see the call after prompt_confirm below.
-    write_session_sandbox_brief(&resolved, active_agent, scratch_path, &home_dir);
-
-    // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
-    // init script so sandboxed builds keep the preferIPv4Stack workaround for
-    // the daemon and Test/JavaExec forks (WorkerExecutor forks have no
-    // init-script hook — see gradle_init module docs). Inert outside the
-    // sandbox (__CPLT_WRAPPED guard); a no-op when ~/.gradle doesn't exist.
-    #[cfg(target_os = "macos")]
-    if resolved.gradle_init
-        && let Err(e) = gradle_init::ensure_init_script(&home_dir)
-    {
-        ui::warn(&format!(
-            "Could not install Gradle sandbox init script: {e}"
-        ));
-    }
-
-    // Start proxy (handle returned for RAII ownership)
-    let proxy_handle =
-        start_proxy_if_enabled(&mut resolved, &cli, config_path.as_ref(), active_agent)?;
-
-    // Prepare the sandbox — validates paths, generates platform-specific profile.
-    // Path validation (SBPL injection checks on macOS) is handled internally
-    // by prepare(), so callers don't need to know about backend-specific risks.
-    // proxy_port comes from the running handle so the actual ephemeral port is embedded.
-    let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
-    // #242: drop the whole-Keychain grant only when the agent can authenticate
-    // without it. Resolved against `deny_env` because that list is stripped from
-    // the child environment later — a repo `.cplt.toml` naming the token var
-    // must not leave the run with neither Keychain nor token.
-    let keychain_substitute = active_agent.credential_outside_keychain(
-        &home_dir,
-        &resolved.deny_env,
-        resolved.keychain_substitute,
-    );
-    let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
-        project_dir: &project_dir,
-        home_dir: &home_dir,
-        extra_read: &resolved.allow_read,
-        extra_write: &resolved.allow_write,
-        extra_exec: &resolved.allow_exec,
-        extra_socket: &resolved.allow_socket,
-        extra_deny: &resolved.deny_paths,
-        existing_home_tool_dirs: Some(&existing_home_tool_dirs),
-        existing_app_dirs: Some(&existing_app_dirs),
-        extra_ports: &resolved.allow_ports,
-        localhost_ports: &resolved.allow_localhost,
-        proxy_port: proxy_port_for_profile,
-        proxy_forced: resolved.proxy_forced,
-        allow_env_files: resolved.allow_env_files,
-        allow_localhost_any: resolved.allow_localhost_any,
-        scratch_dir: scratch_path,
-        playwright_socket_dir: playwright_socket_path,
-        allow_tmp_exec: resolved.allow_tmp_exec,
-        copilot_install_dir: copilot_install_dir.as_deref(),
-        java_home: java_home_dir.as_deref(),
-        dotnet_root: dotnet_root_dir.as_deref(),
-        git_hooks_path: git_hooks_path.as_deref(),
-        git_common_dir: git_common_dir.as_deref(),
-        allow_gpg_signing: resolved.allow_gpg_signing,
-        deny_clipboard: resolved.deny_clipboard,
-        allow_jvm_attach: resolved.allow_jvm_attach,
-        allow_msbuild: resolved.allow_msbuild,
-        allow_docker: resolved.allow_docker,
-        electron_app_dir: electron_app_dir.as_deref(),
-        agent: active_agent,
-        agent_dirs: &agent_dirs,
-        allow_cache_exec: &resolved.allow_cache_exec,
-        allow_cache_exec_any: resolved.allow_cache_exec_any,
-        allow_browser: resolved.allow_browser,
-        keychain_substitute,
-        use_bubblewrap: resolved.use_bubblewrap,
-    }) {
-        Ok(s) => s,
-        Err(e) => bail!("{e}"),
-    };
+    let AssembledSandbox {
+        prepared,
+        proxy_handle,
+        scratch_guard: _scratch_guard,
+        #[cfg(target_os = "macos")]
+            playwright_socket_guard: _playwright_socket_guard,
+        ..
+    } = assemble_sandbox(
+        &cli,
+        &mut resolved,
+        config_path.as_ref(),
+        &probe,
+        AssemblyOptions {
+            agent: active_agent,
+            copilot_install_dir: copilot_install_dir.as_deref(),
+            electron_app_dir: electron_app_dir.as_deref(),
+            announce_scratch: true,
+        },
+    )?;
 
     // --print-profile: dump the sandbox policy and exit (no copilot binary needed)
     if cli.print_profile {
@@ -3133,7 +3003,91 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
 /// via the handle). `policy` is the structured Landlock model of the filesystem
 /// policy — the same rules the profile enforces — used by `cplt check` for the
 /// explain layer (`describe_policy`'s model).
-struct ShellSandbox {
+/// Everything the sandbox assembly reads off the host machine.
+///
+/// Pulled out as a seam: production calls [`HostProbe::probe`], while a test can
+/// build one by hand and get a deterministic `SandboxConfig` without depending
+/// on whether the machine running it happens to have a JAVA_HOME, a git
+/// checkout, or any particular tool installed.
+struct HostProbe {
+    home_dir: PathBuf,
+    project_dir: PathBuf,
+    existing_home_tool_dirs: Vec<cplt::sandbox::ResolvedToolDir>,
+    existing_app_dirs: Vec<String>,
+    git_hooks_path: Option<PathBuf>,
+    git_common_dir: Option<PathBuf>,
+    java_home: Option<PathBuf>,
+    dotnet_root: Option<PathBuf>,
+}
+
+impl HostProbe {
+    /// Probe the host for everything the sandbox profile needs to know about it.
+    ///
+    /// Also grants tool paths relocated via env vars (GOPATH, CARGO_HOME, ...)
+    /// by mutating `resolved`: the grant and the tool discovery share the same
+    /// tool roots, so they must not be able to drift apart.
+    fn probe(resolved: &mut config::Resolved, home_dir: &Path, project_dir: &Path) -> Self {
+        let tool_roots = merge_tool_path_env_overrides(resolved, home_dir);
+        let tool_discovery = discover::discover_tools(home_dir, &tool_roots);
+        Self {
+            home_dir: home_dir.to_path_buf(),
+            project_dir: project_dir.to_path_buf(),
+            existing_home_tool_dirs: tool_discovery.existing_home_tool_dirs,
+            existing_app_dirs: tool_discovery.existing_app_dirs,
+            // Global git hooks path from core.hooksPath.
+            git_hooks_path: discover::git_hooks_path(home_dir),
+            // Git worktree common directory (shared .git for worktrees).
+            git_common_dir: discover::git_common_dir(home_dir, project_dir),
+            // JDK read access when installed outside TOOL_READ_DIRS. Covers
+            // sdkman (~/.sdkman/candidates/java/), actions/setup-java
+            // (hostedtoolcache), jabba, or any other manager under HOME.
+            java_home: tool_dir_from_env("JAVA_HOME", home_dir),
+            // .NET SDK read access when installed outside TOOL_READ_DIRS (e.g.
+            // actions/setup-dotnet hostedtoolcache, or dotnet-install.sh into a
+            // custom directory under $HOME).
+            dotnet_root: tool_dir_from_env("DOTNET_ROOT", home_dir),
+        }
+    }
+}
+
+/// An env var naming a tool directory, accepted only when it exists and does not
+/// resolve to an unsafe root that would defeat the sandbox.
+fn tool_dir_from_env(var: &str, home_dir: &Path) -> Option<PathBuf> {
+    accept_tool_dir(std::env::var(var).ok(), home_dir)
+}
+
+/// The value half of [`tool_dir_from_env`], separate so it can be tested without
+/// mutating the process environment — `set_var` is UB while sibling tests read
+/// env under edition 2024, and it would clobber a developer's real JAVA_HOME.
+///
+/// A tool-path env var is ambient input: it may have been exported years ago for
+/// unrelated reasons, or injected through a repo config. Granting read access to
+/// `/`, `/tmp` or `$HOME` because `JAVA_HOME` points there would defeat the
+/// sandbox, so the same `is_unsafe_root` veto that guards the relocatable tool
+/// roots guards these too.
+fn accept_tool_dir(value: Option<String>, home_dir: &Path) -> Option<PathBuf> {
+    value
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .filter(|p| !crate::is_unsafe_root(p, home_dir))
+}
+
+/// The agent-specific inputs to the sandbox assembly. Everything else about a
+/// run is identical whether an AI agent or a plain shell is being launched.
+struct AssemblyOptions<'a> {
+    agent: agent::Agent,
+    /// The agent's install directory, granted read + map-exec. `None` for the
+    /// shell and check paths, which have no agent binary to grant access to.
+    copilot_install_dir: Option<&'a Path>,
+    /// VS Code's Electron bundle, which the Copilot shim needs dyld access to.
+    electron_app_dir: Option<&'a Path>,
+    /// Announce the scratch directory. The agent launch prints a summary; `exec`
+    /// and `check` must keep their output clean for scripts and `--json`.
+    announce_scratch: bool,
+}
+
+/// An assembled sandbox, plus the guards whose lifetime must outlive the run.
+struct AssembledSandbox {
     prepared: sandbox::PreparedSandbox,
     policy: sandbox::LandlockPolicy,
     proxy_handle: Option<proxy::ProxyHandle>,
@@ -3186,32 +3140,40 @@ fn create_playwright_socket_dir(
         .map_err(|error| anyhow::anyhow!("Cannot create Playwright socket dir: {error}"))
 }
 
-/// Build the resolved Shell sandbox: tool discovery, scratch dir, optional
-/// proxy, and the compiled sandbox profile.
+/// Assemble the sandbox for this run: scratch dir, agent config dirs, session
+/// brief, optional Gradle hook, optional proxy, and the compiled profile.
 ///
-/// This is the shared setup used by both `cplt exec` and `cplt check` so their
-/// probes run under byte-for-byte the same policy. Mutates `resolved`
-/// (proxy port, tool-path env overrides) exactly as the agent launch does.
-fn prepare_shell_sandbox(
+/// The single place a `SandboxConfig` is constructed. The agent launch,
+/// `cplt exec` and `cplt check` all come through here, so their policies cannot
+/// drift — which they previously did, kept byte-for-byte identical only by hand,
+/// with at least one fix having to land twice (090ea8c).
+///
+/// Mutates `resolved` (proxy port, tool-path env overrides). Host state arrives
+/// through `probe`; the parts that genuinely differ between an agent and a shell
+/// arrive through `opts`.
+fn assemble_sandbox(
     cli: &Cli,
     resolved: &mut config::Resolved,
     config_path: Option<&PathBuf>,
-    home_dir: &Path,
-    project_dir: &Path,
-) -> anyhow::Result<ShellSandbox> {
-    let active_agent = agent::Agent::Shell;
+    probe: &HostProbe,
+    opts: AssemblyOptions<'_>,
+) -> anyhow::Result<AssembledSandbox> {
+    let home_dir = probe.home_dir.as_path();
+    let project_dir = probe.project_dir.as_path();
+    let active_agent = opts.agent;
 
-    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
-    let tool_roots = merge_tool_path_env_overrides(resolved, home_dir);
-
-    let tool_discovery = discover::discover_tools(home_dir, &tool_roots);
-    let existing_home_tool_dirs = tool_discovery.existing_home_tool_dirs;
-    let existing_app_dirs = tool_discovery.existing_app_dirs;
-
+    // Create per-session scratch directory if enabled
     let scratch_guard = if resolved.scratch_dir {
+        // GC stale scratch dirs from previous sessions (best-effort)
         scratch::ScratchDir::gc_stale(home_dir);
+
         match scratch::ScratchDir::create(home_dir) {
-            Ok(s) => Some(s),
+            Ok(s) => {
+                if opts.announce_scratch && !resolved.quiet {
+                    ui::ok(&format!("Scratch dir: {}", s.path().display()));
+                }
+                Some(s)
+            }
             Err(e) => bail!("Cannot create scratch dir: {e}"),
         }
     } else {
@@ -3228,40 +3190,31 @@ fn prepare_shell_sandbox(
     #[cfg(not(target_os = "macos"))]
     let playwright_socket_path = None;
 
-    let git_hooks_path = discover::git_hooks_path(home_dir);
-    let git_common_dir = discover::git_common_dir(home_dir, project_dir);
-    let java_home_dir = std::env::var("JAVA_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .filter(|p| !crate::is_unsafe_root(p, home_dir));
-
-    // Discover DOTNET_ROOT for .NET SDK read access when installed outside
-    // TOOL_READ_DIRS (e.g. actions/setup-dotnet hostedtoolcache, or
-    // dotnet-install.sh into a custom directory under $HOME).
-    let dotnet_root_dir = std::env::var("DOTNET_ROOT")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .filter(|p| !crate::is_unsafe_root(p, home_dir));
-
+    // Compute agent-specific sandbox directories
     let mut agent_dirs = active_agent.config_dirs(home_dir);
+
+    // Pre-create agent directories before entering sandbox.
+    // Agents like OpenCode crash if their data/config dirs don't exist,
+    // and the sandbox may block mkdir on parent paths.
     for dir in &agent_dirs {
         if !dir.path.exists() {
             let _ = std::fs::create_dir_all(&dir.path);
         }
     }
-    // See the agent-path call site: resolve symlinked agent dirs (#171).
+    // After pre-creation, so a dir we just made resolves too. See #171.
     agent::canonicalize_agent_dirs(&mut agent_dirs);
 
-    // See the agent-path call site: agent-facing sandbox brief (issue #148).
-    // Session layer only — `cplt check` and `cplt exec` must not write
-    // AGENTS.md into the user's project. See `apply_persistent_sandbox_brief`.
+    // Agent-facing sandbox brief (issue #148), session layer only. The
+    // AGENTS.md layer writes into the user's repo and must not run until the
+    // launch is confirmed — see `apply_persistent_sandbox_brief`, which the
+    // `exec` and `check` paths deliberately never call.
     write_session_sandbox_brief(resolved, active_agent, scratch_path, home_dir);
 
-    // See the agent-path call site: guarded Gradle init script (opt-in via
-    // sandbox.gradle_init) so sandboxed builds keep the preferIPv4Stack
-    // workaround for the daemon and Test/JavaExec forks.
+    // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
+    // init script so sandboxed builds keep the preferIPv4Stack workaround for
+    // the daemon and Test/JavaExec forks (WorkerExecutor forks have no
+    // init-script hook — see gradle_init module docs). Inert outside the
+    // sandbox (__CPLT_WRAPPED guard); a no-op when ~/.gradle doesn't exist.
     #[cfg(target_os = "macos")]
     if resolved.gradle_init
         && let Err(e) = gradle_init::ensure_init_script(home_dir)
@@ -3271,15 +3224,21 @@ fn prepare_shell_sandbox(
         ));
     }
 
+    // Start proxy (handle returned for RAII ownership). Before the profile is
+    // built, so the actual ephemeral port can be embedded in it.
     let proxy_handle = start_proxy_if_enabled(resolved, cli, config_path, active_agent)?;
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
 
-    // See the #242 note at the other `SandboxConfig` construction.
+    // #242: drop the whole-Keychain grant only when the agent can authenticate
+    // without it. Resolved against `deny_env` because that list is stripped from
+    // the child environment later — a repo `.cplt.toml` naming the token var
+    // must not leave the run with neither Keychain nor token.
     let keychain_substitute = active_agent.credential_outside_keychain(
         home_dir,
         &resolved.deny_env,
         resolved.keychain_substitute,
     );
+
     let sandbox_config = sandbox::SandboxConfig {
         project_dir,
         home_dir,
@@ -3288,8 +3247,8 @@ fn prepare_shell_sandbox(
         extra_exec: &resolved.allow_exec,
         extra_socket: &resolved.allow_socket,
         extra_deny: &resolved.deny_paths,
-        existing_home_tool_dirs: Some(&existing_home_tool_dirs),
-        existing_app_dirs: Some(&existing_app_dirs),
+        existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
+        existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
         localhost_ports: &resolved.allow_localhost,
         proxy_port: proxy_port_for_profile,
@@ -3299,18 +3258,17 @@ fn prepare_shell_sandbox(
         scratch_dir: scratch_path,
         playwright_socket_dir: playwright_socket_path,
         allow_tmp_exec: resolved.allow_tmp_exec,
-        // shell/check have no agent install dir to grant special access to
-        copilot_install_dir: None,
-        java_home: java_home_dir.as_deref(),
-        dotnet_root: dotnet_root_dir.as_deref(),
-        git_hooks_path: git_hooks_path.as_deref(),
-        git_common_dir: git_common_dir.as_deref(),
+        copilot_install_dir: opts.copilot_install_dir,
+        java_home: probe.java_home.as_deref(),
+        dotnet_root: probe.dotnet_root.as_deref(),
+        git_hooks_path: probe.git_hooks_path.as_deref(),
+        git_common_dir: probe.git_common_dir.as_deref(),
         allow_gpg_signing: resolved.allow_gpg_signing,
         deny_clipboard: resolved.deny_clipboard,
         allow_jvm_attach: resolved.allow_jvm_attach,
         allow_msbuild: resolved.allow_msbuild,
         allow_docker: resolved.allow_docker,
-        electron_app_dir: None,
+        electron_app_dir: opts.electron_app_dir,
         agent: active_agent,
         agent_dirs: &agent_dirs,
         allow_cache_exec: &resolved.allow_cache_exec,
@@ -3324,9 +3282,11 @@ fn prepare_shell_sandbox(
     // explain layer. It faithfully mirrors the enforced allow-list on both
     // platforms (the live probe remains authoritative where they differ).
     let policy = sandbox::generate_policy(&sandbox_config);
+    // Path validation (SBPL injection checks on macOS) is handled internally by
+    // prepare(), so callers don't need to know about backend-specific risks.
     let prepared = sandbox::prepare(&sandbox_config).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    Ok(ShellSandbox {
+    Ok(AssembledSandbox {
         prepared,
         policy,
         proxy_handle,
@@ -3334,6 +3294,32 @@ fn prepare_shell_sandbox(
         #[cfg(target_os = "macos")]
         playwright_socket_guard,
     })
+}
+
+/// Build the resolved Shell sandbox, shared by `cplt exec` and `cplt check` so
+/// their probes run under byte-for-byte the same policy as each other — and, via
+/// [`assemble_sandbox`], as the agent launch.
+fn prepare_shell_sandbox(
+    cli: &Cli,
+    resolved: &mut config::Resolved,
+    config_path: Option<&PathBuf>,
+    home_dir: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<AssembledSandbox> {
+    let probe = HostProbe::probe(resolved, home_dir, project_dir);
+    assemble_sandbox(
+        cli,
+        resolved,
+        config_path,
+        &probe,
+        AssemblyOptions {
+            agent: agent::Agent::Shell,
+            // shell/check have no agent install dir to grant special access to
+            copilot_install_dir: None,
+            electron_app_dir: None,
+            announce_scratch: false,
+        },
+    )
 }
 
 /// Run an arbitrary command inside the sandbox (`cplt exec -- <cmd> [args]`).
@@ -3421,7 +3407,7 @@ fn run_exec_command(
 
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
     // with `cplt check`, which runs its probes under the identical policy.
-    let ShellSandbox {
+    let AssembledSandbox {
         prepared,
         proxy_handle,
         scratch_guard: _scratch_guard,
@@ -3813,7 +3799,7 @@ fn run_check_command(
     // which affects domain/port classification, but snapshot early to be safe).
     let net_policy = build_net_policy(&resolved, active_agent);
 
-    let ShellSandbox {
+    let AssembledSandbox {
         prepared,
         policy,
         proxy_handle,
@@ -6158,6 +6144,66 @@ mod tests {
         let cli = parse(&[]);
         let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
         assert!(args.is_empty());
+    }
+
+    // ── the host probe seam (`HostProbe` / `accept_tool_dir`) ───────────────
+
+    #[test]
+    fn tool_dir_env_var_that_is_unset_or_missing_grants_nothing() {
+        let home = std::env::temp_dir();
+        assert_eq!(accept_tool_dir(None, &home), None);
+        assert_eq!(
+            accept_tool_dir(Some(String::new()), &home),
+            None,
+            "an exported-but-empty JAVA_HOME must not resolve to the cwd"
+        );
+        assert_eq!(
+            accept_tool_dir(Some("/definitely/not/a/jdk".to_string()), &home),
+            None
+        );
+    }
+
+    #[test]
+    fn tool_dir_env_var_pointing_at_an_unsafe_root_is_refused() {
+        let home = std::env::temp_dir();
+        // HOME itself, and the filesystem root: granting either would hand the
+        // sandbox read access to everything the guard exists to withhold.
+        assert_eq!(
+            accept_tool_dir(Some(home.to_string_lossy().into_owned()), &home),
+            None
+        );
+        assert_eq!(accept_tool_dir(Some("/".to_string()), &home), None);
+    }
+
+    #[test]
+    fn tool_dir_env_var_pointing_at_a_real_directory_is_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let jdk = dir.path().join("jdk-21");
+        std::fs::create_dir_all(&jdk).unwrap();
+        assert_eq!(
+            accept_tool_dir(Some(jdk.to_string_lossy().into_owned()), dir.path()),
+            Some(jdk)
+        );
+    }
+
+    #[test]
+    fn host_probe_carries_the_dirs_it_was_probed_with() {
+        // The probe owns home/project so `assemble_sandbox` cannot be handed a
+        // profile built against one project and paths discovered under another.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let mut resolved = config::Config::parse("")
+            .unwrap()
+            .merge(config::CliFlags::default())
+            .unwrap();
+        let probe = HostProbe::probe(&mut resolved, &home, &project);
+        assert_eq!(probe.home_dir, home);
+        assert_eq!(probe.project_dir, project);
+        // A directory that is not a git work tree has no worktree common dir.
+        assert_eq!(probe.git_common_dir, None);
     }
 
     #[test]
