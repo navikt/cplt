@@ -34,6 +34,8 @@ pub struct ProfileOptions<'a> {
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
+    /// Trees the agent may execute binaries from (`allow.exec`).
+    pub extra_exec: &'a [PathBuf],
     pub allow_socket: &'a [PathBuf],
     pub extra_deny: &'a [PathBuf],
     /// If `Some`, only include these home tool dirs (tighter profile via discovery,
@@ -224,7 +226,7 @@ pub fn generate_profile_with_playwright_socket_dir(
             .then_some(playwright_socket_dir)
             .flatten(),
     );
-    emit_user_allows(&mut sb, opts.extra_read, opts.extra_write);
+    emit_user_allows(&mut sb, opts.extra_read, opts.extra_write, opts.extra_exec);
     emit_deny_rules(&mut sb, &home, opts.extra_deny);
     emit_registry_config_overrides(&mut sb, &home, opts.extra_read);
     emit_denied_dotfile_overrides(&mut sb, &home, opts.extra_read);
@@ -270,6 +272,9 @@ pub fn generate_profile_with_playwright_socket_dir(
     // $PNPM_HOME would reopen them, and mise's two live inside a tree that has
     // to stay writable.
     emit_path_bin_denies(&mut sb, opts.home_dir);
+    // MUST stay last: see `emit_exec_write_denies`. An exec grant that could be
+    // reopened for writing by a later allow is a write-then-exec path.
+    emit_exec_write_denies(&mut sb, opts.extra_exec);
 
     sb
 }
@@ -1593,8 +1598,13 @@ fn emit_temp_rules(
     }
 }
 
-fn emit_user_allows(sb: &mut String, extra_read: &[PathBuf], extra_write: &[PathBuf]) {
-    if !extra_read.is_empty() || !extra_write.is_empty() {
+fn emit_user_allows(
+    sb: &mut String,
+    extra_read: &[PathBuf],
+    extra_write: &[PathBuf],
+    extra_exec: &[PathBuf],
+) {
+    if !extra_read.is_empty() || !extra_write.is_empty() || !extra_exec.is_empty() {
         sbpl!(sb, ";; User-specified allows");
         for path in extra_read {
             let p = path.to_string_lossy();
@@ -1605,8 +1615,42 @@ fn emit_user_allows(sb: &mut String, extra_read: &[PathBuf], extra_write: &[Path
             sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
             sbpl!(sb, "(allow file-write* (subpath \"{p}\"))");
         }
+        // `process-exec` is granted profile-wide, so an exec grant needs the two
+        // rights that are not: reading the binary and its interpreter, and
+        // mapping the pages executable. The matching write-deny is emitted last,
+        // by `emit_exec_write_denies`.
+        for path in extra_exec {
+            let p = path.to_string_lossy();
+            sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
+            sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
+        }
         sbpl!(sb);
     }
+}
+
+/// Keep every `allow.exec` tree read-only.
+///
+/// `sandbox::prepare` already refuses an exec grant that overlaps the project
+/// dir or an `allow.write` grant, so this is the second line: nothing else in
+/// the profile — a tool dir, a scratch path, an agent dir — may quietly make an
+/// exec-granted tree writable either.
+///
+/// Emitted LAST, after every allow in the profile. SBPL is last-match-wins, so
+/// a write-deny sitting next to its own allow is reopened by any later
+/// `file-write*` allow that covers the same tree. That is exactly the bug #158
+/// left behind, and the reason `emit_dotnet_exec_denies` and
+/// `emit_gradle_toolchain_write_deny` are at the bottom of `generate_profile`
+/// too. Do not move this call.
+fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
+    if extra_exec.is_empty() {
+        return;
+    }
+    sbpl!(sb, ";; allow.exec trees stay read-only (write-then-exec)");
+    for path in extra_exec {
+        let p = path.to_string_lossy();
+        sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+    }
+    sbpl!(sb);
 }
 
 fn emit_deny_rules(sb: &mut String, home: &str, extra_deny: &[PathBuf]) {
@@ -2093,6 +2137,7 @@ mod tests {
             home_dir,
             extra_read: &[],
             extra_write: &[],
+            extra_exec: &[],
             allow_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,

@@ -105,6 +105,9 @@ pub struct SandboxConfig<'a> {
     pub home_dir: &'a Path,
     pub extra_read: &'a [PathBuf],
     pub extra_write: &'a [PathBuf],
+    /// Trees the agent may execute binaries from (`allow.exec` / `--allow-exec`).
+    /// Read + execute, never write; see [`validate_exec_grants`].
+    pub extra_exec: &'a [PathBuf],
     pub extra_socket: &'a [PathBuf],
     pub extra_deny: &'a [PathBuf],
     /// If `Some`, only include these home tool dirs (tighter profile via discovery,
@@ -243,6 +246,7 @@ impl PreparedSandbox {
 pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
     validate_hard_denied_grants(config)?;
+    validate_exec_grants(config)?;
     prepare_impl(config, &extra_git_dirs(config.extra_write))
 }
 
@@ -259,6 +263,7 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
     for (key, paths) in [
         ("allow.read", config.extra_read),
         ("allow.write", config.extra_write),
+        ("allow.exec", config.extra_exec),
         ("allow.socket", config.extra_socket),
     ] {
         for p in paths {
@@ -271,6 +276,95 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Refuse an exec grant that is unbounded or that overlaps a writable tree.
+///
+/// `allow.exec` is the one grant that hands the agent *execute* rights on a
+/// tree of its own choosing, so two things are refused outright:
+///
+/// 1. `/`, `$HOME`, and any ancestor of `$HOME`
+///    ([`policy::tool_override_path_is_safe`]) — an exec grant that wide is
+///    indistinguishable from no sandbox.
+/// 2. Any overlap, in either direction, with a writable tree: the project
+///    directory or an `allow.write` grant (including the ones
+///    `merge_tool_path_env_overrides` derives from `CARGO_HOME` and friends —
+///    this runs after that merge, which is why the check lives here and not in
+///    `Config::resolve`).
+///
+/// Overlap is a hard error rather than a warning or a narrowed rule because a
+/// tree that is both agent-writable and executable is a binary-drop staging
+/// path: the agent writes a binary and runs it, which is the class of hole the
+/// non-executable cache and tmp defaults exist to close.
+///
+/// It cannot be mitigated instead of refused. Landlock is additive: a write
+/// rule on an ancestor unions with an exec rule on a child and there is no way
+/// to subtract it, so on Linux the only alternatives are refusing or a
+/// bubblewrap `ro_protect` mount — and bubblewrap is absent on any host without
+/// user namespaces, which would make the control silently missing exactly where
+/// it is needed. Refusing is also the only answer that is identical on macOS
+/// and Linux; a control that holds on one backend and not the other is how #207
+/// survived for months.
+fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
+    for exec in config.extra_exec {
+        if !policy::tool_override_path_is_safe(exec, config.home_dir) {
+            return Err(format!(
+                "allow.exec names {} \u{2014} an unsafe root cannot be granted execute \
+                 rights: `/`, `/tmp`, `$HOME` and any parent of `$HOME`, and the platform \
+                 system directories. A grant that wide defeats the sandbox. Name the \
+                 specific tool prefix instead, e.g. ~/.linuxbrew.",
+                exec.display()
+            ));
+        }
+        for (write, source) in writable_trees(config) {
+            let write = write.as_path();
+            if !(exec.starts_with(write) || write.starts_with(exec)) {
+                continue;
+            }
+            return Err(format!(
+                "allow.exec {} overlaps {source} {}: a tree that is both writable and \
+                 executable lets the agent drop a binary and run it. Neither backend can \
+                 subtract the write grant from the exec grant, so cplt refuses the pair \
+                 instead of pretending to. Narrow one of the two so they do not overlap \
+                 \u{2014} exec grants belong on read-only tool prefixes.",
+                exec.display(),
+                write.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every tree the sandbox makes writable, paired with a name for the error.
+///
+/// The `allow.write` grants include the ones `merge_tool_path_env_overrides`
+/// derives from `CARGO_HOME` and friends, since that merge happens before
+/// `prepare`. The home tool dirs are here because several of them (`~/.gradle`,
+/// `~/.m2`, `~/.cache`) are writable by design, and an exec grant on one of them
+/// would be the same write+exec pair by a different route — the route
+/// `--allow-cache-exec` exists to handle deliberately.
+fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
+    let mut trees = vec![(config.project_dir.to_path_buf(), "the project directory")];
+    trees.extend(
+        config
+            .extra_write
+            .iter()
+            .map(|w| (w.clone(), "the allow.write grant")),
+    );
+    match config.existing_home_tool_dirs {
+        Some(dirs) => trees.extend(
+            dirs.iter()
+                .filter(|d| d.dir.write)
+                .map(|d| (d.path.clone(), "the writable tool directory")),
+        ),
+        None => trees.extend(
+            policy::HOME_TOOL_DIRS
+                .iter()
+                .filter(|d| d.write)
+                .map(|d| (config.home_dir.join(d.path), "the writable tool directory")),
+        ),
+    }
+    trees
 }
 
 /// Resolve the real `.git` directory of every writable granted path whose repo
@@ -376,6 +470,7 @@ fn prepare_impl(
         home_dir: config.home_dir,
         extra_read: config.extra_read,
         extra_write: config.extra_write,
+        extra_exec: config.extra_exec,
         allow_socket: config.extra_socket,
         extra_deny: config.extra_deny,
         existing_home_tool_dirs: config.existing_home_tool_dirs,
@@ -737,6 +832,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     for p in config.extra_write {
         policy::validate_sbpl_path(p).map_err(|e| format!("--allow-write path: {e}"))?;
     }
+    for p in config.extra_exec {
+        policy::validate_sbpl_path(p).map_err(|e| format!("--allow-exec path: {e}"))?;
+    }
     for p in config.extra_socket {
         policy::validate_sbpl_path(p).map_err(|e| format!("--allow-socket path: {e}"))?;
     }
@@ -853,6 +951,7 @@ mod tests {
             home_dir,
             extra_read: grants,
             extra_write: &[],
+            extra_exec: &[],
             extra_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
@@ -928,6 +1027,86 @@ mod tests {
                 .expect("allow.socket must be refused");
             assert!(error.contains("allow.socket"), "{error}");
         }
+    }
+
+    /// `/` and `$HOME` are refused: an exec grant that wide is not a sandbox.
+    /// `$HOME`'s ancestors go with it — granting `/home` reaches every user.
+    #[test]
+    fn prepare_refuses_an_unbounded_exec_grant() {
+        let home = Path::new("/home/test");
+        for wide in ["/", "/tmp", "/home/test"] {
+            let granted = vec![PathBuf::from(wide)];
+            let mut config = test_config(home, &[]);
+            config.extra_exec = &granted;
+
+            let error = prepare(&config)
+                .err()
+                .unwrap_or_else(|| panic!("allow.exec {wide} must be refused"));
+            assert!(error.contains("allow.exec"), "{error}");
+            assert!(error.contains("defeats the sandbox"), "{error}");
+        }
+    }
+
+    /// The overlap refusal, in both directions and against both sources of
+    /// write: an `allow.write` grant and the project directory.
+    ///
+    /// Not a warning and not a narrowed rule. Landlock unions a write rule on
+    /// an ancestor with an exec rule on a child and cannot subtract it, so an
+    /// overlapping pair really is writable + executable — a binary-drop staging
+    /// path — on the one backend where it cannot be mitigated without
+    /// bubblewrap. Refusing is the only answer both backends give alike.
+    #[test]
+    fn prepare_refuses_an_exec_grant_overlapping_a_writable_tree() {
+        let home = Path::new("/home/test");
+        let cases: [(&str, &str); 5] = [
+            // exec inside the writable grant, and the reverse
+            ("/home/test/tools/bin", "/home/test/tools"),
+            ("/home/test/tools", "/home/test/tools/bin"),
+            // the same tree granted twice
+            ("/home/test/tools", "/home/test/tools"),
+            // exec inside the project directory
+            ("/project/vendor/bin", "/project"),
+            // exec inside a writable HOME_TOOL_DIRS entry — the same write+exec
+            // pair by another route; `--allow-cache-exec` is the way in there.
+            ("/home/test/.cache/ms-playwright", "/home/test/.cache"),
+        ];
+        for (exec, write) in cases {
+            let exec_paths = vec![PathBuf::from(exec)];
+            let write_paths = vec![PathBuf::from(write)];
+            let mut config = test_config(home, &[]);
+            config.extra_exec = &exec_paths;
+            // "/project" is `test_config`'s project dir and `~/.cache` a
+            // writable HOME_TOOL_DIRS entry; both are writable without any
+            // `allow.write` at all.
+            if write != "/project" && !write.starts_with("/home/test/.cache") {
+                config.extra_write = &write_paths;
+            }
+
+            let error = prepare(&config).err().unwrap_or_else(|| {
+                panic!("allow.exec {exec} over writable {write} must be refused")
+            });
+            assert!(error.contains("allow.exec"), "{error}");
+            assert!(error.contains(exec), "{error}");
+            assert!(error.contains(write), "{error}");
+            assert!(
+                error.contains("writable and") && error.contains("executable"),
+                "the error must say why, not just no: {error}"
+            );
+        }
+    }
+
+    /// The case from #202: a relocated Homebrew prefix under `$HOME`. It is not
+    /// `$HOME`, not an ancestor of it, and overlaps nothing writable, so it is
+    /// accepted — this is the grant that makes the reporter's
+    /// `~/.linuxbrew/bin/git` runnable.
+    #[test]
+    fn prepare_accepts_a_relocated_tool_prefix_exec_grant() {
+        let home = Path::new("/home/test");
+        let granted = vec![home.join(".linuxbrew")];
+        let mut config = test_config(home, &[]);
+        config.extra_exec = &granted;
+
+        assert_eq!(validate_exec_grants(&config), Ok(()));
     }
 
     /// The overridable list keeps working: refusing these would be a regression.

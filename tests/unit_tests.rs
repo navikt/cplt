@@ -754,6 +754,7 @@ fn profile_contains_deny_default() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -795,6 +796,7 @@ fn profile_allows_tty_ioctl() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -845,6 +847,7 @@ fn landlock_policy_device_files_have_ioctl() {
         home_dir: std::path::Path::new("/home/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         extra_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -914,6 +917,7 @@ fn profile_grants_project_access() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -984,6 +988,7 @@ fn profile_grants_copilot_config_access() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1028,6 +1033,7 @@ fn profile_grants_claude_config_access() {
             home_dir: home,
             extra_read: &[],
             extra_write: &[],
+            extra_exec: &[],
             allow_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
@@ -1098,6 +1104,7 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
                 home_dir: home,
                 extra_read: &[],
                 extra_write: &[],
+                extra_exec: &[],
                 allow_socket: &[],
                 extra_deny: &[],
                 existing_home_tool_dirs: None,
@@ -1160,6 +1167,7 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
         home_dir: home,
         extra_read: &[],
         extra_write: std::slice::from_ref(&settings),
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1207,6 +1215,102 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
     }
 }
 
+/// A default `ProfileOptions` for tests that only care about one or two fields.
+/// Every other test here spells the struct out; new ones need not.
+fn base_profile_options() -> ProfileOptions<'static> {
+    ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_exec: &[],
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        extra_git_dirs: &[],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+        credential_outside_keychain: false,
+    }
+}
+
+/// `allow.exec` on macOS: `process-exec` is already granted profile-wide, so
+/// the two rights the grant has to add are reading the binary (and its
+/// interpreter and libraries) and mapping its pages executable.
+#[test]
+fn exec_grant_allows_read_and_map_executable() {
+    let exec = [std::path::PathBuf::from("/Users/test/.linuxbrew")];
+    let p = generate_profile(&ProfileOptions {
+        extra_exec: &exec,
+        ..base_profile_options()
+    });
+
+    assert!(
+        p.contains("(allow file-read* (subpath \"/Users/test/.linuxbrew\"))"),
+        "allow.exec must grant read: exec of a dynamically linked binary opens \
+         its ELF interpreter and RPATH libraries too\n{p}"
+    );
+    assert!(
+        p.contains("(allow file-map-executable (subpath \"/Users/test/.linuxbrew\"))"),
+        "allow.exec must grant file-map-executable\n{p}"
+    );
+}
+
+/// The write-deny that keeps an `allow.exec` tree read-only must be the LAST
+/// word in the profile. SBPL is last-match-wins, so a deny emitted next to its
+/// own allow is silently reopened by any later `file-write*` allow covering the
+/// same tree — that is the bug #158 left behind, and it is why
+/// `emit_exec_write_denies` is called at the very end of `generate_profile`.
+///
+/// Asserted against every write allow in the profile rather than one known
+/// culprit: the point is placement, and a new emitter appended after this call
+/// must fail here rather than quietly reopen the tree.
+#[test]
+fn exec_write_deny_comes_after_every_write_allow() {
+    let exec = [std::path::PathBuf::from("/Users/test/.linuxbrew")];
+    let p = generate_profile(&ProfileOptions {
+        extra_exec: &exec,
+        extra_write: &[std::path::PathBuf::from("/Users/test/work")],
+        scratch_dir: Some(std::path::Path::new("/private/tmp/cplt-scratch")),
+        ..base_profile_options()
+    });
+
+    let deny = p
+        .find("(deny file-write* (subpath \"/Users/test/.linuxbrew\"))")
+        .expect("allow.exec tree must get a write-deny");
+    let last_write_allow = p
+        .rfind("(allow file-write*")
+        .expect("the profile always has write allows");
+    assert!(
+        deny > last_write_allow,
+        "the allow.exec write-deny must come after EVERY file-write* allow, or \
+         last-match-wins reopens the tree for writing (#158)\n{p}"
+    );
+}
+
 #[test]
 fn profile_denies_sensitive_dirs() {
     let p = generate_profile(&ProfileOptions {
@@ -1214,6 +1318,7 @@ fn profile_denies_sensitive_dirs() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1280,6 +1385,7 @@ fn profile_denies_sensitive_files() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1328,6 +1434,7 @@ fn profile_denies_credential_files_in_tool_dirs() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1407,6 +1514,7 @@ fn profile_allows_credential_files_when_user_opts_in() {
             PathBuf::from("/Users/test/.npmrc"),
         ],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1502,6 +1610,7 @@ fn profile_extra_read_overrides_denied_dotfile_directory() {
             "/Users/test/.config/gcloud/application_default_credentials.json",
         )],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1565,6 +1674,7 @@ fn profile_extra_read_overrides_multiple_denied_dotfile_dirs() {
             PathBuf::from("/Users/test/.aws/credentials"),
         ],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1626,6 +1736,7 @@ fn profile_restricts_outbound_tcp() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1694,6 +1805,7 @@ fn profile_extra_ports_adds_allows() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1746,6 +1858,7 @@ fn profile_allow_browser_enables_lsopen() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1790,6 +1903,7 @@ fn profile_proxy_port_allows_localhost() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1838,6 +1952,7 @@ fn profile_allow_localhost_opens_specific_ports() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1901,6 +2016,7 @@ fn profile_deny_rules_come_after_allow_rules() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -1951,6 +2067,7 @@ fn profile_allows_gh_config_read_only() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2003,6 +2120,7 @@ fn profile_allows_file_map_executable_for_copilot() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2051,6 +2169,7 @@ fn profile_denies_env_files_by_default() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2123,6 +2242,7 @@ fn profile_allows_env_files_when_flag_set() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2167,6 +2287,7 @@ fn profile_env_deny_comes_after_project_allow() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2223,6 +2344,7 @@ fn profile_env_deny_comes_after_user_allows() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[std::path::PathBuf::from("/projects")],
         extra_write: &[std::path::PathBuf::from("/projects")],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2327,6 +2449,7 @@ fn profile_denies_resolved_git_dirs_of_granted_repos() {
             std::path::PathBuf::from("/work/wt"),
             std::path::PathBuf::from("/work/bare.git"),
         ],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2421,6 +2544,7 @@ fn profile_allows_all_localhost_when_flag_set() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2483,6 +2607,7 @@ fn profile_allows_all_tcp_outbound_when_jvm_and_localhost_any() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2541,6 +2666,7 @@ fn profile_denies_write_to_copilot_pkg() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2789,6 +2915,7 @@ fn profile_denies_exec_from_tmp() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2862,6 +2989,7 @@ fn profile_allows_jvm_attach_when_flag_set() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -2946,6 +3074,7 @@ fn profile_allows_msbuild_when_flag_set() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -3021,6 +3150,7 @@ fn profile_allows_localhost_tcp_bind() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -3076,6 +3206,7 @@ fn allow_localhost_any_affects_both_backends() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -3122,6 +3253,7 @@ fn allow_localhost_any_affects_both_backends() {
         home_dir: std::path::Path::new("/home/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         extra_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -3180,6 +3312,7 @@ fn config_options_parity_across_backends() {
         home_dir: home,
         extra_read: &extra_read,
         extra_write: &extra_write,
+        extra_exec: &[],
         extra_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -3271,6 +3404,7 @@ fn config_options_parity_across_backends() {
         home_dir: home,
         extra_read: &extra_read,
         extra_write: &extra_write,
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -3356,6 +3490,7 @@ fn profile_denies_git_persistence_vectors() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -3422,6 +3557,7 @@ fn profile_denies_write_to_cplt_toml() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -3470,6 +3606,7 @@ fn default_profile() -> String {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -3704,6 +3841,7 @@ fn path_bin_denies_survive_a_user_allow_write_over_the_parent() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &extra_write,
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -4598,6 +4736,7 @@ fn profile_scratch_dir_adds_all_permissions() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -4671,6 +4810,7 @@ fn profile_allow_tmp_exec_removes_denies() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -4839,6 +4979,7 @@ fn profile_allows_copilot_install_dir() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -4896,6 +5037,7 @@ fn profile_allows_vscode_copilot_path() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -4958,6 +5100,7 @@ fn profile_allows_dotnet_root_when_set() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5064,6 +5207,7 @@ fn profile_dotnet_exec_paths_stay_readonly_under_user_allow_write() {
         extra_read: &[],
         // The user allows writes to the whole dotnet root (or any parent).
         extra_write: &[std::path::PathBuf::from(dotnet_root)],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5132,6 +5276,7 @@ fn profile_allows_electron_app_bundle() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5295,6 +5440,7 @@ fn profile_allows_git_hooks_path() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5360,6 +5506,7 @@ fn profile_allows_git_worktree_common_dir() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5517,6 +5664,7 @@ fn profile_gpg_signing_allows_public_keyring() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5569,6 +5717,7 @@ fn profile_gpg_signing_allows_agent_socket() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5618,6 +5767,7 @@ fn profile_gpg_signing_denies_private_keys() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5666,6 +5816,7 @@ fn profile_gpg_signing_rules_come_after_deny() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5724,6 +5875,7 @@ fn profile_gpg_signing_uses_literal_not_subpath() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5770,6 +5922,7 @@ fn profile_gpg_signing_deny_path_wins() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &deny,
         existing_home_tool_dirs: None,
@@ -5819,6 +5972,7 @@ fn profile_gpg_signing_denies_legacy_secring() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -5863,6 +6017,7 @@ fn profile_gpg_signing_allows_socket_file_read() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -6648,6 +6803,7 @@ fn profile_docker_disabled_by_default() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -6698,6 +6854,7 @@ fn profile_docker_enabled_allows_config_and_sockets() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -6780,6 +6937,7 @@ fn profile_docker_skipped_when_deny_path_overlaps() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[std::path::PathBuf::from("/Users/test/.docker")],
         existing_home_tool_dirs: None,
@@ -6829,6 +6987,7 @@ fn profile_socket_allows_rules() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[std::path::PathBuf::from(
             "/Users/test/.codex/codex-lsp/daemon/daemon.sock",
         )],
@@ -6896,6 +7055,7 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[std::path::PathBuf::from(
             "/Users/test/.codex/codex-lsp/daemon/daemon.sock",
         )],
@@ -6959,6 +7119,7 @@ fn profile_allow_cache_exec_subdir_adds_carveout() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -7014,6 +7175,7 @@ fn profile_allow_cache_exec_any_allows_all_caches() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -7063,6 +7225,7 @@ fn profile_default_denies_cache_exec() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -7108,6 +7271,7 @@ fn profile_allow_cache_exec_multiple_subdirs() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -7155,6 +7319,32 @@ fn config_parses_allow_cache_exec() {
     assert_eq!(
         config.sandbox.allow_cache_exec,
         vec!["ms-playwright", "pnpm/dlx"]
+    );
+}
+
+/// `allow.exec` reaches `Resolved` from config, and is flagged dangerous in the
+/// registry so `config show` / `config validate` warn about it like
+/// `allow_docker` does.
+#[test]
+fn config_parses_and_flags_allow_exec() {
+    use cplt::config::{Config, DiagnosticLevel, lookup_key, validate_config};
+
+    let toml = "[allow]\nexec = [\"/opt/tools\"]\n";
+    let config = Config::parse(toml).unwrap();
+    assert_eq!(config.allow.exec, vec!["/opt/tools".to_string()]);
+
+    assert!(
+        lookup_key("allow.exec").unwrap().dangerous,
+        "allow.exec must be marked dangerous, like allow_docker"
+    );
+
+    let warnings: Vec<_> = validate_config(toml)
+        .into_iter()
+        .filter(|d| d.level == DiagnosticLevel::Warning)
+        .collect();
+    assert!(
+        warnings.iter().any(|d| d.message.contains("allow.exec")),
+        "a non-empty allow.exec must warn: {warnings:?}"
     );
 }
 
@@ -7236,6 +7426,7 @@ fn profile_cache_exec_carveout_comes_after_exec_deny() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -7538,6 +7729,7 @@ fn playwright_profile(
             home_dir: std::path::Path::new("/Users/test"),
             extra_read: &[],
             extra_write: &[],
+            extra_exec: &[],
             allow_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
@@ -7721,6 +7913,7 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -7793,6 +7986,7 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -7854,6 +8048,7 @@ fn chromium_runtime_rules_absent_by_default() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -7912,6 +8107,7 @@ fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -7971,6 +8167,7 @@ fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -8039,6 +8236,7 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
             home_dir: std::path::Path::new("/Users/test"),
             extra_read: &[],
             extra_write: &[],
+            extra_exec: &[],
             allow_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
@@ -8097,6 +8295,7 @@ fn chromium_runtime_mach_register_rules_remain_narrow() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -8216,6 +8415,7 @@ fn existing_app_dirs_none_includes_all() {
         home_dir: std::path::Path::new("/home/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -8268,6 +8468,7 @@ fn existing_app_dirs_matching_includes_dir() {
         home_dir: std::path::Path::new("/home/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -8321,6 +8522,7 @@ fn existing_app_dirs_nonmatching_excludes_dir() {
         home_dir: std::path::Path::new("/home/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -8390,6 +8592,7 @@ fn existing_app_dirs_per_path_filtering() {
         home_dir: std::path::Path::new("/home/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -8484,6 +8687,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -8571,6 +8775,7 @@ fn deny_clipboard_emits_pasteboard_deny_after_allow() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -8622,6 +8827,7 @@ fn no_deny_clipboard_by_default() {
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
@@ -8724,6 +8930,7 @@ allow_private_domains = []
 [allow]
 read = []
 write = []
+exec = []
 socket = []
 ports = []
 localhost = []
@@ -9153,6 +9360,7 @@ fn profile_relocated_cargo_bin_is_exec_only_and_registry_is_write_only() {
         home_dir: std::path::Path::new("/home/tester"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: Some(&dirs),
@@ -9202,6 +9410,7 @@ fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
         home_dir: std::path::Path::new("/home/tester"),
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         extra_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: Some(&dirs),
@@ -9854,6 +10063,7 @@ fn profile_opts<'a>(project: &'a std::path::Path, home: &'a std::path::Path) -> 
         home_dir: home,
         extra_read: &[],
         extra_write: &[],
+        extra_exec: &[],
         allow_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,

@@ -565,6 +565,111 @@ EOF
         );
     }
 
+    /// The #202 case: a relocated Homebrew prefix, whose binaries only work if
+    /// the grant carries READ as well as EXECUTE — the interpreter and the RPATH
+    /// libraries live inside the same prefix. The script here proves both halves
+    /// at once: exec'ing it needs execute, and its own interpreter plus the file
+    /// it reads need read.
+    ///
+    /// The prefix lives under the real `$HOME`, not the fake one: bubblewrap
+    /// mounts a private tmpfs over `/tmp` and binds back only the *writable*
+    /// rules, so a read-only grant on a path under `/tmp` — which every
+    /// `tempfile::tempdir()` is — would be invisible inside the namespace and the
+    /// test would fail for a reason that has nothing to do with the grant.
+    #[test]
+    fn landlock_allow_exec_grants_read_and_execute_on_a_tool_prefix() {
+        require_landlock!();
+        let project = create_test_project();
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        let prefix = home_dir().join(format!(".cplt-exec-test-{}", std::process::id()));
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("lib")).unwrap();
+        fs::write(prefix.join("lib/marker"), "linked ok\n").unwrap();
+        fs::write(
+            prefix.join("bin/tool"),
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/../lib/marker\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            prefix.join("bin/tool"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let prefix_arg = prefix.to_string_lossy().into_owned();
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            fake_home.path(),
+            &["--allow-exec", &prefix_arg],
+            &format!("{prefix_arg}/bin/tool"),
+        );
+        fs::remove_dir_all(&prefix).ok();
+
+        assert_eq!(
+            code, 0,
+            "--allow-exec on a relocated tool prefix must make its binaries runnable \
+             — stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("linked ok"),
+            "the grant must carry read too, not just execute — stdout: {stdout}"
+        );
+    }
+
+    /// Without the grant the same prefix stays unrunnable — otherwise the test
+    /// above would pass for the wrong reason.
+    #[test]
+    fn landlock_blocks_a_tool_prefix_without_allow_exec() {
+        require_landlock!();
+        let project = create_test_project();
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        let prefix = home_dir().join(format!(".cplt-exec-blocked-{}", std::process::id()));
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::write(prefix.join("bin/tool"), "#!/bin/sh\necho should not run\n").unwrap();
+        fs::set_permissions(
+            prefix.join("bin/tool"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let prefix_arg = prefix.to_string_lossy().into_owned();
+        let (code, stdout, _) = run_sandboxed_home(
+            project.path(),
+            fake_home.path(),
+            &format!("{prefix_arg}/bin/tool 2>&1"),
+        );
+        fs::remove_dir_all(&prefix).ok();
+
+        assert!(
+            code != 0 || !stdout.contains("should not run"),
+            "exec from an ungranted prefix must be blocked — code: {code}, stdout: {stdout}"
+        );
+    }
+
+    /// The overlap refusal is a startup error, not a warning, and it names both
+    /// grants. Same refusal on macOS — the point is that the two backends agree.
+    #[test]
+    fn allow_exec_overlapping_a_writable_grant_is_refused_at_startup() {
+        let project = create_test_project();
+        let fake_home = tempfile::tempdir().expect("Failed to create temp home");
+        let tree = fake_home.path().join("tools");
+        fs::create_dir_all(tree.join("bin")).unwrap();
+        let tree_arg = tree.to_string_lossy().into_owned();
+        let bin_arg = tree.join("bin").to_string_lossy().into_owned();
+
+        let (code, _, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            fake_home.path(),
+            &["--allow-write", &tree_arg, "--allow-exec", &bin_arg],
+            "echo should not run",
+        );
+        assert!(code != 0, "an overlapping exec grant must refuse to launch");
+        assert!(
+            stderr.contains("allow.exec") && stderr.contains("overlaps"),
+            "the refusal must name the collision: {stderr}"
+        );
+    }
+
     // ── seccomp enforcement tests ─────────────────────────────────
 
     #[test]

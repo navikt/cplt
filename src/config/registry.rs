@@ -156,6 +156,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "allow",
+        key: "exec",
+        value_type: ConfigValueType::StrArray,
+        dangerous: true,
+        default_display: "[]",
+        description: "\u{26a0}\u{fe0f}  DANGEROUS: Trees the agent may execute binaries from (e.g. a relocated Homebrew prefix). Read + execute, never write. Refused for an unsafe root (/, /tmp, $HOME and its parents, the platform system dirs) and for any tree that overlaps a writable one \u{2014} writable + executable is a binary-drop path.",
+    },
+    ConfigKeyInfo {
+        section: "allow",
         key: "socket",
         value_type: ConfigValueType::StrArray,
         dangerous: false,

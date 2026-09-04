@@ -459,6 +459,7 @@ mod macos_tests {
             home_dir: home,
             extra_read: &[],
             extra_write: &[],
+            extra_exec: &[],
             allow_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
@@ -1455,6 +1456,80 @@ mod macos_tests {
         assert!(
             success && output.contains("EXEC_OK"),
             "with allow_tmp_exec, executing from /tmp should work, got: {output}"
+        );
+    }
+
+    // ── allow.exec ────────────────────────────────────────────────
+
+    /// `allow.exec` on a tool prefix outside the default tool dirs — the #202
+    /// case, with the kernel rather than the profile text as the witness. Both
+    /// halves are checked: executing a binary from the prefix, and reading a
+    /// file beside it (the ELF/Mach-O interpreter and the libraries a real tool
+    /// loads live there too).
+    #[test]
+    fn real_profile_allow_exec_permits_exec_and_read_in_the_granted_tree() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        // Under $HOME, which the default profile grants neither read nor exec
+        // on — so a pass can only come from the grant under test.
+        let prefix = home.join(format!(".cplt-exec-test-{}", std::process::id()));
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::copy("/usr/bin/true", prefix.join("bin/tool")).unwrap();
+        fs::write(prefix.join("marker"), "linked ok\n").unwrap();
+
+        let granted = [prefix.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_exec = &granted;
+        let profile = write_real_profile(&opts);
+
+        let p = prefix.to_string_lossy();
+        let (output, success) = run_sandboxed(
+            &profile,
+            &format!("'{p}/bin/tool' && cat '{p}/marker' && echo EXEC_OK"),
+        );
+
+        fs::remove_file(&profile).ok();
+        fs::remove_dir_all(&prefix).ok();
+
+        assert!(
+            success && output.contains("linked ok") && output.contains("EXEC_OK"),
+            "allow.exec must grant exec AND read on the tree, got: {output}"
+        );
+    }
+
+    /// The write-deny that keeps an `allow.exec` tree read-only has to survive
+    /// every later allow in the profile — SBPL is last-match-wins, and #158 is
+    /// what happens when a deny is emitted next to its own allow instead of at
+    /// the end. `sandbox::prepare` refuses this pair outright; the profile
+    /// generator is exercised directly here so the ordering itself is proven
+    /// against a real kernel rather than only against the refusal.
+    #[test]
+    fn real_profile_allow_exec_tree_stays_read_only_under_a_wider_write_allow() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let prefix = home.join(format!(".cplt-exec-ro-test-{}", std::process::id()));
+        fs::create_dir_all(&prefix).unwrap();
+
+        let granted = [prefix.clone()];
+        let wider = [home.clone()];
+        let mut opts = default_opts(&project, &home);
+        opts.extra_exec = &granted;
+        opts.extra_write = &wider;
+        let profile = write_real_profile(&opts);
+
+        let p = prefix.to_string_lossy();
+        let (output, _) =
+            run_sandboxed(&profile, &format!("touch '{p}/dropped' 2>&1; echo EXIT:$?"));
+
+        fs::remove_file(&profile).ok();
+        fs::remove_dir_all(&prefix).ok();
+
+        assert!(
+            !output.contains("EXIT:0"),
+            "a write into an allow.exec tree must stay denied even under a wider \
+             allow.write, or the tree is a write-then-exec path, got: {output}"
         );
     }
 

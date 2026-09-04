@@ -245,6 +245,15 @@ struct Cli {
     #[arg(long = "allow-write", value_name = "PATH")]
     allow_write: Vec<PathBuf>,
 
+    /// DANGEROUS: let the agent execute binaries from a tree outside the
+    /// default tool directories, e.g. a relocated Homebrew or toolchain prefix.
+    /// Grants read + execute, never write. Refused for an unsafe root (/, /tmp,
+    /// $HOME and its parents, the platform system dirs) and for any tree that
+    /// overlaps a writable one.
+    /// Can be specified multiple times.
+    #[arg(long = "allow-exec", value_name = "PATH")]
+    allow_exec: Vec<PathBuf>,
+
     /// Allow the agent to access a Unix domain socket path (e.g. for LSP server or Docker).
     /// Can be specified multiple times.
     #[arg(long = "allow-socket", value_name = "PATH")]
@@ -1293,6 +1302,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // Canonicalize CLI paths for consistency with config path handling
     let cli_allow_read = canonicalize_paths(&cli.allow_read, "--allow-read");
     let cli_allow_write = canonicalize_paths(&cli.allow_write, "--allow-write");
+    let cli_allow_exec = canonicalize_paths(&cli.allow_exec, "--allow-exec");
     let cli_allow_socket = canonicalize_paths(&cli.allow_socket, "--allow-socket");
     let cli_deny_paths = canonicalize_deny_paths(&cli.deny_paths)?;
 
@@ -1408,6 +1418,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         allow_private_domains: cli.allow_private_domains.clone(),
         allow_read: cli_allow_read,
         allow_write: cli_allow_write,
+        allow_exec: cli_allow_exec,
         allow_socket: cli_allow_socket,
         deny_paths: cli_deny_paths,
         allow_ports: cli.allow_ports.clone(),
@@ -2684,6 +2695,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         home_dir: &home_dir,
         extra_read: &resolved.allow_read,
         extra_write: &resolved.allow_write,
+        extra_exec: &resolved.allow_exec,
         extra_socket: &resolved.allow_socket,
         extra_deny: &resolved.deny_paths,
         existing_home_tool_dirs: Some(&existing_home_tool_dirs),
@@ -3271,6 +3283,7 @@ fn prepare_shell_sandbox(
         home_dir,
         extra_read: &resolved.allow_read,
         extra_write: &resolved.allow_write,
+        extra_exec: &resolved.allow_exec,
         extra_socket: &resolved.allow_socket,
         extra_deny: &resolved.deny_paths,
         existing_home_tool_dirs: Some(&existing_home_tool_dirs),
