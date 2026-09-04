@@ -16,12 +16,14 @@ Always run `mise run check` at the end of a coding session.
 | `mise run test:lib` | lib (modules) | ✅ | ✅ | ✅ | None |
 | `mise run test:integration` | integration | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
 | `mise run test:integration-linux` | integration_linux | ❌ | ✅ | ❌ | Linux with Landlock (5.13+) |
-| `mise run test:e2e` | e2e | ✅ | ❌ | ✅ | macOS + `copilot` in PATH |
-| `mise run test:e2e-projects` | e2e_projects | ✅ | ❌ | ✅ | macOS `sandbox-exec` |
+| `mise run test:e2e` | e2e | ✅ | ❌ | ✅ | macOS + `copilot` in PATH; checkout not under `/tmp` or `/var/folders` |
+| `mise run test:e2e-projects` | e2e_projects | ✅ | ❌ | ✅ | macOS `sandbox-exec`; checkout not under `/tmp` or `/var/folders` |
 | `mise run test:e2e-live` | e2e (ignored), 6 smoke tests | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
 | `mise run test:all` | the suites above except live, minus the guard suites | ✅ | ❌ | ✅ | macOS + `copilot` in PATH |
 | `mise run test:everything` | all + live | ❌ | ❌ | ⚠️ | macOS + Copilot auth + network |
 | `mise run test` | every suite via `cargo test` | ❌ | ❌ | ✅ | macOS |
+
+Both e2e suites spawn a fake agent binary from inside the project tree, and the sandbox denies exec under `/tmp` and `/var/folders` by design. A checkout there fails nearly every test in `e2e_projects` and hangs `e2e`, with no hint that the location is the cause. Clone somewhere else.
 
 `test:all` has no task for `tests/e2e_guards.rs` or `tests/e2e_git_hardening.rs`,
 so its `depends` list skips both. They are not uncovered: bare `mise run test`
