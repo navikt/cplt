@@ -69,11 +69,16 @@ fn top_level_keys() -> Vec<&'static str> {
 /// Candidate keys for the suggestion come from `CONFIG_KEYS`, so suggestions
 /// automatically cover any option present in the registry.
 pub(super) fn describe_unknown_key(path: &str) -> String {
-    if let Some((section, key)) = path.split_once('.') {
+    // Split off the LAST segment: everything before it is the enclosing table
+    // path. Nested tables exist ([proxy.subscriptions], [[git_guard.allow_push]]),
+    // and splitting on the FIRST dot would report `proxy.subscriptions.allow` as
+    // key `subscriptions.allow` in [proxy] — missing the scoping diagnosis below
+    // and suggesting typo candidates from the wrong section.
+    if let Some((section, key)) = path.rsplit_once('.') {
         // A section name showing up as a key inside another section is a dotted
         // key written below the wrong header: TOML scopes `allow.read = [...]`
         // under the preceding `[git_guard]` header as `git_guard.allow.read`,
-        // so the grant is silently dropped (#228).
+        // so the grant is silently dropped (#228). Same under a nested header.
         if known_sections().contains(&key) {
             let example = section_keys(key).first().copied().unwrap_or("x");
             // Repeating the section name under its own header (`[allow]` +
@@ -682,6 +687,41 @@ some_new_option = true
             diagnostic.message.contains("[allow]"),
             "got: {}",
             diagnostic.message
+        );
+    }
+
+    /// The same silent drop happens under a NESTED header: `[proxy.subscriptions]`
+    /// scopes a following `allow.read = [...]` as `proxy.subscriptions.allow.read`.
+    /// The diagnosis must name the enclosing table it actually landed in, and the
+    /// key must be the last segment — not `subscriptions.allow` in [proxy].
+    #[test]
+    fn section_name_used_as_key_under_a_nested_header() {
+        let toml = "[proxy.subscriptions]\nrefresh = \"daily\"\n\nallow.read = [\"~/x\"]\n";
+        let diagnostics = validate_config(toml);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| {
+                d.message
+                    .contains("unknown key 'allow' in [proxy.subscriptions]")
+            })
+            .unwrap_or_else(|| {
+                panic!("should flag allow under proxy.subscriptions: {diagnostics:?}")
+            });
+        assert!(
+            diagnostic.message.contains("[allow]"),
+            "got: {}",
+            diagnostic.message
+        );
+    }
+
+    /// A plain typo inside a nested table must be reported against that table,
+    /// not against its parent with the subtable name glued onto the key.
+    #[test]
+    fn typo_in_nested_table_names_the_nested_table() {
+        let msg = describe_unknown_key("proxy.subscriptions.refrsh");
+        assert!(
+            msg.contains("unknown key 'refrsh' in [proxy.subscriptions]"),
+            "got: {msg}"
         );
     }
 
