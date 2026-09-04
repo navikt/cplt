@@ -11,11 +11,11 @@ use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
     HardeningCategory, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_PATH_LIMIT,
-    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, ProfileOptions, SandboxConfig, build_sandbox_env,
-    generate_policy, generate_profile, generate_profile_with_playwright_socket_dir,
-    npmrc_explicitly_allowed, npmrc_userconfig_override, npmrc_userconfig_stale_variants,
-    playwright_runtime_intent, playwright_sockets_dir_override, tool_override_path_is_safe,
-    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
+    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, SandboxConfig, build_sandbox_env, generate_policy,
+    generate_profile, generate_profile_with_playwright_socket_dir, npmrc_explicitly_allowed,
+    npmrc_userconfig_override, npmrc_userconfig_stale_variants, playwright_runtime_intent,
+    playwright_sockets_dir_override, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 use cplt::sandbox::{ResolvedToolDir, ToolRoot, home_tool_dirs, relocatable_tool_prefix};
 use std::path::PathBuf;
@@ -752,85 +752,23 @@ fn sbpl_path_allows_normal_path() {
 
 #[test]
 fn profile_contains_deny_default() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(p.contains("(deny default)"));
 }
 
 #[test]
 fn profile_allows_tty_ioctl() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow file-ioctl)"),
         "Profile must allow file-ioctl for terminal raw mode"
@@ -915,43 +853,12 @@ fn landlock_policy_device_files_have_ioctl() {
 
 #[test]
 fn profile_grants_project_access() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(p.contains("(allow file-read* (subpath \"/projects/app\"))"));
     assert!(p.contains("(allow file-write* (subpath \"/projects/app\"))"));
     assert!(
@@ -986,43 +893,12 @@ fn profile_grants_project_access() {
 
 #[test]
 fn profile_grants_copilot_config_access() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(p.contains("(allow file-read* (subpath \"/Users/test/.copilot\"))"));
 }
 
@@ -1031,43 +907,14 @@ fn profile_grants_claude_config_access() {
     temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
         let home = std::path::Path::new("/Users/test");
         let agent_dirs = cplt::agent::Agent::Claude.config_dirs(home);
-        let p = generate_profile(&ProfileOptions {
-            project_dir: std::path::Path::new("/projects/app"),
-            home_dir: home,
-            extra_read: &[],
-            extra_write: &[],
-            extra_exec: &[],
-            allow_socket: &[],
-            extra_deny: &[],
-            existing_home_tool_dirs: None,
-            existing_app_dirs: None,
-            extra_ports: &[],
-            localhost_ports: &[],
-            proxy_port: None,
-            proxy_forced: false,
-            allow_env_files: false,
-            allow_localhost_any: false,
-            scratch_dir: None,
-            allow_tmp_exec: false,
-            copilot_install_dir: None,
-            java_home: None,
-            dotnet_root: None,
-            git_hooks_path: None,
-            git_common_dir: None,
-            extra_git_dirs: &[],
-            allow_gpg_signing: false,
-            deny_clipboard: false,
-            allow_jvm_attach: false,
-            allow_msbuild: false,
-            allow_docker: false,
-            electron_app_dir: None,
-            agent: cplt::agent::Agent::Claude,
-            agent_dirs: &agent_dirs,
-            allow_cache_exec: &[],
-            allow_cache_exec_any: false,
-            allow_browser: false,
-            credential_outside_keychain: false,
-        });
+        let p = generate_profile(
+            &SandboxConfig {
+                agent: cplt::agent::Agent::Claude,
+                agent_dirs: &agent_dirs,
+                ..base_profile_options()
+            },
+            &[],
+        );
         // Config dir + top-level config file are readable and writable.
         assert!(p.contains("(allow file-read* (subpath \"/Users/test/.claude\"))"));
         assert!(p.contains("(allow file-write* (subpath \"/Users/test/.claude\"))"));
@@ -1102,43 +949,14 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
             cplt::agent::Agent::Shell,
         ] {
             let agent_dirs = agent.config_dirs(home);
-            let p = generate_profile(&ProfileOptions {
-                project_dir: std::path::Path::new("/projects/app"),
-                home_dir: home,
-                extra_read: &[],
-                extra_write: &[],
-                extra_exec: &[],
-                allow_socket: &[],
-                extra_deny: &[],
-                existing_home_tool_dirs: None,
-                existing_app_dirs: None,
-                extra_ports: &[],
-                localhost_ports: &[],
-                proxy_port: None,
-                proxy_forced: false,
-                allow_env_files: false,
-                allow_localhost_any: false,
-                scratch_dir: None,
-                allow_tmp_exec: false,
-                copilot_install_dir: None,
-                java_home: None,
-                dotnet_root: None,
-                git_hooks_path: None,
-                git_common_dir: None,
-                extra_git_dirs: &[],
-                allow_gpg_signing: false,
-                deny_clipboard: false,
-                allow_jvm_attach: false,
-                allow_msbuild: false,
-                allow_docker: false,
-                electron_app_dir: None,
-                agent,
-                agent_dirs: &agent_dirs,
-                allow_cache_exec: &[],
-                allow_cache_exec_any: false,
-                allow_browser: false,
-                credential_outside_keychain: false,
-            });
+            let p = generate_profile(
+                &SandboxConfig {
+                    agent,
+                    agent_dirs: &agent_dirs,
+                    ..base_profile_options()
+                },
+                &[],
+            );
             for dir in agent_dirs.iter().filter(|d| d.write) {
                 for sub in agent.host_persistence_denies() {
                     let path = dir.path.join(sub).display().to_string();
@@ -1165,43 +983,15 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
     // The whole config dir, not just the file: the wider grant is the one that
     // used to swallow the denies.
     let settings = home.join(".claude");
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: home,
-        extra_read: &[],
-        extra_write: std::slice::from_ref(&settings),
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Claude,
-        agent_dirs: &agent_dirs,
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: std::slice::from_ref(&settings),
+            agent: cplt::agent::Agent::Claude,
+            agent_dirs: &agent_dirs,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // rfind, not find: emit_home_access emits the identical allow line for the
     // agent-dir grant itself, so the LAST occurrence is the user's allow.write
     // and the one the denies have to outlive.
@@ -1218,16 +1008,16 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
     }
 }
 
-/// A default `ProfileOptions` for tests that only care about one or two fields.
+/// A default `SandboxConfig` for tests that only care about one or two fields.
 /// Every other test here spells the struct out; new ones need not.
-fn base_profile_options() -> ProfileOptions<'static> {
-    ProfileOptions {
+fn base_profile_options() -> SandboxConfig<'static> {
+    SandboxConfig {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
         extra_read: &[],
         extra_write: &[],
         extra_exec: &[],
-        allow_socket: &[],
+        extra_socket: &[],
         extra_deny: &[],
         existing_home_tool_dirs: None,
         existing_app_dirs: None,
@@ -1238,13 +1028,13 @@ fn base_profile_options() -> ProfileOptions<'static> {
         allow_env_files: false,
         allow_localhost_any: false,
         scratch_dir: None,
+        playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
         java_home: None,
         dotnet_root: None,
         git_hooks_path: None,
         git_common_dir: None,
-        extra_git_dirs: &[],
         allow_gpg_signing: false,
         deny_clipboard: false,
         allow_jvm_attach: false,
@@ -1256,7 +1046,8 @@ fn base_profile_options() -> ProfileOptions<'static> {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
-        credential_outside_keychain: false,
+        keychain_substitute: None,
+        use_bubblewrap: None,
     }
 }
 
@@ -1266,10 +1057,13 @@ fn base_profile_options() -> ProfileOptions<'static> {
 #[test]
 fn exec_grant_allows_read_and_map_executable() {
     let exec = [std::path::PathBuf::from("/Users/test/.linuxbrew")];
-    let p = generate_profile(&ProfileOptions {
-        extra_exec: &exec,
-        ..base_profile_options()
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_exec: &exec,
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     assert!(
         p.contains("(allow file-read* (subpath \"/Users/test/.linuxbrew\"))"),
@@ -1294,12 +1088,15 @@ fn exec_grant_allows_read_and_map_executable() {
 #[test]
 fn exec_write_deny_comes_after_every_write_allow() {
     let exec = [std::path::PathBuf::from("/Users/test/.linuxbrew")];
-    let p = generate_profile(&ProfileOptions {
-        extra_exec: &exec,
-        extra_write: &[std::path::PathBuf::from("/Users/test/work")],
-        scratch_dir: Some(std::path::Path::new("/private/tmp/cplt-scratch")),
-        ..base_profile_options()
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_exec: &exec,
+            extra_write: &[std::path::PathBuf::from("/Users/test/work")],
+            scratch_dir: Some(std::path::Path::new("/private/tmp/cplt-scratch")),
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     let deny = p
         .find("(deny file-write* (subpath \"/Users/test/.linuxbrew\"))")
@@ -1316,43 +1113,12 @@ fn exec_write_deny_comes_after_every_write_allow() {
 
 #[test]
 fn profile_denies_sensitive_dirs() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     for dir in &[
         ".ssh",
         ".gnupg",
@@ -1383,43 +1149,12 @@ fn profile_denies_sensitive_dirs() {
 
 #[test]
 fn profile_denies_sensitive_files() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     for file in &[".netrc", ".pypirc", ".gem/credentials", ".vault-token"] {
         assert!(
             p.contains(&format!(
@@ -1432,43 +1167,12 @@ fn profile_denies_sensitive_files() {
 
 #[test]
 fn profile_denies_credential_files_in_tool_dirs() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     // These credential files inside allowed tool dirs must be denied
     for file in &[
@@ -1508,47 +1212,17 @@ fn profile_denies_credential_files_in_tool_dirs() {
 fn profile_allows_credential_files_when_user_opts_in() {
     use std::path::PathBuf;
 
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[
-            PathBuf::from("/Users/test/.m2/settings.xml"),
-            PathBuf::from("/Users/test/.gradle/gradle.properties"),
-            PathBuf::from("/Users/test/.npmrc"),
-        ],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_read: &[
+                PathBuf::from("/Users/test/.m2/settings.xml"),
+                PathBuf::from("/Users/test/.gradle/gradle.properties"),
+                PathBuf::from("/Users/test/.npmrc"),
+            ],
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     // The deny should still be present (defense in depth)
     assert!(
@@ -1606,45 +1280,15 @@ fn profile_allows_credential_files_when_user_opts_in() {
 fn profile_extra_read_overrides_denied_dotfile_directory() {
     use std::path::PathBuf;
 
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[PathBuf::from(
-            "/Users/test/.config/gcloud/application_default_credentials.json",
-        )],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_read: &[PathBuf::from(
+                "/Users/test/.config/gcloud/application_default_credentials.json",
+            )],
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     // The deny for .config/gcloud (DENIED_DOTFILES) should still exist
     assert!(
@@ -1669,46 +1313,16 @@ fn profile_extra_read_overrides_denied_dotfile_directory() {
 fn profile_extra_read_overrides_multiple_denied_dotfile_dirs() {
     use std::path::PathBuf;
 
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[
-            PathBuf::from("/Users/test/.config/gcloud/application_default_credentials.json"),
-            PathBuf::from("/Users/test/.aws/credentials"),
-        ],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_read: &[
+                PathBuf::from("/Users/test/.config/gcloud/application_default_credentials.json"),
+                PathBuf::from("/Users/test/.aws/credentials"),
+            ],
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     // Both denied dotfile dirs should still have their deny rules
     assert!(p.contains("(deny file-read* (subpath \"/Users/test/.config/gcloud\"))"));
@@ -1734,43 +1348,12 @@ fn profile_extra_read_overrides_multiple_denied_dotfile_dirs() {
 
 #[test]
 fn profile_restricts_outbound_tcp() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(deny network-outbound (remote tcp))"),
         "Profile must deny general TCP before port allows"
@@ -1803,43 +1386,13 @@ fn profile_restricts_outbound_tcp() {
 
 #[test]
 fn profile_extra_ports_adds_allows() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[8080, 3000],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_ports: &[8080, 3000],
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
         "Profile must allow extra port 8080"
@@ -1856,43 +1409,13 @@ fn profile_extra_ports_adds_allows() {
 
 #[test]
 fn profile_allow_browser_enables_lsopen() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: true,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_browser: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow lsopen)"),
         "Profile must allow lsopen when --allow-browser is set"
@@ -1901,43 +1424,13 @@ fn profile_allow_browser_enables_lsopen() {
 
 #[test]
 fn profile_proxy_port_allows_localhost() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: Some(18080),
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            proxy_port: Some(18080),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:18080\"))"),
         "Profile must allow localhost proxy port"
@@ -1950,43 +1443,13 @@ fn profile_proxy_port_allows_localhost() {
 
 #[test]
 fn profile_allow_localhost_opens_specific_ports() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[3000, 8080],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            localhost_ports: &[3000, 8080],
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:3000\"))"),
         "Profile must allow localhost:3000"
@@ -2014,43 +1477,12 @@ fn profile_allow_localhost_opens_specific_ports() {
 
 #[test]
 fn profile_deny_rules_come_after_allow_rules() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     let allow_pos = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
         .unwrap();
@@ -2065,43 +1497,12 @@ fn profile_deny_rules_come_after_allow_rules() {
 
 #[test]
 fn profile_allows_gh_config_read_only() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.config/gh/hosts.yml\"))"),
         "should allow read to .config/gh/hosts.yml"
@@ -2118,43 +1519,12 @@ fn profile_allows_gh_config_read_only() {
 
 #[test]
 fn profile_allows_file_map_executable_for_copilot() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.copilot\"))"),
         "should allow file-map-executable for native Node.js addons (keytar.node, pty.node)"
@@ -2167,43 +1537,12 @@ fn profile_allows_file_map_executable_for_copilot() {
 
 #[test]
 fn profile_denies_env_files_by_default() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains(r#"(deny file-read* (regex #"/\.env$"))"#),
         "should deny read .env files: {p}"
@@ -2240,43 +1579,13 @@ fn profile_denies_env_files_by_default() {
 
 #[test]
 fn profile_allows_env_files_when_flag_set() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: true,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_env_files: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         !p.contains(r#"deny file-read* (regex #"/projects/app/"#),
         "should NOT deny project env files when allow_env_files is true"
@@ -2285,43 +1594,12 @@ fn profile_allows_env_files_when_flag_set() {
 
 #[test]
 fn profile_env_deny_comes_after_project_allow() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     let project_allow = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
         .unwrap();
@@ -2342,43 +1620,14 @@ fn profile_env_deny_comes_after_project_allow() {
 
 #[test]
 fn profile_env_deny_comes_after_user_allows() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[std::path::PathBuf::from("/projects")],
-        extra_write: &[std::path::PathBuf::from("/projects")],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_read: &[std::path::PathBuf::from("/projects")],
+            extra_write: &[std::path::PathBuf::from("/projects")],
+            ..base_profile_options()
+        },
+        &[],
+    );
     let user_read_allow = p
         .find("(allow file-read* (subpath \"/projects\"))")
         .unwrap();
@@ -2443,52 +1692,22 @@ fn profile_env_deny_comes_after_user_allows() {
 /// deleting the whole `extra_git_dirs` loop leaves the suite green.
 #[test]
 fn profile_denies_resolved_git_dirs_of_granted_repos() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        // A granted worktree and a granted bare repo.
-        extra_write: &[
-            std::path::PathBuf::from("/work/wt"),
-            std::path::PathBuf::from("/work/bare.git"),
-        ],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
+    let p = generate_profile(
+        &SandboxConfig {
+            // A granted worktree and a granted bare repo.
+            extra_write: &[
+                std::path::PathBuf::from("/work/wt"),
+                std::path::PathBuf::from("/work/bare.git"),
+            ],
+            ..base_profile_options()
+        },
         // What `discover::git_dir_of` resolves them to: the worktree's shared
         // `.git` lives in the main repo, the bare repo IS its own git dir.
-        extra_git_dirs: &[
+        &[
             std::path::PathBuf::from("/work/main/.git"),
             std::path::PathBuf::from("/work/bare.git"),
         ],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    );
 
     // The last user write allow in the profile — every deny below must follow
     // it, or SBPL last-match-wins hands the grant back.
@@ -2542,43 +1761,13 @@ fn profile_denies_resolved_git_dirs_of_granted_repos() {
 
 #[test]
 fn profile_allows_all_localhost_when_flag_set() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: true,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_localhost_any: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         !p.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
         "Profile must NOT deny localhost when allow_localhost_any is set"
@@ -2605,43 +1794,14 @@ fn profile_allows_all_localhost_when_flag_set() {
 
 #[test]
 fn profile_allows_all_tcp_outbound_when_jvm_and_localhost_any() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: true,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: true,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_localhost_any: true,
+            allow_jvm_attach: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // With preferIPv4Stack=true in JAVA_TOOL_OPTIONS, Java uses AF_INET4 and
     // "localhost:*" works. No need for the old "*:*" nuclear option.
     assert!(
@@ -2664,43 +1824,12 @@ fn profile_allows_all_tcp_outbound_when_jvm_and_localhost_any() {
 
 #[test]
 fn profile_denies_write_to_copilot_pkg() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Must allow write to ~/.copilot (session state, config)
     assert!(
         p.contains("(allow file-write* (subpath \"/Users/test/.copilot\"))"),
@@ -2913,43 +2042,12 @@ fn env_allowlist_includes_terminal_multiplexers() {
 
 #[test]
 fn profile_denies_exec_from_tmp() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Must allow read+write to /tmp (needed for temp files)
     assert!(
         p.contains("(allow file-write* (subpath \"/private/tmp\"))"),
@@ -2987,43 +2085,13 @@ fn profile_denies_exec_from_tmp() {
 
 #[test]
 fn profile_allows_jvm_attach_when_flag_set() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: true,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_jvm_attach: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Must allow unix socket bind+inbound+connect for JVM Attach API (.java_pid*)
     // Three operations needed: bind (create socket), inbound (accept), outbound (connect)
     // Two paths: /tmp (legacy) and /var/folders (macOS confstr temp dir)
@@ -3072,43 +2140,13 @@ fn profile_allows_jvm_attach_when_flag_set() {
 
 #[test]
 fn profile_allows_msbuild_when_flag_set() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: true,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_msbuild: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Must allow unix socket bind+inbound+connect for the MSBuild worker-node
     // pipe (MSBuild<pid>). Three operations needed: bind (worker node creates
     // socket), inbound (worker node accepts), outbound (client connects).
@@ -3148,43 +2186,13 @@ fn profile_allows_msbuild_when_flag_set() {
 
 #[test]
 fn profile_allows_localhost_tcp_bind() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/tmp/proj"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            project_dir: std::path::Path::new("/tmp/proj"),
+            ..base_profile_options()
+        },
+        &[],
+    );
     // We use "*:*" instead of "localhost:*" because Java NIO uses IPv6 sockets
     // with IPv4-mapped addresses (::ffff:127.0.0.1) which "localhost" doesn't match.
     assert!(
@@ -3204,43 +2212,14 @@ fn profile_allows_localhost_tcp_bind() {
 #[test]
 fn allow_localhost_any_affects_both_backends() {
     // macOS: allow_localhost_any should produce unrestricted localhost rules
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/tmp/proj"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: true,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            project_dir: std::path::Path::new("/tmp/proj"),
+            allow_localhost_any: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // macOS SBPL should allow all localhost ports.
     // #126 Tier 2: dropped the always-true `|| p.contains("network-outbound")`
     // disjunct (every profile contains that substring) so this now actually
@@ -3402,43 +2381,25 @@ fn config_options_parity_across_backends() {
     );
 
     // ── macOS SBPL profile ──
-    let profile = generate_profile(&ProfileOptions {
-        project_dir: project,
-        home_dir: home,
-        extra_read: &extra_read,
-        extra_write: &extra_write,
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &ports,
-        localhost_ports: &lh_ports,
-        proxy_port: Some(9090),
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: Some(&scratch),
-        allow_tmp_exec: true,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: true,
-        deny_clipboard: false,
-        allow_jvm_attach: true,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let profile = generate_profile(
+        &SandboxConfig {
+            // Same project/home as the Landlock half above: this test asserts
+            // the two backends see one config, so they must not drift apart.
+            project_dir: project,
+            home_dir: home,
+            extra_read: &extra_read,
+            extra_write: &extra_write,
+            extra_ports: &ports,
+            localhost_ports: &lh_ports,
+            proxy_port: Some(9090),
+            scratch_dir: Some(&scratch),
+            allow_tmp_exec: true,
+            allow_gpg_signing: true,
+            allow_jvm_attach: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     // extra_ports → SBPL port allow
     assert!(
@@ -3488,43 +2449,12 @@ fn config_options_parity_across_backends() {
 
 #[test]
 fn profile_denies_git_persistence_vectors() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Must deny writes to .git/hooks (post-checkout etc. run outside sandbox)
     assert!(
         p.contains("(deny file-write* (subpath \"/projects/app/.git/hooks\"))"),
@@ -3555,43 +2485,12 @@ fn profile_denies_git_persistence_vectors() {
 
 #[test]
 fn profile_denies_write_to_cplt_toml() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(deny file-write* (literal \"/projects/app/.cplt.toml\"))"),
         "Profile must deny write to .cplt.toml to prevent agent tampering"
@@ -3604,43 +2503,12 @@ fn profile_denies_write_to_cplt_toml() {
 
 /// Helper to generate a default profile for permission tests.
 fn default_profile() -> String {
-    generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    })
+    generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    )
 }
 
 #[test]
@@ -3839,43 +2707,13 @@ fn path_bin_denies_survive_a_user_allow_write_over_the_parent() {
         std::path::PathBuf::from("/Users/test/.bun"),
         std::path::PathBuf::from("/Users/test/Library/pnpm"),
     ];
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &extra_write,
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: &extra_write,
+            ..base_profile_options()
+        },
+        &[],
+    );
     let user_allow = p
         .rfind(r#"(allow file-write* (subpath "/Users/test/.bun"))"#)
         .expect("user allow.write must be emitted");
@@ -4734,43 +3572,13 @@ fn env_otel_passes_through_for_opencode_agent() {
 #[test]
 fn profile_scratch_dir_adds_all_permissions() {
     let scratch = std::path::Path::new("/Users/test/Library/Caches/cplt/tmp/abc123");
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: Some(scratch),
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            scratch_dir: Some(scratch),
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     let scratch_str = scratch.to_string_lossy();
     assert!(
@@ -4808,43 +3616,13 @@ fn profile_no_scratch_dir_omits_rules() {
 
 #[test]
 fn profile_allow_tmp_exec_removes_denies() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: true,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_tmp_exec: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     assert!(
         !p.contains("(deny process-exec (subpath \"/private/tmp\"))"),
@@ -4977,45 +3755,15 @@ fn profile_denies_write_to_copilot_caches_pkg() {
 
 #[test]
 fn profile_allows_copilot_install_dir() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: Some(std::path::Path::new(
-            "/Users/test/n/lib/node_modules/@github/copilot",
-        )),
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            copilot_install_dir: Some(std::path::Path::new(
+                "/Users/test/n/lib/node_modules/@github/copilot",
+            )),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains(
             "(allow file-read* (subpath \"/Users/test/n/lib/node_modules/@github/copilot\"))"
@@ -5035,43 +3783,13 @@ fn profile_allows_vscode_copilot_path() {
     // VS Code bundles Copilot CLI at ~/Library/Application Support/Code/.../copilotCli/
     // When copilot_pkg_dir() returns None, main.rs falls back to the binary's parent dir
     let vscode_dir = "/Users/test/Library/Application Support/Code/User/globalStorage/github.copilot-chat/copilotCli";
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: Some(std::path::Path::new(vscode_dir)),
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            copilot_install_dir: Some(std::path::Path::new(vscode_dir)),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{vscode_dir}\"))")),
         "Profile must allow reading VS Code Copilot CLI directory (path with spaces)"
@@ -5098,43 +3816,13 @@ fn profile_allows_dotnet_root_when_set() {
     // Simulates actions/setup-dotnet installing the SDK in the writable
     // dotnet CLI state directory, whose broad process-exec rule is denied.
     let dotnet_root = "/Users/test/.dotnet";
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: Some(std::path::Path::new(dotnet_root)),
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            dotnet_root: Some(std::path::Path::new(dotnet_root)),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{dotnet_root}\"))")),
         "Profile must allow reading DOTNET_ROOT"
@@ -5204,44 +3892,15 @@ fn profile_no_dotnet_root_omits_section() {
 #[test]
 fn profile_dotnet_exec_paths_stay_readonly_under_user_allow_write() {
     let dotnet_root = "/Users/test/.dotnet";
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        // The user allows writes to the whole dotnet root (or any parent).
-        extra_write: &[std::path::PathBuf::from(dotnet_root)],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: Some(std::path::Path::new(dotnet_root)),
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            // The user allows writes to the whole dotnet root (or any parent).
+            extra_write: &[std::path::PathBuf::from(dotnet_root)],
+            dotnet_root: Some(std::path::Path::new(dotnet_root)),
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     let user_write = p
         .find(&format!("(allow file-write* (subpath \"{dotnet_root}\"))"))
@@ -5274,43 +3933,13 @@ fn profile_dotnet_exec_paths_stay_readonly_under_user_allow_write() {
 #[test]
 fn profile_allows_electron_app_bundle() {
     let electron_dir = "/Applications/Visual Studio Code.app/Contents";
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: Some(std::path::Path::new(electron_dir)),
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            electron_app_dir: Some(std::path::Path::new(electron_dir)),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{electron_dir}\"))")),
         "Profile must allow reading Electron app bundle"
@@ -5438,43 +4067,13 @@ fn pkg_dir_finds_package_multiple_levels_up() {
 
 #[test]
 fn profile_allows_git_hooks_path() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: Some(std::path::Path::new("/Users/test/.config/git/hooks")),
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            git_hooks_path: Some(std::path::Path::new("/Users/test/.config/git/hooks")),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow file-read* (subpath \"/Users/test/.config/git/hooks\"))"),
         "Profile must allow reading global git hooks"
@@ -5504,43 +4103,14 @@ fn profile_no_git_hooks_path_omits_section() {
 
 #[test]
 fn profile_allows_git_worktree_common_dir() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/feature-branch"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: Some(std::path::Path::new("/Users/test/repos/main-repo/.git")),
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            project_dir: std::path::Path::new("/projects/feature-branch"),
+            git_common_dir: Some(std::path::Path::new("/Users/test/repos/main-repo/.git")),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow file-read* (subpath \"/Users/test/repos/main-repo/.git\"))"),
         "Profile must allow reading worktree common dir"
@@ -5662,43 +4232,13 @@ fn profile_gpg_signing_disabled_by_default() {
 
 #[test]
 fn profile_gpg_signing_allows_public_keyring() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: true,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_gpg_signing: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.gnupg/pubring.kbx\"))"),
         "Must allow reading public keyring"
@@ -5715,43 +4255,13 @@ fn profile_gpg_signing_allows_public_keyring() {
 
 #[test]
 fn profile_gpg_signing_allows_agent_socket() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: true,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_gpg_signing: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow network-outbound (literal \"/Users/test/.gnupg/S.gpg-agent\"))"),
         "Must allow connecting to GPG agent socket"
@@ -5765,43 +4275,13 @@ fn profile_gpg_signing_allows_agent_socket() {
 
 #[test]
 fn profile_gpg_signing_denies_private_keys() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: true,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_gpg_signing: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(deny file-read* (subpath \"/Users/test/.gnupg/private-keys-v1.d\"))"),
         "Private keys must remain denied even with GPG signing enabled"
@@ -5814,43 +4294,13 @@ fn profile_gpg_signing_denies_private_keys() {
 
 #[test]
 fn profile_gpg_signing_rules_come_after_deny() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: true,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_gpg_signing: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     let deny_pos = p
         .find("(deny file-read* (subpath \"/Users/test/.gnupg\"))")
         .expect("must have .gnupg deny rule");
@@ -5873,43 +4323,13 @@ fn profile_gpg_signing_rules_come_after_deny() {
 
 #[test]
 fn profile_gpg_signing_uses_literal_not_subpath() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: true,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_gpg_signing: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Must use literal (exact file), never subpath (recursive) for GPG allows
     assert!(
         !p.contains("(allow file-read* (subpath \"/Users/test/.gnupg\"))"),
@@ -5920,43 +4340,14 @@ fn profile_gpg_signing_uses_literal_not_subpath() {
 #[test]
 fn profile_gpg_signing_deny_path_wins() {
     let deny = vec![std::path::PathBuf::from("/Users/test/.gnupg")];
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &deny,
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: true,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_deny: &deny,
+            allow_gpg_signing: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // When user explicitly denies ~/.gnupg, GPG allows should NOT appear
     assert!(
         !p.contains("(allow file-read* (literal \"/Users/test/.gnupg/pubring.kbx\"))"),
@@ -5970,43 +4361,13 @@ fn profile_gpg_signing_deny_path_wins() {
 
 #[test]
 fn profile_gpg_signing_denies_legacy_secring() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: true,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_gpg_signing: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(deny file-read* (literal \"/Users/test/.gnupg/secring.gpg\"))"),
         "legacy secring.gpg must be explicitly denied"
@@ -6015,43 +4376,13 @@ fn profile_gpg_signing_denies_legacy_secring() {
 
 #[test]
 fn profile_gpg_signing_allows_socket_file_read() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: true,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_gpg_signing: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Socket needs file-read* for inode lookup before connect(2)
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.gnupg/S.gpg-agent\"))"),
@@ -6801,43 +5132,12 @@ fn config_from_str_round_trips() {
 
 #[test]
 fn profile_docker_disabled_by_default() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     // .docker should be denied
     assert!(
         p.contains(r#"(deny file-read* (subpath "/Users/test/.docker"))"#),
@@ -6852,43 +5152,13 @@ fn profile_docker_disabled_by_default() {
 
 #[test]
 fn profile_docker_enabled_allows_config_and_sockets() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: true,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_docker: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Should allow read of ~/.docker
     assert!(
         p.contains(r#"(allow file-read* (subpath "/Users/test/.docker"))"#),
@@ -6935,43 +5205,14 @@ fn profile_docker_enabled_allows_config_and_sockets() {
 
 #[test]
 fn profile_docker_skipped_when_deny_path_overlaps() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[std::path::PathBuf::from("/Users/test/.docker")],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: true,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_deny: &[std::path::PathBuf::from("/Users/test/.docker")],
+            allow_docker: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Docker allows should be skipped — deny-path wins
     assert!(
         p.contains("Docker access skipped"),
@@ -6985,45 +5226,15 @@ fn profile_docker_skipped_when_deny_path_overlaps() {
 
 #[test]
 fn profile_socket_allows_rules() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[std::path::PathBuf::from(
-            "/Users/test/.codex/codex-lsp/daemon/daemon.sock",
-        )],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_socket: &[std::path::PathBuf::from(
+                "/Users/test/.codex/codex-lsp/daemon/daemon.sock",
+            )],
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     assert!(
         p.contains(
@@ -7053,45 +5264,16 @@ fn profile_socket_allows_rules() {
 
 #[test]
 fn profile_socket_skipped_when_deny_path_overlaps() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[std::path::PathBuf::from(
-            "/Users/test/.codex/codex-lsp/daemon/daemon.sock",
-        )],
-        extra_deny: &[std::path::PathBuf::from("/Users/test/.codex")],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_socket: &[std::path::PathBuf::from(
+                "/Users/test/.codex/codex-lsp/daemon/daemon.sock",
+            )],
+            extra_deny: &[std::path::PathBuf::from("/Users/test/.codex")],
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     assert!(
         p.contains("Socket access skipped: --deny-path overlaps with /Users/test/.codex/codex-lsp/daemon/daemon.sock"),
@@ -7117,43 +5299,13 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
 
 #[test]
 fn profile_allow_cache_exec_subdir_adds_carveout() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &["ms-playwright".to_string()],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec: &["ms-playwright".to_string()],
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     assert!(
         p.contains("(allow process-exec (subpath \"/Users/test/Library/Caches/ms-playwright\"))"),
@@ -7173,43 +5325,13 @@ fn profile_allow_cache_exec_subdir_adds_carveout() {
 
 #[test]
 fn profile_allow_cache_exec_any_allows_all_caches() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: true,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec_any: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     assert!(
         p.contains("(allow process-exec (subpath \"/Users/test/Library/Caches\"))"),
@@ -7223,43 +5345,12 @@ fn profile_allow_cache_exec_any_allows_all_caches() {
 
 #[test]
 fn profile_default_denies_cache_exec() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     assert!(
         !p.contains("(allow process-exec (subpath \"/Users/test/Library/Caches\"))"),
@@ -7269,43 +5360,13 @@ fn profile_default_denies_cache_exec() {
 
 #[test]
 fn profile_allow_cache_exec_multiple_subdirs() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &["ms-playwright".to_string(), "pnpm/dlx".to_string()],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec: &["ms-playwright".to_string(), "pnpm/dlx".to_string()],
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     assert!(
         p.contains("(allow process-exec (subpath \"/Users/test/Library/Caches/ms-playwright\"))")
@@ -7424,43 +5485,13 @@ fn allow_cache_exec_rejects_unsafe_chars() {
 #[test]
 fn profile_cache_exec_carveout_comes_after_exec_deny() {
     // The carve-out must appear after the broad exec-deny rules for last-match-wins to work.
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &["ms-playwright".to_string()],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec: &["ms-playwright".to_string()],
+            ..base_profile_options()
+        },
+        &[],
+    );
     let deny_pos = p
         .find("(deny process-exec")
         .expect("profile must contain a process-exec deny rule");
@@ -7727,43 +5758,12 @@ fn playwright_profile(
     socket_dir: Option<&std::path::Path>,
 ) -> String {
     generate_profile_with_playwright_socket_dir(
-        &ProfileOptions {
-            project_dir: std::path::Path::new("/projects/app"),
-            home_dir: std::path::Path::new("/Users/test"),
-            extra_read: &[],
-            extra_write: &[],
-            extra_exec: &[],
-            allow_socket: &[],
-            extra_deny: &[],
-            existing_home_tool_dirs: None,
-            existing_app_dirs: None,
-            extra_ports: &[],
-            localhost_ports: &[],
-            proxy_port: None,
-            proxy_forced: false,
-            allow_env_files: false,
-            allow_localhost_any: false,
-            scratch_dir: None,
-            allow_tmp_exec: false,
-            copilot_install_dir: None,
-            java_home: None,
-            dotnet_root: None,
-            git_hooks_path: None,
-            git_common_dir: None,
-            extra_git_dirs: &[],
-            allow_gpg_signing: false,
-            deny_clipboard: false,
-            allow_jvm_attach: false,
-            allow_msbuild: false,
-            allow_docker: false,
-            electron_app_dir: None,
-            agent: cplt::agent::Agent::Copilot,
-            agent_dirs: &[],
+        &SandboxConfig {
             allow_cache_exec,
             allow_cache_exec_any,
-            allow_browser: false,
-            credential_outside_keychain: false,
+            ..base_profile_options()
         },
+        &[],
         socket_dir,
     )
 }
@@ -7911,43 +5911,13 @@ fn chrome_for_testing_apps_mach_register_rule() -> String {
 #[test]
 fn chromium_runtime_rules_emitted_for_ms_playwright() {
     let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &["ms-playwright".to_string()],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec: &["ms-playwright".to_string()],
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow syscall*)"),
         "syscall* required for Chromium Mach traps"
@@ -7984,43 +5954,13 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
     // get the Chromium runtime rules — without them, Chrome segfaults even though
     // process-exec is allowed for the binary.
     let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &["ms-playwright/chromium-1243".to_string()],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec: &["ms-playwright/chromium-1243".to_string()],
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains("(allow syscall*)"),
         "syscall* must be present for subpath entry"
@@ -8046,43 +5986,12 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
 #[test]
 fn chromium_runtime_rules_absent_by_default() {
     let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         !p.contains("(allow syscall*)"),
         "syscall* must not be emitted by default"
@@ -8105,43 +6014,13 @@ fn chromium_runtime_rules_absent_by_default() {
 fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
     // An unrelated allow_cache_exec entry must not trigger Chromium runtime rules.
     let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &["some-other-tool".to_string()],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec: &["some-other-tool".to_string()],
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         !p.contains("(allow syscall*)"),
         "syscall* must not be emitted for unrelated allow_cache_exec entry"
@@ -8165,43 +6044,13 @@ fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
     // allow_cache_exec_any grants broad process-exec but must NOT trigger the
     // Chromium-specific IPC/syscall rules without an explicit "ms-playwright" entry.
     let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: true,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec_any: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         !p.contains("(allow syscall*)"),
         "syscall* must not be emitted when only allow_cache_exec_any is set"
@@ -8234,43 +6083,13 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
         "xms-playwright",
     ] {
         let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
-        let p = generate_profile(&ProfileOptions {
-            project_dir: std::path::Path::new("/projects/app"),
-            home_dir: std::path::Path::new("/Users/test"),
-            extra_read: &[],
-            extra_write: &[],
-            extra_exec: &[],
-            allow_socket: &[],
-            extra_deny: &[],
-            existing_home_tool_dirs: None,
-            existing_app_dirs: None,
-            extra_ports: &[],
-            localhost_ports: &[],
-            proxy_port: None,
-            proxy_forced: false,
-            allow_env_files: false,
-            allow_localhost_any: false,
-            scratch_dir: None,
-            allow_tmp_exec: false,
-            copilot_install_dir: None,
-            java_home: None,
-            dotnet_root: None,
-            git_hooks_path: None,
-            git_common_dir: None,
-            extra_git_dirs: &[],
-            allow_gpg_signing: false,
-            deny_clipboard: false,
-            allow_jvm_attach: false,
-            allow_msbuild: false,
-            allow_docker: false,
-            electron_app_dir: None,
-            agent: cplt::agent::Agent::Copilot,
-            agent_dirs: &[],
-            allow_cache_exec: &[name.to_string()],
-            allow_cache_exec_any: false,
-            allow_browser: false,
-            credential_outside_keychain: false,
-        });
+        let p = generate_profile(
+            &SandboxConfig {
+                allow_cache_exec: &[name.to_string()],
+                ..base_profile_options()
+            },
+            &[],
+        );
         assert!(
             !p.contains("(allow syscall*)"),
             "syscall* must not be emitted for near-miss entry {name:?}"
@@ -8293,43 +6112,13 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
 #[test]
 fn chromium_runtime_mach_register_rules_remain_narrow() {
     let expected_apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &["ms-playwright".to_string()],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            allow_cache_exec: &["ms-playwright".to_string()],
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     let mach_register_rules: Vec<_> = p
         .lines()
@@ -8413,43 +6202,14 @@ fn existing_app_dirs_none_includes_all() {
     };
     let data_str = data_path.to_string_lossy().to_string();
 
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/tmp/proj"),
-        home_dir: std::path::Path::new("/home/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            project_dir: std::path::Path::new("/tmp/proj"),
+            home_dir: std::path::Path::new("/home/test"),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains(&data_str),
         "With existing_app_dirs=None, mise data dir path should appear in profile"
@@ -8466,43 +6226,15 @@ fn existing_app_dirs_matching_includes_dir() {
     let data_str = data_path.to_string_lossy().to_string();
 
     let existing = vec![data_str.clone()];
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/tmp/proj"),
-        home_dir: std::path::Path::new("/home/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: Some(&existing),
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            project_dir: std::path::Path::new("/tmp/proj"),
+            home_dir: std::path::Path::new("/home/test"),
+            existing_app_dirs: Some(&existing),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains(&data_str),
         "With existing_app_dirs containing a matching path, mise data dir should appear in profile"
@@ -8520,43 +6252,15 @@ fn existing_app_dirs_nonmatching_excludes_dir() {
     let data_str = data_path.to_string_lossy().to_string();
 
     let existing = vec!["/nonexistent".to_string()];
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/tmp/proj"),
-        home_dir: std::path::Path::new("/home/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: Some(&existing),
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            project_dir: std::path::Path::new("/tmp/proj"),
+            home_dir: std::path::Path::new("/home/test"),
+            existing_app_dirs: Some(&existing),
+            ..base_profile_options()
+        },
+        &[],
+    );
     // Only the *grants* are discovery-filtered. The unconditional
     // PATH-resolved bin/shim write-denies (#238) name the same tree and are
     // emitted whether or not mise is installed, so assert on the allow rules
@@ -8590,43 +6294,15 @@ fn existing_app_dirs_per_path_filtering() {
 
     // Only the data dir is "existing" — config dir is absent
     let existing = vec![data_str.clone()];
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/tmp/proj"),
-        home_dir: std::path::Path::new("/home/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: Some(&existing),
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            project_dir: std::path::Path::new("/tmp/proj"),
+            home_dir: std::path::Path::new("/home/test"),
+            existing_app_dirs: Some(&existing),
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         p.contains(&data_str),
         "mise data dir (present in existing_app_dirs) should appear in profile"
@@ -8685,43 +6361,14 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
         },
     ];
 
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::OpenCode,
-        agent_dirs: &agent_dirs,
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            agent: cplt::agent::Agent::OpenCode,
+            agent_dirs: &agent_dirs,
+            ..base_profile_options()
+        },
+        &[],
+    );
 
     // Config dir should be readable but NOT writable at subpath level
     assert!(
@@ -8773,43 +6420,13 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
 
 #[test]
 fn deny_clipboard_emits_pasteboard_deny_after_allow() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: true,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            deny_clipboard: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
     let allow = p
         .find("(allow mach-lookup)")
         .expect("blanket allow present");
@@ -8825,43 +6442,12 @@ fn deny_clipboard_emits_pasteboard_deny_after_allow() {
 
 #[test]
 fn no_deny_clipboard_by_default() {
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/Users/test"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            ..base_profile_options()
+        },
+        &[],
+    );
     assert!(
         !p.contains("com.apple.pasteboard"),
         "pasteboard deny rule must not appear by default"
@@ -9358,43 +6944,14 @@ fn relocated_cargo_dirs() -> Vec<ResolvedToolDir> {
 #[test]
 fn profile_relocated_cargo_bin_is_exec_only_and_registry_is_write_only() {
     let dirs = relocated_cargo_dirs();
-    let p = generate_profile(&ProfileOptions {
-        project_dir: std::path::Path::new("/projects/app"),
-        home_dir: std::path::Path::new("/home/tester"),
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: Some(&dirs),
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
-    });
+    let p = generate_profile(
+        &SandboxConfig {
+            home_dir: std::path::Path::new("/home/tester"),
+            existing_home_tool_dirs: Some(&dirs),
+            ..base_profile_options()
+        },
+        &[],
+    );
     let bin = "/home/tester/.local/share/cargo/bin";
     let registry = "/home/tester/.local/share/cargo/registry";
     assert!(p.contains(&format!("(allow process-exec (subpath \"{bin}\"))")));
@@ -10055,44 +7612,12 @@ fn socket_masks_follow_the_uid() {
 
 // ── Keychain credential brokering (#242) ──────────────────
 
-/// Minimal `ProfileOptions` for the #242 keychain-grant assertions.
-fn profile_opts<'a>(project: &'a std::path::Path, home: &'a std::path::Path) -> ProfileOptions<'a> {
-    ProfileOptions {
+/// Minimal `SandboxConfig` for the #242 keychain-grant assertions.
+fn profile_opts<'a>(project: &'a std::path::Path, home: &'a std::path::Path) -> SandboxConfig<'a> {
+    SandboxConfig {
         project_dir: project,
         home_dir: home,
-        extra_read: &[],
-        extra_write: &[],
-        extra_exec: &[],
-        allow_socket: &[],
-        extra_deny: &[],
-        existing_home_tool_dirs: None,
-        existing_app_dirs: None,
-        extra_ports: &[],
-        localhost_ports: &[],
-        proxy_port: None,
-        proxy_forced: false,
-        allow_env_files: false,
-        allow_localhost_any: false,
-        scratch_dir: None,
-        allow_tmp_exec: false,
-        copilot_install_dir: None,
-        java_home: None,
-        dotnet_root: None,
-        git_hooks_path: None,
-        git_common_dir: None,
-        extra_git_dirs: &[],
-        allow_gpg_signing: false,
-        deny_clipboard: false,
-        allow_jvm_attach: false,
-        allow_msbuild: false,
-        allow_docker: false,
-        electron_app_dir: None,
-        agent: cplt::agent::Agent::Copilot,
-        agent_dirs: &[],
-        allow_cache_exec: &[],
-        allow_cache_exec_any: false,
-        allow_browser: false,
-        credential_outside_keychain: false,
+        ..base_profile_options()
     }
 }
 
@@ -10131,24 +7656,24 @@ fn keychain_substitute_vars_are_never_allowlisted() {
 /// Profile level: the grant tracks the resolved credential, not the agent alone.
 #[test]
 fn profile_keychain_grant_follows_resolved_credential() {
-    use cplt::agent::Agent;
+    use cplt::agent::{Agent, KeychainSubstitute};
     let project = std::path::Path::new("/projects/app");
     let home = std::path::Path::new("/Users/test");
 
     for agent in [Agent::Claude, Agent::Copilot, Agent::Antigravity] {
         let mut opts = profile_opts(project, home);
         opts.agent = agent;
-        opts.credential_outside_keychain = false;
+        opts.keychain_substitute = None;
         assert!(
-            generate_profile(&opts).contains("/Users/test/Library/Keychains"),
+            generate_profile(&opts, &[]).contains("/Users/test/Library/Keychains"),
             "{agent:?}: grant must be kept when no substitute credential resolved"
         );
 
         let mut opts = profile_opts(project, home);
         opts.agent = agent;
-        opts.credential_outside_keychain = true;
+        opts.keychain_substitute = Some(KeychainSubstitute::EnvVar("TOKEN"));
         assert!(
-            !generate_profile(&opts).contains("/Users/test/Library/Keychains"),
+            !generate_profile(&opts, &[]).contains("/Users/test/Library/Keychains"),
             "{agent:?}: grant must be dropped once the credential came from the environment"
         );
     }
@@ -10157,9 +7682,9 @@ fn profile_keychain_grant_follows_resolved_credential() {
     for (agent, in_env) in [(Agent::OpenCode, false), (Agent::OpenCode, true)] {
         let mut opts = profile_opts(project, home);
         opts.agent = agent;
-        opts.credential_outside_keychain = in_env;
+        opts.keychain_substitute = in_env.then_some(KeychainSubstitute::EnvVar("TOKEN"));
         assert!(
-            !generate_profile(&opts).contains("/Users/test/Library/Keychains"),
+            !generate_profile(&opts, &[]).contains("/Users/test/Library/Keychains"),
             "{agent:?} never gets the Keychain grant"
         );
     }

@@ -56,7 +56,7 @@ set.
 
 - `src/sandbox.rs` module root with re-exports (submodules use `#[path]`)
 - `src/sandbox_policy.rs` constants, types, deny lists, env allowlists, validation
-- `src/sandbox_profile.rs` SBPL profile generation (`generate_profile`, `ProfileOptions`)
+- `src/sandbox_profile.rs` SBPL profile generation (`generate_profile`, takes `SandboxConfig`)
 - `src/sandbox_env.rs` environment variable construction (`build_sandbox_env`)
 - `src/sandbox_exec.rs` sandbox execution, validation, signal forwarding
 - `src/sandbox_landlock.rs` Landlock LSM + seccomp-BPF (cross-platform policy, Linux-only enforcement)

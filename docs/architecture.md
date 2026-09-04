@@ -254,10 +254,15 @@ pub struct TrustHash(String);    // A content hash, not just any string
 
 ### Structs with many fields
 
-For structs with more than 8 fields, like `ProfileOptions`, document field
-groups with comments. If the struct is constructed in many places, consider a
-builder. Keep fields private and expose them through methods when validation
-matters.
+For structs with more than 8 fields, like `SandboxConfig`, document field groups
+with comments. If the struct is constructed in many places, consider a builder.
+Keep fields private and expose them through methods when validation matters.
+
+Do not mirror one wide struct into a second one for a single backend. The SBPL
+generator once took a `ProfileOptions` that was a verbatim copy of
+`SandboxConfig`, so every new toggle had to be added twice and copied across in
+a third place; it now takes `SandboxConfig` directly, like the Landlock side
+always did. Genuinely per-backend inputs are passed as separate arguments.
 
 ## Security patterns
 
