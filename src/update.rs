@@ -655,6 +655,7 @@ fn create_stage_dir(home: &Path) -> Result<PathBuf, UpdateError> {
 /// be pointed at a different file. This holds the descriptor from the file it
 /// validated, compares `(dev, ino)` before each use of the path, and installs
 /// by copying out of the descriptor rather than re-opening the name.
+#[derive(Debug)]
 struct StagedBinary {
     path: PathBuf,
     file: std::fs::File,
@@ -671,7 +672,13 @@ impl StagedBinary {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
-            .map_err(|_| UpdateError::BinaryNotFound)?;
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => UpdateError::BinaryNotFound,
+                // O_NOFOLLOW refusing a symlink surfaces as ELOOP, which is the
+                // check doing its job rather than an I/O problem.
+                _ if e.raw_os_error() == Some(libc::ELOOP) => UpdateError::BinaryNotRegularFile,
+                _ => UpdateError::Io(format!("Cannot open staged binary: {e}")),
+            })?;
         let meta = file
             .metadata()
             .map_err(|e| UpdateError::Io(format!("Cannot stat staged binary: {e}")))?;
@@ -968,10 +975,8 @@ mod tests {
         let link = dir.path().join("cplt");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-        assert!(
-            StagedBinary::open(&link).is_err(),
-            "a symlinked staged binary must be refused"
-        );
+        let err = StagedBinary::open(&link).expect_err("a symlinked staged binary must be refused");
+        assert!(matches!(err, UpdateError::BinaryNotRegularFile), "{err:?}");
     }
 
     #[test]
