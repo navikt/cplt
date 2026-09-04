@@ -1659,31 +1659,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     // back at the grant. Narrow: only fires where a process-exec tool dir is
     // actually shadowed, so the ordinary `allow.write` on a work tree is silent.
     for (granted, dirs) in resolved.write_grants_over_exec_tool_dirs(&home_dir) {
-        let list = dirs.join(", ");
-        let plural = if dirs.len() == 1 { "" } else { "ies" };
-        let overlap = if dirs.iter().any(|d| granted.starts_with(d)) {
-            format!(
-                "allow.write grants {} — inside the executable tool directory {list}.",
-                granted.display()
-            )
-        } else {
-            format!(
-                "allow.write grants {}, which contains the executable tool director{plural} \
-                 {list}.",
-                granted.display()
-            )
-        };
-        ui::warn(&format!(
-            "{overlap}\n  \
-             cplt denies execute across an allow.write tree, because a tree that is both \
-             writable and executable lets an agent drop a binary and run it. On macOS that \
-             deny is enforced, so binaries under the tool directory will not run in this \
-             session. On Linux, Landlock cannot subtract a grant, so the tree stays \
-             writable AND executable instead — the hole this deny closes on macOS is left \
-             open there.\n  \
-             Narrow the write grant so it does not cover the tool directory, or use \
-             allow.exec on a tree that does not overlap it."
-        ));
+        ui::warn(&cplt::config::exec_tool_dir_warning(&granted, &dirs));
     }
 
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)

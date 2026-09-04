@@ -578,6 +578,45 @@ fn grants_over_trusted_paths(
     grants_overlapping(allow_write, &paths)
 }
 
+/// The launch warning for an `allow.write` grant that shadows a tool directory
+/// cplt grants execute on (see [`Resolved::write_grants_over_exec_tool_dirs`]).
+///
+/// Built here rather than at the call site so the wording — including the one
+/// thing a format string gets wrong every time, pluralisation — is testable.
+pub fn exec_tool_dir_warning(granted: &Path, dirs: &[String]) -> String {
+    let list = dirs.join(", ");
+    // Two different overlaps, and the user can only act on the right one: a
+    // grant *inside* the tool dir and a grant that swallows it are the same
+    // shadowing seen from opposite ends.
+    let overlap = if dirs.iter().any(|d| granted.starts_with(d)) {
+        format!(
+            "allow.write grants {} — inside the executable tool directory {list}.",
+            granted.display()
+        )
+    } else {
+        let noun = if dirs.len() == 1 {
+            "directory"
+        } else {
+            "directories"
+        };
+        format!(
+            "allow.write grants {}, which contains the executable tool {noun} {list}.",
+            granted.display()
+        )
+    };
+    format!(
+        "{overlap}\n  \
+         cplt denies execute across an allow.write tree, because a tree that is both \
+         writable and executable lets an agent drop a binary and run it. On macOS that \
+         deny is enforced, so binaries under the tool directory will not run in this \
+         session. On Linux, Landlock cannot subtract a grant, so the tree stays \
+         writable AND executable instead — the hole this deny closes on macOS is left \
+         open there.\n  \
+         Narrow the write grant so it does not cover the tool directory, or use \
+         allow.exec on a tree that does not overlap it."
+    )
+}
+
 /// Which `allow.write` grants overlap one of `paths`, in either direction, as
 /// `(granted path, every path it overlaps)`.
 ///
@@ -2067,6 +2106,53 @@ validate = false
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The singular case is the one a `{plural}` format string gets wrong, and
+    /// #322 shipped `director{plural}` rendering as "director". This is a
+    /// warning whose whole job is to explain why a tool stopped working, so a
+    /// mangled word in it costs more than usual. Both counts asserted: a test
+    /// that only covers the plural is how the bug got here.
+    #[test]
+    fn exec_tool_dir_warning_pluralises_both_ways() {
+        let granted = PathBuf::from("/home/u");
+        let one = exec_tool_dir_warning(&granted, &["/home/u/.rustup".to_string()]);
+        assert!(
+            one.contains("contains the executable tool directory /home/u/.rustup."),
+            "one shadowed dir must read \"directory\": {one}"
+        );
+
+        let many = exec_tool_dir_warning(
+            &granted,
+            &["/home/u/.rustup".to_string(), "/home/u/.nvm".to_string()],
+        );
+        assert!(
+            many.contains(
+                "contains the executable tool directories /home/u/.rustup, /home/u/.nvm."
+            ),
+            "two shadowed dirs must read \"directories\" and name both: {many}"
+        );
+
+        // No half-word survives either rendering.
+        for w in [&one, &many] {
+            assert!(!w.contains("director "), "\"director\" is not a word: {w}");
+        }
+    }
+
+    /// A grant *inside* a tool dir is the same shadowing from the other end,
+    /// and gets the wording the user can act on — no pluralisation involved,
+    /// since the grant sits in exactly one tree.
+    #[test]
+    fn exec_tool_dir_warning_names_the_inside_case() {
+        let w = exec_tool_dir_warning(
+            &PathBuf::from("/home/u/.rustup/toolchains"),
+            &["/home/u/.rustup".to_string()],
+        );
+        assert!(
+            w.contains("inside the executable tool directory /home/u/.rustup."),
+            "a grant inside a tool dir must say so: {w}"
+        );
+        assert!(w.contains("allow.exec"), "the remedy must be named: {w}");
     }
 
     /// One grant, many overlaps, one warning: `/` contains every trusted
