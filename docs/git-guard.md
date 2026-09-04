@@ -219,6 +219,7 @@ guard checks force flags on `push` and lets everything else through.
 | **SSH push (if creds available)** | Agent could use raw SSH if keys were accessible | Kernel sandbox blocks `~/.ssh/` access entirely |
 | **Agent modifies `.git/hooks`** | Post-push hooks or other persistence | Kernel sandbox blocks writes to `.git/hooks/` on both platforms, and to `.git/config` on macOS only. On Linux `.git/config` stays writable, so `core.hooksPath` can still redirect hooks. |
 | **Git credential helper** | Could theoretically extract tokens | `GIT_TERMINAL_PROMPT=0` disables interactive prompts; credential files blocked |
+| **Agent rewrites the recorded default branch** | `protect_default_branch_only` resolves the default branch from `.git/refs/remotes/<remote>/HEAD`. `symbolic-ref` and `remote set-head` are both allowed subcommands and `.git/refs` is not in `PROTECTED_IN_GITDIR`, so an agent can point that symref at a branch of its choosing and make its own branch look like the protected one, or the protected one look like a feature branch. | None inside cplt, by design. This is the same "policy on intent, not a boundary" position the guard holds everywhere: it stops a compliant agent from pushing by accident, and it is strictly better than the hardcoded `main`/`master` list it replaced, but a local symref lookup is not a boundary and should not be read as one. Server-side branch protection is the boundary. |
 
 ### Defense in depth
 
