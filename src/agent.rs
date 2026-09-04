@@ -539,8 +539,9 @@ impl Agent {
     /// - Copilot: `settings.json` and `hooks/*.json` hold `hooks.<event>[]`
     ///   commands, `mcp-config.json` and `lsp-config.json` name host processes
     ///   the CLI spawns, `extensions/` runs Node modules, and `pkg` holds the
-    ///   native `.node` addons. `installed-plugins/` is the same class but is
-    ///   deliberately excluded — see the match arm.
+    ///   native `.node` addons. `installed-plugins/` carries the same three
+    ///   routes inside a plugin, and is denied with an unresolved cost — see
+    ///   the match arm.
     /// - Pi: `extensions/*.ts` and `extensions/*/index.ts` are auto-discovered
     ///   at startup (the trust gate covers only the project-local path), and
     ///   `settings.json` can name extension paths and npm/git packages, so
@@ -591,18 +592,42 @@ impl Agent {
             // `mcp-oauth-config/`, `mcp-secrets/`, `plugin-data/` — stays
             // writable.
             //
-            // `installed-plugins/` is DELIBERATELY not here. It auto-executes
-            // by the same route (plugins ship their own hooks and MCP servers),
-            // but first-party plugins update themselves at the start of every
-            // session in a trusted directory, so denying it breaks that
-            // silently. Left open as a known residual rather than closed at
-            // that price.
+            // `installed-plugins/` is here too, and it is the one entry with
+            // an unresolved cost. Plugins carry their own `hooks.json`,
+            // `.mcp.json` and `lsp.json` — the same three routes the entries
+            // above close — so leaving it out denied the front door and left
+            // the side door. Against that: first-party plugins are documented
+            // as updating themselves at the start of every session in a
+            // trusted directory, and this deny would stop that.
+            //
+            // Whether it actually stops anything *inside cplt* could not be
+            // determined. `COPILOT_AUTO_UPDATE=false` and `--no-auto-update`
+            // are the same boolean in the shipped SEA bootstrap, and
+            // `extra_args` already passes the flag for every Copilot run — but
+            // that bootstrap is the binary self-update path, and the code that
+            // would show whether the flag also covers session-start *plugin*
+            // updates is not in the published artifact. Read
+            // `@github/copilot-darwin-arm64@1.0.83` end to end:
+            // `COPILOT_AUTO_UPDATE` occurs once, and `installed-plugins`,
+            // `mcp-config.json` and `session-store.db` occur zero times — the
+            // application is fetched into `pkg/` on first run.
+            //
+            // So: if the flag already covers plugin updates, this deny costs
+            // nothing, because plugins never self-update inside cplt anyway.
+            // If it does not, plugin auto-update fails inside the sandbox and
+            // the plugin has to be updated outside it, like every other denied
+            // path here. One `cplt --agent copilot` session on a host with a
+            // first-party plugin installed settles it: watch whether
+            // `installed-plugins/` is touched at startup. Documented in
+            // SECURITY.md so the next person finds the answer rather than
+            // repeating the investigation.
             Agent::Copilot => &[
                 "settings.json",
                 "hooks",
                 "mcp-config.json",
                 "lsp-config.json",
                 "extensions",
+                "installed-plugins",
                 "pkg",
             ],
             // goose needs no entries: its ONLY auto-execution vector is
@@ -2087,15 +2112,17 @@ mod tests {
                 "mcp-config.json",
                 "lsp-config.json",
                 "extensions",
+                "installed-plugins",
                 "pkg"
             ],
         );
         assert!(
-            !Agent::Copilot
+            Agent::Copilot
                 .host_persistence_denies()
                 .contains(&"installed-plugins"),
-            "installed-plugins is deliberately writable: first-party plugins \
-             self-update at session start and denying it breaks that silently"
+            "a plugin ships its own hooks.json, .mcp.json and lsp.json — the \
+             same three routes the other entries close, so leaving it out \
+             denied the front door and left the side door"
         );
         assert!(Agent::Goose.host_persistence_denies().is_empty());
         assert!(Agent::OpenCode.host_persistence_denies().is_empty());

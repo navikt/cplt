@@ -1010,14 +1010,14 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
     }
 }
 
-/// Copilot's six host-persistence denies, and the one deliberately left out.
+/// Copilot's seven host-persistence denies.
 ///
 /// `~/.copilot` is granted write for the session store, the permissions file
 /// and the logs Copilot rewrites every run, so the persistence guard has to be
-/// file-level. These six auto-execute on the next host launch and are never
-/// written by the CLI in normal operation; `installed-plugins/` auto-executes
-/// too but first-party plugins self-update at session start, so denying it
-/// would break that silently.
+/// file-level. These seven auto-execute on the next host launch. Six are never
+/// written by the CLI in normal operation; `installed-plugins/` may be, at
+/// session start, which is the one unresolved cost in the set — see
+/// SECURITY.md.
 #[test]
 fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
     let home = std::path::Path::new("/Users/test");
@@ -1043,6 +1043,7 @@ fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
         "mcp-config.json",
         "lsp-config.json",
         "extensions",
+        "installed-plugins",
         "pkg",
     ] {
         let line = format!("(deny file-write* (subpath \"/Users/test/.copilot/{sub}\"))");
@@ -1055,11 +1056,6 @@ fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
         );
     }
 
-    assert!(
-        !p.contains("(deny file-write* (subpath \"/Users/test/.copilot/installed-plugins\"))"),
-        "installed-plugins must stay writable — first-party plugins self-update \
-         at session start"
-    );
     // The dirs Copilot rewrites every session keep the dir-wide write grant.
     assert!(
         !p.contains("(deny file-write* (subpath \"/Users/test/.copilot/session-store.db\"))")
