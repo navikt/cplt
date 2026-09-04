@@ -225,6 +225,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// command. stdout is drained on a helper thread so a chatty binary cannot fill
 /// the pipe buffer and deadlock while we poll, and stdin is `/dev/null` so a
 /// probe can never sit waiting on the terminal.
+///
+/// The reader thread is received from with a timeout rather than joined: a
+/// probe that forks something inheriting its stdout leaves the pipe open even
+/// after the probe itself exits, and an unbounded join there would reintroduce
+/// exactly the hang this function exists to remove. A detached reader blocked
+/// on a pipe costs one thread in a process that exits moments later.
 fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
     let Ok(mut child) = std::process::Command::new(path)
         .args(args)
@@ -240,10 +246,11 @@ fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
         let _ = child.wait();
         return VersionProbe::Unknown;
     };
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
 
     let deadline = Instant::now() + PROBE_TIMEOUT;
@@ -257,7 +264,6 @@ fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
                 let timed_out = matches!(outcome, Ok(None));
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
                 return if timed_out {
                     VersionProbe::TimedOut
                 } else {
@@ -267,9 +273,9 @@ fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
         }
     };
 
-    // The child is gone, so its write end of the pipe is closed and the reader
-    // sees EOF.
-    let Ok(buf) = reader.join() else {
+    // The child is gone, so unless it left something else holding the write end
+    // of the pipe the reader has already seen EOF and sent.
+    let Ok(buf) = rx.recv_timeout(Duration::from_millis(500)) else {
         return VersionProbe::Unknown;
     };
     if !status.success() {
@@ -1991,14 +1997,14 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
 
     // ── #298: version probes must not hang doctor ───────────────
 
-    /// Write an executable shell script that `exec`s the given command, so the
-    /// direct child of the probe *is* that command (no intermediate shell to
-    /// kill instead).
+    /// Write an executable shell script with the given body. Callers that care
+    /// which process the probe kills use `exec ...`, so the direct child of the
+    /// probe *is* that command and no intermediate shell absorbs the signal.
     #[cfg(unix)]
     fn fake_binary(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\nexec {body}\n")).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -2014,7 +2020,7 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
     fn version_probe_gives_up_on_a_binary_that_never_exits() {
         let dir = tempfile::tempdir().unwrap();
         // An unusual duration doubles as a marker for the orphan check below.
-        let bin = fake_binary(dir.path(), "wedged", "sleep 3298");
+        let bin = fake_binary(dir.path(), "wedged", "exec sleep 3298");
 
         let start = Instant::now();
         let outcome = probe_version(&bin, &["--version"]);
@@ -2044,20 +2050,45 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
         }
     }
 
+    /// A probe that exits but leaves a child holding its stdout must still
+    /// return: waiting for EOF on that pipe is the same hang wearing a
+    /// different hat, so the read is bounded too.
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_gives_up_when_a_grandchild_holds_the_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_binary(dir.path(), "forker", "sleep 3297 &\nexit 0");
+
+        let start = Instant::now();
+        let outcome = probe_version(&bin, &["--version"]);
+        assert_eq!(outcome, VersionProbe::Unknown);
+        assert!(
+            start.elapsed() < PROBE_TIMEOUT,
+            "a held-open pipe must not extend the probe, took {:?}",
+            start.elapsed()
+        );
+
+        // Not ours to reap — the probe exited cleanly and this is its child —
+        // but leave the machine as we found it.
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "sleep 3297"])
+            .status();
+    }
+
     /// The happy path still parses, and a binary that answers is never
     /// misreported as timed out.
     #[cfg(unix)]
     #[test]
     fn version_probe_parses_a_prompt_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let ok = fake_binary(dir.path(), "quick", "echo GitHub Copilot CLI 1.0.21.");
+        let ok = fake_binary(dir.path(), "quick", "exec echo GitHub Copilot CLI 1.0.21.");
         assert_eq!(
             probe_version(&ok, &["--version"]),
             VersionProbe::Version("1.0.21".to_string())
         );
 
         // Non-zero exit is "ran, said nothing useful" — not a timeout.
-        let bad = fake_binary(dir.path(), "broken", "false");
+        let bad = fake_binary(dir.path(), "broken", "exec false");
         assert_eq!(probe_version(&bad, &["--version"]), VersionProbe::Unknown);
     }
 }
