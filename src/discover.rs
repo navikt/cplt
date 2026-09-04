@@ -10,7 +10,10 @@
 
 use crate::sandbox::{DENIED_DOTFILES, DENIED_FILES};
 use crate::ui;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 // ── Result types ────────────────────────────────────────────────
 
@@ -30,7 +33,24 @@ pub struct AgentInfo {
     pub name: &'static str,
     pub binary_name: &'static str,
     pub path: PathBuf,
-    pub version: Option<String>,
+    pub version: VersionProbe,
+}
+
+/// Outcome of one `<binary> --version` probe.
+///
+/// `Unknown` and `TimedOut` are deliberately distinct: "the binary answered but
+/// said nothing we could parse" and "the binary never answered" are different
+/// problems with different fixes, and doctor is the command people run when
+/// something is already wrong (#298).
+#[derive(Debug, PartialEq, Eq)]
+pub enum VersionProbe {
+    /// Parsed version string (e.g. `"1.0.21"`).
+    Version(String),
+    /// Ran to completion without yielding a version: spawn failed, non-zero
+    /// exit, or output with no version-looking token.
+    Unknown,
+    /// Did not exit within [`PROBE_TIMEOUT`]. The child was killed and reaped.
+    TimedOut,
 }
 
 #[derive(Debug)]
@@ -51,8 +71,6 @@ pub struct AuthDiscovery {
 pub struct CopilotDiscovery {
     /// Resolved path to the `copilot` binary (after symlink resolution).
     pub binary_path: Option<PathBuf>,
-    /// Copilot CLI version string (e.g. "1.0.21").
-    pub version: Option<String>,
     /// All discovered native `.node` modules with their names.
     pub native_modules: Vec<NativeModule>,
 }
@@ -147,23 +165,6 @@ impl AuthDiscovery {
 pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
     let binary_path = which_resolved("copilot");
 
-    let version = std::process::Command::new("copilot")
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                // Parse "GitHub Copilot CLI 1.0.21." → "1.0.21"
-                stdout
-                    .split_whitespace()
-                    .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                    .map(|v| v.trim_end_matches('.').to_string())
-            } else {
-                None
-            }
-        });
-
     // Scan for all native modules across all versions
     let mut native_modules = Vec::new();
     for name in &["keytar.node", "pty.node", "computer.node"] {
@@ -188,7 +189,6 @@ pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
 
     CopilotDiscovery {
         binary_path,
-        version,
         native_modules,
     }
 }
@@ -203,6 +203,88 @@ const AGENTS_TO_CHECK: &[(&str, &[&str], &[&str])] = &[
     ("Claude", &["claude"], &["--version"]),
 ];
 
+/// Per-probe budget for a `--version` call.
+///
+/// Per probe, not one budget for the whole sweep: a single wedged binary must
+/// not hide the state of the others (#298). Five seconds matches
+/// `audit::GIT_TIMEOUT` and leaves a Node-based CLI room for a cold start on a
+/// loaded machine, while keeping doctor's worst case (every probed agent
+/// wedged) in the tens of seconds rather than forever.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `<path> <args>` and parse a version out of its stdout, giving up after
+/// [`PROBE_TIMEOUT`].
+///
+/// These are the only places discovery *executes* something off the user's
+/// `PATH`, and an agent binary that never exits used to hang `cplt doctor`
+/// forever with no output — `claude --version` does exactly that when invoked
+/// from inside a Claude Code session (#298).
+///
+/// On timeout the child is killed **and reaped**: dropping a `Child` does not
+/// kill it, so returning early without this leaves an orphan that outlives the
+/// command. stdout is drained on a helper thread so a chatty binary cannot fill
+/// the pipe buffer and deadlock while we poll, and stdin is `/dev/null` so a
+/// probe can never sit waiting on the terminal.
+fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
+    let Ok(mut child) = std::process::Command::new(path)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return VersionProbe::Unknown;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return VersionProbe::Unknown;
+    };
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            outcome => {
+                let timed_out = matches!(outcome, Ok(None));
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return if timed_out {
+                    VersionProbe::TimedOut
+                } else {
+                    VersionProbe::Unknown
+                };
+            }
+        }
+    };
+
+    // The child is gone, so its write end of the pipe is closed and the reader
+    // sees EOF.
+    let Ok(buf) = reader.join() else {
+        return VersionProbe::Unknown;
+    };
+    if !status.success() {
+        return VersionProbe::Unknown;
+    }
+    // Parse "GitHub Copilot CLI 1.0.21." → "1.0.21": first token starting with
+    // a digit, trailing period trimmed.
+    String::from_utf8_lossy(&buf)
+        .split_whitespace()
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map_or(VersionProbe::Unknown, |v| {
+            VersionProbe::Version(v.trim_end_matches('.').to_string())
+        })
+}
+
 /// Discover all available AI coding agents in PATH.
 pub fn discover_agents() -> Vec<AgentInfo> {
     AGENTS_TO_CHECK
@@ -211,22 +293,7 @@ pub fn discover_agents() -> Vec<AgentInfo> {
             let (binary_name, path) = binaries
                 .iter()
                 .find_map(|binary| which_resolved(binary).map(|path| (*binary, path)))?;
-            let version = std::process::Command::new(&path)
-                .args(*version_args)
-                .output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        let stdout = String::from_utf8_lossy(&o.stdout);
-                        // Extract first token that starts with a digit (version number)
-                        stdout
-                            .split_whitespace()
-                            .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                            .map(|v| v.trim_end_matches('.').to_string())
-                    } else {
-                        None
-                    }
-                });
+            let version = probe_version(&path, version_args);
             Some(AgentInfo {
                 name,
                 binary_name,
@@ -474,24 +541,37 @@ impl Discovery {
                     critical_ok = false;
                     continue;
                 }
-                if let Some(ref ver) = agent.version {
-                    println!(
+                match agent.version {
+                    VersionProbe::Version(ref ver) => println!(
                         "  {}✓{} {} ({}) v{ver}: {}",
                         ui::stdout_color(ui::GREEN),
                         ui::stdout_color(ui::RESET),
                         agent.name,
                         agent.binary_name,
                         agent.path.display()
-                    );
-                } else {
-                    println!(
+                    ),
+                    VersionProbe::Unknown => println!(
                         "  {}✓{} {} ({}): {}",
                         ui::stdout_color(ui::GREEN),
                         ui::stdout_color(ui::RESET),
                         agent.name,
                         agent.binary_name,
                         agent.path.display()
-                    );
+                    ),
+                    // Reported, not omitted: the binary is installed, so
+                    // "not detected" would be a lie, and a silently missing
+                    // row sends the user looking for an install that is
+                    // already there (#298).
+                    VersionProbe::TimedOut => println!(
+                        "  {}⚠{} {} ({}): {} — version probe did not answer within \
+                         {}s and was killed; the binary is installed but may be wedged",
+                        ui::stdout_color(ui::YELLOW),
+                        ui::stdout_color(ui::RESET),
+                        agent.name,
+                        agent.binary_name,
+                        agent.path.display(),
+                        PROBE_TIMEOUT.as_secs()
+                    ),
                 }
             }
         }
@@ -1907,5 +1987,77 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
         std::fs::create_dir_all(tmp.join(".cache/copilot/pkg")).unwrap();
         let expected = tmp.join(".cache/copilot/pkg");
         assert_eq!(copilot_sea_cache_dir(&tmp), Some(expected));
+    }
+
+    // ── #298: version probes must not hang doctor ───────────────
+
+    /// Write an executable shell script that `exec`s the given command, so the
+    /// direct child of the probe *is* that command (no intermediate shell to
+    /// kill instead).
+    #[cfg(unix)]
+    fn fake_binary(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nexec {body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A binary that never exits must be given up on, not waited for forever.
+    ///
+    /// The bound is the point of the test: before #298 this call never
+    /// returned, and a regression must fail CI rather than wedge it. The fake
+    /// sleeps far longer than [`PROBE_TIMEOUT`], so a broken timeout caps out
+    /// at the sleep and then fails the elapsed assertion.
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_gives_up_on_a_binary_that_never_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        // An unusual duration doubles as a marker for the orphan check below.
+        let bin = fake_binary(dir.path(), "wedged", "sleep 3298");
+
+        let start = Instant::now();
+        let outcome = probe_version(&bin, &["--version"]);
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            outcome,
+            VersionProbe::TimedOut,
+            "a wedged probe reports TimedOut"
+        );
+        assert!(
+            elapsed < PROBE_TIMEOUT * 3,
+            "probe should return near PROBE_TIMEOUT, took {elapsed:?}"
+        );
+
+        // Killing without reaping turns one hang into an orphan that outlives
+        // the command — the exact state found on the machine in #298. Dropping
+        // the Child handle does not do this, so assert the process is gone.
+        let orphans = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 3298"])
+            .output();
+        if let Ok(out) = orphans {
+            assert!(
+                String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+                "timed-out probe left the child running"
+            );
+        }
+    }
+
+    /// The happy path still parses, and a binary that answers is never
+    /// misreported as timed out.
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_parses_a_prompt_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = fake_binary(dir.path(), "quick", "echo GitHub Copilot CLI 1.0.21.");
+        assert_eq!(
+            probe_version(&ok, &["--version"]),
+            VersionProbe::Version("1.0.21".to_string())
+        );
+
+        // Non-zero exit is "ran, said nothing useful" — not a timeout.
+        let bad = fake_binary(dir.path(), "broken", "false");
+        assert_eq!(probe_version(&bad, &["--version"]), VersionProbe::Unknown);
     }
 }
