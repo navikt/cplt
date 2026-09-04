@@ -1102,6 +1102,7 @@ fn detect_project_root() -> Option<PathBuf> {
 
 // Use library's is_unsafe_root
 use cplt::is_unsafe_root;
+use cplt::sandbox::ToolRoot;
 use cplt::ui;
 
 /// Prompt the user to confirm the sandbox configuration.
@@ -1201,7 +1202,13 @@ fn canonicalize_deny_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 /// path to open, and macOS SBPL rules for missing paths are inert. Paths are
 /// merged into `allow_read`/`allow_write`, which the backends already handle;
 /// this only ever *adds* access.
-fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) {
+///
+/// Vars whose default location is split into `HOME_TOOL_DIRS` entries with
+/// different postures (`CARGO_HOME` → `.cargo/{bin,registry,git}`) are not
+/// granted as one tree: they come back as `ToolRoot`s that relocate those
+/// entries, so `$CARGO_HOME/bin` stays exec-only and never writable (#152).
+fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -> Vec<ToolRoot> {
+    let mut roots = Vec::new();
     // Read only the handful of recognized tool-path vars rather than snapshotting
     // the entire parent environment — no need to copy unrelated secrets (tokens,
     // credentials) into a Vec just to inspect a fixed, small set of names.
@@ -1233,6 +1240,17 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) {
             ));
             continue;
         }
+        // One root per default tree: a second segment of a list var
+        // (`GOPATH=/a:/b`) keeps the plain whole-tree grant below.
+        if let Some(default) = cplt::sandbox::relocatable_tool_prefix(ovr.name)
+            && roots.iter().all(|r: &ToolRoot| r.default != default)
+        {
+            roots.push(ToolRoot {
+                default,
+                root: path,
+            });
+            continue;
+        }
         let target = if ovr.write {
             &mut resolved.allow_write
         } else {
@@ -1242,6 +1260,7 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) {
             target.push(path);
         }
     }
+    roots
 }
 
 /// Resolved configuration, paths, and agent info needed by the sandbox.
@@ -2458,8 +2477,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         unapproved_proposals: _,
     } = resolve_context(&cli, false)?;
 
+    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
+    let tool_roots = merge_tool_path_env_overrides(&mut resolved, &home_dir);
+
     // Run auto-discovery to tighten the sandbox profile
-    let tool_discovery = discover::discover_tools(&home_dir);
+    let tool_discovery = discover::discover_tools(&home_dir, &tool_roots);
     let existing_home_tool_dirs = tool_discovery.existing_home_tool_dirs;
     let existing_app_dirs = tool_discovery.existing_app_dirs;
 
@@ -2582,9 +2604,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // Start proxy (handle returned for RAII ownership)
     let proxy_handle =
         start_proxy_if_enabled(&mut resolved, &cli, config_path.as_ref(), active_agent)?;
-
-    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
-    merge_tool_path_env_overrides(&mut resolved, &home_dir);
 
     // Prepare the sandbox — validates paths, generates platform-specific profile.
     // Path validation (SBPL injection checks on macOS) is handled internally
@@ -3108,7 +3127,10 @@ fn prepare_shell_sandbox(
 ) -> anyhow::Result<ShellSandbox> {
     let active_agent = agent::Agent::Shell;
 
-    let tool_discovery = discover::discover_tools(home_dir);
+    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
+    let tool_roots = merge_tool_path_env_overrides(resolved, home_dir);
+
+    let tool_discovery = discover::discover_tools(home_dir, &tool_roots);
     let existing_home_tool_dirs = tool_discovery.existing_home_tool_dirs;
     let existing_app_dirs = tool_discovery.existing_app_dirs;
 
@@ -3177,9 +3199,6 @@ fn prepare_shell_sandbox(
 
     let proxy_handle = start_proxy_if_enabled(resolved, cli, config_path, active_agent)?;
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
-
-    // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
-    merge_tool_path_env_overrides(resolved, home_dir);
 
     // See the #242 note at the other `SandboxConfig` construction.
     let keychain_substitute = active_agent.credential_outside_keychain(

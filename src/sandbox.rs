@@ -54,8 +54,9 @@ pub use policy::{
     ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
     HomeToolDir, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
     PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
-    TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, app_dirs, current_uid, home_tool_dirs,
-    linux_docker_socket_paths, playwright_runtime_intent, socket_mask_paths,
+    ResolvedToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
+    active_tool_dirs, app_dirs, current_uid, home_tool_dirs, linux_docker_socket_paths,
+    playwright_runtime_intent, relocatable_tool_prefix, socket_mask_paths,
     tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
     validate_sbpl_path,
 };
@@ -105,9 +106,10 @@ pub struct SandboxConfig<'a> {
     pub extra_write: &'a [PathBuf],
     pub extra_socket: &'a [PathBuf],
     pub extra_deny: &'a [PathBuf],
-    /// If `Some`, only include these home tool dirs (tighter profile via discovery).
-    /// If `None`, all known home tool dirs are included.
-    pub existing_home_tool_dirs: Option<&'a [String]>,
+    /// If `Some`, only include these home tool dirs (tighter profile via discovery,
+    /// with relocated tool homes such as `CARGO_HOME` already resolved).
+    /// If `None`, all known home tool dirs are included at their defaults.
+    pub existing_home_tool_dirs: Option<&'a [ResolvedToolDir]>,
     /// If `Some`, only include these app dirs (tighter profile via discovery).
     /// If `None`, all known app dirs are included.
     pub existing_app_dirs: Option<&'a [String]>,
@@ -661,6 +663,9 @@ fn validate_config_paths(config: &SandboxConfig) -> Result<(), String> {
     }
     if let Some(dir) = config.dotnet_root {
         policy::validate_sbpl_path(dir).map_err(|e| format!("DOTNET_ROOT: {e}"))?;
+    }
+    for d in config.existing_home_tool_dirs.unwrap_or(&[]) {
+        policy::validate_sbpl_path(&d.path).map_err(|e| format!("Tool dir: {e}"))?;
     }
     if let Some(p) = config.git_hooks_path {
         policy::validate_sbpl_path(p).map_err(|e| format!("Git hooks path: {e}"))?;

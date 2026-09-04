@@ -759,6 +759,7 @@ mod tests {
             restrict_net_connect: true,
             proxy_forced: false,
             home_dir: PathBuf::from("/home/u"),
+            precreate_dirs: vec![],
         }
     }
 

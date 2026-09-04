@@ -926,6 +926,7 @@ pub fn app_dirs() -> &'static [AppDir] {
 /// Security principle: every writable+executable directory is a potential
 /// binary-drop staging path (see SECURITY.md axios case study). Grant exec
 /// only where tools genuinely install executables.
+#[derive(Debug, PartialEq, Eq)]
 pub struct HomeToolDir {
     pub path: &'static str,
     pub process_exec: bool,
@@ -1173,6 +1174,80 @@ pub fn home_tool_dirs() -> &'static [HomeToolDir] {
     HOME_TOOL_DIRS
 }
 
+/// A tool home relocated by an env var (`CARGO_HOME=~/.local/share/cargo`).
+///
+/// [`HOME_TOOL_DIRS`] entries under `default` (home-relative, e.g. `.cargo`)
+/// are re-rooted under `root` (absolute, canonicalized, existence-checked by
+/// the caller) and keep their own permission flags, so `$CARGO_HOME/bin` gets
+/// the exec-only posture of `~/.cargo/bin` rather than one write grant over
+/// the whole tree (#152).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRoot {
+    pub default: &'static str,
+    pub root: PathBuf,
+}
+
+/// A [`HOME_TOOL_DIRS`] entry at its effective absolute path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedToolDir {
+    pub path: PathBuf,
+    pub dir: &'static HomeToolDir,
+}
+
+impl HomeToolDir {
+    /// Absolute path of this entry: under the matching [`ToolRoot`] if one
+    /// relocates its tree, else under `home`.
+    pub fn resolve(&'static self, home: &Path, roots: &[ToolRoot]) -> ResolvedToolDir {
+        let rel = Path::new(self.path);
+        let path = roots
+            .iter()
+            .find_map(|r| {
+                let rest = rel.strip_prefix(r.default).ok()?;
+                // `join("")` would append a trailing separator, and Seatbelt
+                // matches the literal string.
+                Some(if rest.as_os_str().is_empty() {
+                    r.root.clone()
+                } else {
+                    r.root.join(rest)
+                })
+            })
+            .unwrap_or_else(|| home.join(rel));
+        ResolvedToolDir { path, dir: self }
+    }
+}
+
+/// The default subpath of tool-path env var `name` that has [`HOME_TOOL_DIRS`]
+/// entries under it, if any. Such a var relocates those entries (see
+/// [`ToolRoot`]) instead of granting its whole tree.
+pub fn relocatable_tool_prefix(name: &str) -> Option<&'static str> {
+    TOOL_PATH_ENV_VARS
+        .iter()
+        .find(|tv| tv.name == name)?
+        .default_subpaths
+        .iter()
+        .copied()
+        .find(|d| {
+            HOME_TOOL_DIRS
+                .iter()
+                .any(|h| Path::new(h.path).starts_with(d))
+        })
+}
+
+/// Home tool dirs to grant: the discovered subset when available, else every
+/// entry at its default location under `home`.
+pub fn active_tool_dirs(
+    home: &Path,
+    discovered: Option<&[ResolvedToolDir]>,
+) -> Vec<ResolvedToolDir> {
+    match discovered {
+        Some(dirs) => dirs.to_vec(),
+        None => HOME_TOOL_DIRS
+            .iter()
+            .map(|d| d.resolve(home, &[]))
+            .collect(),
+    }
+}
+
 // ── Tool-path environment variable overrides ───────────────────────────────
 
 /// A development tool environment variable that relocates where the tool reads
@@ -1251,6 +1326,14 @@ pub const TOOL_PATH_ENV_VARS: &[ToolPathEnvVar] = &[
         name: "CARGO_HOME",
         write: true,
         default_subpaths: &[".cargo"],
+        list: false,
+    },
+    // RUSTUP_HOME holds the toolchains that the `$CARGO_HOME/bin` proxies
+    // exec into. Read-only, like the default `.rustup` entry.
+    ToolPathEnvVar {
+        name: "RUSTUP_HOME",
+        write: false,
+        default_subpaths: &[".rustup"],
         list: false,
     },
     // ── Node / npm / yarn / pnpm ─────────────────────────────────────────────
