@@ -2547,9 +2547,28 @@ const DEFAULT_BRANCH_NAMES: &[&str] = &["main", "master"];
 /// `develop`, `trunk` or `production` must be covered — a hardcoded name list
 /// alone silently protects nothing there.
 fn is_protected_branch(branch: &str, default_branch: Option<&str>) -> bool {
-    // Strip remote prefix if present (e.g., "origin/main" → "main")
+    // A `refs/heads/`-qualified refspec target reaches here unstripped when the
+    // refspec has no colon (`git push origin refs/heads/release/2026`);
+    // `refspec_target_branch` only strips the prefix off the `src:dst` form.
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    // Last path segment, so a remote-qualified `origin/main` still matches the
+    // unslashed floor names below.
     let short = branch.rsplit('/').next().unwrap_or(branch);
-    DEFAULT_BRANCH_NAMES.contains(&short) || default_branch == Some(short)
+    DEFAULT_BRANCH_NAMES.contains(&short)
+        // The whole name, because the two sides arrive differently: `branch`
+        // comes from push argv or `symbolic-ref --short HEAD`, so it is the
+        // branch name entire — `release/2026`, slashes and all — while
+        // `default_branch` comes from the `refs/remotes/<remote>/HEAD` symref
+        // with only the `<remote>/` prefix taken off, so it is `release/2026`
+        // too. Comparing last segments alone asked `"release/2026" == "2026"`
+        // and a repository whose default branch has a slash in it was silently
+        // unprotected — the exact under-protection #346 was written to remove,
+        // surviving in the comparison.
+        || default_branch == Some(branch)
+        // Kept for the remote-qualified spelling of an unslashed default
+        // (`origin/develop` against a default of `develop`). It can only add
+        // protection: a false match here blocks a push, never allows one.
+        || default_branch == Some(short)
 }
 
 /// Extract the target branch from `git push` arguments.
@@ -3837,6 +3856,53 @@ mod tests {
     }
 
     #[test]
+    fn is_protected_branch_covers_a_slashed_default_branch() {
+        // A default branch is free to have a slash in it. Comparing only the
+        // last path segment asked `"release/2026" == "2026"` and left such a
+        // repository's default branch pushable.
+        assert!(is_protected_branch("release/2026", Some("release/2026")));
+        assert!(is_protected_branch(
+            "refs/heads/release/2026",
+            Some("release/2026")
+        ));
+        assert!(is_protected_branch("main", Some("release/2026")));
+        // Neighbours of a slashed default are still feature branches.
+        assert!(!is_protected_branch("release/2025", Some("release/2026")));
+        assert!(!is_protected_branch("2026", Some("release/2026")));
+        assert!(!is_protected_branch("feature/x", Some("release/2026")));
+    }
+
+    #[test]
+    fn protect_default_blocks_slashed_default_branch() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("release/2026", "https://github.com/o/o.git", "release/2026")
+        else {
+            return;
+        };
+        let git = which_git().unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+        assert!(gate_push_in(&git, &dir, &["push", "origin", "release/2026"]).is_err());
+        assert!(
+            gate_push_in(
+                &git,
+                &dir,
+                &["push", "origin", "HEAD:refs/heads/release/2026"]
+            )
+            .is_err()
+        );
+        assert!(gate_push_in(&git, &dir, &["push", "origin", "refs/heads/release/2026"]).is_err());
+        // Bare `git push` on the checked-out default branch, too.
+        assert!(gate_push_in(&git, &dir, &["push"]).is_err());
+        // A second refspec must not smuggle it past the first.
+        assert!(
+            gate_push_in(&git, &dir, &["push", "origin", "feature/x", "release/2026"]).is_err()
+        );
+        // Feature branches in the same repository stay pushable.
+        assert!(gate_push_in(&git, &dir, &["push", "origin", "release/2025"]).is_ok());
+        assert!(gate_push_in(&git, &dir, &["push", "origin", "feature/x"]).is_ok());
+    }
+
+    #[test]
     fn extract_push_target_handles_refspecs() {
         assert_eq!(
             extract_push_target_branch(&["origin", "feature"], None),
@@ -3963,6 +4029,16 @@ mod tests {
     /// A scratch git repo on `branch`, with `origin` pointing at `origin_url`.
     /// `None` when git is unavailable.
     fn scratch_repo(branch: &str, origin_url: &str) -> Option<(tempfile::TempDir, PathBuf)> {
+        scratch_repo_with_default(branch, origin_url, "main")
+    }
+
+    /// Same, with the remote's default branch spelled out — including the
+    /// slashed forms (`release/2026`) a repository is free to use.
+    fn scratch_repo_with_default(
+        branch: &str,
+        origin_url: &str,
+        default_branch: &str,
+    ) -> Option<(tempfile::TempDir, PathBuf)> {
         let git = which_git()?;
         let tmp = tempfile::tempdir().ok()?;
         let repo = tmp.path().join("repo");
@@ -3987,7 +4063,7 @@ mod tests {
         run(&[
             "symbolic-ref",
             "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/main",
+            &format!("refs/remotes/origin/{default_branch}"),
         ])?;
         Some((tmp, repo))
     }
