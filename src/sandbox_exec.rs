@@ -470,6 +470,35 @@ fn install_command_wrappers(
     let cplt_str = cplt_bin.to_string_lossy();
     let mut installed_any = false;
 
+    // The git both wrappers bake in and run INSIDE the sandbox.
+    //
+    // PATH first, `trusted_git()` only as a fallback — the reverse of the
+    // parent-side rule, and deliberately so. `trusted_git()` scans
+    // `TRUSTED_BIN_DIRS` in a fixed order with `/usr/bin` first, which on macOS
+    // is `xcrun`'s shim, not git. The shim dlopens `libxcrun.dylib` out of
+    // whatever `xcode-select` points at; where that is a full `Xcode.app` rather
+    // than the Command Line Tools, the sandbox does not grant `/Applications`
+    // and *every* git through the wrapper dies with
+    // "unable to load libxcrun ... (file system sandbox blocked open())" —
+    // `git status`, `git log`, `git --version`, not just `git push`.
+    //
+    // Preferring PATH makes the guard run the same git the agent would have run
+    // without it. That is the invariant that was broken: a guard decides
+    // *whether* a command runs, and must not silently change *which* binary it
+    // is. The same substitution hits every machine whose PATH git comes from
+    // Homebrew, mise, asdf, nix-profile or snap; the Xcode shim is just the case
+    // that fails loudly instead of quietly running a different git.
+    //
+    // Safe because this path is only ever executed inside the sandbox, by the
+    // agent's own shell. A git planted on the agent's PATH gains it nothing: it
+    // can invoke any git by absolute path and skip the wrapper entirely, so the
+    // guard is a policy on intent, not a boundary. Parent-side git — the audit,
+    // repo-config trust, the gh guard's repo scope and allow_push URL pinning —
+    // stays on `trusted_git()` below, where a planted binary WOULD run
+    // unsandboxed as the user.
+    let sandbox_git =
+        which_binary("git").or_else(|| crate::git::trusted_git().map(std::path::Path::to_path_buf));
+
     // Install gh wrapper (only if gh_proxy enabled)
     if gh_guard.enabled
         && let Some(real_gh) = which_binary("gh")
@@ -509,9 +538,17 @@ fn install_command_wrappers(
         } else {
             None
         };
-        let real_git_str = real_git
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
+        // `real_git` above is the parent-side probe and stays trusted. What the
+        // wrapper carries is the sandbox git: `gh-gate` re-runs it inside the
+        // sandbox to resolve scope, so a git that cannot start there turns every
+        // scope-checked `gh` command into a refusal.
+        let real_git_str = if real_git.is_some() {
+            sandbox_git
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+        } else {
+            None
+        };
         let script = crate::gh_proxy::generate_wrapper_script(
             &real_gh.to_string_lossy(),
             repo_scope.as_deref(),
@@ -526,25 +563,10 @@ fn install_command_wrappers(
         }
     }
 
-    // Install git guard wrapper (only if git_guard enabled)
-    // Trusted first, then PATH — the same call the gh wrapper above makes, and
-    // for the same reason.
-    //
-    // This path is baked into a wrapper the agent's own shell runs INSIDE the
-    // sandbox; it is never executed by the parent. A planted `git` there gains
-    // the agent nothing it does not already have: it can invoke any git by
-    // absolute path and skip the PATH wrapper entirely, so the guard is a policy
-    // on intent, not a boundary. Requiring a trusted git instead removed the
-    // guard outright on every machine whose git comes from mise, asdf,
-    // nix-profile or snap — the agent's PATH still had that git, so `git push`
-    // simply went unguarded. That is a loss with no matching gain.
-    //
-    // Parent-side git (audit, repo-config trust, gh guard scope) stays on
-    // `trusted_git()`, where a planted binary WOULD run unsandboxed.
+    // Install git guard wrapper (only if git_guard enabled). It runs
+    // `sandbox_git` — see the reasoning where that is resolved above.
     if git_guard.enabled
-        && let Some(real_git) = crate::git::trusted_git()
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| which_binary("git"))
+        && let Some(real_git) = sandbox_git.clone()
     {
         // Pin each allow_push rule's remote name to the URL that name has in
         // the launch repository, so the rule identifies a repository and not
