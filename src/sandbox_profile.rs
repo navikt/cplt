@@ -24,7 +24,7 @@ use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, EXEC_IN_WRITABLE,
     GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
     ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
-    active_tool_dirs, app_dirs, escape_regex, nested_alternation, path_bin_dirs,
+    XCODE_SELECT_LINK, active_tool_dirs, app_dirs, escape_regex, nested_alternation, path_bin_dirs,
     playwright_runtime_intent, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
@@ -119,6 +119,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.agent,
         config.allow_cache_exec,
         config.allow_cache_exec_any,
+        Path::new(XCODE_SELECT_LINK),
     );
     emit_copilot_install(&mut sb, config.copilot_install_dir);
     emit_gradle_toolchain_exec(&mut sb, &home);
@@ -893,6 +894,7 @@ fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
     sbpl!(sb);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_tool_dirs(
     sb: &mut String,
     home_dir: &std::path::Path,
@@ -901,12 +903,23 @@ fn emit_tool_dirs(
     agent: Agent,
     allow_cache_exec: &[String],
     allow_cache_exec_any: bool,
+    xcode_select_link: &Path,
 ) {
     let home = home_dir.to_string_lossy();
     sbpl!(sb, ";; Developer tools");
     for dir in TOOL_READ_DIRS {
         sbpl!(sb, "(allow file-read* (subpath \"{dir}\"))");
         sbpl!(sb, "(allow file-map-executable (subpath \"{dir}\"))");
+    }
+    // The developer directory xcode-select actually points at, when it is not
+    // already covered above. Without it the xcrun shims at /usr/bin/{git,clang,
+    // make,python3} cannot dlopen libxcrun.dylib and exit 1 (#342).
+    if let Some(dev) = super::policy::xcode_developer_dir_from(xcode_select_link, home_dir)
+        && !TOOL_READ_DIRS.iter().any(|d| dev.starts_with(d))
+    {
+        let p = dev.to_string_lossy();
+        sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
+        sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
     }
     // Home tool dirs: use discovered existing dirs if available, else include all
     let active_dirs = active_tool_dirs(home_dir, existing_home_tool_dirs);
@@ -2321,6 +2334,141 @@ mod tests {
             keychain_substitute: None,
             use_bubblewrap: None,
         }
+    }
+
+    /// Emit just the developer-tools block with `xcode_select_link` pointed at a
+    /// symlink under test control, so every `xcode-select` configuration can be
+    /// exercised on a machine that only has one.
+    fn tool_dirs_block(home: &Path, xcode_select_link: &Path) -> String {
+        let mut sb = String::new();
+        emit_tool_dirs(
+            &mut sb,
+            home,
+            Some(&[]),
+            Some(&[]),
+            crate::agent::Agent::Copilot,
+            &[],
+            false,
+            xcode_select_link,
+        );
+        sb
+    }
+
+    fn link_to(dir: &Path, target: &Path) -> PathBuf {
+        let link = dir.join("xcode_select_link");
+        std::os::unix::fs::symlink(target, &link).expect("symlink");
+        link
+    }
+
+    /// A stand-in for a versioned Xcode: a real directory, because the resolver
+    /// canonicalizes the link target and a path that does not exist is not
+    /// granted.
+    fn fake_xcode(home: &Path, name: &str) -> PathBuf {
+        let dev = home
+            .join("Applications")
+            .join(name)
+            .join("Contents/Developer");
+        std::fs::create_dir_all(&dev).expect("mkdir");
+        dev
+    }
+
+    /// #342: the selected developer directory is granted, not just the literal
+    /// default. `/usr/bin/git` and the other xcrun shims dlopen libxcrun.dylib
+    /// from here; on a versioned Xcode the literal grant covers nothing they use
+    /// and every one of them exits 1 inside the sandbox.
+    #[test]
+    fn versioned_xcode_developer_dir_is_granted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let dev = std::fs::canonicalize(fake_xcode(&home, "Xcode_26.6.app")).unwrap();
+        let sb = tool_dirs_block(&home, &link_to(&home, &dev));
+        let dev = dev.display();
+        assert!(
+            sb.contains(&format!("(allow file-read* (subpath \"{dev}\"))")),
+            "selected developer dir must be readable:\n{sb}"
+        );
+        assert!(
+            sb.contains(&format!("(allow file-map-executable (subpath \"{dev}\"))")),
+            "libxcrun.dylib must be mappable from the selected developer dir:\n{sb}"
+        );
+    }
+
+    /// No link (or an unreadable one) falls back to the literal default install,
+    /// which stays in `TOOL_READ_DIRS` for exactly this case.
+    #[test]
+    fn absent_xcode_select_link_falls_back_to_the_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sb = tool_dirs_block(tmp.path(), &tmp.path().join("does_not_exist"));
+        assert!(
+            sb.contains(
+                "(allow file-read* (subpath \"/Applications/Xcode.app/Contents/Developer\"))"
+            ),
+            "default install must remain granted when nothing is selected:\n{sb}"
+        );
+    }
+
+    /// A `/var/db/xcode_select_link` that is a regular file rather than a
+    /// symlink — the shape this file reportedly had on older macOS — must fall
+    /// back rather than grant a subpath on the file itself.
+    #[test]
+    fn regular_file_xcode_select_link_grants_nothing_extra() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("xcode_select_link");
+        std::fs::write(&link, "/Applications/Xcode_26.6.app/Contents/Developer\n").unwrap();
+        let sb = tool_dirs_block(tmp.path(), &link);
+        assert!(
+            !sb.contains(&format!("(subpath \"{}\"", link.display())),
+            "the link file itself must never be granted:\n{sb}"
+        );
+    }
+
+    /// Command Line Tools: `xcode_select` points at a directory `TOOL_READ_DIRS`
+    /// already grants, so no second rule is emitted for it.
+    #[test]
+    fn command_line_tools_selection_emits_no_duplicate_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clt = Path::new("/Library/Developer/CommandLineTools");
+        let sb = tool_dirs_block(tmp.path(), &link_to(tmp.path(), clt));
+        let clt = clt.display();
+        assert_eq!(
+            sb.matches(&format!("(allow file-read* (subpath \"{clt}\"))"))
+                .count(),
+            1,
+            "CommandLineTools is already in TOOL_READ_DIRS:\n{sb}"
+        );
+    }
+
+    /// The link is root-owned, but a grant that follows a symlink still gets the
+    /// widening check every other resolved path gets. A link to `/` or to $HOME
+    /// would hand the sandbox the whole machine.
+    #[test]
+    fn xcode_select_link_to_an_unsafe_root_is_not_granted() {
+        for target in ["/", "/tmp", "/Users", "/Applications"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = std::fs::canonicalize(tmp.path()).unwrap();
+            let sb = tool_dirs_block(&home, &link_to(&home, Path::new(target)));
+            for granted in [target, "/private/tmp"] {
+                assert!(
+                    !sb.contains(&format!("(allow file-read* (subpath \"{granted}\"))")),
+                    "xcode-select pointing at {target} must not widen the sandbox:\n{sb}"
+                );
+            }
+        }
+        // $HOME itself, via a target that only reaches it through `..` — the
+        // case that needs the target canonicalized before it is checked.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let escape = fake_xcode(&home, "Xcode.app").join("../../../..");
+        let sb = tool_dirs_block(&home, &link_to(&home, &escape));
+        let home = home.display();
+        assert!(
+            !sb.contains(&format!("(allow file-read* (subpath \"{home}\"))")),
+            "a link target escaping to $HOME must not be granted:\n{sb}"
+        );
+        assert!(
+            !sb.contains(".."),
+            "no un-normalized path may reach the profile:\n{sb}"
+        );
     }
 
     #[test]
