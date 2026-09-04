@@ -335,6 +335,36 @@ mod linux_tests {
         );
     }
 
+    /// `--allow-docker` grants `~/.docker` read-only on Linux (#155).
+    #[test]
+    fn landlock_allow_docker_reads_docker_config_but_not_write() {
+        require_landlock!();
+        let project = create_test_project();
+        let fake_home = create_fake_home_with_secrets();
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            fake_home.path(),
+            &["--allow-docker"],
+            "cat ~/.docker/config.json",
+        );
+        assert_eq!(
+            code, 0,
+            "--allow-docker should make ~/.docker/config.json readable — stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(stdout.contains("registry.example.com"), "{stdout}");
+
+        let (code, stdout, _) = run_sandboxed_home_with_flags(
+            project.path(),
+            fake_home.path(),
+            &["--allow-docker"],
+            "echo x > ~/.docker/pwned 2>&1",
+        );
+        assert!(
+            code != 0 || stdout.contains("Permission denied"),
+            "~/.docker must stay read-only under --allow-docker — code: {code}, stdout: {stdout}"
+        );
+    }
+
     #[test]
     fn landlock_allows_system_read() {
         require_landlock!();
