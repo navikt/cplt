@@ -358,8 +358,8 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // always do that when cplt lived in a granted directory, and it can skip the
     // wrapper entirely by calling git by absolute path. The guard is a policy on
     // intent, not a boundary.
-    if let Ok(cplt_bin) = std::env::current_exe() {
-        fs_rules.push(FsRule {
+    match std::env::current_exe() {
+        Ok(cplt_bin) => fs_rules.push(FsRule {
             path: cplt_bin,
             access: FsAccess {
                 read: true,
@@ -367,7 +367,16 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 execute: true,
                 ioctl: false,
             },
-        });
+        }),
+        // Say so rather than silently rebuilding the bug. Dropping the rule
+        // quietly is exactly the failure this commit fixes, and the symptom —
+        // every git command failing with "Permission denied" from a wrapper —
+        // gives no hint of the cause.
+        Err(e) => crate::ui::warn(&format!(
+            "cannot locate the cplt binary ({e}); the gh and git guard wrappers \
+             re-execute it, so every guarded command will fail with \
+             \"Permission denied\". Disable the guards or reinstall cplt."
+        )),
     }
 
     // ── Tool directories: read + execute ──
