@@ -5258,4 +5258,70 @@ paths = [
             "no launch reached the sandboxed agent, so nothing was proven:\n{transcript}"
         );
     }
+
+    /// A descriptor the caller leaves open reaches the agent through
+    /// `sandbox-exec`, and reading it needs no `open(2)` for the sandbox to
+    /// refuse. Any wrapper, IDE or service that launches cplt holding a
+    /// non-CLOEXEC `.env` or a connected socket would hand that capability
+    /// straight past every path and socket rule.
+    #[test]
+    fn e2e_inherited_descriptor_does_not_reach_the_agent() {
+        require_sandbox!();
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::io::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        const MARKER: &str = "LEAKED-THROUGH-FD-3";
+
+        let mut secret = tempfile::NamedTempFile::new().expect("temp file");
+        writeln!(secret, "{MARKER}").expect("write");
+        secret.flush().expect("flush");
+        // A fresh read handle at offset 0, with CLOEXEC cleared: exactly the
+        // state a parent process leaves a descriptor in.
+        let handle = std::fs::File::open(secret.path()).expect("reopen");
+        let leaked = handle.as_raw_fd();
+        assert_eq!(unsafe { libc::fcntl(leaked, libc::F_SETFD, 0) }, 0);
+
+        // The agent reads the inherited descriptor directly. `<&3` is a
+        // redirect from an already-open fd, not a path lookup, so nothing in
+        // the SBPL profile is consulted.
+        let fake_dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-copilot-")
+            .tempdir_in(project_dir())
+            .expect("create fake copilot dir");
+        let script = fake_dir.path().join("copilot");
+        std::fs::write(&script, "#!/bin/sh\ncat <&3 2>/dev/null\necho AGENT-RAN\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
+        let mut cmd = cplt_cmd();
+        cmd.args(["--yes", "--no-validate", "--", "--version"])
+            .current_dir(project_dir())
+            .env("PATH", &new_path);
+        // Put the leak on fd 3 inside cplt, the way the reviewer demonstrated it.
+        // SAFETY: dup2 only; runs between fork and exec, no allocation.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(leaked, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let output = cmd.output().expect("binary should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            stdout.contains("AGENT-RAN"),
+            "the fake agent did not run, so this test proves nothing.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains(MARKER),
+            "the agent read a descriptor cplt inherited from its caller.\nstdout: {stdout}"
+        );
+    }
 }

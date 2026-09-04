@@ -646,6 +646,19 @@ Git's `core.hooksPath` points to a directory of user-configured hooks that run o
 - **Depth >= 3:** the path must have at least 3 components under `$HOME`, so `~/.config/git/hooks` is fine and `~/hooks` is too broad
 - **Unsafe root rejection:** `/`, `$HOME`, `/tmp`, and similar are rejected
 
+### Layer 0.8: Inherited file descriptor sealing
+
+The kernel sandbox decides what the agent may *open*. It says nothing about what is already open when the agent starts, and an inherited descriptor needs no `open(2)` at all — `cat <&3` reads a file the SBPL profile denies, and an inherited socket carries traffic the proxy never sees. Whatever launched cplt (an IDE, a wrapper script, a service manager) may be holding non-CLOEXEC descriptors on exactly such files, and they cross `sandbox-exec` and `bwrap` alike straight into the agent.
+
+Before every agent spawn, cplt marks every descriptor above stderr `FD_CLOEXEC`, so nothing survives the `execve`. Details that matter:
+
+- **`FD_CLOEXEC`, not `close(2)`.** The sealing runs as a `pre_exec` hook, and at that point Rust's `std` is still holding a CLOEXEC pipe it uses to report `execve` failure back to the parent. Closing descriptors blindly closes that pipe too, and the parent then reads EOF and reports a *successful* spawn for a binary that never ran.
+- **stdin/stdout/stderr are untouched.** `std` has already dup2'd them into 0/1/2 by the time the hook runs.
+- **The Linux bubblewrap path preserves exactly two descriptors.** The policy pipe and the confirm pipe are deliberately not CLOEXEC, and the in-namespace re-entry helper reads them by fd number. They are named in an explicit keep list and have their CLOEXEC flag cleared after the sweep. Nothing else is preserved on any path.
+- **Ordering.** The seal is registered before the Landlock `pre_exec` hook, so the descriptors Landlock opens for its own ruleset are not swept.
+
+**Compatibility note:** cplt has no protocol for accepting a descriptor from its caller, so there is nothing legitimate to break. The one scenario worth naming is a parent that spawns cplt as a Node IPC child (`NODE_CHANNEL_FD=3`); that variable is not in the environment allowlist, so in the default sanitized mode the descriptor was already useless to the agent, and under `--inherit-env` an IPC channel back to the launching process is precisely the ambient capability the sandbox exists to remove.
+
 ### Layer 1: Seatbelt kernel sandbox (sandbox-exec)
 
 The primary defense is Apple's mandatory access control framework, enforced in the XNU kernel. All restrictions apply to the sandboxed process **and all its children**, and there is no way to shed the sandbox after `sandbox_init()`.

@@ -703,6 +703,62 @@ fn spawn_error_message(e: &std::io::Error) -> String {
     format!("Failed to start sandboxed process: {e}")
 }
 
+/// Make every descriptor above stderr close on `execve`, keeping only `keep`.
+///
+/// # Why
+///
+/// The sandbox gates what the agent can *open*. It says nothing about what is
+/// already open when the agent starts. Whatever launched cplt — an IDE, a
+/// wrapper script, a service manager — may be holding descriptors on files the
+/// policy denies, or on sockets the policy would never allow, and a non-CLOEXEC
+/// descriptor is inherited straight through `sandbox-exec` (and through bwrap)
+/// into the agent. `cat <&3` then reads a denied `.env` with no `open(2)` for
+/// the kernel to refuse. Path rules and socket rules both walk past it.
+///
+/// # Why CLOEXEC rather than `close(2)`
+///
+/// This runs as a `pre_exec` hook, and at that point `std` is still holding a
+/// CLOEXEC pipe it uses to report `execve` failure back to the parent. Closing
+/// descriptors blindly closes that pipe too, and the parent then reads EOF and
+/// concludes the exec succeeded. Setting `FD_CLOEXEC` leaves it working: it is
+/// already CLOEXEC, so nothing changes for it, and every other descriptor is
+/// gone the moment `execve` succeeds.
+///
+/// `keep` is cleared afterwards, so a descriptor that is *meant* to reach the
+/// child survives — the Linux bubblewrap path passes two such pipes deliberately.
+///
+/// Register this before any other `pre_exec` hook. Descriptors a later hook
+/// opens for itself (Landlock's ruleset, for one) must not be sealed.
+fn seal_inherited_fds(cmd: &mut Command, keep: Vec<std::os::unix::io::RawFd>) {
+    use std::os::unix::process::CommandExt as _;
+
+    // The upper bound is the soft RLIMIT_NOFILE, read here in the parent so the
+    // hook itself is nothing but `fcntl`. A machine with a very high limit pays
+    // a linear sweep once per agent launch (~250ms at 2^20); Linux
+    // `close_range(.., CLOSE_RANGE_CLOEXEC)` would fix that if it ever shows up
+    // in a profile.
+    // SAFETY: getdtablesize() takes no arguments, touches no memory, and has no
+    // failure mode.
+    let max = unsafe { libc::getdtablesize() };
+
+    // SAFETY: the closure runs between fork and exec. It makes only `fcntl`
+    // calls — no allocation, no locks, async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            // stdin/stdout/stderr are already dup2'd into place by std before
+            // pre_exec hooks run, so 0..=2 are ours and must stay.
+            for fd in 3..max {
+                // EBADF on an unused descriptor is expected and ignored.
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            for &fd in &keep {
+                libc::fcntl(fd, libc::F_SETFD, 0);
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Spawn a sandboxed command, forward signals, and wait for exit.
 ///
 /// Handles SIGTTOU/SIGTTIN suppression (Node.js terminal raw mode),
@@ -846,6 +902,8 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
+    // Nothing the caller was holding open crosses into the agent.
+    seal_inherited_fds(&mut cmd, Vec::new());
 
     spawn_and_wait(&mut cmd)
 }
@@ -962,6 +1020,9 @@ pub fn exec(
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
+    // Before the Landlock hook below: that hook opens descriptors of its own,
+    // and they must not be sealed.
+    seal_inherited_fds(&mut cmd, Vec::new());
 
     // Apply pre-computed sandbox in the child process, between fork and exec.
     // Safety: The proxy thread is running (multi-threaded at fork), making this
@@ -1106,6 +1167,11 @@ fn exec_bwrap(
         policy_read_fd.to_string(),
     );
     cmd.env(super::bubblewrap::ENV_CONFIRM_FD, write_fd.to_string());
+    // bwrap forwards inherited descriptors into the namespace, so the caller's
+    // leak reaches the agent here too. The policy and confirm pipes are the
+    // only two that are meant to: both are deliberately not CLOEXEC, and the
+    // re-entry helper reads them by the fd numbers set above.
+    seal_inherited_fds(&mut cmd, vec![policy_read_fd, write_fd]);
 
     ignore_terminal_stop_signals();
     let child = match cmd.spawn() {
@@ -1404,6 +1470,150 @@ mod spawn_error_tests {
         assert!(
             msg.starts_with("Failed to start sandboxed process:"),
             "{msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inherited_fd_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::io::{AsRawFd, RawFd};
+
+    const SECRET: &str = "SUPER-SECRET-TOKEN";
+
+    /// A file holding [`SECRET`], for the caller to leak a descriptor on.
+    fn secret_file() -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        writeln!(f, "{SECRET}").expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    /// Open `file` and leave the descriptor non-CLOEXEC, exactly the way a
+    /// wrapper or IDE leaves one when it launches cplt.
+    ///
+    /// A *fresh* handle per launch on purpose: two children sharing one open
+    /// file description also share its offset, so a first child that reads to
+    /// EOF makes the second read nothing whether it is sealed or not. That
+    /// mistake makes this whole test pass for the wrong reason.
+    fn leak(file: &tempfile::NamedTempFile) -> std::fs::File {
+        let handle = std::fs::File::open(file.path()).expect("reopen");
+        assert_eq!(
+            unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        handle
+    }
+
+    /// Read the inherited descriptor directly (`<&3`), never by path. Opening
+    /// `/dev/fd/3` would be an `open(2)` the sandbox could refuse on its own;
+    /// a redirect from an already-open descriptor is the capability that
+    /// bypasses every path rule.
+    ///
+    /// `source` is dup2'd onto fd 3 first. Not cosmetic: `/bin/sh` is dash on
+    /// Debian-family CI, and dash accepts only a single digit in `<&N`, so a
+    /// descriptor that happens to land on fd 10 fails with "Bad fd number"
+    /// rather than proving anything. Pinning it also matches how the leak was
+    /// demonstrated.
+    fn read_through_fd(source: RawFd, keep_fd3: bool, seal: bool) -> String {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("cat <&3")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // SAFETY: dup2 only, between fork and exec. Registered before the seal
+        // so fd 3 exists by the time the sweep runs.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(source, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        if seal {
+            seal_inherited_fds(&mut cmd, if keep_fd3 { vec![3] } else { Vec::new() });
+        }
+        let out = cmd.output().expect("spawn /bin/sh");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    #[test]
+    fn an_inherited_descriptor_does_not_reach_the_child() {
+        let file = secret_file();
+
+        // Baseline: without the seal the descriptor is readable. If this stops
+        // holding, the assertion below is proving nothing.
+        let unsealed = leak(&file);
+        assert!(
+            read_through_fd(unsealed.as_raw_fd(), false, false).contains(SECRET),
+            "the leak this test guards against no longer reproduces unsealed"
+        );
+
+        let sealed_fd = leak(&file);
+        let sealed = read_through_fd(sealed_fd.as_raw_fd(), false, true);
+        assert!(
+            !sealed.contains(SECRET),
+            "a descriptor the caller left open reached the child: {sealed}"
+        );
+    }
+
+    #[test]
+    fn a_kept_descriptor_still_reaches_the_child() {
+        // The Linux bubblewrap path hands the re-entry helper two pipes on
+        // purpose. Sealing must not take those away.
+        let file = secret_file();
+        let kept = leak(&file);
+        let fd = kept.as_raw_fd();
+
+        let got = read_through_fd(fd, true, true);
+        assert!(
+            got.contains(SECRET),
+            "an explicitly kept descriptor must survive exec: {got}"
+        );
+    }
+
+    #[test]
+    fn stdio_survives_sealing() {
+        // std dup2s the stdio pipes into 0/1/2 before pre_exec hooks run, so
+        // sealing 3.. must leave them alone. A regression here looks like the
+        // agent losing its terminal.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("echo out; echo err >&2; cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        seal_inherited_fds(&mut cmd, Vec::new());
+        let mut child = cmd.spawn().expect("spawn");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"echoed\n")
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("wait");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out\nechoed\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    }
+
+    #[test]
+    fn a_failed_exec_is_still_reported() {
+        // Sealing sets FD_CLOEXEC rather than calling close(2) precisely so
+        // std's exec-failure pipe keeps working. Closing it would make this
+        // spawn return Ok for a binary that does not exist.
+        let mut cmd = Command::new("/nonexistent/cplt-seal-test");
+        seal_inherited_fds(&mut cmd, Vec::new());
+        assert!(
+            cmd.output().is_err(),
+            "a failed execve must still surface as a spawn error"
         );
     }
 }
