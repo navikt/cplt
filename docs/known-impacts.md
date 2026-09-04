@@ -134,18 +134,27 @@ Or for a single run: `cplt --allow-cache-exec ms-playwright --allow-cache-exec p
 
 `--allow-cache-exec-any` opens exec for the entire cache tree (`~/Library/Caches` on macOS, `~/.cache` on Linux). Last resort only.
 
-> **Playwright Chromium on macOS and Linux:** also launch with `--no-sandbox`,
-> or set Playwright `chromiumSandbox: false`. On macOS, Chrome helpers inherit
-> cplt's profile and cannot initialize another Seatbelt sandbox
-> (`forbidden-sandbox-reinit`). On Linux, cplt's seccomp filter blocks the
-> `unshare`/`setns` syscalls used by Chromium's nested namespace sandbox. cplt
-> remains the enforcing kernel boundary on both platforms. Launching Chromium
-> with its sandbox disabled means a compromised renderer receives the full cplt
-> Playwright profile instead of Chromium's narrower child profile; cache opt-in
-> alone does not disable Chromium's sandbox, and cplt does not inject either
-> setting. cplt still validates the cache-exec subdir as traversal-free before
-> Landlock grants execute access. See
+> **Playwright Chromium on macOS and Linux:** Chromium cannot run its own
+> nested sandbox in here. On macOS its helpers inherit cplt's profile and cannot
+> initialize a second Seatbelt sandbox (`forbidden-sandbox-reinit`). On Linux,
+> cplt's seccomp filter blocks the `unshare`/`setns` syscalls that sandbox
+> needs. cplt remains the enforcing kernel boundary on both platforms, but a
+> renderer compromised there receives the full cplt Playwright profile instead
+> of Chromium's narrower child profile. cplt still validates the cache-exec
+> subdir as traversal-free before Landlock grants execute access. See
 > [SECURITY.md](../SECURITY.md#out-of-scope).
+>
+> **Which setting applies where.** `playwright` the library already launches
+> Chromium with `--no-sandbox` unless you explicitly ask for `chromiumSandbox:
+> true`, so a plain `chromium.launch()` needs no change. `@playwright/mcp` is
+> the one that turns it back on: always on macOS, and on Linux for channels
+> other than `chromium` and `chrome-for-testing`. The `ms-playwright` opt-in
+> therefore sets `PLAYWRIGHT_MCP_SANDBOX=false` for the child, the same way cplt
+> turns off Gradle's nested sandbox. That keeps the workaround inside cplt
+> instead of in an MCP server configuration that editors also read on machines
+> without it. Override with `--pass-env PLAYWRIGHT_MCP_SANDBOX`. Any other
+> Chromium launcher still needs `--no-sandbox` of its own. Note that the MCP's
+> README documents an environment variable name the shipped code does not read.
 
 ## Localhost blocking
 

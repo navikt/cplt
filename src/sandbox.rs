@@ -68,7 +68,8 @@ pub use profile::{ProfileOptions, generate_profile, generate_profile_with_playwr
 // Environment construction — already platform-agnostic.
 pub use env::{
     SandboxEnv, build_sandbox_env, npmrc_explicitly_allowed, npmrc_userconfig_override,
-    npmrc_userconfig_stale_variants, playwright_sockets_dir_override,
+    npmrc_userconfig_stale_variants, playwright_mcp_sandbox_disabled,
+    playwright_sockets_dir_override,
 };
 
 // The in-process PATH lookup. Re-exported (rather than opening the whole `exec`
@@ -178,6 +179,10 @@ pub struct PreparedSandbox {
     scratch_dir: Option<PathBuf>,
     /// Exact automatic Playwright socket base authorized by the macOS profile.
     playwright_socket_dir: Option<PathBuf>,
+    /// Explicit `ms-playwright` opt-in, the same intent that gates the browser
+    /// runtime rules. Chromium cannot nest its own sandbox inside cplt's, so
+    /// this also turns off Playwright MCP's nested sandbox for the child.
+    playwright_runtime: bool,
     proxy_port: Option<u16>,
     agent: Agent,
     /// Specific localhost ports the user has explicitly opened.
@@ -367,6 +372,10 @@ fn prepare_impl(
         profile_text,
         scratch_dir: config.scratch_dir.map(Path::to_path_buf),
         playwright_socket_dir: playwright_socket_dir.map(Path::to_path_buf),
+        playwright_runtime: policy::playwright_runtime_intent(
+            config.allow_cache_exec,
+            config.allow_cache_exec_any,
+        ),
         proxy_port: config.proxy_port,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),
@@ -601,6 +610,13 @@ fn prepare_impl(
         // The automatic capability is macOS-only; direct Linux callers cannot
         // introduce a new /tmp path lifecycle or child environment override.
         playwright_socket_dir: None,
+        // Chromium's nested sandbox is unavailable on both platforms: seccomp
+        // denies the namespace syscalls it needs here, Seatbelt refuses the
+        // reinitialization there. The opt-in signal is the same.
+        playwright_runtime: policy::playwright_runtime_intent(
+            config.allow_cache_exec,
+            config.allow_cache_exec_any,
+        ),
         proxy_port: config.proxy_port,
         agent: config.agent,
         allow_localhost: config.localhost_ports.to_vec(),

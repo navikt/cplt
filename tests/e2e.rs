@@ -4540,6 +4540,105 @@ paths = [
     }
 
     #[test]
+    fn e2e_exec_playwright_mcp_sandbox_is_disabled_only_for_exact_intent() {
+        require_sandbox!();
+
+        let opted_in = playwright_env_output(&["--allow-cache-exec", "ms-playwright"], None);
+        assert!(opted_in.status.success());
+        assert_eq!(
+            env_value(
+                &String::from_utf8_lossy(&opted_in.stdout),
+                "PLAYWRIGHT_MCP_SANDBOX"
+            ),
+            Some("false"),
+            "Chromium cannot nest its sandbox inside cplt's, so the opt-in must turn \
+             Playwright MCP's back off"
+        );
+
+        for (label, args) in [
+            ("no opt-in", Vec::<&str>::new()),
+            (
+                "unrelated opt-in",
+                vec!["--allow-cache-exec", "some-other-tool"],
+            ),
+            ("allow-cache-exec-any alone", vec!["--allow-cache-exec-any"]),
+        ] {
+            let output = playwright_env_output(&args, None);
+            assert!(output.status.success(), "{label} should run");
+            assert_eq!(
+                env_value(
+                    &String::from_utf8_lossy(&output.stdout),
+                    "PLAYWRIGHT_MCP_SANDBOX"
+                ),
+                None,
+                "{label} must not weaken a browser it was never asked to run"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_exec_playwright_mcp_sandbox_pass_env_returns_the_choice_to_the_caller() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args([
+                "--no-validate",
+                "--allow-cache-exec",
+                "ms-playwright",
+                "--pass-env",
+                "PLAYWRIGHT_MCP_SANDBOX",
+                "exec",
+                "--",
+                "/usr/bin/env",
+            ])
+            .current_dir(project_dir())
+            .env("PLAYWRIGHT_MCP_SANDBOX", "true")
+            .output()
+            .expect("cplt exec should run");
+        assert!(output.status.success());
+        assert_eq!(
+            env_value(
+                &String::from_utf8_lossy(&output.stdout),
+                "PLAYWRIGHT_MCP_SANDBOX"
+            ),
+            Some("true"),
+            "an explicit pass-through must not be overwritten by cplt's default"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_playwright_pass_env_without_value_warns_about_the_missing_socket_dir() {
+        require_sandbox!();
+        let output = playwright_env_output(
+            &[
+                "--allow-cache-exec",
+                "ms-playwright",
+                "--pass-env",
+                "PWTEST_SOCKETS_DIR",
+            ],
+            None,
+        );
+        assert!(
+            output.status.success(),
+            "the child should still run.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            env_value(&stdout, "PWTEST_SOCKETS_DIR"),
+            None,
+            "an override with no value must not be replaced by the automatic path"
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("PWTEST_SOCKETS_DIR is passed through but has no value"),
+            "cplt must name the cause instead of leaving Playwright to fail on \
+             a too-long socket path.\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
     fn e2e_exec_playwright_socket_dir_obeys_repo_deny_env_last() {
         require_sandbox!();
         let (repo, config_file) = make_trust_repo(

@@ -2915,16 +2915,38 @@ struct ShellSandbox {
 fn create_playwright_socket_dir(
     resolved: &config::Resolved,
 ) -> anyhow::Result<Option<scratch::PlaywrightSocketDir>> {
-    let automatic = sandbox::playwright_runtime_intent(
+    let intent = sandbox::playwright_runtime_intent(
         &resolved.allow_cache_exec,
         resolved.allow_cache_exec_any,
-    ) && !resolved
+    );
+    let caller_owned = resolved
         .pass_env
         .iter()
         .any(|name| name == "PWTEST_SOCKETS_DIR");
-    if !automatic {
+
+    // Passing the key through is an override signal, so cplt creates no
+    // directory and grants no socket rules. With no value to inherit the child
+    // gets nothing at all, and Playwright falls back to a path under cplt's
+    // long TMPDIR that exceeds its 103-byte Unix-socket limit. Setting the
+    // variable is not a way out either: the pass-through also suppresses the
+    // SBPL rules, so a shorter path of the caller's own would then be denied at
+    // bind. Both failures surface deep inside Playwright, so name the cause.
+    let inherited_value = std::env::var_os("PWTEST_SOCKETS_DIR")
+        .filter(|value| !value.is_empty())
+        .is_some();
+    if intent && caller_owned && !inherited_value {
+        ui::warn(
+            "PWTEST_SOCKETS_DIR is passed through but has no value, so cplt creates no \
+             socket directory for this session. Playwright will fall back to a path \
+             under TMPDIR that is usually too long for a Unix socket. Drop the \
+             pass-through to let cplt manage the directory and authorize its sockets.",
+        );
+    }
+
+    if !intent || caller_owned {
         return Ok(None);
     }
+
     scratch::PlaywrightSocketDir::create()
         .map(Some)
         .map_err(|error| anyhow::anyhow!("Cannot create Playwright socket dir: {error}"))

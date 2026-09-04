@@ -67,6 +67,7 @@ fn configure_command(
     git_guard: &crate::config::GitGuardPolicy,
     npmrc_allowed: bool,
     playwright_socket_dir: Option<&Path>,
+    playwright_runtime: bool,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -107,6 +108,14 @@ fn configure_command(
         super::env::playwright_sockets_dir_override(extra_pass_env, playwright_socket_dir)
     {
         cmd.env("PWTEST_SOCKETS_DIR", path);
+    }
+
+    // Playwright MCP re-enables Chromium's own sandbox, which cannot start
+    // inside cplt's. Disabling it here keeps the fix inside the boundary that
+    // needs it, instead of putting a cplt-only flag in the server configuration
+    // every editor and CLI shares.
+    if super::env::playwright_mcp_sandbox_disabled(extra_pass_env, playwright_runtime) {
+        cmd.env("PLAYWRIGHT_MCP_SANDBOX", "false");
     }
 
     // Default DOTNET_CLI_HOME to the already-resolved, already-validated sandbox
@@ -666,6 +675,7 @@ pub fn exec(
         git_guard,
         sandbox.npmrc_allowed,
         sandbox.playwright_socket_dir.as_deref(),
+        sandbox.playwright_runtime,
     );
 
     // Strip repo-config denied env vars
@@ -818,6 +828,7 @@ pub fn exec(
         git_guard,
         sandbox.npmrc_allowed,
         sandbox.playwright_socket_dir.as_deref(),
+        sandbox.playwright_runtime,
     );
 
     // Strip repo-config denied env vars
@@ -957,6 +968,7 @@ fn exec_bwrap(
         git_guard,
         sandbox.npmrc_allowed,
         sandbox.playwright_socket_dir.as_deref(),
+        sandbox.playwright_runtime,
     );
     for var in deny_env {
         cmd.env_remove(var);

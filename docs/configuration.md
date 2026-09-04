@@ -279,7 +279,7 @@ Supported ecosystems:
 
 Machine-specific suggestions such as `allow_cache_exec` or home-relative read paths come out as comments pointing you to add them to your personal `~/.config/cplt/config.toml`.
 
-The Playwright suggestion covers cache execution only. On macOS and Linux, Chromium must also run with `--no-sandbox` or Playwright `chromiumSandbox: false`; see [Known impacts](known-impacts.md#cache-exec-playwright-pnpm-dlx-etc).
+The Playwright suggestion enables cache execution and, with it, turns off Chromium's nested sandbox, which cannot run inside cplt. Playwright MCP is handled through `PLAYWRIGHT_MCP_SANDBOX`; any other Chromium launcher needs `--no-sandbox` itself. See [Known impacts](known-impacts.md#cache-exec-playwright-pnpm-dlx-etc).
 
 Permissions marked dangerous above get risk warnings in the generated TOML. `allow_lifecycle_scripts` is never auto-suggested. If lifecycle scripts are detected it only shows up as a diagnostic, because it allows arbitrary code execution on `npm install`.
 

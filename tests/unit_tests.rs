@@ -5622,6 +5622,28 @@ fn playwright_socket_dir_override_uses_only_the_automatic_path() {
 }
 
 #[test]
+fn playwright_mcp_sandbox_is_disabled_only_for_runtime_intent() {
+    use cplt::sandbox::playwright_mcp_sandbox_disabled;
+
+    assert!(
+        playwright_mcp_sandbox_disabled(&[], true),
+        "the browser opt-in must turn off a nested sandbox that cannot start in here"
+    );
+    assert!(
+        !playwright_mcp_sandbox_disabled(&[], false),
+        "without the opt-in cplt must not weaken a browser it was never asked to run"
+    );
+    assert!(
+        !playwright_mcp_sandbox_disabled(&["PLAYWRIGHT_MCP_SANDBOX".to_string()], true),
+        "an explicit pass-through returns the choice to the caller"
+    );
+    assert!(
+        playwright_mcp_sandbox_disabled(&["UNRELATED".to_string()], true),
+        "an unrelated pass-through must not suppress the default"
+    );
+}
+
+#[test]
 fn playwright_socket_dir_respects_explicit_pass_env_value() {
     let parent = make_env(&[("PWTEST_SOCKETS_DIR", "/caller/playwright-sockets")]);
     let extra_pass_env = ["PWTEST_SOCKETS_DIR".to_string()];
