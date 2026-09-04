@@ -991,14 +991,16 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         via_upstream,
         localhost_connect_allowed,
         localhost_opt_in,
-        is_domain_match(&host, &state.get_private_domains()),
+        // Only consulted when there is an address to check, so an unresolvable
+        // host costs no policy read (and no possible TTL-expiry file re-read).
+        resolved.is_some() && is_domain_match(&host, &state.get_private_domains()),
     );
 
     match route {
         ConnectRoute::Refuse(refusal) => {
             log_connection(state, "CONNECT", target, refusal.status());
             let _ = client.write_all(refusal.response());
-            if refusal.half_close() {
+            if refusal.shuts_down_socket() {
                 let _ = client.shutdown(std::net::Shutdown::Both);
             }
         }
@@ -1595,7 +1597,7 @@ pub fn resolved_ip_is_blocked(
 /// Each variant carries the audit-log status and the exact 403/502 the client
 /// sees, so the decision and its wire effect cannot drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
+pub(crate) enum Refusal {
     /// The host does not resolve locally and there is no upstream to defer to.
     DnsFail,
     /// A target permitted ONLY by the `--allow-localhost` carve-out resolved to
@@ -1613,7 +1615,7 @@ pub enum Refusal {
 impl Refusal {
     /// Audit-log status string.
     #[must_use]
-    pub fn status(self) -> &'static str {
+    pub(crate) fn status(self) -> &'static str {
         match self {
             Refusal::DnsFail => "DNS-FAIL",
             Refusal::ResolvedNonLoopback | Refusal::ResolvedPrivate => "BLOCKED-PRIVATE-RESOLVED",
@@ -1622,7 +1624,7 @@ impl Refusal {
 
     /// The exact bytes written back to the client.
     #[must_use]
-    pub fn response(self) -> &'static [u8] {
+    pub(crate) fn response(self) -> &'static [u8] {
         match self {
             Refusal::DnsFail => b"HTTP/1.1 502 Bad Gateway\r\n\r\n",
             Refusal::ResolvedNonLoopback => {
@@ -1632,17 +1634,20 @@ impl Refusal {
         }
     }
 
-    /// Whether the client socket is half-closed after the refusal. A policy
-    /// block does; a gateway error does not.
+    /// Whether the client socket is explicitly shut down (`Shutdown::Both`)
+    /// after the refusal, rather than just being dropped at the end of the
+    /// connection. A policy block does this so the client sees the tunnel go
+    /// away immediately; a gateway error does not. It is a full shutdown, not a
+    /// TCP half-close.
     #[must_use]
-    pub fn half_close(self) -> bool {
+    pub(crate) fn shuts_down_socket(self) -> bool {
         !matches!(self, Refusal::DnsFail)
     }
 }
 
 /// What to do with a CONNECT target once DNS has answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectRoute {
+pub(crate) enum ConnectRoute {
     /// Forward the tunnel through the configured upstream proxy.
     Upstream,
     /// Connect directly to this resolved address (never re-resolving).
@@ -1676,7 +1681,7 @@ pub enum ConnectRoute {
 /// allow/block/port gates above still constrain it. On the direct path there is
 /// no upstream to defer to, so it is a hard error.
 #[must_use]
-pub fn classify_resolved(
+pub(crate) fn classify_resolved(
     resolved: Option<std::net::SocketAddr>,
     via_upstream: bool,
     localhost_connect_allowed: bool,
@@ -2181,9 +2186,9 @@ mod tests {
             "BLOCKED-PRIVATE-RESOLVED"
         );
         // A policy block half-closes the socket; a gateway error does not.
-        assert!(Refusal::ResolvedPrivate.half_close());
-        assert!(Refusal::ResolvedNonLoopback.half_close());
-        assert!(!Refusal::DnsFail.half_close());
+        assert!(Refusal::ResolvedPrivate.shuts_down_socket());
+        assert!(Refusal::ResolvedNonLoopback.shuts_down_socket());
+        assert!(!Refusal::DnsFail.shuts_down_socket());
         assert!(Refusal::DnsFail.response().starts_with(b"HTTP/1.1 502"));
         assert!(
             Refusal::ResolvedPrivate
