@@ -753,13 +753,22 @@ except OSError as e:
     // here so the guarantee is pinned the moment a runner has it.
 
     /// Probe that tries to `connect()` to a pathname UNIX socket.
+    ///
+    /// The path is hex-encoded rather than interpolated. It crosses two
+    /// quoting layers — a double-quoted shell word and a single-quoted Python
+    /// literal — and at least one caller derives it from `$HOME`, where a
+    /// quote or a backslash is legal. Encoded, the payload is `[0-9a-f]` only,
+    /// so neither layer can misread it and a broken probe can never be
+    /// mistaken for a sandbox verdict. `connect()` takes the decoded bytes:
+    /// AF_UNIX addresses are bytes, not text.
     fn unix_connect_probe(path: &str) -> String {
+        let hex: String = path.bytes().map(|b| format!("{b:02x}")).collect();
         format!(
             r#"python3 -c "
-import socket, sys
+import binascii, socket
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
-    s.connect('{path}')
+    s.connect(binascii.unhexlify('{hex}'))
     print('CONNECTED')
 except OSError as e:
     print(f'REFUSED {{e.errno}}')
