@@ -565,17 +565,23 @@ EOF
         );
     }
 
-    /// The #202 case: a relocated Homebrew prefix (`~/.linuxbrew`), whose
-    /// binaries only work if the grant carries READ as well as EXECUTE — the
-    /// interpreter and the RPATH libraries live inside the same prefix. The
-    /// script here proves both halves at once: exec'ing it needs execute, and
-    /// its own interpreter plus the file it reads need read.
+    /// The #202 case: a relocated Homebrew prefix, whose binaries only work if
+    /// the grant carries READ as well as EXECUTE — the interpreter and the RPATH
+    /// libraries live inside the same prefix. The script here proves both halves
+    /// at once: exec'ing it needs execute, and its own interpreter plus the file
+    /// it reads need read.
+    ///
+    /// The prefix lives under the real `$HOME`, not the fake one: bubblewrap
+    /// mounts a private tmpfs over `/tmp` and binds back only the *writable*
+    /// rules, so a read-only grant on a path under `/tmp` — which every
+    /// `tempfile::tempdir()` is — would be invisible inside the namespace and the
+    /// test would fail for a reason that has nothing to do with the grant.
     #[test]
     fn landlock_allow_exec_grants_read_and_execute_on_a_tool_prefix() {
         require_landlock!();
         let project = create_test_project();
         let fake_home = tempfile::tempdir().expect("Failed to create temp home");
-        let prefix = fake_home.path().join(".linuxbrew");
+        let prefix = home_dir().join(format!(".cplt-exec-test-{}", std::process::id()));
         fs::create_dir_all(prefix.join("bin")).unwrap();
         fs::create_dir_all(prefix.join("lib")).unwrap();
         fs::write(prefix.join("lib/marker"), "linked ok\n").unwrap();
@@ -595,8 +601,10 @@ EOF
             project.path(),
             fake_home.path(),
             &["--allow-exec", &prefix_arg],
-            "~/.linuxbrew/bin/tool",
+            &format!("{prefix_arg}/bin/tool"),
         );
+        fs::remove_dir_all(&prefix).ok();
+
         assert_eq!(
             code, 0,
             "--allow-exec on a relocated tool prefix must make its binaries runnable \
@@ -615,7 +623,7 @@ EOF
         require_landlock!();
         let project = create_test_project();
         let fake_home = tempfile::tempdir().expect("Failed to create temp home");
-        let prefix = fake_home.path().join(".linuxbrew");
+        let prefix = home_dir().join(format!(".cplt-exec-blocked-{}", std::process::id()));
         fs::create_dir_all(prefix.join("bin")).unwrap();
         fs::write(prefix.join("bin/tool"), "#!/bin/sh\necho should not run\n").unwrap();
         fs::set_permissions(
@@ -624,11 +632,14 @@ EOF
         )
         .unwrap();
 
+        let prefix_arg = prefix.to_string_lossy().into_owned();
         let (code, stdout, _) = run_sandboxed_home(
             project.path(),
             fake_home.path(),
-            "~/.linuxbrew/bin/tool 2>&1",
+            &format!("{prefix_arg}/bin/tool 2>&1"),
         );
+        fs::remove_dir_all(&prefix).ok();
+
         assert!(
             code != 0 || !stdout.contains("should not run"),
             "exec from an ungranted prefix must be blocked — code: {code}, stdout: {stdout}"
