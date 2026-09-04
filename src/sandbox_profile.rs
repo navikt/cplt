@@ -2642,7 +2642,7 @@ mod tests {
             let esc = root.replace('.', r"\.");
             for rule in [
                 format!(
-                    "(deny file-write* (regex #\"^{esc}/.+/\\.git/(hooks|config|commondir|modules)($|/)\"))"
+                    "(deny file-write* (regex #\"^{esc}/.+/\\.git/(hooks|config|commondir|modules|info/exclude)($|/)\"))"
                 ),
                 format!("(deny file-write-unlink (regex #\"^{esc}/.+/\\.git$\"))"),
                 format!("(deny file-write-data (regex #\"^{esc}/.+/\\.git$\"))"),
@@ -2653,7 +2653,7 @@ mod tests {
 
         // Last-match-wins: nothing may re-open write after these.
         let nested_deny = p
-            .rfind("/.+/\\.git/(hooks|config|commondir|modules)")
+            .rfind("/.+/\\.git/(hooks|config|commondir|modules|info/exclude)")
             .expect("nested deny missing");
         let last_write_allow = p.rfind("(allow file-write*").expect("no write allows");
         assert!(
@@ -2711,6 +2711,154 @@ mod tests {
             let rule = format!("(deny file-write* (regex #\"^{esc}/.+/\\.agents/plugins($|/)\"))");
             assert!(p.contains(&rule), "missing nested deny for {root}: {rule}");
         }
+    }
+
+    /// #339: `.github/hooks/*.json` is a Copilot CLI hook load path inside the
+    /// writable project directory. A hook the agent writes there runs on the
+    /// next *unsandboxed* Copilot session in that repo — and unlike the
+    /// `~/.copilot` paths it needs no grant at all, since the project dir is
+    /// writable by definition. Denied for every writable root, because a
+    /// granted sibling repo is as exposed as the project.
+    #[test]
+    fn github_hooks_is_denied_for_every_writable_root() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let rule = format!("(deny file-write* (subpath \"{root}/.github/hooks\"))");
+            assert!(p.contains(&rule), "missing for {root}: {rule}");
+        }
+
+        // Last-match-wins: an `allow.write` on the project must not reopen it.
+        let deny = p
+            .rfind("/.github/hooks\"))")
+            .expect("github hooks deny must be emitted");
+        let last_allow = p
+            .rfind("(allow file-write*")
+            .expect("a write allow must be emitted");
+        assert!(
+            last_allow < deny,
+            "a write allow at {last_allow} comes after the .github/hooks deny at {deny}"
+        );
+    }
+
+    /// The hook fires for whoever next opens *that* repo, so a repo nested
+    /// under a writable root needs the same deny — the #247 shape.
+    #[test]
+    fn github_hooks_is_denied_in_nested_repos_too() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = root.replace('.', r"\.");
+            let rule = format!("(deny file-write* (regex #\"^{esc}/.+/\\.github/hooks($|/)\"))");
+            assert!(p.contains(&rule), "missing nested deny for {root}: {rule}");
+        }
+    }
+
+    /// Scoped to `hooks/`. Workflows, instruction files and agent prompts under
+    /// `.github/` are ordinary repo content, and CI is a different boundary —
+    /// denying the tree would break writes nothing asked to break.
+    #[test]
+    fn github_dir_itself_is_not_denied() {
+        let p = generate_profile(
+            &test_options(
+                std::path::Path::new("/projects/app"),
+                std::path::Path::new("/Users/test"),
+            ),
+            &[],
+        );
+        assert!(
+            !p.contains("(deny file-write* (subpath \"/projects/app/.github\"))"),
+            "only .github/hooks is denied, not the whole tree"
+        );
+    }
+
+    /// #341: `.git/info/exclude` is a local, uncommitted gitignore. Writing it
+    /// hides every path it names from `git status` — the review step people
+    /// actually perform — so an agent can conceal what it plants. Emitted for
+    /// every gitdir the profile names, like the rest of `PROTECTED_IN_GITDIR`.
+    #[test]
+    fn git_info_exclude_is_denied_in_every_gitdir() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let rule = format!("(deny file-write* (literal \"{root}/.git/info/exclude\"))");
+            assert!(p.contains(&rule), "missing for {root}: {rule}");
+        }
+
+        let deny = p
+            .rfind("/.git/info/exclude\"))")
+            .expect("info/exclude deny must be emitted");
+        let last_allow = p
+            .rfind("(allow file-write*")
+            .expect("a write allow must be emitted");
+        assert!(
+            last_allow < deny,
+            "a write allow at {last_allow} comes after the info/exclude deny at {deny}"
+        );
+    }
+
+    /// A file hidden in a nested repo is hidden from the same `git status`, so
+    /// `info/exclude` joins the nested alternation rather than stopping at the
+    /// gitdirs the profile can name.
+    #[test]
+    fn git_info_exclude_is_denied_in_nested_repos_too() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home), &[]);
+        assert!(
+            p.contains(
+                "(deny file-write* (regex #\"^/projects/app/.+/\\.git/(hooks|config|commondir|modules|info/exclude)($|/)\"))"
+            ),
+            "info/exclude must reach the nested-repo alternation:\n{p}"
+        );
+    }
+
+    /// #313: `.cplt.toml` was denied only at the writable root, so
+    /// `~/code/other-repo/.cplt.toml` stayed writable under `allow.write =
+    /// ["~/code"]` and a later `--project-dir ~/code/other-repo` read it.
+    #[test]
+    fn cplt_toml_is_denied_in_nested_repos_too() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = root.replace('.', r"\.");
+            let rule = format!("(deny file-write* (regex #\"^{esc}/.+/\\.cplt\\.toml($|/)\"))");
+            assert!(p.contains(&rule), "missing nested deny for {root}: {rule}");
+        }
+    }
+
+    /// #313, the other half: `git submodule update --init` reads `.gitmodules`
+    /// directly, so the nested variant is not covered by the nested
+    /// `.git/config` deny the way the old rationale claimed.
+    #[test]
+    fn gitmodules_is_denied_in_nested_repos_too() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home), &[]);
+        assert!(
+            p.contains("(deny file-write* (regex #\"^/projects/app/.+/\\.gitmodules($|/)\"))"),
+            "missing nested .gitmodules deny:\n{p}"
+        );
     }
 
     /// The rest of `.agents/` is ordinary state with no auto-execution. Denying

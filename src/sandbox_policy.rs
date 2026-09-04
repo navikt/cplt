@@ -1891,12 +1891,18 @@ pub const PROTECTED_IN_ROOT: &[Protected] = &[
     // Submodule URLs are a supply-chain vector: `git submodule update` clones
     // whatever this file names.
     //
-    // Not nested: a nested repo's `.gitmodules` is only reachable through that
-    // repo's own `.git/config`, which is already denied at every depth.
+    // Nested since #313. The earlier rationale for stopping at the root — that a
+    // nested repo's `.gitmodules` is only reachable through its own `.git/config`,
+    // which is denied at every depth — does not hold: `git submodule update
+    // --init` reads `.gitmodules` directly to seed that config. The nested flag is
+    // macOS-only (no other backend can express "any depth"), so this costs nothing
+    // on Linux, and on macOS it costs nothing new either: `git submodule add` in a
+    // nested repo already fails on its `<gitdir>/config` write. The Linux position
+    // is unchanged and stated below.
     Protected {
         rel: ".gitmodules",
         tree: false,
-        nested: false,
+        nested: true,
         why: "Git submodule config — URLs are a supply-chain vector",
         linux: LinuxCoverage::Gap(
             "not in the bubblewrap ro-protect set. Exploiting a rewritten URL needs \
@@ -1908,10 +1914,17 @@ pub const PROTECTED_IN_ROOT: &[Protected] = &[
     },
     // cplt's own config controls how relaxed the *next* session's sandbox is.
     // Writing it would let the agent prepare a permissive profile for itself.
+    //
+    // Nested since #313: with `allow.write = ["~/code"]`, `~/code/other-repo/
+    // .cplt.toml` was writable, and a later `--project-dir ~/code/other-repo`
+    // reads it. Repo config can only tighten, so this is not a route to a wider
+    // sandbox — it is an agent steering a *later* run in a repository this run
+    // was never pointed at. Same argument that made `.git/hooks` (#247) and
+    // `.agents/plugins` (#276) nested.
     Protected {
         rel: ".cplt.toml",
         tree: false,
-        nested: false,
+        nested: true,
         why: "Repo config — deny write to prevent sandbox tampering",
         linux: LinuxCoverage::Bwrap,
     },
@@ -1927,6 +1940,26 @@ pub const PROTECTED_IN_ROOT: &[Protected] = &[
         tree: true,
         nested: true,
         why: "Plugin manifests — auto-spawned on the host next session",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // #339: `.github/hooks/*.json` is a documented Copilot CLI hook load path.
+    // Same class as `.git/hooks` — a file the agent writes now that executes
+    // later, outside the sandbox, in whichever repo the user opens next — but
+    // strictly worse in three ways. It needs no grant at all, because it lives
+    // in the project directory the sandbox makes writable by definition; a file
+    // appearing under `.github/` is less conspicuous than one under `.git/`,
+    // which most people never open; and it survives being committed and pushed,
+    // so it can reach other people's checkouts rather than only the author's.
+    //
+    // Scoped to `hooks/`, not all of `.github/`: workflows, instruction files
+    // and agent prompts there are ordinary repo content people edit routinely,
+    // and CI execution is a different trust boundary. `hooks/` is the only
+    // project-directory path Copilot loads and runs on the host.
+    Protected {
+        rel: ".github/hooks",
+        tree: true,
+        nested: true,
+        why: "Copilot hook load path — runs unsandboxed on the next session in this repo",
         linux: LinuxCoverage::Bwrap,
     },
 ];
@@ -2000,6 +2033,31 @@ pub const PROTECTED_IN_GITDIR: &[Protected] = &[
             "not in the bubblewrap ro-protect set, and reaching it needs the same \
              `<gitdir>/config` write that is itself only denied on macOS.",
         ),
+    },
+    // #341: a local, uncommitted gitignore. Nothing here executes, so this is a
+    // lower bracket than `hooks` — what it is, is a *concealment* vector. Every
+    // path `info/exclude` names disappears from `git status`, for the user and
+    // for any tooling that shells out to git, and `git status` is the review
+    // step people actually perform. It composes with `.github/hooks` (#339): a
+    // hook planted in the working tree and hidden from `git status` is one the
+    // user never sees appear.
+    //
+    // Nothing legitimate writes it from inside a session — git creates it once
+    // from the template at `git init` and never touches it again — so the deny
+    // is free. `.gitignore` in the working tree is deliberately not protected:
+    // it is committed, so it shows up in a diff.
+    //
+    // The other route to the same concealment, `core.excludesFile`, is closed
+    // by paths already denied: `<gitdir>/config` (denied at every depth on
+    // macOS), and the user-level `~/.gitconfig` / `~/.gitconfig.local` /
+    // `~/.config/git`, which are read-only exceptions in a home that is
+    // write-denied by default.
+    Protected {
+        rel: "info/exclude",
+        tree: false,
+        nested: true,
+        why: "local gitignore — hides whatever the agent plants from `git status`",
+        linux: LinuxCoverage::Bwrap,
     },
 ];
 
@@ -2245,12 +2303,12 @@ mod tests {
         };
         assert_eq!(
             bwrap(PROTECTED_IN_ROOT),
-            [".cplt.toml", ".agents/plugins"],
+            [".cplt.toml", ".agents/plugins", ".github/hooks"],
             "bubblewrap re-binds these read-only under every writable root"
         );
         assert_eq!(
             bwrap(PROTECTED_IN_GITDIR),
-            ["hooks"],
+            ["hooks", "info/exclude"],
             "`config`, `commondir` and `modules` are macOS-only; each entry \
              carries the reason in its LinuxCoverage::Gap"
         );
@@ -2272,11 +2330,11 @@ mod tests {
     fn nested_alternation_covers_the_nested_entries() {
         assert_eq!(
             nested_alternation(PROTECTED_IN_GITDIR),
-            "hooks|config|commondir|modules"
+            "hooks|config|commondir|modules|info/exclude"
         );
         assert_eq!(
             nested_alternation(PROTECTED_IN_ROOT),
-            r"\.agents/plugins",
+            r"\.gitmodules|\.cplt\.toml|\.agents/plugins|\.github/hooks",
             "a `.` in a rel path must reach the regex escaped, not as `any char`"
         );
     }

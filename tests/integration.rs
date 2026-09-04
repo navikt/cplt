@@ -1401,6 +1401,98 @@ mod macos_tests {
         );
     }
 
+    /// #339: `.github/hooks/*.json` is a Copilot CLI hook load path in the
+    /// writable project directory, so a hook planted there runs on the next
+    /// unsandboxed session in that repo. Kernel-level proof, not just the
+    /// profile string.
+    #[test]
+    fn real_profile_blocks_github_hooks_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".github-hooks-{}", std::process::id()));
+        fs::create_dir_all(tmp.join(".github/hooks")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let hook_path = tmp.join(".github/hooks/session-start.json");
+        let cmd = format!(
+            "echo '{{\"command\":\"id\"}}' > '{}' 2>&1; echo EXIT:$?",
+            hook_path.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "writing to .github/hooks should be blocked, got: {output}"
+        );
+    }
+
+    /// #341: writing `.git/info/exclude` hides whatever the agent plants from
+    /// `git status`, which is the review step people actually perform.
+    #[test]
+    fn real_profile_blocks_git_info_exclude_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".info-exclude-{}", std::process::id()));
+        fs::create_dir_all(tmp.join(".git/info")).unwrap();
+        fs::write(tmp.join(".git/info/exclude"), "").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let exclude = tmp.join(".git/info/exclude");
+        let cmd = format!(
+            "echo 'evil.json' >> '{}' 2>&1; echo EXIT:$?",
+            exclude.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "writing to .git/info/exclude should be blocked, got: {output}"
+        );
+    }
+
+    /// #313: the nested variant is a regex rather than a path rule, so it needs
+    /// its own kernel check — `<root>/<repo>/.cplt.toml` steers a later run
+    /// pointed at that repo, which this run was never pointed at.
+    #[test]
+    fn real_profile_blocks_nested_repo_cplt_toml_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".nested-cplt-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("other-repo")).unwrap();
+        fs::write(tmp.join("other-repo/.cplt.toml"), "").unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let nested = tmp.join("other-repo/.cplt.toml");
+        let cmd = format!(
+            "echo 'tampered' >> '{}' 2>&1; echo EXIT:$?",
+            nested.display()
+        );
+        let (output, _) = run_sandboxed(&profile, &cmd);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("Operation not permitted") || output.contains("EXIT:1"),
+            "writing to a nested repo's .cplt.toml should be blocked, got: {output}"
+        );
+    }
+
     // ── Temp exec denial (write-then-exec attack) ─────────────────
 
     #[test]

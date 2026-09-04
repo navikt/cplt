@@ -1346,13 +1346,17 @@ mod tests {
     fn ro_protect_set_is_narrow_and_leaves_git_config_writable() {
         // The protected set is deliberately narrow: exactly the
         // `LinuxCoverage::Bwrap` entries of `PROTECTED_IN_ROOT` and
-        // `PROTECTED_IN_GITDIR` — .git/hooks, .cplt.toml, .agents/plugins.
+        // `PROTECTED_IN_GITDIR` — .git/hooks, .git/info/exclude, .cplt.toml,
+        // .agents/plugins and .github/hooks.
         // .git/config / .gitmodules must stay writable so legit in-sandbox git
         // config/remote/submodule ops (and their lock files) are not broken —
         // even when those files exist on disk.
         let proj = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(proj.path().join(".git/hooks")).expect("create .git/hooks");
         std::fs::create_dir_all(proj.path().join(".agents/plugins")).expect("create plugins");
+        std::fs::create_dir_all(proj.path().join(".github/hooks")).expect("create .github/hooks");
+        std::fs::create_dir_all(proj.path().join(".git/info")).expect("create .git/info");
+        std::fs::write(proj.path().join(".git/info/exclude"), "").expect("create info/exclude");
         std::fs::write(proj.path().join(".git/config"), "").expect("create .git/config");
         std::fs::write(proj.path().join(".gitmodules"), "").expect("create .gitmodules");
         std::fs::write(proj.path().join(".cplt.toml"), "").expect("create .cplt.toml");
@@ -1382,6 +1386,19 @@ mod tests {
             args.windows(2).any(|w| w[0] == "--ro-bind"
                 && w[1] == proj.path().join(".agents/plugins").to_string_lossy()),
             ".agents/plugins must be re-bound read-only"
+        );
+        // #339: a Copilot hook load path in the writable project dir, running
+        // unsandboxed on the next session in this repo.
+        assert!(
+            args.windows(2).any(|w| w[0] == "--ro-bind"
+                && w[1] == proj.path().join(".github/hooks").to_string_lossy()),
+            ".github/hooks must be re-bound read-only"
+        );
+        // #341: writing it hides whatever the agent plants from `git status`.
+        assert!(
+            args.windows(2).any(|w| w[0] == "--ro-bind"
+                && w[1] == proj.path().join(".git/info/exclude").to_string_lossy()),
+            ".git/info/exclude must be re-bound read-only"
         );
         // .git/config and .gitmodules are NOT re-bound (stay writable), even
         // though both exist on disk — the narrowing, not the exists-check, is
