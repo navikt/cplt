@@ -2137,6 +2137,65 @@ mod tests {
         }
     }
 
+    /// #238: `$PNPM_HOME` is `~/.local/share/pnpm` on Linux, and `pnpm setup`
+    /// puts it on PATH — the global shims sit directly in it. Landlock cannot
+    /// subtract a deny from an allowed tree, so the only shape that works is
+    /// not granting write on the dir in the first place and granting it on
+    /// `store/` instead, which is all `pnpm install` needs.
+    #[test]
+    fn pnpm_home_is_not_writable_but_its_store_is() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let policy = generate_policy(&test_config(&project, &home));
+        let Some(data) = policy::AppDirKind::Data.resolve("", "", "pnpm", &home) else {
+            return;
+        };
+
+        for rule in policy.fs_rules.iter().filter(|r| r.path == data) {
+            assert!(
+                !rule.access.write,
+                "$PNPM_HOME must not be writable — a shim dropped there runs unsandboxed on the next PATH lookup"
+            );
+        }
+        let store = data.join("store");
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == store && r.access.write),
+            "pnpm's content-addressable store must stay writable for ordinary `pnpm install`"
+        );
+    }
+
+    /// The same class one tree over, where the structural fix does apply:
+    /// `~/.bun/bin` and `~/.deno/bin` are covered by their parents losing write.
+    #[test]
+    fn bun_and_deno_roots_are_not_writable() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let policy = generate_policy(&test_config(&project, &home));
+
+        for dir in [".bun", ".deno"] {
+            let path = home.join(dir);
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == path)
+                .unwrap_or_else(|| panic!("{dir} should be in rules"));
+            assert!(
+                !rule.access.write,
+                "~/{dir} must not be writable — its bin/ is on PATH"
+            );
+        }
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == home.join(".bun/install") && r.access.write),
+            "bun's global module cache must stay writable"
+        );
+    }
+
     #[test]
     fn scratch_dir_always_has_exec() {
         let project = PathBuf::from("/home/user/project");

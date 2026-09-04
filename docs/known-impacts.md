@@ -691,6 +691,45 @@ Plenty of developer tools phone home with default-on usage analytics: build syst
 
 Tools keep working normally. These are non-essential telemetry endpoints.
 
+## Global tool installs
+
+The directories a package manager puts on your `PATH` are read-only inside the sandbox:
+
+| Directory | Written by |
+| --- | --- |
+| `~/.bun/bin` | `bun install -g` |
+| `~/.deno/bin` | `deno install`, `deno upgrade` |
+| `$PNPM_HOME` (`~/Library/pnpm`, `~/.local/share/pnpm`) | `pnpm add -g`, `pnpm setup`, `pnpm env use -g` |
+| `~/.local/share/mise/shims` | `mise install`, `mise use -g`, `mise reshim` |
+| `~/.local/share/mise/installs/<tool>/<version>/bin` | `mise install`, `mise use -g` |
+
+`~/.cargo/bin` and `~/go/bin` have been read-only for the same reason since the start. These directories sit ahead of `/usr/bin` on your `PATH`, so a file the agent leaves in one of them is what your *next* shell command resolves — outside the sandbox, with your credentials. Six lines of shell is the whole exploit: write `$HOME/.bun/bin/git`, `chmod 700`, exit.
+
+**Those commands now fail inside cplt.** That is the point, not a bug. Run them outside, in a normal shell.
+
+**Project-local installs are unaffected.** `npm install`, `pnpm install`, `bun install`, `cargo build`, `go build` and `pip install` in a venv write to the project or to a per-project cache. The sibling package and cache trees stay writable — `~/.bun/install`, `$PNPM_HOME/store`, `~/.npm`, `~/.cargo/registry` — so nothing about ordinary dependency resolution changes.
+
+**The one that will bite you: mise bootstrap.** A repo whose `mise.toml` pins a toolchain your host does not already have will not bootstrap inside cplt. `mise install` fails writing to `installs/`, and even a toolchain that installs cleanly cannot be reshimmed. Install it once outside:
+
+```bash
+mise install          # outside cplt
+cplt                  # then work inside
+```
+
+`mise x`, `mise exec` and an already-activated toolchain keep working — reading and executing what is already on disk was never restricted.
+
+**Relocated homes are followed, `XDG_DATA_HOME` for pnpm is not.** A custom `$PNPM_HOME` gets the same split posture (read-only top level, writable `store/`) through the same mechanism that keeps `$CARGO_HOME/bin` exec-only. But pnpm's store carve-out is spelled at the two default locations, so if you have moved `XDG_DATA_HOME` and use pnpm, add the store back explicitly:
+
+```toml
+# .cplt.toml
+[allow]
+write = ["~/my-xdg-data/pnpm/store"]   # only `~/` expands, not env vars
+```
+
+**Linux is weaker than macOS here.** For `~/.bun`, `~/.deno` and `$PNPM_HOME` it is not: those are enforced by *not granting* write to the parent, which Landlock expresses natively. mise is the exception — its `shims/` and `installs/` sit inside a data dir that has to stay writable, and Landlock cannot deny a subpath inside an allowed tree. They are carried by the bubblewrap read-only overlay instead, so they hold only when `bwrap` is installed and only for directories that already exist. Without bubblewrap, the mise pair is unenforced on Linux. Under bubblewrap the whole of `installs/` is read-only rather than just each `<tool>/<version>/bin`, because bwrap binds paths and takes no globs.
+
+**There is no flag that reopens these.** The denies are emitted after every user `allow.write`, so `--allow-write ~/.bun` does not override them, the same way it does not override the agent config-dir denies below.
+
 ## Agent config-dir host-persistence denies
 
 Each agent's global config dir is mounted read/write, but the files in it that **auto-execute on the host** the next time you run that agent outside cplt are write-denied. A sandboxed agent never needs to write them mid-session, and anything it did write there would run unsandboxed on your next launch.

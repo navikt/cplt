@@ -3601,6 +3601,248 @@ fn profile_cargo_has_exec() {
     );
 }
 
+// ============================================================
+// PATH-resolved bin and shim directories (#238)
+// ============================================================
+
+/// The dirs a trojan binary would be dropped into, and the exact SBPL rule
+/// that must deny writes to each. A binary left in one of these is what the
+/// user's next *unsandboxed* `git`/`node`/`python` resolves through PATH.
+const PATH_BIN_DENY_RULES: &[(&str, &str)] = &[
+    (
+        "~/.bun/bin",
+        r#"(deny file-write* (subpath "/Users/test/.bun/bin"))"#,
+    ),
+    (
+        "~/.deno/bin",
+        r#"(deny file-write* (subpath "/Users/test/.deno/bin"))"#,
+    ),
+    (
+        "$PNPM_HOME (macOS default)",
+        r#"(deny file-write* (regex #"^/Users/test/Library/pnpm/[^/]+$"))"#,
+    ),
+    (
+        "$PNPM_HOME (XDG default)",
+        r#"(deny file-write* (regex #"^/Users/test/\.local/share/pnpm/[^/]+$"))"#,
+    ),
+    (
+        "mise shims/",
+        r#"(deny file-write* (subpath "/Users/test/.local/share/mise/shims"))"#,
+    ),
+    (
+        "mise installs/*/bin",
+        r#"(deny file-write* (regex #"^/Users/test/\.local/share/mise/installs/[^/]+/[^/]+/bin($|/)"))"#,
+    ),
+];
+
+#[test]
+fn profile_denies_write_on_path_resolved_bin_dirs() {
+    let p = default_profile();
+    for (name, rule) in PATH_BIN_DENY_RULES {
+        assert!(
+            p.contains(rule),
+            "{name} must be write-denied — a binary dropped there runs unsandboxed on the user's next PATH lookup.\nMissing rule: {rule}"
+        );
+    }
+}
+
+#[test]
+fn path_bin_denies_come_after_every_allow_they_narrow() {
+    let p = default_profile();
+    // SBPL is last-match-wins, so a deny placed before the allow it narrows is
+    // silently dead. The mise data dir is the one that actually needs this:
+    // it is granted write, and the two denies carve out of it.
+    let allow = p
+        .rfind(r#"(allow file-write* (subpath "/Users/test/.local/share/mise"))"#)
+        .expect("mise data dir must still be writable for the rest of mise's state");
+    for (name, rule) in PATH_BIN_DENY_RULES {
+        let deny = p
+            .find(rule)
+            .unwrap_or_else(|| panic!("{name} rule missing"));
+        assert!(
+            deny > allow,
+            "{name} deny must be emitted after the last write-allow it narrows (last-match-wins)"
+        );
+    }
+}
+
+#[test]
+fn path_bin_denies_survive_a_user_allow_write_over_the_parent() {
+    // `allow.write = ["~/.bun"]` is an ordinary thing for a user to write, and
+    // before #237's tail-placement fix that reopened everything underneath.
+    let extra_write = [
+        std::path::PathBuf::from("/Users/test/.bun"),
+        std::path::PathBuf::from("/Users/test/Library/pnpm"),
+    ];
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &extra_write,
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        extra_git_dirs: &[],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+        credential_outside_keychain: false,
+    });
+    let user_allow = p
+        .rfind(r#"(allow file-write* (subpath "/Users/test/.bun"))"#)
+        .expect("user allow.write must be emitted");
+    let deny = p
+        .find(r#"(deny file-write* (subpath "/Users/test/.bun/bin"))"#)
+        .expect("~/.bun/bin deny must be emitted");
+    assert!(
+        deny > user_allow,
+        "a user allow.write over ~/.bun must not reopen ~/.bun/bin"
+    );
+}
+
+#[test]
+fn profile_keeps_the_sibling_package_and_cache_trees_writable() {
+    let p = default_profile();
+    // Denying the bin dirs must not cost ordinary project-local installs.
+    for (what, rule) in [
+        (
+            "bun's global module cache",
+            r#"(allow file-write* (subpath "/Users/test/.bun/install"))"#,
+        ),
+        (
+            "pnpm's content-addressable store (macOS)",
+            r#"(allow file-write* (subpath "/Users/test/Library/pnpm/store"))"#,
+        ),
+        (
+            "pnpm's content-addressable store (XDG)",
+            r#"(allow file-write* (subpath "/Users/test/.local/share/pnpm/store"))"#,
+        ),
+        (
+            "the mise data dir",
+            r#"(allow file-write* (subpath "/Users/test/.local/share/mise"))"#,
+        ),
+    ] {
+        assert!(p.contains(rule), "{what} must stay writable: {rule}");
+    }
+}
+
+#[test]
+fn path_bin_parents_are_never_granted_write() {
+    let p = default_profile();
+    // The structural half of the fix: HOME_TOOL_DIRS grants write to the
+    // sibling cache, not the parent. This is what makes the rule hold on
+    // Landlock too, which cannot subtract from an allowed tree.
+    for parent in [
+        "/Users/test/.bun",
+        "/Users/test/.deno",
+        "/Users/test/Library/pnpm",
+        "/Users/test/.local/share/pnpm",
+    ] {
+        assert!(
+            !p.contains(&format!("(allow file-write* (subpath \"{parent}\"))")),
+            "{parent} must not be granted write — the shims sit directly in it"
+        );
+    }
+}
+
+#[test]
+fn home_tool_dirs_split_bin_dirs_from_their_caches() {
+    use cplt::sandbox::HOME_TOOL_DIRS;
+    let posture = |path: &str| {
+        HOME_TOOL_DIRS
+            .iter()
+            .find(|d| d.path == path)
+            .unwrap_or_else(|| panic!("HOME_TOOL_DIRS missing {path}"))
+    };
+    for path in [".bun", ".deno", "Library/pnpm"] {
+        assert!(
+            !posture(path).write,
+            "{path} must not be writable — its bin/ is on PATH"
+        );
+    }
+    for path in [
+        ".bun/install",
+        "Library/pnpm/store",
+        ".local/share/pnpm/store",
+    ] {
+        assert!(
+            posture(path).write,
+            "{path} must stay writable — project-local installs go through it"
+        );
+    }
+    // Order is load-bearing on both backends: SBPL is last-match-wins and
+    // Landlock unions a path's ancestors, so the narrower grant must come
+    // second.
+    let index = |path: &str| {
+        HOME_TOOL_DIRS
+            .iter()
+            .position(|d| d.path == path)
+            .expect("entry present")
+    };
+    assert!(index(".bun/install") > index(".bun"));
+    assert!(index("Library/pnpm/store") > index("Library/pnpm"));
+}
+
+#[test]
+fn pnpm_app_dir_does_not_grant_write_to_its_data_dir() {
+    use cplt::sandbox::{AppDirKind, app_dirs};
+    let home = std::path::Path::new("/Users/test");
+    let pnpm = app_dirs()
+        .iter()
+        .find(|d| d.application == "pnpm")
+        .expect("pnpm AppDir entry");
+    let data = AppDirKind::Data
+        .resolve("", "", "pnpm", home)
+        .expect("pnpm data dir resolves");
+    assert!(
+        !pnpm.write_paths(home).contains(&data),
+        "the pnpm data dir is $PNPM_HOME on Linux — granting write to it puts the global shims back in reach"
+    );
+    assert!(
+        pnpm.read_paths(home).contains(&data),
+        "the pnpm data dir must stay readable"
+    );
+}
+
+#[test]
+fn mise_ro_protect_paths_cover_shims_and_installs() {
+    // Landlock cannot subtract from the writable mise data dir, so on Linux
+    // these two ride the bubblewrap read-only overlay instead.
+    let home = std::path::Path::new("/Users/test");
+    let paths = cplt::sandbox::mise_ro_protect_paths(home);
+    for expected in [
+        "/Users/test/.local/share/mise/shims",
+        "/Users/test/.local/share/mise/installs",
+    ] {
+        assert!(
+            paths.contains(&std::path::PathBuf::from(expected)),
+            "{expected} must be in the bwrap read-only set"
+        );
+    }
+}
+
 #[test]
 fn profile_nvm_has_exec() {
     let p = default_profile();
@@ -8085,9 +8327,17 @@ fn existing_app_dirs_nonmatching_excludes_dir() {
         allow_browser: false,
         credential_outside_keychain: false,
     });
+    // Only the *grants* are discovery-filtered. The unconditional
+    // PATH-resolved bin/shim write-denies (#238) name the same tree and are
+    // emitted whether or not mise is installed, so assert on the allow rules
+    // rather than on the path appearing anywhere at all.
     assert!(
-        !p.contains(&data_str),
-        "With existing_app_dirs containing only non-matching paths, mise data dir should NOT appear in profile"
+        !p.contains(&format!("(allow file-read* (subpath \"{data_str}\"))")),
+        "With existing_app_dirs containing only non-matching paths, mise data dir should NOT be granted in the profile"
+    );
+    assert!(
+        !p.contains(&format!("(allow file-write* (subpath \"{data_str}\"))")),
+        "With existing_app_dirs containing only non-matching paths, mise data dir should NOT be granted in the profile"
     );
 }
 

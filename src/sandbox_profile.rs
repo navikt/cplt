@@ -21,9 +21,9 @@ macro_rules! sbpl {
 
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
-    GPG_SIGNING_ALLOW_FILES, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES,
-    TOOL_READ_DIRS, active_tool_dirs, app_dirs, playwright_runtime_intent,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    GPG_SIGNING_ALLOW_FILES, PathBinDir, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, active_tool_dirs, app_dirs, path_bin_dirs,
+    playwright_runtime_intent, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Options for generating an SBPL sandbox profile.
@@ -259,6 +259,12 @@ pub fn generate_profile_with_playwright_socket_dir(
     // Same reason: keeps the exec-allowed Gradle toolchain dir non-writable
     // even when a user allow.write covers ~/.gradle (write-then-exec).
     emit_gradle_toolchain_write_deny(&mut sb, &home);
+    // Same reason: the PATH-resolved bin and shim directories are already
+    // read-only by construction (HOME_TOOL_DIRS grants write to the sibling
+    // cache, not the parent), but a user allow.write covering ~/.bun or
+    // $PNPM_HOME would reopen them, and mise's two live inside a tree that has
+    // to stay writable.
+    emit_path_bin_denies(&mut sb, opts.home_dir);
 
     sb
 }
@@ -1289,6 +1295,73 @@ fn emit_dotnet_exec_denies(sb: &mut String, dotnet_root: Option<&Path>) {
         }
         sbpl!(sb);
     }
+}
+
+/// Write-deny every directory that lands on the user's `PATH` ahead of
+/// `/usr/bin`.
+///
+/// A file written to one of these outlives the session: the user's next
+/// unsandboxed `git`, `node` or `python` resolves through PATH and runs it.
+/// `~/.cargo/bin` has been read-only for exactly this reason; these are the
+/// rest of the class — `~/.bun/bin`, `~/.deno/bin`, `$PNPM_HOME`, and mise's
+/// `shims/` and `installs/<tool>/<version>/bin`.
+///
+/// Most of them are read-only by construction already, because
+/// `HOME_TOOL_DIRS` grants write to the sibling cache instead of the parent
+/// (that shape, unlike a deny, also holds on Landlock). Re-denying them here
+/// is what survives a user `allow.write = ["~/.bun"]`. mise is the exception
+/// that genuinely needs the deny: `shims/` and `installs/` sit inside the mise
+/// data dir, which has to stay writable for the rest of mise's state.
+///
+/// Emitted AFTER `emit_user_allows` because SBPL is last-match-wins — same
+/// rationale as `emit_host_persistence_denies`.
+///
+/// The cost is deliberate: `bun install -g`, `deno install`, `pnpm add -g`,
+/// `mise use -g` and `mise install` all fail inside the sandbox, and a repo
+/// whose `mise.toml` pins a toolchain the host does not already have no longer
+/// bootstraps. See docs/known-impacts.md.
+///
+/// macOS only. Landlock cannot deny a subpath inside an allowed tree, so on
+/// Linux the mise pair is carried by the bubblewrap read-only overlay
+/// (`policy::mise_ro_protect_paths`) and the rest by the `HOME_TOOL_DIRS`
+/// shape; the `TopLevel` shape has no Landlock equivalent at all for a
+/// relocated `XDG_DATA_HOME`. See docs/security.md.
+fn emit_path_bin_denies(sb: &mut String, home_dir: &Path) {
+    sbpl!(sb, ";; PATH-resolved bin/shim dirs stay read-only");
+    for dir in path_bin_dirs(home_dir) {
+        match dir {
+            PathBinDir::Subtree(path) => {
+                if validate_sbpl_path(&path).is_err() {
+                    continue;
+                }
+                let p = path.display();
+                sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+            }
+            // Anchored to a single path component so `store/` and everything
+            // under it keeps its write grant.
+            PathBinDir::TopLevel(path) => {
+                if validate_sbpl_path(&path).is_err() {
+                    continue;
+                }
+                let r = escape_regex(&path.to_string_lossy());
+                sbpl!(sb, "(deny file-write* (regex #\"^{r}/[^/]+$\"))");
+            }
+            // `installs/<tool>/<version>/bin` and below. SBPL subpaths have no
+            // wildcard, and the tool and version components are not known when
+            // the profile is generated.
+            PathBinDir::NestedBin(path) => {
+                if validate_sbpl_path(&path).is_err() {
+                    continue;
+                }
+                let r = escape_regex(&path.to_string_lossy());
+                sbpl!(
+                    sb,
+                    "(deny file-write* (regex #\"^{r}/[^/]+/[^/]+/bin($|/)\"))"
+                );
+            }
+        }
+    }
+    sbpl!(sb);
 }
 
 /// Allow reading and loading shared libraries from an Electron app bundle.
