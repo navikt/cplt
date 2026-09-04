@@ -240,6 +240,80 @@ pub(super) fn is_secret_suffix(name: &str) -> bool {
         .any(|suffix| upper.ends_with(suffix))
 }
 
+/// Fixed macOS parent for cplt-owned Playwright control sockets.
+pub const PLAYWRIGHT_SOCKET_ROOT: &str = "/private/tmp";
+/// Prefix followed by a 128-bit lowercase hexadecimal session ID.
+pub const PLAYWRIGHT_SOCKET_DIR_PREFIX: &str = "cplt-pw-";
+/// Conservative budget for the cplt-controlled portion of a Playwright socket path.
+///
+/// Playwright core 1.63.0-alpha-2026-08-31 appends a domain directory and,
+/// in its longest fallback form, `/dashboard/<16 lowercase hex>.sock` (32
+/// bytes). Keeping the base at 64 bytes or less leaves at least six spare bytes
+/// under Playwright's strict 103-byte Unix-socket limit.
+pub const PLAYWRIGHT_SOCKET_BASE_MAX_BYTES: usize = 64;
+pub const PLAYWRIGHT_SOCKET_PATH_LIMIT: usize = 103;
+pub const PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX: &str = "/dashboard/0123456789abcdef.sock";
+
+/// Whether cache execution explicitly opts into the Playwright browser runtime.
+///
+/// This intent gates both Chromium's additional macOS runtime permissions and
+/// Playwright-specific child environment setup. `allow_cache_exec_any` is
+/// deliberately ignored: broad cache execution must not imply browser runtime
+/// intent.
+pub fn playwright_runtime_intent(allow_cache_exec: &[String], _allow_cache_exec_any: bool) -> bool {
+    allow_cache_exec
+        .iter()
+        .any(|entry| entry == "ms-playwright" || entry.starts_with("ms-playwright/"))
+}
+
+/// Validate the exact shape of a cplt-owned Playwright socket directory.
+///
+/// This is the authorization boundary for SBPL interpolation: callers cannot
+/// turn the dedicated capability into a grant for a parent, sibling, project,
+/// scratch, or caller-selected path.
+pub fn validate_playwright_socket_dir(path: &Path) -> Result<(), String> {
+    validate_sbpl_path(path)?;
+
+    let Some(path_str) = path.to_str() else {
+        return Err("Playwright socket dir must be valid UTF-8".to_string());
+    };
+    if path.as_os_str().len() > PLAYWRIGHT_SOCKET_BASE_MAX_BYTES {
+        return Err(format!(
+            "Playwright socket dir exceeds the {PLAYWRIGHT_SOCKET_BASE_MAX_BYTES}-byte safety budget"
+        ));
+    }
+    if path.parent() != Some(Path::new(PLAYWRIGHT_SOCKET_ROOT)) {
+        return Err(format!(
+            "Playwright socket dir must be directly under {PLAYWRIGHT_SOCKET_ROOT}"
+        ));
+    }
+
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err("Playwright socket dir must have an ASCII file name".to_string());
+    };
+    let Some(session_id) = name.strip_prefix(PLAYWRIGHT_SOCKET_DIR_PREFIX) else {
+        return Err("Playwright socket dir has an invalid prefix".to_string());
+    };
+    if session_id.len() != 32
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            "Playwright socket dir must end in exactly 32 lowercase hexadecimal characters"
+                .to_string(),
+        );
+    }
+
+    let worst_case_len = path_str.len() + PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX.len();
+    if worst_case_len >= PLAYWRIGHT_SOCKET_PATH_LIMIT {
+        return Err(format!(
+            "Playwright socket path would reach {worst_case_len} bytes, but must stay below {PLAYWRIGHT_SOCKET_PATH_LIMIT}"
+        ));
+    }
+    Ok(())
+}
+
 /// Environment variables safe to pass through to the sandboxed process.
 /// Deliberately excludes cloud credentials (AWS_*, AZURE_*), CI tokens,
 /// npm/pip tokens, database URLs, and other secrets.

@@ -5,10 +5,22 @@
 
 #[cfg(target_os = "macos")]
 mod macos_tests {
-    use std::fs;
-    use std::path::PathBuf;
-    use std::process::Command;
+    use std::ffi::OsString;
+    use std::fs::{self, File};
+    use std::io::{Read, Seek, SeekFrom};
+    use std::net::{SocketAddr, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+    use tungstenite::Error as WebSocketError;
+    use tungstenite::client::client_with_config;
+    use tungstenite::protocol::{Message, WebSocket, WebSocketConfig};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -164,6 +176,50 @@ mod macos_tests {
             String::from_utf8_lossy(&output.stderr),
         );
         (combined, output.status.success())
+    }
+
+    fn python_path_literal(path: &Path) -> String {
+        serde_json::to_string(
+            path.to_str()
+                .expect("generated Playwright socket paths must be valid UTF-8"),
+        )
+        .expect("serialize generated Playwright socket path")
+    }
+
+    fn python_inline_command(source: &str) -> String {
+        format!("python3 -c '{}'", source.replace('\'', "'\\''"))
+    }
+
+    #[test]
+    fn python_path_literal_survives_inline_shell_command() {
+        for path in [
+            Path::new("/private/tmp/cplt-pw-089a0123456789abcdef0123456789ab/browser/allowed.sock"),
+            Path::new("/private/tmp/cplt-pw quoted/quo'te-\"-back\\slash-\n.sock"),
+        ] {
+            let source = format!(
+                "import os\npath = {}\nprint(os.fsencode(path).hex())",
+                python_path_literal(path)
+            );
+            let output = Command::new("/bin/bash")
+                .arg("-c")
+                .arg(python_inline_command(&source))
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .expect("run generated Python source");
+
+            assert!(
+                output.status.success(),
+                "generated Python source failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected: String = path
+                .as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
     }
 
     // ============================================================
@@ -371,11 +427,23 @@ mod macos_tests {
     // full pipeline: profile generation → SBPL → kernel enforcement.
     // ============================================================
 
-    use cplt::sandbox::{ProfileOptions, generate_profile};
+    use cplt::sandbox::{
+        ProfileOptions, generate_profile, generate_profile_with_playwright_socket_dir,
+    };
 
     /// Write a real cplt-generated profile to a temp file.
     fn write_real_profile(opts: &ProfileOptions) -> PathBuf {
         let profile = generate_profile(opts);
+        let path = unique_profile_path();
+        fs::write(&path, &profile).unwrap();
+        path
+    }
+
+    fn write_real_profile_with_playwright_socket(
+        opts: &ProfileOptions,
+        socket_dir: &Path,
+    ) -> PathBuf {
+        let profile = generate_profile_with_playwright_socket_dir(opts, Some(socket_dir));
         let path = unique_profile_path();
         fs::write(&path, &profile).unwrap();
         path
@@ -422,6 +490,740 @@ mod macos_tests {
             allow_browser: false,
             credential_outside_keychain: false,
         }
+    }
+
+    /// A unique, grep-safe token embedded in the render probe document.
+    ///
+    /// Alphanumeric only so it survives DOM serialization verbatim and cannot
+    /// be confused with unrelated Chrome log output.
+    fn unique_render_token() -> String {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("CPLTRENDEROK{}x{id}", std::process::id())
+    }
+
+    /// A deterministic, network-free `data:` document whose live DOM only
+    /// contains `token` if the renderer parsed the document and executed its
+    /// script.
+    ///
+    /// The token is split across a runtime JS concatenation so the *contiguous*
+    /// token never appears in the document source or CDP evaluation request.
+    /// The whole token can only surface through the page script writing it into
+    /// the live DOM — the work a denied renderer process cannot perform.
+    fn render_probe_document(token: &str) -> String {
+        // token is ASCII alphanumeric, so a byte split lands on a char boundary
+        // and yields two non-empty halves.
+        let (head, tail) = token.split_at(token.len() / 2);
+        let url = format!(
+            concat!(
+                "data:text/html,<html><body><div id=cplt-probe></div><script>",
+                "const e=document.getElementById('cplt-probe');",
+                "e.textContent='{}'+'{}';e.dataset.cpltReady='yes'",
+                "</script></body></html>"
+            ),
+            head, tail
+        );
+        assert!(
+            !url.contains(token),
+            "render token must not appear contiguously in the unexecuted document source"
+        );
+        url
+    }
+
+    fn chrome_probe_args(user_data_dir: &Path) -> Vec<OsString> {
+        vec![
+            "--headless".into(),
+            "--disable-gpu".into(),
+            "--no-first-run".into(),
+            format!("--user-data-dir={}", user_data_dir.display()).into(),
+            "--remote-debugging-address=127.0.0.1".into(),
+            "--remote-debugging-port=0".into(),
+            "about:blank".into(),
+        ]
+    }
+
+    struct ChromeProcess {
+        child: Child,
+        process_group: libc::pid_t,
+        stdout_file: File,
+        stderr_file: File,
+        status: Option<ExitStatus>,
+        cleaned_up: bool,
+    }
+
+    impl ChromeProcess {
+        fn spawn(stage: &str, command: &mut Command) -> Self {
+            let stdout_file = tempfile::tempfile().expect("create Chrome stdout capture file");
+            let stderr_file = tempfile::tempfile().expect("create Chrome stderr capture file");
+            command
+                .process_group(0)
+                .stdout(Stdio::from(
+                    stdout_file
+                        .try_clone()
+                        .expect("clone Chrome stdout capture file"),
+                ))
+                .stderr(Stdio::from(
+                    stderr_file
+                        .try_clone()
+                        .expect("clone Chrome stderr capture file"),
+                ));
+
+            let mut child = command
+                .spawn()
+                .unwrap_or_else(|error| panic!("{stage}: failed to launch command: {error}"));
+            let process_group = libc::pid_t::try_from(child.id()).unwrap_or_else(|_| {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{stage}: Chrome process ID does not fit pid_t");
+            });
+
+            Self {
+                child,
+                process_group,
+                stdout_file,
+                stderr_file,
+                status: None,
+                cleaned_up: false,
+            }
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            if self.status.is_none() {
+                self.status = self.child.try_wait()?;
+            }
+            Ok(self.status)
+        }
+
+        fn terminate_and_reap(&mut self) -> Result<String, String> {
+            if self.status.is_some() {
+                self.cleaned_up = true;
+                return Ok(
+                    "Chrome child was already reaped; process group was not signaled".to_string(),
+                );
+            }
+
+            // SAFETY: The child was placed in its own process group, and killpg
+            // does not dereference pointers. The group ID is the child's PID,
+            // which cannot be reused while the child remains unreaped.
+            let kill_result = unsafe { libc::killpg(self.process_group, libc::SIGKILL) };
+            let kill_error = (kill_result == -1)
+                .then(std::io::Error::last_os_error)
+                .filter(|error| error.raw_os_error() != Some(libc::ESRCH));
+
+            if kill_error.is_some() && self.status.is_none() {
+                let _ = self.child.kill();
+            }
+            if self.status.is_none() {
+                self.status = Some(
+                    self.child
+                        .wait()
+                        .map_err(|error| format!("failed to reap Chrome child: {error}"))?,
+                );
+            }
+            self.cleaned_up = true;
+
+            if let Some(error) = kill_error {
+                return Err(format!(
+                    "process-group SIGKILL failed ({error}); attempted direct child cleanup"
+                ));
+            }
+
+            Ok(format!(
+                "sent SIGKILL to process group {} and reaped the child",
+                self.process_group
+            ))
+        }
+
+        fn diagnostics(&mut self) -> String {
+            let status = self
+                .status
+                .as_ref()
+                .map_or_else(|| "not reaped".to_string(), ToString::to_string);
+            format!(
+                "status: {status}\nstdout:\n{}\nstderr:\n{}",
+                Self::read_capture(&mut self.stdout_file),
+                Self::read_capture(&mut self.stderr_file),
+            )
+        }
+
+        fn read_capture(file: &mut File) -> String {
+            const MAX_CAPTURE_BYTES: u64 = 256 * 1024;
+
+            let length = match file.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(error) => return format!("<failed to inspect capture file: {error}>"),
+            };
+            let start = length.saturating_sub(MAX_CAPTURE_BYTES);
+            if let Err(error) = file.seek(SeekFrom::Start(start)) {
+                return format!("<failed to rewind capture file: {error}>");
+            }
+            let mut bytes = Vec::new();
+            if let Err(error) = file.take(MAX_CAPTURE_BYTES).read_to_end(&mut bytes) {
+                return format!("<failed to read capture file: {error}>");
+            }
+            let capture = String::from_utf8_lossy(&bytes);
+            if start == 0 {
+                capture.into_owned()
+            } else {
+                format!("<capture truncated to final {MAX_CAPTURE_BYTES} bytes>\n{capture}")
+            }
+        }
+    }
+
+    impl Drop for ChromeProcess {
+        fn drop(&mut self) {
+            if self.cleaned_up {
+                return;
+            }
+
+            match self.try_wait() {
+                Ok(Some(_)) => {
+                    self.cleaned_up = true;
+                    return;
+                }
+                Ok(None) => {}
+                Err(_) => return,
+            }
+
+            // SAFETY: See terminate_and_reap. Drop is the last-resort cleanup
+            // path for an unexpected panic while the browser probe is running.
+            // try_wait above established that the child is still running, so its
+            // process-group ID cannot have been reaped and reused.
+            let kill_result = unsafe { libc::killpg(self.process_group, libc::SIGKILL) };
+            if kill_result == -1 && matches!(self.try_wait(), Ok(None)) {
+                let _ = self.child.kill();
+            }
+            if self.status.is_none() {
+                let _ = self.child.wait();
+            }
+            self.cleaned_up = true;
+        }
+    }
+
+    const CHROME_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+    const CDP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+    const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+    const CDP_IO_TIMEOUT: Duration = Duration::from_secs(1);
+    const CDP_MAX_MESSAGE_SIZE: usize = 256 * 1024;
+    const CDP_MAX_FRAME_SIZE: usize = 64 * 1024;
+
+    fn ensure_chrome_alive(browser: &mut ChromeProcess, operation: &str) -> Result<(), String> {
+        match browser.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => Err(format!(
+                "Chrome exited ({status}) before completing {operation}"
+            )),
+            Err(error) => Err(format!(
+                "failed to check Chrome while waiting for {operation}: {error}"
+            )),
+        }
+    }
+
+    fn bounded_timeout(deadline: Instant, maximum: Duration) -> Result<Duration, String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("the Chrome CDP probe reached its total deadline".to_string());
+        }
+        Ok(std::cmp::min(remaining, maximum))
+    }
+
+    fn cdp_discovery_deadline(start: Instant, total_deadline: Instant) -> Instant {
+        std::cmp::min(total_deadline, start + CDP_DISCOVERY_TIMEOUT)
+    }
+
+    #[test]
+    fn cdp_discovery_budget_covers_observed_slow_start_and_stays_bounded() {
+        let start = Instant::now();
+        let total_deadline = start + CHROME_PROBE_TIMEOUT;
+        let observed_slow_start = start + Duration::from_millis(5_050);
+        let discovery_deadline = cdp_discovery_deadline(start, total_deadline);
+
+        assert!(observed_slow_start < discovery_deadline);
+        assert!(discovery_deadline <= total_deadline);
+    }
+
+    fn read_debug_port(user_data_dir: &Path) -> Result<u16, String> {
+        let path = user_data_dir.join("DevToolsActivePort");
+        let file = File::open(&path)
+            .map_err(|error| format!("DevToolsActivePort is not readable yet: {error}"))?;
+        let mut contents = String::new();
+        file.take(128)
+            .read_to_string(&mut contents)
+            .map_err(|error| format!("failed to read DevToolsActivePort: {error}"))?;
+        contents
+            .lines()
+            .next()
+            .ok_or_else(|| "DevToolsActivePort did not contain a port".to_string())?
+            .parse::<u16>()
+            .map_err(|error| format!("DevToolsActivePort contained an invalid port: {error}"))
+    }
+
+    fn select_initial_page_websocket(targets: &Value, port: u16) -> Result<Option<String>, String> {
+        let Some(initial_page) = targets.as_array().into_iter().flatten().find(|target| {
+            target.get("type").and_then(Value::as_str) == Some("page")
+                && target.get("url").and_then(Value::as_str) == Some("about:blank")
+        }) else {
+            return Ok(None);
+        };
+        let websocket_url = initial_page
+            .get("webSocketDebuggerUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "Chrome's initial about:blank page target had no webSocketDebuggerUrl".to_string()
+            })?
+            .to_string();
+        let expected_prefix = format!("ws://127.0.0.1:{port}/");
+        if !websocket_url.starts_with(&expected_prefix) {
+            return Err("Chrome returned a non-local or mismatched page WebSocket URL".to_string());
+        }
+        Ok(Some(websocket_url))
+    }
+
+    #[test]
+    fn cdp_page_target_selection_keeps_missing_target_pending() {
+        assert_eq!(select_initial_page_websocket(&json!([]), 9222), Ok(None));
+        assert_eq!(
+            select_initial_page_websocket(
+                &json!([
+                    {
+                        "type": "page",
+                        "url": "https://example.invalid/",
+                        "webSocketDebuggerUrl":
+                            "ws://127.0.0.1:9222/devtools/page/wrong-url"
+                    },
+                    {
+                        "type": "service_worker",
+                        "url": "about:blank",
+                        "webSocketDebuggerUrl":
+                            "ws://127.0.0.1:9222/devtools/page/wrong-type"
+                    }
+                ]),
+                9222
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn cdp_page_target_selection_accepts_exact_initial_page() {
+        let websocket_url = "ws://127.0.0.1:9222/devtools/page/expected";
+        assert_eq!(
+            select_initial_page_websocket(
+                &json!([
+                    {
+                        "type": "page",
+                        "url": "https://example.invalid/",
+                        "webSocketDebuggerUrl":
+                            "ws://127.0.0.1:9222/devtools/page/wrong-url"
+                    },
+                    {
+                        "type": "page",
+                        "url": "about:blank",
+                        "webSocketDebuggerUrl": websocket_url
+                    }
+                ]),
+                9222
+            ),
+            Ok(Some(websocket_url.to_string()))
+        );
+    }
+
+    fn discover_page_websocket(
+        browser: &mut ChromeProcess,
+        user_data_dir: &Path,
+        total_deadline: Instant,
+    ) -> Result<(u16, String), String> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(50);
+        const MAX_DISCOVERY_BYTES: usize = 256 * 1024;
+
+        let discovery_deadline = cdp_discovery_deadline(Instant::now(), total_deadline);
+        let mut last_error = "Chrome has not published its DevTools port".to_string();
+
+        loop {
+            ensure_chrome_alive(browser, "CDP endpoint discovery")?;
+            if Instant::now() >= discovery_deadline {
+                return Err(format!(
+                    "timed out discovering a page CDP WebSocket: {last_error}"
+                ));
+            }
+
+            match read_debug_port(user_data_dir) {
+                Ok(port) => {
+                    let attempt_timeout = bounded_timeout(discovery_deadline, CDP_IO_TIMEOUT)?;
+                    let timeout_arg = format!("{:.3}", attempt_timeout.as_secs_f64());
+                    let max_bytes_arg = MAX_DISCOVERY_BYTES.to_string();
+                    let endpoint = format!("http://127.0.0.1:{port}/json/list");
+                    let output = Command::new("/usr/bin/curl")
+                        .args([
+                            "--disable",
+                            "--silent",
+                            "--show-error",
+                            "--fail",
+                            "--noproxy",
+                            "127.0.0.1",
+                            "--max-time",
+                            &timeout_arg,
+                            "--connect-timeout",
+                            &timeout_arg,
+                            "--max-filesize",
+                            &max_bytes_arg,
+                            &endpoint,
+                        ])
+                        .output()
+                        .map_err(|error| {
+                            format!("failed to launch bounded CDP discovery curl: {error}")
+                        })?;
+
+                    if output.status.success() {
+                        let targets: Value =
+                            serde_json::from_slice(&output.stdout).map_err(|error| {
+                                format!("Chrome returned invalid /json/list JSON: {error}")
+                            })?;
+                        match select_initial_page_websocket(&targets, port)? {
+                            Some(websocket_url) => return Ok((port, websocket_url)),
+                            None => {
+                                last_error = "Chrome /json/list had no initial \
+                                              about:blank page target yet"
+                                    .to_string();
+                            }
+                        }
+                    } else {
+                        last_error = format!(
+                            "CDP discovery curl exited with {}: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                    }
+                }
+                Err(error) => last_error = error,
+            }
+
+            let remaining = discovery_deadline.saturating_duration_since(Instant::now());
+            thread::sleep(std::cmp::min(POLL_INTERVAL, remaining));
+        }
+    }
+
+    fn set_websocket_timeout(
+        websocket: &mut WebSocket<TcpStream>,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let timeout = bounded_timeout(deadline, CDP_IO_TIMEOUT)?;
+        websocket
+            .get_mut()
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("failed to bound the CDP socket read: {error}"))?;
+        websocket
+            .get_mut()
+            .set_write_timeout(Some(timeout))
+            .map_err(|error| format!("failed to bound the CDP socket write: {error}"))
+    }
+
+    fn send_cdp_request(
+        websocket: &mut WebSocket<TcpStream>,
+        deadline: Instant,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<(), String> {
+        let mut request = json!({ "id": id, "method": method });
+        if let Some(params) = params {
+            request["params"] = params;
+        }
+        let payload = serde_json::to_string(&request)
+            .map_err(|error| format!("failed to encode CDP request {id}: {error}"))?;
+        set_websocket_timeout(websocket, deadline)?;
+        websocket
+            .send(Message::Text(payload.into()))
+            .map_err(|error| format!("failed to send CDP request {id} ({method}): {error}"))
+    }
+
+    fn read_cdp_message(
+        browser: &mut ChromeProcess,
+        websocket: &mut WebSocket<TcpStream>,
+        deadline: Instant,
+        operation: &str,
+    ) -> Result<Value, String> {
+        loop {
+            ensure_chrome_alive(browser, operation)?;
+            set_websocket_timeout(websocket, deadline)?;
+            match websocket.read() {
+                Ok(Message::Text(text)) => {
+                    return serde_json::from_str(text.as_str())
+                        .map_err(|error| format!("received invalid CDP JSON: {error}"));
+                }
+                Ok(Message::Ping(_)) => {
+                    set_websocket_timeout(websocket, deadline)?;
+                    websocket.flush().map_err(|error| {
+                        format!("failed to flush the automatic CDP Pong response: {error}")
+                    })?;
+                }
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(frame)) => {
+                    return Err(format!(
+                        "CDP WebSocket closed before completing {operation}: {frame:?}"
+                    ));
+                }
+                Ok(Message::Binary(_)) => {
+                    return Err(format!(
+                        "CDP sent an unexpected binary message during {operation}"
+                    ));
+                }
+                Ok(Message::Frame(_)) => {
+                    return Err(format!(
+                        "CDP exposed an unexpected raw frame during {operation}"
+                    ));
+                }
+                Err(WebSocketError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) && Instant::now() < deadline => {}
+                Err(error) => {
+                    return Err(format!(
+                        "CDP WebSocket terminated while waiting for {operation}: {error}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn wait_for_cdp_response(
+        browser: &mut ChromeProcess,
+        websocket: &mut WebSocket<TcpStream>,
+        deadline: Instant,
+        expected_id: u64,
+    ) -> Result<Value, String> {
+        loop {
+            let message = read_cdp_message(
+                browser,
+                websocket,
+                deadline,
+                &format!("CDP response {expected_id}"),
+            )?;
+            if message.get("id").and_then(Value::as_u64) != Some(expected_id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(format!("CDP request {expected_id} failed: {error}"));
+            }
+            return message
+                .get("result")
+                .cloned()
+                .ok_or_else(|| format!("CDP response {expected_id} had no result"));
+        }
+    }
+
+    fn run_cdp_probe(
+        browser: &mut ChromeProcess,
+        user_data_dir: &Path,
+        render_url: &str,
+        expected_token: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let (port, websocket_url) = discover_page_websocket(browser, user_data_dir, deadline)?;
+        ensure_chrome_alive(browser, "CDP WebSocket connection")?;
+
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let connect_timeout = bounded_timeout(deadline, CDP_CONNECT_TIMEOUT)?;
+        let stream = TcpStream::connect_timeout(&address, connect_timeout)
+            .map_err(|error| format!("failed to connect to the local CDP socket: {error}"))?;
+        let io_timeout = bounded_timeout(deadline, CDP_IO_TIMEOUT)?;
+        stream
+            .set_read_timeout(Some(io_timeout))
+            .map_err(|error| format!("failed to bound the CDP handshake read: {error}"))?;
+        stream
+            .set_write_timeout(Some(io_timeout))
+            .map_err(|error| format!("failed to bound the CDP handshake write: {error}"))?;
+
+        let config = WebSocketConfig::default()
+            .read_buffer_size(8 * 1024)
+            .write_buffer_size(8 * 1024)
+            .max_write_buffer_size(64 * 1024)
+            .max_message_size(Some(CDP_MAX_MESSAGE_SIZE))
+            .max_frame_size(Some(CDP_MAX_FRAME_SIZE));
+        let (mut websocket, _) = client_with_config(&websocket_url, stream, Some(config))
+            .map_err(|error| format!("CDP WebSocket handshake failed: {error}"))?;
+        ensure_chrome_alive(browser, "CDP domain setup")?;
+
+        send_cdp_request(&mut websocket, deadline, 1, "Page.enable", None)?;
+        wait_for_cdp_response(browser, &mut websocket, deadline, 1)?;
+        send_cdp_request(&mut websocket, deadline, 2, "Runtime.enable", None)?;
+        wait_for_cdp_response(browser, &mut websocket, deadline, 2)?;
+
+        send_cdp_request(
+            &mut websocket,
+            deadline,
+            3,
+            "Page.navigate",
+            Some(json!({ "url": render_url })),
+        )?;
+        let navigation = wait_for_cdp_response(browser, &mut websocket, deadline, 3)?;
+        if let Some(error_text) = navigation.get("errorText").and_then(Value::as_str) {
+            return Err(format!("Page.navigate failed: {error_text}"));
+        }
+
+        let expression = "(() => {\
+            const node = document.getElementById('cplt-probe');\
+            return document.readyState === 'complete' && node?.dataset.cpltReady === 'yes'\
+                ? node.textContent : null;\
+        })()";
+        assert!(
+            !expression.contains(expected_token),
+            "the expected value must not be embedded in the evaluation request"
+        );
+        let mut request_id = 4;
+        loop {
+            send_cdp_request(
+                &mut websocket,
+                deadline,
+                request_id,
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": expression,
+                    "returnByValue": true,
+                    "awaitPromise": true
+                })),
+            )?;
+            let evaluation = wait_for_cdp_response(browser, &mut websocket, deadline, request_id)?;
+            if let Some(exception) = evaluation.get("exceptionDetails") {
+                return Err(format!("Runtime.evaluate threw an exception: {exception}"));
+            }
+            let remote_object = evaluation
+                .get("result")
+                .ok_or_else(|| "Runtime.evaluate returned no remote object".to_string())?;
+            if remote_object.get("type").and_then(Value::as_str) == Some("string")
+                && remote_object.get("value").and_then(Value::as_str) == Some(expected_token)
+            {
+                break;
+            }
+            ensure_chrome_alive(browser, "renderer readiness")?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    "Runtime.evaluate never observed the ready live DOM before the total deadline"
+                        .to_string(),
+                );
+            }
+            request_id = request_id
+                .checked_add(1)
+                .ok_or_else(|| "CDP request ID overflowed".to_string())?;
+            thread::sleep(std::cmp::min(Duration::from_millis(25), remaining));
+        }
+        ensure_chrome_alive(browser, "completed DOM evaluation")?;
+
+        if set_websocket_timeout(&mut websocket, deadline).is_ok() {
+            let _ = websocket.close(None);
+            let _ = websocket.flush();
+        }
+        Ok(())
+    }
+
+    /// Launch Chrome and prove real renderer execution through bounded CDP
+    /// navigation and JavaScript evaluation.
+    fn run_chrome_probe(
+        stage: &str,
+        command: &mut Command,
+        user_data_dir: &Path,
+        render_url: &str,
+        expected_token: &str,
+    ) {
+        let mut browser = ChromeProcess::spawn(stage, command);
+        let deadline = Instant::now() + CHROME_PROBE_TIMEOUT;
+
+        let failure = run_cdp_probe(
+            &mut browser,
+            user_data_dir,
+            render_url,
+            expected_token,
+            deadline,
+        )
+        .err();
+
+        let cleanup = browser.terminate_and_reap();
+        let diagnostics = browser.diagnostics();
+        match (failure, cleanup) {
+            (None, Ok(_)) => {}
+            (None, Err(cleanup_error)) => {
+                panic!(
+                    "{stage}: browser was ready but cleanup failed: \
+                     {cleanup_error}\n{diagnostics}"
+                )
+            }
+            (Some(failure), Ok(cleanup)) => {
+                panic!("{stage}: {failure}; {cleanup}:\n{diagnostics}")
+            }
+            (Some(failure), Err(cleanup_error)) => {
+                panic!("{stage}: {failure}; cleanup failed: {cleanup_error}\n{diagnostics}")
+            }
+        }
+    }
+
+    #[test]
+    fn real_profile_renders_page_in_chrome_for_testing() {
+        require_sandbox!();
+
+        let Some(chrome) = std::env::var_os("CPLT_CHROME_FOR_TESTING") else {
+            eprintln!("SKIPPED (chrome-for-testing): CPLT_CHROME_FOR_TESTING is not set");
+            return;
+        };
+        let chrome = PathBuf::from(chrome);
+        let chrome = fs::canonicalize(&chrome)
+            .expect("CPLT_CHROME_FOR_TESTING must identify an existing executable");
+        let expected_suffix =
+            Path::new("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing");
+        assert!(
+            chrome.is_absolute() && chrome.ends_with(expected_suffix),
+            "CPLT_CHROME_FOR_TESTING must identify the expected \
+             Google Chrome for Testing.app executable"
+        );
+        let metadata = fs::metadata(&chrome)
+            .expect("CPLT_CHROME_FOR_TESTING executable metadata should be readable");
+        assert!(
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+            "CPLT_CHROME_FOR_TESTING must identify an executable file"
+        );
+
+        let control_data_dir = tempfile::tempdir().expect("create control browser state");
+        let control_token = unique_render_token();
+        let control_url = render_probe_document(&control_token);
+        eprintln!(
+            "chrome-for-testing stage: direct control \
+             (Chromium sandbox enabled, no cplt Seatbelt)"
+        );
+        run_chrome_probe(
+            "direct Chrome for Testing control (Chromium sandbox enabled, no cplt Seatbelt)",
+            Command::new(&chrome).args(chrome_probe_args(control_data_dir.path())),
+            control_data_dir.path(),
+            &control_url,
+            &control_token,
+        );
+        eprintln!("chrome-for-testing stage: direct control ready");
+
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let allow_cache_exec = ["ms-playwright".to_string()];
+        let mut opts = default_opts(&project, &home);
+        opts.allow_cache_exec = &allow_cache_exec;
+        let profile = tempfile::NamedTempFile::new()
+            .expect("create generated Chrome test profile")
+            .into_temp_path();
+        fs::write(&profile, generate_profile(&opts)).expect("write generated Chrome test profile");
+        let sandbox_data_dir = tempfile::tempdir().expect("create sandboxed browser state");
+        let sandbox_token = unique_render_token();
+        let sandbox_url = render_probe_document(&sandbox_token);
+        eprintln!("chrome-for-testing stage: sandboxed launch");
+        run_chrome_probe(
+            "sandboxed Chrome for Testing launch",
+            Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(profile.as_os_str())
+                .arg(&chrome)
+                .arg("--no-sandbox")
+                .args(chrome_probe_args(sandbox_data_dir.path())),
+            sandbox_data_dir.path(),
+            &sandbox_url,
+            &sandbox_token,
+        );
+        eprintln!("chrome-for-testing stage: sandboxed launch ready");
     }
 
     #[test]
@@ -1519,6 +2321,110 @@ finally:
         assert!(
             output.contains("BLOCKED"),
             "Arbitrary unix sockets in /tmp must be blocked, got: {output}"
+        );
+    }
+
+    #[test]
+    fn real_profile_scopes_playwright_unix_sockets_to_owned_directory() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let home = home_dir();
+        let mut opts = default_opts(&project, &home);
+        let allow_cache_exec = ["ms-playwright".to_string()];
+        opts.allow_cache_exec = &allow_cache_exec;
+        let socket_guard = cplt::scratch::PlaywrightSocketDir::create().unwrap();
+        let sibling = tempfile::Builder::new()
+            .prefix("cplt-pw-integration-sibling-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let profile = write_real_profile_with_playwright_socket(&opts, socket_guard.path());
+        let allowed_socket = socket_guard.path().join("browser/allowed.sock");
+        let sibling_socket = sibling.path().join("blocked.sock");
+
+        let source = format!(
+            r"
+import os, socket, threading
+allowed = {allowed_socket}
+sibling = {sibling_socket}
+timeout = 2.0
+server = None
+client = None
+thread = None
+accept_result = []
+owned_ok = False
+
+try:
+    os.makedirs(os.path.dirname(allowed), exist_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.settimeout(timeout)
+    server.bind(allowed)
+    server.listen(1)
+
+    def accept():
+        connection = None
+        try:
+            connection, _ = server.accept()
+            connection.settimeout(timeout)
+            connection.sendall(b'OK')
+            accept_result.append('OK')
+        except Exception:
+            accept_result.append('ERROR')
+        finally:
+            if connection is not None:
+                connection.close()
+
+    thread = threading.Thread(target=accept, daemon=True)
+    thread.start()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    client.connect(allowed)
+    payload = client.recv(2)
+    thread.join(timeout)
+    owned_ok = payload == b'OK' and accept_result == ['OK'] and not thread.is_alive()
+except Exception:
+    pass
+finally:
+    if client is not None:
+        client.close()
+    if server is not None:
+        server.close()
+
+print('OWNED_OK' if owned_ok else 'OWNED_ERROR')
+
+probe = None
+sibling_result = 'SIBLING_ERROR'
+try:
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    probe.bind(sibling)
+    sibling_result = 'SIBLING_EXPOSED'
+except PermissionError:
+    sibling_result = 'SIBLING_BLOCKED'
+except OSError as error:
+    if error.errno == 1:
+        sibling_result = 'SIBLING_BLOCKED'
+finally:
+    if probe is not None:
+        probe.close()
+
+print(sibling_result)
+if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
+    raise SystemExit(1)
+",
+            allowed_socket = python_path_literal(&allowed_socket),
+            sibling_socket = python_path_literal(&sibling_socket),
+        );
+        let command = python_inline_command(&source);
+        let (output, _) = run_sandboxed(&profile, &command);
+
+        fs::remove_file(&profile).ok();
+        assert!(
+            output.contains("OWNED_OK"),
+            "all three socket operations must work in the owned directory, got: {output}"
+        );
+        assert!(
+            output.contains("SIBLING_BLOCKED") && !output.contains("SIBLING_EXPOSED"),
+            "a sibling /private/tmp directory must remain outside the grant, got: {output}"
         );
     }
 

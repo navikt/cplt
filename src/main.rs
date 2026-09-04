@@ -2482,6 +2482,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     };
     let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
 
+    #[cfg(target_os = "macos")]
+    let playwright_socket_guard = create_playwright_socket_dir(&resolved)?;
+    #[cfg(target_os = "macos")]
+    let playwright_socket_path = playwright_socket_guard
+        .as_ref()
+        .map(cplt::scratch::PlaywrightSocketDir::path);
+    #[cfg(not(target_os = "macos"))]
+    let playwright_socket_path = None;
+
     // Resolve the agent binary early so its installation directory
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
@@ -2607,6 +2616,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         allow_env_files: resolved.allow_env_files,
         allow_localhost_any: resolved.allow_localhost_any,
         scratch_dir: scratch_path,
+        playwright_socket_dir: playwright_socket_path,
         allow_tmp_exec: resolved.allow_tmp_exec,
         copilot_install_dir: copilot_install_dir.as_deref(),
         java_home: java_home_dir.as_deref(),
@@ -3025,16 +3035,62 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
 
 /// A fully-built Shell sandbox plus the live resources it depends on.
 ///
-/// `scratch_guard` and `proxy_handle` are RAII/handle values that must outlive
-/// any use of `prepared` (the scratch dir is cleaned up on drop; the proxy
-/// thread is shut down via the handle). `policy` is the structured Landlock
-/// model of the filesystem policy — the same rules the profile enforces —
-/// used by `cplt check` for the explain layer (`describe_policy`'s model).
+/// The directory guards and `proxy_handle` must outlive any use of `prepared`
+/// (session directories are cleaned up on drop; the proxy thread is shut down
+/// via the handle). `policy` is the structured Landlock model of the filesystem
+/// policy — the same rules the profile enforces — used by `cplt check` for the
+/// explain layer (`describe_policy`'s model).
 struct ShellSandbox {
     prepared: sandbox::PreparedSandbox,
     policy: sandbox::LandlockPolicy,
     proxy_handle: Option<proxy::ProxyHandle>,
     scratch_guard: Option<scratch::ScratchDir>,
+    #[cfg(target_os = "macos")]
+    playwright_socket_guard: Option<scratch::PlaywrightSocketDir>,
+}
+
+/// Create the automatic macOS Playwright socket capability only for exact
+/// runtime intent. An explicit pass-through remains caller-owned and receives
+/// neither a cplt directory nor an automatic SBPL grant.
+#[cfg(target_os = "macos")]
+fn create_playwright_socket_dir(
+    resolved: &config::Resolved,
+) -> anyhow::Result<Option<scratch::PlaywrightSocketDir>> {
+    let intent = sandbox::playwright_runtime_intent(
+        &resolved.allow_cache_exec,
+        resolved.allow_cache_exec_any,
+    );
+    let caller_owned = resolved
+        .pass_env
+        .iter()
+        .any(|name| name == "PWTEST_SOCKETS_DIR");
+
+    // Passing the key through is an override signal, so cplt creates no
+    // directory and grants no socket rules. With no value to inherit the child
+    // gets nothing at all, and Playwright falls back to a path under cplt's
+    // long TMPDIR that exceeds its 103-byte Unix-socket limit. Setting the
+    // variable is not a way out either: the pass-through also suppresses the
+    // SBPL rules, so a shorter path of the caller's own would then be denied at
+    // bind. Both failures surface deep inside Playwright, so name the cause.
+    let inherited_value = std::env::var_os("PWTEST_SOCKETS_DIR")
+        .filter(|value| !value.is_empty())
+        .is_some();
+    if intent && caller_owned && !inherited_value {
+        ui::warn(
+            "PWTEST_SOCKETS_DIR is passed through but has no value, so cplt creates no \
+             socket directory for this session. Playwright will fall back to a path \
+             under TMPDIR that is usually too long for a Unix socket. Drop the \
+             pass-through to let cplt manage the directory and authorize its sockets.",
+        );
+    }
+
+    if !intent || caller_owned {
+        return Ok(None);
+    }
+
+    scratch::PlaywrightSocketDir::create()
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("Cannot create Playwright socket dir: {error}"))
 }
 
 /// Build the resolved Shell sandbox: tool discovery, scratch dir, optional
@@ -3066,6 +3122,15 @@ fn prepare_shell_sandbox(
         None
     };
     let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
+
+    #[cfg(target_os = "macos")]
+    let playwright_socket_guard = create_playwright_socket_dir(resolved)?;
+    #[cfg(target_os = "macos")]
+    let playwright_socket_path = playwright_socket_guard
+        .as_ref()
+        .map(cplt::scratch::PlaywrightSocketDir::path);
+    #[cfg(not(target_os = "macos"))]
+    let playwright_socket_path = None;
 
     let git_hooks_path = discover::git_hooks_path(home_dir);
     let git_common_dir = discover::git_common_dir(home_dir, project_dir);
@@ -3138,6 +3203,7 @@ fn prepare_shell_sandbox(
         allow_env_files: resolved.allow_env_files,
         allow_localhost_any: resolved.allow_localhost_any,
         scratch_dir: scratch_path,
+        playwright_socket_dir: playwright_socket_path,
         allow_tmp_exec: resolved.allow_tmp_exec,
         // shell/check have no agent install dir to grant special access to
         copilot_install_dir: None,
@@ -3171,6 +3237,8 @@ fn prepare_shell_sandbox(
         policy,
         proxy_handle,
         scratch_guard,
+        #[cfg(target_os = "macos")]
+        playwright_socket_guard,
     })
 }
 
@@ -3263,6 +3331,8 @@ fn run_exec_command(
         prepared,
         proxy_handle,
         scratch_guard: _scratch_guard,
+        #[cfg(target_os = "macos")]
+            playwright_socket_guard: _playwright_socket_guard,
         ..
     } = prepare_shell_sandbox(
         cli,
@@ -3654,6 +3724,8 @@ fn run_check_command(
         policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
+        #[cfg(target_os = "macos")]
+            playwright_socket_guard: _playwright_socket_guard,
     } = prepare_shell_sandbox(
         cli,
         &mut resolved,

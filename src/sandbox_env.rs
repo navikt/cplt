@@ -306,6 +306,43 @@ pub fn npmrc_userconfig_override(
     Some(scratch_dir?.join("npmrc"))
 }
 
+/// The cplt-owned Playwright socket base to inject, unless the caller overrides it.
+///
+/// An explicit `--pass-env PWTEST_SOCKETS_DIR` is an override signal even when
+/// the parent has no value. Ambient values are not considered: callers apply
+/// this after normal environment filtering so the short automatic value replaces
+/// inherited or allowlisted values unless the user explicitly passed the key.
+pub fn playwright_sockets_dir_override<'a>(
+    extra_pass_env: &[String],
+    playwright_socket_dir: Option<&'a Path>,
+) -> Option<&'a Path> {
+    if extra_pass_env.iter().any(|var| var == "PWTEST_SOCKETS_DIR") {
+        return None;
+    }
+    playwright_socket_dir
+}
+
+/// Whether to turn off Playwright MCP's nested Chromium sandbox for the child.
+///
+/// Chromium cannot run its own sandbox inside cplt's: macOS rejects the second
+/// Seatbelt initialization, and cplt's seccomp filter denies the namespace
+/// syscalls Linux needs. Playwright as a library already launches without it,
+/// but Playwright MCP turns it back on, so browser operations fail inside cplt
+/// unless it is disabled. cplt is the enforcing kernel boundary either way, so
+/// it disables the redundant inner sandbox the same way it does for Gradle,
+/// rather than making every client's server configuration carry a cplt-only
+/// flag. Requires the explicit `ms-playwright` opt-in, and an explicit
+/// `--pass-env PLAYWRIGHT_MCP_SANDBOX` hands the choice back to the caller.
+pub fn playwright_mcp_sandbox_disabled(
+    extra_pass_env: &[String],
+    playwright_runtime: bool,
+) -> bool {
+    playwright_runtime
+        && !extra_pass_env
+            .iter()
+            .any(|var| var == "PLAYWRIGHT_MCP_SANDBOX")
+}
+
 /// Keys in `parent_env` that name the same npm setting as `NPM_CONFIG_USERCONFIG`
 /// but are spelled differently, and so must be dropped when the override is injected.
 ///
