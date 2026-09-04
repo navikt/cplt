@@ -1698,12 +1698,23 @@ pub fn gate(
     // and scope-checked commands are refused. That matches what the gh wrapper
     // already tells the user in the same situation, and it fails closed: the
     // alternative is answering a scope question with an unverified answer.
-    gate_with_scope_resolver(args, policy, || {
-        let git = crate::git::trusted_git().ok_or_else(|| {
-            "no git in a trusted directory, so the repository scope cannot be verified".to_string()
-        })?;
-        detect_current_repo(git, project_dir)
-    })
+    // Resolved once, and passed to BOTH consumers: the scope resolver below and
+    // `gate_with_scope_resolver`'s own `real_git`, which #230 uses to verify the
+    // invocation repo of an implicit target. Passing `None` there would silently
+    // skip that check.
+    let trusted = crate::git::trusted_git();
+    gate_with_scope_resolver(
+        args,
+        policy,
+        || {
+            let git = trusted.ok_or_else(|| {
+                "no git in a trusted directory, so the repository scope cannot be verified"
+                    .to_string()
+            })?;
+            detect_current_repo(git, project_dir)
+        },
+        trusted,
+    )
 }
 
 /// Evaluate a `gh` command using a pre-resolved Git binary for repository scope.
