@@ -155,7 +155,12 @@ pub struct SandboxConfig<'a> {
     pub allow_cache_exec: &'a [String],
     /// Allow process-exec from all of ~/Library/Caches.
     pub allow_cache_exec_any: bool,
-    /// Allow Launch Services (`open` command) for OAuth browser flows.
+    /// Let the sandboxed agent launch ANY application outside the sandbox.
+    ///
+    /// Granted for OAuth code flows, but Launch Services starts the target
+    /// through launchd, outside the Seatbelt profile. Cannot be scoped: SBPL's
+    /// `lsopen` takes no filter, and LSOpenCFURLRef() reaches it without the
+    /// `open` binary (#251).
     pub allow_browser: bool,
     /// The credential this agent can use *instead of* the login Keychain, if
     /// any (#242). `Some` drops the Keychain grant from the profile and, for an

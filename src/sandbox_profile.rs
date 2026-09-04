@@ -116,7 +116,12 @@ pub struct ProfileOptions<'a> {
     pub allow_cache_exec: &'a [String],
     /// Allow process execution from ALL ~/Library/Caches subdirs.
     pub allow_cache_exec_any: bool,
-    /// Allow Launch Services (`open` command) for OAuth browser flows.
+    /// Let the sandboxed agent launch ANY application outside the sandbox.
+    ///
+    /// Granted for OAuth code flows, but Launch Services starts the target
+    /// through launchd, outside the Seatbelt profile. Cannot be scoped: SBPL's
+    /// `lsopen` takes no filter, and LSOpenCFURLRef() reaches it without the
+    /// `open` binary (#251).
     pub allow_browser: bool,
     /// The agent's credential was resolved outside the Keychain before launch —
     /// from an environment variable, or from a credential file the sandbox
@@ -657,11 +662,45 @@ fn emit_system_access(
     sbpl!(sb, "(allow ipc-posix-shm-write-create)");
     sbpl!(sb);
 
-    // Launch Services — allows `open` to launch URLs in the default browser.
-    // Needed for OAuth code flows (MCP servers, Antigravity, gh auth).
-    // Opt-in because it lets the agent leverage the user's browser session state.
+    // Launch Services — a full sandbox escape, granted on purpose (#251).
+    //
+    // The flag exists for OAuth code flows (MCP servers, Antigravity, gh auth),
+    // where the agent needs to hand an https URL to the user's browser. What it
+    // actually grants is Launch Services, which starts the target through
+    // launchd — outside this profile. So with the flag on, the agent can launch
+    // any application on the machine, unsandboxed. `open -a Terminal script.sh`
+    // is the whole exploit.
+    //
+    // Two things were checked before deciding not to shim `open` (#251):
+    //
+    // 1. `lsopen` cannot be scoped. SBPL gives it no filter — no URL, no bundle
+    //    id, no path. Every profile under /System/Library/Sandbox/Profiles that
+    //    uses it emits it bare, exactly as here; Apple has no narrower form to
+    //    copy. It is all of Launch Services or none of it.
+    //
+    // 2. The grant does not run through the `open` binary, so a PATH wrapper of
+    //    the kind `install_command_wrappers` installs for gh and git could not
+    //    contain it. Measured on macOS 15 with a ~10-line C program linking
+    //    CoreServices and calling LSOpenCFURLRef() on
+    //    file:///System/Applications/Calculator.app, compiled outside and run
+    //    inside a real cplt sandbox:
+    //
+    //      without --allow-browser:  status = -54, no application launched
+    //      with    --allow-browser:  status =   0, Calculator running outside
+    //                                             the sandbox
+    //
+    //    No `open` process was involved in either run. Separately, the blanket
+    //    `(allow process-exec)` in `emit_process_rules` means /usr/bin/open is
+    //    executable by absolute path anyway, which a PATH shim never sees.
+    //
+    // Both bypasses are one-liners for a hostile agent, so a shim would guard
+    // only against an agent that types `open` politely. Do not add one and call
+    // it a fix: the only control that holds is leaving the flag off.
     if allow_browser {
-        sbpl!(sb, ";; Launch Services (OAuth browser flows)");
+        sbpl!(
+            sb,
+            ";; Launch Services — unscopable; launches apps outside the sandbox"
+        );
         sbpl!(sb, "(allow lsopen)");
         sbpl!(sb);
     }

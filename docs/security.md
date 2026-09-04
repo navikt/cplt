@@ -34,12 +34,34 @@ This section describes the macOS Seatbelt profile; the Linux equivalents, and wh
 
 See [SECURITY.md](../SECURITY.md) for the full threat model and honest gaps.
 
+## `--allow-browser` is a sandbox escape, and cannot be scoped
+
+`--allow-browser` (and `sandbox.allow_browser`) exists so an agent can hand an https URL to your browser during an OAuth sign-in. What it grants is Launch Services, which is a much larger thing. Launch Services starts the target through launchd, **outside** the Seatbelt profile, so with the flag on the agent can launch any application on the machine with no sandbox in front of it. `open -a Terminal script.sh` is the whole exploit. That is not a defect; it is what the grant is.
+
+The obvious repair — wrap `open`, accept `http://` and `https://`, reject file paths and `-a`/`-b` — was investigated for [#251](https://github.com/navikt/cplt/issues/251) and rejected, because two measured facts say it would guard nothing.
+
+**`lsopen` takes no filter.** SBPL has no URL, bundle-id or path predicate for the operation. Every profile under `/System/Library/Sandbox/Profiles` that uses it emits it bare, `(allow lsopen)`, exactly as cplt does — Apple has no narrower form to copy. It is all of Launch Services or none of it.
+
+**The grant does not go through the `open` binary.** A PATH wrapper, of the kind cplt installs for `gh` and `git`, only shadows a name. A program that calls `LSOpenCFURLRef()` reaches Launch Services directly and never runs `open` at all. Measured on macOS 15, with a ten-line C program linking CoreServices, compiled outside the sandbox and run inside a real cplt session against `file:///System/Applications/Calculator.app`:
+
+| run | `LSOpenCFURLRef` status | result |
+| --- | --- | --- |
+| without `--allow-browser` | `-54` (denied) | no application launched |
+| with `--allow-browser` | `0` | **Calculator running outside the sandbox** |
+
+No `open` process existed in either run. Separately, the profile's blanket `(allow process-exec)` means `/usr/bin/open` is executable by absolute path regardless, which a PATH shim never sees — so even the polite path has a one-token bypass (`/usr/bin/open` instead of `open`).
+
+Both bypasses are one-liners for a hostile agent. A shim would stop an agent that types `open` politely and nothing else, so cplt does not ship one and does not describe this flag as scopable.
+
+**What to do instead.** Leave it off, which is the default. Turn it on only while a sign-in prompt is actually on screen, and turn it back off afterwards. Of the supported agents only Antigravity needs it; Copilot, OpenCode and Claude Code use device flows that print a code and a URL and need no browser at all. `cplt config set sandbox.allow_browser true` is flagged dangerous and asks for confirmation, and `detect` never proposes it.
+
 ## Limitations
 
 ### macOS
 
 - **`sandbox-exec` is deprecated.** Apple has not removed it, but may in a future macOS version.
 - **SBPL has no domain-based filtering.** The optional CONNECT proxy provides domain blocking.
+- **SBPL has no `lsopen` filtering either.** `--allow-browser` is therefore all of Launch Services or none of it, and with it on the agent launches applications outside the sandbox. It cannot be narrowed by a wrapper: see [`--allow-browser` is a sandbox escape](#--allow-browser-is-a-sandbox-escape-and-cannot-be-scoped).
 - **Keychain access is required.** Copilot stores auth tokens in the macOS Keychain.
 - **Proxy-forced mode gets full enforcement.** With `--proxy-forced` or `proxy.forced = true` ([#53](https://github.com/navikt/cplt/issues/53), opt-in, off by default), SBPL pins outbound egress to `localhost:<proxy_port>`. Seatbelt can pin to localhost, so there is **no residual** on macOS: no direct `:443` path exists, and neither raw sockets nor `env -u HTTPS_PROXY` can get around the proxy. It fails closed if the proxy cannot start, and conflicts with `--no-proxy`.
 

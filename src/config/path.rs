@@ -255,9 +255,11 @@ pub fn default_config_contents() -> String {
 # Much broader than allow_cache_exec. Prefer specifying exact subdirs.
 # allow_cache_exec_any = false
 #
-# Allow the agent to open URLs in your default browser.
-# Needed for OAuth code flows (MCP servers, Antigravity, gh auth login).
-# Disabled by default because it lets the agent use your browser session.
+# DANGEROUS: Let the agent launch ANY application outside the sandbox.
+# Needed for OAuth code flows (MCP servers, Antigravity, gh auth login), but the
+# grant is Launch Services, not a browser: launchd starts the target outside the
+# Seatbelt profile, so `open -a Terminal script.sh` escapes. It cannot be
+# narrowed to URLs. Turn it on only while a sign-in prompt is on screen.
 # allow_browser = false
 #
 # EXPERIMENTAL. Drop the macOS Keychain grant for runs where the agent has a
