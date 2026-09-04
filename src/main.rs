@@ -446,8 +446,8 @@ Let the agent launch ANY application outside the sandbox (DANGEROUS).
 Needed for OAuth code flows (MCP servers, Antigravity, gh auth login), but what
 it grants is Launch Services, not a browser. Launch Services starts the target
 through launchd, outside the Seatbelt profile, so with this flag on the agent
-can run any application on the machine with no sandbox at all. `open -a Terminal
-script.sh` is the one-line version.
+can run any application on the machine with no sandbox at all. The one-line
+version is: `open -a Terminal script.sh`
 
 This cannot be narrowed. SBPL's `lsopen` operation takes no filter, and the
 grant does not depend on the `open` binary: a program that calls
