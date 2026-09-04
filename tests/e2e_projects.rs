@@ -1204,10 +1204,10 @@ fi
         require_sandbox!();
         let project = TempProject::scaffold_node();
 
-        // Create a temporary config file
-        let config_dir = project.path().join(".cplt-config-test");
-        fs::create_dir_all(&config_dir).unwrap();
-        let config_path = config_dir.join("config.toml");
+        // Create a temporary config file OUTSIDE the project: cplt refuses a
+        // CPLT_CONFIG that the repo itself controls (issue #261).
+        let config_home = TempProject::new("cplt-config-test");
+        let config_path = config_home.path().join("config.toml");
         fs::write(
             &config_path,
             r"

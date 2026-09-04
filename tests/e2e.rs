@@ -4998,4 +4998,129 @@ paths = [
             "docker should be allowed with --allow-docker:\n{stdout}"
         );
     }
+
+    // ── CPLT_CONFIG visibility and containment (issue #261) ─────
+    //
+    // CPLT_CONFIG replaces the whole user config, [sandbox] keys included, so
+    // it walks around the repo-config trust machinery. Both messages must
+    // survive --quiet: a quiet run is when a silent swap costs the most.
+
+    /// A git repo with a HOME of its own, so nothing here can see the real
+    /// user's config. Returns (home, project).
+    fn cplt_config_fixture(tag: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(home.path().join(".config/cplt")).unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(project.path())
+            .status()
+            .unwrap_or_else(|e| panic!("git init for {tag}: {e}"));
+        assert!(status.success(), "git init should succeed for {tag}");
+        (home, project)
+    }
+
+    #[test]
+    fn e2e_cplt_config_outside_user_dir_warns_even_when_quiet() {
+        let (home, project) = cplt_config_fixture("outside");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let config = elsewhere.path().join("config.toml");
+        std::fs::write(&config, "[sandbox]\n").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["--quiet", "--print-profile", "--agent", "copilot"])
+            .current_dir(project.path())
+            .env("HOME", home.path())
+            .env("CPLT_CONFIG", &config)
+            .output()
+            .expect("should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "a config outside the project is allowed: {stderr}"
+        );
+        assert!(
+            stderr.contains("CPLT_CONFIG replaces your whole cplt config"),
+            "--quiet must not swallow the warning: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_cplt_config_under_user_dir_is_silent() {
+        let (home, project) = cplt_config_fixture("normal");
+        let config = home.path().join(".config/cplt/config.toml");
+        std::fs::write(&config, "[sandbox]\n").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["--quiet", "--print-profile", "--agent", "copilot"])
+            .current_dir(project.path())
+            .env("HOME", home.path())
+            .env("CPLT_CONFIG", &config)
+            .output()
+            .expect("should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "normal location works: {stderr}");
+        assert!(
+            !stderr.contains("CPLT_CONFIG"),
+            "the normal location must not be flagged: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_cplt_config_inside_project_is_refused() {
+        let (home, project) = cplt_config_fixture("inside");
+        let config = project.path().join("ci/cplt.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[sandbox]\nallow_env_files = true\n").unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["--quiet", "--print-profile", "--agent", "copilot"])
+            .current_dir(project.path())
+            .env("HOME", home.path())
+            .env("CPLT_CONFIG", &config)
+            .output()
+            .expect("should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "repo-controlled config must not launch: {stderr}"
+        );
+        assert!(
+            stderr.contains("points inside the project directory"),
+            "refusal should say why: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_cplt_config_symlinked_into_project_is_refused() {
+        // The sidestep the containment check exists for: an innocent-looking
+        // path outside the repo that is a symlink back into it.
+        let (home, project) = cplt_config_fixture("symlink");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let real = project.path().join("cplt.toml");
+        std::fs::write(&real, "[sandbox]\n").unwrap();
+        let link = elsewhere.path().join("innocent.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let output = Command::new(binary_path())
+            .args(["--quiet", "--print-profile", "--agent", "copilot"])
+            .current_dir(project.path())
+            .env("HOME", home.path())
+            .env("CPLT_CONFIG", &link)
+            .output()
+            .expect("should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "a symlink into the repo must be refused too: {stderr}"
+        );
+        assert!(
+            stderr.contains("points inside the project directory"),
+            "refusal should say why: {stderr}"
+        );
+    }
 }

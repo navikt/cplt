@@ -428,6 +428,67 @@ pub(super) fn resolve_repo_path(path: &str, config_dir: &Path) -> PathBuf {
     canonicalize_deepest(&full)
 }
 
+/// Where a `CPLT_CONFIG` override points, relative to the two locations that
+/// decide whether it can be trusted.
+///
+/// `CPLT_CONFIG` replaces the *entire* user config, including every `[sandbox]`
+/// key, so it goes around the repo-config trust machinery that only ever lets a
+/// repository tighten the sandbox (issue #261). A shell that auto-loads
+/// repository-provided environment (direnv, mise) makes a checkout enough to
+/// aim cplt at a config the repository controls.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CustomConfigVerdict {
+    /// Under `$HOME/.config/cplt/` — the normal location, nothing to say.
+    UserConfigDir,
+    /// Outside the normal location but outside the project too: allowed, but
+    /// the substitution must be visible.
+    Outside(PathBuf),
+    /// Inside the project directory: the repo controls it. Refused.
+    InsideProject(PathBuf),
+}
+
+/// Resolve a path far enough that containment checks cannot be sidestepped.
+///
+/// `canonicalize` alone is not enough: it fails whole-path on a file that does
+/// not exist yet, and `canonicalize_deepest`'s walk gives up entirely on a `..`
+/// component (`file_name()` is `None` there). So walk the components, resolving
+/// symlinks in what has been built up each time a `..` arrives and stepping up
+/// from the resolved path — POSIX order — and fold `..` lexically only out
+/// beyond where the filesystem still has anything to say.
+///
+/// Without this, `<project>/sub/../cplt.toml` and
+/// `~/.config/cplt/sub/../../../evil.toml` both dodge a plain `starts_with`.
+fn fully_resolved(path: &Path) -> PathBuf {
+    let anchored = if path.is_relative() {
+        std::env::current_dir().unwrap_or_default().join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let mut out = PathBuf::new();
+    for component in lexically_normalized(&anchored).components() {
+        if matches!(component, Component::ParentDir) {
+            out = canonicalize_deepest(&out);
+            out.pop();
+        } else {
+            out.push(component);
+        }
+    }
+    canonicalize_deepest(&out)
+}
+
+/// Classify a `CPLT_CONFIG` value. Pure apart from resolving `path` on disk:
+/// `home` and `project_dir` are passed in, already canonicalized by the caller.
+pub fn classify_custom_config(path: &Path, home: &Path, project_dir: &Path) -> CustomConfigVerdict {
+    let resolved = fully_resolved(path);
+    if resolved.starts_with(fully_resolved(project_dir)) {
+        return CustomConfigVerdict::InsideProject(resolved);
+    }
+    if resolved.starts_with(fully_resolved(&home.join(CONFIG_DIR))) {
+        return CustomConfigVerdict::UserConfigDir;
+    }
+    CustomConfigVerdict::Outside(resolved)
+}
+
 /// Expand tilde, resolve relative paths against config dir, and canonicalize.
 pub(super) fn resolve_config_path(
     path: &str,
@@ -650,5 +711,157 @@ mod tests {
         assert_eq!(expanded, PathBuf::from(format!("{home}/.config/test")));
         let collapsed = collapse_tilde(expanded.to_str().unwrap());
         assert_eq!(collapsed, original);
+    }
+
+    // ── CPLT_CONFIG classification (issue #261) ──────────────────
+    //
+    // These take home and project_dir as arguments rather than reading the
+    // environment, so they are safe to run in parallel with everything else.
+
+    /// tempfile hands out paths under /var on macOS, which is a symlink to
+    /// /private/var. Compare resolved paths against resolved fixtures.
+    fn canon(p: &Path) -> PathBuf {
+        p.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn custom_config_under_user_config_dir_is_normal() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cfg_dir = home.path().join(CONFIG_DIR);
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg = cfg_dir.join(CONFIG_FILE);
+        std::fs::write(&cfg, "").unwrap();
+
+        assert_eq!(
+            classify_custom_config(&cfg, &canon(home.path()), &canon(project.path())),
+            CustomConfigVerdict::UserConfigDir
+        );
+    }
+
+    #[test]
+    fn custom_config_elsewhere_is_flagged_but_allowed() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let cfg = other.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+
+        assert_eq!(
+            classify_custom_config(&cfg, &canon(home.path()), &canon(project.path())),
+            CustomConfigVerdict::Outside(canon(&cfg))
+        );
+    }
+
+    #[test]
+    fn custom_config_inside_project_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cfg = project.path().join("cplt.toml");
+        std::fs::write(&cfg, "").unwrap();
+
+        assert_eq!(
+            classify_custom_config(&cfg, &canon(home.path()), &canon(project.path())),
+            CustomConfigVerdict::InsideProject(canon(&cfg))
+        );
+    }
+
+    #[test]
+    fn custom_config_inside_project_nested_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().join(".config/nested");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("cplt.toml");
+        std::fs::write(&cfg, "").unwrap();
+
+        assert_eq!(
+            classify_custom_config(&cfg, &canon(home.path()), &canon(project.path())),
+            CustomConfigVerdict::InsideProject(canon(&cfg))
+        );
+    }
+
+    #[test]
+    fn custom_config_reached_through_a_symlink_is_still_inside_the_project() {
+        // The escape the containment check exists to survive: a symlink outside
+        // the project pointing back into it. Comparing the unresolved path
+        // would call this Outside and let the repo own the sandbox config.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let real = project.path().join("cplt.toml");
+        std::fs::write(&real, "").unwrap();
+        let link = elsewhere.path().join("innocent.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            classify_custom_config(&link, &canon(home.path()), &canon(project.path())),
+            CustomConfigVerdict::InsideProject(canon(&real))
+        );
+    }
+
+    #[test]
+    fn custom_config_symlinked_directory_into_the_project_is_still_inside() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let real = project.path().join("cplt.toml");
+        std::fs::write(&real, "").unwrap();
+        let link_dir = elsewhere.path().join("repo");
+        std::os::unix::fs::symlink(project.path(), &link_dir).unwrap();
+
+        assert_eq!(
+            classify_custom_config(
+                &link_dir.join("cplt.toml"),
+                &canon(home.path()),
+                &canon(project.path())
+            ),
+            CustomConfigVerdict::InsideProject(canon(&real))
+        );
+    }
+
+    #[test]
+    fn custom_config_dot_dot_back_into_the_project_is_still_inside() {
+        // `<project>/sub/../cplt.toml` where neither `sub` nor the file exists,
+        // so canonicalize stops at the project root and `..` survives into the
+        // tail — it has to be folded there, not left in the path.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let spelled = project.path().join("sub/../cplt.toml");
+
+        assert_eq!(
+            classify_custom_config(&spelled, &canon(home.path()), &canon(project.path())),
+            CustomConfigVerdict::InsideProject(canon(project.path()).join("cplt.toml"))
+        );
+    }
+
+    #[test]
+    fn custom_config_dot_dot_out_of_the_user_config_dir_is_not_normal() {
+        // `~/.config/cplt/sub/../../../evil.toml`, with `sub` absent so `..`
+        // reaches the unresolved tail. It starts_with the user config dir until
+        // `..` is folded, and must not be reported as the normal location.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(CONFIG_DIR)).unwrap();
+        let spelled = home.path().join(CONFIG_DIR).join("sub/../../../evil.toml");
+
+        assert_eq!(
+            classify_custom_config(&spelled, &canon(home.path()), &canon(project.path())),
+            CustomConfigVerdict::Outside(canon(home.path()).join("evil.toml"))
+        );
+    }
+
+    #[test]
+    fn custom_config_that_does_not_exist_is_still_classified() {
+        // The file need not exist: cplt falls back to no config, but the
+        // substitution is still worth flagging.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cfg = project.path().join("does/not/exist.toml");
+
+        assert_eq!(
+            classify_custom_config(&cfg, &canon(home.path()), &canon(project.path())),
+            CustomConfigVerdict::InsideProject(canon(project.path()).join("does/not/exist.toml"))
+        );
     }
 }

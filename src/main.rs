@@ -1366,6 +1366,42 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         }
     };
 
+    // ── CPLT_CONFIG sanity check (issue #261) ────────────────────
+    // The env var replaces the whole user config, every [sandbox] key included,
+    // bypassing the repo-config trust machinery that only ever lets a repo
+    // tighten the sandbox. Warn whenever it points somewhere unusual, and
+    // refuse outright when the project directory controls the file.
+    //
+    // Both messages ignore --quiet: a quiet run is exactly when a silent
+    // config swap does the most damage.
+    if let Ok(custom) = std::env::var("CPLT_CONFIG") {
+        let user_dir = home_dir.join(".config/cplt");
+        match config::classify_custom_config(
+            &config::expand_tilde(&custom),
+            &home_dir,
+            &project_dir,
+        ) {
+            config::CustomConfigVerdict::UserConfigDir => {}
+            config::CustomConfigVerdict::Outside(p) => {
+                ui::warn("CPLT_CONFIG replaces your whole cplt config, sandbox settings included:");
+                eprintln!("  {}", p.display());
+                eprintln!("  It is not under {}.", user_dir.display());
+                eprintln!(
+                    "  If you did not set it yourself, your shell did (direnv, mise, .envrc)."
+                );
+            }
+            config::CustomConfigVerdict::InsideProject(p) => bail!(
+                "CPLT_CONFIG points inside the project directory:\n  \
+                 {}\n  \
+                 That file is repository content, and it would replace your whole cplt \
+                 config — sandbox settings included — with none of the review a .cplt.toml \
+                 gets. Refusing.\n  \
+                 Unset CPLT_CONFIG (check .envrc / mise config) and re-run.",
+                p.display()
+            ),
+        }
+    }
+
     // Safety check: reject overly broad project roots
     if is_unsafe_root(&project_dir, &home_dir) {
         bail!(
