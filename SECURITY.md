@@ -1038,10 +1038,14 @@ The update mechanism downloads releases from GitHub, verifies SHA256 checksums, 
 - The extracted binary is verified via `symlink_metadata`, which rejects symlinks
 - Absolute paths are used for system tools on macOS (`/usr/bin/curl`, `/usr/bin/shasum`, `/usr/bin/tar`) and Linux (`/usr/bin/sha256sum`, standard paths only, no bare PATH lookup)
 - Replacement is atomic: stage to `.new`, set permissions, rename
+- Staging happens in `~/.config/cplt/update/<128 random bits>`, not the system temp directory. Sandboxed agents can write throughout `/tmp` and `/var/folders`; `~/.config/cplt` is a hard deny (`DENIED_DOTFILES`), so a sandboxed process cannot reach the staged files at all
+- The staging directory is created with `mkdir(2)` at mode 0700, which fails with `EEXIST` rather than adopting a directory that is already there
+- The extracted binary is held open, and its `(dev, ino)` is re-checked before the unsandboxed `--version` probe and again before install. The install copies from that descriptor, so the bytes that are validated are the bytes that land on disk even if the path is repointed
 
 **Not verified:**
 - There is no cryptographic signature, neither GPG nor Sigstore. `SHA256SUMS` and the binary come from the same GitHub release, so a compromised release controls both. This matches most Go/Rust CLI tools but is weaker than signed package managers.
-- The temp directory is `/tmp/cplt-update-{PID}`, predictable by local attackers, though the extracted binary is checked for symlinks before installation.
+- The `--version` probe runs the freshly downloaded binary **unsandboxed**. The inode is pinned across that step, so it is the file cplt validated, but its provenance rests entirely on the SHA256 check above.
+- On the sudo install path the binary is handed to `sudo install` by path, not by descriptor. The inode is re-checked immediately before, but the staging directory being private is what closes that window.
 
 The Homebrew install path (`brew install navikt/tap/cplt`) uses Homebrew's own verification and is preferred on macOS.
 

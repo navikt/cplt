@@ -241,7 +241,7 @@ impl Drop for ScratchDir {
 }
 
 /// Generate a random session ID using /dev/urandom.
-fn generate_session_id() -> Result<String, String> {
+pub(crate) fn generate_session_id() -> Result<String, String> {
     let mut buf = [0u8; 16];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| {
@@ -263,7 +263,7 @@ fn is_session_id(name: &str) -> bool {
 /// - Is a directory (not a symlink to one)
 /// - Owned by current user
 /// - Permissions are 0700 (set if not)
-fn validate_dir_safety(path: &Path, label: &str) -> Result<(), String> {
+pub(crate) fn validate_dir_safety(path: &Path, label: &str) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = path
@@ -305,7 +305,7 @@ fn validate_dir_safety(path: &Path, label: &str) -> Result<(), String> {
 }
 
 /// Create a directory with 0700 permissions atomically.
-fn create_secure_dir(path: &Path, label: &str) -> Result<(), String> {
+pub(crate) fn create_secure_dir(path: &Path, label: &str) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .mode(0o700)

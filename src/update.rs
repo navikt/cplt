@@ -95,6 +95,11 @@ pub enum UpdateError {
         "Version mismatch: binary reports '{got}' but release tag expects '{expected}'.\n  This is a release pipeline bug. The binary was built with a different version than the tag."
     )]
     VersionMismatch { expected: String, got: String },
+
+    #[error(
+        "The staged binary at {0} was replaced after cplt validated it.\n  Refusing to run or install it."
+    )]
+    StagedBinaryReplaced(String),
 }
 
 /// A parsed GitHub release.
@@ -213,7 +218,9 @@ pub fn perform_update(
 
     // 1. Download the archive
     eprintln!("  Downloading {asset}...");
-    let tmp_dir = create_temp_dir()?;
+    let home = std::env::var("HOME")
+        .map_err(|_| UpdateError::Io("HOME is not set, cannot stage the update".to_string()))?;
+    let tmp_dir = create_stage_dir(Path::new(&home))?;
     let archive_path = tmp_dir.join(&asset);
     curl_download(&asset_url, &archive_path, current_version)?;
 
@@ -254,17 +261,28 @@ pub fn perform_update(
         .map_err(|e| UpdateError::Io(format!("Cannot determine current binary path: {e}")))?;
     let target_path = std::fs::canonicalize(&current_exe).unwrap_or(current_exe);
 
-    // 5. Stage: set permissions and platform-specific postprocessing
+    // 5. Stage: set permissions and platform-specific postprocessing.
+    // Both rewrite the file, and codesign is free to do so by rename, so the
+    // inode identity below is taken afterwards.
     eprintln!("  Preparing binary...");
     set_executable(&new_binary)?;
     postprocess_binary(&new_binary);
 
-    // 5b. Verify the binary reports the expected version.
+    // 5b. Pin the inode. Everything after this point must be the same file:
+    // the version probe below executes it *unsandboxed*, so a swap between
+    // probe and install would run one binary and ship another.
+    let binary = StagedBinary::open(&new_binary).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    })?;
+
+    // 5c. Verify the binary reports the expected version.
     // Catches release pipeline bugs where the tag and binary version diverge
     // (e.g., version timestamp generated twice → infinite update loop).
+    binary.verify_unchanged()?;
     verify_binary_version(&new_binary, expected_version, &tmp_dir)?;
 
     // 6. Install to target path — use sudo if direct write fails
+    binary.verify_unchanged()?;
     let needs_sudo = !is_writable(&target_path);
     if needs_sudo {
         eprintln!(
@@ -274,8 +292,7 @@ pub fn perform_update(
         sudo_install(&new_binary, &target_path)?;
     } else {
         let staged = target_path.with_extension("new");
-        std::fs::copy(&new_binary, &staged)
-            .map_err(|e| UpdateError::Io(format!("Cannot stage binary: {e}")))?;
+        binary.copy_to(&staged)?;
         set_executable(&staged)?;
         postprocess_binary(&staged);
         std::fs::rename(&staged, &target_path).map_err(|e| {
@@ -589,16 +606,119 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
     }
 }
 
-/// Create a temporary directory for the update process.
-fn create_temp_dir() -> Result<PathBuf, UpdateError> {
-    let dir = std::env::temp_dir().join(format!("cplt-update-{}", std::process::id()));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| UpdateError::Io(format!("Cannot clean up old temp dir: {e}")))?;
+/// Staging base for downloads, relative to `$HOME`.
+///
+/// Deliberately *not* the system temp directory. Every cplt sandbox can write
+/// throughout `/tmp` and `/var/folders`, so a same-UID process could swap the
+/// archive or the extracted binary between validation and use. `~/.config/cplt`
+/// is a hard deny for sandboxed agents (see `sandbox_policy::DENIED_DOTFILES`),
+/// which takes that reach away.
+const STAGE_BASE: &str = ".config/cplt/update";
+
+/// Create a private staging directory for the update process.
+///
+/// The directory name is 128 bits from `/dev/urandom` rather than the pid, and
+/// it is created with `mkdir(2)` at mode 0700, which fails with `EEXIST` rather
+/// than adopting a directory someone else planted — the "check then create"
+/// version this replaces did adopt it.
+fn create_stage_dir(home: &Path) -> Result<PathBuf, UpdateError> {
+    let base = home.join(STAGE_BASE);
+    std::fs::create_dir_all(&base)
+        .map_err(|e| UpdateError::Io(format!("Cannot create staging base: {e}")))?;
+
+    // Canonicalize both sides so a symlink at any ancestor is caught, not
+    // followed: `~/.config` swapped for a symlink would otherwise stage the
+    // update wherever it points.
+    let canonical_home = std::fs::canonicalize(home)
+        .map_err(|e| UpdateError::Io(format!("Cannot canonicalize home dir: {e}")))?;
+    let canonical_base = std::fs::canonicalize(&base)
+        .map_err(|e| UpdateError::Io(format!("Cannot canonicalize staging base: {e}")))?;
+    if canonical_base != canonical_home.join(STAGE_BASE) {
+        return Err(UpdateError::Io(format!(
+            "Staging base resolved to {} but expected {}. An ancestor may be a symlink",
+            canonical_base.display(),
+            canonical_home.join(STAGE_BASE).display()
+        )));
     }
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| UpdateError::Io(format!("Cannot create temp dir: {e}")))?;
+    crate::scratch::validate_dir_safety(&canonical_base, "Update staging base")
+        .map_err(UpdateError::Io)?;
+
+    let dir = canonical_base.join(crate::scratch::generate_session_id().map_err(UpdateError::Io)?);
+    crate::scratch::create_secure_dir(&dir, "update staging dir").map_err(UpdateError::Io)?;
     Ok(dir)
+}
+
+/// The extracted binary, held open so that validation, execution and install
+/// all refer to the same inode.
+///
+/// Re-checking a *path* proves nothing: between two `stat` calls the name can
+/// be pointed at a different file. This holds the descriptor from the file it
+/// validated, compares `(dev, ino)` before each use of the path, and installs
+/// by copying out of the descriptor rather than re-opening the name.
+struct StagedBinary {
+    path: PathBuf,
+    file: std::fs::File,
+    dev: u64,
+    ino: u64,
+}
+
+impl StagedBinary {
+    /// Open `path` without following symlinks and record the inode identity.
+    fn open(path: &Path) -> Result<Self, UpdateError> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| UpdateError::BinaryNotFound)?;
+        let meta = file
+            .metadata()
+            .map_err(|e| UpdateError::Io(format!("Cannot stat staged binary: {e}")))?;
+        if !meta.file_type().is_file() {
+            return Err(UpdateError::BinaryNotRegularFile);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            file,
+        })
+    }
+
+    /// Fail if the path no longer names the inode we validated.
+    fn verify_unchanged(&self) -> Result<(), UpdateError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let meta =
+            std::fs::symlink_metadata(&self.path).map_err(|_| UpdateError::BinaryNotFound)?;
+        if meta.dev() != self.dev || meta.ino() != self.ino {
+            return Err(UpdateError::StagedBinaryReplaced(
+                self.path.display().to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Copy the validated bytes to `dest`, reading from the held descriptor.
+    ///
+    /// Never re-opens `self.path`, so a swap of that name cannot change what
+    /// gets installed.
+    fn copy_to(&self, dest: &Path) -> Result<(), UpdateError> {
+        use std::io::Seek;
+
+        let mut src = self
+            .file
+            .try_clone()
+            .map_err(|e| UpdateError::Io(format!("Cannot re-read staged binary: {e}")))?;
+        src.rewind()
+            .map_err(|e| UpdateError::Io(format!("Cannot rewind staged binary: {e}")))?;
+        let mut out = std::fs::File::create(dest)
+            .map_err(|e| UpdateError::Io(format!("Cannot stage binary: {e}")))?;
+        std::io::copy(&mut src, &mut out)
+            .map_err(|e| UpdateError::Io(format!("Cannot stage binary: {e}")))?;
+        Ok(())
+    }
 }
 
 /// Set executable permissions on a file.
@@ -743,6 +863,136 @@ fn find_sudo() -> Result<PathBuf, UpdateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// Write `bytes` to a fresh file at `path`.
+    fn write_file(path: &Path, bytes: &[u8]) {
+        let mut f = std::fs::File::create(path).expect("create");
+        f.write_all(bytes).expect("write");
+    }
+
+    #[test]
+    fn stage_dir_is_private_unpredictable_and_exclusive() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let a = create_stage_dir(home.path()).expect("first stage dir");
+        let b = create_stage_dir(home.path()).expect("second stage dir");
+
+        // Under cplt's own config dir, never the world-writable system temp:
+        // every sandbox can write throughout /tmp and /var/folders.
+        let base = std::fs::canonicalize(home.path()).unwrap().join(STAGE_BASE);
+        assert!(
+            a.starts_with(&base),
+            "stage dir {} is not under {}",
+            a.display(),
+            base.display()
+        );
+        assert!(
+            !a.starts_with(std::env::temp_dir()),
+            "stage dir must not live in the system temp directory"
+        );
+
+        // Unpredictable: two runs must not collide, and the name must not be
+        // derivable from the pid.
+        assert_ne!(a, b, "two staging dirs collided");
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name.len(), 32, "expected 128 bits of hex, got {name:?}");
+        assert!(
+            !name.contains(&std::process::id().to_string()),
+            "staging dir name {name:?} leaks the pid"
+        );
+
+        // Owner-only from the moment it exists (mkdir with mode, not chmod after).
+        let mode = std::fs::symlink_metadata(&a).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "staging dir is not 0700");
+
+        // Exclusive creation: an existing directory is refused, not adopted.
+        let planted = base.join("00000000000000000000000000000000");
+        crate::scratch::create_secure_dir(&planted, "planted").expect("plant");
+        assert!(
+            crate::scratch::create_secure_dir(&planted, "planted").is_err(),
+            "creating over an existing staging dir must fail"
+        );
+    }
+
+    #[test]
+    fn staged_binary_refuses_a_swapped_inode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cplt");
+        write_file(&path, b"good");
+
+        let staged = StagedBinary::open(&path).expect("open");
+        staged
+            .verify_unchanged()
+            .expect("untouched file must verify");
+
+        // Same path, different inode — exactly the swap the version probe and
+        // the install would otherwise walk into.
+        let evil = dir.path().join("evil");
+        write_file(&evil, b"evil");
+        std::fs::rename(&evil, &path).expect("swap");
+
+        let err = staged
+            .verify_unchanged()
+            .expect_err("swap must be detected");
+        assert!(
+            matches!(err, UpdateError::StagedBinaryReplaced(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn staged_binary_installs_the_bytes_it_validated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cplt");
+        write_file(&path, b"good");
+
+        let staged = StagedBinary::open(&path).expect("open");
+
+        let evil = dir.path().join("evil");
+        write_file(&evil, b"evil");
+        std::fs::rename(&evil, &path).expect("swap");
+
+        // Copying re-reads the held descriptor, not the name, so the swap
+        // cannot change what lands on disk.
+        let dest = dir.path().join("installed");
+        staged.copy_to(&dest).expect("copy");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"good");
+    }
+
+    #[test]
+    fn staged_binary_rejects_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        write_file(&real, b"good");
+        let link = dir.path().join("cplt");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        assert!(
+            StagedBinary::open(&link).is_err(),
+            "a symlinked staged binary must be refused"
+        );
+    }
+
+    #[test]
+    fn staged_binary_accepts_in_place_edits_of_the_same_inode() {
+        // Sanity check that the guard keys on the inode and not on content or
+        // mtime: postprocess_binary rewrites the file in place.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cplt");
+        write_file(&path, b"good");
+        let staged = StagedBinary::open(&path).expect("open");
+        let ino = std::fs::symlink_metadata(&path).unwrap().ino();
+
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all(b"gooo").unwrap();
+        drop(f);
+
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), ino);
+        staged
+            .verify_unchanged()
+            .expect("in-place edit is not a swap");
+    }
 
     #[test]
     fn version_looks_valid() {
