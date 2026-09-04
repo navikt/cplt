@@ -93,10 +93,11 @@ pub fn current_uid() -> u32 {
 ///
 /// `allow_docker` punches through the container-runtime entries only (#155):
 /// the D-Bus and systemd masks are never lifted. On Linux `--allow-docker` was
-/// previously a documented no-op; it now means exactly two things — *do not
-/// mask the daemon sockets*, and *grant Landlock read+write on them* (see
+/// previously a documented no-op; it now means three things — *do not mask
+/// the daemon sockets*, *grant Landlock read+write on them* (see
 /// [`linux_docker_socket_paths`]) so `connect(2)` still works once the kernel
-/// gates it at ABI v9. It grants nothing else: `~/.docker` stays denied.
+/// gates it at ABI v9, and *grant `~/.docker` read-only* so the CLI finds its
+/// contexts and registry auth. It grants nothing else.
 ///
 /// Abstract-namespace sockets have no path and cannot be masked this way; they
 /// are covered (kernel ≥ 6.12 only) by `Scope::AbstractUnixSocket`.
@@ -128,9 +129,9 @@ pub fn socket_mask_paths(uid: u32, allow_docker: bool) -> Vec<PathBuf> {
 /// Directory entries (`.../podman`) are intentional: Podman's socket sits at
 /// `<dir>/podman.sock`, and a `PathBeneath` rule covers the subtree.
 ///
-/// Not granted, and out of scope here: `~/.docker` (in [`DENIED_DOTFILES`], so
-/// the Docker CLI runs without its config file — contexts and registry auth
-/// stay unavailable on Linux; that is #155's remaining half, not this one).
+/// `~/.docker` is not a socket and not in this list; it is in
+/// [`DENIED_DOTFILES`] and gets its own read-only Landlock rule under
+/// `--allow-docker` (see `sandbox_landlock.rs`), mirroring the macOS profile.
 pub fn linux_docker_socket_paths(uid: u32) -> Vec<PathBuf> {
     vec![
         PathBuf::from("/run/docker.sock"),

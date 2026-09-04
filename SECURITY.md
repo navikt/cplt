@@ -808,7 +808,7 @@ Linux-specific tool directories use XDG-style paths:
 #### Linux-specific limitations
 
 1. **No `--show-denials`.** Landlock has no audit logging. Use `strace` for debugging.
-2. **No subpath deny.** The entire directory must be allowed or denied. See [Out of scope](#out-of-scope).
+2. **No subpath deny.** The entire directory must be allowed or denied. See [Out of scope](#out-of-scope). This is why `--allow-docker` on Linux exposes all of `~/.docker` read-only, including `trust/private`, which the macOS profile denies.
 3. **No auth integration.** Linux v1 supports env token and `gh auth` only, with no D-Bus/Secret Service.
 4. **No localhost isolation at kernel level.** Landlock network rules are port-based only and cannot distinguish `localhost:443` from `remote:443`. On macOS, Seatbelt blocks localhost outbound separately. On Linux, use `--with-proxy` for localhost SSRF protection, since the proxy resolves DNS and blocks private IPs.
 5. **Unix-socket protection depends on the kernel and on bubblewrap.** Landlock cannot restrict `connect()` to a pathname unix socket before ABI v9 (kernel 7.1); the seccomp filter cannot help, since the path arrives behind a pointer BPF cannot dereference; and a read-only bubblewrap bind does not stop a `connect()` either (the `MS_RDONLY` check lives in `mnt_want_write()`, which unix-socket connect never reaches). Three regimes result, and cplt prints which one a run is in:

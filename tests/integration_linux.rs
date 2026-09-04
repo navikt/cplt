@@ -335,6 +335,39 @@ mod linux_tests {
         );
     }
 
+    /// `--allow-docker` makes `~/.docker` readable on Linux (#155). The
+    /// read-only half of that grant is checked against the generated policy,
+    /// not here — see the comment at the end of this test.
+    #[test]
+    fn landlock_allow_docker_reads_docker_config() {
+        require_landlock!();
+        let project = create_test_project();
+        let fake_home = create_fake_home_with_secrets();
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
+            project.path(),
+            fake_home.path(),
+            &["--allow-docker"],
+            "cat ~/.docker/config.json",
+        );
+        assert_eq!(
+            code, 0,
+            "--allow-docker should make ~/.docker/config.json readable — stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(stdout.contains("registry.example.com"), "{stdout}");
+
+        // The write half cannot be asserted here, and the reason is worth
+        // stating rather than leaving as a missing case. The Landlock policy
+        // grants /tmp read+write unconditionally, `create_fake_home_with_secrets`
+        // builds the home under /tmp, and Landlock unions a path's ancestor
+        // rights — so no rule beneath a writable /tmp can be read-only, whatever
+        // this backend emits. On a real machine $HOME gets no blanket write
+        // grant and the read-only rule does hold.
+        //
+        // The generated policy is where that is checked instead:
+        // `allow_docker_grants_docker_config_read_only` asserts the rule carries
+        // read without write, and fails if the grant is removed.
+    }
+
     #[test]
     fn landlock_allows_system_read() {
         require_landlock!();

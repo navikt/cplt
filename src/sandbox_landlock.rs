@@ -616,13 +616,19 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
-    // ── Docker/Podman daemon sockets (--allow-docker) ──
-    // Landlock's first actual effect for this flag on Linux (#155): read+write
-    // on the daemon endpoints, which is what `connect(2)` needs once the kernel
-    // gates pathname sockets (ABI v9). Below v9 it changes nothing — an
+    // ── Docker/Podman daemon sockets and ~/.docker (--allow-docker) ──
+    // Read+write on the daemon endpoints is what `connect(2)` needs once the
+    // kernel gates pathname sockets (ABI v9). Below v9 it changes nothing — an
     // ungranted socket was already connectable — so this is not a widening.
     // Sockets are *not* masked by bubblewrap in this mode either; both halves
     // read the same path list.
+    //
+    // `~/.docker` is read-only, matching the macOS profile (#155): the CLI
+    // needs config.json for contexts and registry auth. No write, and no
+    // execute — `execute` here is full process-exec (see #243), and a
+    // writable+executable config dir would be a binary-drop path. Unlike
+    // macOS there is no carve-out for `~/.docker/trust/private`: Landlock
+    // cannot deny a subpath of a granted directory.
     if config.allow_docker {
         for path in policy::linux_docker_socket_paths(policy::current_uid()) {
             fs_rules.push(FsRule {
@@ -635,6 +641,15 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 },
             });
         }
+        fs_rules.push(FsRule {
+            path: home.join(".docker"),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: false,
+                ioctl: false,
+            },
+        });
     }
 
     // ── Home config files: individual read-only rules ──
@@ -1879,6 +1894,29 @@ mod tests {
             let found = policy.fs_rules.iter().any(|r| r.path == path);
             assert!(!found, "denied dotfile {dotfile} should NOT be in ruleset");
         }
+    }
+
+    /// `--allow-docker` on Linux grants `~/.docker` read-only (#155). Off, the
+    /// dir stays out of the ruleset (covered by `denied_dotfiles_not_in_ruleset`).
+    #[test]
+    fn allow_docker_grants_docker_config_read_only() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.allow_docker = true;
+        let policy = generate_policy(&config);
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == home.join(".docker"))
+            .expect("~/.docker should be in the ruleset with --allow-docker");
+        assert!(rule.access.read);
+        assert!(!rule.access.write, "~/.docker must not be writable");
+        assert!(
+            !rule.access.execute,
+            "~/.docker must not carry execute (Landlock execute is process-exec, #243)"
+        );
     }
 
     #[test]
