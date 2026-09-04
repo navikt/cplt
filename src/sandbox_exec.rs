@@ -98,6 +98,8 @@ fn configure_command(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     npmrc_allowed: bool,
+    playwright_socket_dir: Option<&Path>,
+    playwright_runtime: bool,
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -128,6 +130,24 @@ fn configure_command(
         for (key, val) in &sandbox_env.vars {
             cmd.env(key, val);
         }
+    }
+
+    // Playwright's internal control server binds Unix sockets below this short,
+    // random, policy-authorized per-session directory.
+    // This runs after filtering so ambient values cannot displace the safe
+    // default; only an explicit --pass-env requests a caller override.
+    if let Some(path) =
+        super::env::playwright_sockets_dir_override(extra_pass_env, playwright_socket_dir)
+    {
+        cmd.env("PWTEST_SOCKETS_DIR", path);
+    }
+
+    // Playwright MCP re-enables Chromium's own sandbox, which cannot start
+    // inside cplt's. Disabling it here keeps the fix inside the boundary that
+    // needs it, instead of putting a cplt-only flag in the server configuration
+    // every editor and CLI shares.
+    if super::env::playwright_mcp_sandbox_disabled(extra_pass_env, playwright_runtime) {
+        cmd.env("PLAYWRIGHT_MCP_SANDBOX", "false");
     }
 
     // Default DOTNET_CLI_HOME to the already-resolved, already-validated sandbox
@@ -699,6 +719,8 @@ pub fn exec(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        sandbox.playwright_socket_dir.as_deref(),
+        sandbox.playwright_runtime,
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -847,6 +869,8 @@ pub fn exec(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        sandbox.playwright_socket_dir.as_deref(),
+        sandbox.playwright_runtime,
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -982,6 +1006,8 @@ fn exec_bwrap(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        sandbox.playwright_socket_dir.as_deref(),
+        sandbox.playwright_runtime,
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     // Set the re-entry env AFTER configure_command so a `clear_first` env build
