@@ -1429,7 +1429,7 @@ fn profile_extra_read_overrides_denied_dotfile_directory() {
         .find("(deny file-read* (subpath \"/Users/test/.config/gcloud\"))")
         .unwrap();
     let allow_pos = p
-        .find("(allow file-read* (literal \"/Users/test/.config/gcloud/application_default_credentials.json\"))")
+        .rfind("(allow file-read* (subpath \"/Users/test/.config/gcloud/application_default_credentials.json\"))")
         .expect("should have a post-deny re-allow for gcloud ADC file");
     assert!(
         allow_pos > deny_pos,
@@ -1461,7 +1461,7 @@ fn profile_extra_read_overrides_multiple_denied_dotfile_dirs() {
         .find("(deny file-read* (subpath \"/Users/test/.config/gcloud\"))")
         .unwrap();
     let gcloud_allow = p
-        .find("(allow file-read* (literal \"/Users/test/.config/gcloud/application_default_credentials.json\"))")
+        .rfind("(allow file-read* (subpath \"/Users/test/.config/gcloud/application_default_credentials.json\"))")
         .expect("gcloud ADC re-allow missing");
     assert!(gcloud_allow > gcloud_deny);
 
@@ -1469,7 +1469,7 @@ fn profile_extra_read_overrides_multiple_denied_dotfile_dirs() {
         .find("(deny file-read* (subpath \"/Users/test/.aws\"))")
         .unwrap();
     let aws_allow = p
-        .find("(allow file-read* (literal \"/Users/test/.aws/credentials\"))")
+        .rfind("(allow file-read* (subpath \"/Users/test/.aws/credentials\"))")
         .expect("aws credentials re-allow missing");
     assert!(aws_allow > aws_deny);
 }

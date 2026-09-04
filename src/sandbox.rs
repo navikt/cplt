@@ -288,8 +288,8 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
                     "{key} names {} (~/{dir}), a credential directory that cannot be granted \
                      whole: macOS denies it whatever the grant says, so honouring it on Linux \
                      alone would mean the same config opens every key in it on one platform \
-                     and nothing on the other. Name the specific files you need instead, e.g. \
-                     ~/{dir}/<file> — that grant works on both.",
+                     and nothing on the other. Name the specific path you need inside it \
+                     instead, e.g. ~/{dir}/<file> — that grant works on both.",
                     p.display()
                 ));
             }
@@ -344,7 +344,14 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
             // The temp dirs cannot be narrowed — they are writable with no
             // grant to withdraw — so that case needs its own remedy or the
             // message tells the user to do something impossible.
-            let remedy = if source == TEMP_DIR_SOURCE {
+            #[cfg(not(target_os = "macos"))]
+            let shm = source == SHM_SOURCE;
+            #[cfg(target_os = "macos")]
+            let shm = false;
+            let remedy = if shm {
+                "/dev/shm is writable for POSIX shared memory and there is no grant to \
+                 withdraw. Use the scratch dir, which is write+exec by design."
+            } else if source == TEMP_DIR_SOURCE {
                 "Move the tree somewhere the sandbox does not make writable, or use the \
                  scratch dir, which is write+exec by design. `--allow-tmp-exec` opens \
                  execute on all of temp if that is really what you want."
@@ -394,6 +401,32 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
                 .map(|d| (config.home_dir.join(d.path), "the writable tool directory")),
         ),
     }
+    // The agent's own data dirs are writable by the same construction as the
+    // tool dirs, and they were missing here: `~/.local/share/opencode`,
+    // `~/.claude`, `~/.pi/agent` and friends are granted write by
+    // `emit_home_access` and `generate_policy`, not by config, so an
+    // `allow.exec` on an ancestor (`~/.local`, the pipx layout) passed
+    // validation and then unioned with them under Landlock into exactly the
+    // writable-and-executable tree this function exists to refuse. On macOS
+    // `emit_exec_write_denies` runs last and takes the write back, so the same
+    // config broke loudly there and silently held on Linux — the #207 shape.
+    for dir in config.agent_dirs {
+        if dir.write {
+            trees.push((dir.path.clone(), "the writable agent directory"));
+        }
+        // A file-level write grant inside a read-only agent dir (OpenCode's
+        // `auth.json`) is a writable path too, just a one-entry one.
+        trees.extend(
+            dir.write_files
+                .iter()
+                .map(|f| (dir.path.join(f), "the writable agent file")),
+        );
+    }
+    // A worktree's or bare repo's real `.git` is granted write so git can
+    // update refs and the index from inside the sandbox.
+    if let Some(p) = config.git_common_dir {
+        trees.push((p.to_path_buf(), "the git common directory"));
+    }
     // The system temp dirs are made writable by the backends themselves, not by
     // config, which is why they were missing here (#299). An exec grant under
     // one is the same writable-plus-executable staging pair as a grant under
@@ -409,6 +442,13 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
             .iter()
             .map(|d| (PathBuf::from(d), TEMP_DIR_SOURCE)),
     );
+    // `/dev/shm` is the same class as `/tmp`: Landlock seeds it read+write for
+    // POSIX shared memory, so an exec grant over it is the same binary-drop
+    // pair. It is only reachable with `--no-bubblewrap` — bubblewrap's
+    // `--dev /dev` replaces it with a fresh devtmpfs and the grant does nothing
+    // at all — and refusing is the one answer that is identical in both modes.
+    #[cfg(not(target_os = "macos"))]
+    trees.push((PathBuf::from("/dev/shm"), SHM_SOURCE));
     trees
 }
 
@@ -416,6 +456,11 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
 /// dir is writable with no grant to withdraw, so "narrow one of the two" is not
 /// advice a user can act on there.
 const TEMP_DIR_SOURCE: &str = "the always-writable system temp dir";
+
+/// Same idea for `/dev/shm`, which `--allow-tmp-exec` does not cover, so it
+/// needs its own remedy rather than the temp dir's.
+#[cfg(not(target_os = "macos"))]
+const SHM_SOURCE: &str = "the always-writable shared-memory dir";
 
 /// Temp roots the backends grant write on unconditionally: Landlock seeds a
 /// read+write rule for `/tmp`, and the SBPL profile does the same for
@@ -1010,6 +1055,90 @@ mod tests {
         }
     }
 
+    /// Finding A: the agent's own writable data dirs are granted by the
+    /// backends, not by config, so an `allow.exec` over an ancestor of one was
+    /// accepted and then unioned with the write grant by Landlock into the
+    /// binary-drop pair `validate_exec_grants` exists to refuse. The concrete
+    /// case is `allow.exec = ["~/.local"]` — the pipx layout — with OpenCode,
+    /// whose data dir is `~/.local/share/opencode`.
+    #[test]
+    fn exec_grant_over_an_agent_data_dir_is_refused() {
+        let home = Path::new("/home/test");
+        let agent_dirs = [AgentDir {
+            path: home.join(".local/share/opencode"),
+            write: true,
+            map_exec: false,
+            process_exec: false,
+            write_files: vec![],
+        }];
+        let exec = [home.join(".local")];
+        let mut config = test_config(home, &[]);
+        // No tool dirs, so the refusal can only come from the agent dir.
+        config.existing_home_tool_dirs = Some(&[]);
+        config.agent_dirs = &agent_dirs;
+        config.extra_exec = &exec;
+
+        let error = validate_exec_grants(&config).expect_err("the overlap must be refused");
+        assert!(error.contains(".local/share/opencode"), "{error}");
+        assert!(error.contains("writable agent directory"), "{error}");
+    }
+
+    /// Same class, the file-level half: OpenCode's `auth.json` is a write grant
+    /// inside an otherwise read-only agent dir.
+    #[test]
+    fn exec_grant_over_a_writable_agent_file_is_refused() {
+        let home = Path::new("/home/test");
+        let agent_dirs = [AgentDir {
+            path: home.join(".config/opencode"),
+            write: false,
+            map_exec: false,
+            process_exec: false,
+            write_files: vec!["auth.json"],
+        }];
+        let exec = [home.join(".config/opencode")];
+        let mut config = test_config(home, &[]);
+        config.existing_home_tool_dirs = Some(&[]);
+        config.agent_dirs = &agent_dirs;
+        config.extra_exec = &exec;
+
+        let error = validate_exec_grants(&config).expect_err("the overlap must be refused");
+        assert!(error.contains("auth.json"), "{error}");
+    }
+
+    /// Same class again: a worktree's real `.git` is granted write so git can
+    /// update refs from inside the sandbox.
+    #[test]
+    fn exec_grant_over_the_git_common_dir_is_refused() {
+        let home = Path::new("/home/test");
+        let common = home.join("repo/.git");
+        let exec = [home.join("repo")];
+        let mut config = test_config(home, &[]);
+        config.existing_home_tool_dirs = Some(&[]);
+        config.git_common_dir = Some(&common);
+        config.extra_exec = &exec;
+
+        let error = validate_exec_grants(&config).expect_err("the overlap must be refused");
+        assert!(error.contains("git common directory"), "{error}");
+    }
+
+    /// `/dev/shm` is seeded read+write by the Landlock policy exactly as `/tmp`
+    /// is, so an exec grant over it is the same pair. Bubblewrap's `--dev /dev`
+    /// replaces it and the grant does nothing at all there; refusing is the one
+    /// answer that is the same in both modes.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn exec_grant_over_dev_shm_is_refused() {
+        let home = Path::new("/home/test");
+        let exec = [PathBuf::from("/dev/shm")];
+        let mut config = test_config(home, &[]);
+        config.existing_home_tool_dirs = Some(&[]);
+        config.extra_exec = &exec;
+
+        let error = validate_exec_grants(&config).expect_err("the overlap must be refused");
+        assert!(error.contains("/dev/shm"), "{error}");
+        assert!(error.contains("shared memory"), "{error}");
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn prepare_rejects_playwright_socket_capability_off_macos() {
@@ -1071,7 +1200,7 @@ mod tests {
             assert!(error.contains("allow.read"), "{error}");
             assert!(error.contains(dir), "{error}");
             assert!(
-                error.contains("Name the specific files"),
+                error.contains("Name the specific path"),
                 "the error must point at the grant that does work: {error}"
             );
 

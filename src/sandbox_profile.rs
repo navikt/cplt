@@ -145,7 +145,13 @@ pub fn generate_profile_with_playwright_socket_dir(
     );
     emit_deny_rules(&mut sb, &home, config.extra_deny);
     emit_registry_config_overrides(&mut sb, &home, config.extra_read);
-    emit_denied_dotfile_overrides(&mut sb, &home, config.extra_read, config.extra_write);
+    emit_denied_dotfile_overrides(
+        &mut sb,
+        &home,
+        config.extra_read,
+        config.extra_write,
+        config.extra_exec,
+    );
     emit_gpg_signing_rules(&mut sb, &home, config.allow_gpg_signing, config.extra_deny);
     emit_docker_rules(&mut sb, &home, config.allow_docker, config.extra_deny);
     emit_socket_rules(&mut sb, config.extra_socket, config.extra_deny);
@@ -1678,7 +1684,7 @@ fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[Pat
     }
 }
 
-/// Every spelling of `path` that needs a re-allow, when it names a file *inside*
+/// Every spelling of `path` that needs a re-allow, when it names a path *inside*
 /// a [`DENIED_DOTFILES`] directory. Empty when it does not.
 ///
 /// A grant naming the directory itself is not an override — `sandbox::prepare`
@@ -1722,37 +1728,62 @@ fn denied_dotfile_override_paths(home: &Path, path: &Path) -> Vec<String> {
 /// `emit_user_allows` emitted the write grant *before* `emit_deny_rules`, the
 /// deny won, and the grant silently did nothing on macOS while working on
 /// Linux — the same shape as #291, pointing the other way.
+///
+/// `allow.exec` is here for the same reason and needs the same two rights
+/// `emit_user_allows` grants it: reading the binary and mapping it executable.
+/// Without this it was emitted before the deny and lost to it, so
+/// `allow.exec = ["~/.docker/cli-plugins"]` — a real layout, alongside
+/// `~/.terraform.d/plugins` — worked on Linux and silently did not on macOS.
+/// The write-deny `emit_exec_write_denies` puts at the tail of the profile
+/// still applies, so an exec grant here does not become writable.
+///
+/// The re-allows use `subpath`, not `literal`. `literal` matches the directory
+/// entry and nothing beneath it, so a grant on a subdirectory of a credential
+/// dir — `~/.aws/sso/cache`, `~/.kube/cache` — was accepted, granted the whole
+/// subtree by Landlock's `path_beneath`, and granted effectively nothing on
+/// macOS. `subpath` matches a plain file exactly as `literal` did, so the
+/// file case is unchanged and the directory case now means the same thing on
+/// both backends: the subtree the user named.
 fn emit_denied_dotfile_overrides(
     sb: &mut String,
     home: &str,
     extra_read: &[PathBuf],
     extra_write: &[PathBuf],
+    extra_exec: &[PathBuf],
 ) {
     let home_path = Path::new(home);
     // A path granted both ways is emitted once, from the write list.
     let read_only: Vec<String> = extra_read
         .iter()
-        .filter(|p| !extra_write.contains(p))
+        .filter(|p| !extra_write.contains(p) && !extra_exec.contains(p))
         .flat_map(|p| denied_dotfile_override_paths(home_path, p))
         .collect();
     let writable: Vec<String> = extra_write
         .iter()
         .flat_map(|p| denied_dotfile_override_paths(home_path, p))
         .collect();
+    let executable: Vec<String> = extra_exec
+        .iter()
+        .flat_map(|p| denied_dotfile_override_paths(home_path, p))
+        .collect();
 
-    if read_only.is_empty() && writable.is_empty() {
+    if read_only.is_empty() && writable.is_empty() && executable.is_empty() {
         return;
     }
     sbpl!(
         sb,
-        ";; User-overridden files in sensitive directories (allow.read / allow.write)"
+        ";; User-overridden paths in sensitive directories (allow.read / allow.write / allow.exec)"
     );
     for path in &read_only {
-        sbpl!(sb, "(allow file-read* (literal \"{path}\"))");
+        sbpl!(sb, "(allow file-read* (subpath \"{path}\"))");
     }
     for path in &writable {
-        sbpl!(sb, "(allow file-read* (literal \"{path}\"))");
-        sbpl!(sb, "(allow file-write* (literal \"{path}\"))");
+        sbpl!(sb, "(allow file-read* (subpath \"{path}\"))");
+        sbpl!(sb, "(allow file-write* (subpath \"{path}\"))");
+    }
+    for path in &executable {
+        sbpl!(sb, "(allow file-read* (subpath \"{path}\"))");
+        sbpl!(sb, "(allow file-map-executable (subpath \"{path}\"))");
     }
     sbpl!(sb);
 }
@@ -2119,6 +2150,76 @@ mod tests {
         }
     }
 
+    /// Finding B: `allow.exec` inside a credential directory was emitted by
+    /// `emit_user_allows`, i.e. *before* `emit_deny_rules` re-denies `file-read*`
+    /// on the dotfile subpath, and nothing re-allowed it afterwards. So
+    /// `allow.exec = ["~/.docker/cli-plugins"]` — a real layout, as is
+    /// `~/.terraform.d/plugins` — worked on Linux, where the grant is simply an
+    /// additive Landlock rule, and silently did nothing on macOS.
+    #[test]
+    fn profile_extra_exec_overrides_a_denied_dotfile_directory() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let granted = [PathBuf::from("/Users/test/.docker/cli-plugins")];
+        let mut opts = test_options(project, home);
+        opts.extra_exec = &granted;
+        let p = generate_profile(&opts, &[]);
+
+        let deny = p
+            .find("(deny file-read* (subpath \"/Users/test/.docker\"))")
+            .expect("the blanket ~/.docker read deny must still be emitted");
+        for rule in [
+            "(allow file-read* (subpath \"/Users/test/.docker/cli-plugins\"))",
+            "(allow file-map-executable (subpath \"/Users/test/.docker/cli-plugins\"))",
+        ] {
+            let at = p
+                .rfind(rule)
+                .unwrap_or_else(|| panic!("missing post-deny re-allow: {rule}\n{p}"));
+            assert!(
+                at > deny,
+                "re-allow must come AFTER the subpath deny (SBPL last-match-wins): {rule}"
+            );
+        }
+        // The exec tree still stays read-only.
+        assert!(
+            p.rfind("(deny file-write* (subpath \"/Users/test/.docker/cli-plugins\"))")
+                .is_some_and(|at| at > deny),
+            "the write-deny on the exec tree must survive the re-allow:\n{p}"
+        );
+    }
+
+    /// Finding C: the re-allow used `(literal ...)`, which matches the directory
+    /// entry and nothing beneath it, so a grant on a subdirectory of a credential
+    /// dir — `~/.aws/sso/cache`, `~/.kube/cache` — granted the whole subtree on
+    /// Linux (`path_beneath`) and effectively nothing on macOS. `subpath` makes the
+    /// two backends mean the same thing.
+    #[test]
+    fn profile_extra_read_on_a_subdir_of_a_denied_dotfile_dir_is_a_subtree() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let granted = [PathBuf::from("/Users/test/.aws/sso/cache")];
+        let mut opts = test_options(project, home);
+        opts.extra_read = &granted;
+        let p = generate_profile(&opts, &[]);
+
+        let deny = p
+            .find("(deny file-read* (subpath \"/Users/test/.aws\"))")
+            .expect("the blanket ~/.aws read deny must still be emitted");
+        let allow = p
+            .rfind("(allow file-read* (subpath \"/Users/test/.aws/sso/cache\"))")
+            .expect("the re-allow must name the subtree, not just the directory entry");
+        assert!(allow > deny, "re-allow must come AFTER the subpath deny");
+        assert!(
+            !p.contains("(allow file-read* (literal \"/Users/test/.aws/sso/cache\"))"),
+            "a literal re-allow matches the directory entry only, which is the silent half of #312:\n{p}"
+        );
+        // Nothing else in ~/.aws is reopened.
+        assert!(
+            !p.contains("/Users/test/.aws/credentials"),
+            "the grant must not reach beyond the path it names:\n{p}"
+        );
+    }
+
     /// `allow.write` on a file inside a `DENIED_DOTFILES` directory must reach
     /// the profile as a post-deny re-allow, exactly as `allow.read` does.
     ///
@@ -2145,11 +2246,13 @@ mod tests {
             .find(r#"(deny file-write* (subpath "/Users/test/.ssh"))"#)
             .expect("the blanket ~/.ssh write deny must still be emitted");
         for rule in [
-            r#"(allow file-read* (literal "/Users/test/.ssh/known_hosts"))"#,
-            r#"(allow file-write* (literal "/Users/test/.ssh/known_hosts"))"#,
+            r#"(allow file-read* (subpath "/Users/test/.ssh/known_hosts"))"#,
+            r#"(allow file-write* (subpath "/Users/test/.ssh/known_hosts"))"#,
         ] {
+            // rfind: `emit_user_allows` emits the same read rule earlier for a
+            // write grant, and the one that has to outrank the deny is the last.
             let at = p
-                .find(rule)
+                .rfind(rule)
                 .unwrap_or_else(|| panic!("missing post-deny re-allow: {rule}"));
             assert!(
                 at > deny,
@@ -2158,7 +2261,7 @@ mod tests {
         }
         // Scoped to the granted file: a sibling key stays denied.
         assert!(
-            !p.contains(r#"(literal "/Users/test/.ssh/id_ed25519")"#),
+            !p.contains(r#"(subpath "/Users/test/.ssh/id_ed25519")"#),
             "a write grant must not reopen anything but the file it names:\n{p}"
         );
     }
@@ -2693,7 +2796,7 @@ mod tests {
         let home_str = home.display();
         assert!(
             p.contains(&format!(
-                "(allow file-read* (literal \"{home_str}/.aws/config\"))"
+                "(allow file-read* (subpath \"{home_str}/.aws/config\"))"
             )),
             "re-allow naming the $HOME path missing from profile:\n{p}"
         );
