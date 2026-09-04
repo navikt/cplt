@@ -505,6 +505,8 @@ cplt config set allow.ports 8443
 - API calls to services not on 443
 - FTP, SMTP, or other protocol connections
 
+Under `proxy.forced` an extra port opens no direct socket ([#297](https://github.com/navikt/cplt/issues/297)). The proxy still tunnels it, so the first two work; a tool that speaks its own protocol on a raw socket, such as FTP or SMTP, does not. Run those without proxy-forced — see [the proxy docs](proxy.md#proxy-forced-mode).
+
 ## Private registries
 
 Registry credential files are **blocked by default**, because they typically hold passwords or tokens a rogue agent could exfiltrate:
