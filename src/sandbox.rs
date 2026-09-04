@@ -258,7 +258,7 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
         for p in paths {
             if let Some(file) = policy::hard_denied_file(config.home_dir, p) {
                 return Err(format!(
-                    "{key} grants {} (~/{file}), which is on the hard-deny list and cannot be granted on any platform. Remove it from your config or command line.",
+                    "{key} names {} (~/{file}), which is on the hard-deny list and cannot be granted explicitly. Remove it from your config or command line.",
                     p.display()
                 ));
             }
