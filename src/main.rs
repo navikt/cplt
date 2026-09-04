@@ -2796,6 +2796,80 @@ fn warn_mode_message(msg: &str) -> String {
     }
 }
 
+/// What a guard verdict means for this process, decided before anything runs.
+///
+/// `gh_proxy::evaluate` and `gate_git` decide well and are heavily unit-tested,
+/// but everything that turned a verdict into an effect used to be a match on the
+/// enforcement mode whose every arm called `.exec()`. That made the arms
+/// unreachable from a unit test — the only coverage was e2e tests spawning the
+/// compiled binary. Naming the effect makes each arm an ordinary value to assert.
+#[derive(Debug, PartialEq, Eq)]
+enum GateEffect {
+    /// Run the real binary with `GH_REPO` pinned to this repository, so the
+    /// operation cannot retarget away from the repo the guard approved.
+    ExecScoped(String),
+    /// Run the real binary exactly as invoked, with no `GH_REPO` pin. `notice`
+    /// is printed to stderr first: warn and audit modes report the verdict they
+    /// are declining to enforce.
+    ExecPlain { notice: Option<String> },
+    /// Serve the cached token from the scratch dir instead of running `gh`.
+    ServeCachedToken,
+    /// Refuse, printing this message.
+    Refuse(String),
+}
+
+/// Decide what `cplt gh-gate` should do. Pure: no process is spawned here.
+///
+/// ## Why warn and audit exec without the `GH_REPO` pin
+///
+/// A pin is a modification of the command, not a relaxation of it: `GH_REPO`
+/// retargets any invocation that resolves its repository implicitly. It is only
+/// ever safe to apply on the `Ok` path, where the guard has verified that the
+/// pinned repo is the one the command was already asking for.
+///
+/// On the `Err` path there is no verified repo to pin. The scope was either
+/// unresolvable, or resolvable and *different* from the target — and pinning it
+/// there would silently redirect the agent's `gh pr create` into another
+/// repository instead of letting it proceed. Warn and audit are documented as
+/// observation modes that let the command through (see `EnforcementMode`), and
+/// a command that has been rewritten is no longer the command being observed.
+///
+/// So the absent pin is deliberate, and `warn_and_audit_exec_without_a_repo_pin`
+/// below is what keeps it from being changed by accident. The consequence is the
+/// intended one: in warn and audit mode a refused `gh` command runs exactly as
+/// the unsandboxed binary would have run it.
+fn decide_gh_gate(
+    args: &[String],
+    policy: &gh_proxy::GatePolicy,
+    repo_scope: Option<&str>,
+    real_git: Option<&Path>,
+) -> GateEffect {
+    // Intercept `gh auth token` — serve from cached file instead of blocking.
+    // This allows Copilot to authenticate without exposing the token as an env var
+    // to all child processes. The token file is written to scratch dir at startup.
+    if policy.block_auth_token && is_gh_auth_token_request(args) {
+        return GateEffect::ServeCachedToken;
+    }
+
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope, real_git) {
+        Ok(approval) => match approval.repo_scope {
+            Some(repo) => GateEffect::ExecScoped(repo),
+            None => GateEffect::ExecPlain { notice: None },
+        },
+        Err(msg) => match policy.mode {
+            config::EnforcementMode::Block => GateEffect::Refuse(msg),
+            config::EnforcementMode::Warn => GateEffect::ExecPlain {
+                notice: Some(warn_mode_message(&msg)),
+            },
+            config::EnforcementMode::Audit => GateEffect::ExecPlain {
+                notice: Some(format!("[audit] gh-gate: would block: {msg}")),
+            },
+        },
+    }
+}
+
 /// Handle `cplt gh-gate` — evaluate a gh command and exec the real binary if allowed.
 ///
 /// Called from the wrapper script placed in the sandbox's PATH. If the command
@@ -2808,47 +2882,52 @@ fn run_gh_gate(
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
-    // Intercept `gh auth token` — serve from cached file instead of blocking.
-    // This allows Copilot to authenticate without exposing the token as an env var
-    // to all child processes. The token file is written to scratch dir at startup.
-    if policy.block_auth_token && is_gh_auth_token_request(args) {
-        return serve_cached_gh_token();
-    }
+    let effect = decide_gh_gate(args, policy, repo_scope, real_git);
+    perform_gate_effect(real_gh, "gh", args, effect)
+}
 
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-
-    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope, real_git) {
-        Ok(approval) => exec_gh(real_gh, args, approval.repo_scope.as_deref()),
-        Err(msg) => match policy.mode {
-            config::EnforcementMode::Block => {
-                eprintln!("{msg}");
-                ExitCode::FAILURE
+/// Carry out a decided [`GateEffect`]. On success `exec` replaces this process,
+/// so the only paths that return are a refusal and a failed exec.
+fn perform_gate_effect(
+    real_binary: &Path,
+    name: &str,
+    args: &[String],
+    effect: GateEffect,
+) -> ExitCode {
+    match effect {
+        GateEffect::ServeCachedToken => serve_cached_gh_token(),
+        GateEffect::Refuse(msg) => {
+            eprintln!("{msg}");
+            ExitCode::FAILURE
+        }
+        GateEffect::ExecScoped(repo) => exec_real(real_binary, name, args, Some(&repo)),
+        GateEffect::ExecPlain { notice } => {
+            if let Some(notice) = notice {
+                eprintln!("{notice}");
             }
-            config::EnforcementMode::Warn => {
-                eprintln!("{}", warn_mode_message(&msg));
-                // Allow through in warn mode
-                exec_gh(real_gh, args, None)
-            }
-            config::EnforcementMode::Audit => {
-                // Log the decision to stderr for audit trail
-                eprintln!("[audit] gh-gate: would block: {msg}");
-                exec_gh(real_gh, args, None)
-            }
-        },
+            exec_real(real_binary, name, args, None)
+        }
     }
 }
 
-fn exec_gh(real_gh: &Path, args: &[String], repo_scope: Option<&str>) -> ExitCode {
+/// Replace this process with the real binary. `repo_scope` pins `GH_REPO`, which
+/// only `gh` reads — the git guard always passes `None`.
+fn exec_real(
+    real_binary: &Path,
+    name: &str,
+    args: &[String],
+    repo_scope: Option<&str>,
+) -> ExitCode {
     use std::os::unix::process::CommandExt;
 
-    let mut command = std::process::Command::new(real_gh);
+    let mut command = std::process::Command::new(real_binary);
     command.args(args);
     if let Some(repo) = repo_scope {
         command.env_remove("GH_HOST");
         command.env("GH_REPO", repo);
     }
     let err = command.exec();
-    ui::error(&format!("Failed to exec gh: {err}"));
+    ui::error(&format!("Failed to exec {name}: {err}"));
     ExitCode::FAILURE
 }
 
@@ -2904,15 +2983,20 @@ fn parse_allow_push_rules(json: &str) -> Vec<config::ResolvedPushRule> {
 }
 
 /// Handle `cplt git-gate` — evaluate a git command and exec the real binary if allowed.
-fn run_git_gate(
-    real_git: &Path,
+/// Decide what `cplt git-gate` should do. Pure: no process is spawned here.
+///
+/// The git guard has no repository pin to apply, so an allowed command and a
+/// command let through by warn or audit take the same effect and differ only in
+/// whether a notice is printed first.
+fn decide_git_gate(
     args: &[String],
     mode: config::EnforcementMode,
     prevent_push: bool,
     prevent_force_push: bool,
     protect_default_branch_only: bool,
     allow_push_rules: &[config::ResolvedPushRule],
-) -> ExitCode {
+    real_git: &Path,
+) -> GateEffect {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     match gh_proxy::gate_git(
@@ -2923,34 +3007,38 @@ fn run_git_gate(
         allow_push_rules,
         Some(real_git),
     ) {
-        Ok(()) => {
-            use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(real_git).args(args).exec();
-            ui::error(&format!("Failed to exec git: {err}"));
-            ExitCode::FAILURE
-        }
+        Ok(()) => GateEffect::ExecPlain { notice: None },
         Err(msg) => match mode {
-            config::EnforcementMode::Block => {
-                eprintln!("{msg}");
-                ExitCode::FAILURE
-            }
-            config::EnforcementMode::Warn => {
-                eprintln!("{}", warn_mode_message(&msg));
-                use std::os::unix::process::CommandExt;
-                let err = std::process::Command::new(real_git).args(args).exec();
-                ui::error(&format!("Failed to exec git: {err}"));
-                ExitCode::FAILURE
-            }
-            config::EnforcementMode::Audit => {
-                // Log the decision to stderr for audit trail
-                eprintln!("[audit] git-gate: would block: {msg}");
-                use std::os::unix::process::CommandExt;
-                let err = std::process::Command::new(real_git).args(args).exec();
-                ui::error(&format!("Failed to exec git: {err}"));
-                ExitCode::FAILURE
-            }
+            config::EnforcementMode::Block => GateEffect::Refuse(msg),
+            config::EnforcementMode::Warn => GateEffect::ExecPlain {
+                notice: Some(warn_mode_message(&msg)),
+            },
+            config::EnforcementMode::Audit => GateEffect::ExecPlain {
+                notice: Some(format!("[audit] git-gate: would block: {msg}")),
+            },
         },
     }
+}
+
+fn run_git_gate(
+    real_git: &Path,
+    args: &[String],
+    mode: config::EnforcementMode,
+    prevent_push: bool,
+    prevent_force_push: bool,
+    protect_default_branch_only: bool,
+    allow_push_rules: &[config::ResolvedPushRule],
+) -> ExitCode {
+    let effect = decide_git_gate(
+        args,
+        mode,
+        prevent_push,
+        prevent_force_push,
+        protect_default_branch_only,
+        allow_push_rules,
+        real_git,
+    );
+    perform_gate_effect(real_git, "git", args, effect)
 }
 
 // ── cplt exec ──────────────────────────────────────────────────────────────
@@ -6144,6 +6232,176 @@ mod tests {
         let cli = parse(&[]);
         let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
         assert!(args.is_empty());
+    }
+
+    // ── guard verdict → effect (`decide_gh_gate` / `decide_git_gate`) ──────
+
+    fn gh_policy(mode: config::EnforcementMode) -> gh_proxy::GatePolicy {
+        gh_proxy::GatePolicy {
+            mode,
+            ..gh_proxy::GatePolicy::default()
+        }
+    }
+
+    fn gh_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn in_scope_write_execs_with_the_repo_pinned() {
+        let effect = decide_gh_gate(
+            &gh_args(&["pr", "create", "--repo", "navikt/cplt"]),
+            &gh_policy(config::EnforcementMode::Block),
+            Some("navikt/cplt"),
+            None,
+        );
+        assert_eq!(
+            effect,
+            GateEffect::ExecScoped("github.com/navikt/cplt".to_string()),
+            "an approved scope-checked command must carry the GH_REPO pin"
+        );
+    }
+
+    #[test]
+    fn out_of_scope_write_is_refused_in_block_mode() {
+        let effect = decide_gh_gate(
+            &gh_args(&["pr", "create", "--repo", "someone/else"]),
+            &gh_policy(config::EnforcementMode::Block),
+            Some("navikt/cplt"),
+            None,
+        );
+        let GateEffect::Refuse(msg) = effect else {
+            panic!("block mode must refuse an out-of-scope write, got {effect:?}");
+        };
+        assert!(
+            msg.contains("someone/else"),
+            "message names the target: {msg}"
+        );
+    }
+
+    /// The `GH_REPO` pin is deliberately absent in warn and audit mode.
+    ///
+    /// A pin is a modification: it retargets any invocation that resolves its
+    /// repository implicitly. On the refusal path there is no verified repo to
+    /// pin — the target is the one the guard just rejected — so applying the
+    /// startup repo would silently redirect the command into a different
+    /// repository rather than let it through. Warn and audit are documented as
+    /// observation modes (see `EnforcementMode`), and a rewritten command is no
+    /// longer the command being observed.
+    ///
+    /// The consequence is intended and worth stating: in these modes a refused
+    /// `gh` command runs exactly as the unsandboxed binary would run it.
+    #[test]
+    fn warn_and_audit_exec_without_a_repo_pin() {
+        for mode in [
+            config::EnforcementMode::Warn,
+            config::EnforcementMode::Audit,
+        ] {
+            let effect = decide_gh_gate(
+                &gh_args(&["pr", "create", "--repo", "someone/else"]),
+                &gh_policy(mode),
+                Some("navikt/cplt"),
+                None,
+            );
+            match effect {
+                GateEffect::ExecPlain {
+                    notice: Some(notice),
+                } => {
+                    assert!(
+                        notice.contains("would block"),
+                        "{mode} must report the verdict it is not enforcing: {notice}"
+                    );
+                }
+                other => panic!("{mode} must exec unpinned, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn warn_and_audit_notices_are_distinguishable() {
+        let args = gh_args(&["pr", "create", "--repo", "someone/else"]);
+        let warn = decide_gh_gate(
+            &args,
+            &gh_policy(config::EnforcementMode::Warn),
+            Some("navikt/cplt"),
+            None,
+        );
+        let audit = decide_gh_gate(
+            &args,
+            &gh_policy(config::EnforcementMode::Audit),
+            Some("navikt/cplt"),
+            None,
+        );
+        assert_ne!(
+            warn, audit,
+            "audit must be identifiable in a log, warn to a human"
+        );
+        assert!(matches!(
+            audit,
+            GateEffect::ExecPlain { notice: Some(ref n) } if n.starts_with("[audit] gh-gate:")
+        ));
+    }
+
+    #[test]
+    fn auth_token_is_served_from_cache_in_every_mode() {
+        // The cached-token intercept is checked before the gate, so it must not
+        // be reachable past a mode that lets refusals through.
+        for mode in [
+            config::EnforcementMode::Block,
+            config::EnforcementMode::Warn,
+            config::EnforcementMode::Audit,
+        ] {
+            assert_eq!(
+                decide_gh_gate(&gh_args(&["auth", "token"]), &gh_policy(mode), None, None),
+                GateEffect::ServeCachedToken,
+                "{mode} must not let `gh auth token` reach the real binary"
+            );
+        }
+    }
+
+    #[test]
+    fn informational_gh_commands_exec_unannounced() {
+        assert_eq!(
+            decide_gh_gate(
+                &gh_args(&["--version"]),
+                &gh_policy(config::EnforcementMode::Block),
+                Some("navikt/cplt"),
+                None,
+            ),
+            GateEffect::ExecPlain { notice: None }
+        );
+    }
+
+    #[test]
+    fn git_gate_blocks_a_force_push_and_warns_it_through() {
+        let args = gh_args(&["push", "--force", "origin", "main"]);
+        let blocked = decide_git_gate(
+            &args,
+            config::EnforcementMode::Block,
+            true,
+            true,
+            false,
+            &[],
+            Path::new("/usr/bin/git"),
+        );
+        assert!(
+            matches!(blocked, GateEffect::Refuse(_)),
+            "block mode must refuse a force push, got {blocked:?}"
+        );
+
+        let warned = decide_git_gate(
+            &args,
+            config::EnforcementMode::Warn,
+            true,
+            true,
+            false,
+            &[],
+            Path::new("/usr/bin/git"),
+        );
+        assert!(
+            matches!(warned, GateEffect::ExecPlain { notice: Some(_) }),
+            "warn mode must let the force push through with a notice, got {warned:?}"
+        );
     }
 
     // ── the host probe seam (`HostProbe` / `accept_tool_dir`) ───────────────
