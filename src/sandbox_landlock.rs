@@ -36,7 +36,7 @@ use super::policy;
 #[cfg(target_os = "linux")]
 use crate::ui;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use landlock::{ABI, PathBeneath};
@@ -308,6 +308,21 @@ fn is_safe_cache_subdir(subdir: &str) -> bool {
     saw_component
 }
 
+/// The emitted rule, if any, that makes `path` writable without also making it
+/// executable.
+///
+/// The overlap half of `sandbox::validate_exec_grants`, asked of the rules this
+/// backend is about to emit rather than of `sandbox::writable_trees`. Landlock
+/// is additive, so granting execute on a file under such a rule hands the agent
+/// the write-plus-execute pair — it overwrites the file and runs it. Trees that
+/// are already executable are not a finding: the pair exists there by design
+/// (the project and scratch dirs) and this grant adds nothing to it.
+fn writable_non_exec_tree_over<'a>(fs_rules: &'a [FsRule], path: &Path) -> Option<&'a FsRule> {
+    fs_rules
+        .iter()
+        .find(|r| r.access.write && !r.access.execute && path.starts_with(&r.path))
+}
+
 pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     let mut fs_rules = Vec::new();
     let home = config.home_dir;
@@ -334,49 +349,6 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 ioctl: false,
             },
         });
-    }
-
-    // ── The cplt binary itself: read + execute ──
-    //
-    // The guard wrappers are `exec <cplt> git-gate ...` / `gh-gate ...` — they
-    // re-enter this binary from inside the sandbox to reach the decision. macOS
-    // gets that for free from a blanket `(allow process-exec)`; Landlock has no
-    // such thing, so without an explicit rule the wrapper dies with
-    // "exec: /path/to/cplt: Permission denied" and *every* git command fails —
-    // `status`, `log`, `--version`, not only `push`.
-    //
-    // It worked at all only by accident of layout: `/usr/local` is in
-    // LINUX_TOOL_DIRS, so an install there re-entered fine, while `install.sh`'s
-    // default of `~/.local/bin` did not. The guard's own design requires this
-    // grant; leaving it to depend on where the user installed cplt is what made
-    // it look like it worked.
-    //
-    // The file, not its directory: `~/.local/bin` holds whatever else the user
-    // put there, and none of it needs to become executable inside the sandbox.
-    // No boundary is given up — `gh-gate`/`git-gate` take their policy from
-    // argv, so an agent that can exec cplt can pass its own flags, but it could
-    // always do that when cplt lived in a granted directory, and it can skip the
-    // wrapper entirely by calling git by absolute path. The guard is a policy on
-    // intent, not a boundary.
-    match std::env::current_exe() {
-        Ok(cplt_bin) => fs_rules.push(FsRule {
-            path: cplt_bin,
-            access: FsAccess {
-                read: true,
-                write: false,
-                execute: true,
-                ioctl: false,
-            },
-        }),
-        // Say so rather than silently rebuilding the bug. Dropping the rule
-        // quietly is exactly the failure this commit fixes, and the symptom —
-        // every git command failing with "Permission denied" from a wrapper —
-        // gives no hint of the cause.
-        Err(e) => crate::ui::warn(&format!(
-            "cannot locate the cplt binary ({e}); the gh and git guard wrappers \
-             re-execute it, so every guarded command will fail with \
-             \"Permission denied\". Disable the guards or reinstall cplt."
-        )),
     }
 
     // ── Tool directories: read + execute ──
@@ -918,6 +890,85 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // disable kernel-level ConnectTcp restriction entirely (the proxy still
     // provides domain filtering and port enforcement for remote connections).
     let restrict_net_connect = !config.allow_localhost_any;
+
+    // ── The cplt binary itself: read + execute ──
+    //
+    // The guard wrappers are `exec <cplt> git-gate ...` / `gh-gate ...` — they
+    // re-enter this binary from inside the sandbox to reach the decision. macOS
+    // gets that for free from a blanket `(allow process-exec)`; Landlock has no
+    // such thing, so without an explicit rule the wrapper dies with
+    // "exec: /path/to/cplt: Permission denied" and *every* git command fails —
+    // `status`, `log`, `--version`, not only `push`.
+    //
+    // It worked at all only by accident of layout: `/usr/local` is in
+    // LINUX_TOOL_DIRS, so an install there re-entered fine, while `install.sh`'s
+    // default of `~/.local/bin` did not. The guard's own design requires this
+    // grant; leaving it to depend on where the user installed cplt is what made
+    // it look like it worked.
+    //
+    // The file, not its directory: `~/.local/bin` holds whatever else the user
+    // put there, and none of it needs to become executable inside the sandbox.
+    // No boundary is given up — `gh-gate`/`git-gate` take their policy from
+    // argv, so an agent that can exec cplt can pass its own flags, but it could
+    // always do that when cplt lived in a granted directory, and it can skip the
+    // wrapper entirely by calling git by absolute path. The guard is a policy on
+    // intent, not a boundary.
+    //
+    // Emitted last, and only after the same writable-tree overlap check
+    // `sandbox::validate_exec_grants` applies to every user `allow.exec` grant.
+    // This grant is generated rather than written by the user, so there is no
+    // config line to refuse at — but it is the same pair, and Landlock is
+    // additive: a write rule on an ancestor unions with an execute rule on a
+    // child and nothing can subtract it. Install cplt under a tree that is
+    // writable-but-not-executable and the agent gets `WriteFile` from that
+    // tree's rule and `Execute` from this one, which is the binary-drop staging
+    // path `validate_exec_grants` exists to refuse. `/tmp` is exactly that
+    // shape by default — untar a release there to try it out and the pair is
+    // real — while `~/.local/bin`, `~/.cargo/bin` and `/usr/local` are
+    // read-only and already executable, and the project dir already carries
+    // execute by design, so none of them trip it.
+    //
+    // The check runs against the rules actually emitted rather than against
+    // `sandbox::writable_trees`, because what matters is whether execute is
+    // *new* here. The project and scratch dirs are writable and executable by
+    // design; skipping the grant there would break the guard to close a hole
+    // that is already open by construction.
+    match std::env::current_exe() {
+        Ok(cplt_bin) => match writable_non_exec_tree_over(&fs_rules, &cplt_bin) {
+            // Warn and skip rather than grant. Skipping means the wrappers
+            // cannot re-enter and every guarded git and gh command fails
+            // loudly, which is the right way round: a guard that has stopped
+            // working says so, where a silently writable-and-executable cplt
+            // binary does not.
+            Some(tree) => crate::ui::warn(&format!(
+                "the cplt binary at {} sits under {}, which the sandbox makes writable. \
+                 Granting it execute would let the agent overwrite cplt and run it, so the \
+                 grant is skipped and the gh and git guard wrappers cannot re-execute cplt \
+                 — every guarded command will fail with \"Permission denied\". Install cplt \
+                 outside that tree (~/.local/bin or /usr/local/bin) and rerun.",
+                cplt_bin.display(),
+                tree.path.display()
+            )),
+            None => fs_rules.push(FsRule {
+                path: cplt_bin,
+                access: FsAccess {
+                    read: true,
+                    write: false,
+                    execute: true,
+                    ioctl: false,
+                },
+            }),
+        },
+        // Say so rather than silently rebuilding the bug. Dropping the rule
+        // quietly is exactly the failure #348 fixed, and the symptom — every
+        // git command failing with "Permission denied" from a wrapper — gives
+        // no hint of the cause.
+        Err(e) => crate::ui::warn(&format!(
+            "cannot locate the cplt binary ({e}); the gh and git guard wrappers \
+             re-execute it, so every guarded command will fail with \
+             \"Permission denied\". Disable the guards or reinstall cplt."
+        )),
+    }
 
     let precreate_dirs = tool_dirs
         .into_iter()
@@ -2726,6 +2777,81 @@ mod tests {
         assert!(
             !policy.net_rules.iter().any(|r| r.port == 443),
             "fail-closed: proxy_forced without a port must not re-add 443"
+        );
+    }
+
+    /// An `FsRule` with just the access bits the overlap check reads.
+    fn rule(path: &str, write: bool, execute: bool) -> FsRule {
+        FsRule {
+            path: PathBuf::from(path),
+            access: FsAccess {
+                read: true,
+                write,
+                execute,
+                ioctl: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_writable_non_exec_tree_over_the_cplt_binary_is_a_finding() {
+        // `/tmp` is read+write and *not* executable unless --allow-tmp-exec or
+        // --allow-jvm-attach is set, which is the shape that matters: granting
+        // execute on a file under it unions into write-plus-execute, and the
+        // agent can overwrite cplt and run it. "Untar a release into /tmp and
+        // try it" puts the binary exactly there.
+        let rules = vec![rule("/tmp", true, false)];
+        assert_eq!(
+            writable_non_exec_tree_over(&rules, Path::new("/tmp/cplt-0.1/cplt"))
+                .map(|r| r.path.as_path()),
+            Some(Path::new("/tmp"))
+        );
+    }
+
+    #[test]
+    fn an_already_executable_writable_tree_is_not_a_finding() {
+        // The project dir and the scratch dir are write+exec by design. The
+        // grant adds nothing there, so skipping it would break the guard
+        // wrappers to close a hole that is open by construction.
+        let rules = vec![rule("/home/user/project", true, true)];
+        assert!(
+            writable_non_exec_tree_over(&rules, Path::new("/home/user/project/target/debug/cplt"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_read_only_tool_dir_is_not_a_finding() {
+        // `~/.local/bin`, `~/.cargo/bin`, `/usr/local` — read-only and already
+        // executable, which is where cplt is normally installed.
+        let rules = vec![rule("/usr/local", false, true), rule("/tmp", true, false)];
+        assert!(writable_non_exec_tree_over(&rules, Path::new("/usr/local/bin/cplt")).is_none());
+    }
+
+    #[test]
+    fn a_sibling_path_does_not_match_on_a_prefix() {
+        // `starts_with` on `Path` is component-wise, so `/tmpfoo` is not under
+        // `/tmp`. Asserted so a later switch to string prefixes is caught.
+        let rules = vec![rule("/tmp", true, false)];
+        assert!(writable_non_exec_tree_over(&rules, Path::new("/tmpfoo/cplt")).is_none());
+    }
+
+    #[test]
+    fn generate_policy_grants_execute_on_the_cplt_binary() {
+        // #348: without this rule the guard wrappers cannot re-enter cplt and
+        // every guarded git and gh command fails with "Permission denied".
+        // The test binary is not under any writable-non-executable tree of a
+        // fixture config, so the grant must survive the overlap check.
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let policy = generate_policy(&test_config(&project, &home));
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == exe && r.access.execute && !r.access.write),
+            "the cplt binary must be granted read+execute and not write"
         );
     }
 
