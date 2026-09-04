@@ -352,7 +352,6 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // ── Application directories (filtered by discovery) ──
     for dir in policy::app_dirs() {
         let process_exec = dir.process_exec_paths(home);
-        let map_exec = dir.map_exec_paths(home);
         let write = dir.write_paths(home);
         let read = dir.read_paths(home);
         // all_paths() returns deduplicated union of all categories
@@ -364,7 +363,13 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 None => true,
             };
             if include {
-                let execute = process_exec.contains(&path) || map_exec.contains(&path);
+                // `map_exec` is deliberately not consulted: Landlock's EXECUTE
+                // is checked on execve() alone and has no mmap(PROT_EXEC) hook,
+                // so honouring it would grant full execve for a right the
+                // loader reaches with READ_FILE (#243). Every AppDir that maps
+                // executable pages also process-execs, so this changes nothing
+                // today — it keeps the rule from drifting when one does not.
+                let execute = process_exec.contains(&path);
                 let writable = write.contains(&path);
                 // read permission mirrors SBPL: only paths in read_paths() get file-read*.
                 // A write-only path (not in read_paths) does not get read access.
@@ -390,7 +395,30 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             access: FsAccess {
                 read: true,
                 write: dir.write,
-                execute: dir.process_exec || dir.map_exec,
+                // `process_exec` alone. Landlock checks EXECUTE on execve()
+                // (`file_open` with `FMODE_EXEC`) and has no hook for
+                // `mmap(PROT_EXEC)`, which a dynamic loader reaches with
+                // READ_FILE — so `map_exec`, which buys exactly
+                // `file-map-executable` on macOS, cannot be expressed here as
+                // anything narrower than full execve. Honouring it made every
+                // `write: true, map_exec: true` dependency store write+execute
+                // on Linux and nowhere else (#243).
+                execute: dir.process_exec,
+                ioctl: false,
+            },
+        });
+    }
+
+    // ── Trees that keep EXECUTE despite `process_exec: false` (#243) ──
+    // Landlock unions these with the write grant on the tool dir above, which
+    // is the write+execute pair each entry's `LinuxCoverage::Gap` records.
+    for entry in policy::EXEC_IN_WRITABLE {
+        fs_rules.push(FsRule {
+            path: home.join(entry.path),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: true,
                 ioctl: false,
             },
         });
@@ -763,7 +791,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             access: FsAccess {
                 read: true,
                 write: dir.write,
-                execute: dir.process_exec || dir.map_exec,
+                // `process_exec` alone, for the reason spelled out on the home
+                // tool dirs above (#243). No AgentDir sets `map_exec` today.
+                execute: dir.process_exec,
                 ioctl: false,
             },
         });
@@ -2387,11 +2417,70 @@ mod tests {
             assert!(rule.access.read, "{} should have read", dir.path);
             assert_eq!(rule.access.write, dir.write, "{} write mismatch", dir.path);
             assert_eq!(
-                rule.access.execute,
-                dir.process_exec || dir.map_exec,
+                rule.access.execute, dir.process_exec,
                 "{} execute mismatch",
                 dir.path
             );
+        }
+    }
+
+    /// #243: Landlock has no `mmap(PROT_EXEC)` right, so `map_exec` used to be
+    /// promoted to full `execve()`. Every dependency store that carries
+    /// `map_exec` for dylib loading was therefore write+execute on Linux and
+    /// nowhere else.
+    #[test]
+    fn map_exec_alone_does_not_grant_execute() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let policy = generate_policy(&test_config(&project, &home));
+
+        for rel in [
+            ".cargo/registry",
+            ".cargo/git",
+            ".gradle",
+            ".m2",
+            ".nuget",
+            "go/pkg",
+            "Library/pnpm/store",
+            ".local/share/pnpm/store",
+        ] {
+            let dir = policy::home_tool_dirs()
+                .iter()
+                .find(|d| d.path == rel)
+                .unwrap_or_else(|| panic!("{rel} should be a home tool dir"));
+            assert!(
+                dir.write && dir.map_exec && !dir.process_exec,
+                "{rel} premise"
+            );
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == home.join(rel))
+                .unwrap_or_else(|| panic!("{rel} should be in rules"));
+            assert!(rule.access.write, "{rel} must stay writable");
+            assert!(
+                !rule.access.execute,
+                "{rel} is writable, so it must not also be executable"
+            );
+        }
+    }
+
+    /// The carve-outs are a table with a stated reason each, not an absence:
+    /// every one of them keeps EXECUTE, and `.gradle/jdks` gets its own rule
+    /// because it is not a `HOME_TOOL_DIRS` entry.
+    #[test]
+    fn exec_in_writable_trees_keep_execute() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let policy = generate_policy(&test_config(&project, &home));
+
+        for entry in policy::EXEC_IN_WRITABLE {
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == home.join(entry.path) && r.access.execute)
+                .unwrap_or_else(|| panic!("{} should keep execute", entry.path));
+            assert!(rule.access.read, "{} should have read", entry.path);
         }
     }
 

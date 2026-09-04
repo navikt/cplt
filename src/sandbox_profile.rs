@@ -21,7 +21,7 @@ macro_rules! sbpl {
 
 use super::SandboxConfig;
 use super::policy::{
-    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
+    DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, EXEC_IN_WRITABLE,
     GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
     ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
     active_tool_dirs, app_dirs, escape_regex, nested_alternation, path_bin_dirs,
@@ -193,6 +193,16 @@ pub fn generate_profile_with_playwright_socket_dir(
     // $PNPM_HOME would reopen them, and mise's two live inside a tree that has
     // to stay writable.
     emit_path_bin_denies(&mut sb, config.home_dir);
+    // Same reason, in the other direction: `process-exec` is granted
+    // profile-wide, so an `allow.write` tree is executable unless something
+    // says otherwise, and only a rule after every allow can say it.
+    emit_user_write_exec_denies(
+        &mut sb,
+        &home,
+        &project,
+        config.extra_write,
+        config.scratch_dir,
+    );
     // MUST stay last: see `emit_exec_write_denies`. An exec grant that could be
     // reopened for writing by a later allow is a write-then-exec path.
     emit_exec_write_denies(&mut sb, config.extra_exec);
@@ -1520,6 +1530,69 @@ fn emit_exec_write_denies(sb: &mut String, extra_exec: &[PathBuf]) {
     for path in extra_exec {
         let p = path.to_string_lossy();
         sbpl!(sb, "(deny file-write* (subpath \"{p}\"))");
+    }
+    sbpl!(sb);
+}
+
+/// Keep every `allow.write` tree non-executable.
+///
+/// `process-exec` is granted profile-wide (`emit_process_rules`), so a user
+/// write grant lands on a tree the kernel will already execute from: writable
+/// plus executable, which is the binary-drop staging pair `validate_exec_grants`
+/// refuses when an `allow.exec` grant creates it the other way round (#295).
+/// `HOME_TOOL_DIRS` entries have carried the compensating deny since long
+/// before `allow.write` existed; user grants never did (#243).
+///
+/// Emitted after every allow, for the reason `emit_exec_write_denies` spells
+/// out: SBPL is last-match-wins.
+///
+/// Three exec grants are re-issued afterwards, but only where they fall inside
+/// a granted tree — an unconditional re-allow would override the `/private/tmp`
+/// exec deny for a project or scratch dir that lives there:
+///
+/// - the project directory, which is writable and executable by design, and
+///   which an `allow.write` on a parent (`~/Repos`) would otherwise silently
+///   stop running its own build output;
+/// - the scratch dir, which is write+exec by design;
+/// - the [`EXEC_IN_WRITABLE`] trees, which were already write+execute before
+///   the grant. The deny exists to stop a grant *creating* that pair, not to
+///   revoke a documented one.
+///
+/// Everything else loses execute: an `allow.write` covering `~/.cargo` or
+/// `~/.rustup` makes a read-only tool tree writable, and that pair is new.
+fn emit_user_write_exec_denies(
+    sb: &mut String,
+    home: &str,
+    project: &str,
+    extra_write: &[PathBuf],
+    scratch_dir: Option<&Path>,
+) {
+    if extra_write.is_empty() {
+        return;
+    }
+    sbpl!(
+        sb,
+        ";; allow.write trees stay non-executable (write-then-exec)"
+    );
+    for path in extra_write {
+        let p = path.to_string_lossy();
+        sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
+    }
+    let granted = |p: &Path| extra_write.iter().any(|w| p.starts_with(w));
+    let mut carve_outs: Vec<PathBuf> = vec![PathBuf::from(project)];
+    carve_outs.extend(scratch_dir.map(Path::to_path_buf));
+    carve_outs.extend(
+        EXEC_IN_WRITABLE
+            .iter()
+            .filter(|e| e.macos)
+            .map(|e| Path::new(home).join(e.path)),
+    );
+    for path in carve_outs.iter().filter(|p| granted(p)) {
+        if validate_sbpl_path(path).is_err() {
+            continue;
+        }
+        let p = path.display();
+        sbpl!(sb, "(allow process-exec (subpath \"{p}\"))");
     }
     sbpl!(sb);
 }
