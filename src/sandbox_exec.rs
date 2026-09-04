@@ -98,6 +98,10 @@ fn configure_command(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     npmrc_allowed: bool,
+    // Consulted before extracting a token: these names are stripped from the
+    // child afterwards, so a parent value that is about to be denied must not
+    // suppress the extraction. See `child_keeps_a_github_token`.
+    deny_env: &[String],
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -213,7 +217,7 @@ fn configure_command(
         if gh_guard.enabled {
             // Inject GH_TOKEN into env only when explicitly requested.
             if gh_guard.inject_token {
-                inject_gh_token_if_needed(cmd, agent);
+                inject_gh_token_if_needed(cmd, agent, deny_env);
             }
             // Cache token to file so the wrapper can serve `gh auth token`
             // requests without exposing the token as an env var to all child
@@ -227,7 +231,7 @@ fn configure_command(
             // does not close — the window. A determined agent that reads
             // `$TMPDIR/.gh-token` before the legitimate consumer still wins.
             if gh_guard.block_auth_token {
-                cache_gh_token_to_file(scratch, agent);
+                cache_gh_token_to_file(scratch, agent, deny_env);
             }
         }
         install_command_wrappers(cmd, scratch, project_dir, gh_guard, git_guard);
@@ -278,40 +282,63 @@ fn trusted_gh() -> Option<PathBuf> {
 }
 
 /// Only injects for agents that need GitHub access (Copilot).
-fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
-    // Only inject for Copilot — other agents have their own auth
-    if agent != Agent::Copilot {
-        return;
-    }
+/// The env vars that carry a GitHub token into the agent.
+///
+/// Mirrors `sandbox_env::COPILOT_ONLY_VARS`; kept here because this module both
+/// strips them from the `gh` subprocess and consults them to decide whether
+/// extraction is needed at all.
+const GH_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
 
-    // Skip if any GitHub token is already set (non-empty) in the environment
-    let has_token = |key| std::env::var(key).is_ok_and(|v| !v.is_empty());
-    if has_token("GH_TOKEN") || has_token("GITHUB_TOKEN") || has_token("COPILOT_GITHUB_TOKEN") {
-        return;
+/// The GitHub token `gh` holds, or `None` when there is nothing to hand over.
+///
+/// Trusted path, not PATH: this runs in the unsandboxed parent at launch and
+/// its stdout is treated as a GitHub token, so a planted `gh` would get both
+/// code execution as the user and a free channel into the agent's environment.
+///
+/// `--hostname github.com` is not optional. `gh auth token` without it resolves
+/// against the *active* host, which `GH_HOST` can steer and which is a GHES
+/// instance on a machine logged into one — so the agent would be handed a token
+/// for the wrong host. The token vars are stripped from the subprocess so `gh`
+/// answers from its own credential store rather than echoing back an ambient
+/// value.
+fn extract_gh_token() -> Option<String> {
+    let gh = trusted_gh()?;
+    let mut cmd = std::process::Command::new(&gh);
+    cmd.args(["auth", "token", "--hostname", "github.com"]);
+    for var in GH_TOKEN_VARS {
+        cmd.env_remove(var);
     }
-
-    // Extract token from gh CLI config (outside sandbox). Trusted path, not
-    // PATH: this runs in the unsandboxed parent at launch and its stdout is
-    // treated as a GitHub token, so a planted `gh` gets both code execution as
-    // the user and a free channel into the agent's environment.
-    let Some(gh) = trusted_gh() else {
-        return;
-    };
-    let Ok(output) = std::process::Command::new(&gh)
-        .args(["auth", "token"])
+    let output = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
-    else {
-        return;
-    };
-
+        .ok()?;
     if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Whether the child will already have a usable GitHub token in its own
+/// environment, making extraction unnecessary.
+///
+/// `deny_env` is consulted because the caller strips those names from the child
+/// AFTER this runs. Without it a repo `deny.env = ["GH_TOKEN"]` produced a
+/// child with no token at all: the parent's value suppressed the extraction,
+/// and then the deny removed the variable it was suppressed in favour of.
+fn child_keeps_a_github_token(deny_env: &[String]) -> bool {
+    GH_TOKEN_VARS.iter().any(|var| {
+        !deny_env.iter().any(|d| d == var) && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+    })
+}
+
+fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent, deny_env: &[String]) {
+    // Only inject for Copilot — other agents have their own auth.
+    if agent != Agent::Copilot || child_keeps_a_github_token(deny_env) {
         return;
     }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !token.is_empty() {
+    if let Some(token) = extract_gh_token() {
         cmd.env("GH_TOKEN", &token);
     }
 }
@@ -335,43 +362,14 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
 /// window. They do NOT prevent a determined same-UID agent from `cat`-ing
 /// `$TMPDIR/.gh-token` before the legitimate read. Do not treat this as
 /// confidentiality against an adversarial agent.
-fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent) {
-    // Only cache for Copilot — other agents have their own auth
-    if agent != Agent::Copilot {
+fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent, deny_env: &[String]) {
+    // Only cache for Copilot — other agents have their own auth.
+    if agent != Agent::Copilot || child_keeps_a_github_token(deny_env) {
         return;
     }
-
-    // Skip if any GitHub token is already set (non-empty) in the environment —
-    // in that case Copilot will use the env var directly.
-    let has_token = |key| std::env::var(key).is_ok_and(|v| !v.is_empty());
-    if has_token("GH_TOKEN") || has_token("GITHUB_TOKEN") || has_token("COPILOT_GITHUB_TOKEN") {
-        return;
-    }
-
-    // Extract token from gh CLI config (outside sandbox). Trusted path, not
-    // PATH: this runs in the unsandboxed parent at launch and its stdout is
-    // treated as a GitHub token, so a planted `gh` gets both code execution as
-    // the user and a free channel into the agent's environment.
-    let Some(gh) = trusted_gh() else {
+    let Some(token) = extract_gh_token() else {
         return;
     };
-    let Ok(output) = std::process::Command::new(&gh)
-        .args(["auth", "token"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-    else {
-        return;
-    };
-
-    if !output.status.success() {
-        return;
-    }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        return;
-    }
 
     // Write token to file, creating it with 0600 from the start to avoid a
     // permissions window where the file is world-readable.
@@ -699,6 +697,7 @@ pub fn exec(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        deny_env,
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -847,6 +846,7 @@ pub fn exec(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        deny_env,
     );
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
@@ -982,6 +982,7 @@ fn exec_bwrap(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        deny_env,
     );
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     // Set the re-entry env AFTER configure_command so a `clear_first` env build
@@ -1092,6 +1093,60 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
             return ConfirmResult::Eof;
         }
         return ConfirmResult::Confirmed;
+    }
+}
+
+#[cfg(test)]
+mod gh_token_extraction_tests {
+    use super::*;
+
+    /// A repo `deny.env` on a token var used to leave the child with NO token:
+    /// the parent's value suppressed the extraction, then the deny stripped the
+    /// very variable it was suppressed in favour of. The suppression check has
+    /// to see the deny list for the same reason the injection does.
+    #[test]
+    fn a_denied_parent_token_does_not_suppress_extraction() {
+        temp_env::with_var("GH_TOKEN", Some("ghp_parent"), || {
+            assert!(
+                child_keeps_a_github_token(&[]),
+                "an undenied parent token reaches the child, so no extraction is needed"
+            );
+            assert!(
+                !child_keeps_a_github_token(&["GH_TOKEN".to_string()]),
+                "a denied token is stripped from the child, so extraction must still run"
+            );
+        });
+    }
+
+    /// Denying one variable says nothing about the others.
+    #[test]
+    fn denying_one_token_var_leaves_the_others_counting() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", Some("ghp_other")),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                assert!(
+                    child_keeps_a_github_token(&["GH_TOKEN".to_string()]),
+                    "GITHUB_TOKEN survives the deny and still reaches the child"
+                );
+            },
+        );
+    }
+
+    /// Whitespace is not a credential.
+    #[test]
+    fn a_blank_token_does_not_count() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", Some("   ")),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || assert!(!child_keeps_a_github_token(&[])),
+        );
     }
 }
 
