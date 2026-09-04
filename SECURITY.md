@@ -359,7 +359,9 @@ A curated blocklist of these domains ships in [`blocked-domains.txt`](blocked-do
 
 A repo `deny.env` naming `GH_TOKEN` suppresses this cache as well as the environment variable, so `gh auth token` inside such a sandbox returns nothing and no `.gh-token` is written. `GH_TOKEN` is the injection target, so denying it is the repo saying the agent gets no GitHub credential, and serving one through the wrapper would honour the letter of that and not its intent.
 
-Denying only `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN` is a narrower statement and leaves the cache channel open. That is deliberate: with `GH_TOKEN` still permitted the agent receives a token through the environment anyway, so suppressing the cache would remove nothing. It also means "deny the token vars and the agent has no credential" holds only when `GH_TOKEN` is among them.
+Denying only `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN` is a narrower statement and leaves the cache channel open. That is deliberate: the cache follows the injection target. `inject_gh_token_if_needed` injects into the first of the three names the deny list does not strip, so with `GH_TOKEN` permitted the repo has not withheld the credential — it has objected to one variable, and the same token remains available through the name it did not deny.
+
+Do not read that as the cache being redundant. Under `block_auth_token` the environment variable is deliberately withheld and the one-time cache is how the credential reaches the agent at all; both channels are gated on the child not already carrying a token of its own. The point is narrower: which name the repo denies decides whether it has refused the credential or merely one route to it, and only `GH_TOKEN` means the former.
 
 *Possible mitigation:* a repo-scoped MCP proxy or a fine-grained PAT that limits token scope to the current repository. See issue #4.
 
