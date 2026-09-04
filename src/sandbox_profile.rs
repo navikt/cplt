@@ -2354,11 +2354,11 @@ mod tests {
     /// Emit just the developer-tools block with `xcode_select_link` pointed at a
     /// symlink under test control, so every `xcode-select` configuration can be
     /// exercised on a machine that only has one.
-    fn tool_dirs_block(xcode_select_link: &Path) -> String {
+    fn tool_dirs_block(home: &Path, xcode_select_link: &Path) -> String {
         let mut sb = String::new();
         emit_tool_dirs(
             &mut sb,
-            std::path::Path::new("/Users/test"),
+            home,
             Some(&[]),
             Some(&[]),
             crate::agent::Agent::Copilot,
@@ -2369,10 +2369,22 @@ mod tests {
         sb
     }
 
-    fn link_to(dir: &tempfile::TempDir, target: &str) -> PathBuf {
-        let link = dir.path().join("xcode_select_link");
+    fn link_to(dir: &Path, target: &Path) -> PathBuf {
+        let link = dir.join("xcode_select_link");
         std::os::unix::fs::symlink(target, &link).expect("symlink");
         link
+    }
+
+    /// A stand-in for a versioned Xcode: a real directory, because the resolver
+    /// canonicalizes the link target and a path that does not exist is not
+    /// granted.
+    fn fake_xcode(home: &Path, name: &str) -> PathBuf {
+        let dev = home
+            .join("Applications")
+            .join(name)
+            .join("Contents/Developer");
+        std::fs::create_dir_all(&dev).expect("mkdir");
+        dev
     }
 
     /// #342: the selected developer directory is granted, not just the literal
@@ -2381,17 +2393,17 @@ mod tests {
     /// and every one of them exits 1 inside the sandbox.
     #[test]
     fn versioned_xcode_developer_dir_is_granted() {
-        let dir = tempfile::tempdir().unwrap();
-        let selected = "/Applications/Xcode_26.6.app/Contents/Developer";
-        let sb = tool_dirs_block(&link_to(&dir, selected));
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let dev = std::fs::canonicalize(fake_xcode(&home, "Xcode_26.6.app")).unwrap();
+        let sb = tool_dirs_block(&home, &link_to(&home, &dev));
+        let dev = dev.display();
         assert!(
-            sb.contains(&format!("(allow file-read* (subpath \"{selected}\"))")),
+            sb.contains(&format!("(allow file-read* (subpath \"{dev}\"))")),
             "selected developer dir must be readable:\n{sb}"
         );
         assert!(
-            sb.contains(&format!(
-                "(allow file-map-executable (subpath \"{selected}\"))"
-            )),
+            sb.contains(&format!("(allow file-map-executable (subpath \"{dev}\"))")),
             "libxcrun.dylib must be mappable from the selected developer dir:\n{sb}"
         );
     }
@@ -2400,8 +2412,8 @@ mod tests {
     /// which stays in `TOOL_READ_DIRS` for exactly this case.
     #[test]
     fn absent_xcode_select_link_falls_back_to_the_literal() {
-        let dir = tempfile::tempdir().unwrap();
-        let sb = tool_dirs_block(&dir.path().join("does_not_exist"));
+        let tmp = tempfile::tempdir().unwrap();
+        let sb = tool_dirs_block(tmp.path(), &tmp.path().join("does_not_exist"));
         assert!(
             sb.contains(
                 "(allow file-read* (subpath \"/Applications/Xcode.app/Contents/Developer\"))"
@@ -2410,13 +2422,29 @@ mod tests {
         );
     }
 
+    /// A `/var/db/xcode_select_link` that is a regular file rather than a
+    /// symlink — the shape this file reportedly had on older macOS — must fall
+    /// back rather than grant a subpath on the file itself.
+    #[test]
+    fn regular_file_xcode_select_link_grants_nothing_extra() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("xcode_select_link");
+        std::fs::write(&link, "/Applications/Xcode_26.6.app/Contents/Developer\n").unwrap();
+        let sb = tool_dirs_block(tmp.path(), &link);
+        assert!(
+            !sb.contains(&format!("(subpath \"{}\"", link.display())),
+            "the link file itself must never be granted:\n{sb}"
+        );
+    }
+
     /// Command Line Tools: `xcode_select` points at a directory `TOOL_READ_DIRS`
     /// already grants, so no second rule is emitted for it.
     #[test]
     fn command_line_tools_selection_emits_no_duplicate_grant() {
-        let dir = tempfile::tempdir().unwrap();
-        let clt = "/Library/Developer/CommandLineTools";
-        let sb = tool_dirs_block(&link_to(&dir, clt));
+        let tmp = tempfile::tempdir().unwrap();
+        let clt = Path::new("/Library/Developer/CommandLineTools");
+        let sb = tool_dirs_block(tmp.path(), &link_to(tmp.path(), clt));
+        let clt = clt.display();
         assert_eq!(
             sb.matches(&format!("(allow file-read* (subpath \"{clt}\"))"))
                 .count(),
@@ -2430,14 +2458,32 @@ mod tests {
     /// would hand the sandbox the whole machine.
     #[test]
     fn xcode_select_link_to_an_unsafe_root_is_not_granted() {
-        for target in ["/", "/Users/test", "/Users", "/tmp"] {
-            let dir = tempfile::tempdir().unwrap();
-            let sb = tool_dirs_block(&link_to(&dir, target));
-            assert!(
-                !sb.contains(&format!("(allow file-read* (subpath \"{target}\"))")),
-                "xcode-select pointing at {target} must not widen the sandbox:\n{sb}"
-            );
+        for target in ["/", "/tmp", "/Users", "/Applications"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = std::fs::canonicalize(tmp.path()).unwrap();
+            let sb = tool_dirs_block(&home, &link_to(&home, Path::new(target)));
+            for granted in [target, "/private/tmp"] {
+                assert!(
+                    !sb.contains(&format!("(allow file-read* (subpath \"{granted}\"))")),
+                    "xcode-select pointing at {target} must not widen the sandbox:\n{sb}"
+                );
+            }
         }
+        // $HOME itself, via a target that only reaches it through `..` — the
+        // case that needs the target canonicalized before it is checked.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let escape = fake_xcode(&home, "Xcode.app").join("../../../..");
+        let sb = tool_dirs_block(&home, &link_to(&home, &escape));
+        let home = home.display();
+        assert!(
+            !sb.contains(&format!("(allow file-read* (subpath \"{home}\"))")),
+            "a link target escaping to $HOME must not be granted:\n{sb}"
+        );
+        assert!(
+            !sb.contains(".."),
+            "no un-normalized path may reach the profile:\n{sb}"
+        );
     }
 
     #[test]

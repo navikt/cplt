@@ -354,17 +354,27 @@ pub const XCODE_SELECT_LINK: &str = "/var/db/xcode_select_link";
 /// them on any machine with a versioned or relocated Xcode — a user whose only
 /// git is `/usr/bin/git` then has no git inside the sandbox at all (#342).
 ///
-/// Returns `None` when the link is absent, when it is relative, when it names a
-/// path that would widen the sandbox ([`tool_override_path_is_safe`] — the link
-/// is root-owned, but a grant that follows a symlink still gets the same sanity
-/// check every other resolved path in this codebase gets), or when the target
-/// cannot be safely interpolated into SBPL.
+/// Returns `None` when the link is absent, when it is not a symlink, when its
+/// target does not exist, when it names a path that would widen the sandbox
+/// ([`tool_override_path_is_safe`] — the link is root-owned, but a grant that
+/// follows a symlink still gets the same sanity check every other resolved path
+/// in this codebase gets), or when the target cannot be safely interpolated
+/// into SBPL.
+///
+/// The target is canonicalized before it is checked and before it is granted.
+/// `tool_override_path_is_safe` compares paths textually and documents that its
+/// argument is already canonical, so a link target carrying `..` — or one whose
+/// own parents are symlinks — would otherwise slip past it and be emitted as a
+/// grant on whatever it really resolves to.
 ///
 /// The caller is responsible for skipping a target already covered by
 /// [`TOOL_READ_DIRS`] — the Command Line Tools case, where the selected
 /// directory is `/Library/Developer/CommandLineTools` and is already granted.
 pub fn xcode_developer_dir_from(link: &Path, home: &Path) -> Option<PathBuf> {
-    let target = std::fs::read_link(link).ok()?;
+    // `read_link` rather than `canonicalize` alone: it fails on a regular file,
+    // so a `/var/db/xcode_select_link` that is not a symlink falls back to the
+    // literal instead of granting a subpath on the file itself.
+    let target = std::fs::canonicalize(std::fs::read_link(link).ok()?).ok()?;
     if !target.is_absolute()
         || !tool_override_path_is_safe(&target, home)
         || validate_sbpl_path(&target).is_err()
