@@ -1304,7 +1304,7 @@ fn emit_dotnet_exec_denies(sb: &mut String, dotnet_root: Option<&Path>) {
 /// unsandboxed `git`, `node` or `python` resolves through PATH and runs it.
 /// `~/.cargo/bin` has been read-only for exactly this reason; these are the
 /// rest of the class — `~/.bun/bin`, `~/.deno/bin`, `$PNPM_HOME`, and mise's
-/// `shims/` and `installs/<tool>/<version>/bin`.
+/// `shims/` and `installs/`.
 ///
 /// Most of them are read-only by construction already, because
 /// `HOME_TOOL_DIRS` grants write to the sibling cache instead of the parent
@@ -1317,7 +1317,8 @@ fn emit_dotnet_exec_denies(sb: &mut String, dotnet_root: Option<&Path>) {
 /// rationale as `emit_host_persistence_denies`.
 ///
 /// The cost is deliberate: `bun install -g`, `deno install`, `pnpm add -g`,
-/// `mise use -g` and `mise install` all fail inside the sandbox, and a repo
+/// `mise use -g`, `mise install` and `mise upgrade` all fail inside the
+/// sandbox, and a repo
 /// whose `mise.toml` pins a toolchain the host does not already have no longer
 /// bootstraps. See docs/known-impacts.md.
 ///
@@ -1345,19 +1346,6 @@ fn emit_path_bin_denies(sb: &mut String, home_dir: &Path) {
                 }
                 let r = escape_regex(&path.to_string_lossy());
                 sbpl!(sb, "(deny file-write* (regex #\"^{r}/[^/]+$\"))");
-            }
-            // `installs/<tool>/<version>/bin` and below. SBPL subpaths have no
-            // wildcard, and the tool and version components are not known when
-            // the profile is generated.
-            PathBinDir::NestedBin(path) => {
-                if validate_sbpl_path(&path).is_err() {
-                    continue;
-                }
-                let r = escape_regex(&path.to_string_lossy());
-                sbpl!(
-                    sb,
-                    "(deny file-write* (regex #\"^{r}/[^/]+/[^/]+/bin($|/)\"))"
-                );
             }
         }
     }

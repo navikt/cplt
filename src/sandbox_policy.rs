@@ -1243,8 +1243,6 @@ pub enum PathBinDir {
     /// The `$PNPM_HOME` shape — the global shims sit at the top level, while
     /// `store/` below it must keep taking writes for ordinary `pnpm install`.
     TopLevel(PathBuf),
-    /// `<dir>/<tool>/<version>/bin`, mise's `installs/` layout.
-    NestedBin(PathBuf),
 }
 
 /// Resolve the PATH-resolved bin/shim directories for `home`.
@@ -1261,11 +1259,17 @@ pub fn path_bin_dirs(home: &Path) -> Vec<PathBinDir> {
         dirs.push(PathBinDir::TopLevel(data));
     }
     for data in app_data_dirs("mise", home) {
-        // Shims are what `mise activate` puts on PATH; `installs/` holds the
-        // real toolchains, whose `bin` directories PATH picks up directly in
-        // non-shim mode.
+        // Shims are what `mise activate` puts on PATH.
         dirs.push(PathBinDir::Subtree(data.join("shims")));
-        dirs.push(PathBinDir::NestedBin(data.join("installs")));
+        // The whole of `installs/`, not each `<tool>/<version>/bin`. mise only
+        // creates a `bin/` for tools that ship one — on a machine with 207
+        // installed version directories, 55 did. Everything else lands flat at
+        // `installs/<tool>/<version>/<name>` (`installs/actionlint/1.7.12/actionlint`),
+        // and in non-shim mode mise puts *that* directory on PATH, so a
+        // `bin`-anchored rule leaves the majority of tools writable. Denying
+        // the tree costs only `mise install` and `mise upgrade` from inside the
+        // sandbox, which is already the accepted cost for the shimmed ones.
+        dirs.push(PathBinDir::Subtree(data.join("installs")));
     }
     dirs
 }

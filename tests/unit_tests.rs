@@ -3630,8 +3630,8 @@ const PATH_BIN_DENY_RULES: &[(&str, &str)] = &[
         r#"(deny file-write* (subpath "/Users/test/.local/share/mise/shims"))"#,
     ),
     (
-        "mise installs/*/bin",
-        r#"(deny file-write* (regex #"^/Users/test/\.local/share/mise/installs/[^/]+/[^/]+/bin($|/)"))"#,
+        "mise installs/",
+        r#"(deny file-write* (subpath "/Users/test/.local/share/mise/installs"))"#,
     ),
 ];
 
@@ -3644,6 +3644,31 @@ fn profile_denies_write_on_path_resolved_bin_dirs() {
             "{name} must be write-denied — a binary dropped there runs unsandboxed on the user's next PATH lookup.\nMissing rule: {rule}"
         );
     }
+}
+
+/// mise only creates `installs/<tool>/<version>/bin` for tools that ship a
+/// `bin`. Everything else lands flat at `installs/<tool>/<version>/<name>`, and
+/// in non-shim mode mise puts *that* directory on PATH — so it is a drop point
+/// too. Counted on a real machine: 55 of 207 installed version directories had
+/// a `bin/`.
+///
+/// This is the test the earlier `installs/*/bin` rule failed. Asserting on a
+/// `bin` path would have passed under both rules and proved nothing.
+#[test]
+fn mise_flat_layout_tool_dirs_are_write_denied() {
+    let p = default_profile();
+    let deny = r#"(deny file-write* (subpath "/Users/test/.local/share/mise/installs"))"#;
+    assert!(
+        p.contains(deny),
+        "the whole installs/ tree must be denied — a `bin`-anchored rule leaves \
+         installs/actionlint/1.7.12/actionlint writable, and mise puts that \
+         directory on PATH"
+    );
+    // The narrow rule this replaced. Present means the widening was reverted.
+    assert!(
+        !p.contains("/bin($|/)"),
+        "the bin-anchored mise regex must be gone — it covered a minority of tools"
+    );
 }
 
 #[test]
