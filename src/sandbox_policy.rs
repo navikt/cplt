@@ -1910,6 +1910,25 @@ pub const PROTECTED_IN_GITDIR: &[Protected] = &[
     },
 ];
 
+/// Escape the regex metacharacters that can still appear in a path.
+///
+/// `validate_sbpl_path` already rejects `"`, `(`, `)`, `;`, `\` and newlines, so
+/// what is left is the set below. Without this a project directory like
+/// `~/code/v1.0+rc` would compile to a rule matching more than it names.
+pub fn escape_regex(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(
+            c,
+            '.' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The `nested: true` entries of a table, as a regex alternation.
 ///
 /// macOS is the only backend that can protect repositories nested at unknown
@@ -1917,10 +1936,16 @@ pub const PROTECTED_IN_GITDIR: &[Protected] = &[
 /// alternation is derived here rather than written out next to the regex, so it
 /// cannot drift from the table the way it did before #247's comment had to
 /// promise it "mirrors `emit_gitdir_denies` exactly".
+///
+/// Each name is passed through [`escape_regex`] first. Today's gitdir names are
+/// all bare words, so the escaping is a no-op for them — but `.agents/plugins`
+/// in [`PROTECTED_IN_ROOT`] is not, and an entry added later need not be. The
+/// helper says "alternation", so it owes the caller a *regex*, not a list of
+/// names that happens to look like one.
 pub fn nested_alternation(set: &[Protected]) -> String {
     set.iter()
         .filter(|p| p.nested)
-        .map(|p| p.rel)
+        .map(|p| escape_regex(p.rel))
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -2049,6 +2074,10 @@ mod tests {
             nested_alternation(PROTECTED_IN_GITDIR),
             "hooks|config|commondir|modules"
         );
-        assert_eq!(nested_alternation(PROTECTED_IN_ROOT), ".agents/plugins");
+        assert_eq!(
+            nested_alternation(PROTECTED_IN_ROOT),
+            r"\.agents/plugins",
+            "a `.` in a rel path must reach the regex escaped, not as `any char`"
+        );
     }
 }

@@ -23,8 +23,8 @@ use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
     ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
-    active_tool_dirs, app_dirs, nested_alternation, path_bin_dirs, playwright_runtime_intent,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    active_tool_dirs, app_dirs, escape_regex, nested_alternation, path_bin_dirs,
+    playwright_runtime_intent, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Options for generating an SBPL sandbox profile.
@@ -920,25 +920,6 @@ fn emit_git_persistence_denies(
     for root in writable_roots(project, extra_write) {
         emit_nested_gitdir_denies(sb, &root);
     }
-}
-
-/// Escape the regex metacharacters that can still appear in a path.
-///
-/// `validate_sbpl_path` already rejects `"`, `(`, `)`, `;`, `\` and newlines, so
-/// what is left is the set below. Without this a project directory like
-/// `~/code/v1.0+rc` would compile to a rule matching more than it names.
-fn escape_regex(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for c in path.chars() {
-        if matches!(
-            c,
-            '.' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
-        ) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Extend the git-persistence denies to repositories nested *beneath* a

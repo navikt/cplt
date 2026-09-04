@@ -1068,12 +1068,15 @@ mod tests {
 
     #[test]
     fn ro_protect_set_is_narrow_and_leaves_git_config_writable() {
-        // The protected set is deliberately narrow: only .git/hooks and
-        // .cplt.toml. .git/config / .gitmodules must stay writable so legit
-        // in-sandbox git config/remote/submodule ops (and their lock files)
-        // are not broken — even when those files exist on disk.
+        // The protected set is deliberately narrow: exactly the
+        // `LinuxCoverage::Bwrap` entries of `PROTECTED_IN_ROOT` and
+        // `PROTECTED_IN_GITDIR` — .git/hooks, .cplt.toml, .agents/plugins.
+        // .git/config / .gitmodules must stay writable so legit in-sandbox git
+        // config/remote/submodule ops (and their lock files) are not broken —
+        // even when those files exist on disk.
         let proj = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(proj.path().join(".git/hooks")).expect("create .git/hooks");
+        std::fs::create_dir_all(proj.path().join(".agents/plugins")).expect("create plugins");
         std::fs::write(proj.path().join(".git/config"), "").expect("create .git/config");
         std::fs::write(proj.path().join(".gitmodules"), "").expect("create .gitmodules");
         std::fs::write(proj.path().join(".cplt.toml"), "").expect("create .cplt.toml");
@@ -1095,6 +1098,14 @@ mod tests {
                 .any(|w| w[0] == "--ro-bind"
                     && w[1] == proj.path().join(".cplt.toml").to_string_lossy()),
             ".cplt.toml must be re-bound read-only"
+        );
+        // #267: goose auto-spawns MCP servers declared here on the next host
+        // run. It is `LinuxCoverage::Bwrap`, so the bind must actually reach
+        // `build_bwrap_args` — this is the end-to-end pin for the table.
+        assert!(
+            args.windows(2).any(|w| w[0] == "--ro-bind"
+                && w[1] == proj.path().join(".agents/plugins").to_string_lossy()),
+            ".agents/plugins must be re-bound read-only"
         );
         // .git/config and .gitmodules are NOT re-bound (stay writable), even
         // though both exist on disk — the narrowing, not the exists-check, is
