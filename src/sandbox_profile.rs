@@ -1971,13 +1971,25 @@ fn emit_network_rules(
     // contradiction the orchestration already prevents), we emit NO outbound-443
     // rule and NO localhost proxy carve-out — the deny-by-default profile then
     // blocks all remote TCP, which is the safe failure rather than an open one.
+    //
+    // `extra_ports` (#297) is gated on the same condition, and for the same
+    // reason. `(remote ip "*:{port}")` is a direct path to ANY remote host on
+    // that port, family-agnostic so it carries UDP too — a channel the proxy
+    // never sees, that `allowed_domains`/`blocked_domains` never filter, and
+    // that no cooperating localhost process is needed to reach. Leaving it
+    // ungated made the "no residual" claim above false for every user who
+    // passed `--allow-port`. The port stays in the *proxy's* allowed-port
+    // policy, so a proxy-aware tool still reaches `remote:{port}` by CONNECT,
+    // logged and domain-filtered; only non-proxy-aware raw TCP loses the path,
+    // which is precisely what this mode exists to take away. `main.rs` warns
+    // when the two are combined, so the narrowing is never silent.
     if !proxy_forced {
         sbpl!(sb, "(allow network-outbound (remote ip \"*:443\"))");
-    }
 
-    // Extra ports (e.g., MCP servers, custom services)
-    for port in extra_ports {
-        sbpl!(sb, "(allow network-outbound (remote ip \"*:{port}\"))");
+        // Extra ports (e.g., MCP servers, custom services)
+        for port in extra_ports {
+            sbpl!(sb, "(allow network-outbound (remote ip \"*:{port}\"))");
+        }
     }
 
     // Block localhost outbound — prevents SSRF to local dev servers, databases, etc.
@@ -2189,6 +2201,37 @@ mod tests {
         assert!(
             !p.contains("\"*:443\""),
             "proxy_forced must drop the broad *:443 allowance"
+        );
+    }
+
+    #[test]
+    fn extra_ports_are_direct_egress_in_default_mode_only() {
+        // #297: `--allow-port 9999` emits `(remote ip "*:9999")`, a direct path
+        // to any remote host on that port. Under proxy_forced that path must be
+        // gone, or the "no residual" claim on the rule above is false. The same
+        // options run both ways, so the assertion can only pass by the gate.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let ports = [9999u16];
+
+        let mut opts = test_options(project, home);
+        opts.extra_ports = &ports;
+        let default_mode = generate_profile(&opts);
+        assert!(
+            default_mode.contains("(allow network-outbound (remote ip \"*:9999\"))"),
+            "default mode must still honour --allow-port"
+        );
+
+        opts.proxy_forced = true;
+        opts.proxy_port = Some(8080);
+        let forced = generate_profile(&opts);
+        assert!(
+            !forced.contains("*:9999"),
+            "proxy_forced must not emit a direct remote path for an extra port"
+        );
+        assert!(
+            forced.contains("(allow network-outbound (remote ip \"localhost:8080\"))"),
+            "proxy_forced still pins egress to the localhost proxy port"
         );
     }
 

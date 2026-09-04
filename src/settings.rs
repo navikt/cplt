@@ -490,9 +490,17 @@ fn resolved_values(
                 get_value_from_doc(global_doc, key)
                     .unwrap_or_else(|| key.default_display.to_string())
             };
+            // A boolean on the precedence ladder reads its effective value
+            // straight off the registry row, so this match no longer keeps a
+            // parallel list of those — the list that silently drifted behind
+            // the `_ => fallback()` arm. The booleans in `BOOL_KEYS_EXEMPT`
+            // (the legacy `sandbox.gh_proxy` / `sandbox.git_push_prevention`
+            // spellings, and `sandbox.use_bubblewrap`) are not on the ladder
+            // and still need an arm below.
+            if let Some(row) = crate::config::bool_key(key.section, key.key) {
+                return ((key.section, key.key), (row.resolved)(resolved).to_string());
+            }
             let value = match (key.section, key.key) {
-                ("proxy", "enabled") => resolved.with_proxy.to_string(),
-                ("proxy", "forced") => resolved.proxy_forced.to_string(),
                 ("proxy", "port") => resolved.proxy_port.to_string(),
                 ("proxy", "blocked_domains") => {
                     format_optional_path(resolved.blocked_domains.as_ref())
@@ -500,7 +508,6 @@ fn resolved_values(
                 ("proxy", "allowed_domains") => {
                     format_optional_path(resolved.allowed_domains.as_ref())
                 }
-                ("proxy", "default_allowlist") => resolved.default_allowlist.to_string(),
                 ("proxy", "log_file") => format_optional_path(resolved.proxy_log_file.as_ref()),
                 ("proxy", "log_level") => resolved.proxy_log_level.as_str().to_string(),
                 ("proxy", "timeout") => resolved.proxy_timeout.as_secs().to_string(),
@@ -519,47 +526,16 @@ fn resolved_values(
                 ("sandbox", "preset") => resolved
                     .preset
                     .map_or_else(|| "standard".to_string(), |preset| preset.to_string()),
-                ("sandbox", "validate") => (!resolved.no_validate).to_string(),
-                ("sandbox", "allow_env_files") => resolved.allow_env_files.to_string(),
-                ("sandbox", "allow_localhost_any") => resolved.allow_localhost_any.to_string(),
                 ("sandbox", "pass_env") => format_strings(&resolved.pass_env),
-                ("sandbox", "inherit_env") => resolved.inherit_env.to_string(),
-                ("sandbox", "allow_lifecycle_scripts") => {
-                    resolved.allow_lifecycle_scripts.to_string()
-                }
-                ("sandbox", "allow_gpg_signing") => resolved.allow_gpg_signing.to_string(),
-                ("sandbox", "allow_tmp_exec") => resolved.allow_tmp_exec.to_string(),
-                ("sandbox", "scratch_dir") => resolved.scratch_dir.to_string(),
-                ("sandbox", "audit") => resolved.audit.to_string(),
                 ("sandbox", "use_bubblewrap") => resolved
                     .use_bubblewrap
                     .map_or_else(|| "auto-detect".to_string(), |value| value.to_string()),
-                ("sandbox", "quiet") => resolved.quiet.to_string(),
-                ("sandbox", "yes") => resolved.yes.to_string(),
-                ("sandbox", "allow_jvm_attach") => resolved.allow_jvm_attach.to_string(),
-                ("sandbox", "allow_docker") => resolved.allow_docker.to_string(),
                 ("sandbox", "allow_cache_exec") => format_strings(&resolved.allow_cache_exec),
-                ("sandbox", "allow_cache_exec_any") => resolved.allow_cache_exec_any.to_string(),
-                ("sandbox", "allow_browser") => resolved.allow_browser.to_string(),
-                ("sandbox", "keychain_substitute") => resolved.keychain_substitute.to_string(),
                 ("sandbox", "gh_proxy") => resolved.gh_guard.enabled.to_string(),
                 ("sandbox", "git_push_prevention") => resolved.git_guard.enabled.to_string(),
-                ("gh_guard", "enabled") => resolved.gh_guard.enabled.to_string(),
                 ("gh_guard", "mode") => resolved.gh_guard.mode.to_string(),
-                ("gh_guard", "scope_check") => resolved.gh_guard.scope_check.to_string(),
-                ("gh_guard", "block_auth_token") => resolved.gh_guard.block_auth_token.to_string(),
-                ("gh_guard", "inject_token") => resolved.gh_guard.inject_token.to_string(),
                 ("gh_guard", "unknown_command") => resolved.gh_guard.unknown_command.to_string(),
-                ("gh_guard", "allow_api_write") => resolved.gh_guard.allow_api_write.to_string(),
-                ("git_guard", "enabled") => resolved.git_guard.enabled.to_string(),
                 ("git_guard", "mode") => resolved.git_guard.mode.to_string(),
-                ("git_guard", "prevent_push") => resolved.git_guard.prevent_push.to_string(),
-                ("git_guard", "prevent_force_push") => {
-                    resolved.git_guard.prevent_force_push.to_string()
-                }
-                ("git_guard", "protect_default_branch_only") => {
-                    resolved.git_guard.protect_default_branch_only.to_string()
-                }
                 _ => fallback(),
             };
             ((key.section, key.key), value)

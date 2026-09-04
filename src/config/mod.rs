@@ -29,8 +29,13 @@ pub use path::{
     CustomConfigVerdict, classify_custom_config, collapse_tilde, config_dir, config_path,
     default_config_contents, expand_tilde,
 };
-pub use registry::{ConfigKeyInfo, ConfigValueType, all_config_keys, lookup_key};
-pub use repo::{RepoKeyTarget, repo_key_rejection_reason, repo_key_target, set_repo_value_in_doc};
+pub use registry::{
+    BoolKeyRow, ConfigKeyInfo, ConfigValueType, all_config_keys, bool_key, lookup_key,
+};
+pub use repo::{
+    PROPOSE_BOOLS, ProposeBoolRow, RepoKeyTarget, repo_key_rejection_reason, repo_key_target,
+    set_repo_value_in_doc,
+};
 pub use types::{
     AllowConfig, AuditConfig, BlocklistSource, CliFlags, Config, DenyConfig, EnforcementMode,
     FeatureToggle, GhGuardConfig, GhGuardPolicy, GitGuardConfig, GitGuardPolicy, GitPushRule,

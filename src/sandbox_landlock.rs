@@ -809,9 +809,18 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     {
         net_rules.push(NetRule { port });
     }
-    for &port in config.extra_ports {
-        if !net_rules.iter().any(|r| r.port == port) {
-            net_rules.push(NetRule { port });
+    // `extra_ports` (#297) is dropped under proxy-forced for the same reason the
+    // 443 seed is: a port rule here is a direct kernel egress path to any remote
+    // host on that port, outside the proxy and so outside its domain filtering
+    // and its log. Keeping it would widen the documented `evil.com:<proxy_port>`
+    // residual to a port the user has already announced. The proxy still allows
+    // CONNECT tunnels on these ports, so proxy-aware tools keep working; only
+    // raw TCP loses the path. `main.rs` warns when the two are combined.
+    if !config.proxy_forced {
+        for &port in config.extra_ports {
+            if !net_rules.iter().any(|r| r.port == port) {
+                net_rules.push(NetRule { port });
+            }
         }
     }
     for &port in config.localhost_ports {
@@ -2833,6 +2842,38 @@ mod tests {
 
         assert!(policy.net_rules.iter().any(|r| r.port == 443));
         assert!(policy.net_rules.iter().any(|r| r.port == 8443));
+    }
+
+    #[test]
+    fn extra_ports_dropped_under_proxy_forced() {
+        // #297: a Landlock port rule is a direct egress path to any remote host
+        // on that port, outside the proxy's log and domain filtering. Under
+        // proxy_forced the allowed set must be the proxy port alone. Same config
+        // both ways, so only the gate can make this pass.
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let ports = vec![9999];
+        let mut config = test_config(&project, &home);
+        config.extra_ports = &ports;
+
+        let default_mode = generate_policy(&config);
+        assert!(
+            default_mode.net_rules.iter().any(|r| r.port == 9999),
+            "default mode must still honour --allow-port"
+        );
+
+        config.proxy_forced = true;
+        config.proxy_port = Some(8080);
+        let forced = generate_policy(&config);
+        assert!(
+            !forced.net_rules.iter().any(|r| r.port == 9999),
+            "proxy_forced must not open an extra port at the kernel level"
+        );
+        assert_eq!(
+            forced.net_rules.iter().map(|r| r.port).collect::<Vec<_>>(),
+            vec![8080],
+            "proxy_forced allows the proxy port and nothing else"
+        );
     }
 
     #[test]
