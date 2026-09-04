@@ -86,7 +86,7 @@ cplt assumes the sandboxed agent is **untrusted**, because it executes arbitrary
 | **Org/user data enumeration** | `gh api /orgs/.../audit-log` leaks PII | gh guard restricts API to `/repos/{current-repo}/...` endpoints only |
 | **DNS rebinding SSRF** | Domain resolves to `127.0.0.1` after check | Post-DNS-resolution IP validation; `--allow-private-domain` opt-in bypass for explicitly trusted internal domains |
 | **Sandbox profile injection** | Path with `\n(allow file-read* (subpath "/"))` | SBPL path character validation (macOS) |
-| **Temp file symlink attack** | Symlink at predictable `/tmp/cplt.sb` | Unique filename plus `O_CREAT\|O_EXCL` |
+| **Cross-session profile replacement** | Overwrite another session's SBPL profile in the shared temp dir before the kernel reads it | The profile is passed to `sandbox-exec -p` as an argument; it is never written to disk, so there is no file to swap |
 | **Write-then-exec in /tmp** | Drop binary in `/tmp`, execute it | Seatbelt deny (macOS) / Landlock deny (Linux); `--scratch-dir` provides a safe alternative |
 | **Cloud metadata access** | Fetch `169.254.169.254` or CGNAT range | Private IP blocklist covering all reserved ranges |
 | **Cross-project access** | Read files outside project directory | Seatbelt subpath (macOS) / Landlock ruleset (Linux) |
@@ -1186,7 +1186,7 @@ The GitHub Actions workflow runs in two stages:
 
 ### Secure temporary files
 
-- [CWE-377: Insecure Temporary File](https://cwe.mitre.org/data/definitions/377.html). Motivation for unique filenames and `O_CREAT|O_EXCL`.
+- [CWE-377: Insecure Temporary File](https://cwe.mitre.org/data/definitions/377.html). Why the SBPL profile is never written to a temp file at all, and why the files that do live in the scratch dir use `O_CREAT|O_EXCL` with mode `0600`.
 - [CWE-59: Improper Link Resolution Before File Access](https://cwe.mitre.org/data/definitions/59.html). Symlink attacks on predictable temp paths.
 
 ### AI agent sandboxing (broader context)

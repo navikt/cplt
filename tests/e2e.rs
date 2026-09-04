@@ -5138,13 +5138,14 @@ paths = [
         require_sandbox!();
 
         let project = project_dir();
-        let canary = project.join(".cplt-e2e-profile-swap-canary");
-        std::fs::write(&canary, "canary").expect("write canary");
-
+        // Canary and fake agent both live in the TempDir, so an early panic
+        // cannot leave either behind in the checkout.
         let fake_dir = tempfile::Builder::new()
             .prefix(".cplt-e2e-fake-copilot-")
             .tempdir_in(&project)
             .expect("create fake copilot dir");
+        let canary = fake_dir.path().join("canary");
+        std::fs::write(&canary, "canary").expect("write canary");
         let script = fake_dir.path().join("copilot");
         std::fs::write(
             &script,
@@ -5171,6 +5172,13 @@ paths = [
             std::thread::spawn(move || {
                 let temp = std::env::temp_dir();
                 while !stop.load(Ordering::Relaxed) {
+                    // A scan every millisecond, not a spin: `read_dir` over the
+                    // whole system temp dir pinned a core for the length of the
+                    // test and starved the other tests sharing the binary. The
+                    // window a real attacker gets is the whole gap between our
+                    // write and the kernel's read, so 1ms costs the attack
+                    // nothing — it still lands 15/15 against the old code.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                     let Ok(entries) = std::fs::read_dir(&temp) else {
                         continue;
                     };
@@ -5219,7 +5227,6 @@ paths = [
 
         stop.store(true, Ordering::Relaxed);
         attacker.join().expect("attacker thread");
-        let _ = std::fs::remove_file(&canary);
 
         assert_eq!(
             allowed,

@@ -659,6 +659,25 @@ fn forward_and_wait(mut child: std::process::Child) -> u8 {
     }
 }
 
+/// Why a sandboxed process would not start.
+///
+/// `E2BIG` gets its own sentence on macOS: the SBPL profile travels in the
+/// argument list (`sandbox-exec -p`), so an unusually large grant set is the
+/// one configuration that can exceed `kern.argmax` — and `preflight` is
+/// skippable with `--no-validate`, which makes this the only place some users
+/// will see the reason.
+fn spawn_error_message(e: &std::io::Error) -> String {
+    #[cfg(target_os = "macos")]
+    if e.raw_os_error() == Some(libc::E2BIG) {
+        return format!(
+            "Failed to start sandboxed process: {e}. The SBPL profile is passed to \
+             sandbox-exec as an argument, and it must fit in kern.argmax (1 MiB) \
+             alongside the environment. Reduce the number of allow/deny grants."
+        );
+    }
+    format!("Failed to start sandboxed process: {e}")
+}
+
 /// Spawn a sandboxed command, forward signals, and wait for exit.
 ///
 /// Handles SIGTTOU/SIGTTIN suppression (Node.js terminal raw mode),
@@ -669,7 +688,7 @@ fn spawn_and_wait(cmd: &mut Command) -> u8 {
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            ui::error(&format!("Failed to start sandboxed process: {e}"));
+            ui::error(&spawn_error_message(&e));
             restore_terminal_stop_signals();
             return 1;
         }
@@ -1330,5 +1349,36 @@ mod keychain_substitute_tests {
             let set: Vec<_> = cmd.get_envs().collect();
             assert_eq!(set, vec![("FOO".as_ref(), None)]);
         });
+    }
+}
+
+#[cfg(test)]
+mod spawn_error_tests {
+    use super::*;
+
+    /// `preflight` is skippable (`--no-validate`), so this is the only message
+    /// some users get when a large grant set overflows the argument list. It
+    /// has to say what to do about it, not just "argument list too long".
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn oversized_profile_spawn_failure_says_what_to_shrink() {
+        let msg = spawn_error_message(&std::io::Error::from_raw_os_error(libc::E2BIG));
+        assert!(
+            msg.contains("kern.argmax") && msg.contains("allow/deny grants"),
+            "E2BIG must be explained in terms of the profile, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn other_spawn_failures_are_reported_verbatim() {
+        let msg = spawn_error_message(&std::io::Error::from_raw_os_error(libc::ENOENT));
+        assert!(
+            !msg.contains("kern.argmax"),
+            "unexpected profile advice: {msg}"
+        );
+        assert!(
+            msg.starts_with("Failed to start sandboxed process:"),
+            "{msg}"
+        );
     }
 }
