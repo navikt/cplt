@@ -930,7 +930,7 @@ impl Resolved {
         }
         if self.allow_browser {
             eprintln!(
-                "{blue}[cplt]{nc}    Browser:       {yellow}allowed{nc}     {dim}OAuth flows via open (--allow-browser){nc}"
+                "{blue}[cplt]{nc}    Browser:       {yellow}allowed{nc}     {dim}launches any app outside the sandbox (--allow-browser){nc}"
             );
         }
         if agent.needs_copilot_dir() {

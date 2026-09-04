@@ -384,9 +384,9 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         section: "sandbox",
         key: "allow_browser",
         value_type: ConfigValueType::Bool,
-        dangerous: false,
+        dangerous: true,
         default_display: "false",
-        description: "Allow the agent to open URLs in your default browser (needed for OAuth code flows).",
+        description: "⚠️  DANGEROUS: Launch Services grant for OAuth code flows. Lets the agent launch ANY application outside the sandbox, via launchd. Cannot be scoped.",
     },
     ConfigKeyInfo {
         section: "sandbox",

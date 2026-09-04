@@ -629,8 +629,13 @@ pub struct SandboxConfig {
     /// Allow process execution from ALL ~/Library/Caches subdirectories (default: false).
     /// DANGEROUS: much broader than allow_cache_exec — prefer specific subdirs.
     pub allow_cache_exec_any: Option<bool>,
-    /// Allow Launch Services (`open` command) for OAuth browser flows (default: false).
-    /// Lets the sandboxed agent open URLs in your default browser.
+    /// Let the sandboxed agent launch ANY application outside the sandbox
+    /// (default: false).
+    ///
+    /// Granted for OAuth code flows, but Launch Services starts the target
+    /// through launchd, outside the Seatbelt profile. Cannot be scoped: SBPL's
+    /// `lsopen` takes no filter, and LSOpenCFURLRef() reaches it without the
+    /// `open` binary (#251).
     pub allow_browser: Option<bool>,
     /// EXPERIMENTAL (default: false). Drop the macOS Keychain grant for runs
     /// where the agent has a credential it can reach without it (#242).

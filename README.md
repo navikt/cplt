@@ -437,7 +437,7 @@ What passes through:
 | `--allow-tmp-exec` | ⚠️ Dangerous. Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer the scratch dir |
 | `--allow-cache-exec <SUBDIR>` | Allow exec from one `~/Library/Caches/<SUBDIR>`. Repeatable. For tools that cache compiled binaries there, such as Playwright and pnpm dlx |
 | `--allow-cache-exec-any` | ⚠️ Dangerous. Allow exec from all of `~/Library/Caches`. Prefer `--allow-cache-exec <SUBDIR>` |
-| `--allow-browser` | ⚠️ Dangerous. Emits an unscoped `(allow lsopen)`, which lets the agent hand any file or URL to Launch Services. launchd starts the target **outside** the Seatbelt profile, so `open -a Terminal /tmp/x.sh` is an immediate sandbox escape, not just browser-session access. Only turn it on when a sign-in prompt actually appears (MCP server OAuth, re-auth), then turn it back off. Off by default |
+| `--allow-browser` | ⚠️ Dangerous. **With this on, the agent can launch any application on your machine outside the sandbox.** The grant is Launch Services, not a browser: launchd starts the target **outside** the Seatbelt profile, so `open -a Terminal /tmp/x.sh` runs unsandboxed. This **cannot be scoped to URLs** — SBPL's `lsopen` takes no filter, and the grant is reachable through `LSOpenCFURLRef()` without the `open` binary at all, so no wrapper can narrow it ([#251](https://github.com/navikt/cplt/issues/251), and [docs/security.md](docs/security.md#--allow-browser-is-a-sandbox-escape-and-cannot-be-scoped)). Only turn it on while a sign-in prompt is actually on screen (MCP server OAuth, re-auth), then turn it back off. Off by default |
 | `--deny-clipboard` | Block the agent from reading or writing the macOS clipboard (`pbpaste`/`pbcopy`) by denying the `com.apple.pasteboard` Mach service. Every other Mach service (Keychain, DNS, Security framework) is unaffected |
 | `--use-bubblewrap` | Linux only. Require the bubblewrap namespace layer (PID, mount, IPC, UTS, cgroup, user namespaces plus a private `/tmp`) on top of Landlock and seccomp. Errors out if `bwrap` is missing. Auto-detected when neither flag is given |
 | `--no-bubblewrap` | Linux only. Never use bubblewrap, even when installed. Falls back to Landlock and seccomp. Use it when bwrap breaks a specific tool |
@@ -523,7 +523,7 @@ Pick one with `--agent <name>`, or make it the default with `cplt config set san
 - **Pi and Claude Code are never auto-detected.** `pi` is a generic binary name that could collide with something else on your machine, and Claude Code has to be chosen on purpose.
 - **Third-party API keys are opt-in.** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and the Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`) never pass through unless you name them with `--pass-env`.
 - **Subscription auth needs no env var.** OpenCode's `/connect` device flow stores its token in `~/.local/share/opencode/auth.json`, and Claude Code's OAuth token lives in `~/.claude` (`.credentials.json` on Linux) or the macOS Keychain. Both are reachable inside the sandbox, so cplt does not nag about a missing API key for either.
-- **OAuth browser flows need `--allow-browser`** when a sign-in prompt appears. That covers Antigravity.
+- **OAuth browser flows need `--allow-browser`** when a sign-in prompt appears. That covers Antigravity; every other agent here uses a device flow that prints a code and a URL and needs no browser. The flag lets the agent launch any application outside the sandbox and cannot be narrowed to URLs, so turn it on for the sign-in and off again — see the [flag table](#sandbox-toggles) and [docs/security.md](docs/security.md#--allow-browser-is-a-sandbox-escape-and-cannot-be-scoped).
 - **Claude Code auto-update is disabled** with `DISABLE_AUTOUPDATER=1`. Claude Code has no `--no-auto-update` flag, self-updating inside the sandbox is a persistence vector, and it would fail against read-only install paths anyway.
 - **`CLAUDE_CONFIG_DIR` is honored.** When it is set, cplt grants that directory instead of `~/.claude` and passes the variable through, so a relocated config root keeps working.
 - OpenCode is [an officially supported Copilot client](https://github.blog/changelog/2026-01-16-github-copilot-now-supports-opencode/), so your existing Copilot subscription works with `/connect` inside OpenCode.
@@ -862,6 +862,7 @@ Every impact, with the per-tool tables, JVM and Kotlin daemon notes, GPG trouble
 
 - `sandbox-exec` is deprecated. Apple has not removed it, but may in a future macOS version.
 - SBPL has no domain-based filtering. The optional CONNECT proxy provides domain blocking instead.
+- SBPL's `lsopen` has no filter either, so `--allow-browser` is all of Launch Services or none of it. With it on the agent can launch any application outside the sandbox, and no wrapper can narrow that — see [docs/security.md](docs/security.md#--allow-browser-is-a-sandbox-escape-and-cannot-be-scoped).
 
 ### Linux
 

@@ -436,10 +436,24 @@ grants exec to every binary cached by any application. Prefer
     )]
     allow_cache_exec_any: bool,
 
-    /// Allow the agent to open URLs in your default browser.
+    /// Let the agent launch ANY application outside the sandbox (DANGEROUS).
     /// Needed for OAuth code flows (MCP servers, Antigravity, gh auth login).
-    /// Disabled by default because it lets the agent use your browser session.
-    #[arg(long)]
+    #[arg(
+        long,
+        long_help = "\
+Let the agent launch ANY application outside the sandbox (DANGEROUS).
+
+Needed for OAuth code flows (MCP servers, Antigravity, gh auth login), but what
+it grants is Launch Services, not a browser. Launch Services starts the target
+through launchd, outside the Seatbelt profile, so with this flag on the agent
+can run any application on the machine with no sandbox at all. `open -a Terminal
+script.sh` is the one-line version.
+
+This cannot be narrowed. SBPL's `lsopen` operation takes no filter, and the
+grant does not depend on the `open` binary: a program that calls
+LSOpenCFURLRef() reaches it directly. Turn it on only while a sign-in prompt is
+actually on screen, then turn it back off."
+    )]
     allow_browser: bool,
 
     /// Enable a per-session scratch directory for TMPDIR redirect (default).
