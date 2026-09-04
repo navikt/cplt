@@ -23,7 +23,7 @@
 use std::process::Command;
 
 mod common;
-use common::{binary_in_path, cplt_cmd, temp_repo};
+use common::{assert_refused, binary_in_path, cplt_cmd, temp_repo};
 
 /// Run `cplt gh-gate` with default block policy.
 /// Returns (stdout, stderr, exit_success).
@@ -191,37 +191,32 @@ fn gh_gate_allows_api_get() {
 #[test]
 fn gh_gate_blocks_repo_delete() {
     let (_, stderr, ok) = gh_gate(&["repo", "delete", "navikt/cplt"]);
-    assert!(!ok, "gh repo delete should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should show BLOCKED: {stderr}");
+    assert_refused(&stderr, ok, "deletes entire repository");
 }
 
 #[test]
 fn gh_gate_blocks_repo_edit() {
     let (_, stderr, ok) = gh_gate(&["repo", "edit", "--visibility", "private"]);
-    assert!(!ok, "gh repo edit should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should show BLOCKED: {stderr}");
+    assert_refused(&stderr, ok, "modifies repo settings");
 }
 
 #[test]
 fn gh_gate_blocks_repo_archive() {
     let (_, stderr, ok) = gh_gate(&["repo", "archive"]);
-    assert!(!ok, "gh repo archive should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should show BLOCKED: {stderr}");
+    assert_refused(&stderr, ok, "irreversible state change");
 }
 
 #[test]
 fn gh_gate_blocks_repo_fork() {
     let (_, stderr, ok) = gh_gate(&["repo", "fork"]);
-    assert!(!ok, "gh repo fork should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should show BLOCKED: {stderr}");
+    assert_refused(&stderr, ok, "creates new repo");
 }
 
 // pr merge is always blocked (human decision), pr close is ScopeCheck
 #[test]
 fn gh_gate_blocks_pr_merge_always() {
     let (_, stderr, ok) = gh_gate(&["pr", "merge", "42"]);
-    assert!(!ok, "gh pr merge should ALWAYS be blocked (human decision)");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "merging is a human decision");
 }
 
 #[test]
@@ -233,8 +228,9 @@ fn gh_gate_allows_pr_close_in_scope() {
 #[test]
 fn gh_gate_blocks_pr_merge_cross_repo() {
     let (_, stderr, ok) = gh_gate(&["pr", "merge", "42", "-R", "evil-org/other"]);
-    assert!(!ok, "gh pr merge cross-repo should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    // `pr merge` is Decision::Block outright, so the refusal is the merge
+    // policy, not the scope check — pin that rather than implying otherwise.
+    assert_refused(&stderr, ok, "merging is a human decision");
 }
 
 #[test]
@@ -246,8 +242,7 @@ fn gh_gate_allows_issue_close_in_scope() {
 #[test]
 fn gh_gate_blocks_issue_close_cross_repo() {
     let (_, stderr, ok) = gh_gate(&["issue", "close", "99", "-R", "evil-org/other"]);
-    assert!(!ok, "gh issue close cross-repo should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "outside the startup repo");
 }
 
 // ============================================================
@@ -257,18 +252,17 @@ fn gh_gate_blocks_issue_close_cross_repo() {
 #[test]
 fn gh_gate_blocks_auth_token() {
     let (_, stderr, ok) = gh_gate(&["auth", "token"]);
-    assert!(!ok, "gh auth token should be blocked");
-    assert!(
-        stderr.contains("BLOCKED"),
-        "should mention blocked: {stderr}"
-    );
+    // block_auth_token routes `gh auth token` to the cached-token file rather
+    // than the real gh; with no cached token the refusal is this one. Turning
+    // the policy off execs the real gh instead, which the sibling
+    // `gh_gate_auth_token_allowed_when_disabled` pins.
+    assert_refused(&stderr, ok, "No cached token available");
 }
 
 #[test]
 fn gh_gate_blocks_auth_token_with_hostname() {
     let (_, stderr, ok) = gh_gate(&["auth", "token", "--hostname", "github.com"]);
-    assert!(!ok, "gh auth token with hostname should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "No cached token available");
 }
 
 #[test]
@@ -293,8 +287,7 @@ fn gh_gate_auth_token_allowed_when_disabled() {
 #[test]
 fn gh_gate_blocks_unknown_command() {
     let (_, stderr, ok) = gh_gate(&["totally-new-command", "arg1"]);
-    assert!(!ok, "unknown gh commands should be blocked by default");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "not recognized by the policy table");
 }
 
 #[test]
@@ -317,18 +310,13 @@ fn gh_gate_allows_pr_list_cross_repo() {
 #[test]
 fn gh_gate_blocks_cross_repo_pr_close() {
     let (_, stderr, ok) = gh_gate(&["pr", "close", "42", "-R", "evil-org/other-repo"]);
-    assert!(
-        !ok,
-        "cross-repo gh pr close should be blocked by scope check"
-    );
-    assert!(stderr.contains("BLOCKED"), "should mention scope: {stderr}");
+    assert_refused(&stderr, ok, "outside the startup repo");
 }
 
 #[test]
 fn gh_gate_blocks_cross_repo_pr_merge() {
     let (_, stderr, ok) = gh_gate(&["pr", "merge", "42", "--repo", "evil-org/other-repo"]);
-    assert!(!ok, "cross-repo pr merge should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "merging is a human decision");
 }
 
 #[test]
@@ -760,25 +748,19 @@ fn gh_gate_blocks_conflicting_hostname_flag() {
         "evil.example",
         "/repos/navikt/cplt/pulls",
     ]);
-    assert!(!ok, "conflicting GitHub host must be blocked");
-    assert!(stderr.contains("outside the approved host"), "{stderr}");
+    assert_refused(&stderr, ok, "outside the approved host");
 }
 
 #[test]
 fn gh_gate_blocks_conflicting_hostname_for_allow_command() {
     let (_, stderr, ok) = gh_gate(&["--hostname", "evil.example", "repo", "view"]);
-    assert!(!ok, "allow command must not retarget the GitHub host");
-    assert!(stderr.contains("outside the approved host"), "{stderr}");
+    assert_refused(&stderr, ok, "outside the approved host");
 }
 
 #[test]
 fn gh_gate_blocks_fully_qualified_external_api_endpoint() {
     let (_, stderr, ok) = gh_gate(&["api", "https://evil.example/repos/navikt/cplt"]);
-    assert!(!ok, "external fully qualified API endpoint must be blocked");
-    assert!(
-        stderr.contains("outside 'https://api.github.com'"),
-        "{stderr}"
-    );
+    assert_refused(&stderr, ok, "outside 'https://api.github.com'");
 }
 
 #[test]
@@ -803,10 +785,7 @@ fn gh_gate_scope_check_disabled() {
 fn gh_gate_blocks_cross_repo_api_endpoint() {
     // API GET to a different repo's endpoint — scope check blocks it
     let (_, stderr, ok) = gh_gate(&["api", "/repos/evil-org/other-repo/pulls"]);
-    assert!(
-        !ok,
-        "cross-repo API GET via URL path should be blocked: stderr={stderr}"
-    );
+    assert_refused(&stderr, ok, "outside the startup repo");
 }
 
 #[test]
@@ -877,11 +856,7 @@ fn gh_gate_allows_global_command_from_unverifiable_cwd() {
 fn gh_gate_blocks_non_repo_api_endpoint() {
     // Endpoints like /user, /orgs don't target the current repo — blocked for security
     let (_, stderr, ok) = gh_gate(&["api", "/user"]);
-    assert!(!ok, "non-repo API endpoints should be blocked");
-    assert!(
-        stderr.contains("BLOCKED") || stderr.contains("blocked"),
-        "should indicate blocked: {stderr}"
-    );
+    assert_refused(&stderr, ok, "outside the startup repo");
 }
 
 // ============================================================
@@ -913,25 +888,29 @@ fn gh_gate_audit_mode_allows_blocked_command() {
 #[test]
 fn gh_gate_blocks_api_post_with_dash_x() {
     let (_, stderr, ok) = gh_gate(&["api", "-X", "POST", "/repos/navikt/cplt/issues"]);
-    assert!(!ok, "gh api POST should be blocked (mutating): {stderr}");
+    assert_refused(&stderr, ok, "gh api with non-GET method");
 }
 
 #[test]
 fn gh_gate_blocks_api_post_combined_flag() {
     let (_, stderr, ok) = gh_gate(&["api", "-XPOST", "/repos/navikt/cplt/issues"]);
-    assert!(!ok, "gh api -XPOST should be blocked (mutating): {stderr}");
+    assert_refused(&stderr, ok, "gh api with non-GET method");
 }
 
 #[test]
 fn gh_gate_blocks_api_delete() {
-    let (_, _, ok) = gh_gate(&["api", "-XDELETE", "/repos/navikt/cplt/issues/1"]);
-    assert!(!ok, "gh api DELETE should be blocked");
+    let (_, stderr, ok) = gh_gate(&["api", "-XDELETE", "/repos/navikt/cplt/issues/1"]);
+    assert_refused(&stderr, ok, "gh api DELETE is destructive");
 }
 
 #[test]
 fn gh_gate_blocks_api_with_input_flags() {
-    let (_, _, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "-f", "title=pwned"]);
-    assert!(!ok, "gh api with -f (implies POST) should be blocked");
+    let (_, stderr, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "-f", "title=pwned"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
+    );
 }
 
 // ============================================================
@@ -963,17 +942,14 @@ fn gh_gate_allow_api_write_permits_post_in_scope() {
 fn gh_gate_allow_api_write_still_blocks_graphql() {
     // GraphQL must remain blocked even with --allow-api-write — arbitrary mutations
     // cannot be statically scope-checked.
-    let (_, _, ok) = gh_gate_with_opts(&["api", "graphql"], &["--allow-api-write"]);
-    assert!(
-        !ok,
-        "gh api graphql must be blocked even with allow_api_write"
-    );
+    let (_, stderr, ok) = gh_gate_with_opts(&["api", "graphql"], &["--allow-api-write"]);
+    assert_refused(&stderr, ok, "arbitrary mutations");
 }
 
 #[test]
 fn gh_gate_allow_api_write_blocks_cross_repo_post() {
     // Scope check must still apply: POST to another repo is blocked.
-    let (_, _, ok) = gh_gate_with_opts(
+    let (_, stderr, ok) = gh_gate_with_opts(
         &[
             "api",
             "repos/evil-org/other-repo/issues",
@@ -984,16 +960,13 @@ fn gh_gate_allow_api_write_blocks_cross_repo_post() {
         ],
         &["--allow-api-write"],
     );
-    assert!(
-        !ok,
-        "gh api POST to a different repo must still be blocked by scope check"
-    );
+    assert_refused(&stderr, ok, "outside the startup repo");
 }
 
 #[test]
 fn gh_gate_default_still_blocks_api_post() {
     // Regression: default (no --allow-api-write) must still block writes.
-    let (_, _, ok) = gh_gate(&[
+    let (_, stderr, ok) = gh_gate(&[
         "api",
         "repos/navikt/cplt/pulls/comments/123/replies",
         "--method",
@@ -1001,9 +974,10 @@ fn gh_gate_default_still_blocks_api_post() {
         "--field",
         "body=test",
     ]);
-    assert!(
-        !ok,
-        "gh api POST must be blocked by default (no allow_api_write)"
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
     );
 }
 
@@ -1038,40 +1012,57 @@ fn gh_gate_allows_version_command() {
 #[test]
 fn gh_gate_blocks_field_equals_form() {
     // Agent tries: gh api /repos/x/y/issues --field=title=pwned
-    let (_, _, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "--field=title=pwned"]);
-    assert!(
-        !ok,
-        "--field=value form must be detected as write operation"
+    let (_, stderr, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "--field=title=pwned"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
     );
 }
 
 #[test]
 fn gh_gate_blocks_raw_field_equals_form() {
-    let (_, _, ok) = gh_gate(&[
+    let (_, stderr, ok) = gh_gate(&[
         "api",
         "/repos/navikt/cplt/issues",
         "--raw-field=body=hacked",
     ]);
-    assert!(!ok, "--raw-field=value form must be detected as write");
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
+    );
 }
 
 #[test]
 fn gh_gate_blocks_input_equals_form() {
-    let (_, _, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "--input=-"]);
-    assert!(!ok, "--input=- form must be detected as write");
+    let (_, stderr, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "--input=-"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
+    );
 }
 
 #[test]
 fn gh_gate_blocks_short_f_combined() {
     // Agent tries: gh api /repos/x/y/issues -ftitle=pwned
-    let (_, _, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "-ftitle=pwned"]);
-    assert!(!ok, "-f<value> combined form must be detected as write");
+    let (_, stderr, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "-ftitle=pwned"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
+    );
 }
 
 #[test]
 fn gh_gate_blocks_short_f_uppercase_combined() {
-    let (_, _, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "-Ftitle=pwned"]);
-    assert!(!ok, "-F<value> combined form must be detected as write");
+    let (_, stderr, ok) = gh_gate(&["api", "/repos/navikt/cplt/issues", "-Ftitle=pwned"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "gh api with input flags implies write operation",
+    );
 }
 
 // -- GraphQL bypass --
@@ -1080,42 +1071,37 @@ fn gh_gate_blocks_short_f_uppercase_combined() {
 fn gh_gate_blocks_graphql_endpoint() {
     // Agent tries: echo '{"query":"mutation{...}"}' | gh api graphql
     let (_, stderr, ok) = gh_gate(&["api", "graphql"]);
-    assert!(
-        !ok,
-        "gh api graphql must be blocked (arbitrary mutations via stdin)"
-    );
-    assert!(
-        stderr.contains("graphql"),
-        "should mention graphql: {stderr}"
-    );
+    // The old assertion only required "graphql" in stderr, which the echoed
+    // command line supplies for any refusal at all. Pin the reason instead.
+    assert_refused(&stderr, ok, "arbitrary mutations");
 }
 
 #[test]
 fn gh_gate_blocks_graphql_with_slash() {
-    let (_, _, ok) = gh_gate(&["api", "/graphql"]);
-    assert!(!ok, "gh api /graphql must be blocked");
+    let (_, stderr, ok) = gh_gate(&["api", "/graphql"]);
+    assert_refused(&stderr, ok, "arbitrary mutations");
 }
 
 #[test]
 fn gh_gate_blocks_graphql_trailing_slash() {
     // Trailing slash should not bypass the graphql block
-    let (_, _, ok) = gh_gate(&["api", "graphql/"]);
-    assert!(!ok, "gh api graphql/ must be blocked");
-    let (_, _, ok) = gh_gate(&["api", "/graphql/"]);
-    assert!(!ok, "gh api /graphql/ must be blocked");
+    let (_, stderr, ok) = gh_gate(&["api", "graphql/"]);
+    assert_refused(&stderr, ok, "arbitrary mutations");
+    let (_, stderr, ok) = gh_gate(&["api", "/graphql/"]);
+    assert_refused(&stderr, ok, "arbitrary mutations");
 }
 
 #[test]
 fn gh_gate_blocks_graphql_with_query_params() {
-    let (_, _, ok) = gh_gate(&["api", "graphql?foo=bar"]);
-    assert!(!ok, "gh api graphql?foo=bar must be blocked");
+    let (_, stderr, ok) = gh_gate(&["api", "graphql?foo=bar"]);
+    assert_refused(&stderr, ok, "arbitrary mutations");
 }
 
 #[test]
 fn gh_gate_blocks_graphql_with_method() {
     // Even explicit GET to graphql should be blocked (mutations can be sent as GET with query param)
-    let (_, _, ok) = gh_gate(&["api", "-XGET", "graphql"]);
-    assert!(!ok, "gh api GET graphql must still be blocked");
+    let (_, stderr, ok) = gh_gate(&["api", "-XGET", "graphql"]);
+    assert_refused(&stderr, ok, "arbitrary mutations");
 }
 
 // ============================================================
@@ -1205,29 +1191,25 @@ fn git_gate_allows_stash() {
 #[test]
 fn git_gate_blocks_push() {
     let (_, stderr, ok) = git_gate(&["push"], true, true);
-    assert!(!ok, "git push should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_blocks_push_with_remote() {
     let (_, stderr, ok) = git_gate(&["push", "origin", "main"], true, true);
-    assert!(!ok, "git push origin main should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_blocks_push_force() {
     let (_, stderr, ok) = git_gate(&["push", "--force", "origin", "main"], true, true);
-    assert!(!ok, "git push --force should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_blocks_send_pack() {
     let (_, stderr, ok) = git_gate(&["send-pack", "origin"], true, true);
-    assert!(!ok, "git send-pack should be blocked (push equivalent)");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 // ============================================================
@@ -1243,11 +1225,7 @@ fn git_gate_allows_push_when_not_prevented() {
 #[test]
 fn git_gate_blocks_force_push_when_prevented() {
     let (_, stderr, ok) = git_gate(&["push", "--force", "origin", "main"], false, true);
-    assert!(
-        !ok,
-        "git push --force should be blocked when prevent_force_push=true"
-    );
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "Force push prevention is enabled");
 }
 
 #[test]
@@ -1257,10 +1235,7 @@ fn git_gate_blocks_force_with_lease() {
         false,
         true,
     );
-    assert!(
-        !ok,
-        "git push --force-with-lease should be blocked: {stderr}"
-    );
+    assert_refused(&stderr, ok, "Force push prevention is enabled");
 }
 
 #[test]
@@ -1270,14 +1245,13 @@ fn git_gate_blocks_force_if_includes() {
         false,
         true,
     );
-    assert!(!ok, "git push --force-if-includes should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "Force push prevention is enabled");
 }
 
 #[test]
 fn git_gate_blocks_short_force_flag() {
     let (_, stderr, ok) = git_gate(&["push", "-f", "origin", "main"], false, true);
-    assert!(!ok, "git push -f should be blocked: {stderr}");
+    assert_refused(&stderr, ok, "Force push prevention is enabled");
 }
 
 #[test]
@@ -1313,20 +1287,20 @@ fn git_gate_audit_mode_allows_push() {
 
 #[test]
 fn git_gate_blocks_push_with_refspec() {
-    let (_, _, ok) = git_gate(&["push", "origin", "HEAD:refs/heads/main"], true, true);
-    assert!(!ok, "git push with refspec should still be blocked");
+    let (_, stderr, ok) = git_gate(&["push", "origin", "HEAD:refs/heads/main"], true, true);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_blocks_push_with_set_upstream() {
-    let (_, _, ok) = git_gate(&["push", "--set-upstream", "origin", "feature"], true, true);
-    assert!(!ok, "git push --set-upstream should still be blocked");
+    let (_, stderr, ok) = git_gate(&["push", "--set-upstream", "origin", "feature"], true, true);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_blocks_push_u_shorthand() {
-    let (_, _, ok) = git_gate(&["push", "-u", "origin", "feature"], true, true);
-    assert!(!ok, "git push -u should still be blocked");
+    let (_, stderr, ok) = git_gate(&["push", "-u", "origin", "feature"], true, true);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 // -- Force-push =value form bypass --
@@ -1339,23 +1313,17 @@ fn git_gate_blocks_force_with_lease_equals_ref() {
         false,
         true,
     );
-    assert!(
-        !ok,
-        "--force-with-lease=<ref> must be detected as force push: {stderr}"
-    );
+    assert_refused(&stderr, ok, "Force push prevention is enabled");
 }
 
 #[test]
 fn git_gate_blocks_force_if_includes_equals_ref() {
-    let (_, _, ok) = git_gate(
+    let (_, stderr, ok) = git_gate(
         &["push", "--force-if-includes=HEAD~3", "origin", "main"],
         false,
         true,
     );
-    assert!(
-        !ok,
-        "--force-if-includes=<ref> must be detected as force push"
-    );
+    assert_refused(&stderr, ok, "Force push prevention is enabled");
 }
 
 // ============================================================
@@ -1365,15 +1333,13 @@ fn git_gate_blocks_force_if_includes_equals_ref() {
 #[test]
 fn git_gate_protect_default_blocks_push_to_main() {
     let (_, stderr, ok) = git_gate_protect_default(&["push", "origin", "main"]);
-    assert!(!ok, "push to main should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_protect_default_blocks_push_to_master() {
     let (_, stderr, ok) = git_gate_protect_default(&["push", "origin", "master"]);
-    assert!(!ok, "push to master should be blocked");
-    assert!(stderr.contains("BLOCKED"), "should block: {stderr}");
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
@@ -1391,27 +1357,21 @@ fn git_gate_protect_default_allows_push_to_copilot_branch() {
 #[test]
 fn git_gate_protect_default_blocks_bare_push() {
     // Bare push can't verify branch (real-git=/usr/bin/true) → fail closed
-    let (_, _, ok) = git_gate_protect_default(&["push"]);
-    assert!(
-        !ok,
-        "bare git push should be blocked when branch can't be resolved"
-    );
+    let (_, stderr, ok) = git_gate_protect_default(&["push"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_protect_default_blocks_push_with_remote_only() {
     // `git push origin` — can't verify branch → fail closed
-    let (_, _, ok) = git_gate_protect_default(&["push", "origin"]);
-    assert!(
-        !ok,
-        "push with only remote should be blocked when branch can't be resolved"
-    );
+    let (_, stderr, ok) = git_gate_protect_default(&["push", "origin"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_protect_default_blocks_refspec_to_main() {
-    let (_, _, ok) = git_gate_protect_default(&["push", "origin", "HEAD:refs/heads/main"]);
-    assert!(!ok, "push with refspec targeting main should be blocked");
+    let (_, stderr, ok) = git_gate_protect_default(&["push", "origin", "HEAD:refs/heads/main"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
@@ -1423,8 +1383,8 @@ fn git_gate_protect_default_allows_refspec_to_feature() {
 
 #[test]
 fn git_gate_protect_default_blocks_origin_slash_main() {
-    let (_, _, ok) = git_gate_protect_default(&["push", "origin", "origin/main"]);
-    assert!(!ok, "push to origin/main should be blocked");
+    let (_, stderr, ok) = git_gate_protect_default(&["push", "origin", "origin/main"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 // ── Security hardening tests ────────────────────────────────────
@@ -1433,48 +1393,47 @@ fn git_gate_protect_default_blocks_origin_slash_main() {
 fn git_gate_blocks_alias_via_dash_c() {
     // `-c alias.p=push` must be caught to prevent bypass
     let (_, stderr, ok) = git_gate(&["-c", "alias.p=push", "p", "origin", "main"], true, true);
-    assert!(!ok, "git -c alias.p=push should be blocked: {stderr}");
+    assert_refused(&stderr, ok, "git alias definitions via -c are blocked");
 }
 
 #[test]
 fn git_gate_blocks_unknown_subcommand_when_push_prevented() {
     // Unknown subcommands blocked to prevent alias-based bypass
-    let (_, _, ok) = git_gate(
+    let (_, stderr, ok) = git_gate(
         &["subtree", "push", "--prefix=lib", "origin", "main"],
         true,
         true,
     );
-    assert!(!ok, "git subtree push should be blocked");
-    let (_, _, ok) = git_gate(&["random-extension"], true, true);
-    assert!(
-        !ok,
-        "unknown git subcommand should be blocked when push prevented"
-    );
+    assert_refused(&stderr, ok, "'subtree push' performs a remote write");
+    let (_, stderr, ok) = git_gate(&["random-extension"], true, true);
+    assert_refused(&stderr, ok, "only known git subcommands are allowed");
 }
 
 #[test]
 fn git_gate_protect_default_blocks_force_push_to_feature() {
     // Force push to feature branch must be blocked when prevent_force_push=true
-    let (_, _, ok) = git_gate_protect_default(&["push", "--force", "origin", "feature-branch"]);
-    assert!(!ok, "force push to feature branch should be blocked");
-    let (_, _, ok) = git_gate_protect_default(&["push", "-f", "origin", "my-feature"]);
-    assert!(!ok, "-f to feature branch should be blocked");
-    let (_, _, ok) = git_gate_protect_default(&["push", "--force-with-lease", "origin", "feature"]);
-    assert!(!ok, "--force-with-lease to feature should be blocked");
+    let (_, stderr, ok) =
+        git_gate_protect_default(&["push", "--force", "origin", "feature-branch"]);
+    assert_refused(&stderr, ok, "Force push prevention is enabled");
+    let (_, stderr, ok) = git_gate_protect_default(&["push", "-f", "origin", "my-feature"]);
+    assert_refused(&stderr, ok, "Force push prevention is enabled");
+    let (_, stderr, ok) =
+        git_gate_protect_default(&["push", "--force-with-lease", "origin", "feature"]);
+    assert_refused(&stderr, ok, "Force push prevention is enabled");
 }
 
 #[test]
 fn git_gate_protect_default_blocks_multi_refspec_with_main() {
     // `git push origin feature main` should be blocked (main is a default branch)
-    let (_, _, ok) = git_gate_protect_default(&["push", "origin", "feature", "main"]);
-    assert!(!ok, "multi-refspec including main should be blocked");
-    let (_, _, ok) = git_gate_protect_default(&[
+    let (_, stderr, ok) = git_gate_protect_default(&["push", "origin", "feature", "main"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
+    let (_, stderr, ok) = git_gate_protect_default(&[
         "push",
         "origin",
         "HEAD:refs/heads/feature",
         "HEAD:refs/heads/master",
     ]);
-    assert!(!ok, "multi-refspec including master should be blocked");
+    assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 // ============================================================

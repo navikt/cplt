@@ -1573,65 +1573,59 @@ print('CONNECTED')
         (port, handle)
     }
 
-    /// Full-stack proxy wiring test: --allow-localhost PORT sets NO_PROXY and opens
-    /// the Landlock TCP path so curl can reach the listener directly.
+    /// Full-stack proxy wiring test, both directions against one live listener:
+    /// `--allow-localhost PORT` sets NO_PROXY and opens the Landlock TCP path so
+    /// curl reaches the listener; without the flag the same request must fail.
     ///
     /// Data flow: curl → (NO_PROXY set) → direct TCP → Landlock allows PORT → listener
+    ///
+    /// The negative half used to bind an ephemeral port and *drop* the listener
+    /// before running curl, so it passed on ECONNREFUSED whether or not anything
+    /// was enforced (issue #126). Both halves now talk to a listener that is
+    /// really there, and the positive control lives in the same test: if the
+    /// deny half ever passed because the sandbox could not reach the port at
+    /// all, the allow half fails too and says so.
     ///
     /// This test would fail if:
     /// - allow_localhost_ports is not wired from CLI into sandbox_exec (NO_PROXY not set)
     /// - Landlock does not open the port when --allow-localhost is given
+    /// - loopback is reachable *without* --allow-localhost
     #[test]
-    fn proxy_allows_curl_to_localhost_with_allow_flag() {
+    fn proxy_localhost_reachable_only_with_allow_flag() {
         require_landlock!(4);
         require_curl!();
         let project = create_test_project();
         let (port, server_handle) = start_http_echo_server();
 
         let script = format!(
-            "curl --max-time 5 -s http://127.0.0.1:{port}/ && echo CURL_OK || echo CURL_FAIL"
+            "curl --max-time 5 -sf http://127.0.0.1:{port}/ && echo CURL_OK || echo CURL_FAIL"
         );
-        let (_, stdout, stderr) = run_sandboxed_with_flags(
+
+        // Negative: no --allow-localhost. The listener is up, so a pass here can
+        // only come from enforcement (Landlock TCP deny, or the proxy refusing
+        // to forward), never from "nothing was listening".
+        let (_, denied_stdout, denied_stderr) = run_sandboxed(project.path(), &script);
+        assert!(
+            denied_stdout.contains("CURL_FAIL"),
+            "without --allow-localhost, curl to a live 127.0.0.1:{port} must fail; \
+             stdout: {denied_stdout} stderr: {denied_stderr}"
+        );
+
+        // Positive control: same script, same live listener, flag added.
+        let (_, allowed_stdout, allowed_stderr) = run_sandboxed_with_flags(
             project.path(),
             &["--allow-localhost", &port.to_string()],
             &script,
         );
 
-        // Unblock the server if curl didn't connect
+        // Unblock the server if curl never connected.
         let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         server_handle.join().ok();
 
         assert!(
-            stdout.contains("CURL_OK"),
-            "--allow-localhost {port}: curl to 127.0.0.1:{port} must succeed; stdout: {stdout} stderr: {stderr}"
-        );
-    }
-
-    /// Negative case: without --allow-localhost, curl to localhost must be blocked.
-    /// Without the flag, NO_PROXY is not set → curl routes through the cplt proxy →
-    /// proxy returns 405 (plain HTTP) or the Landlock TCP deny fires first.
-    #[test]
-    fn proxy_blocks_curl_to_localhost_without_allow_flag() {
-        require_landlock!(4);
-        require_curl!();
-        let project = create_test_project();
-
-        // Use a high ephemeral port. There's nothing listening, but the test
-        // only needs to verify the connection attempt is blocked, not that a
-        // real server responds.
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener); // Close it — we don't want connections to succeed
-
-        let script = format!(
-            "curl --max-time 3 -sf http://127.0.0.1:{port}/ 2>&1 && echo CURL_OK || echo CURL_FAIL"
-        );
-        let (_, stdout, _) = run_sandboxed(project.path(), &script);
-
-        assert!(
-            stdout.contains("CURL_FAIL"),
-            "without --allow-localhost, curl to 127.0.0.1:{port} must fail; got: {stdout}"
+            allowed_stdout.contains("CURL_OK"),
+            "--allow-localhost {port}: curl to 127.0.0.1:{port} must succeed — without this \
+             control the deny above proves nothing; stdout: {allowed_stdout} stderr: {allowed_stderr}"
         );
     }
 
@@ -1895,13 +1889,22 @@ print('CONNECTED')
         require_bwrap!();
         let project = create_test_project();
 
+        // What PID 1 is on *this* host, whatever it is called. Keying on the
+        // literal "systemd" made this test pass on any runner whose init has
+        // another name — a container with tini, a non-systemd distro — while
+        // asserting nothing (issue #126).
+        let host_init = fs::read_to_string("/proc/1/comm")
+            .expect("host /proc/1/comm must be readable to have anything to compare against");
+        let host_init = host_init.trim();
+        assert!(!host_init.is_empty(), "host /proc/1/comm was empty");
+
         let (exit, stdout, _) =
             run_sandboxed_bwrap(project.path(), "cat /proc/1/comm 2>&1 || echo 'blocked'");
         assert_eq!(exit, 0);
         // PID 1 inside the namespace is bwrap/the helper, never the host init.
         assert!(
-            !stdout.contains("systemd") || stdout.contains("blocked"),
-            "Should not see host init in PID namespace: {stdout}"
+            stdout.contains("blocked") || stdout.trim() != host_init,
+            "PID 1 in the namespace must not be the host init ({host_init:?}): {stdout}"
         );
     }
 

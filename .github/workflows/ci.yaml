@@ -63,7 +63,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Run unit and lib tests
-        run: cargo test --test unit_tests --lib --verbose
+        # --no-fail-fast: cargo stops at the first *target* that fails, so a
+        # broken lib assertion hides every integration test behind it. Two
+        # mutation-testing rounds were scored against suites that never ran for
+        # exactly that reason (issue #126). Failures still fail the job.
+        run: cargo test --no-fail-fast --test unit_tests --lib --verbose
 
   # Integration tests need macOS for sandbox-exec
   integration-tests:
@@ -150,6 +154,10 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Run all tests (skips fail the job)
+        # --no-fail-fast: cargo stops at the first *target* that fails, so a
+        # broken lib assertion hides every integration test behind it. Two
+        # mutation-testing rounds were scored against suites that never ran for
+        # exactly that reason (issue #126). Failures still fail the job.
         # CPLT_TEST_REQUIRE_SANDBOX=1 makes require_sandbox! panic instead of skip,
         # so a missing/broken sandbox-exec (a Seatbelt regression on the runner)
         # turns this job red rather than silently passing while nothing is
@@ -163,7 +171,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --verbose -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          cargo test --no-fail-fast --verbose -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test-output.log"
 
       - name: Surface tests skipped for missing tooling
         if: always()
@@ -309,6 +317,10 @@ jobs:
           exit 1
 
       - name: Run all Linux tests (skips fail the job)
+        # --no-fail-fast: cargo stops at the first *target* that fails, so a
+        # broken lib assertion hides every integration test behind it. Two
+        # mutation-testing rounds were scored against suites that never ran for
+        # exactly that reason (issue #126). Failures still fail the job.
         # CPLT_TEST_REQUIRE_SANDBOX=1 makes require_landlock!/require_bwrap!/
         # require_curl! panic instead of skip, so a missing capability (e.g.
         # bubblewrap uninstalled — issue #113) turns this job red rather than
@@ -318,7 +330,7 @@ jobs:
         env:
           CPLT_TEST_REQUIRE_SANDBOX: "1"
           CPLT_TEST_PRIV_443: "1"
-        run: cargo test --verbose
+        run: cargo test --no-fail-fast --verbose
 
       - name: Stop 127.0.0.1:443 listener
         if: always()
