@@ -570,17 +570,70 @@ fn grants_over_trusted_paths(
     allow_write: &[PathBuf],
     extra: &[String],
 ) -> Vec<(PathBuf, Vec<String>)> {
+    let paths: Vec<String> = crate::git::TRUSTED_BIN_DIRS
+        .iter()
+        .map(|d| (*d).to_string())
+        .chain(extra.iter().cloned())
+        .collect();
+    grants_overlapping(allow_write, &paths)
+}
+
+/// The launch warning for an `allow.write` grant that shadows a tool directory
+/// cplt grants execute on (see [`Resolved::write_grants_over_exec_tool_dirs`]).
+///
+/// Built here rather than at the call site so the wording — including the one
+/// thing a format string gets wrong every time, pluralisation — is testable.
+pub fn exec_tool_dir_warning(granted: &Path, dirs: &[String]) -> String {
+    let list = dirs.join(", ");
+    // Two different overlaps, and the user can only act on the right one: a
+    // grant *inside* the tool dir and a grant that swallows it are the same
+    // shadowing seen from opposite ends.
+    let overlap = if dirs.iter().any(|d| granted.starts_with(d)) {
+        format!(
+            "allow.write grants {} — inside the executable tool directory {list}.",
+            granted.display()
+        )
+    } else {
+        let noun = if dirs.len() == 1 {
+            "directory"
+        } else {
+            "directories"
+        };
+        format!(
+            "allow.write grants {}, which contains the executable tool {noun} {list}.",
+            granted.display()
+        )
+    };
+    format!(
+        "{overlap}\n  \
+         cplt denies execute across an allow.write tree, because a tree that is both \
+         writable and executable lets an agent drop a binary and run it. On macOS that \
+         deny is enforced, so binaries under the tool directory will not run in this \
+         session. On Linux, Landlock cannot subtract a grant, so the tree stays \
+         writable AND executable instead — the hole this deny closes on macOS is left \
+         open there.\n  \
+         Narrow the write grant so it does not cover the tool directory, or use \
+         allow.exec on a tree that does not overlap it."
+    )
+}
+
+/// Which `allow.write` grants overlap one of `paths`, in either direction, as
+/// `(granted path, every path it overlaps)`.
+///
+/// Both directions count. A grant *inside* one of the paths and a grant on an
+/// ancestor of it are the same overlap seen from opposite ends, and the caller
+/// needs both — only the wording of the advice differs.
+fn grants_overlapping(allow_write: &[PathBuf], paths: &[String]) -> Vec<(PathBuf, Vec<String>)> {
     allow_write
         .iter()
         .filter_map(|granted| {
-            let mut hit: Vec<String> = crate::git::TRUSTED_BIN_DIRS
+            let mut hit: Vec<String> = paths
                 .iter()
-                .map(|d| (*d).to_string())
-                .chain(extra.iter().cloned())
                 .filter(|d| {
                     let dir = Path::new(d);
                     dir.starts_with(granted) || granted.starts_with(dir)
                 })
+                .cloned()
                 .collect();
             // A resolved binary usually lives under a bin dir, so one grant can
             // match both; report each path once. Sorted first because `dedup`
@@ -703,6 +756,43 @@ impl Resolved {
             })
             .collect();
         grants_over_trusted_paths(&self.allow_write, &resolved)
+    }
+
+    /// Write grants that overlap a tool directory cplt grants *execute* on, as
+    /// `(granted path, every exec tool dir it overlaps)`.
+    ///
+    /// Since #243 an `allow.write` tree is denied `process-exec` on macOS: a
+    /// tree that is both writable and executable is a binary-drop staging path,
+    /// and the deny is what stops a grant creating one. Nothing is dropped —
+    /// the write grant is honoured in full — but the tree *loses* an execute
+    /// right it had by default, and the two facts are invisible to each other.
+    /// Someone who grants write on `~/.rustup` and finds rustup no longer runs
+    /// has nothing pointing back here.
+    ///
+    /// So it is warned, not silent, and narrowly: only where a `process_exec`
+    /// tool directory is actually shadowed. Warning on every writable tree
+    /// would fire on the ordinary case and teach people to skip it.
+    ///
+    /// Best-effort by design, and existence-checked so an uninstalled tool
+    /// never produces advice about a directory that is not there. Tool homes
+    /// relocated by `CARGO_HOME` and friends are not resolved here — those
+    /// become `ToolRoot`s rather than `allow.write` grants (#152), so they
+    /// cannot be the grant this warning is about.
+    #[must_use]
+    pub fn write_grants_over_exec_tool_dirs(&self, home: &Path) -> Vec<(PathBuf, Vec<String>)> {
+        let dirs: Vec<String> = crate::sandbox::HOME_TOOL_DIRS
+            .iter()
+            .filter(|d| d.process_exec)
+            .map(|d| home.join(d.path))
+            .chain(
+                crate::sandbox::app_dirs()
+                    .iter()
+                    .flat_map(|a| a.process_exec_paths(home)),
+            )
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        grants_overlapping(&self.allow_write, &dirs)
     }
 
     /// Print comprehensive sandbox configuration summary to stderr.
@@ -1953,6 +2043,116 @@ validate = false
             3,
             "one row per grant, not per (grant, trusted dir) pair: {found:?}"
         );
+    }
+
+    /// #243 denies process-exec across an `allow.write` tree. The warning that
+    /// says so must fire where a tool directory actually loses execute, and
+    /// stay quiet otherwise — a warning on every writable tree is one people
+    /// learn to skip.
+    ///
+    /// Driven through a temp HOME so the result does not depend on which tools
+    /// this machine has installed.
+    #[test]
+    fn write_grant_shadowing_an_exec_tool_dir_is_reported() {
+        let home = std::env::temp_dir().join(format!(
+            "cplt-exec-warn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        // `.rustup` is process_exec, `.cache` is write-only. `.nvm` is
+        // process_exec but deliberately NOT created: an uninstalled tool must
+        // not produce advice about a directory that is not there.
+        std::fs::create_dir_all(home.join(".rustup")).expect("temp home");
+        std::fs::create_dir_all(home.join(".cache")).expect("temp home");
+
+        let mut r = Config::default()
+            .merge(CliFlags::default())
+            .expect("default config merges");
+        r.allow_write = vec![
+            home.clone(),        // ancestor: swallows .rustup
+            home.join(".cache"), // write-only tool dir: nothing lost
+            home.join(".nvm"),   // process_exec but absent
+            home.join("work"),   // ordinary grant
+        ];
+        let found = r.write_grants_over_exec_tool_dirs(&home);
+
+        let rustup = home.join(".rustup").to_string_lossy().into_owned();
+        assert!(
+            found
+                .iter()
+                .any(|(g, dirs)| *g == home && dirs.contains(&rustup)),
+            "a grant containing an exec tool dir must be reported and name it: {found:?}"
+        );
+        for quiet in [home.join(".cache"), home.join(".nvm"), home.join("work")] {
+            assert!(
+                !found.iter().any(|(g, _)| *g == quiet),
+                "{} must not warn — nothing executable is shadowed: {found:?}",
+                quiet.display()
+            );
+        }
+        assert_eq!(found.len(), 1, "one row per grant: {found:?}");
+
+        // The other direction of the overlap: a grant INSIDE an exec tool dir
+        // loses the same right.
+        r.allow_write = vec![home.join(".rustup/toolchains")];
+        let found = r.write_grants_over_exec_tool_dirs(&home);
+        assert_eq!(
+            found.len(),
+            1,
+            "a grant inside an exec tool dir must be reported too: {found:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The singular case is the one a `{plural}` format string gets wrong, and
+    /// #322 shipped `director{plural}` rendering as "director". This is a
+    /// warning whose whole job is to explain why a tool stopped working, so a
+    /// mangled word in it costs more than usual. Both counts asserted: a test
+    /// that only covers the plural is how the bug got here.
+    #[test]
+    fn exec_tool_dir_warning_pluralises_both_ways() {
+        let granted = PathBuf::from("/home/u");
+        let one = exec_tool_dir_warning(&granted, &["/home/u/.rustup".to_string()]);
+        assert!(
+            one.contains("contains the executable tool directory /home/u/.rustup."),
+            "one shadowed dir must read \"directory\": {one}"
+        );
+
+        let many = exec_tool_dir_warning(
+            &granted,
+            &["/home/u/.rustup".to_string(), "/home/u/.nvm".to_string()],
+        );
+        assert!(
+            many.contains(
+                "contains the executable tool directories /home/u/.rustup, /home/u/.nvm."
+            ),
+            "two shadowed dirs must read \"directories\" and name both: {many}"
+        );
+
+        // No half-word survives either rendering.
+        for w in [&one, &many] {
+            assert!(!w.contains("director "), "\"director\" is not a word: {w}");
+        }
+    }
+
+    /// A grant *inside* a tool dir is the same shadowing from the other end,
+    /// and gets the wording the user can act on — no pluralisation involved,
+    /// since the grant sits in exactly one tree.
+    #[test]
+    fn exec_tool_dir_warning_names_the_inside_case() {
+        let w = exec_tool_dir_warning(
+            &PathBuf::from("/home/u/.rustup/toolchains"),
+            &["/home/u/.rustup".to_string()],
+        );
+        assert!(
+            w.contains("inside the executable tool directory /home/u/.rustup."),
+            "a grant inside a tool dir must say so: {w}"
+        );
+        assert!(w.contains("allow.exec"), "the remedy must be named: {w}");
     }
 
     /// One grant, many overlaps, one warning: `/` contains every trusted

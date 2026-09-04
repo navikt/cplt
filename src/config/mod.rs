@@ -24,6 +24,7 @@ pub use editing::{
     write_document_atomically, write_repo_document_atomically,
 };
 pub use error::ConfigError;
+pub use loading::exec_tool_dir_warning;
 pub(crate) use path::lexically_normalized;
 pub use path::{
     CustomConfigVerdict, classify_custom_config, collapse_tilde, config_dir, config_path,

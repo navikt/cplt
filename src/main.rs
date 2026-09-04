@@ -1652,6 +1652,16 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         ));
     }
 
+    // #243 closed the write-then-exec hole by denying process-exec across an
+    // allow.write tree. Nothing is dropped — the write grant is honoured in
+    // full — but a tool directory swallowed by that grant loses the execute
+    // right it had by default, and the tool then fails with nothing pointing
+    // back at the grant. Narrow: only fires where a process-exec tool dir is
+    // actually shadowed, so the ordinary `allow.write` on a work tree is silent.
+    for (granted, dirs) in resolved.write_grants_over_exec_tool_dirs(&home_dir) {
+        ui::warn(&cplt::config::exec_tool_dir_warning(&granted, &dirs));
+    }
+
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         ui::warn(&format!(
