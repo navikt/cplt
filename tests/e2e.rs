@@ -4373,6 +4373,305 @@ paths = [
         );
     }
 
+    fn is_automatic_playwright_socket_dir(value: &str) -> bool {
+        value
+            .strip_prefix("/private/tmp/cplt-pw-")
+            .is_some_and(|suffix| {
+                suffix.len() == 32
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+    }
+
+    fn playwright_env_output(args: &[&str], ambient: Option<&str>) -> std::process::Output {
+        let mut command = cplt_cmd();
+        command
+            .arg("--no-validate")
+            .args(args)
+            .args(["exec", "--", "/usr/bin/env"])
+            .current_dir(project_dir());
+        if let Some(value) = ambient {
+            command.env("PWTEST_SOCKETS_DIR", value);
+        } else {
+            command.env_remove("PWTEST_SOCKETS_DIR");
+        }
+        command.output().expect("cplt exec should run")
+    }
+
+    #[test]
+    fn e2e_exec_playwright_socket_dir_for_exact_and_versioned_intent() {
+        require_sandbox!();
+        for cache_entry in ["ms-playwright", "ms-playwright/chromium-1243"] {
+            let output = playwright_env_output(
+                &["--allow-cache-exec", cache_entry],
+                Some("/ambient/playwright-sockets"),
+            );
+
+            assert!(
+                output.status.success(),
+                "Playwright child-env assertion should exit 0 for {cache_entry:?}.\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let sockets_dir = env_value(&stdout, "PWTEST_SOCKETS_DIR")
+                .expect("PWTEST_SOCKETS_DIR must be injected for Playwright");
+            assert!(
+                is_automatic_playwright_socket_dir(sockets_dir),
+                "automatic path must have the short fixed shape: {sockets_dir:?}"
+            );
+            assert!(
+                !std::path::Path::new(sockets_dir).exists(),
+                "RAII guard must remove the socket directory after the child exits"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_exec_playwright_socket_dir_absent_without_exact_intent() {
+        require_sandbox!();
+        for (label, args) in [
+            ("no opt-in", Vec::<&str>::new()),
+            (
+                "unrelated opt-in",
+                vec!["--allow-cache-exec", "some-other-tool"],
+            ),
+            (
+                "near-miss opt-in",
+                vec!["--allow-cache-exec", "ms-playwright-evil"],
+            ),
+            ("allow-cache-exec-any alone", vec!["--allow-cache-exec-any"]),
+        ] {
+            let output = playwright_env_output(&args, None);
+            assert!(
+                output.status.success(),
+                "{label} child-env assertion should exit 0.\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                env_value(&stdout, "PWTEST_SOCKETS_DIR").is_none(),
+                "{label} must not expose an automatic socket directory"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_exec_playwright_socket_dir_is_independent_of_scratch() {
+        require_sandbox!();
+        let output = playwright_env_output(
+            &["--allow-cache-exec", "ms-playwright", "--no-scratch-dir"],
+            None,
+        );
+        assert!(
+            output.status.success(),
+            "no-scratch child-env assertion should exit 0.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let sockets_dir = env_value(&stdout, "PWTEST_SOCKETS_DIR")
+            .expect("Playwright socket directory must not depend on scratch");
+        assert!(is_automatic_playwright_socket_dir(sockets_dir));
+        if let Some(tmpdir) = env_value(&stdout, "TMPDIR") {
+            assert_ne!(
+                sockets_dir, tmpdir,
+                "the automatic socket base must remain independent of ambient TMPDIR"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_exec_playwright_socket_dir_overrides_inherited_ambient_value() {
+        require_sandbox!();
+        let output = playwright_env_output(
+            &["--allow-cache-exec", "ms-playwright", "--inherit-env"],
+            Some("/ambient/playwright-sockets"),
+        );
+        assert!(
+            output.status.success(),
+            "inherit-env child-env assertion should exit 0.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let sockets_dir = env_value(&stdout, "PWTEST_SOCKETS_DIR")
+            .expect("automatic socket path must replace inherited ambient value");
+        assert!(is_automatic_playwright_socket_dir(sockets_dir));
+    }
+
+    #[test]
+    fn e2e_exec_playwright_explicit_pass_env_preserves_caller_without_grant() {
+        require_sandbox!();
+        let caller_path = "/caller/playwright-sockets";
+        let output = playwright_env_output(
+            &[
+                "--allow-cache-exec",
+                "ms-playwright",
+                "--pass-env",
+                "PWTEST_SOCKETS_DIR",
+            ],
+            Some(caller_path),
+        );
+        assert!(
+            output.status.success(),
+            "explicit pass-env child assertion should exit 0.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(env_value(&stdout, "PWTEST_SOCKETS_DIR"), Some(caller_path));
+
+        let profile = cplt_cmd()
+            .args([
+                "--allow-cache-exec",
+                "ms-playwright",
+                "--pass-env",
+                "PWTEST_SOCKETS_DIR",
+                "--print-profile",
+            ])
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt should print the explicit-override profile");
+        assert!(profile.status.success());
+        let profile = String::from_utf8_lossy(&profile.stdout);
+        assert!(
+            !profile.contains("Per-session Playwright control sockets")
+                && !profile.contains("/private/tmp/cplt-pw-"),
+            "caller-owned override must not receive an automatic socket grant"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_playwright_mcp_sandbox_is_disabled_only_for_exact_intent() {
+        require_sandbox!();
+
+        let opted_in = playwright_env_output(&["--allow-cache-exec", "ms-playwright"], None);
+        assert!(opted_in.status.success());
+        assert_eq!(
+            env_value(
+                &String::from_utf8_lossy(&opted_in.stdout),
+                "PLAYWRIGHT_MCP_SANDBOX"
+            ),
+            Some("false"),
+            "Chromium cannot nest its sandbox inside cplt's, so the opt-in must turn \
+             Playwright MCP's back off"
+        );
+
+        for (label, args) in [
+            ("no opt-in", Vec::<&str>::new()),
+            (
+                "unrelated opt-in",
+                vec!["--allow-cache-exec", "some-other-tool"],
+            ),
+            ("allow-cache-exec-any alone", vec!["--allow-cache-exec-any"]),
+        ] {
+            let output = playwright_env_output(&args, None);
+            assert!(output.status.success(), "{label} should run");
+            assert_eq!(
+                env_value(
+                    &String::from_utf8_lossy(&output.stdout),
+                    "PLAYWRIGHT_MCP_SANDBOX"
+                ),
+                None,
+                "{label} must not weaken a browser it was never asked to run"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_exec_playwright_mcp_sandbox_pass_env_returns_the_choice_to_the_caller() {
+        require_sandbox!();
+        let output = cplt_cmd()
+            .args([
+                "--no-validate",
+                "--allow-cache-exec",
+                "ms-playwright",
+                "--pass-env",
+                "PLAYWRIGHT_MCP_SANDBOX",
+                "exec",
+                "--",
+                "/usr/bin/env",
+            ])
+            .current_dir(project_dir())
+            .env("PLAYWRIGHT_MCP_SANDBOX", "true")
+            .output()
+            .expect("cplt exec should run");
+        assert!(output.status.success());
+        assert_eq!(
+            env_value(
+                &String::from_utf8_lossy(&output.stdout),
+                "PLAYWRIGHT_MCP_SANDBOX"
+            ),
+            Some("true"),
+            "an explicit pass-through must not be overwritten by cplt's default"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_playwright_pass_env_without_value_warns_about_the_missing_socket_dir() {
+        require_sandbox!();
+        let output = playwright_env_output(
+            &[
+                "--allow-cache-exec",
+                "ms-playwright",
+                "--pass-env",
+                "PWTEST_SOCKETS_DIR",
+            ],
+            None,
+        );
+        assert!(
+            output.status.success(),
+            "the child should still run.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            env_value(&stdout, "PWTEST_SOCKETS_DIR"),
+            None,
+            "an override with no value must not be replaced by the automatic path"
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("PWTEST_SOCKETS_DIR is passed through but has no value"),
+            "cplt must name the cause instead of leaving Playwright to fail on \
+             a too-long socket path.\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn e2e_exec_playwright_socket_dir_obeys_repo_deny_env_last() {
+        require_sandbox!();
+        let (repo, config_file) = make_trust_repo(
+            "playwright-deny-env",
+            "[deny]\nenv = [\"PWTEST_SOCKETS_DIR\"]\n",
+        );
+        let output = Command::new(binary_path())
+            .args([
+                "--no-validate",
+                "--allow-cache-exec",
+                "ms-playwright",
+                "exec",
+                "--",
+                "/usr/bin/env",
+            ])
+            .current_dir(&repo)
+            .env("CPLT_CONFIG", &config_file)
+            .env_remove("PWTEST_SOCKETS_DIR")
+            .output()
+            .expect("cplt exec should apply repo deny.env");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "deny.env child assertion should exit 0.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            env_value(&stdout, "PWTEST_SOCKETS_DIR").is_none(),
+            "repo deny.env must remove the automatic value after command setup"
+        );
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
     #[test]
     fn e2e_exec_no_command_errors() {
         let output = cplt_cmd()

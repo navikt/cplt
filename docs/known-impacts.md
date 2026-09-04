@@ -120,7 +120,7 @@ Some tools unpack and execute binaries straight out of `~/Library/Caches` (macOS
 
 | Tool | Cache path | Fix |
 |---|---|---|
-| Playwright (browsers) | `~/Library/Caches/ms-playwright/` · `~/.cache/ms-playwright/` | `--allow-cache-exec ms-playwright` |
+| Playwright Chromium | `~/Library/Caches/ms-playwright/` · `~/.cache/ms-playwright/` | Allow cache exec and disable Chromium's nested sandbox; see below |
 | pnpm dlx | `~/Library/Caches/pnpm/dlx/` · `~/.cache/pnpm/dlx/` | `--allow-cache-exec pnpm/dlx` |
 
 **Fix:**
@@ -134,12 +134,27 @@ Or for a single run: `cplt --allow-cache-exec ms-playwright --allow-cache-exec p
 
 `--allow-cache-exec-any` opens exec for the entire cache tree (`~/Library/Caches` on macOS, `~/.cache` on Linux). Last resort only.
 
-> **Playwright on Linux:** also run Chromium with its own sandbox disabled
-> (`chromiumSandbox: false`, or launch with `--no-sandbox`). cplt's seccomp filter
-> blocks the `unshare`/`setns` syscalls Chromium's nested namespace sandbox needs,
-> and cplt's Landlock + seccomp is the enforcing boundary, so the nested sandbox is
-> redundant. The cache-exec subdir is validated to be traversal-free before a
-> Landlock execute rule is granted.
+> **Playwright Chromium on macOS and Linux:** Chromium cannot run its own
+> nested sandbox in here. On macOS its helpers inherit cplt's profile and cannot
+> initialize a second Seatbelt sandbox (`forbidden-sandbox-reinit`). On Linux,
+> cplt's seccomp filter blocks the `unshare`/`setns` syscalls that sandbox
+> needs. cplt remains the enforcing kernel boundary on both platforms, but a
+> renderer compromised there receives the full cplt Playwright profile instead
+> of Chromium's narrower child profile. cplt still validates the cache-exec
+> subdir as traversal-free before Landlock grants execute access. See
+> [SECURITY.md](../SECURITY.md#out-of-scope).
+>
+> **Which setting applies where.** `playwright` the library already launches
+> Chromium with `--no-sandbox` unless you explicitly ask for `chromiumSandbox:
+> true`, so a plain `chromium.launch()` needs no change. `@playwright/mcp` is
+> the one that turns it back on: always on macOS, and on Linux for channels
+> other than `chromium` and `chrome-for-testing`. The `ms-playwright` opt-in
+> therefore sets `PLAYWRIGHT_MCP_SANDBOX=false` for the child, the same way cplt
+> turns off Gradle's nested sandbox. That keeps the workaround inside cplt
+> instead of in an MCP server configuration that editors also read on machines
+> without it. Override with `--pass-env PLAYWRIGHT_MCP_SANDBOX`. Any other
+> Chromium launcher still needs `--no-sandbox` of its own. Note that the MCP's
+> README documents an environment variable name the shipped code does not read.
 
 ## Localhost blocking
 
@@ -299,11 +314,12 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth token` provides credentials            |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked on macOS | SSH agent socket denied, use HTTPS. On Linux only `SSH_AUTH_SOCK` is withheld |
-| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
+| `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every `allow.write` grant, and to any repository nested under one. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
 | `git remote set-url`               | ❌ Blocked on macOS | Writes to `.git/config`, which stays writable on Linux |
 | `git submodule add`                | ❌ Blocked on macOS | `.gitmodules` is write-protected on macOS. Writable on Linux, same Landlock limit (supply chain vector) |
-| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project and in every `allow.write` grant, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, see [security.md](security.md) |
+| Creating git hooks                 | ❌ Blocked   | `.git/hooks/` is write-protected in the project, in every `allow.write` grant, and in any repository nested under one, hooks run unsandboxed. On Linux this needs the Bubblewrap layer, see [security.md](security.md) |
+| `git init` / `git clone`           | ❌ Blocked on macOS | Both write `.git/config` and `.git/hooks/`, which are protected anywhere under a writable root. Clone outside the sandbox, then point cplt at the result. Writable on Linux, same Landlock limit |
 | Signed commits/tags                | ❌ Disabled  | `commit.gpgsign` and `tag.gpgsign` overridden to `false` via env; use `--allow-gpg-signing` to enable |
 
 **Global git hooks:** if `core.hooksPath` is set in `~/.gitconfig`, cplt auto-detects the hooks directory and allows reading it so git operations succeed. Write access is explicitly denied, to stop persistence attacks. The hooks path must be under `$HOME` with at least 3 path components (`~/.config/git/hooks`, for instance) to keep the read grant from being overly broad.
@@ -681,22 +697,17 @@ Each agent's global config dir is mounted read/write, but the files in it that *
 
 | Agent | Denied | What breaks |
 | --- | --- | --- |
-| Gemini | `~/.gemini/settings.json`, `extensions/`, `policies/`, `hooks/` | ❌ **First login.** Gemini records the auth method it picked as `selectedAuthType` in `settings.json`, so signing in from inside cplt fails with `Failed to save settings: …`. cplt warns about this before launching — run `gemini` once outside cplt. Also blocks editing user-level hooks, extensions and policies from inside a session |
 | Pi | `~/.pi/agent/settings.json`, `extensions/`, `npm/`, `git/` | ⚠️ `pi install`, and every in-session setting that persists to `settings.json`: `/model` (Ctrl+S), `/thinking`, `/settings`. Do those outside cplt. Auth is unaffected — Pi uses provider API keys via `--pass-env` |
 | Claude Code | `~/.claude/settings.json`, `statusline.sh`, `plugins/` | ⚠️ Editing `settings.json` (including `hooks`) from inside a session. `commands/`, `agents/` and `skills/` stay writable. Auth is unaffected — the OAuth token is in the Keychain or `.credentials.json` |
 | Antigravity | `~/.gemini/config/hooks.json`, `config/mcp_config.json`, `antigravity-cli/bin/` | ⚠️ Editing hooks or MCP server config from inside a session. Auth is unaffected |
+| goose | the whole of `~/.config/goose` is read-only, not just named files | ⚠️ `/mode` and theme changes, the first-run telemetry prompt, and persisted "always allow" tool permissions do not survive a sandboxed session. Run `goose configure` outside cplt. Ordinary sessions are unaffected — goose does not rewrite `config.yaml` while running. Auth is unaffected: secrets come from the keyring or `--pass-env` |
 | Copilot, OpenCode | — | Nothing denied |
 
-**There is no flag that reopens these.** The denies are emitted at the very end of the profile, after every user `allow.write`, so even `--allow-write ~/.gemini/settings.json` does not override them. That is deliberate: before this, `allow.write = ["~/.gemini"]` silently reopened the whole set.
+**There is no flag that reopens these.** The denies are emitted at the very end of the profile, after every user `allow.write`, so even `--allow-write ~/.claude/settings.json` does not override them. That is deliberate: before this, `allow.write = ["~/.claude"]` silently reopened the whole set.
 
 **Linux is weaker than macOS here.** Landlock cannot deny a subpath inside an allowed directory, so the denies are carried by the bubblewrap read-only overlay. They hold only when `bwrap` is installed, and only for paths that **already exist** — bubblewrap cannot bind a missing source, so a `extensions/` directory that does not exist yet is unprotected until something creates it. Without bubblewrap the guard does not apply on Linux at all.
 
-**Fix (Gemini first login):**
-
-```bash
-gemini          # once, outside cplt — complete the sign-in
-cplt --agent gemini
-```
+goose is the exception to the table's opening sentence: its config dir is granted read-only outright rather than read/write with named denies. A `write_files` carve-out would not work — goose rewrites `config.yaml`, `permission.yaml` and `permissions/tool_permissions.json` by creating a temp file in the directory and renaming over the target, which needs directory write and would hand back the very vector the deny exists to close.
 
 ## AI agent telemetry
 

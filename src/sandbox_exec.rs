@@ -45,6 +45,38 @@ fn compute_mise_ignored_paths(project_dir: &Path, home: &Path) -> Vec<PathBuf> {
 
 // ── Shared command setup ──────────────────────────────────────
 
+/// Strip repo-config denied env vars, then forward the Keychain substitute.
+///
+/// Both steps live here so the ordering is local and cannot drift: the
+/// substitute is applied *after* the deny sweep, and it can never name a denied
+/// variable in the first place because `Agent::credential_outside_keychain`
+/// filters `deny_env` before returning one (#242).
+///
+/// The forwarded variable is deliberately NOT in `ENV_ALLOWLIST` — it reaches
+/// the agent only as part of this trade, so with `sandbox.keychain_substitute`
+/// off the child environment is exactly what it was before the key existed.
+fn apply_deny_env_and_credential(
+    cmd: &mut Command,
+    deny_env: &[String],
+    substitute: Option<&crate::agent::KeychainSubstitute>,
+) {
+    for var in deny_env {
+        cmd.env_remove(var);
+    }
+    if let Some(var) = substitute.and_then(crate::agent::KeychainSubstitute::env_var)
+        // `deny_env` wins here too, not only in `credential_outside_keychain`.
+        // That filter is what keeps a denied var from becoming a substitute in
+        // the first place, so today this is unreachable — but this function
+        // removes and then re-adds, and re-adding a var the repo denied is the
+        // one mistake its shape invites. The check costs nothing and does not
+        // depend on a caller two modules away staying correct.
+        && !deny_env.iter().any(|d| d == var)
+        && let Ok(val) = std::env::var(var)
+    {
+        cmd.env(var, val);
+    }
+}
+
 /// Configure environment, proxy, and common args on a sandboxed Command.
 ///
 /// Both macOS (Seatbelt) and Linux (Landlock) paths call this to apply the
@@ -66,6 +98,12 @@ fn configure_command(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     npmrc_allowed: bool,
+    playwright_socket_dir: Option<&Path>,
+    playwright_runtime: bool,
+    // Consulted before extracting a token: these names are stripped from the
+    // child afterwards, so a parent value that is about to be denied must not
+    // suppress the extraction. See `child_keeps_a_github_token`.
+    deny_env: &[String],
 ) {
     for arg in copilot_args {
         cmd.arg(arg);
@@ -96,6 +134,24 @@ fn configure_command(
         for (key, val) in &sandbox_env.vars {
             cmd.env(key, val);
         }
+    }
+
+    // Playwright's internal control server binds Unix sockets below this short,
+    // random, policy-authorized per-session directory.
+    // This runs after filtering so ambient values cannot displace the safe
+    // default; only an explicit --pass-env requests a caller override.
+    if let Some(path) =
+        super::env::playwright_sockets_dir_override(extra_pass_env, playwright_socket_dir)
+    {
+        cmd.env("PWTEST_SOCKETS_DIR", path);
+    }
+
+    // Playwright MCP re-enables Chromium's own sandbox, which cannot start
+    // inside cplt's. Disabling it here keeps the fix inside the boundary that
+    // needs it, instead of putting a cplt-only flag in the server configuration
+    // every editor and CLI shares.
+    if super::env::playwright_mcp_sandbox_disabled(extra_pass_env, playwright_runtime) {
+        cmd.env("PLAYWRIGHT_MCP_SANDBOX", "false");
     }
 
     // Default DOTNET_CLI_HOME to the already-resolved, already-validated sandbox
@@ -181,7 +237,7 @@ fn configure_command(
         if gh_guard.enabled {
             // Inject GH_TOKEN into env only when explicitly requested.
             if gh_guard.inject_token {
-                inject_gh_token_if_needed(cmd, agent);
+                inject_gh_token_if_needed(cmd, agent, deny_env);
             }
             // Cache token to file so the wrapper can serve `gh auth token`
             // requests without exposing the token as an env var to all child
@@ -195,7 +251,7 @@ fn configure_command(
             // does not close — the window. A determined agent that reads
             // `$TMPDIR/.gh-token` before the legitimate consumer still wins.
             if gh_guard.block_auth_token {
-                cache_gh_token_to_file(scratch, agent);
+                cache_gh_token_to_file(scratch, agent, deny_env);
             }
         }
         install_command_wrappers(cmd, scratch, project_dir, gh_guard, git_guard);
@@ -209,36 +265,113 @@ fn configure_command(
 /// the gh proxy to safely block `gh auth token` inside the sandbox
 /// while still giving the agent API access.
 ///
+/// `gh`, resolved from [`crate::git::TRUSTED_BIN_DIRS`], warning once when the
+/// only `gh` on this machine is somewhere else.
+///
+/// Before the trusted-lookup change, `gh` came off `PATH`, so an installation in
+/// `~/.local/bin` or a mise shim worked. It no longer does — correctly, since a
+/// planted `gh` hands the agent both unsandboxed execution and a channel into
+/// the next agent's environment. But the failure is invisible: no token is
+/// injected, and the user sees Copilot's GitHub API calls fail with nothing
+/// pointing at cplt. A `gh` that exists on `PATH` and is not trusted is the one
+/// case worth a line on stderr.
+///
+/// Warned once per process: both token paths call this, and two identical
+/// warnings at launch read like two different problems.
+fn trusted_gh() -> Option<PathBuf> {
+    if let Some(gh) = crate::git::trusted_binary("gh") {
+        return Some(gh);
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if let Some(untrusted) = which_binary("gh") {
+        WARNED.call_once(|| {
+            ui::warn(&format!(
+                "gh is installed at {} — outside the directories cplt trusts for \
+                 unsandboxed helpers ({}).\n  \
+                 The GitHub token is NOT injected, so the agent's GitHub API calls \
+                 will fail. cplt runs `gh auth token` as you, outside the sandbox, \
+                 so it will not run a `gh` a previous session could have replaced.\n  \
+                 Install gh into one of those directories (`brew install gh`, or your \
+                 distro's package), or export GH_TOKEN yourself before launching.",
+                untrusted.display(),
+                crate::git::TRUSTED_BIN_DIRS.join(", ")
+            ));
+        });
+    }
+    None
+}
+
 /// Only injects for agents that need GitHub access (Copilot).
-fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
-    // Only inject for Copilot — other agents have their own auth
-    if agent != Agent::Copilot {
-        return;
-    }
+/// The env vars that carry a GitHub token into the agent.
+///
+/// Mirrors `sandbox_env::COPILOT_ONLY_VARS`; kept here because this module both
+/// strips them from the `gh` subprocess and consults them to decide whether
+/// extraction is needed at all.
+const GH_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"];
 
-    // Skip if any GitHub token is already set (non-empty) in the environment
-    let has_token = |key| std::env::var(key).is_ok_and(|v| !v.is_empty());
-    if has_token("GH_TOKEN") || has_token("GITHUB_TOKEN") || has_token("COPILOT_GITHUB_TOKEN") {
-        return;
+/// The GitHub token `gh` holds, or `None` when there is nothing to hand over.
+///
+/// Trusted path, not PATH: this runs in the unsandboxed parent at launch and
+/// its stdout is treated as a GitHub token, so a planted `gh` would get both
+/// code execution as the user and a free channel into the agent's environment.
+///
+/// `--hostname github.com` is not optional. `gh auth token` without it resolves
+/// against the *active* host, which `GH_HOST` can steer and which is a GHES
+/// instance on a machine logged into one — so the agent would be handed a token
+/// for the wrong host. The token vars are stripped from the subprocess so `gh`
+/// answers from its own credential store rather than echoing back an ambient
+/// value.
+fn extract_gh_token() -> Option<String> {
+    let gh = trusted_gh()?;
+    let mut cmd = std::process::Command::new(&gh);
+    cmd.args(["auth", "token", "--hostname", "github.com"]);
+    for var in GH_TOKEN_VARS {
+        cmd.env_remove(var);
     }
-
-    // Extract token from gh CLI config (outside sandbox)
-    let Ok(output) = std::process::Command::new("gh")
-        .args(["auth", "token"])
+    let output = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Whether the child will already have a usable GitHub token in its own
+/// environment, making extraction unnecessary.
+///
+/// `deny_env` is consulted because the caller strips those names from the child
+/// AFTER this runs. Without it a repo `deny.env = ["GH_TOKEN"]` produced a
+/// child with no token at all: the parent's value suppressed the extraction,
+/// and then the deny removed the variable it was suppressed in favour of.
+fn child_keeps_a_github_token(deny_env: &[String]) -> bool {
+    GH_TOKEN_VARS.iter().any(|var| {
+        !deny_env.iter().any(|d| d == var) && std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+    })
+}
+
+fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent, deny_env: &[String]) {
+    // Only inject for Copilot — other agents have their own auth.
+    if agent != Agent::Copilot || child_keeps_a_github_token(deny_env) {
+        return;
+    }
+    // Into the first name the deny list does not strip. Injecting into
+    // GH_TOKEN unconditionally would hand the token to a variable
+    // `apply_deny_env_and_credential` removes moments later, so a repo denying
+    // GH_TOKEN alone would leave the agent tokenless even though Copilot reads
+    // GITHUB_TOKEN too. All three names are denied means no channel is left, so
+    // there is nothing to inject into.
+    let Some(target) = GH_TOKEN_VARS
+        .iter()
+        .find(|var| !deny_env.iter().any(|d| d == *var))
     else {
         return;
     };
-
-    if !output.status.success() {
-        return;
-    }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !token.is_empty() {
-        cmd.env("GH_TOKEN", &token);
+    if let Some(token) = extract_gh_token() {
+        cmd.env(target, &token);
     }
 }
 
@@ -261,37 +394,14 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent) {
 /// window. They do NOT prevent a determined same-UID agent from `cat`-ing
 /// `$TMPDIR/.gh-token` before the legitimate read. Do not treat this as
 /// confidentiality against an adversarial agent.
-fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent) {
-    // Only cache for Copilot — other agents have their own auth
-    if agent != Agent::Copilot {
+fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent, deny_env: &[String]) {
+    // Only cache for Copilot — other agents have their own auth.
+    if agent != Agent::Copilot || child_keeps_a_github_token(deny_env) {
         return;
     }
-
-    // Skip if any GitHub token is already set (non-empty) in the environment —
-    // in that case Copilot will use the env var directly.
-    let has_token = |key| std::env::var(key).is_ok_and(|v| !v.is_empty());
-    if has_token("GH_TOKEN") || has_token("GITHUB_TOKEN") || has_token("COPILOT_GITHUB_TOKEN") {
-        return;
-    }
-
-    // Extract token from gh CLI config (outside sandbox)
-    let Ok(output) = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-    else {
+    let Some(token) = extract_gh_token() else {
         return;
     };
-
-    if !output.status.success() {
-        return;
-    }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        return;
-    }
 
     // Write token to file, creating it with 0600 from the start to avoid a
     // permissions window where the file is world-readable.
@@ -340,18 +450,13 @@ fn install_command_wrappers(
     if gh_guard.enabled
         && let Some(real_gh) = which_binary("gh")
     {
-        let repo_scope = if gh_guard.scope_check {
-            if let Some(real_git) = which_binary("git") {
-                match crate::gh_proxy::detect_current_repo(&real_git, project_dir) {
-                    Ok(repo) => Some(repo),
-                    Err(reason) => {
-                        ui::warn(&format!(
-                            "gh guard could not capture repository scope: {reason}. \
-                             Scope-checked commands will be blocked."
-                        ));
-                        None
-                    }
-                }
+        let real_git = if gh_guard.scope_check {
+            // Trusted, not PATH: this git runs in the UNSANDBOXED parent, at
+            // launch. A `git` the previous session planted in ~/.bun/bin (or any
+            // other write+exec grant on PATH) would otherwise execute as the
+            // user here, one session later.
+            if let Some(real_git) = crate::git::trusted_git() {
+                Some(real_git.to_path_buf())
             } else {
                 ui::warn(
                     "gh guard could not find Git to capture repository scope. \
@@ -362,9 +467,31 @@ fn install_command_wrappers(
         } else {
             None
         };
+        let repo_scope = if gh_guard.scope_check {
+            if let Some(real_git) = real_git.as_deref() {
+                match crate::gh_proxy::detect_current_repo(real_git, project_dir) {
+                    Ok(repo) => Some(repo),
+                    Err(reason) => {
+                        ui::warn(&format!(
+                            "gh guard could not capture repository scope: {reason}. \
+                             Scope-checked commands will be blocked."
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let real_git_str = real_git
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
         let script = crate::gh_proxy::generate_wrapper_script(
             &real_gh.to_string_lossy(),
             repo_scope.as_deref(),
+            real_git_str.as_deref(),
             &cplt_str,
             gh_guard,
         );
@@ -376,8 +503,24 @@ fn install_command_wrappers(
     }
 
     // Install git guard wrapper (only if git_guard enabled)
+    // Trusted first, then PATH — the same call the gh wrapper above makes, and
+    // for the same reason.
+    //
+    // This path is baked into a wrapper the agent's own shell runs INSIDE the
+    // sandbox; it is never executed by the parent. A planted `git` there gains
+    // the agent nothing it does not already have: it can invoke any git by
+    // absolute path and skip the PATH wrapper entirely, so the guard is a policy
+    // on intent, not a boundary. Requiring a trusted git instead removed the
+    // guard outright on every machine whose git comes from mise, asdf,
+    // nix-profile or snap — the agent's PATH still had that git, so `git push`
+    // simply went unguarded. That is a loss with no matching gain.
+    //
+    // Parent-side git (audit, repo-config trust, gh guard scope) stays on
+    // `trusted_git()`, where a planted binary WOULD run unsandboxed.
     if git_guard.enabled
-        && let Some(real_git) = which_binary("git")
+        && let Some(real_git) = crate::git::trusted_git()
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| which_binary("git"))
     {
         let script = crate::gh_proxy::generate_git_wrapper_script(
             &real_git.to_string_lossy(),
@@ -403,16 +546,19 @@ fn install_command_wrappers(
     }
 }
 
-/// Find a binary in PATH by name.
+/// Find an executable in PATH by name.
+///
+/// Executability matters: `which` and `execvp` both skip a file the caller may
+/// not execute, so accepting one here would report a stub as the tool's
+/// location (`cplt doctor`) or hand a caller a path that can only ever fail
+/// with `EACCES`. Deliberately the same predicate as the trusted-directory
+/// lookup — [`crate::git::is_executable_file`], an `X_OK` check, not a
+/// mode-bit test — so the two resolvers cannot disagree about what counts.
 pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|p| crate::git::is_executable_file(p))
 }
 
 /// Ignore SIGTTOU/SIGTTIN — copilot (Node.js) may manipulate terminal
@@ -506,11 +652,20 @@ fn install_signal_forwarding(child_pid: i32) {
 
 // ── macOS: Seatbelt / sandbox-exec ────────────────────────────
 
+/// The Seatbelt driver. Absolute on purpose: a bare program name is resolved
+/// from the parent's PATH at spawn time, and the sandbox grants the agent
+/// write+exec on directories that sit on it (see `TRUSTED_BIN_DIRS` in git.rs).
+#[cfg(target_os = "macos")]
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
 /// Verify the SBPL profile works by running `/usr/bin/true` inside sandbox-exec.
 #[cfg(target_os = "macos")]
 pub fn preflight(sandbox: &super::PreparedSandbox) -> Result<(), String> {
     let profile_path = write_temp_profile(&sandbox.profile_text)?;
-    let output = Command::new("sandbox-exec")
+    // Absolute: `sandbox-exec` only ever lives in /usr/bin (SIP-protected), and
+    // resolving it by name would go through the parent's PATH, which contains
+    // directories the sandbox itself grants the agent write+exec on.
+    let output = Command::new(SANDBOX_EXEC)
         .arg("-f")
         .arg(&profile_path)
         .arg("/usr/bin/true")
@@ -555,7 +710,7 @@ pub fn exec(
         }
     };
 
-    let mut cmd = Command::new("sandbox-exec");
+    let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-f").arg(&profile_path).arg(copilot_bin);
 
     configure_command(
@@ -574,12 +729,12 @@ pub fn exec(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        sandbox.playwright_socket_dir.as_deref(),
+        sandbox.playwright_runtime,
+        deny_env,
     );
 
-    // Strip repo-config denied env vars
-    for var in deny_env {
-        cmd.env_remove(var);
-    }
+    apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
 
     let exit_code = spawn_and_wait(&mut cmd);
     let _ = std::fs::remove_file(&profile_path);
@@ -725,12 +880,12 @@ pub fn exec(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        sandbox.playwright_socket_dir.as_deref(),
+        sandbox.playwright_runtime,
+        deny_env,
     );
 
-    // Strip repo-config denied env vars
-    for var in deny_env {
-        cmd.env_remove(var);
-    }
+    apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
 
     // Apply pre-computed sandbox in the child process, between fork and exec.
     // Safety: The proxy thread is running (multi-threaded at fork), making this
@@ -863,10 +1018,11 @@ fn exec_bwrap(
         gh_guard,
         git_guard,
         sandbox.npmrc_allowed,
+        sandbox.playwright_socket_dir.as_deref(),
+        sandbox.playwright_runtime,
+        deny_env,
     );
-    for var in deny_env {
-        cmd.env_remove(var);
-    }
+    apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
     // Set the re-entry env AFTER configure_command so a `clear_first` env build
     // cannot wipe them.
     cmd.env(
@@ -975,5 +1131,130 @@ fn read_confirm_byte(fd: i32) -> ConfirmResult {
             return ConfirmResult::Eof;
         }
         return ConfirmResult::Confirmed;
+    }
+}
+
+#[cfg(test)]
+mod gh_token_extraction_tests {
+    use super::*;
+
+    /// A repo `deny.env` on a token var used to leave the child with NO token:
+    /// the parent's value suppressed the extraction, then the deny stripped the
+    /// very variable it was suppressed in favour of. The suppression check has
+    /// to see the deny list for the same reason the injection does.
+    #[test]
+    fn a_denied_parent_token_does_not_suppress_extraction() {
+        temp_env::with_var("GH_TOKEN", Some("ghp_parent"), || {
+            assert!(
+                child_keeps_a_github_token(&[]),
+                "an undenied parent token reaches the child, so no extraction is needed"
+            );
+            assert!(
+                !child_keeps_a_github_token(&["GH_TOKEN".to_string()]),
+                "a denied token is stripped from the child, so extraction must still run"
+            );
+        });
+    }
+
+    /// Injecting into a denied name hands the token to a variable that is
+    /// stripped moments later. With GH_TOKEN denied and GITHUB_TOKEN free,
+    /// the surviving name is the one to use.
+    #[test]
+    fn injection_target_skips_denied_names() {
+        let pick = |deny: &[String]| -> Option<&'static str> {
+            GH_TOKEN_VARS
+                .iter()
+                .find(|var| !deny.iter().any(|d| d.as_str() == **var))
+                .copied()
+        };
+        assert_eq!(pick(&[]), Some("GH_TOKEN"), "no deny, first name wins");
+        assert_eq!(
+            pick(&["GH_TOKEN".to_string()]),
+            Some("GITHUB_TOKEN"),
+            "a denied name is skipped for the next surviving one"
+        );
+        assert_eq!(
+            pick(&[
+                "GH_TOKEN".to_string(),
+                "GITHUB_TOKEN".to_string(),
+                "COPILOT_GITHUB_TOKEN".to_string(),
+            ]),
+            None,
+            "all three denied leaves no channel to inject into"
+        );
+    }
+
+    /// Denying one variable says nothing about the others.
+    #[test]
+    fn denying_one_token_var_leaves_the_others_counting() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", Some("ghp_other")),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                assert!(
+                    child_keeps_a_github_token(&["GH_TOKEN".to_string()]),
+                    "GITHUB_TOKEN survives the deny and still reaches the child"
+                );
+            },
+        );
+    }
+
+    /// Whitespace is not a credential.
+    #[test]
+    fn a_blank_token_does_not_count() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", Some("   ")),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || assert!(!child_keeps_a_github_token(&[])),
+        );
+    }
+}
+
+#[cfg(test)]
+mod keychain_substitute_tests {
+    use super::*;
+    use crate::agent::KeychainSubstitute;
+
+    /// The forwarded variable is not in `ENV_ALLOWLIST`, so this helper is the
+    /// only thing that puts it in the child environment (#242). If it stops
+    /// working the agent silently loses the credential it traded the Keychain
+    /// for, which is the failure this whole change exists to avoid.
+    #[test]
+    fn env_var_substitute_is_forwarded_and_file_substitute_is_not() {
+        temp_env::with_var("CPLT_TEST_SUBSTITUTE", Some("tok"), || {
+            let mut cmd = Command::new("/usr/bin/true");
+            apply_deny_env_and_credential(
+                &mut cmd,
+                &[],
+                Some(&KeychainSubstitute::EnvVar("CPLT_TEST_SUBSTITUTE")),
+            );
+            let set: Vec<_> = cmd.get_envs().collect();
+            assert!(
+                set.iter()
+                    .any(|(k, v)| *k == "CPLT_TEST_SUBSTITUTE" && *v == Some("tok".as_ref())),
+                "an env-var substitute must be forwarded: {set:?}"
+            );
+
+            // A file substitute needs nothing forwarded — the agent reads it.
+            let mut cmd = Command::new("/usr/bin/true");
+            apply_deny_env_and_credential(
+                &mut cmd,
+                &[],
+                Some(&KeychainSubstitute::File("/tmp/tok".into())),
+            );
+            assert_eq!(cmd.get_envs().count(), 0);
+
+            // No substitute: nothing forwarded, deny sweep still applies.
+            let mut cmd = Command::new("/usr/bin/true");
+            apply_deny_env_and_credential(&mut cmd, &["FOO".to_string()], None);
+            let set: Vec<_> = cmd.get_envs().collect();
+            assert_eq!(set, vec![("FOO".as_ref(), None)]);
+        });
     }
 }

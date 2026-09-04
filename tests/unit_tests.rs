@@ -7,10 +7,12 @@ use cplt::discover::copilot_pkg_dir;
 use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
 use cplt::sandbox::{
-    HardeningCategory, ProfileOptions, SandboxConfig, build_sandbox_env, generate_policy,
-    generate_profile, npmrc_explicitly_allowed, npmrc_userconfig_override,
-    npmrc_userconfig_stale_variants, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_sbpl_path,
+    HardeningCategory, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_PATH_LIMIT,
+    PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, ProfileOptions, SandboxConfig, build_sandbox_env,
+    generate_policy, generate_profile, generate_profile_with_playwright_socket_dir,
+    npmrc_explicitly_allowed, npmrc_userconfig_override, npmrc_userconfig_stale_variants,
+    playwright_runtime_intent, playwright_sockets_dir_override, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 // ============================================================
@@ -779,6 +781,7 @@ fn profile_contains_deny_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(p.contains("(deny default)"));
 }
@@ -819,6 +822,7 @@ fn profile_allows_tty_ioctl() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-ioctl)"),
@@ -850,6 +854,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_env_files: false,
         allow_localhost_any: false,
         scratch_dir: None,
+        playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
         java_home: None,
@@ -868,6 +873,7 @@ fn landlock_policy_device_files_have_ioctl() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        keychain_substitute: None,
     });
 
     let device_paths = ["/dev/tty", "/dev/ptmx", "/dev/pts"];
@@ -935,6 +941,7 @@ fn profile_grants_project_access() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(p.contains("(allow file-read* (subpath \"/projects/app\"))"));
     assert!(p.contains("(allow file-write* (subpath \"/projects/app\"))"));
@@ -1004,6 +1011,7 @@ fn profile_grants_copilot_config_access() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(p.contains("(allow file-read* (subpath \"/Users/test/.copilot\"))"));
 }
@@ -1047,6 +1055,7 @@ fn profile_grants_claude_config_access() {
             allow_cache_exec: &[],
             allow_cache_exec_any: false,
             allow_browser: false,
+            credential_outside_keychain: false,
         });
         // Config dir + top-level config file are readable and writable.
         assert!(p.contains("(allow file-read* (subpath \"/Users/test/.claude\"))"));
@@ -1075,10 +1084,10 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
         for agent in [
             cplt::agent::Agent::Copilot,
             cplt::agent::Agent::OpenCode,
-            cplt::agent::Agent::Gemini,
             cplt::agent::Agent::Antigravity,
             cplt::agent::Agent::Pi,
             cplt::agent::Agent::Claude,
+            cplt::agent::Agent::Goose,
             cplt::agent::Agent::Shell,
         ] {
             let agent_dirs = agent.config_dirs(home);
@@ -1116,6 +1125,7 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
                 allow_cache_exec: &[],
                 allow_cache_exec_any: false,
                 allow_browser: false,
+                credential_outside_keychain: false,
             });
             for dir in agent_dirs.iter().filter(|d| d.write) {
                 for sub in agent.host_persistence_denies() {
@@ -1130,19 +1140,19 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
 
 /// A user `allow.write` must NOT reopen the host-persistence denies.
 ///
-/// `allow.write = ["~/.gemini"]` is an ordinary thing to write — `is_unsafe_root`
+/// `allow.write = ["~/.claude"]` is an ordinary thing to write — `is_unsafe_root`
 /// only rejects `~` itself — and while these denies lived beside the dir-wide
 /// allow in `emit_home_access` it silently reopened every one of them, including
-/// Claude's pre-existing `statusline.sh`/`plugins`. SBPL is last-match-wins, so
+/// Claude's `statusline.sh`/`plugins`. SBPL is last-match-wins, so
 /// the fix is placement: `emit_host_persistence_denies` runs at the tail, after
 /// `emit_user_allows`. This test fails if it is ever moved back before it.
 #[test]
 fn host_persistence_denies_survive_a_later_user_allow_write() {
     let home = std::path::Path::new("/Users/test");
-    let agent_dirs = cplt::agent::Agent::Gemini.config_dirs(home);
+    let agent_dirs = cplt::agent::Agent::Claude.config_dirs(home);
     // The whole config dir, not just the file: the wider grant is the one that
     // used to swallow the denies.
-    let settings = home.join(".gemini");
+    let settings = home.join(".claude");
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: home,
@@ -1172,20 +1182,21 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
         allow_msbuild: false,
         allow_docker: false,
         electron_app_dir: None,
-        agent: cplt::agent::Agent::Gemini,
+        agent: cplt::agent::Agent::Claude,
         agent_dirs: &agent_dirs,
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // rfind, not find: emit_home_access emits the identical allow line for the
     // agent-dir grant itself, so the LAST occurrence is the user's allow.write
     // and the one the denies have to outlive.
     let allow = p
-        .rfind("(allow file-write* (subpath \"/Users/test/.gemini\"))")
+        .rfind("(allow file-write* (subpath \"/Users/test/.claude\"))")
         .expect("user allow.write must be emitted");
-    for sub in cplt::agent::Agent::Gemini.host_persistence_denies() {
-        let line = format!("(deny file-write* (subpath \"/Users/test/.gemini/{sub}\"))");
+    for sub in cplt::agent::Agent::Claude.host_persistence_denies() {
+        let line = format!("(deny file-write* (subpath \"/Users/test/.claude/{sub}\"))");
         let deny = p.find(&line).expect("persistence deny must be emitted");
         assert!(
             deny > allow,
@@ -1230,6 +1241,7 @@ fn profile_denies_sensitive_dirs() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     for dir in &[
         ".ssh",
@@ -1295,6 +1307,7 @@ fn profile_denies_sensitive_files() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     for file in &[".netrc", ".pypirc", ".gem/credentials", ".vault-token"] {
         assert!(
@@ -1342,6 +1355,7 @@ fn profile_denies_credential_files_in_tool_dirs() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // These credential files inside allowed tool dirs must be denied
@@ -1420,6 +1434,7 @@ fn profile_allows_credential_files_when_user_opts_in() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // The deny should still be present (defense in depth)
@@ -1514,6 +1529,7 @@ fn profile_extra_read_overrides_denied_dotfile_directory() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // The deny for .config/gcloud (DENIED_DOTFILES) should still exist
@@ -1576,6 +1592,7 @@ fn profile_extra_read_overrides_multiple_denied_dotfile_dirs() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // Both denied dotfile dirs should still have their deny rules
@@ -1636,6 +1653,7 @@ fn profile_restricts_outbound_tcp() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(deny network-outbound (remote tcp))"),
@@ -1703,6 +1721,7 @@ fn profile_extra_ports_adds_allows() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"*:8080\"))"),
@@ -1754,6 +1773,7 @@ fn profile_allow_browser_enables_lsopen() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: true,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow lsopen)"),
@@ -1797,6 +1817,7 @@ fn profile_proxy_port_allows_localhost() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:18080\"))"),
@@ -1844,6 +1865,7 @@ fn profile_allow_localhost_opens_specific_ports() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow network-outbound (remote ip \"localhost:3000\"))"),
@@ -1906,6 +1928,7 @@ fn profile_deny_rules_come_after_allow_rules() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let allow_pos = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -1955,6 +1978,7 @@ fn profile_allows_gh_config_read_only() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.config/gh/hosts.yml\"))"),
@@ -2006,6 +2030,7 @@ fn profile_allows_file_map_executable_for_copilot() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-map-executable (subpath \"/Users/test/.copilot\"))"),
@@ -2053,6 +2078,7 @@ fn profile_denies_env_files_by_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(r#"(deny file-read* (regex #"/\.env$"))"#),
@@ -2124,6 +2150,7 @@ fn profile_allows_env_files_when_flag_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains(r#"deny file-read* (regex #"/projects/app/"#),
@@ -2167,6 +2194,7 @@ fn profile_env_deny_comes_after_project_allow() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let project_allow = p
         .find("(allow file-read* (subpath \"/projects/app\"))")
@@ -2222,6 +2250,7 @@ fn profile_env_deny_comes_after_user_allows() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let user_read_allow = p
         .find("(allow file-read* (subpath \"/projects\"))")
@@ -2330,6 +2359,7 @@ fn profile_denies_resolved_git_dirs_of_granted_repos() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // The last user write allow in the profile — every deny below must follow
@@ -2418,6 +2448,7 @@ fn profile_allows_all_localhost_when_flag_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("(deny network-outbound (remote ip \"localhost:*\"))"),
@@ -2479,6 +2510,7 @@ fn profile_allows_all_tcp_outbound_when_jvm_and_localhost_any() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // With preferIPv4Stack=true in JAVA_TOOL_OPTIONS, Java uses AF_INET4 and
     // "localhost:*" works. No need for the old "*:*" nuclear option.
@@ -2536,6 +2568,7 @@ fn profile_denies_write_to_copilot_pkg() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must allow write to ~/.copilot (session state, config)
     assert!(
@@ -2783,6 +2816,7 @@ fn profile_denies_exec_from_tmp() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must allow read+write to /tmp (needed for temp files)
     assert!(
@@ -2855,6 +2889,7 @@ fn profile_allows_jvm_attach_when_flag_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must allow unix socket bind+inbound+connect for JVM Attach API (.java_pid*)
     // Three operations needed: bind (create socket), inbound (accept), outbound (connect)
@@ -2938,6 +2973,7 @@ fn profile_allows_msbuild_when_flag_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must allow unix socket bind+inbound+connect for the MSBuild worker-node
     // pipe (MSBuild<pid>). Three operations needed: bind (worker node creates
@@ -3012,6 +3048,7 @@ fn profile_allows_localhost_tcp_bind() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // We use "*:*" instead of "localhost:*" because Java NIO uses IPv6 sockets
     // with IPv4-mapped addresses (::ffff:127.0.0.1) which "localhost" doesn't match.
@@ -3066,6 +3103,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // macOS SBPL should allow all localhost ports.
     // #126 Tier 2: dropped the always-true `|| p.contains("network-outbound")`
@@ -3093,6 +3131,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_env_files: false,
         allow_localhost_any: true,
         scratch_dir: None,
+        playwright_socket_dir: None,
         allow_tmp_exec: false,
         copilot_install_dir: None,
         java_home: None,
@@ -3111,6 +3150,7 @@ fn allow_localhost_any_affects_both_backends() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        keychain_substitute: None,
     });
     assert!(
         !landlock_policy.restrict_net_connect,
@@ -3149,6 +3189,7 @@ fn config_options_parity_across_backends() {
         allow_env_files: false,
         allow_localhost_any: false,
         scratch_dir: Some(&scratch),
+        playwright_socket_dir: None,
         allow_tmp_exec: true,
         copilot_install_dir: None,
         java_home: None,
@@ -3167,6 +3208,7 @@ fn config_options_parity_across_backends() {
         allow_cache_exec_any: false,
         allow_browser: false,
         use_bubblewrap: None,
+        keychain_substitute: None,
     };
 
     // ── Landlock policy ──
@@ -3256,6 +3298,7 @@ fn config_options_parity_across_backends() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // extra_ports → SBPL port allow
@@ -3340,6 +3383,7 @@ fn profile_denies_git_persistence_vectors() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must deny writes to .git/hooks (post-checkout etc. run outside sandbox)
     assert!(
@@ -3405,6 +3449,7 @@ fn profile_denies_write_to_cplt_toml() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(deny file-write* (literal \"/projects/app/.cplt.toml\"))"),
@@ -3452,6 +3497,7 @@ fn default_profile() -> String {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     })
 }
 
@@ -4312,6 +4358,7 @@ fn profile_scratch_dir_adds_all_permissions() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     let scratch_str = scratch.to_string_lossy();
@@ -4384,6 +4431,7 @@ fn profile_allow_tmp_exec_removes_denies() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -4553,6 +4601,7 @@ fn profile_allows_copilot_install_dir() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(
@@ -4607,6 +4656,7 @@ fn profile_allows_vscode_copilot_path() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{vscode_dir}\"))")),
@@ -4668,6 +4718,7 @@ fn profile_allows_dotnet_root_when_set() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{dotnet_root}\"))")),
@@ -4773,6 +4824,7 @@ fn profile_dotnet_exec_paths_stay_readonly_under_user_allow_write() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     let user_write = p
@@ -4840,6 +4892,7 @@ fn profile_allows_electron_app_bundle() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&format!("(allow file-read* (subpath \"{electron_dir}\"))")),
@@ -5002,6 +5055,7 @@ fn profile_allows_git_hooks_path() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-read* (subpath \"/Users/test/.config/git/hooks\"))"),
@@ -5066,6 +5120,7 @@ fn profile_allows_git_worktree_common_dir() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-read* (subpath \"/Users/test/repos/main-repo/.git\"))"),
@@ -5222,6 +5277,7 @@ fn profile_gpg_signing_allows_public_keyring() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow file-read* (literal \"/Users/test/.gnupg/pubring.kbx\"))"),
@@ -5273,6 +5329,7 @@ fn profile_gpg_signing_allows_agent_socket() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow network-outbound (literal \"/Users/test/.gnupg/S.gpg-agent\"))"),
@@ -5321,6 +5378,7 @@ fn profile_gpg_signing_denies_private_keys() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(deny file-read* (subpath \"/Users/test/.gnupg/private-keys-v1.d\"))"),
@@ -5368,6 +5426,7 @@ fn profile_gpg_signing_rules_come_after_deny() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let deny_pos = p
         .find("(deny file-read* (subpath \"/Users/test/.gnupg\"))")
@@ -5425,6 +5484,7 @@ fn profile_gpg_signing_uses_literal_not_subpath() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Must use literal (exact file), never subpath (recursive) for GPG allows
     assert!(
@@ -5470,6 +5530,7 @@ fn profile_gpg_signing_deny_path_wins() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // When user explicitly denies ~/.gnupg, GPG allows should NOT appear
     assert!(
@@ -5518,6 +5579,7 @@ fn profile_gpg_signing_denies_legacy_secring() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(deny file-read* (literal \"/Users/test/.gnupg/secring.gpg\"))"),
@@ -5561,6 +5623,7 @@ fn profile_gpg_signing_allows_socket_file_read() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Socket needs file-read* for inode lookup before connect(2)
     assert!(
@@ -5570,8 +5633,103 @@ fn profile_gpg_signing_allows_socket_file_read() {
 }
 
 // ============================================================
-// build_sandbox_env — scratch dir env injection
+// Playwright runtime intent and child environment
 // ============================================================
+
+#[test]
+fn playwright_runtime_intent_is_exact_and_does_not_follow_cache_exec_any() {
+    for cache_entry in ["ms-playwright", "ms-playwright/chromium-1243"] {
+        let allow_cache_exec = [cache_entry.to_string()];
+        assert!(
+            playwright_runtime_intent(&allow_cache_exec, false),
+            "{cache_entry:?} must enable Playwright runtime intent"
+        );
+    }
+
+    for (label, allow_cache_exec) in [
+        ("no cache opt-in", Vec::<String>::new()),
+        (
+            "unrelated cache opt-in",
+            vec!["some-other-tool".to_string()],
+        ),
+        (
+            "near-miss cache opt-in",
+            vec!["ms-playwright-evil".to_string()],
+        ),
+    ] {
+        assert!(
+            !playwright_runtime_intent(&allow_cache_exec, false),
+            "{label} must not imply Playwright intent"
+        );
+    }
+
+    assert!(
+        !playwright_runtime_intent(&[], true),
+        "allow_cache_exec_any alone must not imply Playwright intent"
+    );
+}
+
+#[test]
+fn playwright_socket_dir_override_uses_only_the_automatic_path() {
+    let socket_dir = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        playwright_sockets_dir_override(&[], Some(socket_dir)),
+        Some(socket_dir)
+    );
+    assert_eq!(playwright_sockets_dir_override(&[], None), None);
+}
+
+#[test]
+fn playwright_mcp_sandbox_is_disabled_only_for_runtime_intent() {
+    use cplt::sandbox::playwright_mcp_sandbox_disabled;
+
+    assert!(
+        playwright_mcp_sandbox_disabled(&[], true),
+        "the browser opt-in must turn off a nested sandbox that cannot start in here"
+    );
+    assert!(
+        !playwright_mcp_sandbox_disabled(&[], false),
+        "without the opt-in cplt must not weaken a browser it was never asked to run"
+    );
+    assert!(
+        !playwright_mcp_sandbox_disabled(&["PLAYWRIGHT_MCP_SANDBOX".to_string()], true),
+        "an explicit pass-through returns the choice to the caller"
+    );
+    assert!(
+        playwright_mcp_sandbox_disabled(&["UNRELATED".to_string()], true),
+        "an unrelated pass-through must not suppress the default"
+    );
+}
+
+#[test]
+fn playwright_socket_dir_respects_explicit_pass_env_value() {
+    let parent = make_env(&[("PWTEST_SOCKETS_DIR", "/caller/playwright-sockets")]);
+    let extra_pass_env = ["PWTEST_SOCKETS_DIR".to_string()];
+    let scratch = std::path::Path::new("/scratch/session");
+    let socket_dir = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+
+    let env = build_sandbox_env(
+        &parent,
+        &extra_pass_env,
+        false,
+        &[],
+        Some(scratch),
+        cplt::agent::Agent::Copilot,
+    );
+    assert_eq!(
+        env.vars
+            .iter()
+            .find(|(key, _)| key == "PWTEST_SOCKETS_DIR")
+            .map(|(_, value)| value.as_str()),
+        Some("/caller/playwright-sockets"),
+        "explicit --pass-env must preserve the caller's parent value"
+    );
+    assert_eq!(
+        playwright_sockets_dir_override(&extra_pass_env, Some(socket_dir)),
+        None,
+        "explicit --pass-env must suppress cplt's automatic injection"
+    );
+}
 
 // #180: the sandbox denies ~/.npmrc, and yarn 1 aborts on EACCES/EPERM where it
 // tolerates ENOENT. Redirecting NPM_CONFIG_USERCONFIG at a nonexistent scratch
@@ -6250,6 +6408,7 @@ fn profile_docker_disabled_by_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // .docker should be denied
     assert!(
@@ -6299,6 +6458,7 @@ fn profile_docker_enabled_allows_config_and_sockets() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Should allow read of ~/.docker
     assert!(
@@ -6380,6 +6540,7 @@ fn profile_docker_skipped_when_deny_path_overlaps() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     // Docker allows should be skipped — deny-path wins
     assert!(
@@ -6430,6 +6591,7 @@ fn profile_socket_allows_rules() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6496,6 +6658,7 @@ fn profile_socket_skipped_when_deny_path_overlaps() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6556,6 +6719,7 @@ fn profile_allow_cache_exec_subdir_adds_carveout() {
         allow_cache_exec: &["ms-playwright".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6610,6 +6774,7 @@ fn profile_allow_cache_exec_any_allows_all_caches() {
         allow_cache_exec: &[],
         allow_cache_exec_any: true,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6658,6 +6823,7 @@ fn profile_default_denies_cache_exec() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6702,6 +6868,7 @@ fn profile_allow_cache_exec_multiple_subdirs() {
         allow_cache_exec: &["ms-playwright".to_string(), "pnpm/dlx".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     assert!(
@@ -6829,6 +6996,7 @@ fn profile_cache_exec_carveout_comes_after_exec_deny() {
         allow_cache_exec: &["ms-playwright".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let deny_pos = p
         .find("(deny process-exec")
@@ -7090,8 +7258,195 @@ fn set_repo_value_unset_removes_array_element() {
 // Chromium runtime rules (allow_cache_exec = ["ms-playwright"] or subpath)
 // ============================================================
 
+fn playwright_profile(
+    allow_cache_exec: &[String],
+    allow_cache_exec_any: bool,
+    socket_dir: Option<&std::path::Path>,
+) -> String {
+    generate_profile_with_playwright_socket_dir(
+        &ProfileOptions {
+            project_dir: std::path::Path::new("/projects/app"),
+            home_dir: std::path::Path::new("/Users/test"),
+            extra_read: &[],
+            extra_write: &[],
+            allow_socket: &[],
+            extra_deny: &[],
+            existing_home_tool_dirs: None,
+            existing_app_dirs: None,
+            extra_ports: &[],
+            localhost_ports: &[],
+            proxy_port: None,
+            proxy_forced: false,
+            allow_env_files: false,
+            allow_localhost_any: false,
+            scratch_dir: None,
+            allow_tmp_exec: false,
+            copilot_install_dir: None,
+            java_home: None,
+            dotnet_root: None,
+            git_hooks_path: None,
+            git_common_dir: None,
+            extra_git_dirs: &[],
+            allow_gpg_signing: false,
+            deny_clipboard: false,
+            allow_jvm_attach: false,
+            allow_msbuild: false,
+            allow_docker: false,
+            electron_app_dir: None,
+            agent: cplt::agent::Agent::Copilot,
+            agent_dirs: &[],
+            allow_cache_exec,
+            allow_cache_exec_any,
+            allow_browser: false,
+            credential_outside_keychain: false,
+        },
+        socket_dir,
+    )
+}
+
+#[test]
+fn playwright_socket_dir_validation_enforces_shape_and_length_budget() {
+    let valid = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+    validate_playwright_socket_dir(valid).unwrap();
+    assert!(valid.as_os_str().len() <= PLAYWRIGHT_SOCKET_BASE_MAX_BYTES);
+    assert!(
+        valid.as_os_str().len() + PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX.len()
+            < PLAYWRIGHT_SOCKET_PATH_LIMIT
+    );
+
+    for invalid in [
+        "/private/tmp",
+        "/private/tmp/cplt-pw-0123456789ABCDEF0123456789ABCDEF",
+        "/private/tmp/cplt-pw-0123456789abcdef",
+        "/private/tmp/not-cplt-pw-0123456789abcdef0123456789abcdef",
+        "/projects/app/cplt-pw-0123456789abcdef0123456789abcdef",
+        "/private/tmp/nested/cplt-pw-0123456789abcdef0123456789abcdef",
+        "/private/tmp/cplt-pw-0123456789abcdef0123456789abcde\"",
+    ] {
+        assert!(
+            validate_playwright_socket_dir(std::path::Path::new(invalid)).is_err(),
+            "unsafe Playwright socket path must be rejected: {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn playwright_socket_rules_are_exactly_scoped_for_runtime_intent() {
+    let socket_dir = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+    let socket_path = socket_dir.to_string_lossy();
+    let expected = [
+        format!("(allow network-bind (local unix-socket (subpath \"{socket_path}\")))"),
+        format!("(allow network-inbound (local unix-socket (subpath \"{socket_path}\")))"),
+        format!("(allow network-outbound (remote unix-socket (subpath \"{socket_path}\")))"),
+    ];
+
+    for cache_entry in ["ms-playwright", "ms-playwright/chromium-1243"] {
+        let profile = playwright_profile(&[cache_entry.to_string()], false, Some(socket_dir));
+        let scoped_rules: Vec<_> = profile
+            .lines()
+            .filter(|line| line.contains(socket_path.as_ref()))
+            .collect();
+        assert_eq!(
+            scoped_rules,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "{cache_entry:?} must emit only the three concrete socket operations"
+        );
+        assert!(
+            !profile
+                .contains("(allow network-bind (local unix-socket (subpath \"/private/tmp\")))")
+        );
+        assert!(
+            !profile
+                .contains("(allow network-inbound (local unix-socket (subpath \"/private/tmp\")))")
+        );
+        assert!(
+            !profile.contains(
+                "(allow network-outbound (remote unix-socket (subpath \"/private/tmp\")))"
+            )
+        );
+        assert!(!profile.contains("/private/tmp/cplt-pw-fedcba9876543210fedcba9876543210"));
+        assert!(
+            !profile
+                .contains("(allow network-bind (local unix-socket (subpath \"/projects/app\")))")
+        );
+        assert!(
+            !profile.contains(
+                "(allow network-bind (local unix-socket (subpath \"/scratch/session\")))"
+            )
+        );
+        assert!(!profile.contains("/private/tmp/unrelated.sock"));
+        assert!(!profile.contains("(allow process-exec (subpath \"/private/tmp/cplt-pw-"));
+        assert!(!profile.contains("(allow file-map-executable (subpath \"/private/tmp/cplt-pw-"));
+        assert!(profile.contains("(deny process-exec (subpath \"/private/tmp\"))"));
+        assert!(profile.contains("(deny file-map-executable (subpath \"/private/tmp\"))"));
+    }
+}
+
+#[test]
+fn playwright_socket_rules_require_both_exact_intent_and_automatic_path() {
+    let socket_dir = std::path::Path::new("/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef");
+    for (label, allow_cache_exec, allow_cache_exec_any, automatic_path) in [
+        ("no intent", Vec::<String>::new(), false, Some(socket_dir)),
+        (
+            "unrelated intent",
+            vec!["some-other-tool".to_string()],
+            false,
+            Some(socket_dir),
+        ),
+        (
+            "near miss",
+            vec!["ms-playwright-evil".to_string()],
+            false,
+            Some(socket_dir),
+        ),
+        (
+            "allow cache exec any alone",
+            Vec::<String>::new(),
+            true,
+            Some(socket_dir),
+        ),
+        (
+            "no automatic path",
+            vec!["ms-playwright".to_string()],
+            false,
+            None,
+        ),
+        (
+            "unsafe automatic path",
+            vec!["ms-playwright".to_string()],
+            false,
+            Some(std::path::Path::new("/private/tmp")),
+        ),
+    ] {
+        let profile = playwright_profile(&allow_cache_exec, allow_cache_exec_any, automatic_path);
+        assert!(
+            !profile.contains("Per-session Playwright control sockets"),
+            "{label} must not emit automatic Playwright socket rules"
+        );
+        assert!(
+            !profile.contains(socket_dir.to_string_lossy().as_ref()),
+            "{label} must not grant the candidate path"
+        );
+    }
+}
+
+const CHROME_FOR_TESTING_MACH_REGISTER_RULE: &str = r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#;
+const CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX: &str =
+    r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\."#;
+const CHROME_FOR_TESTING_APPS_MACH_REGISTER_SUFFIX: &str = r#"$"))"#;
+const CHROME_FOR_TESTING_APPS_HASH_ATOM: &str = "[0-9A-F]";
+const CHROME_FOR_TESTING_APPS_HASH_LENGTH: usize = 64;
+
+fn chrome_for_testing_apps_mach_register_rule() -> String {
+    format!(
+        "{CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX}{}{CHROME_FOR_TESTING_APPS_MACH_REGISTER_SUFFIX}",
+        CHROME_FOR_TESTING_APPS_HASH_ATOM.repeat(CHROME_FOR_TESTING_APPS_HASH_LENGTH)
+    )
+}
+
 #[test]
 fn chromium_runtime_rules_emitted_for_ms_playwright() {
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7126,6 +7481,7 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
         allow_cache_exec: &["ms-playwright".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow syscall*)"),
@@ -7144,6 +7500,14 @@ fn chromium_runtime_rules_emitted_for_ms_playwright() {
         "mach-register must be anchored with ^...$ and scoped to org.chromium.*"
     );
     assert!(
+        p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must be fully anchored with a numeric PID suffix"
+    );
+    assert!(
+        p.contains(&apps_mach_register_rule),
+        "Chrome for Testing apps mach-register must be fully anchored with an uppercase SHA-256 suffix"
+    );
+    assert!(
         p.contains(r#"(regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")"#),
         "SingletonSocket regex must use [^/]+/[^/]+ for var/folders segments and be fully anchored"
     );
@@ -7154,6 +7518,7 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
     // A user who pins a versioned subdirectory in allow_cache_exec should also
     // get the Chromium runtime rules — without them, Chrome segfaults even though
     // process-exec is allowed for the binary.
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7185,9 +7550,10 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
         electron_app_dir: None,
         agent: cplt::agent::Agent::Copilot,
         agent_dirs: &[],
-        allow_cache_exec: &["ms-playwright/chromium-1217".to_string()],
+        allow_cache_exec: &["ms-playwright/chromium-1243".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains("(allow syscall*)"),
@@ -7201,10 +7567,19 @@ fn chromium_runtime_rules_emitted_for_ms_playwright_subpath() {
         p.contains(r#"(regex #"^/private/var/folders/[^/]+/[^/]+/T/com\.google\.chrome\.for\.testing\.[^/]+/SingletonSocket$")"#),
         "SingletonSocket regex must use [^/]+/[^/]+ for subpath entry"
     );
+    assert!(
+        p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must be present for versioned subpath entry"
+    );
+    assert!(
+        p.contains(&apps_mach_register_rule),
+        "Chrome for Testing apps mach-register must be present for versioned subpath entry"
+    );
 }
 
 #[test]
 fn chromium_runtime_rules_absent_by_default() {
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7239,6 +7614,7 @@ fn chromium_runtime_rules_absent_by_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("(allow syscall*)"),
@@ -7248,11 +7624,20 @@ fn chromium_runtime_rules_absent_by_default() {
         !p.contains("SingletonSocket"),
         "SingletonSocket rules must not be emitted by default"
     );
+    assert!(
+        !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must not be emitted by default"
+    );
+    assert!(
+        !p.contains(&apps_mach_register_rule),
+        "Chrome for Testing apps mach-register must not be emitted by default"
+    );
 }
 
 #[test]
 fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
     // An unrelated allow_cache_exec entry must not trigger Chromium runtime rules.
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7287,6 +7672,7 @@ fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
         allow_cache_exec: &["some-other-tool".to_string()],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("(allow syscall*)"),
@@ -7296,12 +7682,21 @@ fn chromium_runtime_rules_absent_for_unrelated_cache_exec() {
         !p.contains("SingletonSocket"),
         "SingletonSocket rules must not be emitted for unrelated allow_cache_exec entry"
     );
+    assert!(
+        !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must not be emitted for unrelated allow_cache_exec entry"
+    );
+    assert!(
+        !p.contains(&apps_mach_register_rule),
+        "Chrome for Testing apps mach-register must not be emitted for unrelated allow_cache_exec entry"
+    );
 }
 
 #[test]
 fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
     // allow_cache_exec_any grants broad process-exec but must NOT trigger the
     // Chromium-specific IPC/syscall rules without an explicit "ms-playwright" entry.
+    let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
     let p = generate_profile(&ProfileOptions {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/Users/test"),
@@ -7336,6 +7731,7 @@ fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
         allow_cache_exec: &[],
         allow_cache_exec_any: true,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("(allow syscall*)"),
@@ -7344,6 +7740,14 @@ fn chromium_runtime_rules_absent_for_cache_exec_any_alone() {
     assert!(
         !p.contains("SingletonSocket"),
         "SingletonSocket rules must not be emitted when only allow_cache_exec_any is set"
+    );
+    assert!(
+        !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+        "Chrome for Testing mach-register must not be emitted when only allow_cache_exec_any is set"
+    );
+    assert!(
+        !p.contains(&apps_mach_register_rule),
+        "Chrome for Testing apps mach-register must not be emitted when only allow_cache_exec_any is set"
     );
 }
 
@@ -7360,6 +7764,7 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
         "not-ms-playwright",
         "xms-playwright",
     ] {
+        let apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
         let p = generate_profile(&ProfileOptions {
             project_dir: std::path::Path::new("/projects/app"),
             home_dir: std::path::Path::new("/Users/test"),
@@ -7394,6 +7799,7 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
             allow_cache_exec: &[name.to_string()],
             allow_cache_exec_any: false,
             allow_browser: false,
+            credential_outside_keychain: false,
         });
         assert!(
             !p.contains("(allow syscall*)"),
@@ -7402,6 +7808,121 @@ fn chromium_runtime_rules_absent_for_near_miss_names() {
         assert!(
             !p.contains("SingletonSocket"),
             "SingletonSocket must not be emitted for near-miss entry {name:?}"
+        );
+        assert!(
+            !p.contains(CHROME_FOR_TESTING_MACH_REGISTER_RULE),
+            "Chrome for Testing mach-register must not be emitted for near-miss entry {name:?}"
+        );
+        assert!(
+            !p.contains(&apps_mach_register_rule),
+            "Chrome for Testing apps mach-register must not be emitted for near-miss entry {name:?}"
+        );
+    }
+}
+
+#[test]
+fn chromium_runtime_mach_register_rules_remain_narrow() {
+    let expected_apps_mach_register_rule = chrome_for_testing_apps_mach_register_rule();
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/Users/test"),
+        extra_read: &[],
+        extra_write: &[],
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        extra_git_dirs: &[],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &["ms-playwright".to_string()],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+        credential_outside_keychain: false,
+    });
+
+    let mach_register_rules: Vec<_> = p
+        .lines()
+        .filter(|line| line.starts_with("(allow mach-register"))
+        .collect();
+    assert_eq!(
+        mach_register_rules,
+        [
+            r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#,
+            CHROME_FOR_TESTING_MACH_REGISTER_RULE,
+            expected_apps_mach_register_rule.as_str(),
+        ],
+        "only the three approved, fully anchored Chromium namespaces may be registered"
+    );
+    let apps_mach_register_rule = mach_register_rules
+        .iter()
+        .copied()
+        .find(|rule| rule.starts_with(CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX))
+        .expect("generated profile must contain the Chrome for Testing apps rule");
+    let apps_hash_pattern = apps_mach_register_rule
+        .strip_prefix(CHROME_FOR_TESTING_APPS_MACH_REGISTER_PREFIX)
+        .and_then(|suffix| suffix.strip_suffix(CHROME_FOR_TESTING_APPS_MACH_REGISTER_SUFFIX))
+        .expect("test helper must delimit the Chrome for Testing apps hash pattern");
+    assert_eq!(
+        apps_hash_pattern,
+        CHROME_FOR_TESTING_APPS_HASH_ATOM.repeat(CHROME_FOR_TESTING_APPS_HASH_LENGTH),
+        "apps hash pattern must contain exactly 64 adjacent uppercase-hex atoms"
+    );
+    assert_eq!(
+        apps_hash_pattern
+            .matches(CHROME_FOR_TESTING_APPS_HASH_ATOM)
+            .count(),
+        CHROME_FOR_TESTING_APPS_HASH_LENGTH,
+        "apps hash pattern must contain exactly 64 uppercase-hex atoms"
+    );
+    assert!(
+        !apps_hash_pattern
+            .chars()
+            .any(|character| matches!(character, '{' | '}' | '+' | '*' | '?')),
+        "apps hash pattern must not use counted or variable-length quantifiers"
+    );
+
+    for disallowed_rule in [
+        "(allow mach-register)",
+        r#"(allow mach-register (global-name-regex #"^com\.google\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\..+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]+$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{63}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-F]{65}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9a-f]{32}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9a-f]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.[0-9A-Z]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.Chrome\.apps\.[0-9A-F]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.beta\.apps\.[0-9A-F]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.dev\.apps\.[0-9A-F]{64}$"))"#,
+        r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.canary\.apps\.[0-9A-F]{64}$"))"#,
+    ] {
+        assert!(
+            !p.lines().any(|line| line == disallowed_rule),
+            "broader or unsupported mach-register rule must not be emitted: {disallowed_rule}"
         );
     }
 }
@@ -7455,6 +7976,7 @@ fn existing_app_dirs_none_includes_all() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&data_str),
@@ -7506,6 +8028,7 @@ fn existing_app_dirs_matching_includes_dir() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&data_str),
@@ -7558,6 +8081,7 @@ fn existing_app_dirs_nonmatching_excludes_dir() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains(&data_str),
@@ -7618,6 +8142,7 @@ fn existing_app_dirs_per_path_filtering() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         p.contains(&data_str),
@@ -7711,6 +8236,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
 
     // Config dir should be readable but NOT writable at subpath level
@@ -7797,6 +8323,7 @@ fn deny_clipboard_emits_pasteboard_deny_after_allow() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     let allow = p
         .find("(allow mach-lookup)")
@@ -7847,6 +8374,7 @@ fn no_deny_clipboard_by_default() {
         allow_cache_exec: &[],
         allow_cache_exec_any: false,
         allow_browser: false,
+        credential_outside_keychain: false,
     });
     assert!(
         !p.contains("com.apple.pasteboard"),
@@ -7930,6 +8458,8 @@ paths = []
 agent = "copilot"
 preset = "standard"
 validate = true
+brief = false
+agents_md = false
 allow_env_files = false
 allow_localhost_any = false
 pass_env = []
@@ -7949,6 +8479,7 @@ allow_docker = false
 allow_cache_exec = []
 allow_cache_exec_any = false
 allow_browser = false
+keychain_substitute = false
 git_push_prevention = false
 
 [gh_guard]
@@ -8774,4 +9305,115 @@ fn socket_masks_follow_the_uid() {
             .any(|p| p.to_string_lossy().contains("/run/user/1000/")),
         "no other uid may leak into the list, got {masks:?}"
     );
+}
+
+// ── Keychain credential brokering (#242) ──────────────────
+
+/// Minimal `ProfileOptions` for the #242 keychain-grant assertions.
+fn profile_opts<'a>(project: &'a std::path::Path, home: &'a std::path::Path) -> ProfileOptions<'a> {
+    ProfileOptions {
+        project_dir: project,
+        home_dir: home,
+        extra_read: &[],
+        extra_write: &[],
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: None,
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        extra_git_dirs: &[],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+        credential_outside_keychain: false,
+    }
+}
+
+/// A substitute credential must NOT be in `ENV_ALLOWLIST`.
+///
+/// That is the whole default-off property at the environment layer (#242): the
+/// variable reaches the agent only because `apply_deny_env_and_credential`
+/// forwards it as part of the trade. Allowlisting it would deliver it on every
+/// run with `sandbox.keychain_substitute` off, silently switching a user with
+/// the variable exported off their Keychain login — the exact change this trade
+/// refuses to make unasked.
+#[test]
+fn keychain_substitute_vars_are_never_allowlisted() {
+    use cplt::agent::Agent;
+    use cplt::sandbox::{ENV_ALLOWLIST, ENV_PREFIX_ALLOWLIST};
+
+    for agent in Agent::ALL {
+        for var in agent.keychain_substitute_env_vars() {
+            assert!(
+                agent.needs_keychain(),
+                "{agent:?} lists substitute credentials but never wanted the Keychain"
+            );
+            assert!(
+                !ENV_ALLOWLIST.contains(var),
+                "{agent:?}: {var} is allowlisted, so it reaches the agent even with \
+                 sandbox.keychain_substitute off — forward it in sandbox_exec instead"
+            );
+            assert!(
+                !ENV_PREFIX_ALLOWLIST.iter().any(|p| var.starts_with(p)),
+                "{agent:?}: {var} passes the prefix allowlist, same problem"
+            );
+        }
+    }
+}
+
+/// Profile level: the grant tracks the resolved credential, not the agent alone.
+#[test]
+fn profile_keychain_grant_follows_resolved_credential() {
+    use cplt::agent::Agent;
+    let project = std::path::Path::new("/projects/app");
+    let home = std::path::Path::new("/Users/test");
+
+    for agent in [Agent::Claude, Agent::Copilot, Agent::Antigravity] {
+        let mut opts = profile_opts(project, home);
+        opts.agent = agent;
+        opts.credential_outside_keychain = false;
+        assert!(
+            generate_profile(&opts).contains("/Users/test/Library/Keychains"),
+            "{agent:?}: grant must be kept when no substitute credential resolved"
+        );
+
+        let mut opts = profile_opts(project, home);
+        opts.agent = agent;
+        opts.credential_outside_keychain = true;
+        assert!(
+            !generate_profile(&opts).contains("/Users/test/Library/Keychains"),
+            "{agent:?}: grant must be dropped once the credential came from the environment"
+        );
+    }
+
+    // An agent that never needed it stays denied either way.
+    for (agent, in_env) in [(Agent::OpenCode, false), (Agent::OpenCode, true)] {
+        let mut opts = profile_opts(project, home);
+        opts.agent = agent;
+        opts.credential_outside_keychain = in_env;
+        assert!(
+            !generate_profile(&opts).contains("/Users/test/Library/Keychains"),
+            "{agent:?} never gets the Keychain grant"
+        );
+    }
 }

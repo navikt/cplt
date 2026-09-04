@@ -22,7 +22,8 @@ macro_rules! sbpl {
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     GPG_SIGNING_ALLOW_FILES, HOME_TOOL_DIRS, HomeToolDir, SENSITIVE_PROJECT_PATTERNS,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS, app_dirs, validate_sbpl_path,
+    SYSTEM_READ_FILES, TOOL_READ_DIRS, app_dirs, playwright_runtime_intent,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Options for generating an SBPL sandbox profile.
@@ -116,6 +117,16 @@ pub struct ProfileOptions<'a> {
     pub allow_cache_exec_any: bool,
     /// Allow Launch Services (`open` command) for OAuth browser flows.
     pub allow_browser: bool,
+    /// The agent's credential was resolved outside the Keychain before launch —
+    /// from an environment variable, or from a credential file the sandbox
+    /// already grants (Antigravity's `agy` keyring fallback) — so the macOS
+    /// Keychain grant is dropped for this run (#242).
+    ///
+    /// The grant is emitted when `agent.needs_keychain()` and this is `false`.
+    /// `false` is the fail-open default: no substitute credential resolved means
+    /// keep the grant, rather than launching an agent that cannot authenticate
+    /// and — with the Keychain gone — cannot re-authenticate either.
+    pub credential_outside_keychain: bool,
 }
 
 /// Generate a complete SBPL sandbox profile from the given options.
@@ -124,6 +135,18 @@ pub struct ProfileOptions<'a> {
 /// so deny rules must come after their corresponding allows. Each `emit_*` helper
 /// writes a contiguous block; their call order must not be changed.
 pub fn generate_profile(opts: &ProfileOptions) -> String {
+    generate_profile_with_playwright_socket_dir(opts, None)
+}
+
+/// Generate an SBPL profile with one validated, cplt-owned Playwright socket base.
+///
+/// The path is kept separate from [`ProfileOptions`] because it is ephemeral
+/// per process. It is honored only for exact Playwright runtime intent; callers
+/// must validate it with `validate_playwright_socket_dir` before interpolation.
+pub fn generate_profile_with_playwright_socket_dir(
+    opts: &ProfileOptions,
+    playwright_socket_dir: Option<&Path>,
+) -> String {
     let mut sb = String::with_capacity(4096);
     let home = opts.home_dir.to_string_lossy();
     let project = opts.project_dir.to_string_lossy();
@@ -131,10 +154,12 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     // Detect Chromium browser runtime: the user has opted in to executing
     // Playwright's Chromium binaries from ~/Library/Caches/ via allow_cache_exec.
     // When true, extra system-level permissions (syscall*, system-socket,
-    // iokit-open-user-client, mach-register) are emitted so Chromium can start.
+    // iokit-open-user-client, mach-register) are emitted for Chromium startup.
+    // cplt also injects PLAYWRIGHT_MCP_SANDBOX=false for this explicit runtime
+    // intent because Chromium cannot nest its own sandbox inside cplt's.
     //
     // Detection matches "ms-playwright" exactly or any subpath entry whose first
-    // component is "ms-playwright" (e.g. "ms-playwright/chromium-1217"). This
+    // component is "ms-playwright" (e.g. "ms-playwright/chromium-<version>"). This
     // covers users who pin a specific versioned subdirectory in allow_cache_exec.
     // Substring matching (e.g. contains("playwright")) is intentionally avoided:
     // matching on the first path component prevents a rogue agent from escalating
@@ -143,15 +168,21 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
     // allow_cache_exec_any does NOT trigger these rules: it grants process-exec
     // broadly, but Chromium's extra IPC/syscall permissions should only be
     // emitted when the user explicitly signals browser testing intent.
-    let allow_chromium_runtime = opts
-        .allow_cache_exec
-        .iter()
-        .any(|s| s == "ms-playwright" || s.starts_with("ms-playwright/"));
+    let allow_chromium_runtime =
+        playwright_runtime_intent(opts.allow_cache_exec, opts.allow_cache_exec_any);
+    let playwright_socket_dir =
+        playwright_socket_dir.filter(|path| validate_playwright_socket_dir(path).is_ok());
 
     emit_header(&mut sb, &project);
     emit_process_rules(&mut sb);
     emit_project_access(&mut sb, &project);
-    emit_home_access(&mut sb, &home, opts.agent, opts.agent_dirs);
+    emit_home_access(
+        &mut sb,
+        &home,
+        opts.agent,
+        opts.agent_dirs,
+        opts.credential_outside_keychain,
+    );
     emit_git_hooks(&mut sb, opts.git_hooks_path);
     emit_git_worktree(&mut sb, opts.git_common_dir);
     emit_system_access(
@@ -183,6 +214,9 @@ pub fn generate_profile(opts: &ProfileOptions) -> String {
         opts.allow_msbuild,
         opts.scratch_dir,
         allow_chromium_runtime,
+        allow_chromium_runtime
+            .then_some(playwright_socket_dir)
+            .flatten(),
     );
     emit_user_allows(&mut sb, opts.extra_read, opts.extra_write);
     emit_deny_rules(&mut sb, &home, opts.extra_deny);
@@ -291,16 +325,11 @@ fn emit_project_access(sb: &mut String, project: &str) {
 /// non-repo grant, and it covers a repo the agent creates mid-session with
 /// `git init` **at the grant root itself**.
 ///
-/// KNOWN GAP — only the root is ever covered, never a subdirectory of it.
-/// `--allow-write ~/work` denies `~/work/.git/hooks`, but
-/// `~/work/proj/.git/hooks` stays writable, whether `proj` was already a repo
-/// at launch or the agent creates one there during the session. This is the
-/// same shape as granting a directory that merely *contains* repos (#212's
-/// third scope bullet) and is not closed here: it needs either a repo walk at
-/// launch or a global path regex, and the regex is macOS-only — it would give
-/// Landlock nothing and widen the platform divergence. There is no dedicated
-/// issue for it: it is tracked as a checklist item under the multi-repo work in
-/// #165, alongside the same gap for a `--project-dir` that contains repos.
+/// The path rules here cover the root only. Repositories nested *beneath* a
+/// writable root — `~/work/proj/.git/hooks` under `--allow-write ~/work` — are
+/// covered by `emit_nested_gitdir_denies` instead (#247), which is a regex and
+/// therefore macOS only: on Linux that gap stays open outside bubblewrap, the
+/// same limitation already documented for the root case.
 fn writable_roots(project: &str, extra_write: &[PathBuf]) -> Vec<String> {
     let mut roots = vec![project.to_string()];
     for p in extra_write {
@@ -365,7 +394,13 @@ fn emit_sensitive_project_denies(
     }
 }
 
-fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[AgentDir]) {
+fn emit_home_access(
+    sb: &mut String,
+    home: &str,
+    agent: Agent,
+    agent_dirs: &[AgentDir],
+    credential_outside_keychain: bool,
+) {
     // Agent-specific directories (Copilot: ~/.copilot, OpenCode: ~/.config/opencode, etc.)
     if agent.needs_copilot_dir() {
         // Copilot config — the CLI needs its auth tokens and settings.
@@ -445,8 +480,12 @@ fn emit_home_access(sb: &mut String, home: &str, agent: Agent, agent_dirs: &[Age
     // macOS Keychain access — Copilot stores auth tokens here.
     // OpenCode stores its /connect credentials in its own data dir, and
     // third-party providers use env/config files — no Keychain needed.
-    if agent.needs_keychain() {
-        sbpl!(sb, ";; macOS Keychain (Copilot auth tokens)");
+    //
+    // Dropped for this run when the agent's credential already came from the
+    // environment (#242): the grant reaches every item in the login keychain
+    // whose ACL lets `/usr/bin/security` through, not just the agent's own.
+    if agent.needs_keychain() && !credential_outside_keychain {
+        sbpl!(sb, ";; macOS Keychain (agent auth tokens)");
         sbpl!(
             sb,
             "(allow file-read* (subpath \"{home}/Library/Keychains\"))"
@@ -506,24 +545,43 @@ fn emit_system_access(
     //    user clients during renderer init, even in headless mode (SwiftShader
     //    fallback still queries IOKit before deciding to use software rendering).
     //
-    // 4. mach-register — Chromium registers Mach services under the org.chromium.*
-    //    namespace for IPC between browser, renderer, GPU, and Crashpad processes.
+    // 4. mach-register — Chromium registers Mach services for IPC between
+    //    browser, renderer, GPU, and Crashpad processes. The namespace is the
+    //    build's bundle ID, not a fixed string: an upstream Chromium build uses
+    //    org.chromium.*, while the Chrome for Testing build Playwright actually
+    //    downloads uses com.google.chrome.for.testing.* (#263). The three
+    //    narrowly scoped rules below are allowed; anything else cannot register.
     //    Crashpad's child_port_handshake uses bootstrap_check_in() which requires
     //    this permission; without it, EPERM (1100) cascades into a segfault.
     //    Scoped to ^org\.chromium\..+$ — the trailing \. prevents matching
     //    "org.chromiumevil" and the .+$ ensures at least one character follows
     //    (Chromium uses variable-depth subnamespaces like crashpad.*, Chromium.*).
+    //    Playwright's Chrome for Testing also registers two exact namespaces:
+    //    com.google.chrome.for.testing.MachPortRendezvousServer.<pid> and
+    //    com.google.chrome.for.testing.apps.<user-data-dir-hash>. The first
+    //    suffix accepts numeric PIDs only. The apps suffix is exactly the
+    //    uppercase, 64-character hexadecimal SHA-256 of the user data directory.
+    //    Denied registration produces EPERM (1100), so both regexes are fully
+    //    anchored and limited to their observed suffix formats.
     //
     // SECURITY: these rules only activate when the user has explicitly opted in
     // to browser execution via allow_cache_exec containing "ms-playwright" or a
-    // subpath like "ms-playwright/chromium-1217" (first component must match exactly).
+    // subpath like "ms-playwright/chromium-<version>" (first component must match
+    // exactly).
     // syscall* is the broadest rule — Chrome uses undocumented Mach traps that
     // cannot be individually enumerated in a stable allowlist across OS versions.
     // iokit-open-user-client is unscoped because IOKit class names vary by GPU
     // hardware and macOS version; scoping would break on different machines.
     // system-socket is scoped to AF_UNIX — only Unix domain sockets, not TCP/UDP.
-    // mach-register is scoped to ^org\.chromium\..+$ to prevent registration
-    // of arbitrary global Mach services.
+    // mach-register is limited to the anchored org.chromium.* namespace and the
+    // two exact Chrome for Testing namespaces and suffix formats above,
+    // preventing registration of arbitrary global Mach services.
+    // Chrome helpers inherit cplt's Seatbelt profile and cannot reinitialize
+    // Seatbelt inside it (`forbidden-sandbox-reinit`). Under explicit Playwright
+    // runtime intent, cplt injects PLAYWRIGHT_MCP_SANDBOX=false unless the caller
+    // explicitly passes that variable through. cplt remains the outer enforcing
+    // boundary, but a compromised renderer then receives this complete opt-in
+    // Chromium profile.
     if allow_chromium_runtime {
         sbpl!(
             sb,
@@ -532,9 +590,22 @@ fn emit_system_access(
         sbpl!(sb, "(allow syscall*)");
         sbpl!(sb, "(allow system-socket (socket-domain AF_UNIX))");
         sbpl!(sb, "(allow iokit-open-user-client)");
+        // Separate rules rather than one loose pattern keep each literal
+        // namespace and observed suffix format fully anchored.
         sbpl!(
             sb,
             r#"(allow mach-register (global-name-regex #"^org\.chromium\..+$"))"#
+        );
+        sbpl!(
+            sb,
+            r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$"))"#
+        );
+        // Seatbelt does not match counted repetition here, so preserve the
+        // exact SHA-256 length with 64 explicit uppercase-hex atoms.
+        let apps_hash_pattern = "[0-9A-F]".repeat(64);
+        sbpl!(
+            sb,
+            r#"(allow mach-register (global-name-regex #"^com\.google\.chrome\.for\.testing\.apps\.{apps_hash_pattern}$"))"#
         );
         sbpl!(sb);
     }
@@ -548,7 +619,7 @@ fn emit_system_access(
     sbpl!(sb);
 
     // Launch Services — allows `open` to launch URLs in the default browser.
-    // Needed for OAuth code flows (MCP servers, Gemini CLI, gh auth).
+    // Needed for OAuth code flows (MCP servers, Antigravity, gh auth).
     // Opt-in because it lets the agent leverage the user's browser session state.
     if allow_browser {
         sbpl!(sb, ";; Launch Services (OAuth browser flows)");
@@ -794,6 +865,76 @@ fn emit_git_persistence_denies(
     // free only because nothing legitimate ever writes it.
     sbpl!(sb, ";; Per-worktree git config (core.hooksPath vector)");
     sbpl!(sb, "(deny file-write* (regex #\"/config\\.worktree$\"))");
+    sbpl!(sb);
+
+    for root in writable_roots(project, extra_write) {
+        emit_nested_gitdir_denies(sb, &root);
+    }
+}
+
+/// Escape the regex metacharacters that can still appear in a path.
+///
+/// `validate_sbpl_path` already rejects `"`, `(`, `)`, `;`, `\` and newlines, so
+/// what is left is the set below. Without this a project directory like
+/// `~/code/v1.0+rc` would compile to a rule matching more than it names.
+fn escape_regex(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(
+            c,
+            '.' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Extend the git-persistence denies to repositories nested *beneath* a
+/// writable root (#247).
+///
+/// `emit_gitdir_denies` names paths, so it can only cover gitdirs known when
+/// the profile is generated: the project's own, and `<root>/.git` for every
+/// writable root. With `--project-dir ~/code`, or an `allow.write` on a
+/// directory that contains repositories, `~/code/other-repo/.git/hooks/…` stayed
+/// writable — and hooks planted there run outside the sandbox on the user's next
+/// git operation in that repo. A path rule cannot express "any depth", so this
+/// is the one place a regex earns its keep.
+///
+/// The alternation mirrors `emit_gitdir_denies` exactly — `hooks`, `config`,
+/// `commondir`, `modules` — with `($|/)` so the directory entry itself is
+/// covered too (otherwise the agent could plant a *symlink* named `hooks`
+/// pointing at a writable directory). `file-write-unlink` and `file-write-data`
+/// on the `.git` entry close the rename-away trick and the worktree pointer-file
+/// rewrite, for the same reasons spelled out on `emit_gitdir_denies`.
+///
+/// Deliberately narrow: the leading `.+/` means the root's own `.git` is not
+/// matched here (it already has the stronger literal rules), and nothing outside
+/// a path component spelled exactly `.git` can match — `.github/workflows` does
+/// not, because `\.git/` requires the separator immediately after `.git`.
+/// Ordinary work inside a nested repo — source files, build output, and every
+/// git internal except the four names above — is untouched.
+///
+/// Cost: `git clone` and `git init` into a nested directory now fail on their
+/// `.git/config` write. That is the same trade already accepted at the root, and
+/// the alternative is leaving hook execution open.
+///
+/// macOS only. Landlock cannot deny a subpath inside an allowed tree, so on
+/// Linux this gap stays open outside bubblewrap — the same limitation already
+/// documented for the root case. Nothing here implies Linux coverage.
+fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
+    let r = escape_regex(root);
+    sbpl!(
+        sb,
+        ";; Git persistence prevention — repos nested under {root}"
+    );
+    sbpl!(
+        sb,
+        "(deny file-write* (regex #\"^{r}/.+/\\.git/(hooks|config|commondir|modules)($|/)\"))"
+    );
+    sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/.+/\\.git$\"))");
+    sbpl!(sb, "(deny file-write-data (regex #\"^{r}/.+/\\.git$\"))");
     sbpl!(sb);
 }
 
@@ -1164,12 +1305,34 @@ fn emit_temp_rules(
     allow_msbuild: bool,
     scratch_dir: Option<&Path>,
     allow_chromium_runtime: bool,
+    playwright_socket_dir: Option<&Path>,
 ) {
     sbpl!(sb, ";; Temp directories");
     sbpl!(sb, "(allow file-read* (subpath \"/private/tmp\"))");
     sbpl!(sb, "(allow file-write* (subpath \"/private/tmp\"))");
     sbpl!(sb, "(allow file-read* (subpath \"/private/var/folders\"))");
     sbpl!(sb, "(allow file-write* (subpath \"/private/var/folders\"))");
+    if let Some(socket_dir) = playwright_socket_dir {
+        let socket_path = socket_dir.to_string_lossy();
+        // SECURITY: this grants only AF_UNIX operations below the one random,
+        // cplt-owned directory validated before profile generation. The
+        // existing /private/tmp file rules are sufficient; no temp execution
+        // or additional file permission accompanies this capability.
+        sbpl!(sb, ";; Per-session Playwright control sockets");
+        sbpl!(
+            sb,
+            "(allow network-bind (local unix-socket (subpath \"{socket_path}\")))"
+        );
+        sbpl!(
+            sb,
+            "(allow network-inbound (local unix-socket (subpath \"{socket_path}\")))"
+        );
+        sbpl!(
+            sb,
+            "(allow network-outbound (remote unix-socket (subpath \"{socket_path}\")))"
+        );
+        sbpl!(sb);
+    }
     if allow_chromium_runtime {
         // Chrome's ProcessSingleton binds a Unix socket in the macOS user temp dir
         // to prevent multiple Chrome instances sharing the same profile directory.
@@ -1770,6 +1933,30 @@ mod tests {
     use super::*;
 
     /// Build a minimal `ProfileOptions` for SBPL-string tests.
+    /// Resolving git from trusted directories means `git_common_dir` is `None`
+    /// on a machine whose git lives elsewhere. The denies for an ordinary repo
+    /// must not depend on it: `<root>/.git` is seeded for every writable root
+    /// unconditionally, so the hooks and config denies stand with no git at all.
+    ///
+    /// Pins the boundary of that guarantee — a worktree's *shared* gitdir, and
+    /// any grant whose repo data is not at `<root>/.git`, still need resolving.
+    /// `discover::gitdir_without_git` recovers those by reading the `.git`
+    /// pointer (and its `commondir`) without spawning anything.
+    #[test]
+    fn git_persistence_denies_do_not_depend_on_a_resolved_git() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        opts.git_common_dir = None;
+        let p = generate_profile(&opts);
+        for rule in [
+            r#"(deny file-write* (subpath "/projects/app/.git/hooks"))"#,
+            r#"(deny file-write* (literal "/projects/app/.git/config"))"#,
+        ] {
+            assert!(p.contains(rule), "MISSING without git_common_dir: {rule}");
+        }
+    }
+
     fn test_options<'a>(
         project_dir: &'a std::path::Path,
         home_dir: &'a std::path::Path,
@@ -1808,6 +1995,7 @@ mod tests {
             allow_cache_exec: &[],
             allow_cache_exec_any: false,
             allow_browser: false,
+            credential_outside_keychain: false,
         }
     }
 
@@ -2058,6 +2246,65 @@ mod tests {
         assert!(
             !p.contains("\"*:443\""),
             "fail-closed: proxy_forced without a port must not emit *:443"
+        );
+    }
+
+    /// Issue #247: a repo nested under a writable root got no git-persistence
+    /// denies at all, so `~/code/other-repo/.git/hooks/post-checkout` was
+    /// writable and ran unsandboxed on the user's next git operation there.
+    ///
+    /// The kernel behaviour behind these strings was verified with
+    /// `sandbox-exec` against a real nested repository: the hook plant, the
+    /// `.git/config` append, the `mv .git .gitbak` rename and the pointer-file
+    /// rewrite are all refused, while `git add`/`commit`/`checkout -b`/`stash`/
+    /// `gc` inside that repo — and every write under `src/`, `target/`,
+    /// `.github/` — still succeed.
+    #[test]
+    fn nested_repos_under_every_writable_root_get_git_denies() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = root.replace('.', r"\.");
+            for rule in [
+                format!(
+                    "(deny file-write* (regex #\"^{esc}/.+/\\.git/(hooks|config|commondir|modules)($|/)\"))"
+                ),
+                format!("(deny file-write-unlink (regex #\"^{esc}/.+/\\.git$\"))"),
+                format!("(deny file-write-data (regex #\"^{esc}/.+/\\.git$\"))"),
+            ] {
+                assert!(p.contains(&rule), "missing for {root}: {rule}\n{p}");
+            }
+        }
+
+        // Last-match-wins: nothing may re-open write after these.
+        let nested_deny = p
+            .rfind("/.+/\\.git/(hooks|config|commondir|modules)")
+            .expect("nested deny missing");
+        let last_write_allow = p.rfind("(allow file-write*").expect("no write allows");
+        assert!(
+            last_write_allow < nested_deny,
+            "a write allow @ {last_write_allow} comes after the nested git deny @ {nested_deny}"
+        );
+    }
+
+    /// A path is interpolated into a regex, so its metacharacters must not be.
+    /// `~/code/v1.0+rc` would otherwise match `v1X0rc`, `v1X00rc`, and more.
+    #[test]
+    fn nested_gitdir_regex_escapes_path_metacharacters() {
+        let project = std::path::Path::new("/projects/v1.0+rc[x]");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home));
+
+        assert!(
+            p.contains(
+                r#"(deny file-write-unlink (regex #"^/projects/v1\.0\+rc\[x\]/.+/\.git$"))"#
+            ),
+            "path metacharacters not escaped:\n{p}"
         );
     }
 

@@ -569,6 +569,14 @@ pub struct SandboxConfig {
     pub preset: Option<Preset>,
     /// Run sandbox-exec validation test on startup (default: true).
     pub validate: Option<bool>,
+    /// Write the per-session agent-facing sandbox brief to the scratch dir
+    /// (default: false — opt-in). Enable with `--brief` or
+    /// `sandbox.brief = true`.
+    pub brief: Option<bool>,
+    /// Also inject the managed sandbox block into the project's `AGENTS.md`
+    /// (default: false — opt-in, since it writes into the user's repo).
+    /// Requires `brief`: with the brief off, this never fires.
+    pub agents_md: Option<bool>,
     /// Allow reading .env files and private keys in project dir (default: false).
     pub allow_env_files: Option<bool>,
     /// Allow all localhost outbound (default: false).
@@ -624,6 +632,13 @@ pub struct SandboxConfig {
     /// Allow Launch Services (`open` command) for OAuth browser flows (default: false).
     /// Lets the sandboxed agent open URLs in your default browser.
     pub allow_browser: Option<bool>,
+    /// EXPERIMENTAL (default: false). Drop the macOS Keychain grant for runs
+    /// where the agent has a credential it can reach without it (#242).
+    ///
+    /// Off by default on purpose: when this misjudges an agent the user can
+    /// neither authenticate nor recover from inside the sandbox, because the
+    /// recovery path *is* the credential store the trade just removed.
+    pub keychain_substitute: Option<bool>,
     /// Enable per-session scratch directory for TMPDIR redirect (default: true).
     /// Creates an executable temp dir so tools like `go test` and `mise` can work.
     pub scratch_dir: Option<bool>,
@@ -762,6 +777,8 @@ pub struct Resolved {
     pub allow_localhost_any: bool,
     pub allow_env_files: bool,
     pub no_validate: bool,
+    pub brief: bool,
+    pub agents_md: bool,
     pub pass_env: Vec<String>,
     pub inherit_env: bool,
     pub allow_lifecycle_scripts: bool,
@@ -775,6 +792,9 @@ pub struct Resolved {
     pub allow_cache_exec: Vec<String>,
     pub allow_cache_exec_any: bool,
     pub allow_browser: bool,
+    /// EXPERIMENTAL: trade the macOS Keychain grant for a credential the agent
+    /// can reach without it (`sandbox.keychain_substitute`, default false).
+    pub keychain_substitute: bool,
     pub scratch_dir: bool,
     pub use_bubblewrap: Option<bool>,
     pub quiet: bool,
@@ -833,6 +853,14 @@ pub struct CliFlags {
     /// Preset-controlled toggle (see `allow_localhost_any`).
     pub allow_env_files: FeatureToggle,
     pub no_validate: bool,
+    /// `--brief` / `--no-brief`: the agent-facing sandbox brief for this run.
+    /// Tri-state so a config `sandbox.brief = true` can be turned off for one
+    /// run without editing the config.
+    pub brief: FeatureToggle,
+    /// `--agents-md` / `--no-agents-md`: the managed AGENTS.md block for this
+    /// run. Still gated on `brief`, exactly like `sandbox.agents_md`, so
+    /// `--no-brief` suppresses it too.
+    pub agents_md: FeatureToggle,
     pub pass_env: Vec<String>,
     pub inherit_env: bool,
     /// Preset-controlled toggle (see `allow_localhost_any`).

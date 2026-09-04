@@ -72,16 +72,6 @@ jobs:
           toolchain: "1.94"
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # ratchet:actions/cache@v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: release-${{ matrix.target }}-
-
       - name: Build release binary
         run: |
           CPLT_LONG_VERSION="${{ needs.version.outputs.version }}" cargo build --release --target ${{ matrix.target }}

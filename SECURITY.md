@@ -4,49 +4,50 @@ This is the security architecture of cplt: the threat model it addresses, the de
 
 ## Supported agents
 
-cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **[OpenCode](https://opencode.ai/)**, **Google Gemini CLI**, **[Antigravity CLI](https://github.com/google-antigravity/antigravity-cli)**, **[Pi](https://github.com/earendil-works/pi)**, and **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**. All share the same core sandbox (deny-default Seatbelt/Landlock profile, env sanitization, scratch dir), with per-agent adaptations:
+cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **[OpenCode](https://opencode.ai/)**, **Google Gemini CLI**, **[Antigravity CLI](https://github.com/google-antigravity/antigravity-cli)**, **[Pi](https://github.com/earendil-works/pi)**, **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**, and **[goose](https://github.com/aaif-goose/goose)**. All share the same core sandbox (deny-default Seatbelt/Landlock profile, env sanitization, scratch dir), with per-agent adaptations:
 
-| Property        | Copilot                             | OpenCode                                                            | Gemini                                    | Antigravity                                 | Pi                                          | Claude Code                                  |
-|-----------------|-------------------------------------|---------------------------------------------------------------------|-------------------------------------------|----------------------------------------------|---------------------------------------------|----------------------------------------------|
-| Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow to `auth.json`, or API keys                  | Google OAuth (browser) or API key         | Google OAuth (browser / keyring session)     | API keys (Anthropic, OpenAI, Gemini, etc.)  | OAuth token (Keychain / `~/.claude`) or API key |
-| Auth in sandbox | Token served via one-time file read (gh guard) or Keychain | Copilot auth stored in data dir; third-party keys need `--pass-env` | OAuth stored in `~/.gemini/`; key needs `--pass-env` | OAuth/session data stored in `~/.gemini/*` | Keys need `--pass-env`             | OAuth stored in `~/.claude`/Keychain; keys need `--pass-env` |
-| Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini` (read/write)                  | `~/.gemini/config` (read/write)              | `~/.pi` (read/write)                       | `~/.claude` + `~/.claude.json` (read/write)  |
-| Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          | N/A (in config dir)                       | `~/.gemini/antigravity-cli` (read/write)     | `~/.pi/agent/bin` (read + exec)             | N/A (in config dir)                          |
-| State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          | N/A                                       | N/A                                          | N/A                                          | N/A                                          |
-| Keychain access | Yes (required for token storage)    | No                                                                  | Yes (extension integrity)                 | Yes (OAuth/keyring flow)                     | No                                          | Yes (macOS OAuth token storage)              |
-| SEA extraction  | Yes (pre-sandbox)                   | No                                                                  | No                                        | No                                           | No                                          | No                                           |
-| Env isolation   | `GH_TOKEN` not injected (one-time file); `COPILOT_*` passed | suppressed (see below)                          | suppressed (see below)        | suppressed (see below)           | suppressed (see below)          | suppressed (see below); `DISABLE_AUTOUPDATER=1` injected |
-| Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                          | Yes (priority 4)                             | No (explicit only, name collision risk)     | No (explicit only)                           |
+| Property        | Copilot                             | OpenCode                                                            | Antigravity                                 | Pi                                          | Claude Code                                  |
+|-----------------|-------------------------------------|---------------------------------------------------------------------|----------------------------------------------|---------------------------------------------|----------------------------------------------|
+| Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow to `auth.json`, or API keys                  | Google OAuth (browser / keyring session)     | API keys (Anthropic, OpenAI, Gemini, etc.)  | OAuth token (Keychain / `~/.claude`) or API key |
+| Auth in sandbox | Token served via one-time file read (gh guard) or Keychain | Copilot auth stored in data dir; third-party keys need `--pass-env` | OAuth/session data stored in `~/.gemini/*` | Keys need `--pass-env`             | OAuth stored in `~/.claude`/Keychain; keys need `--pass-env` |
+| Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini/config` (read/write)              | `~/.pi` (read/write)                       | `~/.claude` + `~/.claude.json` (read/write)  |
+| Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          | `~/.gemini/antigravity-cli` (read/write)     | `~/.pi/agent/bin` (read + exec)             | N/A (in config dir)                          |
+| State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          | N/A                                          | N/A                                          | N/A                                          |
+| Keychain access | Yes                                 | No                                                                  | Yes (OAuth/keyring flow)                     | No                                          | Yes (macOS OAuth token storage)              |
+| SEA extraction  | Yes (pre-sandbox)                   | No                                                                  | No                                           | No                                          | No                                           |
+| Env isolation   | `GH_TOKEN` not injected (one-time file); `COPILOT_*` passed | suppressed (see below)                          | suppressed (see below)           | suppressed (see below)          | suppressed (see below); `DISABLE_AUTOUPDATER=1` injected |
+| Auto-detected   | Yes (priority 1)                    | Yes (priority 2)                                                    | Yes (priority 3)                             | No (explicit only, name collision risk)     | No (explicit only)                           |
+
+¹ Unless the experimental `sandbox.keychain_substitute` is on *and* the agent has a credential it can reach without the Keychain — see [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing).
+
 
 ### Rules that apply to every non-Copilot agent
 
-- **Copilot env vars are suppressed.** `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, and every `COPILOT_*` variable are stripped for OpenCode, Gemini, Antigravity, Pi, and Claude Code. OpenCode's Copilot provider uses its own auth file instead.
+- **Copilot env vars are suppressed.** `GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, and every `COPILOT_*` variable are stripped for OpenCode, Gemini, Antigravity, Pi, Claude Code, and goose. OpenCode's Copilot provider uses its own auth file instead.
 - **Third-party API keys are opt-in.** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), and the Bedrock/Vertex routing vars (`CLAUDE_CODE_USE_BEDROCK`, `AWS_BEARER_TOKEN_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`) are never passed through by default. You have to name each one with `--pass-env`. That keeps credentials from reaching a sandboxed process by accident.
 
-- **Host-persistence guard on the agent's own config dir.** Every agent gets its global config dir mounted read/write, and some files in there auto-execute the next time the agent runs *outside* the sandbox. Those paths are write-denied (`Agent::host_persistence_denies`):
+- **Host-persistence guard on the agent's own config dir.** Most agents get their global config dir mounted read/write, and some files in there auto-execute the next time the agent runs *outside* the sandbox. goose is the exception: its config dir is read-only, because it rewrites `config.yaml` by rename, which needs directory write and would hand back the whole vector. Those paths are write-denied (`Agent::host_persistence_denies`):
 
   | Agent | Denied inside the granted config dir |
   | --- | --- |
   | Claude Code | `settings.json`, `statusline.sh`, `plugins/` |
-  | Gemini | `settings.json`, `extensions/`, `policies/`, `hooks/` |
   | Pi | `settings.json`, `extensions/`, `npm/`, `git/` |
   | Antigravity | `config/hooks.json`, `config/mcp_config.json`, `antigravity-cli/bin/` |
+  | goose | — (its whole config dir is read-only; see below) |
   | Copilot, OpenCode | — |
 
-  Three of these go beyond "the file that names the code". Gemini's `hooks/` is where the scripts `settings.json` points at conventionally live, and Pi's `npm/` and `git/` hold the code of packages `pi install` already fetched: denying only the settings file stops a *new* entry being added while leaving the code an existing entry already points at editable in place, which loads on the next host run. Antigravity's `bin/` holds `agentapi` and `webm_encoder`, which it executes on the host.
-- **No `allow.write` reopens them.** On **macOS** the denies are emitted at the tail of the profile, after `emit_user_allows`, so SBPL last-match-wins keeps them on top. That placement is load-bearing: while they sat beside the dir-wide allow, `allow.write = ["~/.gemini"]` — an ordinary grant, since `is_unsafe_root` only rejects `~` itself — silently reopened every one of them, including Claude's pre-existing `statusline.sh` and `plugins/`. This is the same fix #212 applied to the git-persistence denies. The consequence is that there is deliberately **no in-cplt escape hatch**: a step that needs to write a denied file happens outside cplt.
+  Two of these go beyond "the file that names the code". Pi's `npm/` and `git/` hold the code of packages `pi install` already fetched: denying only the settings file stops a *new* entry being added while leaving the code an existing entry already points at editable in place, which loads on the next host run. Antigravity's `bin/` holds `agentapi` and `webm_encoder`, which it executes on the host.
+- **No `allow.write` reopens them.** On **macOS** the denies are emitted at the tail of the profile, after `emit_user_allows`, so SBPL last-match-wins keeps them on top. That placement is load-bearing: while they sat beside the dir-wide allow, `allow.write = ["~/.claude"]` — an ordinary grant, since `is_unsafe_root` only rejects `~` itself — silently reopened every one of them, including Claude's `statusline.sh` and `plugins/`. This is the same fix #212 applied to the git-persistence denies. The consequence is that there is deliberately **no in-cplt escape hatch**: a step that needs to write a denied file happens outside cplt.
 - **Linux is weaker.** Landlock cannot deny a subpath inside an allowed directory, so the deny is carried by the same bubblewrap read-only overlay used for `.git/hooks`: it holds only when `bwrap` is present, and only for paths that **already exist on disk** — bubblewrap cannot bind a missing source. That caveat bites harder here than it does for git, because `git init` creates `.git/hooks` while `extensions/` does not exist until the first extension is installed, so on Linux that particular deny is nominal in the common case. Without bubblewrap, the guard is unenforced on Linux entirely.
-- **Cost: do the affected step outside cplt.** Denying `settings.json` breaks whatever writes it. For **Gemini** that is sign-in itself: it records the auth method you pick as `selectedAuthType` in that file. For **Pi** it is `pi install` plus every in-session setting that persists there — `/model` (Ctrl+S), `/thinking`, `/settings` — but not auth, which comes from provider API keys via `--pass-env`. For **Claude Code** and **Antigravity** auth is unaffected; the cost is editing hooks, MCP config or a statusline from inside a session.
-- **cplt warns before you meet this as a denied write.** Before starting Gemini, cplt checks whether sign-in has already happened (`~/.gemini/oauth_creds.json` exists, or `settings.json` already records a `selectedAuthType`) and, if not, warns and launches anyway. It is a warning rather than a refusal because the login may be the only thing the deny breaks, and blocking the run takes that judgement away from you. The trade is that you can still walk into the failure — Gemini catches the `EPERM` and prints `Failed to save settings: …` with nothing naming cplt in it — so the warning quotes that error, names the file, and gives the one-time fix, to be recognisable after it has scrolled off. Skipped only where the premise is wrong: a provider API key passed with `--pass-env` authenticates without touching the file, and `--inherit-env` may carry one cplt cannot see. It is two filesystem probes and never fails on an I/O error: anything it cannot read is treated as authenticated.
+- **Cost: do the affected step outside cplt.** Denying `settings.json` breaks whatever writes it. For **Pi** it is `pi install` plus every in-session setting that persists there — `/model` (Ctrl+S), `/thinking`, `/settings` — but not auth, which comes from provider API keys via `--pass-env`. For **Claude Code** and **Antigravity** auth is unaffected; the cost is editing hooks, MCP config or a statusline from inside a session.
 
 
 ### Agent notes beyond the table
 
 **OpenCode.** The data dir (`~/.local/share/opencode/`: sessions, auth, SQLite DB) and the state dir (`~/.local/state/opencode/`: locks, history, statistics) both carry `(deny process-exec)` and `(deny file-map-executable)` alongside their write permission, so neither can be used for write-then-exec persistence. The config dir (`~/.config/opencode/opencode.json` and friends) is read-only, so the agent cannot tamper with settings that apply to unsandboxed runs.
 
-**Gemini.** First-time OAuth login needs `--allow-browser`, and has to be done **outside cplt** (cplt warns before launching an unauthenticated Gemini, because the login will fail as a denied write — see above): `~/.gemini/settings.json` is write-denied by the host-persistence guard and Gemini writes `selectedAuthType` there on first login. `~/.gemini/` otherwise holds auth, settings, sessions, and agents read/write. `settings.json`, `extensions/`, `policies/` and `hooks/` are the denied paths — `policies/*.toml` is the user policy tier, which is not trust-gated either and where `decision = "allow"` on `run_shell_command` makes the next host run auto-execute without confirmation. `settings.json`'s `hooks.SessionStart[].hooks[].command` entries run with the user's privileges the next time `gemini` starts *outside* the sandbox — `SessionStart` fires on application startup, on resume, and after `/clear` — and user-level hooks are not gated by folder trust, which covers workspace (`.gemini/`) settings, custom commands, MCP servers and extensions, and does not disable `~/.gemini/settings.json`. **Deliberate residual: `trustedFolders.json` stays writable.** This is a decision, not an oversight — a sandboxed agent has to be able to trust the folder it is working in, and denying the file would break folder trust from inside cplt. It is the unsigned central record of per-folder trust decisions, and the trust prompt is not merely a disclosure — it is the **gate** between a project's `.gemini/settings.json` hooks and execution on your host. Writing that file marks a folder trusted, which removes the gate. What it no longer buys an attacker is a hook of their own: `~/.gemini/settings.json` is denied, and workspace `.gemini/` settings live in the project tree, where the audit surfaces them as a diff. What it still buys is a project-level hook that arrived some other way — a dependency, a branch, a repo you cloned — running with no prompt at all. Review project-level `.gemini/` config yourself rather than relying on the dialog. `~/.pi/agent/trust.json` is the same class and the same decision, for the same reason. The `settings.json` deny is also subject to the Linux limits described above.
 
-**Antigravity.** macOS keyring/Keychain integration is the authentication trade-off here, the same one the other OAuth agents make. Its two grants carry their own auto-executing config, so the host-persistence guard applies: `~/.gemini/config/hooks.json` names host commands, `~/.gemini/config/mcp_config.json` holds `mcpServers` that auto-start, and `~/.gemini/antigravity-cli/bin/` holds binaries (`agentapi`, `webm_encoder`) Antigravity runs on the host. All three are write-denied. Note that Antigravity is granted `~/.gemini/config` and `~/.gemini/antigravity-cli`, not `~/.gemini` itself, so Gemini's own user-level `settings.json` is not writable through an Antigravity session.
+**Antigravity.** Keeps the Keychain grant unless `~/.gemini/antigravity-cli/antigravity-oauth-token` already exists — that file is `agy`'s *keyring fallback*, not a mirror, so its presence is the only safe signal that the agent can authenticate without the grant (#242). See [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). Its two grants carry their own auto-executing config, so the host-persistence guard applies: `~/.gemini/config/hooks.json` names host commands, `~/.gemini/config/mcp_config.json` holds `mcpServers` that auto-start, and `~/.gemini/antigravity-cli/bin/` holds binaries (`agentapi`, `webm_encoder`) Antigravity runs on the host. All three are write-denied. Note that Antigravity is granted `~/.gemini/config` and `~/.gemini/antigravity-cli`, not `~/.gemini` itself, so Gemini's own user-level `settings.json` is not writable through an Antigravity session.
 
 **Pi.** Not auto-detected: the `pi` binary name is generic and may collide with other tools, so select it explicitly with `--agent pi` or `sandbox.agent = "pi"`. `~/.pi/agent/` holds settings, auth, sessions, and themes. The managed binary dir `~/.pi/agent/bin/` (bundled `fd`, `rg`) has process-exec, and on **macOS only** an explicit `(deny file-write*)` is emitted for it at the tail of the profile — alongside the host-persistence denies, and for the same reason: emitted next to the parent allow it was reopenable by a later user `allow.write`. Linux has no equivalent: Landlock rules are additive, so the parent's read+write unions with the child's read+exec and `~/.pi/agent/bin/` ends up **writable and executable**. `~/.pi/agent/extensions/`, `settings.json`, `npm/` and `git/` are write-denied by the host-persistence guard (macOS Seatbelt; on Linux only via the bubblewrap overlay, and only for paths that already exist). Pi auto-discovers `~/.pi/agent/extensions/*.ts` and `*/index.ts` and loads them at startup without confirmation, since the project-trust gate covers only project-local `.pi/extensions`, and Pi's own documentation states that extensions run with the user's full system permissions and can execute arbitrary code. `settings.json` in the same directory is denied for the same reason: its `extensions` key loads code from arbitrary file paths and its `packages` key from npm or git, so denying the `extensions/` directory alone would not close the vector. `npm/` and `git/` are denied because that is where `pi install` puts the code: without them, denying `settings.json` would stop a *new* `packages` entry being added while leaving an already-installed package editable in place, and it loads on the next host run. A file written to any of these would execute unsandboxed the next time `pi` runs on the host. The cost is in-sandbox package management plus every setting that persists to `settings.json` — `/model` (Ctrl+S), `/thinking`, `/settings`. Do those outside cplt. Auth is unaffected: Pi has no interactive login and reads provider API keys from the environment.
 
@@ -57,6 +58,14 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
 - **Host-persistence guard.** Inside that writable config dir, `statusline.sh`, `plugins/` and `settings.json` are explicitly write-denied. All three auto-execute the next time `claude` runs *outside* the sandbox, so a compromised agent could otherwise plant code that escapes via the next launch. `settings.json` was previously left writable on the grounds that it needs explicit user invocation; that was wrong — its `hooks` key auto-fires on `SessionStart`, `UserPromptSubmit` and other events, so it is now denied. `commands/`, `agents/`, and `skills/` stay writable, because Claude legitimately authors them and they really do run only when the user invokes them. Enforcement follows the platform limits above: full on macOS, bubblewrap-only on Linux. These denies also moved to the tail of the profile, which fixed a pre-existing hole — `allow.write = ["~/.claude"]` used to reopen `statusline.sh` and `plugins/`. The residual `mcpServers` risk in `~/.claude.json` stays unenforceable on Linux. Treat write access to a relocated `CLAUDE_CONFIG_DIR` the same way.
 - **`CLAUDE_CONFIG_DIR` is supported.** It sits on the env allowlist, and when set, `Agent::Claude.config_dirs()` grants that directory in place of `~/.claude`. Both halves are required. Granting the path without passing the variable, or the reverse, breaks auth and config inside the sandbox.
 - **Auto-update disabled.** cplt injects `DISABLE_AUTOUPDATER=1`. Claude Code has no `--no-auto-update` flag, and a self-update inside the sandbox is a persistence vector that would also fail against read-only install paths.
+
+**goose.** Not auto-detected; select it with `--agent goose` or `sandbox.agent = "goose"`. Verified against goose 1.48.0.
+
+- **Provider-agnostic, so no domain defaults.** goose routes model traffic to whichever provider you configure, and an `--observe-domains` capture (1.48.0, 2026-09-03) showed it contacting no goose-owned host of its own. Its built-in allowlist is therefore the shared package-registry base and nothing else; add your provider's domain via `allowed_domains`. See [docs/proxy.md](docs/proxy.md#default-allowlist-fail-closed-networking) for the two hosts that were seen and deliberately excluded.
+- **XDG dirs on macOS too.** goose uses `~/.config/goose`, `~/.local/share/goose` and `~/.local/state/goose` on both platforms — not `~/Library/Application Support` — and honours the `XDG_*` overrides on macOS. It creates no cache dir, so none is granted.
+- **Config dir is read-only, on purpose.** `config.yaml` declares `extensions:` entries carrying a `cmd` and `args` that goose spawns as subprocesses on every session start. A writable config dir would let a sandboxed agent append an extension that runs **unsandboxed** the next time the user launches goose, the same class as `.git/hooks` and Claude Code's `plugins/`. There is no `write_files` carve-out either: goose rewrites `config.yaml`, `permission.yaml` and `permissions/tool_permissions.json` by creating a temp file in the directory and renaming over the target, which needs directory write and would hand the vector straight back. The cost is that `/mode` and theme changes, the first-run telemetry prompt, and persisted "always allow" tool permissions do not survive a sandboxed session. That last one is a feature: a sandboxed agent should not be able to grant itself standing tool approval for the user's future unsandboxed runs. A full `goose run` against an existing `config.yaml` left it byte-identical, so ordinary use is unaffected.
+- **Keychain access is granted, and it is avoidable.** goose stores provider secrets in the OS keyring by default (macOS login Keychain; D-Bus Secret Service on Linux, so the grant is macOS-only in effect) under service `goose`, account `secrets` — a single entry holding every secret. cplt grants the whole of `~/Library/Keychains`, which is broader than that one entry, so a sandboxed goose can reach other Keychain items too (issue #242). Unlike Copilot or Claude Code, goose does not need it: run with `GOOSE_DISABLE_KEYRING=1` and goose falls back to a `secrets.yaml` in its config dir, or pass the provider key with `--pass-env` and skip stored secrets entirely. Prefer either over the Keychain grant.
+- **Not covered: plugin manifests.** goose also auto-spawns MCP servers declared in plugin manifests under `~/.agents/plugins/` and `<project>/.agents/plugins/`. The former is outside every granted dir and so is unreachable in the sandbox. The latter sits in the writable project tree and is the same in-repo persistence class as `.git/hooks`, which the global protected set handles rather than any per-agent rule — but `.agents/plugins` is **not** in that set today.
 
 ## Threat model
 
@@ -185,7 +194,7 @@ sudo pacman -S bubblewrap
 
 - **TLS interception.** The proxy sees CONNECT targets (hostname:port), not request bodies or responses.
 - **Kernel exploits.** We rely on Apple's Seatbelt (macOS) and Landlock/seccomp (Linux) enforcement being correct.
-- **Keychain isolation** (macOS). Copilot requires Keychain access for auth, an accepted trade-off. `mach-lookup` is blanket because Node.js needs it for DNS, the Security framework, and system services. The **clipboard** (`com.apple.pasteboard`) is reachable through that same blanket allow; `--deny-clipboard` adds a targeted deny that blocks only the pasteboard service and leaves all others intact.
+- **Keychain isolation** (macOS). See [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing) below for what the grant actually reaches and when cplt drops it. `mach-lookup` is blanket because Node.js needs it for DNS, the Security framework, and system services. The **clipboard** (`com.apple.pasteboard`) is reachable through that same blanket allow; `--deny-clipboard` adds a targeted deny that blocks only the pasteboard service and leaves all others intact.
 - **sandbox-exec deprecation** (macOS). Apple marks it deprecated but has not removed it, and Chromium and VS Code still use it.
 - **Landlock subpath limitations** (Linux). Landlock cannot deny access to subpaths within allowed directories. If a parent directory is allowed, all children are allowed. Certain fine-grained macOS rules therefore cannot be replicated on Linux, for example denying `.config/gh/extensions` while allowing `.config/gh/hosts.yml`. When Bubblewrap is active, user deny paths (`--deny-path` / `deny.paths`) ARE enforced despite this, via mount masks (see the platform comparison table). The built-in fine-grained rules stay macOS-only.
 - **Code quality.** The sandbox cannot judge whether code written by Copilot contains backdoors. That is a code review problem.
@@ -197,9 +206,17 @@ sudo pacman -S bubblewrap
   - `(allow syscall*)`, meaning all syscalls including Mach traps. Chromium uses undocumented traps that vary by macOS version and cannot be enumerated in a stable allowlist.
   - `(allow system-socket (socket-domain AF_UNIX))` for IPC between the browser, renderer, and GPU processes.
   - `(allow iokit-open-user-client)` for GPU capability probing, unscoped because IOKit class names are hardware-dependent.
-  - `(allow mach-register)` scoped to `^org\.chromium\..+$` for Crashpad and inter-process IPC, anchored with `$` and requiring at least one character after the prefix.
+  - `(allow mach-register)` scoped to three narrow namespaces: `^org\.chromium\..+$` for Crashpad and inter-process IPC, anchored with `$` and requiring at least one character after the prefix; `^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$` for Playwright's Chrome for Testing rendezvous service, fully anchored with a numeric PID suffix; and the `com.google.chrome.for.testing.apps.` app-shim namespace with a suffix of exactly 64 uppercase hexadecimal characters. The emitted SBPL spells that suffix as 64 adjacent `[0-9A-F]` atoms because counted repetition did not match in Seatbelt. Lowercase, non-hexadecimal, shorter, longer, and other product or bundle-ID variants remain denied. Denying either Chrome for Testing registration causes `EPERM (1100)` and prevents the browser from completing startup and CDP navigation.
 
-  Unix socket operations for Chrome's `SingletonSocket` use `[^/]+/[^/]+` for the `var/folders` path segments, so a match cannot cross directory boundaries. All filesystem, network, and credential denies stay enforced independently. These rules activate when `allow_cache_exec` contains `"ms-playwright"` or any subpath like `"ms-playwright/chromium-1217"` (first path component match); `allow_cache_exec_any` does not trigger them. Without them, `chrome-headless-shell` segfaults (`SEGV_ACCERR`) during browser initialization.
+  Unix socket operations for Chrome's `SingletonSocket` use `[^/]+/[^/]+` for the `var/folders` path segments, so a match cannot cross directory boundaries. All filesystem, network, and credential denies stay enforced independently. These rules activate only when `allow_cache_exec` contains `"ms-playwright"` or any subpath such as a versioned Chromium directory (first path component match); `allow_cache_exec_any` and unrelated entries do not trigger them. Without them, `chrome-headless-shell` segfaults (`SEGV_ACCERR`) during browser initialization, while Chrome for Testing fails its Mach registrations.
+
+  With the same explicit Playwright opt-in, cplt creates one short socket base named `/private/tmp/cplt-pw-<32 lowercase hex>` and sets `PWTEST_SOCKETS_DIR` to that exact path. Creation is atomic from a cryptographically random session ID; the directory is a current-user-owned, non-symlink directory with mode `0700`. A guard owns it for the full child lifetime and removes only that exact directory on exit. A hard termination such as `SIGKILL` skips that guard and leaves the empty directory behind; it carries no capability once the process is gone, and reclaiming it automatically would need a descriptor-relative deletion primitive cplt does not have today. The fixed 53-byte shape is independent of `HOME` and scratch, and leaves conservative headroom below Playwright's 103-byte Unix-socket limit after its observed longest domain and fallback socket suffix are appended.
+
+  The macOS profile grants only `network-bind` and `network-inbound` for local Unix sockets and `network-outbound` for remote Unix sockets beneath that concrete validated directory. It does not grant socket operations on `/private/tmp` itself, siblings, project or scratch paths, and adds no file or temp-execution permission; the existing `/private/tmp` file rules and execution denies remain unchanged. Ambient and inherited values cannot move the automatic capability elsewhere. An explicit `--pass-env PWTEST_SOCKETS_DIR`, from the flag or from `sandbox.pass_env` in config, preserves the caller's value and suppresses both automatic directory creation and its SBPL socket rules; repo `deny.env` still applies last. Passing the key through without exporting a value leaves the child with no socket directory at all, so cplt warns that Playwright will fall back to a `TMPDIR` path that is usually too long.
+
+  **macOS nested sandbox:** Chrome helpers inherit cplt's Seatbelt profile, so Chromium's own Seatbelt initialization fails with `forbidden-sandbox-reinit`. Chromium must therefore launch with `--no-sandbox`. Playwright used as a library already does that by default, and for Playwright MCP, which turns it back on, the same `ms-playwright` opt-in sets `PLAYWRIGHT_MCP_SANDBOX=false` for the child. This is the treatment cplt already gives Gradle's nested `sandbox-exec`, and it keeps a cplt-only workaround out of the MCP server configuration that editors and CLIs share with machines that have no cplt around them. An explicit `--pass-env PLAYWRIGHT_MCP_SANDBOX` hands the choice back to the caller. Any other Chromium launcher still needs its own flag. Chrome and all helpers remain inside the outer cplt profile.
+
+  Launching Chromium this way removes its OS-enforced child privilege separation. A compromised renderer receives the complete cplt Playwright profile, including project read/write access, `syscall*`, AF_UNIX sockets, and IOKit user clients. cplt remains the enforcing boundary, and its filesystem, network, environment, and credential restrictions still apply. This is an explicit trade-off of the `ms-playwright` opt-in, which is the only thing that disables Chromium's sandbox: without it cplt sets nothing, and no browser process is launched outside cplt.
 
   **Linux:** `--allow-cache-exec ms-playwright` grants Landlock execute on `~/.cache/ms-playwright` (the XDG equivalent), so the browser binary runs. The macOS Seatbelt/Mach permissions above have no Linux analogue. The remaining difference is Chromium's *own* sandbox: on Linux it builds a setuid-less sandbox from user namespaces (`unshare`/`setns`/`clone` with `CLONE_NEW*`), and cplt's seccomp-bpf filter denies `unshare`/`setns` with `EPERM`, because user-namespace creation is a sandbox-escape tool (see "Defense layers"). cplt deliberately does **not** relax the filter for browser testing. Run Chromium with its own sandbox disabled instead (`--no-sandbox`, or Playwright `chromiumSandbox: false`). cplt's Landlock + seccomp is the enforcing boundary, so Chromium's nested sandbox is redundant inside it. `/dev/shm` is already allowed, so `--disable-dev-shm-usage` is not required.
 - **Project build scripts.** The agent can modify `Makefile`, `package.json` scripts, `build.gradle`, `.github/workflows/`, and the like. These are legitimate Copilot targets and cannot be blocked. Code review (git diff) before running builds or committing is the mitigation.
@@ -320,6 +337,140 @@ The guards raise the bar against accidental and prompt-injected-but-cooperative 
 *Possible mitigation:* `--deny-path ~/.copilot/session-state` blocks access to other sessions' artifacts, at the cost of cross-session features. Scoping the session store to the current session would require changes to Copilot's runtime, since it is a single SQLite file.
 
 Because credentials are inaccessible at both the filesystem and environment level, network-based exfiltration can only leak project source code and `~/.config/gh` tokens. That is a much smaller blast radius than full credential theft.
+
+
+#### Keychain access is all-or-nothing
+
+The macOS Keychain grant is two SBPL file rules on `~/Library/Keychains` plus the
+blanket `(allow mach-lookup)` that reaches securityd. **SBPL cannot narrow it to
+one keychain item.** There is no `keychain` operation in the Seatbelt profile
+language — `sandbox-exec` rejects `keychain`, `keychain-access`,
+`keychain-access-group` and `security-item-read` as unbound variables — and
+per-item arbitration happens inside securityd, past the sandbox boundary. So the
+choice is the whole login keychain or none of it.
+
+What the grant reaches is bounded by each item's own ACL, not by cplt: an item
+whose ACL allows all applications, trusts `/usr/bin/security`, or was set to
+"Always Allow" comes out silently. On a developer machine that is a lot more than
+the agent's own token — measured on one, the readable set included `gh:github.com`,
+`Bitwarden`, `bw_session`, `GnuPG`, and several `* Safe Storage` items. Items
+gated on Touch ID or a password are not silently extractable.
+
+Verified by execution: denying only the two file rules is enough. Under a profile
+that is otherwise `(allow default)`, `security find-generic-password -s
+"Claude Code-credentials" -w` returns the 510-byte credential (exit 0); add
+`(deny file-read* file-write* (subpath "$HOME/Library/Keychains"))` and the same
+command fails with `SecKeychainSearchCopyNext: The specified item could not be
+found in the keychain` (exit 44). Blocking securityd's Mach service instead is
+neither necessary nor sufficient on its own.
+
+**The trade is off by default.** It is gated on one experimental config key,
+`sandbox.keychain_substitute` (default `false`), covering every agent at once:
+
+```toml
+[sandbox]
+keychain_substitute = true   # EXPERIMENTAL
+```
+
+With it unset, the Keychain grant is exactly what `needs_keychain()` says, for
+every agent, as in every release before the key existed. It is off because of the
+shape of the failure: if the trade misjudges an agent, the user can neither
+authenticate nor recover *from inside the sandbox*, since the recovery path is the
+credential store the trade just removed. That is what PR #173 hit, and what the
+first Antigravity verification for this change turned out to be — it passed only
+because a stale fallback file happened to exist on the test host. Nobody's
+authentication should change until they ask for it.
+
+**If your agent cannot authenticate with the key on:** unset
+`sandbox.keychain_substitute` (or unset the substitute variable, e.g.
+`CLAUDE_CODE_OAUTH_TOKEN`) and the grant comes back on the next run. If the agent
+has lost its login entirely, run it once outside cplt to sign in — the browser
+flow needs access cplt does not grant by default.
+
+**What the key does when it is on.** Per agent:
+
+| Agent | Grant dropped when (`keychain_substitute = true`) | What the agent holds instead | Refresh |
+|---|---|---|---|
+| Copilot | never (unverified) | — | — |
+| Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` is set | that OAuth token | none — see below |
+| Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` exists and is non-empty | that file | refreshes into that file |
+
+The trade is not free. Whole-Keychain read+write is exchanged for a full OAuth
+token sitting in the agent's environment, readable by every process it spawns and
+exfiltratable over the permitted HTTPS egress. That token is narrower than the
+keychain but it is not narrow: `CLAUDE_CODE_OAUTH_TOKEN` is a working Anthropic
+credential for the account. What changes is blast radius — one credential the
+agent was going to use anyway, instead of every credential the user owns.
+
+That variable is **not** in `ENV_ALLOWLIST` and does not match any allowlisted
+prefix, so it is not something the sandbox passes through: it is forwarded by
+`apply_deny_env_and_credential` only on runs where the trade actually applied.
+With `sandbox.keychain_substitute` off, a `CLAUDE_CODE_OAUTH_TOKEN` exported in
+your shell still needs `--pass-env` to reach the agent, exactly as before this
+change. `keychain_substitute_vars_are_never_allowlisted` asserts it.
+
+**Why cplt does not pre-extract the Keychain item itself.** The items are refresh
+blobs, not static tokens. `Claude Code-credentials` holds an access token with a
+few hours of life and a refresh token, and Claude Code rewrites the item in place
+(observed: created 26 Aug, modified 2 Sep, `expiresAt` 3h40m out). Handing the
+agent that access token and then taking the Keychain away produces a session that
+dies mid-work and cannot re-authenticate — the exact failure PR #173 hit for
+Copilot. Only credentials that are durable for a whole session qualify.
+
+**Why each agent lands where it does.**
+
+- **Claude Code** — `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) is built
+  straight into the credential without reading secure storage, with
+  `refreshToken: null, expiresAt: null`, so no refresh path runs. Verified against
+  claude 2.1.258: with `~/Library/Keychains` denied, `claude auth status` reports
+  `loggedIn: true, authMethod: oauth_token`. The residual risk is that there is no
+  recovery when a long-lived token finally expires — on a 401 Claude Code
+  deliberately keeps the env token rather than adopting the stored credential, and
+  tells the user to mint a fresh one. `ANTHROPIC_API_KEY` is deliberately *not*
+  accepted as a substitute: with a claude.ai login present, Claude Code reports
+  `authMethod: claude.ai` and treats the key as merely available, so dropping the
+  grant on its account would silently move a subscription user onto per-token API
+  billing. Pass it explicitly with `--pass-env ANTHROPIC_API_KEY` if that is what
+  you want.
+- **Antigravity** — no broker; the grant is dropped only when `agy`'s fallback
+  token file is already there. `agy` prefers its keyring and writes the file only
+  when the keyring fails: its own strings are "Failed to save token to keyring,
+  falling back to file", "Failed to load token from keyring, falling back to
+  file" and "Keyring SaveToken timed out ... falling back to file storage". So a
+  user whose keyring works has **no** such file, and deleting the grant outright
+  strands them — verified by execution: with the file moved aside, `agy models`
+  under cplt's real profile returns exit 0, and under the same profile minus the
+  two Keychain rules it exits 1 with "Please sign in to view available models".
+  Recovering from that needs a browser re-login, and `--allow-browser` is off by
+  default. When the file *is* present the trade is safe, also verified: `agy
+  models` authenticated, refreshed an already-expired access token, and persisted
+  the new one there, with `~/Library/Keychains` denied. Note the honest cost —
+  that file holds a refresh token in plaintext at mode 0600 — but `agy` put it
+  there itself, with or without cplt. One case fails silently rather than loudly:
+  `agy logout` outside cplt clears the keyring but can leave the fallback file
+  behind, so a cplt session keeps authenticating with a credential the user
+  believes is revoked. Every other way the file goes bad — missing, empty,
+  unreadable, corrupt, expired past its refresh token — surfaces as a plain sign-in
+  error.
+
+**Copilot is deliberately not eligible.** Claude Code's substitute was
+confirmed by running the agent under a profile with the grant dropped; Copilot's
+never was. PR #173 asserts an injected `GH_TOKEN` suffices and Copilot's docs
+point at these vars, but asserting is not probing — and Copilot is the default,
+priority-1 agent, while `GITHUB_TOKEN` is the most commonly exported token on a
+developer machine. A fine-grained PAT exported for something unrelated would have
+dropped the grant, and if Copilot rejected it the session would have neither. That
+is the same precedence question this trade declines to assume, so
+Copilot gets the same answer until someone probes it. Re-enabling it is one line
+in `Agent::keychain_substitute_env_vars`.
+
+The fallback is deliberate in both directions: when no substitute credential
+resolves, the grant stays and the session summary says so, rather than launching
+an agent that cannot authenticate and — with the Keychain gone — cannot recover.
+A repo `.cplt.toml` `deny.env` entry naming a substitute variable counts as "not
+resolved": that list is stripped from the child environment, so honouring it as a
+substitute would leave the run with neither Keychain nor token from a checked-in
+file.
 
 ## Defense layers
 
@@ -850,7 +1001,7 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 ### Discovery and `cplt doctor`
 
-`cplt doctor` probes the environment by running `--version` on all known agent binaries found in PATH (copilot, opencode, gemini, claude). These commands run **outside the sandbox** with full user privileges.
+`cplt doctor` probes the environment by running `--version` on all known agent binaries found in PATH (copilot, opencode, antigravity, claude). These commands run **outside the sandbox** with full user privileges.
 
 Trust model: cplt trusts that binaries in your PATH are legitimate, the same trust model as typing `copilot --version` yourself. If you don't trust a binary in your PATH, remove it before running `cplt doctor`.
 

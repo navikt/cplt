@@ -196,7 +196,7 @@ const LINUX_SYSTEM_READ_PATHS: &[&str] = &[
 
 /// Tool directories with read + execute access.
 /// Linux equivalent of macOS `TOOL_READ_DIRS` in sandbox_policy.rs.
-const LINUX_TOOL_DIRS: &[&str] = &[
+pub(super) const LINUX_TOOL_DIRS: &[&str] = &[
     "/bin",
     "/sbin",
     "/usr/bin",
@@ -1829,6 +1829,7 @@ mod tests {
             allow_env_files: false,
             allow_localhost_any: false,
             scratch_dir: None,
+            playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
             java_home: None,
@@ -1847,6 +1848,7 @@ mod tests {
             allow_cache_exec_any: false,
             allow_browser: false,
             use_bubblewrap: None,
+            keychain_substitute: None,
         }
     }
 
