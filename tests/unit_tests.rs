@@ -2976,6 +2976,41 @@ fn mise_ro_protect_paths_cover_shims_and_installs() {
 }
 
 #[test]
+fn copilot_ro_protect_paths_cover_both_package_dirs() {
+    // #328. macOS write-denies both of these in the SBPL profile. Landlock can
+    // express neither: ~/.copilot is granted write wholesale, and the execute
+    // rule on ~/.cache/copilot/pkg unions with the ~/.cache write grant from
+    // HOME_TOOL_DIRS — writable AND executable, in the tree holding the runtime
+    // Copilot spawns on the host. The bwrap read-only overlay is the only
+    // mechanism, so both must be in its set.
+    let home = std::path::Path::new("/Users/test");
+    let paths = cplt::sandbox::copilot_ro_protect_paths(cplt::agent::Agent::Copilot, home);
+    for expected in ["/Users/test/.copilot/pkg", "/Users/test/.cache/copilot/pkg"] {
+        assert!(
+            paths.contains(&std::path::PathBuf::from(expected)),
+            "{expected} must be in the bwrap read-only set"
+        );
+    }
+}
+
+#[test]
+fn copilot_ro_protect_paths_are_empty_for_other_agents() {
+    // These paths belong to Copilot's grants. No other agent gets ~/.copilot,
+    // so nothing should be re-bound for them.
+    for agent in [
+        cplt::agent::Agent::Claude,
+        cplt::agent::Agent::Shell,
+        cplt::agent::Agent::OpenCode,
+    ] {
+        assert!(
+            cplt::sandbox::copilot_ro_protect_paths(agent, std::path::Path::new("/Users/test"))
+                .is_empty(),
+            "{agent:?} must get no Copilot package binds"
+        );
+    }
+}
+
+#[test]
 fn profile_nvm_has_exec() {
     let p = default_profile();
     assert!(

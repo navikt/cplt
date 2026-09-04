@@ -1300,6 +1300,49 @@ mod tests {
     }
 
     #[test]
+    fn copilot_package_dirs_are_rebound_read_only_after_their_writable_parents() {
+        // #328: the whole point is ordering. `~/.copilot` is bound writable for
+        // Copilot and `~/.cache` is bound writable by HOME_TOOL_DIRS, so the
+        // package dirs inside them are only protected if their read-only binds
+        // land AFTER both — mounts apply in argument order.
+        let home = tempfile::tempdir().expect("tempdir");
+        let copilot = home.path().join(".copilot");
+        let cache = home.path().join(".cache");
+        std::fs::create_dir_all(copilot.join("pkg")).expect("create .copilot/pkg");
+        std::fs::create_dir_all(cache.join("copilot/pkg")).expect("create cache pkg");
+
+        let rules = vec![
+            writable_rule(&copilot.to_string_lossy()),
+            writable_rule(&cache.to_string_lossy()),
+        ];
+        let ro =
+            crate::sandbox::copilot_ro_protect_paths(crate::agent::Agent::Copilot, home.path());
+        let args = build_bwrap_args(&rules, &ro, &DenyMasks::default());
+
+        let idx = |flag: &str, p: &std::path::Path| {
+            let s = p.to_string_lossy().into_owned();
+            args.windows(3)
+                .position(|w| w[0] == flag && w[1] == s && w[2] == s)
+        };
+
+        let copilot_bind = idx("--bind", &copilot).expect("~/.copilot must be bound writable");
+        let cache_bind = idx("--bind", &cache).expect("~/.cache must be bound writable");
+        let copilot_pkg_ro = idx("--ro-bind", &copilot.join("pkg"))
+            .expect("~/.copilot/pkg must be re-bound read-only");
+        let cache_pkg_ro = idx("--ro-bind", &cache.join("copilot/pkg"))
+            .expect("~/.cache/copilot/pkg must be re-bound read-only");
+
+        assert!(
+            copilot_pkg_ro > copilot_bind,
+            "the ~/.copilot/pkg read-only bind must come AFTER the writable ~/.copilot bind"
+        );
+        assert!(
+            cache_pkg_ro > cache_bind,
+            "the ~/.cache/copilot/pkg read-only bind must come AFTER the writable ~/.cache bind"
+        );
+    }
+
+    #[test]
     fn ro_protect_set_is_narrow_and_leaves_git_config_writable() {
         // The protected set is deliberately narrow: exactly the
         // `LinuxCoverage::Bwrap` entries of `PROTECTED_IN_ROOT` and
