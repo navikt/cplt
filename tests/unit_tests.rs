@@ -7632,6 +7632,13 @@ fn chromium_runtime_rules_absent_by_default() {
         !p.contains(&apps_mach_register_rule),
         "Chrome for Testing apps mach-register must not be emitted by default"
     );
+    // Blanket, not per-rule: the two checks above only catch the namespaces we
+    // know about today. This one fails if ANY mach-register reaches the default
+    // profile, including one added later by someone who forgets the gate.
+    assert!(
+        !p.contains("mach-register"),
+        "no mach-register namespace may be granted by default"
+    );
 }
 
 #[test]
