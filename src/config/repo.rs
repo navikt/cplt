@@ -20,22 +20,115 @@ pub enum RepoKeyTarget {
     Deny(&'static str),
 }
 
+/// A boolean a repo may propose in `.cplt.toml`, described once.
+///
+/// One row per `[propose]` boolean, holding everything the four places that
+/// used to keep their own copy of this list need: the trust-store key, the
+/// global config key it corresponds to, how to read the proposal, and how to
+/// apply it. `propose` and `apply` are the only per-key code; the rest of the
+/// pipeline iterates.
+///
+/// Proposals are strictly additive — `apply` only ever sets a flag to `true`,
+/// and only for a `Some(true)` proposal whose key the user has approved. A
+/// repo can never turn a permission back off.
+pub struct ProposeBoolRow {
+    /// Name used in `[propose]` and in the trust store.
+    pub key: &'static str,
+    /// The global config key this proposal corresponds to.
+    pub config_key: (&'static str, &'static str),
+    pub propose: fn(&crate::repo_config::ProposeSection) -> Option<bool>,
+    pub apply: fn(&mut super::types::Resolved),
+}
+
+/// Every boolean a `.cplt.toml` may propose.
+pub static PROPOSE_BOOLS: &[ProposeBoolRow] = &[
+    ProposeBoolRow {
+        key: "allow_localhost_any",
+        config_key: ("sandbox", "allow_localhost_any"),
+        propose: |p| p.allow_localhost_any,
+        apply: |r| r.allow_localhost_any = true,
+    },
+    ProposeBoolRow {
+        key: "allow_jvm_attach",
+        config_key: ("sandbox", "allow_jvm_attach"),
+        propose: |p| p.allow_jvm_attach,
+        apply: |r| r.allow_jvm_attach = true,
+    },
+    ProposeBoolRow {
+        key: "allow_msbuild",
+        config_key: ("sandbox", "allow_msbuild"),
+        propose: |p| p.allow_msbuild,
+        apply: |r| r.allow_msbuild = true,
+    },
+    ProposeBoolRow {
+        key: "gradle_init",
+        config_key: ("sandbox", "gradle_init"),
+        propose: |p| p.gradle_init,
+        apply: |r| r.gradle_init = true,
+    },
+    ProposeBoolRow {
+        key: "allow_docker",
+        config_key: ("sandbox", "allow_docker"),
+        propose: |p| p.allow_docker,
+        apply: |r| r.allow_docker = true,
+    },
+    ProposeBoolRow {
+        key: "allow_tmp_exec",
+        config_key: ("sandbox", "allow_tmp_exec"),
+        propose: |p| p.allow_tmp_exec,
+        apply: |r| r.allow_tmp_exec = true,
+    },
+    ProposeBoolRow {
+        key: "allow_gpg_signing",
+        config_key: ("sandbox", "allow_gpg_signing"),
+        propose: |p| p.allow_gpg_signing,
+        apply: |r| r.allow_gpg_signing = true,
+    },
+    ProposeBoolRow {
+        key: "allow_lifecycle_scripts",
+        config_key: ("sandbox", "allow_lifecycle_scripts"),
+        propose: |p| p.allow_lifecycle_scripts,
+        apply: |r| r.allow_lifecycle_scripts = true,
+    },
+    ProposeBoolRow {
+        key: "allow_browser",
+        config_key: ("sandbox", "allow_browser"),
+        propose: |p| p.allow_browser,
+        apply: |r| r.allow_browser = true,
+    },
+    ProposeBoolRow {
+        key: "allow_env_files",
+        config_key: ("sandbox", "allow_env_files"),
+        propose: |p| p.allow_env_files,
+        apply: |r| r.allow_env_files = true,
+    },
+    // `.cplt.toml` spells these two with the legacy `sandbox.*` config keys, so
+    // `config set --repo sandbox.gh_proxy` keeps writing the name a repo file
+    // already uses.
+    ProposeBoolRow {
+        key: "gh_guard",
+        config_key: ("sandbox", "gh_proxy"),
+        propose: |p| p.gh_guard,
+        apply: |r| r.gh_guard.enabled = true,
+    },
+    ProposeBoolRow {
+        key: "git_push_prevention",
+        config_key: ("sandbox", "git_push_prevention"),
+        propose: |p| p.git_push_prevention,
+        apply: |r| r.git_guard.enabled = true,
+    },
+];
+
 /// Map a global config key to its repo config location.
 /// Returns None if the key is not valid in repo config.
 pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
+    if PROPOSE_BOOLS
+        .iter()
+        .any(|row| row.config_key == (key_info.section, key_info.key))
+    {
+        return Some(RepoKeyTarget::ProposeBool);
+    }
     match (key_info.section, key_info.key) {
-        // Propose booleans
-        ("sandbox", "allow_localhost_any") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "allow_jvm_attach") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "allow_msbuild") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "allow_docker") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "allow_tmp_exec") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "allow_gpg_signing") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "allow_lifecycle_scripts") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "allow_browser") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "allow_env_files") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "gh_proxy") => Some(RepoKeyTarget::ProposeBool),
-        ("sandbox", "git_push_prevention") => Some(RepoKeyTarget::ProposeBool),
         // Propose arrays
         ("allow", "read") => Some(RepoKeyTarget::ProposeAllow("read")),
         ("allow", "write") => Some(RepoKeyTarget::ProposeAllow("write")),
