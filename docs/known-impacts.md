@@ -227,7 +227,7 @@ cplt config set allow.write "~/.ssh/known_hosts"    # ssh appends on a first con
 
 Port 22 is the first gate: without it no key grant matters, because the connection never opens. `~/.ssh/config` needs its own `allow.read` if you have one. `known_hosts` needs **write**, not read — under the default `StrictHostKeyChecking` a first connection to a host appends to it, and a read-only grant fails the connection.
 
-**The directory itself cannot be granted.** `allow.read = "~/.ssh"` (or `~/.aws`, `~/.gnupg`, any of the credential directories) is refused at startup with an error naming this per-file route. macOS never honoured such a grant — the blanket subpath deny beats it whatever the config says — while Linux granted it for real, so the same config file opened every key on one platform and nothing on the other. Refusing is the only answer both backends give alike.
+**The directory itself cannot be granted.** `allow.read = "~/.ssh"` (or `~/.aws`, `~/.gnupg`, any of the credential directories) is refused at startup with an error naming the per-path route inside it. macOS never honoured such a grant — the blanket subpath deny beats it whatever the config says — while Linux granted it for real, so the same config file opened every key on one platform and nothing on the other. Refusing is the only answer both backends give alike.
 
 One gap remains on Linux, unchanged and the same limitation described under [private registries](#private-registries): a grant on a *parent* — `$HOME` itself — still exposes everything under it, because Landlock cannot deny a subpath inside an allowed directory.
 
@@ -665,9 +665,11 @@ cplt config set --repo allow.read ~/.config/gcloud/application_default_credentia
 
 This lets GCP SDKs authenticate using the ADC JSON file without exposing the entire directory.
 
-### Executing cloud CLIs (gcloud, aws, az) is intentionally blocked
+A grant may also name a **subdirectory** — `~/.aws/sso/cache`, `~/.kube/cache` — and it grants that subtree. It used to grant the subtree on Linux and only the directory entry itself on macOS, where the re-allow was emitted as an SBPL `literal`; the files underneath stayed denied and nothing said so. Linux's reading is now authoritative on both: the grant covers what the user named, and nothing else in the credential directory.
 
-Even with `allow.read`, the agent **cannot execute** binaries inside these directories. `gcloud`, for instance, uses a Python virtualenv at `~/.config/gcloud/virtenv/` that needs execute permission the sandbox does not grant.
+### Executing cloud CLIs (gcloud, aws, az) is blocked by default
+
+Neither the default sandbox nor `allow.read` lets the agent **execute** binaries inside these directories. `gcloud`, for instance, uses a Python virtualenv at `~/.config/gcloud/virtenv/` that needs execute permission the sandbox does not grant.
 
 **This is intentional.** Cloud CLIs have unrestricted access to your cloud infrastructure. An agent running `gcloud` could create or delete resources, read secrets, or modify IAM policies. The sandbox closes that escalation path.
 
@@ -680,7 +682,9 @@ Even with `allow.read`, the agent **cannot execute** binaries inside these direc
 | Running cloud CLI commands | Run them outside the sandbox in a regular terminal |
 | CI/CD with cloud access | Use project-level service account keys or workload identity, not user credentials |
 
-> **Design principle:** `allow.read` grants read access to credential *files* so SDKs can authenticate. It does not grant execute permission, because executing cloud CLIs would bypass the sandbox's network and filesystem restrictions.
+> **Design principle:** `allow.read` grants read access to credential *paths* so SDKs can authenticate. It does not grant execute permission, because executing cloud CLIs would bypass the sandbox's network and filesystem restrictions.
+
+`allow.exec` is the deliberate opt-out, and it is the only one. It names a path inside a credential directory and grants read plus execute on it — `~/.docker/cli-plugins` and `~/.terraform.d/plugins` are the cases that motivated it. It was honoured on Linux and silently dropped on macOS, where it was emitted before the blanket deny and lost to it; it is now honoured on both. The tree stays read-only either way: the exec-grant write deny is the last rule in the profile, and `sandbox::prepare` refuses an exec grant that overlaps any writable tree.
 
 ## Developer tooling telemetry
 
