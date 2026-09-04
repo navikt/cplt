@@ -1,6 +1,6 @@
 //! macOS SBPL sandbox profile generation.
 //!
-//! Builds a Seatbelt Profile Language string from [`ProfileOptions`],
+//! Builds a Seatbelt Profile Language string from [`SandboxConfig`],
 //! encoding filesystem, network, and process rules for `sandbox-exec`.
 
 use std::fmt::Write;
@@ -19,6 +19,7 @@ macro_rules! sbpl {
     };
 }
 
+use super::SandboxConfig;
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
     GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
@@ -27,138 +28,35 @@ use super::policy::{
     playwright_runtime_intent, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
-/// Options for generating an SBPL sandbox profile.
-///
-/// All paths are validated for SBPL injection before interpolation.
-pub struct ProfileOptions<'a> {
-    pub project_dir: &'a Path,
-    pub home_dir: &'a Path,
-    pub extra_read: &'a [PathBuf],
-    pub extra_write: &'a [PathBuf],
-    /// Trees the agent may execute binaries from (`allow.exec`).
-    pub extra_exec: &'a [PathBuf],
-    pub allow_socket: &'a [PathBuf],
-    pub extra_deny: &'a [PathBuf],
-    /// If `Some`, only include these home tool dirs (tighter profile via discovery,
-    /// relocated tool homes already resolved). If `None`, all known home tool
-    /// dirs are included at their defaults.
-    pub existing_home_tool_dirs: Option<&'a [ResolvedToolDir]>,
-    /// If `Some`, only include these app dirs (tighter profile via discovery).
-    /// If `None`, all known app dirs are included.
-    pub existing_app_dirs: Option<&'a [String]>,
-    pub extra_ports: &'a [u16],
-    pub localhost_ports: &'a [u16],
-    pub proxy_port: Option<u16>,
-    /// Force all egress through the proxy: restrict the SBPL `network-outbound`
-    /// rule to `localhost:{proxy_port}` only, dropping the default `*:443`
-    /// allowance (#53). Consumed by the SBPL builder.
-    pub proxy_forced: bool,
-    /// Allow reading .env files and private keys in the project dir.
-    pub allow_env_files: bool,
-    /// Allow outbound TCP to localhost on all ports.
-    pub allow_localhost_any: bool,
-    /// Per-session scratch directory with write+exec permissions.
-    /// Used to redirect TMPDIR so tools can compile-then-execute.
-    pub scratch_dir: Option<&'a Path>,
-    /// Remove temp dir exec denies (break-glass for system TMPDIR exec).
-    pub allow_tmp_exec: bool,
-    /// Copilot CLI package directory (resolved from the binary location).
-    /// Needed when Copilot is installed in a non-standard location (e.g. ~/n/
-    /// via the `n` Node version manager) that isn't covered by TOOL_READ_DIRS.
-    pub copilot_install_dir: Option<&'a Path>,
-    /// JAVA_HOME directory for JDK read + dylib loading.
-    /// Needed when Java is installed outside TOOL_READ_DIRS (e.g. ~/hostedtoolcache,
-    /// sdkman, or other version managers).
-    pub java_home: Option<&'a Path>,
-    /// DOTNET_ROOT directory for SDK read + dylib loading.
-    /// Needed when the .NET SDK is installed outside TOOL_READ_DIRS (e.g.
-    /// ~/hostedtoolcache via actions/setup-dotnet, or dotnet-install.sh into
-    /// a custom directory under $HOME).
-    pub dotnet_root: Option<&'a Path>,
-    /// Global git hooks directory from `core.hooksPath`.
-    /// Git needs to read and execute hooks from this directory for commits.
-    pub git_hooks_path: Option<&'a Path>,
-    /// Shared .git directory for git worktrees.
-    /// When the project is a worktree, git needs read+write access to the main
-    /// repo's .git directory (objects, refs, packed-refs, etc.).
-    pub git_common_dir: Option<&'a Path>,
-    /// Resolved `.git` directories of writable granted paths (`extra_write`)
-    /// whose real `.git` is not `<path>/.git` — a worktree, a bare repo, or a
-    /// grant pointing inside a repo. Deny-only: the profile never *grants*
-    /// access to these, it only places the hooks/config write denies there so a
-    /// sibling repo cannot be used for hook persistence (#212).
-    pub extra_git_dirs: &'a [PathBuf],
-    /// Allow GPG commit/tag signing. When true, grants read-only access to
-    /// the public keyring and GPG agent socket. Private keys stay denied.
-    pub allow_gpg_signing: bool,
-    /// Deny access to the macOS clipboard (pasteboard) Mach service.
-    ///
-    /// The clipboard is reached via the Mach service `com.apple.pasteboard.1`.
-    /// The profile emits a targeted `(deny mach-lookup …)` immediately after
-    /// `(allow mach-lookup)` so SBPL last-match-wins blocks only the pasteboard
-    /// service — Keychain, DNS (mDNSResponder), and all other Mach services
-    /// remain reachable. Useful when the sandboxed agent must not be able to
-    /// read or write clipboard contents (e.g. credential-sniffing via pbpaste).
-    pub deny_clipboard: bool,
-    /// Allow JVM Attach API unix sockets in /tmp (.java_pid* pattern only).
-    pub allow_jvm_attach: bool,
-    /// Allow MSBuild worker-node unix sockets in /tmp (MSBuild<pid> pattern only).
-    pub allow_msbuild: bool,
-    /// Allow Docker/Colima/OrbStack daemon socket and ~/.docker read access.
-    pub allow_docker: bool,
-    /// Electron app bundle Contents directory (e.g., VS Code .app/Contents).
-    /// Needed when Copilot CLI is installed as a VS Code extension and uses
-    /// VS Code's Electron runtime. Allows read + file-map-executable so dyld
-    /// can load the Electron Framework.
-    pub electron_app_dir: Option<&'a Path>,
-    /// Which AI coding agent is being sandboxed.
-    pub agent: Agent,
-    /// Agent-specific directories that need sandbox access.
-    pub agent_dirs: &'a [AgentDir],
-    /// Specific ~/Library/Caches subdirs to allow process execution from.
-    pub allow_cache_exec: &'a [String],
-    /// Allow process execution from ALL ~/Library/Caches subdirs.
-    pub allow_cache_exec_any: bool,
-    /// Let the sandboxed agent launch ANY application outside the sandbox.
-    ///
-    /// Granted for OAuth code flows, but Launch Services starts the target
-    /// through launchd, outside the Seatbelt profile. Cannot be scoped: SBPL's
-    /// `lsopen` takes no filter, and LSOpenCFURLRef() reaches it without the
-    /// `open` binary (#251).
-    pub allow_browser: bool,
-    /// The agent's credential was resolved outside the Keychain before launch —
-    /// from an environment variable, or from a credential file the sandbox
-    /// already grants (Antigravity's `agy` keyring fallback) — so the macOS
-    /// Keychain grant is dropped for this run (#242).
-    ///
-    /// The grant is emitted when `agent.needs_keychain()` and this is `false`.
-    /// `false` is the fail-open default: no substitute credential resolved means
-    /// keep the grant, rather than launching an agent that cannot authenticate
-    /// and — with the Keychain gone — cannot re-authenticate either.
-    pub credential_outside_keychain: bool,
-}
-
 /// Generate a complete SBPL sandbox profile from the given options.
 ///
 /// Sections are emitted in a fixed order — SBPL uses last-match-wins semantics,
 /// so deny rules must come after their corresponding allows. Each `emit_*` helper
 /// writes a contiguous block; their call order must not be changed.
-pub fn generate_profile(opts: &ProfileOptions) -> String {
-    generate_profile_with_playwright_socket_dir(opts, None)
+pub fn generate_profile(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> String {
+    generate_profile_with_playwright_socket_dir(config, extra_git_dirs, None)
 }
 
 /// Generate an SBPL profile with one validated, cplt-owned Playwright socket base.
 ///
-/// The path is kept separate from [`ProfileOptions`] because it is ephemeral
-/// per process. It is honored only for exact Playwright runtime intent; callers
-/// must validate it with `validate_playwright_socket_dir` before interpolation.
+/// The path is kept separate from [`SandboxConfig`] because it is ephemeral per
+/// process. It is honored only for exact Playwright runtime intent; callers must
+/// validate it with `validate_playwright_socket_dir` before interpolation.
+///
+/// `extra_git_dirs` is the other macOS-only input `prepare` computes rather than
+/// the caller supplying it: the resolved `.git` directories of writable grants
+/// whose repo data does not live at `<grant>/.git` — a worktree, a bare repo, or
+/// a grant pointing inside a repo (`discover::git_dir_of`). Deny-only: the
+/// profile never *grants* access to them, it only places the protected-path
+/// denies there so a sibling repo cannot be used for hook persistence (#212).
 pub fn generate_profile_with_playwright_socket_dir(
-    opts: &ProfileOptions,
+    config: &SandboxConfig,
+    extra_git_dirs: &[PathBuf],
     playwright_socket_dir: Option<&Path>,
 ) -> String {
     let mut sb = String::with_capacity(4096);
-    let home = opts.home_dir.to_string_lossy();
-    let project = opts.project_dir.to_string_lossy();
+    let home = config.home_dir.to_string_lossy();
+    let project = config.project_dir.to_string_lossy();
 
     // Detect Chromium browser runtime: the user has opted in to executing
     // Playwright's Chromium binaries from ~/Library/Caches/ via allow_cache_exec.
@@ -178,7 +76,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     // broadly, but Chromium's extra IPC/syscall permissions should only be
     // emitted when the user explicitly signals browser testing intent.
     let allow_chromium_runtime =
-        playwright_runtime_intent(opts.allow_cache_exec, opts.allow_cache_exec_any);
+        playwright_runtime_intent(config.allow_cache_exec, config.allow_cache_exec_any);
     let playwright_socket_dir =
         playwright_socket_dir.filter(|path| validate_playwright_socket_dir(path).is_ok());
 
@@ -188,82 +86,92 @@ pub fn generate_profile_with_playwright_socket_dir(
     emit_home_access(
         &mut sb,
         &home,
-        opts.agent,
-        opts.agent_dirs,
-        opts.credential_outside_keychain,
+        config.agent,
+        config.agent_dirs,
+        config.keychain_substitute.is_some(),
     );
-    emit_git_hooks(&mut sb, opts.git_hooks_path);
-    emit_git_worktree(&mut sb, opts.git_common_dir);
+    emit_git_hooks(&mut sb, config.git_hooks_path);
+    emit_git_worktree(&mut sb, config.git_common_dir);
     emit_system_access(
         &mut sb,
         &home,
-        opts.allow_browser,
+        config.allow_browser,
         allow_chromium_runtime,
-        opts.deny_clipboard,
+        config.deny_clipboard,
     );
     emit_tool_dirs(
         &mut sb,
-        opts.home_dir,
-        opts.existing_home_tool_dirs,
-        opts.existing_app_dirs,
-        opts.agent,
-        opts.allow_cache_exec,
-        opts.allow_cache_exec_any,
+        config.home_dir,
+        config.existing_home_tool_dirs,
+        config.existing_app_dirs,
+        config.agent,
+        config.allow_cache_exec,
+        config.allow_cache_exec_any,
     );
-    emit_copilot_install(&mut sb, opts.copilot_install_dir);
+    emit_copilot_install(&mut sb, config.copilot_install_dir);
     emit_gradle_toolchain_exec(&mut sb, &home);
-    emit_java_home(&mut sb, opts.java_home);
-    emit_dotnet_root(&mut sb, opts.dotnet_root);
-    emit_electron_app(&mut sb, opts.electron_app_dir);
+    emit_java_home(&mut sb, config.java_home);
+    emit_dotnet_root(&mut sb, config.dotnet_root);
+    emit_electron_app(&mut sb, config.electron_app_dir);
     emit_system_files(&mut sb);
     emit_temp_rules(
         &mut sb,
-        opts.allow_tmp_exec,
-        opts.allow_jvm_attach,
-        opts.allow_msbuild,
-        opts.scratch_dir,
+        config.allow_tmp_exec,
+        config.allow_jvm_attach,
+        config.allow_msbuild,
+        config.scratch_dir,
         allow_chromium_runtime,
         allow_chromium_runtime
             .then_some(playwright_socket_dir)
             .flatten(),
     );
-    emit_user_allows(&mut sb, opts.extra_read, opts.extra_write, opts.extra_exec);
-    emit_deny_rules(&mut sb, &home, opts.extra_deny);
-    emit_registry_config_overrides(&mut sb, &home, opts.extra_read);
-    emit_denied_dotfile_overrides(&mut sb, &home, opts.extra_read, opts.extra_write);
-    emit_gpg_signing_rules(&mut sb, &home, opts.allow_gpg_signing, opts.extra_deny);
-    emit_docker_rules(&mut sb, &home, opts.allow_docker, opts.extra_deny);
-    emit_socket_rules(&mut sb, opts.allow_socket, opts.extra_deny);
+    emit_user_allows(
+        &mut sb,
+        config.extra_read,
+        config.extra_write,
+        config.extra_exec,
+    );
+    emit_deny_rules(&mut sb, &home, config.extra_deny);
+    emit_registry_config_overrides(&mut sb, &home, config.extra_read);
+    emit_denied_dotfile_overrides(&mut sb, &home, config.extra_read, config.extra_write);
+    emit_gpg_signing_rules(&mut sb, &home, config.allow_gpg_signing, config.extra_deny);
+    emit_docker_rules(&mut sb, &home, config.allow_docker, config.extra_deny);
+    emit_socket_rules(&mut sb, config.extra_socket, config.extra_deny);
     emit_network_rules(
         &mut sb,
         &home,
-        opts.extra_ports,
-        opts.allow_localhost_any,
-        opts.proxy_port,
-        opts.localhost_ports,
-        opts.proxy_forced,
+        config.extra_ports,
+        config.allow_localhost_any,
+        config.proxy_port,
+        config.localhost_ports,
+        config.proxy_forced,
     );
     // Sensitive project file denies MUST come after all user-configured allows.
     // SBPL uses last-match-wins, so a user allow like `allow.read = ["~/Repos"]`
     // would override the .env deny if emitted before it.
-    emit_sensitive_project_denies(&mut sb, &project, opts.extra_write, opts.allow_env_files);
+    emit_sensitive_project_denies(
+        &mut sb,
+        &project,
+        config.extra_write,
+        config.allow_env_files,
+    );
     // Same reason, and one more: the worktree common-dir allow is emitted early
     // (so DENIED_DOTFILES still wins over it), which would leave its denies
     // reopenable by any later allow if they were emitted alongside it.
     emit_git_persistence_denies(
         &mut sb,
         &project,
-        opts.extra_write,
-        opts.git_common_dir,
-        opts.extra_git_dirs,
+        config.extra_write,
+        config.git_common_dir,
+        extra_git_dirs,
     );
     // Same reason, and the fix for the same bug one tree over: keeps the
     // agent's own auto-executing config unwritable even when a user
     // `allow.write` covers the whole config dir.
-    emit_host_persistence_denies(&mut sb, opts.agent, opts.agent_dirs);
+    emit_host_persistence_denies(&mut sb, config.agent, config.agent_dirs);
     // Same reason: keeps exec-allowed DOTNET_ROOT subtrees non-writable even
     // when a user allow.write covers them (write-then-exec).
-    emit_dotnet_exec_denies(&mut sb, opts.dotnet_root);
+    emit_dotnet_exec_denies(&mut sb, config.dotnet_root);
     // Same reason: keeps the exec-allowed Gradle toolchain dir non-writable
     // even when a user allow.write covers ~/.gradle (write-then-exec).
     emit_gradle_toolchain_write_deny(&mut sb, &home);
@@ -272,10 +180,10 @@ pub fn generate_profile_with_playwright_socket_dir(
     // cache, not the parent), but a user allow.write covering ~/.bun or
     // $PNPM_HOME would reopen them, and mise's two live inside a tree that has
     // to stay writable.
-    emit_path_bin_denies(&mut sb, opts.home_dir);
+    emit_path_bin_denies(&mut sb, config.home_dir);
     // MUST stay last: see `emit_exec_write_denies`. An exec grant that could be
     // reopened for writing by a later allow is a write-then-exec path.
-    emit_exec_write_denies(&mut sb, opts.extra_exec);
+    emit_exec_write_denies(&mut sb, config.extra_exec);
 
     sb
 }
@@ -2101,7 +2009,7 @@ fn emit_network_rules(
 mod tests {
     use super::*;
 
-    /// Build a minimal `ProfileOptions` for SBPL-string tests.
+    /// Build a minimal `SandboxConfig` for SBPL-string tests.
     /// Resolving git from trusted directories means `git_common_dir` is `None`
     /// on a machine whose git lives elsewhere. The denies for an ordinary repo
     /// must not depend on it: `<root>/.git` is seeded for every writable root
@@ -2117,7 +2025,7 @@ mod tests {
         let home = std::path::Path::new("/Users/test");
         let mut opts = test_options(project, home);
         opts.git_common_dir = None;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
         for rule in [
             r#"(deny file-write* (subpath "/projects/app/.git/hooks"))"#,
             r#"(deny file-write* (literal "/projects/app/.git/config"))"#,
@@ -2146,7 +2054,7 @@ mod tests {
         let granted = [PathBuf::from("/Users/test/.ssh/known_hosts")];
         let mut opts = test_options(project, home);
         opts.extra_write = &granted;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         let deny = p
             .find(r#"(deny file-write* (subpath "/Users/test/.ssh"))"#)
@@ -2187,7 +2095,7 @@ mod tests {
             if write {
                 opts.extra_write = &granted;
             }
-            let p = generate_profile(&opts);
+            let p = generate_profile(&opts, &[]);
             let deny = p
                 .find(r#"(deny file-read* (subpath "/Users/test/.ssh"))"#)
                 .expect("the blanket ~/.ssh deny must still be emitted");
@@ -2201,14 +2109,14 @@ mod tests {
     fn test_options<'a>(
         project_dir: &'a std::path::Path,
         home_dir: &'a std::path::Path,
-    ) -> ProfileOptions<'a> {
-        ProfileOptions {
+    ) -> SandboxConfig<'a> {
+        SandboxConfig {
             project_dir,
             home_dir,
             extra_read: &[],
             extra_write: &[],
             extra_exec: &[],
-            allow_socket: &[],
+            extra_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
@@ -2219,13 +2127,13 @@ mod tests {
             allow_env_files: false,
             allow_localhost_any: false,
             scratch_dir: None,
+            playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
-            extra_git_dirs: &[],
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,
@@ -2237,7 +2145,8 @@ mod tests {
             allow_cache_exec: &[],
             allow_cache_exec_any: false,
             allow_browser: false,
-            credential_outside_keychain: false,
+            keychain_substitute: None,
+            use_bubblewrap: None,
         }
     }
 
@@ -2264,7 +2173,7 @@ mod tests {
 
         let mut opts = test_options(project, home);
         opts.extra_deny = &resolved.deny_paths;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         assert!(
             p.contains(r#"(deny file-read* (subpath "/projects/app/secrets"))"#),
@@ -2284,7 +2193,7 @@ mod tests {
         let home = std::path::Path::new("/Users/test");
         let opts = test_options(project, home);
         assert!(!opts.proxy_forced);
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         assert!(p.contains("(allow network-outbound (remote ip \"*:443\"))"));
     }
@@ -2299,7 +2208,7 @@ mod tests {
         let mut opts = test_options(project, home);
         opts.proxy_forced = true;
         opts.proxy_port = Some(8080);
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         assert!(
             p.contains("(allow network-outbound (remote ip \"localhost:8080\"))"),
@@ -2323,7 +2232,7 @@ mod tests {
 
         let mut opts = test_options(project, home);
         opts.extra_ports = &ports;
-        let default_mode = generate_profile(&opts);
+        let default_mode = generate_profile(&opts, &[]);
         assert!(
             default_mode.contains("(allow network-outbound (remote ip \"*:9999\"))"),
             "default mode must still honour --allow-port"
@@ -2331,7 +2240,7 @@ mod tests {
 
         opts.proxy_forced = true;
         opts.proxy_port = Some(8080);
-        let forced = generate_profile(&opts);
+        let forced = generate_profile(&opts, &[]);
         assert!(
             !forced.contains("*:9999"),
             "proxy_forced must not emit a direct remote path for an extra port"
@@ -2351,7 +2260,7 @@ mod tests {
     fn sensitive_denies_come_after_their_broader_allows() {
         let project = std::path::Path::new("/projects/app");
         let home = std::path::Path::new("/Users/test");
-        let p = generate_profile(&test_options(project, home));
+        let p = generate_profile(&test_options(project, home), &[]);
 
         // Helper: assert `allow` appears strictly before `deny` in the profile.
         let assert_deny_after_allow = |allow: &str, deny: &str| {
@@ -2403,7 +2312,7 @@ mod tests {
         // used to sit next to the worktree allow, where this would reopen them.
         let extra_write = [std::path::PathBuf::from("/Users/test")];
         opts.extra_write = &extra_write;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         let assert_deny_after_allow = |allow: &str, deny: &str| {
             let a = p
@@ -2465,7 +2374,7 @@ mod tests {
         // Worst case for the write-deny: the user has opened up all of ~/.gradle.
         let extra_write = [std::path::PathBuf::from("/Users/test/.gradle")];
         opts.extra_write = &extra_write;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         let at = |rule: &str| {
             p.find(rule)
@@ -2514,7 +2423,7 @@ mod tests {
         let mut opts = test_options(project, home);
         opts.proxy_forced = true;
         opts.proxy_port = None;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         assert!(
             !p.contains("\"*:443\""),
@@ -2539,7 +2448,7 @@ mod tests {
         let mut opts = test_options(project, home);
         let extra_write = [std::path::PathBuf::from("/Users/test/code")];
         opts.extra_write = &extra_write;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         for root in ["/projects/app", "/Users/test/code"] {
             let esc = root.replace('.', r"\.");
@@ -2576,7 +2485,7 @@ mod tests {
         let mut opts = test_options(project, home);
         let extra_write = [std::path::PathBuf::from("/Users/test/code")];
         opts.extra_write = &extra_write;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         for root in ["/projects/app", "/Users/test/code"] {
             let rule = format!("(deny file-write* (subpath \"{root}/.agents/plugins\"))");
@@ -2607,7 +2516,7 @@ mod tests {
         let mut opts = test_options(project, home);
         let extra_write = [std::path::PathBuf::from("/Users/test/code")];
         opts.extra_write = &extra_write;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         for root in ["/projects/app", "/Users/test/code"] {
             let esc = root.replace('.', r"\.");
@@ -2620,10 +2529,13 @@ mod tests {
     /// it wholesale would break writes nothing asked to break.
     #[test]
     fn agents_dir_itself_is_not_denied() {
-        let p = generate_profile(&test_options(
-            std::path::Path::new("/projects/app"),
-            std::path::Path::new("/Users/test"),
-        ));
+        let p = generate_profile(
+            &test_options(
+                std::path::Path::new("/projects/app"),
+                std::path::Path::new("/Users/test"),
+            ),
+            &[],
+        );
         assert!(
             !p.contains("(deny file-write* (subpath \"/projects/app/.agents\"))"),
             "only .agents/plugins is denied, not the whole tree"
@@ -2636,7 +2548,7 @@ mod tests {
     fn nested_gitdir_regex_escapes_path_metacharacters() {
         let project = std::path::Path::new("/projects/v1.0+rc[x]");
         let home = std::path::Path::new("/Users/test");
-        let p = generate_profile(&test_options(project, home));
+        let p = generate_profile(&test_options(project, home), &[]);
 
         assert!(
             p.contains(
@@ -2665,7 +2577,7 @@ mod tests {
         let extra_read = [std::fs::canonicalize(home.join(".npmrc")).expect("canonicalize")];
         assert_eq!(extra_read[0], home.join("dotfiles/npmrc"));
         opts.extra_read = &extra_read;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         let home_str = home.display();
         assert!(
@@ -2691,7 +2603,7 @@ mod tests {
         let mut opts = test_options(&project, &home);
         let extra_read = [std::fs::canonicalize(home.join(".aws/config")).expect("canonicalize")];
         opts.extra_read = &extra_read;
-        let p = generate_profile(&opts);
+        let p = generate_profile(&opts, &[]);
 
         let home_str = home.display();
         assert!(
