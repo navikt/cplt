@@ -522,10 +522,17 @@ impl Agent {
         matches!(self, Agent::Copilot)
     }
 
-    /// Paths inside this agent's writable config dir(s) that auto-execute on
-    /// the HOST the next time the agent runs *outside* cplt — a persistence
-    /// vector the agent never needs to write mid-session. Each entry is joined
-    /// onto every writable [`Agent::config_dirs`] grant and denied for writing.
+    /// Paths inside this agent's writable grants that auto-execute on the HOST
+    /// the next time the agent runs *outside* cplt — a persistence vector the
+    /// agent never needs to write mid-session. Each entry is joined onto every
+    /// writable [`Agent::config_dirs`] grant and denied for writing.
+    ///
+    /// "Config dir" would be too narrow: `config_dirs` returns whatever an
+    /// agent needs granted, which for the shell includes the fish *data* dir
+    /// (`vendor_conf.d/` and friends live there), for Claude a top-level file
+    /// (`~/.claude.json`), and for OpenCode data, state and cache dirs. A join
+    /// that does not correspond to a real path is inert, which is how one list
+    /// covers grants of different shapes.
     ///
     /// - Claude: `statusline.sh` runs on every prompt render, `plugins/` loads
     ///   at startup, and `settings.json` carries `hooks` (`SessionStart`,

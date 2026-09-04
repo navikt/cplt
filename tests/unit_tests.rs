@@ -1070,10 +1070,10 @@ fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
 /// The config dir stays writable for exactly one reason: fish rewrites
 /// `fish_variables` by temp-file-and-rename inside it, so `set -U` needs
 /// directory write. Everything in there that runs on the next host shell is
-/// denied at file level instead. `vendor_functions.d` / `vendor_completions.d`
-/// cover the data dir, which is on `$fish_function_path` and
-/// `$fish_complete_path` by default and was previously granted write with no
-/// guard at all.
+/// denied at file level instead. `vendor_conf.d` (sourced at every startup,
+/// first in `$__fish_vendor_confdirs`), `vendor_functions.d` and
+/// `vendor_completions.d` cover the data dir, which was previously granted
+/// write with no guard at all.
 #[test]
 fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
     // The two grants are built by hand rather than through
