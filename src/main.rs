@@ -4315,7 +4315,10 @@ fn resolved_ip_block_item(
             addr.ip()
         ),
         fix: Some(
-            "for a trusted internal host use --allow-private-domains <DOMAIN>; \
+            // Post-DNS verdict: the host HAS a name, so allow_private_domains can
+            // cover it. No IP-literal caveat needed here.
+            "for a trusted internal host use --allow-private-domain <DOMAIN> \
+             (or proxy.allow_private_domains in config); \
              for a local dev server use --allow-localhost <PORT>."
                 .to_string(),
         ),

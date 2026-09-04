@@ -313,8 +313,15 @@ pub fn explain_domain(
              (e.g. cloud metadata 169.254.169.254, internal services)."
                 .to_string(),
             Some(
-                "for a trusted internal host use --allow-private-domains <DOMAIN>; \
-                 for a local dev server use --allow-localhost <PORT>."
+                // This verdict is the PRE-DNS gate, which fires on an IP literal
+                // before `allow_private_domains` is ever consulted — that list is
+                // only read by the post-DNS guard. So an IP-literal target cannot
+                // be allowed by any key, and saying so beats sending the user to a
+                // flag that will not help them.
+                "for a trusted internal host use --allow-private-domain <DOMAIN> \
+                 (or proxy.allow_private_domains in config); an IP-literal target \
+                 cannot be allowed — give the host a DNS name; for a local dev \
+                 server use --allow-localhost <PORT>."
                     .to_string(),
             ),
         ),

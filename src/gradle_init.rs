@@ -15,6 +15,11 @@
 //! default). The script is guarded by `__CPLT_WRAPPED` — it only activates
 //! inside the sandbox and is inert in normal builds.
 //!
+//! The same script also forwards cplt's JVM proxy system properties
+//! (`http(s).proxyHost`/`proxyPort`/`nonProxyHosts`) into those forks, so a
+//! forked test or `JavaExec` that resolves dependencies or calls out still goes
+//! through the CONNECT proxy and still appears in the proxy log.
+//!
 //! Scope: the script covers the daemon itself plus `Test`/`JavaExec` forks.
 //! `WorkerExecutor` process-isolation forks have no public configuration
 //! hook — those still require the plugin to propagate the environment (see
@@ -42,12 +47,26 @@ if (System.getenv(\"__CPLT_WRAPPED\") != null) {
     // Daemon-side: keep daemon sockets on pure IPv4.
     System.setProperty(\"java.net.preferIPv4Stack\", \"true\")
 
+    // Forward the proxy settings cplt injected into this JVM via
+    // JAVA_TOOL_OPTIONS down to forked JVMs, which do not reliably inherit it.
+    // Read from system properties rather than hardcoding a port: the proxy port
+    // is OS-assigned, and this script is static content. Absent (no proxy, or a
+    // daemon started outside cplt) => nothing is added and forks behave as before.
+    def forkArgs = [\"-Djava.net.preferIPv4Stack=true\"]
+    [\"http.proxyHost\", \"http.proxyPort\", \"http.nonProxyHosts\",
+     \"https.proxyHost\", \"https.proxyPort\", \"https.nonProxyHosts\"].each { k ->
+        def v = System.getProperty(k)
+        if (v != null && !v.isEmpty()) {
+            forkArgs << (\"-D\" + k + \"=\" + v)
+        }
+    }
+
     allprojects {
         tasks.withType(JavaExec).configureEach {
-            jvmArgs \"-Djava.net.preferIPv4Stack=true\"
+            jvmArgs forkArgs
         }
         tasks.withType(Test).configureEach {
-            jvmArgs \"-Djava.net.preferIPv4Stack=true\"
+            jvmArgs forkArgs
         }
     }
 }
@@ -106,6 +125,23 @@ mod tests {
     fn script_is_guarded_by_cplt_env_marker() {
         assert!(SCRIPT_BODY.contains("__CPLT_WRAPPED"));
         assert!(SCRIPT_BODY.contains("preferIPv4Stack"));
+    }
+
+    #[test]
+    fn script_forwards_proxy_properties_to_forks() {
+        // Read from system properties, never a baked-in port: the proxy port is
+        // OS-assigned and this content is static.
+        for key in [
+            "http.proxyHost",
+            "http.proxyPort",
+            "http.nonProxyHosts",
+            "https.proxyHost",
+            "https.proxyPort",
+            "https.nonProxyHosts",
+        ] {
+            assert!(SCRIPT_BODY.contains(key), "{key} not forwarded to forks");
+        }
+        assert!(SCRIPT_BODY.contains("System.getProperty"));
     }
 
     #[test]
