@@ -684,14 +684,17 @@ mod copilot_extraction_tests {
         std::fs::create_dir_all(&bindir).unwrap();
         std::fs::create_dir_all(&pkg).unwrap();
         let bin = bindir.join("copilot");
-        // Staged write, then rename. Writing this script and exec'ing it under
-        // its final name races every other test thread: `Command::spawn` forks,
-        // and a fork that happens while this file is still open for writing
-        // inherits the writable descriptor, so the exec comes back ETXTBSY.
-        // Under `cargo test` that surfaces as an unexplained intermittent
-        // failure on whichever extraction test lost the race. A rename is
-        // atomic, and the descriptor is closed before the name exists.
-        let staging = bindir.join("copilot.staging");
+        // Write the script here, then have a *child process* copy it into
+        // place. Writing it in-process and exec'ing it races every other test
+        // thread: `Command::spawn` forks, and a fork that happens while this
+        // file is open for writing inherits the writable descriptor, so our
+        // exec comes back ETXTBSY. #285 tried to close that with a staged
+        // write plus an atomic rename, but ETXTBSY is a property of the inode,
+        // not of the name — renaming hands the exec the very inode that was
+        // open for writing, so the race survived and recurred. Copying via
+        // `cp` gives `bin` a fresh inode whose only writable descriptor lives
+        // and dies inside the child, where no fork of ours can inherit it.
+        let staging = root.join("copilot.staging");
         std::fs::write(
             &staging,
             format!(
@@ -703,8 +706,13 @@ mod copilot_extraction_tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::rename(&staging, &bin).unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg(&staging)
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(copied.success(), "cp of the fake copilot failed: {copied}");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         Fixture {
             root,
             home,
