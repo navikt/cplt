@@ -3111,7 +3111,15 @@ fn make_env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 #[test]
 fn env_sanitized_injects_hardening_vars() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     let npm = env
         .vars
@@ -3152,7 +3160,15 @@ fn env_claude_injects_autoupdater_and_suppresses_copilot_vars() {
         ("COPILOT_GITHUB_TOKEN", "copilot-secret"),
         ("COPILOT_FOO", "x"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Claude);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Claude,
+    );
 
     // Auto-update disabled (no --no-auto-update flag exists for Claude Code)
     let autoupdate = env.vars.iter().find(|(k, _)| k == "DISABLE_AUTOUPDATER");
@@ -3177,7 +3193,15 @@ fn env_opencode_redirects_claude_config_dir() {
     // (default ~/.claude), which the sandbox denies for OpenCode — cplt must
     // redirect it into the write-allowed OpenCode state dir.
     let parent = make_env(&[("HOME", "/home/test"), ("PATH", "/usr/bin")]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::OpenCode,
+    );
 
     let found = env.vars.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR");
     assert!(
@@ -3193,7 +3217,15 @@ fn env_opencode_redirects_claude_config_dir() {
 #[test]
 fn env_opencode_claude_config_dir_respects_xdg_state_home() {
     let parent = make_env(&[("HOME", "/home/test"), ("XDG_STATE_HOME", "/xdg/state")]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::OpenCode,
+    );
 
     let found = env.vars.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR");
     assert_eq!(found.unwrap().1, "/xdg/state/opencode/claude-config");
@@ -3207,7 +3239,15 @@ fn env_opencode_claude_config_dir_respects_user_override() {
         ("HOME", "/home/test"),
         ("CLAUDE_CONFIG_DIR", "/custom/claude"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::OpenCode,
+    );
 
     let matches: Vec<_> = env
         .vars
@@ -3223,7 +3263,15 @@ fn env_opencode_claude_config_dir_empty_is_treated_as_unset() {
     // An empty CLAUDE_CONFIG_DIR in parent env must not prevent injection —
     // the plugin would resolve it to a relative "transcripts/" path and hit EACCES.
     let parent = make_env(&[("HOME", "/home/test"), ("CLAUDE_CONFIG_DIR", "")]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::OpenCode,
+    );
 
     let matches: Vec<_> = env
         .vars
@@ -3241,7 +3289,7 @@ fn env_opencode_claude_config_dir_empty_is_treated_as_unset() {
 fn env_claude_config_dir_not_injected_for_other_agents() {
     for agent in [cplt::agent::Agent::Copilot, cplt::agent::Agent::Claude] {
         let parent = make_env(&[("HOME", "/home/test"), ("PATH", "/usr/bin")]);
-        let env = build_sandbox_env(&parent, &[], false, &[], None, agent);
+        let env = build_sandbox_env(&parent, &[], false, &[], None, None, agent);
         assert!(
             !env.vars.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
             "CLAUDE_CONFIG_DIR redirect must not be injected for {agent:?}"
@@ -3252,7 +3300,15 @@ fn env_claude_config_dir_not_injected_for_other_agents() {
 #[test]
 fn env_sanitized_injects_telemetry_opt_out_vars() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     for (name, expected) in &[
         ("DO_NOT_TRACK", "1"),
@@ -3277,6 +3333,7 @@ fn env_sanitized_telemetry_opt_out_can_be_disabled() {
         &[],
         false,
         &disabled,
+        None,
         None,
         cplt::agent::Agent::Copilot,
     );
@@ -3317,6 +3374,7 @@ fn env_sanitized_lifecycle_opt_out_skips_npm_yarn() {
         false,
         &disabled,
         None,
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -3340,7 +3398,15 @@ fn env_sanitized_lifecycle_opt_out_skips_npm_yarn() {
 #[test]
 fn env_inherit_injects_hardening_vars() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
-    let env = build_sandbox_env(&parent, &[], true, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        true,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     assert!(!env.clear_first, "inherit mode should not clear env");
     let npm = env
@@ -3367,6 +3433,7 @@ fn env_pass_env_preserves_user_override() {
         &extra,
         false,
         &[],
+        None,
         None,
         cplt::agent::Agent::Copilot,
     );
@@ -3400,6 +3467,7 @@ fn env_inherit_pass_env_preserves_user_override() {
         true,
         &[],
         None,
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -3416,7 +3484,15 @@ fn env_inherit_pass_env_preserves_user_override() {
 #[test]
 fn env_sanitized_clears_first() {
     let parent = make_env(&[("HOME", "/Users/test"), ("SECRET_TOKEN", "abc123")]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     assert!(env.clear_first, "sanitized mode should clear env first");
     assert!(
@@ -3438,7 +3514,15 @@ fn env_lang_prefix_does_not_leak_langchain_keys() {
         ("LANGFUSE_SECRET_KEY", "sk-secret-langfuse"),
         ("LANGSMITH_API_KEY", "sk-secret-langsmith"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     // LANG and LANGUAGE should pass through (explicit allowlist)
     assert!(
@@ -3476,7 +3560,15 @@ fn env_yarn_prefix_does_not_bypass_hardening() {
         ("YARN_ENABLE_SCRIPTS", "true"),
         ("YARN_CACHE_FOLDER", "/some/cache"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     // YARN_ENABLE_SCRIPTS must be overridden to "false" by hardening
     let yarn: Vec<_> = env
@@ -3526,7 +3618,15 @@ fn env_prefix_denies_secret_suffixes() {
         ("SDKMAN_DIR", "/Users/test/.sdkman"),
         ("SDKMAN_CREDENTIALS", "sdk-secret"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     // Safe config vars must pass through
     assert!(
@@ -3588,7 +3688,15 @@ fn env_yarn_npm_auth_ident_is_stripped() {
         ("YARN_NPM_AUTH_IDENT", "dXNlcjpwYXNzd29yZA=="),
         ("YARN_CACHE_FOLDER", "/some/cache"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     assert!(
         !env.vars.iter().any(|(k, _)| k == "YARN_NPM_AUTH_IDENT"),
@@ -3611,7 +3719,15 @@ fn env_explicit_allowlist_bypasses_suffix_deny() {
         ("GITHUB_TOKEN", "ghp_def456"),
         ("COPILOT_GITHUB_TOKEN", "ghp_ghi789"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     assert!(
         env.vars.iter().any(|(k, _)| k == "GH_TOKEN"),
@@ -3640,7 +3756,15 @@ fn env_otel_prefix_passthrough_and_secret_suffix_strip() {
         ("COPILOT_OTEL_ENABLED", "true"),
         ("OTEL_FOO_TOKEN", "secret-otel-token"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     assert!(
         env.vars
@@ -3675,7 +3799,15 @@ fn env_otel_passes_through_for_opencode_agent() {
         ("OTEL_RESOURCE_ATTRIBUTES", "user.name=test"),
         ("COPILOT_OTEL_ENABLED", "true"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::OpenCode);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::OpenCode,
+    );
 
     for var in [
         "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -4273,7 +4405,15 @@ fn profile_no_git_common_dir_omits_section() {
 #[test]
 fn env_git_signing_disabled_by_default() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
     let get = |name: &str| {
         env.vars
             .iter()
@@ -4295,6 +4435,7 @@ fn env_git_signing_enabled_skips_signing_vars() {
         &[],
         false,
         &[HardeningCategory::GitSigning],
+        None,
         None,
         cplt::agent::Agent::Copilot,
     );
@@ -4327,7 +4468,15 @@ fn env_gpg_tty_passed_through() {
         ("PATH", "/usr/bin"),
         ("GPG_TTY", "/dev/ttys001"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
     let get = |name: &str| {
         env.vars
             .iter()
@@ -4600,6 +4749,7 @@ fn playwright_socket_dir_respects_explicit_pass_env_value() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
     assert_eq!(
@@ -4775,6 +4925,7 @@ fn env_scratch_dir_sets_tmpdir_vars() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -4815,6 +4966,7 @@ fn env_scratch_dir_no_duplicate_tmpdir() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -4833,6 +4985,7 @@ fn env_scratch_dir_respects_pass_env_override() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -4851,7 +5004,15 @@ fn env_no_scratch_dir_passes_system_tmpdir() {
         ("HOME", "/Users/test"),
         ("TMPDIR", "/private/var/folders/xx"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     let tmpdir = env.vars.iter().find(|(k, _)| k == "TMPDIR");
     assert!(tmpdir.is_some());
@@ -4876,6 +5037,7 @@ fn env_scratch_dir_injects_java_tool_options() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -4911,6 +5073,7 @@ fn env_scratch_dir_appends_to_existing_java_tool_options() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -4938,6 +5101,7 @@ fn env_scratch_dir_java_tool_options_respects_pass_env() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -4953,7 +5117,15 @@ fn env_scratch_dir_java_tool_options_respects_pass_env() {
 #[test]
 fn env_no_scratch_dir_no_java_tool_options_injected() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
     assert!(
@@ -4974,6 +5146,7 @@ fn env_scratch_dir_no_jansi_tmpdir_env_var() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -4999,6 +5172,7 @@ fn env_injects_gradle_macos_sandbox_off() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -5022,6 +5196,7 @@ fn env_gradle_macos_sandbox_respects_pass_env() {
         false,
         &[],
         Some(scratch),
+        None,
         cplt::agent::Agent::Copilot,
     );
 
@@ -5042,7 +5217,15 @@ fn env_gradle_macos_sandbox_respects_pass_env() {
 #[test]
 fn env_injects_dotnet_do_not_use_msbuild_server() {
     let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
 
     let dotnet = env
         .vars
@@ -5067,6 +5250,7 @@ fn env_dotnet_do_not_use_msbuild_server_respects_pass_env() {
         &extra,
         false,
         &[],
+        None,
         None,
         cplt::agent::Agent::Copilot,
     );
@@ -5096,7 +5280,15 @@ fn env_node_options_strips_require() {
             "--require /tmp/evil.js --max-old-space-size=4096",
         ),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(node_opts.is_some());
     assert_eq!(node_opts.unwrap().1, "--max-old-space-size=4096");
@@ -5108,7 +5300,15 @@ fn env_node_options_strips_loader() {
         ("HOME", "/Users/test"),
         ("NODE_OPTIONS", "--loader=./evil.mjs --no-warnings"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(node_opts.is_some());
     assert_eq!(node_opts.unwrap().1, "--no-warnings");
@@ -5123,7 +5323,15 @@ fn env_node_options_strips_import() {
             "--import ./register.js --dns-result-order=ipv4first",
         ),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(node_opts.is_some());
     assert_eq!(node_opts.unwrap().1, "--dns-result-order=ipv4first");
@@ -5135,7 +5343,15 @@ fn env_node_options_removes_entirely_if_only_dangerous() {
         ("HOME", "/Users/test"),
         ("NODE_OPTIONS", "--require /tmp/evil.js -r ./other.js"),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(
         node_opts.is_none(),
@@ -5152,7 +5368,15 @@ fn env_node_options_preserves_safe_flags() {
             "--max-old-space-size=8192 --openssl-legacy-provider --no-warnings",
         ),
     ]);
-    let env = build_sandbox_env(&parent, &[], false, &[], None, cplt::agent::Agent::Copilot);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        cplt::agent::Agent::Copilot,
+    );
     let node_opts = env.vars.iter().find(|(k, _)| k == "NODE_OPTIONS");
     assert!(node_opts.is_some());
     assert_eq!(
@@ -7828,4 +8052,108 @@ fn profile_denies_write_to_cplt_config_dir() {
         p.contains("(deny file-write* (subpath \"/Users/test/.config/cplt\"))"),
         "sandboxed agents must not be able to write cplt's own config/staging dir"
     );
+}
+
+// ============================================================
+// build_sandbox_env — JVM proxy system properties (JAVA_TOOL_OPTIONS)
+// ============================================================
+
+fn jto_with_proxy(proxy_port: Option<u16>) -> Option<String> {
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let scratch = std::path::Path::new("/scratch/session123");
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        Some(scratch),
+        proxy_port,
+        cplt::agent::Agent::Copilot,
+    );
+    env.vars
+        .iter()
+        .find(|(k, _)| k == "JAVA_TOOL_OPTIONS")
+        .map(|(_, v)| v.clone())
+}
+
+#[test]
+fn env_proxy_running_injects_jvm_proxy_properties() {
+    let val = jto_with_proxy(Some(54321)).expect("JAVA_TOOL_OPTIONS should be injected");
+    for flag in [
+        "-Dhttps.proxyHost=127.0.0.1",
+        "-Dhttps.proxyPort=54321",
+        "-Dhttp.proxyHost=127.0.0.1",
+        "-Dhttp.proxyPort=54321",
+    ] {
+        assert!(val.contains(flag), "missing {flag} in {val}");
+    }
+    // Loopback must bypass the proxy or every local dev server, test container
+    // and daemon-to-daemon connection breaks.
+    for prop in ["-Dhttp.nonProxyHosts=", "-Dhttps.nonProxyHosts="] {
+        assert!(val.contains(prop), "missing {prop} in {val}");
+    }
+    assert!(val.contains("localhost|*.localhost|127.*"), "{val}");
+    assert!(val.contains("[::1]"), "IPv6 loopback must bypass: {val}");
+    // The port is read from the running proxy, never assumed.
+    assert!(!val.contains("proxyPort=8080"), "{val}");
+    // Pre-existing scratch flags are untouched.
+    assert!(
+        val.contains("-Djava.io.tmpdir=/scratch/session123"),
+        "{val}"
+    );
+}
+
+#[test]
+fn env_no_proxy_omits_jvm_proxy_properties() {
+    let val = jto_with_proxy(None).expect("scratch flags still injected");
+    for absent in ["proxyHost", "proxyPort", "nonProxyHosts"] {
+        assert!(
+            !val.contains(absent),
+            "{absent} must not appear without a proxy: {val}"
+        );
+    }
+    assert!(
+        val.contains("-Djava.io.tmpdir=/scratch/session123"),
+        "{val}"
+    );
+}
+
+#[test]
+fn env_proxy_properties_injected_without_scratch_dir() {
+    // The proxy flags must not depend on a scratch dir being configured.
+    let parent = make_env(&[("HOME", "/Users/test"), ("PATH", "/usr/bin")]);
+    let env = build_sandbox_env(
+        &parent,
+        &[],
+        false,
+        &[],
+        None,
+        Some(4711),
+        cplt::agent::Agent::Copilot,
+    );
+    let val = &env
+        .vars
+        .iter()
+        .find(|(k, _)| k == "JAVA_TOOL_OPTIONS")
+        .expect("JAVA_TOOL_OPTIONS should be injected for the proxy alone")
+        .1;
+    assert!(val.contains("-Dhttps.proxyPort=4711"), "{val}");
+    assert!(!val.contains("java.io.tmpdir"), "no scratch dir: {val}");
+}
+
+#[test]
+fn env_pass_env_java_tool_options_still_suppresses_proxy_injection() {
+    let parent = make_env(&[("HOME", "/Users/test"), ("JAVA_TOOL_OPTIONS", "-Xmx1g")]);
+    let extra = vec!["JAVA_TOOL_OPTIONS".to_string()];
+    let env = build_sandbox_env(
+        &parent,
+        &extra,
+        false,
+        &[],
+        Some(std::path::Path::new("/scratch/s")),
+        Some(4711),
+        cplt::agent::Agent::Copilot,
+    );
+    let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
+    assert_eq!(jto.unwrap().1, "-Xmx1g");
 }

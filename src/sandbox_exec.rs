@@ -119,6 +119,7 @@ fn configure_command(
         inherit_env,
         disabled_categories,
         scratch_dir,
+        proxy_port,
         agent,
     );
 

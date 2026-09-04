@@ -46,6 +46,74 @@ fn is_agent_suppressed(key: &str, agent: Agent) -> bool {
     false
 }
 
+/// Loopback spellings that must NEVER be sent to the CONNECT proxy.
+///
+/// This is deliberately the same set `crate::proxy::handle_connect` recognises
+/// as loopback (`localhost`, `*.localhost` per RFC 6761, and any IP literal that
+/// `is_loopback()`), plus `0.0.0.0` — the wildcard bind address a JVM dev server
+/// or test container reports for itself. Keeping the two in step means the list
+/// bypasses exactly what the proxy would refuse anyway (loopback is only
+/// reachable through it under `--allow-localhost`), and nothing more: no public
+/// host is silently exempted from logging or filtering.
+///
+/// Java's `nonProxyHosts` grammar is `|`-separated with `*` as the only
+/// wildcard, and it is matched against the URI host — which for an IPv6 literal
+/// keeps its brackets in some JDK paths and loses them in others, hence both
+/// spellings of `::1`.
+const JVM_NON_PROXY_HOSTS: &str = "localhost|*.localhost|127.*|[::1]|::1|0.0.0.0";
+
+/// Build the `JAVA_TOOL_OPTIONS` value, or `None` when there is nothing to say.
+///
+/// `JAVA_TOOL_OPTIONS` is the standard way to inject flags into ALL JVM
+/// processes, including Maven Surefire forks, the Kotlin compiler daemon and the
+/// Gradle daemon (started by the launcher with an inherited environment).
+///
+/// Scratch-dir flags (only when a scratch dir exists):
+/// - `java.io.tmpdir` — on macOS the JVM ignores `TMPDIR` and uses
+///   `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which returns `/var/folders/...` where
+///   the sandbox blocks exec.
+/// - `jansi.tmpdir` — where Jansi extracts its native library.
+/// - `java.rmi.server.hostname` — forces RMI (used by the Kotlin daemon) to
+///   localhost; otherwise `InetAddress.getLocalHost()` can resolve to a
+///   non-loopback IP via mDNS, which the sandbox blocks on non-443 ports.
+/// - `java.net.preferIPv4Stack` (macOS only) — keeps localhost connections on
+///   AF_INET so SBPL's `localhost:*` filter matches; it cannot match the
+///   IPv4-mapped `::ffff:127.0.0.1` a dual-stack socket produces. Linux Landlock
+///   handles addresses differently.
+///
+/// Proxy flags (only when the proxy is running): the JVM has no `HTTP_PROXY`
+/// support — it reads `http.proxyHost`/`https.proxyHost` system properties and
+/// nothing else — so without these every Gradle and Maven dependency fetch goes
+/// straight out through the kernel's `*:443` allowance, invisible to the proxy
+/// log and unfiltered by the blocklist.
+fn java_tool_options(scratch_dir: Option<&Path>, proxy_port: Option<u16>) -> Option<String> {
+    let mut flags: Vec<String> = Vec::new();
+
+    if let Some(scratch) = scratch_dir {
+        let s = scratch.to_string_lossy();
+        flags.push(format!("-Djava.io.tmpdir={s}"));
+        flags.push(format!("-Djansi.tmpdir={s}"));
+        flags.push("-Djava.rmi.server.hostname=localhost".to_string());
+        #[cfg(target_os = "macos")]
+        flags.push("-Djava.net.preferIPv4Stack=true".to_string());
+    }
+
+    if let Some(port) = proxy_port {
+        // Both schemes: `mavenCentral()` and the Gradle plugin portal are HTTPS,
+        // but plenty of repository declarations and redirects are still plain
+        // HTTP, and an unproxied HTTP fetch is exactly the hole this closes.
+        // `https.nonProxyHosts` is not read by the JDK's own ProxySelector, but
+        // Gradle documents and honours it — setting both costs one flag.
+        for scheme in ["http", "https"] {
+            flags.push(format!("-D{scheme}.proxyHost=127.0.0.1"));
+            flags.push(format!("-D{scheme}.proxyPort={port}"));
+            flags.push(format!("-D{scheme}.nonProxyHosts={JVM_NON_PROXY_HOSTS}"));
+        }
+    }
+
+    (!flags.is_empty()).then(|| flags.join(" "))
+}
+
 /// Build the environment variable map for the sandboxed process.
 ///
 /// Pure function (takes parent env as input) for testability.
@@ -55,6 +123,8 @@ fn is_agent_suppressed(key: &str, agent: Agent) -> bool {
 /// - `vars_to_remove`: only relevant when `should_clear` is false (inherit mode).
 /// - `scratch_dir`: if Some, TMPDIR/TMP/TEMP/GOTMPDIR are redirected to this path
 ///   (unless explicitly overridden by user via `extra_pass_env`).
+/// - `proxy_port`: if Some, JVM proxy system properties pointing at
+///   `127.0.0.1:<port>` are injected into `JAVA_TOOL_OPTIONS`.
 /// - `agent`: which agent is being sandboxed — Copilot-specific env vars are suppressed for other agents.
 pub fn build_sandbox_env(
     parent_env: &[(String, String)],
@@ -62,6 +132,7 @@ pub fn build_sandbox_env(
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
     scratch_dir: Option<&Path>,
+    proxy_port: Option<u16>,
     agent: Agent,
 ) -> SandboxEnv {
     let mut env = SandboxEnv {
@@ -179,41 +250,28 @@ pub fn build_sandbox_env(
                 env.vars.push((var.to_string(), scratch_str.clone()));
             }
         }
+    }
 
-        // Inject JVM temp dir, RMI, and IPv4 stack properties via JAVA_TOOL_OPTIONS.
-        // On macOS, the JVM ignores TMPDIR — it uses confstr(_CS_DARWIN_USER_TEMP_DIR)
-        // which always returns /var/folders/... where the sandbox blocks exec.
-        // JAVA_TOOL_OPTIONS is the standard way to inject flags into ALL JVM processes,
-        // including Maven Surefire forks and the Kotlin compiler daemon.
-        // Also sets jansi.tmpdir (Java system property, not env var) for Jansi native lib extraction.
-        // Also sets java.rmi.server.hostname=localhost to force RMI (used by Kotlin daemon)
-        // to use localhost — without this, InetAddress.getLocalHost() may resolve to a
-        // non-loopback IP via mDNS, which the sandbox blocks on non-443 ports.
-        //
-        // On macOS: forces IPv4 stack so localhost connections use AF_INET4 (127.0.0.1)
-        // instead of IPv6 dual-stack which produces IPv4-mapped addresses (::ffff:127.0.0.1).
-        // SBPL's "localhost:*" filter doesn't match IPv4-mapped addresses, so without this
-        // flag, Java can't use port-specific localhost rules (--allow-localhost <PORT>).
-        // This is macOS-only because Linux Landlock handles addresses differently.
-        if !extra_pass_env.iter().any(|v| v == "JAVA_TOOL_OPTIONS") {
-            let base_flags = format!(
-                "-Djava.io.tmpdir={scratch_str} -Djansi.tmpdir={scratch_str} -Djava.rmi.server.hostname=localhost"
-            );
-            #[cfg(target_os = "macos")]
-            let jvm_flags = format!("{base_flags} -Djava.net.preferIPv4Stack=true");
-            #[cfg(not(target_os = "macos"))]
-            let jvm_flags = base_flags;
-            // Append to existing JAVA_TOOL_OPTIONS if present, otherwise create new
-            if let Some(pos) = env.vars.iter().position(|(k, _)| k == "JAVA_TOOL_OPTIONS") {
-                let existing = env.vars[pos].1.clone();
-                if existing.is_empty() {
-                    env.vars[pos].1 = jvm_flags;
-                } else {
-                    env.vars[pos].1 = format!("{existing} {jvm_flags}");
-                }
+    // Inject JVM temp dir, RMI, IPv4-stack and proxy properties via JAVA_TOOL_OPTIONS.
+    // JAVA_TOOL_OPTIONS is the standard way to inject flags into ALL JVM processes,
+    // including Maven Surefire forks, the Kotlin compiler daemon and the Gradle daemon
+    // (which inherits the launcher's environment). See `java_tool_options` for what
+    // each flag is for. Deliberately NOT nested inside the scratch-dir branch: the
+    // proxy flags must be injected whenever the proxy runs, with or without a scratch
+    // dir.
+    if !extra_pass_env.iter().any(|v| v == "JAVA_TOOL_OPTIONS")
+        && let Some(jvm_flags) = java_tool_options(scratch_dir, proxy_port)
+    {
+        // Append to existing JAVA_TOOL_OPTIONS if present, otherwise create new
+        if let Some(pos) = env.vars.iter().position(|(k, _)| k == "JAVA_TOOL_OPTIONS") {
+            let existing = env.vars[pos].1.clone();
+            if existing.is_empty() {
+                env.vars[pos].1 = jvm_flags;
             } else {
-                env.vars.push(("JAVA_TOOL_OPTIONS".to_string(), jvm_flags));
+                env.vars[pos].1 = format!("{existing} {jvm_flags}");
             }
+        } else {
+            env.vars.push(("JAVA_TOOL_OPTIONS".to_string(), jvm_flags));
         }
     }
 
