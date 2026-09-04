@@ -5100,6 +5100,25 @@ paths = [
     // Cross-session SBPL profile replacement
     // ============================================================
 
+    /// `cplt-<pid>-<nanos>.sb`, the name the launcher used to give the profile
+    /// it wrote to the system temp dir — and nothing else that lives there.
+    fn is_generated_profile_name(name: &str) -> bool {
+        let Some(stem) = name
+            .strip_prefix("cplt-")
+            .and_then(|rest| rest.strip_suffix(".sb"))
+        else {
+            return false;
+        };
+        let mut parts = stem.split('-');
+        let (Some(pid), Some(nanos), None) = (parts.next(), parts.next(), parts.next()) else {
+            return false;
+        };
+        !pid.is_empty()
+            && !nanos.is_empty()
+            && pid.bytes().all(|b| b.is_ascii_digit())
+            && nanos.bytes().all(|b| b.is_ascii_digit())
+    }
+
     /// The profile must never reach the kernel as a pathname.
     ///
     /// The generated profile grants every sandbox write throughout
@@ -5158,8 +5177,12 @@ paths = [
                     for entry in entries.flatten() {
                         let name = entry.file_name();
                         let name = name.to_string_lossy();
-                        if name.starts_with("cplt-")
-                            && name.ends_with(".sb")
+                        // `cplt-<pid>-<nanos>.sb` exactly. Other tests park
+                        // their own fixtures in the temp dir as `cplt-test-*.sb`
+                        // and `cplt-portfilter-*.sb`; overwriting one of those
+                        // with `(allow default)` would turn a sibling test green
+                        // while proving nothing.
+                        if is_generated_profile_name(&name)
                             && std::fs::write(entry.path(), "(version 1)\n(allow default)\n")
                                 .is_ok()
                         {
