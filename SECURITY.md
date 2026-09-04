@@ -196,7 +196,7 @@ sudo pacman -S bubblewrap
 
 - **TLS interception.** The proxy sees CONNECT targets (hostname:port), not request bodies or responses.
 - **Kernel exploits.** We rely on Apple's Seatbelt (macOS) and Landlock/seccomp (Linux) enforcement being correct.
-- **Keychain isolation** (macOS). See [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing) below for what the grant actually reaches and when cplt drops it. `mach-lookup` is blanket because Node.js needs it for DNS, the Security framework, and system services. The **clipboard** (`com.apple.pasteboard`) is reachable through that same blanket allow; `--deny-clipboard` adds a targeted deny that blocks only the pasteboard service and leaves all others intact.
+- **Keychain isolation** (macOS). See [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing) below for what the grant actually reaches and when cplt drops it. `mach-lookup` is blanket because Node.js needs it for DNS, the Security framework, and system services. The **clipboard** (`com.apple.pasteboard`) is reachable through that same blanket allow, so cplt adds a targeted deny **by default**: only the pasteboard service is blocked, every other Mach service is untouched. Whatever the developer last copied — a password out of a password manager as often as not — is otherwise readable by the agent with a bare `pbpaste`. `--allow-clipboard` or `sandbox.deny_clipboard = false` gives it back.
 - **sandbox-exec deprecation** (macOS). Apple marks it deprecated but has not removed it, and Chromium and VS Code still use it.
 - **Landlock subpath limitations** (Linux). Landlock cannot deny access to subpaths within allowed directories. If a parent directory is allowed, all children are allowed. Certain fine-grained macOS rules therefore cannot be replicated on Linux, for example denying `.config/gh/extensions` while allowing `.config/gh/hosts.yml`. When Bubblewrap is active, user deny paths (`--deny-path` / `deny.paths`) ARE enforced despite this, via mount masks (see the platform comparison table). The built-in fine-grained rules stay macOS-only.
 - **Code quality.** The sandbox cannot judge whether code written by Copilot contains backdoors. That is a code review problem.
@@ -1130,7 +1130,7 @@ Most of these invoke `sandbox-exec` with real Seatbelt profiles and verify **ker
 | GPG signing | 4 | Default blocks `~/.gnupg`, flag allows pubring read, private keys stay denied, writes stay denied |
 | Network | 10 | Outbound blocked by default, a port named in the profile reachable while an unnamed one is not, localhost blocked by default and allowed with `--allow-localhost-any`, Java localhost with and without `preferIPv4Stack`, localhost TCP bind, and the wildcard-bind SBPL limitation. Two are text-only: that the default profile emits `*:443`, and that proxy-forced emits the `localhost:<port>` pin and drops `*:443` |
 | Unix sockets | 6 | JVM Attach sockets in `/tmp` and `/var/folders` allowed, MSBuild worker-node socket allowed and blocked without the flag, SSH agent blocked, arbitrary `/tmp` sockets blocked |
-| Clipboard | 3 | `--deny-clipboard` blocks `pbpaste` and `pbcopy`, `pbpaste` works by default |
+| Clipboard | 3 | The clipboard is denied by default; `pbpaste` and `pbcopy` are blocked, and `--allow-clipboard` drops the rule |
 | Binary CLI | 5 | Version, help, root/home dir rejection. The `--print-profile` proxy-forced check is text-only, since `--print-profile` never invokes `sandbox-exec` |
 
 ### E2E project tests (macOS only, 49 tests)

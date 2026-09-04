@@ -343,6 +343,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "deny_clipboard",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "true",
+        description: "Deny the macOS clipboard (com.apple.pasteboard) to the agent, so `pbpaste` cannot read whatever was last copied. Override for one run with --allow-clipboard. No effect on Linux.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "allow_jvm_attach",
         value_type: ConfigValueType::Bool,
         dangerous: false,
@@ -776,6 +784,15 @@ bool_keys! {
         config = |c: &Config| c.sandbox.allow_lifecycle_scripts,
         baseline = |b: PresetBaseline| b.allow_lifecycle_scripts,
         resolved = |r: &Resolved| r.allow_lifecycle_scripts;
+
+    /// Default-on since #147's clipboard hardening: `--deny-clipboard` still
+    /// exists and is now a no-op restatement of the default, and
+    /// `--allow-clipboard` is the flag that does something.
+    deny_clipboard, "sandbox", "deny_clipboard",
+        cli = |c: &CliFlags| c.deny_clipboard,
+        config = |c: &Config| c.sandbox.deny_clipboard,
+        baseline = |_: PresetBaseline| true,
+        resolved = |r: &Resolved| r.deny_clipboard;
 
     /// One-way: `--allow-gpg-signing` only. A config `true` cannot be undone
     /// for a single run.

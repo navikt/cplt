@@ -62,6 +62,8 @@ pub fn default_config_contents() -> String {
 # Stderr verbosity: "none" (default/silent), "error", "blocked", or "all".
 # The log_file always records everything regardless of this setting.
 # log_level = "none"
+# Floored at "blocked" while a domain allowlist is enforcing, so a refused
+# host explains itself instead of surfacing as an unexplained 403.
 # Domains allowed to resolve to private/internal IPs (bypasses DNS-rebinding block).
 # Use for corporate internal services, e.g. MCP servers on your company's intranet.
 # Suffix matching: "intern.nav.no" covers all its subdomains.
@@ -186,6 +188,11 @@ pub fn default_config_contents() -> String {
 # socket are reachable. A compromised process cannot extract the key,
 # but it CAN request arbitrary signatures while the session is active.
 # allow_gpg_signing = false
+#
+# Deny the macOS clipboard (com.apple.pasteboard) to the agent, so `pbpaste`
+# cannot read whatever you last copied. On by default; no effect on Linux.
+# Override for a single run with --allow-clipboard.
+# deny_clipboard = true
 #
 # Allow JVM Attach API unix sockets in /tmp.
 # Needed for JVM testing frameworks that use runtime self-attach:

@@ -383,8 +383,7 @@ impl Config {
 
         let allow_gpg_signing = bools.allow_gpg_signing;
 
-        // Deny-clipboard: CLI-only tightening flag (defaults to false).
-        let deny_clipboard = cli.deny_clipboard;
+        let deny_clipboard = bools.deny_clipboard;
 
         let allow_jvm_attach = bools.allow_jvm_attach;
 
@@ -2958,6 +2957,14 @@ mod precedence {
                 preset: None,
             },
             Ladder {
+                key: "sandbox.deny_clipboard",
+                cli_on: Some(|c| c.deny_clipboard = FeatureToggle::ForceOn),
+                cli_off: Some(|c| c.deny_clipboard = FeatureToggle::ForceOff),
+                get: |r| r.deny_clipboard,
+                default: true,
+                preset: None,
+            },
+            Ladder {
                 key: "sandbox.quiet",
                 cli_on: Some(|c| c.quiet = FeatureToggle::ForceOn),
                 cli_off: Some(|c| c.quiet = FeatureToggle::ForceOff),
@@ -3113,6 +3120,37 @@ mod precedence {
             let r = merge("", CliFlags::default());
             assert_eq!((l.get)(&r), l.default, "{} with nothing set", l.key);
         }
+    }
+
+    /// The clipboard holds whatever was last copied, which on a developer's
+    /// machine is a password out of a password manager more often than not, and
+    /// `pbpaste` reads it with no privileges at all. Asserted on the resolved
+    /// value out of `merge`, not on the registry literal — the default has
+    /// several layers and only this one is what runs.
+    #[test]
+    fn clipboard_is_denied_with_no_config_and_no_flags() {
+        let resolved = Config::default().merge(CliFlags::default()).unwrap();
+        assert!(resolved.deny_clipboard);
+    }
+
+    /// The default is only defensible if it is one flag to undo.
+    #[test]
+    fn allow_clipboard_turns_the_deny_back_off() {
+        let from_cli = Config::default()
+            .merge(CliFlags {
+                deny_clipboard: FeatureToggle::ForceOff,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!from_cli.deny_clipboard);
+
+        let from_config: Config = toml::from_str("[sandbox]\ndeny_clipboard = false\n").unwrap();
+        assert!(
+            !from_config
+                .merge(CliFlags::default())
+                .unwrap()
+                .deny_clipboard
+        );
     }
 
     #[test]
