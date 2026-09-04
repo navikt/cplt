@@ -127,3 +127,33 @@ pub fn temp_repo(remote: &str) -> tempfile::TempDir {
     ));
     dir
 }
+
+/// Assert a gate refused a command *for the stated reason*.
+///
+/// `assert!(!ok, …)` on its own is a vacuous assertion: it passes when the
+/// command failed for any reason at all — a renamed flag clap rejects, a
+/// fixture that never got built, a panic in the harness. Tests of that shape
+/// have shipped green over guards that were never running (issue #126).
+/// Pinning the refusal text is what separates "the policy blocked it" from "it
+/// fell over on the way to the policy".
+///
+/// `reason` should be the distinguishing part of the message — the `Reason:`
+/// line, not the `BLOCKED by sandbox` banner every refusal carries.
+///
+/// # Panics
+/// If the command succeeded, or failed without emitting the refusal banner and
+/// `reason`.
+pub fn assert_refused(stderr: &str, ok: bool, reason: &str) {
+    assert!(
+        !ok,
+        "must be refused, but the gate let it through.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("BLOCKED by sandbox"),
+        "must fail as a policy refusal, not for some other reason.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(reason),
+        "refusal must name {reason:?}.\nstderr: {stderr}"
+    );
+}
