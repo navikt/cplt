@@ -23,7 +23,7 @@
 use std::process::Command;
 
 mod common;
-use common::{binary_in_path, binary_path, cplt_cmd, git_cmd, temp_repo};
+use common::{binary_in_path, cplt_cmd, temp_repo};
 
 /// Run `cplt gh-gate` with default block policy.
 /// Returns (stdout, stderr, exit_success).
@@ -1454,6 +1454,8 @@ fn git_gate_protect_default_blocks_multi_refspec_with_main() {
 
 #[cfg(target_os = "macos")]
 mod sandbox_integration {
+    use crate::common::{binary_path, git_cmd};
+
     use super::*;
     use std::fs;
 
