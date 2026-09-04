@@ -244,8 +244,11 @@ fn ssh_port_open(resolved: &Resolved) -> bool {
 fn ssh_key_readable(allow_read: &[std::path::PathBuf], home: &Path) -> bool {
     let ssh_dir = home.join(".ssh");
     allow_read.iter().any(|p| {
-        (p.starts_with(&ssh_dir) && *p != ssh_dir)
-            || (cfg!(not(target_os = "macos")) && ssh_dir.starts_with(p))
+        // The directory itself counts on neither backend, whichever side of the
+        // prefix test it lands on.
+        *p != ssh_dir
+            && (p.starts_with(&ssh_dir)
+                || (cfg!(not(target_os = "macos")) && ssh_dir.starts_with(p)))
     })
 }
 
@@ -286,8 +289,9 @@ fn denied_dotfile_overrides(home: &Path, granted: &[std::path::PathBuf]) -> Vec<
         .filter(|p| {
             crate::sandbox::DENIED_DOTFILES.iter().any(|d| {
                 let denied = home.join(d);
-                (p.starts_with(&denied) && **p != denied)
-                    || (cfg!(not(target_os = "macos")) && denied.starts_with(p))
+                **p != denied
+                    && (p.starts_with(&denied)
+                        || (cfg!(not(target_os = "macos")) && denied.starts_with(p)))
             })
         })
         .map(|p| match p.strip_prefix(home) {
