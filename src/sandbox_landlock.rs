@@ -336,6 +336,40 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
+    // ── The cplt binary itself: read + execute ──
+    //
+    // The guard wrappers are `exec <cplt> git-gate ...` / `gh-gate ...` — they
+    // re-enter this binary from inside the sandbox to reach the decision. macOS
+    // gets that for free from a blanket `(allow process-exec)`; Landlock has no
+    // such thing, so without an explicit rule the wrapper dies with
+    // "exec: /path/to/cplt: Permission denied" and *every* git command fails —
+    // `status`, `log`, `--version`, not only `push`.
+    //
+    // It worked at all only by accident of layout: `/usr/local` is in
+    // LINUX_TOOL_DIRS, so an install there re-entered fine, while `install.sh`'s
+    // default of `~/.local/bin` did not. The guard's own design requires this
+    // grant; leaving it to depend on where the user installed cplt is what made
+    // it look like it worked.
+    //
+    // The file, not its directory: `~/.local/bin` holds whatever else the user
+    // put there, and none of it needs to become executable inside the sandbox.
+    // No boundary is given up — `gh-gate`/`git-gate` take their policy from
+    // argv, so an agent that can exec cplt can pass its own flags, but it could
+    // always do that when cplt lived in a granted directory, and it can skip the
+    // wrapper entirely by calling git by absolute path. The guard is a policy on
+    // intent, not a boundary.
+    if let Ok(cplt_bin) = std::env::current_exe() {
+        fs_rules.push(FsRule {
+            path: cplt_bin,
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: true,
+                ioctl: false,
+            },
+        });
+    }
+
     // ── Tool directories: read + execute ──
     for &p in LINUX_TOOL_DIRS {
         fs_rules.push(FsRule {
