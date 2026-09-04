@@ -475,8 +475,9 @@ Copilot. Only credentials that are durable for a whole session qualify.
   rather than any variable from goose's env hints: a developer with
   `OPENAI_API_KEY` exported and goose pointed at Anthropic would otherwise lose
   the keyring and the login with it. `GOOSE_DISABLE_KEYRING` does not rescue it
-  either — it sends the same writes to `~/.config/goose/secrets.yaml`, which
-  cplt grants read-only. Determined by reading goose's source
+  either — it sends the same writes to `secrets.yaml` in goose's config dir
+  (`$XDG_CONFIG_HOME/goose`, `~/.config/goose` by default), which cplt grants
+  read-only. Determined by reading goose's source
   (`aaif-goose/goose`), not by inspecting the credential's shape.
 
 **Copilot is deliberately not eligible.** Claude Code's substitute was

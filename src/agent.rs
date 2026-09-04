@@ -437,8 +437,8 @@ impl Agent {
             // exported and goose pointed at Anthropic would otherwise lose the
             // keyring and the login with it. `GOOSE_DISABLE_KEYRING` is not the
             // escape hatch either — it redirects those same writes to
-            // `~/.config/goose/secrets.yaml`, and cplt grants that dir
-            // read-only.
+            // `secrets.yaml` in goose's config dir ($XDG_CONFIG_HOME/goose,
+            // ~/.config/goose by default), which cplt grants read-only.
             Agent::Goose => &[],
             _ => &[],
         }
