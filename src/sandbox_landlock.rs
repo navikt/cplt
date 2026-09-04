@@ -32,7 +32,7 @@
 //! cannot. Use `--with-proxy` on Linux for localhost SSRF protection.
 //! The proxy handles domain-level filtering on both platforms.
 
-use super::policy::{self, HomeToolDir};
+use super::policy;
 #[cfg(target_os = "linux")]
 use crate::ui;
 use std::fmt::Write as _;
@@ -102,9 +102,12 @@ pub struct LandlockPolicy {
     /// (Landlock ABI < v4): warn-and-continue would launch the agent with open
     /// direct networking behind the very flag meant to prevent it.
     pub proxy_forced: bool,
-    /// Home directory — used to pre-create writable cache directories that
+    /// Home directory — used to pre-create cache-exec directories that
     /// Landlock needs to open(O_PATH) before the sandbox is applied.
     pub home_dir: PathBuf,
+    /// Writable home tool dirs (build caches such as `$CARGO_HOME/registry`)
+    /// pre-created before the sandbox is applied, for the same reason.
+    pub precreate_dirs: Vec<PathBuf>,
 }
 
 /// Pre-computed data for sandbox application in the child process.
@@ -362,19 +365,18 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         }
     }
 
-    // ── Home tool directories (filtered by discovery) ──
-    for dir in policy::home_tool_dirs() {
-        if should_include_tool_dir(dir, config) {
-            fs_rules.push(FsRule {
-                path: home.join(dir.path),
-                access: FsAccess {
-                    read: true,
-                    write: dir.write,
-                    execute: dir.process_exec || dir.map_exec,
-                    ioctl: false,
-                },
-            });
-        }
+    // ── Home tool directories (filtered by discovery, relocated homes resolved) ──
+    let tool_dirs = policy::active_tool_dirs(home, config.existing_home_tool_dirs);
+    for policy::ResolvedToolDir { path, dir } in &tool_dirs {
+        fs_rules.push(FsRule {
+            path: path.clone(),
+            access: FsAccess {
+                read: true,
+                write: dir.write,
+                execute: dir.process_exec || dir.map_exec,
+                ioctl: false,
+            },
+        });
     }
 
     // ── Cache exec carve-out (opt-in; Linux equivalent of macOS allow_cache_exec) ──
@@ -760,20 +762,19 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // provides domain filtering and port enforcement for remote connections).
     let restrict_net_connect = !config.allow_localhost_any;
 
+    let precreate_dirs = tool_dirs
+        .into_iter()
+        .filter(|d| d.dir.write)
+        .map(|d| d.path)
+        .collect();
+
     LandlockPolicy {
         fs_rules,
         net_rules,
         restrict_net_connect,
         proxy_forced: config.proxy_forced,
         home_dir: home.to_path_buf(),
-    }
-}
-
-/// Check if a home tool directory should be included based on discovery data.
-fn should_include_tool_dir(dir: &HomeToolDir, config: &super::SandboxConfig) -> bool {
-    match &config.existing_home_tool_dirs {
-        Some(existing) => existing.iter().any(|e| e == dir.path),
-        None => true,
+        precreate_dirs,
     }
 }
 
@@ -1165,12 +1166,9 @@ pub fn precompute(policy: LandlockPolicy) -> Result<PrecomputedSandbox, String> 
     // Scope: only HOME_TOOL_DIRS with write=true (build caches). We do NOT
     // pre-create user --allow-write paths, socket paths, or arbitrary writable
     // rules — those require the user to set up the filesystem themselves.
-    for dir in policy::home_tool_dirs() {
-        if dir.write {
-            let path = policy.home_dir.join(dir.path);
-            if !path.exists() {
-                let _ = std::fs::create_dir_all(&path);
-            }
+    for path in &policy.precreate_dirs {
+        if !path.exists() {
+            let _ = std::fs::create_dir_all(path);
         }
     }
 
@@ -2642,12 +2640,11 @@ mod tests {
     fn discovery_filtering_limits_home_tool_dirs() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
-        let existing = vec![
-            ".cargo/bin".to_string(),
-            ".cargo/registry".to_string(),
-            ".cargo/git".to_string(),
-            ".nvm".to_string(),
-        ];
+        let existing: Vec<policy::ResolvedToolDir> = policy::home_tool_dirs()
+            .iter()
+            .filter(|d| [".cargo/bin", ".cargo/registry", ".cargo/git", ".nvm"].contains(&d.path))
+            .map(|d| d.resolve(&home, &[]))
+            .collect();
         let mut config = test_config(&project, &home);
         config.existing_home_tool_dirs = Some(&existing);
         let policy = generate_policy(&config);
@@ -3255,6 +3252,7 @@ mod tests {
             restrict_net_connect: false,
             proxy_forced: false,
             home_dir: PathBuf::from("/tmp/test-home"),
+            precreate_dirs: vec![],
         };
 
         let precomputed = precompute(policy).expect("precompute should succeed");

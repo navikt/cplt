@@ -14,6 +14,8 @@ use cplt::sandbox::{
     playwright_runtime_intent, playwright_sockets_dir_override, tool_override_path_is_safe,
     tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
 };
+use cplt::sandbox::{ResolvedToolDir, ToolRoot, home_tool_dirs, relocatable_tool_prefix};
+use std::path::PathBuf;
 
 // ============================================================
 // Unsafe root detection
@@ -8769,6 +8771,216 @@ fn tool_path_list_per_segment_safety_guard_drops_unsafe_segment() {
     assert!(
         !tool_override_path_is_safe(std::path::Path::new("/"), home),
         "the `/` segment must be dropped by the guard"
+    );
+}
+
+// --- Relocated tool homes keep per-subdir HOME_TOOL_DIRS posture (#152) ------
+// CARGO_HOME=~/.local/share/cargo must yield the same split as ~/.cargo:
+// bin exec-only, registry/git writable without process-exec. One write grant
+// over the whole tree made $CARGO_HOME/bin non-executable.
+
+fn tool_dir(path: &str) -> &'static cplt::sandbox::HomeToolDir {
+    home_tool_dirs()
+        .iter()
+        .find(|d| d.path == path)
+        .unwrap_or_else(|| panic!("{path} missing from HOME_TOOL_DIRS"))
+}
+
+fn cargo_root() -> Vec<ToolRoot> {
+    vec![ToolRoot {
+        default: ".cargo",
+        root: PathBuf::from("/home/tester/.local/share/cargo"),
+    }]
+}
+
+#[test]
+fn relocatable_prefix_covers_split_trees_only() {
+    assert_eq!(relocatable_tool_prefix("CARGO_HOME"), Some(".cargo"));
+    assert_eq!(relocatable_tool_prefix("RUSTUP_HOME"), Some(".rustup"));
+    assert_eq!(relocatable_tool_prefix("GOPATH"), Some("go"));
+    // No HOME_TOOL_DIRS entry lives under go/pkg/mod → plain whole-tree grant.
+    assert_eq!(relocatable_tool_prefix("GOMODCACHE"), None);
+    assert_eq!(relocatable_tool_prefix("NODE_PATH"), None);
+    assert_eq!(relocatable_tool_prefix("NOT_A_TOOL_VAR"), None);
+}
+
+#[test]
+fn resolve_reroots_entries_under_relocated_home() {
+    let home = std::path::Path::new("/home/tester");
+    let roots = cargo_root();
+    let bin = tool_dir(".cargo/bin").resolve(home, &roots);
+    assert_eq!(
+        bin.path,
+        PathBuf::from("/home/tester/.local/share/cargo/bin")
+    );
+    assert!(bin.dir.process_exec && !bin.dir.write);
+    let registry = tool_dir(".cargo/registry").resolve(home, &roots);
+    assert_eq!(
+        registry.path,
+        PathBuf::from("/home/tester/.local/share/cargo/registry")
+    );
+    assert!(registry.dir.write && !registry.dir.process_exec);
+    // Unrelated entries stay under HOME.
+    assert_eq!(
+        tool_dir(".nvm").resolve(home, &roots).path,
+        PathBuf::from("/home/tester/.nvm")
+    );
+    // No roots → default location.
+    assert_eq!(
+        tool_dir(".cargo/bin").resolve(home, &[]).path,
+        PathBuf::from("/home/tester/.cargo/bin")
+    );
+}
+
+#[test]
+fn resolve_entry_equal_to_root_has_no_trailing_separator() {
+    let home = std::path::Path::new("/home/tester");
+    let roots = vec![ToolRoot {
+        default: ".rustup",
+        root: PathBuf::from("/home/tester/.local/share/rustup"),
+    }];
+    let r = tool_dir(".rustup").resolve(home, &roots);
+    assert_eq!(r.path, PathBuf::from("/home/tester/.local/share/rustup"));
+    assert!(!r.path.to_string_lossy().ends_with('/'));
+}
+
+#[test]
+fn tool_path_rustup_home_custom_yields_read_only_rule() {
+    let home = std::path::Path::new("/home/tester");
+    let env = env_pairs(&[("RUSTUP_HOME", "/home/tester/.local/share/rustup")]);
+    let overrides = tool_path_env_overrides(&env, home);
+    assert_eq!(overrides.len(), 1);
+    assert!(
+        !overrides[0].write,
+        "toolchains are read-only, like ~/.rustup"
+    );
+    let env = env_pairs(&[("RUSTUP_HOME", "~/.rustup")]);
+    assert!(
+        tool_path_env_overrides(&env, home).is_empty(),
+        "default location is already covered by HOME_TOOL_DIRS"
+    );
+}
+
+fn relocated_cargo_dirs() -> Vec<ResolvedToolDir> {
+    let home = std::path::Path::new("/home/tester");
+    let roots = cargo_root();
+    [".cargo/bin", ".cargo/registry", ".cargo/git"]
+        .iter()
+        .map(|p| tool_dir(p).resolve(home, &roots))
+        .collect()
+}
+
+#[test]
+fn profile_relocated_cargo_bin_is_exec_only_and_registry_is_write_only() {
+    let dirs = relocated_cargo_dirs();
+    let p = generate_profile(&ProfileOptions {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/home/tester"),
+        extra_read: &[],
+        extra_write: &[],
+        allow_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: Some(&dirs),
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        extra_git_dirs: &[],
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+        credential_outside_keychain: false,
+    });
+    let bin = "/home/tester/.local/share/cargo/bin";
+    let registry = "/home/tester/.local/share/cargo/registry";
+    assert!(p.contains(&format!("(allow process-exec (subpath \"{bin}\"))")));
+    assert!(!p.contains(&format!("(allow file-write* (subpath \"{bin}\"))")));
+    assert!(p.contains(&format!("(allow file-write* (subpath \"{registry}\"))")));
+    assert!(p.contains(&format!("(deny process-exec (subpath \"{registry}\"))")));
+    // The default location is not granted when discovery relocated it.
+    assert!(!p.contains("/home/tester/.cargo/bin"));
+}
+
+#[test]
+fn landlock_relocated_cargo_bin_is_exec_only_and_registry_is_precreated() {
+    let dirs = relocated_cargo_dirs();
+    let ll = generate_policy(&SandboxConfig {
+        project_dir: std::path::Path::new("/projects/app"),
+        home_dir: std::path::Path::new("/home/tester"),
+        extra_read: &[],
+        extra_write: &[],
+        extra_socket: &[],
+        extra_deny: &[],
+        existing_home_tool_dirs: Some(&dirs),
+        existing_app_dirs: None,
+        extra_ports: &[],
+        localhost_ports: &[],
+        proxy_port: None,
+        proxy_forced: false,
+        allow_env_files: false,
+        allow_localhost_any: false,
+        scratch_dir: None,
+        playwright_socket_dir: None,
+        allow_tmp_exec: false,
+        copilot_install_dir: None,
+        java_home: None,
+        dotnet_root: None,
+        git_hooks_path: None,
+        git_common_dir: None,
+        allow_gpg_signing: false,
+        deny_clipboard: false,
+        allow_jvm_attach: false,
+        allow_msbuild: false,
+        allow_docker: false,
+        electron_app_dir: None,
+        agent: cplt::agent::Agent::Copilot,
+        agent_dirs: &[],
+        allow_cache_exec: &[],
+        allow_cache_exec_any: false,
+        allow_browser: false,
+        use_bubblewrap: None,
+        keychain_substitute: None,
+    });
+    let rule = |p: &str| {
+        ll.fs_rules
+            .iter()
+            .find(|r| r.path == std::path::Path::new(p))
+            .unwrap_or_else(|| panic!("{p} should have a rule"))
+    };
+    let bin = rule("/home/tester/.local/share/cargo/bin");
+    assert!(bin.access.execute && !bin.access.write);
+    let registry = rule("/home/tester/.local/share/cargo/registry");
+    assert!(registry.access.write);
+    assert!(
+        ll.precreate_dirs
+            .contains(&PathBuf::from("/home/tester/.local/share/cargo/registry"))
+    );
+    assert!(
+        !ll.precreate_dirs
+            .contains(&PathBuf::from("/home/tester/.local/share/cargo/bin"))
+    );
+    assert!(
+        !ll.fs_rules
+            .iter()
+            .any(|r| r.path == std::path::Path::new("/home/tester/.cargo/bin"))
     );
 }
 
