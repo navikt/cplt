@@ -34,8 +34,7 @@ mod macos_tests {
         Command::new("sandbox-exec")
             .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox
@@ -2036,11 +2035,10 @@ mod macos_tests {
         if Command::new("java")
             .arg("-version")
             .output()
-            .map(|o| {
+            .map_or(true, |o| {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 !o.status.success() || stderr.contains("Unable to locate")
             })
-            .unwrap_or(true)
         {
             eprintln!("SKIP: java not found");
             return;
@@ -2092,11 +2090,10 @@ public class T {
         if Command::new("java")
             .arg("-version")
             .output()
-            .map(|o| {
+            .map_or(true, |o| {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 !o.status.success() || stderr.contains("Unable to locate")
             })
-            .unwrap_or(true)
         {
             eprintln!("SKIP: java not found");
             return;

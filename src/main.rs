@@ -3164,8 +3164,8 @@ fn create_playwright_socket_dir(
     // SBPL rules, so a shorter path of the caller's own would then be denied at
     // bind. Both failures surface deep inside Playwright, so name the cause.
     let inherited_value = std::env::var_os("PWTEST_SOCKETS_DIR")
-        .filter(|value| !value.is_empty())
-        .is_some();
+        .as_ref()
+        .is_some_and(|value| !value.is_empty());
     if intent && caller_owned && !inherited_value {
         ui::warn(
             "PWTEST_SOCKETS_DIR is passed through but has no value, so cplt creates no \
@@ -7071,8 +7071,7 @@ mod copilot_extraction_tests {
         /// How many times the fake copilot was invoked with `--version`.
         fn version_calls(&self) -> usize {
             std::fs::read_to_string(self.root.join("version-calls"))
-                .map(|s| s.lines().count())
-                .unwrap_or(0)
+                .map_or(0, |s| s.lines().count())
         }
 
         /// Path of cplt's fast-path marker for this fixture.

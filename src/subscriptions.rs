@@ -62,7 +62,7 @@ const LAZY_FETCH_TIMEOUT_SECS: u64 = 5;
 const MAX_FETCH_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Warn about a cache that has not been refreshed in this long.
-const STALE_WARN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const STALE_WARN: Duration = Duration::from_hours(720);
 
 /// How often lazily-refreshed subscriptions are re-fetched before a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,8 +92,8 @@ impl RefreshInterval {
     fn max_age(self) -> Option<Duration> {
         match self {
             Self::Manual => None,
-            Self::Daily => Some(Duration::from_secs(24 * 60 * 60)),
-            Self::Weekly => Some(Duration::from_secs(7 * 24 * 60 * 60)),
+            Self::Daily => Some(Duration::from_hours(24)),
+            Self::Weekly => Some(Duration::from_hours(168)),
         }
     }
 }
@@ -791,12 +791,12 @@ mod tests {
         assert_eq!(o1.len(), 1);
 
         // Shortly after: cache is fresh → not due.
-        let t1 = t0 + Duration::from_secs(60 * 60);
+        let t1 = t0 + Duration::from_hours(1);
         let o2 = refresh_if_stale(&set, &|_| panic!("should not refetch a fresh cache"), t1);
         assert!(o2.is_empty());
 
         // Two days later: cache is stale → due again.
-        let t2 = t0 + Duration::from_secs(2 * 24 * 60 * 60);
+        let t2 = t0 + Duration::from_hours(48);
         let o3 = refresh_if_stale(&set, &|_| Ok(b"a.com\nb.com\n".to_vec()), t2);
         assert_eq!(o3.len(), 1);
         assert_eq!(load_cached_domains(&set), vec!["a.com", "b.com"]);
@@ -826,7 +826,7 @@ mod tests {
         let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
         update_all(&set, &|_| Ok(b"a.com\n".to_vec()), t0);
         // 40 days later.
-        let later = t0 + Duration::from_secs(40 * 24 * 60 * 60);
+        let later = t0 + Duration::from_hours(960);
         let warns = staleness_warnings(&set, later);
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("days old"));

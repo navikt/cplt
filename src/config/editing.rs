@@ -383,9 +383,9 @@ fn create_unique_temp_file(
 #[cfg(unix)]
 fn existing_or_default_mode(path: &Path, default_mode: u32) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|metadata| metadata.permissions().mode() & 0o777)
-        .unwrap_or(default_mode)
+    std::fs::metadata(path).map_or(default_mode, |metadata| {
+        metadata.permissions().mode() & 0o777
+    })
 }
 
 #[cfg(not(unix))]

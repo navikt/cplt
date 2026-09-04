@@ -88,10 +88,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// tearing it down at `proxy.timeout` drops live sessions (Claude Code shows
 /// this as a request timeout). Only this ceiling closes an idle tunnel.
 // ponytail: fixed ceiling, make it configurable if anyone needs longer.
-const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Fallback read-poll interval when `proxy.timeout` is 0, which the OS rejects.
-const DEFAULT_PROXY_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_PROXY_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// How often file-backed domain lists are re-read from disk.
 /// Within the TTL window, cached values are returned without I/O.
@@ -1695,10 +1695,7 @@ fn touch(last_activity: &Mutex<Instant>) {
 }
 
 fn idle_for(last_activity: &Mutex<Instant>) -> Duration {
-    last_activity
-        .lock()
-        .map(|t| t.elapsed())
-        .unwrap_or(Duration::ZERO)
+    last_activity.lock().map_or(Duration::ZERO, |t| t.elapsed())
 }
 
 /// Errors that mean "nothing to read right now", not "this tunnel is dead".
@@ -2460,7 +2457,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2489,7 +2486,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2523,7 +2520,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2560,7 +2557,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2603,7 +2600,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2701,7 +2698,7 @@ mod tests {
             config_file: Some(config_path.clone()),
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             resolver: None,
@@ -2798,7 +2795,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             resolver: None,
@@ -2835,7 +2832,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             resolver: None,
@@ -2871,7 +2868,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2918,7 +2915,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2945,7 +2942,7 @@ mod tests {
             allow_localhost_any: false,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             resolver: None,
@@ -3651,7 +3648,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             upstream: None,
             upstream_no_proxy: Vec::new(),
             resolver,
@@ -3876,7 +3873,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             resolver: Some(resolver),
             upstream: None,
             upstream_no_proxy: Vec::new(),
@@ -3937,7 +3934,7 @@ mod tests {
             config_file: None,
             log_file: None,
             log_level: ProxyLogLevel::None,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             resolver: Some(resolver),
             upstream: None,
             upstream_no_proxy: Vec::new(),
