@@ -61,15 +61,44 @@ fn git_gate(args: &[&str], prevent_push: bool, prevent_force_push: bool) -> (Str
     git_gate_with_mode(args, prevent_push, prevent_force_push, "block")
 }
 
+/// A stand-in `git` that answers the guard's resolution calls with the real
+/// git but makes an actual `push` a no-op.
+///
+/// `protect_default_branch_only` resolves the repository's default branch by
+/// running git, so `/usr/bin/true` (which answers nothing) would leave every
+/// push blocked for the wrong reason — while a real git would try to reach the
+/// network on an allowed push.
+fn fake_push_git(dir: &std::path::Path) -> std::path::PathBuf {
+    let script = dir.join("fake-git.sh");
+    // Any invocation carrying `push` as a word is the push itself; the guard's
+    // own resolution calls (`symbolic-ref`, `rev-parse`, `remote get-url`) never
+    // do. The git path is quoted — it can contain spaces.
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" push \"*) exit 0 ;; esac\nexec '{}' \"$@\"\n",
+            binary_in_path("git").display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    script
+}
+
 /// Run `cplt git-gate` with protect-default-branch-only mode.
 fn git_gate_protect_default(args: &[&str]) -> (String, String, bool) {
     // The gate resolves the target repo from the cwd; a temp repo keeps that
     // independent of whatever origin the checkout running the tests has.
     let repo = temp_repo("navikt/cplt");
+    let real_git = fake_push_git(repo.path());
     let mut cmd = cplt_cmd();
     cmd.arg("git-gate")
         .arg("--real-git")
-        .arg("/usr/bin/true")
+        .arg(&real_git)
         .arg("--mode=block")
         .arg("--prevent-push=true")
         .arg("--prevent-force-push=true")

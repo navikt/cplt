@@ -47,11 +47,13 @@ authorize `git -C ../other-repo push origin main`, even though the other
 checkout also calls its remote `origin`.
 
 Pinning needs a *trusted* git binary (the same one the gh guard uses to capture
-its repo scope), because it runs unsandboxed in the parent at launch. On a
-machine where cplt cannot find one, it says so and the rules fall back to
-matching the bare name — which is where a rule does apply to another
-repository's same-named remote. Fix the git installation cplt is warning about
-rather than relying on the fallback.
+its repo scope), because it runs unsandboxed in the parent at launch. A rule
+that cannot be pinned — no trusted git, or no such remote in the launch
+repository — authorizes nothing at all, and cplt warns about it at launch. It
+does not fall back to matching the bare name: that fallback grants exactly the
+cross-repository authorization pinning exists to prevent, in every repository
+the agent can reach. Fix what the warning names — add the remote to the project
+repository, or fix the git installation — and the rule works again.
 
 URLs are compared after normalization, so the spellings of one remote are one
 remote: `git@github.com:navikt/cplt.git`, `ssh://git@github.com/navikt/cplt`,
@@ -64,12 +66,10 @@ the name it expands to), and local paths — those compare as the literal string
 git reports.
 
 Nothing changes in the config file format, and a rule written against a remote
-name keeps working. The one behavior change is the intended one: such a rule
-now only covers the repository that name pointed at when the session started.
-
-Two cases keep the old name matching, both of them announced rather than
-silent: the launch repository has no remote by that name, and cplt found no
-trusted git to resolve it with.
+name keeps working as long as the name resolves at launch: it then covers the
+repository that name pointed at when the session started, and only that one. A
+rule that names a remote which does not resolve covers nothing, and the block
+message says so.
 
 <details>
 <summary>CLI flag (override for a single run)</summary>
@@ -97,6 +97,8 @@ target branch:
 | `git push origin feature/fix-123` | `feature/fix-123` | Allowed |
 | `git push origin main` | `main` | Blocked |
 | `git push origin master` | `master` | Blocked |
+| `git push origin develop`, in a repo whose default is `develop` | `develop` | Blocked |
+| `git push origin feature/x`, in a repo with no recorded default branch | `feature/x` | Blocked — the default branch is unknown |
 | `git push origin HEAD:refs/heads/main` | `main` (from refspec) | Blocked |
 | `git push origin HEAD:main` | `main` (from refspec) | Blocked |
 | `git push` (bare) | resolved from the current branch via the real git, in the repository the command targets | Allowed on a feature branch, blocked on `main`/`master`, blocked if the branch cannot be resolved |
@@ -104,19 +106,31 @@ target branch:
 | `git push --force origin feature/x` | `feature/x` | Blocked while `prevent_force_push` is on, which is the default |
 | `git push --force origin main` | `main` | Blocked |
 
-The default branch names are `main` and `master`, recognized with or without an
-`origin/` prefix. When several refspecs are given, the guard checks all of them
-and blocks if any names a default branch, so `git push origin feature main`
-does not slip through.
+The default branch is the one the repository actually has. The guard reads it
+from the local `refs/remotes/<remote>/HEAD` symref that `git clone` and
+`git remote set-head` write, so a repository whose default is `develop`,
+`trunk` or `production` is protected under the setting that promises it — no
+network call is made. `main` and `master` stay protected as a floor alongside
+it, recognized with or without an `origin/` prefix. When several refspecs are
+given, the guard checks all of them and blocks if any names a protected branch,
+so `git push origin feature main` does not slip through.
+
+If the default branch cannot be resolved — no such remote, or no recorded
+`refs/remotes/<remote>/HEAD` — the guard cannot tell a feature branch from the
+protected one, so it allows no push at all and the block message says to run
+`git remote set-head <remote> -a`. The setting grants a relaxation of
+`prevent_push`; a relaxation that cannot be justified is refused, not guessed
+at. Falling back to `main`/`master` alone would leave a `develop` repository
+unprotected by a setting that says it is protected.
 
 A push with no branch in the arguments is not waved through. The guard shells
 out to the real git to resolve the current branch, and fails closed when it
 cannot: an unresolvable branch counts as protected and the push is blocked.
 
 That resolution follows the command. `-C`, `--git-dir` and `--work-tree` are
-forwarded to the guard's own git call, so `git -C ../other-repo push` is judged
-by *that* repository's branch, not by the branch of the repository the session
-was launched in.
+forwarded to the guard's own git calls, so `git -C ../other-repo push` is judged
+by *that* repository's branch and *that* repository's default branch, not by the
+repository the session was launched in.
 
 **Security note:** This mode is intentionally permissive about branches. The
 agent can push to any non-default branch, and the human review gate becomes the

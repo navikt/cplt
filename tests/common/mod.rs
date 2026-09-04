@@ -113,5 +113,17 @@ pub fn temp_repo(remote: &str) -> tempfile::TempDir {
             &format!("https://github.com/{remote}.git"),
         ]
     ));
+    // `git clone` records the remote's default branch here, and the git guard
+    // reads it to decide what `protect_default_branch_only` protects. A repo
+    // built by `git init` has none, which is not what these fixtures stand in
+    // for.
+    assert!(git_ok(
+        dir.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]
+    ));
     dir
 }
