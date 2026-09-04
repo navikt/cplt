@@ -343,6 +343,23 @@ impl Config {
             !self.sandbox.validate.unwrap_or(true)
         };
 
+        // Brief: off unless asked for. `--brief` turns it on for one run,
+        // `sandbox.brief = true` for good. cplt writing files an agent then
+        // reads is a behaviour change, not a default.
+        //
+        // `--no-brief` is the way back out for one run: without it, config-on
+        // could only be undone by editing the config, which is no use in a
+        // shared repo or a CI job. Flag beats config in both directions.
+        let brief = cli.brief.resolve(self.sandbox.brief.unwrap_or(false));
+        // AGENTS.md injection additionally writes into the user's repo, so it
+        // is a second opt-in gated on `brief` — with the brief off, the
+        // AGENTS.md block can never be written, whichever layer turned the
+        // brief off.
+        let agents_md = brief
+            && cli
+                .agents_md
+                .resolve(self.sandbox.agents_md.unwrap_or(false));
+
         // Allow-env-files: explicit CLI flag wins, then explicit config value,
         // then the preset baseline (false when no preset — deny by default).
         let allow_env_files = cli
@@ -599,6 +616,8 @@ impl Config {
             allow_localhost_any,
             allow_env_files,
             no_validate,
+            brief,
+            agents_md,
             pass_env,
             inherit_env,
             allow_lifecycle_scripts,
@@ -1643,6 +1662,138 @@ validate = false
         let config: Config = toml::from_str("[sandbox]\nvalidate = false\n").unwrap();
         let resolved = config.merge(CliFlags::default()).unwrap();
         assert!(resolved.no_validate);
+    }
+
+    #[test]
+    fn brief_defaults_off() {
+        let resolved = Config::default().merge(CliFlags::default()).unwrap();
+        assert!(!resolved.brief, "the brief is opt-in");
+    }
+
+    #[test]
+    fn cli_brief_enables_without_config() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                brief: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.brief, "--brief turns it on for one run");
+    }
+
+    #[test]
+    fn config_brief_true_enables() {
+        let config: Config = toml::from_str("[sandbox]\nbrief = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(resolved.brief);
+    }
+
+    #[test]
+    fn agents_md_defaults_off() {
+        let resolved = Config::default().merge(CliFlags::default()).unwrap();
+        assert!(
+            !resolved.agents_md,
+            "writing into the project's AGENTS.md must be opt-in"
+        );
+    }
+
+    #[test]
+    fn config_agents_md_true_needs_brief() {
+        // agents_md alone is not enough: the AGENTS.md write is gated on the
+        // brief, and the brief is off by default.
+        let config: Config = toml::from_str("[sandbox]\nagents_md = true\n").unwrap();
+        let resolved = config.clone().merge(CliFlags::default()).unwrap();
+        assert!(!resolved.agents_md, "no AGENTS.md write while brief is off");
+
+        let resolved = config
+            .merge(CliFlags {
+                brief: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.agents_md);
+    }
+
+    /// `--agents-md` is a per-run alternative to the config key, under the
+    /// same gate: it must do nothing on its own.
+    #[test]
+    fn cli_agents_md_needs_brief_too() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                agents_md: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !resolved.agents_md,
+            "--agents-md alone must not write into the repo"
+        );
+
+        let resolved = Config::default()
+            .merge(CliFlags {
+                brief: FeatureToggle::ForceOn,
+                agents_md: FeatureToggle::ForceOn,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.agents_md, "--brief --agents-md writes the block");
+    }
+
+    /// The escape hatch for config-on: `sandbox.brief = true` is set for the
+    /// whole machine (or checked in), and one run wants out. Without
+    /// `--no-brief` the only way back is editing config.
+    #[test]
+    fn no_brief_overrides_config_on_and_kills_agents_md() {
+        let config: Config = toml::from_str("[sandbox]\nbrief = true\nagents_md = true\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                brief: FeatureToggle::ForceOff,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!resolved.brief, "--no-brief beats sandbox.brief = true");
+        assert!(
+            !resolved.agents_md,
+            "--no-brief must suppress the AGENTS.md write too — it is gated on the brief"
+        );
+    }
+
+    /// The narrower hatch: keep the scratch-dir brief, drop the write into the
+    /// repository.
+    #[test]
+    fn no_agents_md_overrides_config_on_and_leaves_the_brief() {
+        let config: Config = toml::from_str("[sandbox]\nbrief = true\nagents_md = true\n").unwrap();
+        let resolved = config
+            .merge(CliFlags {
+                agents_md: FeatureToggle::ForceOff,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(resolved.brief, "--no-agents-md must not touch the brief");
+        assert!(
+            !resolved.agents_md,
+            "--no-agents-md beats sandbox.agents_md = true"
+        );
+    }
+
+    /// Contradictory flags cannot reach clap (`conflicts_with`), but the
+    /// resolver must still be unambiguous: off wins, like every other
+    /// `FeatureToggle` pair.
+    #[test]
+    fn brief_flags_are_unambiguous_when_both_are_set() {
+        assert_eq!(
+            FeatureToggle::from_pair(true, true),
+            FeatureToggle::ForceOff
+        );
+    }
+
+    #[test]
+    fn brief_false_kills_agents_md() {
+        let config: Config =
+            toml::from_str("[sandbox]\nbrief = false\nagents_md = true\n").unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert!(!resolved.brief);
+        assert!(!resolved.agents_md, "brief = false kills both layers");
     }
 
     #[test]
