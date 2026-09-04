@@ -2999,7 +2999,6 @@ fn parse_allow_push_rules(json: &str) -> Vec<config::ResolvedPushRule> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
-/// Handle `cplt git-gate` — evaluate a git command and exec the real binary if allowed.
 /// Decide what `cplt git-gate` should do. Pure: no process is spawned here.
 ///
 /// The git guard has no repository pin to apply, so an allowed command and a
@@ -3037,6 +3036,7 @@ fn decide_git_gate(
     }
 }
 
+/// Handle `cplt git-gate` — evaluate a git command and exec the real binary if allowed.
 fn run_git_gate(
     real_git: &Path,
     args: &[String],
@@ -3101,13 +3101,6 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
     bail!("exec: '{name}' not found in PATH")
 }
 
-/// A fully-built Shell sandbox plus the live resources it depends on.
-///
-/// The directory guards and `proxy_handle` must outlive any use of `prepared`
-/// (session directories are cleaned up on drop; the proxy thread is shut down
-/// via the handle). `policy` is the structured Landlock model of the filesystem
-/// policy — the same rules the profile enforces — used by `cplt check` for the
-/// explain layer (`describe_policy`'s model).
 /// Everything the sandbox assembly reads off the host machine.
 ///
 /// Pulled out as a seam: production calls [`HostProbe::probe`], while a test can
@@ -3191,7 +3184,13 @@ struct AssemblyOptions<'a> {
     announce_scratch: bool,
 }
 
-/// An assembled sandbox, plus the guards whose lifetime must outlive the run.
+/// A fully-built sandbox plus the live resources it depends on.
+///
+/// The directory guards and `proxy_handle` must outlive any use of `prepared`
+/// (session directories are cleaned up on drop; the proxy thread is shut down
+/// via the handle). `policy` is the structured Landlock model of the filesystem
+/// policy — the same rules the profile enforces — used by `cplt check` for the
+/// explain layer (`describe_policy`'s model).
 struct AssembledSandbox {
     prepared: sandbox::PreparedSandbox,
     policy: sandbox::LandlockPolicy,
