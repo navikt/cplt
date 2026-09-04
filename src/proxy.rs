@@ -6,11 +6,16 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::ui;
+
+#[path = "proxy_domains.rs"]
+pub mod domains;
+
+pub use domains::{DomainPolicy, PolicySpec, parse_lines_file};
 
 /// Controls how much the proxy logs to stderr.
 /// The audit log file (if configured) always records everything regardless of this level.
@@ -92,31 +97,6 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Fallback read-poll interval when `proxy.timeout` is 0, which the OS rejects.
 const DEFAULT_PROXY_TIMEOUT: Duration = Duration::from_mins(1);
-
-/// How often file-backed domain lists are re-read from disk.
-/// Within the TTL window, cached values are returned without I/O.
-const RELOAD_TTL: Duration = Duration::from_secs(5);
-
-/// Cached domain list with TTL-based refresh.
-struct DomainCache {
-    domains: Vec<String>,
-    /// When the last reload attempt was made (success or failure).
-    /// Used for TTL backoff on both success and error paths.
-    last_attempt: Instant,
-}
-
-impl DomainCache {
-    fn new(domains: Vec<String>) -> Self {
-        Self {
-            domains,
-            last_attempt: Instant::now(),
-        }
-    }
-
-    fn is_stale(&self) -> bool {
-        self.last_attempt.elapsed() >= RELOAD_TTL
-    }
-}
 
 /// DNS resolver override used in tests to inject fake DNS responses.
 /// Receives (hostname, port) and returns a resolved `SocketAddr`, or `None`
@@ -407,49 +387,10 @@ type DomainCollector = Mutex<BTreeMap<String, DomainObservation>>;
 /// Shared proxy state holding cached domain lists and config paths.
 /// Wrapped in `Arc` and shared across connection threads.
 pub struct ProxyState {
-    // Blocklist: file of domains to block
-    blocked_file: PathBuf,
-    blocked_cache: Mutex<DomainCache>,
-
-    // Blocklist subscriptions (issue #144, Phase 1): domains from cached,
-    // fetched-and-verified subscription lists, frozen at startup. Empty = no
-    // subscriptions configured (behaviour identical to today). When non-empty
-    // these are UNIONed with the reloadable `blocked_file` to form the effective
-    // blocklist — tighten-only, so this can only ever ADD blocks. See
-    // `crate::subscriptions` for the fetch/verify/cache + fail-open model.
-    subscription_blocklist: Vec<String>,
-
-    // Allowlist: optional file of permitted domains (fail-closed when configured)
-    allowed_domains_file: Option<PathBuf>,
-    allowlist_cache: Mutex<DomainCache>,
-
-    // Agent default allowlist (issue #52): the agent's built-in fail-closed
-    // domain set, frozen at startup. Empty = the feature is off (unchanged
-    // allow-all behaviour). When non-empty it is MERGED with the reloadable
-    // `allowed_domains_file` to form the effective allowlist — so the built-in
-    // base and the user's additions both apply without re-listing either.
-    default_allowlist: Vec<String>,
-
-    // Private domains: merged from a sticky set + the dynamic TOML config.
-    //
-    // `sticky_private_domains` holds every startup-resolved private domain that
-    // `config_file` does NOT supply: `--allow-private-domain` flags and
-    // trust-approved `[propose.proxy] allow_private_domains` from the repo
-    // `.cplt.toml`. They are frozen for the session because nothing re-reads
-    // their source — the repo config is read once from git HEAD, the CLI once
-    // from argv — so leaving them in the reloadable cache made the TTL refresh
-    // wipe them 5s into the session (#186).
-    sticky_private_domains: Vec<String>,
-    config_file: Option<PathBuf>,
-    private_domains_cache: Mutex<DomainCache>,
-
-    // Ports: frozen at startup (kernel Seatbelt profile is immutable)
-    allowed_ports: Vec<u16>,
-
-    // Localhost: ports (or all) explicitly opened via --allow-localhost[/-any].
-    // The proxy bypasses its private-IP block for CONNECT to these.
-    allow_localhost_ports: Vec<u16>,
-    allow_localhost_any: bool,
+    /// The effective domain + port policy: what the blocklist, allowlist and
+    /// private-domain waiver list say right now, including their TTL refresh
+    /// and provenance rules. See [`domains::DomainPolicy`].
+    policy: DomainPolicy,
 
     // Audit log
     log_file: Option<PathBuf>,
@@ -508,84 +449,9 @@ impl ProxyState {
         }
     }
 
-    /// Get the current blocklist, re-reading from disk if TTL expired.
-    /// On read failure, keeps last-good list and resets TTL for retry.
-    fn get_blocked_domains(&self) -> Vec<String> {
-        let file_domains = get_cached_domains(
-            &self.blocked_cache,
-            Some(&self.blocked_file),
-            parse_lines_file,
-        );
-
-        // No subscriptions configured — preserve today's exact behaviour
-        // (the reloadable file + built-ins are the sole source).
-        if self.subscription_blocklist.is_empty() {
-            return file_domains;
-        }
-
-        // UNION the cached subscription blocklist(s) with the local/built-in
-        // blocklist. Tighten-only: this can only ADD blocks. Deduplicated so the
-        // effective list matches what the existing matcher expects.
-        let mut merged = file_domains;
-        merged.extend(self.subscription_blocklist.iter().cloned());
-        merged.sort_unstable();
-        merged.dedup();
-        merged
-    }
-
-    /// Get the effective allowlist, re-reading the user file from disk if the
-    /// TTL expired and merging in the agent's built-in default allowlist.
-    ///
-    /// Resolution (issue #52):
-    /// - `default_allowlist` empty (feature off / `--allow-all-domains`):
-    ///   behaviour is UNCHANGED — the reloadable file is the sole source, and an
-    ///   empty result means allow-all.
-    /// - `default_allowlist` non-empty (`proxy.default_allowlist` on): the
-    ///   effective allowlist is the agent defaults MERGED with any
-    ///   user-configured file domains, deduplicated. The result is always
-    ///   non-empty, so `handle_connect` fail-closes on unknown domains.
-    ///
-    /// Either way the returned list is fed to the same `is_domain_match` /
-    /// BLOCKED-ALLOWLIST enforcement — no matching logic is duplicated.
-    fn get_allowed_domains(&self) -> Vec<String> {
-        let file_domains = match self.allowed_domains_file.as_deref() {
-            Some(path) => get_cached_domains(&self.allowlist_cache, Some(path), parse_lines_file),
-            None => Vec::new(),
-        };
-
-        if self.default_allowlist.is_empty() {
-            // Feature off — preserve today's exact behaviour.
-            return file_domains;
-        }
-
-        let mut merged = self.default_allowlist.clone();
-        merged.extend(file_domains);
-        merged.sort_unstable();
-        merged.dedup();
-        merged
-    }
-
-    /// Get private domains: union of the sticky entries + dynamic config entries.
+    /// The effective private-domain waiver list right now (TTL-refreshed).
     fn get_private_domains(&self) -> Vec<String> {
-        let config_domains = get_cached_domains(
-            &self.private_domains_cache,
-            self.config_file.as_deref(),
-            parse_private_domains_from_toml,
-        );
-
-        if self.sticky_private_domains.is_empty() {
-            return config_domains;
-        }
-        if config_domains.is_empty() {
-            return self.sticky_private_domains.clone();
-        }
-
-        // Merge sticky + config, deduplicate
-        let mut merged = self.sticky_private_domains.clone();
-        merged.extend(config_domains);
-        merged.sort_unstable();
-        merged.dedup();
-        merged
+        self.policy.private_domains(Instant::now())
     }
 
     /// Snapshot the effective CONNECT policy for static classification.
@@ -593,126 +459,16 @@ impl ProxyState {
     /// Reads the current (cache-refreshed) allowlist and blocklist so
     /// [`classify_connect`] sees exactly what the live gates would see.
     fn net_policy(&self) -> NetPolicy {
+        let now = Instant::now();
         NetPolicy {
-            allowed_ports: self.allowed_ports.clone(),
-            allowed_domains: self.get_allowed_domains(),
-            blocked_domains: self.get_blocked_domains(),
-            allow_localhost_ports: self.allow_localhost_ports.clone(),
-            allow_localhost_any: self.allow_localhost_any,
-            private_domains: self.get_private_domains(),
+            allowed_ports: self.policy.allowed_ports.clone(),
+            allowed_domains: self.policy.allowed_domains(now),
+            blocked_domains: self.policy.blocked_domains(now),
+            allow_localhost_ports: self.policy.allow_localhost_ports.clone(),
+            allow_localhost_any: self.policy.allow_localhost_any,
+            private_domains: self.policy.private_domains(now),
         }
     }
-}
-
-/// Read cached domains, refreshing from disk if TTL has expired.
-/// On read failure: keeps the last-good list, resets TTL for backoff retry.
-fn get_cached_domains(
-    cache: &Mutex<DomainCache>,
-    path: Option<&Path>,
-    parser: fn(&Path) -> Option<Vec<String>>,
-) -> Vec<String> {
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    if !guard.is_stale() {
-        return guard.domains.clone();
-    }
-
-    // TTL expired — attempt reload
-    if let Some(path) = path
-        && let Some(new_domains) = parser(path)
-    {
-        guard.domains = new_domains;
-    }
-    // On failure: keep last-good domains (fail-safe)
-    guard.last_attempt = Instant::now();
-    guard.domains.clone()
-}
-
-/// Parse a one-domain-per-line file (blocklist or allowlist format).
-/// Returns None on read failure (caller keeps last-good).
-///
-/// This is the **single** parser the live proxy feeds into its allowlist and
-/// blocklist caches ([`get_cached_domains`]). `cplt check` must build its policy
-/// snapshot through this same function (not [`parse_domain_file`], which extra-
-/// normalizes by stripping scheme/path/port) so a non-canonical allowlist entry
-/// like `github.com:443` is stored byte-identically in both — otherwise check
-/// would report ALLOWED for a host the live `handle_connect` blocks with
-/// BLOCKED-ALLOWLIST.
-pub fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound
-                || e.kind() == std::io::ErrorKind::NotADirectory =>
-        {
-            // File doesn't exist or path component is not a directory — silent.
-            return None;
-        }
-        Err(e) => {
-            eprintln!(
-                "{}[proxy]{} Warning: cannot read {}: {e}",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET),
-                path.display()
-            );
-            return None;
-        }
-    };
-    Some(
-        contents
-            .lines()
-            .map(|l| l.trim().to_lowercase().trim_end_matches('.').to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect(),
-    )
-}
-
-/// Parse `proxy.allow_private_domains` from a TOML config file.
-///
-/// `Some(list)` means the file was read and parsed: an empty list is the real
-/// answer "this file allows no private domains", which is what revokes an entry
-/// removed from the config mid-session. `None` means the file could not be read
-/// or parsed, and the caller keeps its last-good list.
-///
-/// Uses the `toml` crate rather than scanning lines: the config file is written
-/// by `cplt init` (which emits multi-line arrays for more than one entry) and by
-/// hand, so a line scanner silently mis-reads multi-line arrays, trailing
-/// comments and dotted keys — all of which serde accepts elsewhere in cplt.
-fn parse_private_domains_from_toml(path: &Path) -> Option<Vec<String>> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "{}[proxy]{} Warning: cannot read config {}: {e}",
-                ui::color(ui::YELLOW),
-                ui::color(ui::RESET),
-                path.display()
-            );
-            return None;
-        }
-    };
-
-    let parsed: toml::Value = toml::from_str(&contents).ok()?;
-    let Some(value) = parsed
-        .get("proxy")
-        .and_then(|proxy| proxy.get("allow_private_domains"))
-    else {
-        // Key absent — the file genuinely allows nothing.
-        return Some(Vec::new());
-    };
-    // Wrong type: treat as unreadable (keep last-good) rather than as a
-    // revocation. Startup validation rejects it anyway.
-    let entries = value.as_array()?;
-    Some(
-        entries
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .map(normalize_hostname)
-            .filter(|d| !d.is_empty())
-            .collect(),
-    )
 }
 
 pub struct ProxyHandle {
@@ -724,10 +480,6 @@ pub struct ProxyHandle {
     /// Cloned from the state so the observed set can be read after the session
     /// via [`ProxyHandle::observed_domains`].
     domain_collector: Arc<DomainCollector>,
-    /// Test-only view of the live state, so reload behaviour can be asserted
-    /// against the real `start()` wiring instead of a hand-built `ProxyState`.
-    #[cfg(test)]
-    state: Option<Arc<ProxyState>>,
 }
 
 impl ProxyHandle {
@@ -820,45 +572,25 @@ pub struct ProxyOptions {
 /// `allowed_ports` controls which remote ports CONNECT tunnels can reach.
 /// Port 443 is always allowed. Additional ports come from `--allow-port`.
 pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
-    let mut ports: Vec<u16> = vec![443];
-    ports.extend_from_slice(&opts.allowed_ports);
-    ports.sort_unstable();
-    ports.dedup();
-
-    let addr = format!("127.0.0.1:{}", opts.port);
-    let listener = TcpListener::bind(&addr).map_err(|e| format!("Cannot bind to {addr}: {e}"))?;
-    let actual_port = listener
-        .local_addr()
-        .map_err(|e| format!("Cannot get proxy listen address: {e}"))?
-        .port();
-
-    // Validate blocklist is readable at startup (fail-fast, not fail-open)
-    let blocked_initial = if opts.blocked_file.exists() {
-        parse_lines_file(&opts.blocked_file).ok_or_else(|| {
-            format!(
-                "Cannot read blocked domains file {}",
-                opts.blocked_file.display()
-            )
-        })?
-    } else {
-        Vec::new()
-    };
-
-    // Validate allowlist at startup (fail-closed: abort if configured but unreadable)
-    let allowlist_initial = if let Some(ref path) = opts.allowed_domains_file {
-        if path.exists() {
-            parse_lines_file(path)
-                .ok_or_else(|| format!("Cannot read allowed domains file {}", path.display()))?
-        } else if !opts.allowed_domains_initial.is_empty() {
-            // File doesn't exist yet but we have initial domains from config
-            opts.allowed_domains_initial.clone()
-        } else {
-            // No file and no initial domains — this is fine (no allowlist)
-            Vec::new()
-        }
-    } else {
-        opts.allowed_domains_initial.clone()
-    };
+    // Compute the effective policy FIRST — it validates the blocklist and
+    // allowlist files and can fail, and it needs no socket. Only then bind.
+    let policy = DomainPolicy::build(
+        PolicySpec {
+            blocked_file: opts.blocked_file,
+            subscription_blocklist: opts.subscription_blocklist,
+            allowed_domains_file: opts.allowed_domains_file,
+            allowed_domains_initial: opts.allowed_domains_initial,
+            default_allowlist: opts.default_allowlist,
+            cli_private_domains: opts.cli_private_domains,
+            config_private_domains: opts.config_private_domains,
+            repo_private_domains: opts.repo_private_domains,
+            config_file: opts.config_file,
+            allowed_ports: opts.allowed_ports,
+            allow_localhost_ports: opts.allow_localhost_ports,
+            allow_localhost_any: opts.allow_localhost_any,
+        },
+        Instant::now(),
+    )?;
 
     // Validate log file is writable at startup
     if let Some(ref log_path) = opts.log_file {
@@ -869,38 +601,19 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
             .map_err(|e| format!("Cannot open proxy log file {}: {e}", log_path.display()))?;
     }
 
-    // Private domains whose source is read exactly once — CLI flags and
-    // trust-approved repo `.cplt.toml` proposals — are held outside the
-    // TTL cache. That cache's only refresh source is the global config file,
-    // so anything else parked in it is silently dropped by the first refresh,
-    // 5s into the session (#186).
-    let mut sticky_private_domains: Vec<String> = opts
-        .cli_private_domains
-        .iter()
-        .chain(opts.repo_private_domains.iter())
-        .map(|d| normalize_hostname(d))
-        .collect();
-    sticky_private_domains.sort_unstable();
-    sticky_private_domains.dedup();
+    let addr = format!("127.0.0.1:{}", opts.port);
+    let listener = TcpListener::bind(&addr).map_err(|e| format!("Cannot bind to {addr}: {e}"))?;
+    let actual_port = listener
+        .local_addr()
+        .map_err(|e| format!("Cannot get proxy listen address: {e}"))?
+        .port();
 
     // Observation collector, shared between the connection threads (via state)
     // and the returned handle so observed domains can be read after shutdown.
     let domain_collector: Arc<DomainCollector> = Arc::new(Mutex::new(BTreeMap::new()));
 
-    // Build shared state with initial caches
     let state = Arc::new(ProxyState {
-        blocked_file: opts.blocked_file,
-        blocked_cache: Mutex::new(DomainCache::new(blocked_initial)),
-        subscription_blocklist: opts.subscription_blocklist,
-        allowed_domains_file: opts.allowed_domains_file,
-        allowlist_cache: Mutex::new(DomainCache::new(allowlist_initial)),
-        default_allowlist: opts.default_allowlist,
-        sticky_private_domains,
-        config_file: opts.config_file,
-        private_domains_cache: Mutex::new(DomainCache::new(opts.config_private_domains)),
-        allowed_ports: ports,
-        allow_localhost_ports: opts.allow_localhost_ports,
-        allow_localhost_any: opts.allow_localhost_any,
+        policy,
         log_file: opts.log_file,
         log_level: opts.log_level,
         timeout: opts.timeout,
@@ -914,9 +627,6 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
     listener
         .set_nonblocking(false)
         .map_err(|e| format!("set_nonblocking: {e}"))?;
-
-    #[cfg(test)]
-    let state_for_tests = state.clone();
 
     let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = shutdown_flag.clone();
@@ -935,8 +645,6 @@ pub fn start(opts: ProxyOptions) -> Result<ProxyHandle, String> {
         shutdown_flag,
         port: actual_port,
         domain_collector,
-        #[cfg(test)]
-        state: Some(state_for_tests),
     })
 }
 
@@ -1197,7 +905,8 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
     // (`--allow-localhost-any`) or explicitly allow-listed this port
     // (`--allow-localhost <PORT>`). This is the sole gate for a target that
     // *resolves* to loopback — see the `resolved_ip_is_blocked` call below.
-    let localhost_opt_in = state.allow_localhost_any || state.allow_localhost_ports.contains(&port);
+    let localhost_opt_in =
+        state.policy.allow_localhost_any || state.policy.allow_localhost_ports.contains(&port);
 
     let localhost_connect_allowed = {
         let h = host.trim_start_matches('[').trim_end_matches(']');
@@ -2285,483 +1994,20 @@ mod tests {
         assert!(!resolved_ip_is_blocked(&public, false, false));
     }
 
-    #[test]
-    fn domain_cache_returns_cached_within_ttl() {
-        let cache = Mutex::new(DomainCache::new(vec!["example.com".to_string()]));
-        let result = get_cached_domains(&cache, None, |_| panic!("should not call parser"));
-        assert_eq!(result, vec!["example.com"]);
-    }
-
-    #[test]
-    fn domain_cache_reloads_after_ttl() {
-        let dir = test_dir("reload");
-        let path = dir.join("domains.txt");
-        std::fs::write(&path, "old.com\n").unwrap();
-
-        let cache = Mutex::new(DomainCache {
-            domains: vec!["old.com".to_string()],
-            last_attempt: Instant::now()
-                .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-                .unwrap(),
-        });
-
-        let result = get_cached_domains(&cache, Some(&path), parse_lines_file);
-        assert_eq!(result, vec!["old.com"]);
-
-        // Modify file and force stale
-        std::fs::write(&path, "new.com\n").unwrap();
-        cache.lock().unwrap().last_attempt = Instant::now()
-            .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-            .unwrap();
-
-        let result = get_cached_domains(&cache, Some(&path), parse_lines_file);
-        assert_eq!(result, vec!["new.com"]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn domain_cache_keeps_last_good_on_failure() {
-        let cache = Mutex::new(DomainCache {
-            domains: vec!["good.com".to_string()],
-            last_attempt: Instant::now()
-                .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-                .unwrap(),
-        });
-
-        let bad_path = Path::new("/tmp/nonexistent-cplt-test-file-xyz.txt");
-        let result = get_cached_domains(&cache, Some(bad_path), parse_lines_file);
-        assert_eq!(
-            result,
-            vec!["good.com"],
-            "should keep last-good list on failure"
-        );
-    }
-
-    #[test]
-    fn domain_cache_resets_ttl_after_failure() {
-        let cache = Mutex::new(DomainCache {
-            domains: vec!["good.com".to_string()],
-            last_attempt: Instant::now()
-                .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-                .unwrap(),
-        });
-
-        let bad_path = Path::new("/tmp/nonexistent-cplt-test-file-xyz.txt");
-        let _ = get_cached_domains(&cache, Some(bad_path), parse_lines_file);
-
-        let guard = cache.lock().unwrap();
-        assert!(!guard.is_stale(), "TTL should be reset after failed reload");
-    }
-
-    #[test]
-    fn parse_lines_file_skips_comments_and_empty() {
-        let dir = test_dir("parse-lines");
-        let path = dir.join("test.txt");
-        std::fs::write(&path, "# comment\n\nexample.com\n  MIXED.Case.  \n").unwrap();
-
-        let result = parse_lines_file(&path).unwrap();
-        assert_eq!(result, vec!["example.com", "mixed.case"]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_private_domains_from_toml_extracts_correctly() {
-        let dir = test_dir("toml-extract");
-        let path = dir.join("config.toml");
-        std::fs::write(
-            &path,
-            "[sandbox]\nquiet = true\n\n[proxy]\nallow_private_domains = [\"intern.nav.no\", \"dev.CORP.example.com\"]\nport = 8080\n\n[allow]\nports = [443]\n",
-        )
-        .unwrap();
-
-        let result = parse_private_domains_from_toml(&path).unwrap();
-        assert_eq!(result, vec!["intern.nav.no", "dev.corp.example.com"]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_private_domains_from_toml_empty_section() {
-        let dir = test_dir("toml-empty");
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "[proxy]\nport = 8080\n").unwrap();
-
-        let result = parse_private_domains_from_toml(&path).unwrap();
-        assert!(result.is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// TOML shapes the previous line-scanning parser silently mis-read as "no
-    /// domains" (or, for the typo key, as an unreadable file): a multi-line
-    /// array — what `cplt init` writes for more than one entry — a trailing
-    /// comment, a dotted key, and a key that merely starts with the real one.
-    #[test]
-    fn parse_private_domains_from_toml_handles_real_world_shapes() {
-        let dir = test_dir("toml-shapes");
-        let cases = [
-            "[proxy]\nallow_private_domains = [\n  \"a.nav.no\",\n  \"b.nav.no\",\n]\n",
-            "[proxy]\nallow_private_domains = [\"a.nav.no\", \"B.NAV.no.\"]  # trailing comment\n",
-            "proxy.allow_private_domains = [\"a.nav.no\", \"b.nav.no\"]\n",
-            "[proxy]\nallow_private_domains_typo = []\nallow_private_domains = [\"a.nav.no\", \"b.nav.no\"]\n",
-        ];
-        for (i, contents) in cases.iter().enumerate() {
-            let path = dir.join(format!("config{i}.toml"));
-            std::fs::write(&path, contents).unwrap();
-            assert_eq!(
-                parse_private_domains_from_toml(&path),
-                Some(vec!["a.nav.no".to_string(), "b.nav.no".to_string()]),
-                "case {i}: {contents}"
-            );
+    /// A minimal `ProxyState` for tests that exercise something other than
+    /// policy (the observation collector). Policy itself is tested as a value
+    /// in [`crate::proxy::domains`], with no `ProxyState` and no socket.
+    fn bare_state() -> ProxyState {
+        ProxyState {
+            policy: DomainPolicy::build(PolicySpec::default(), Instant::now()).unwrap(),
+            log_file: None,
+            log_level: ProxyLogLevel::None,
+            timeout: Duration::from_mins(1),
+            upstream: None,
+            upstream_no_proxy: Vec::new(),
+            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
+            resolver: None,
         }
-
-        // Unparseable TOML is "unreadable", not "allows nothing" — the caller
-        // keeps its last-good list instead of dropping every waiver.
-        let path = dir.join("broken.toml");
-        std::fs::write(&path, "[proxy\n").unwrap();
-        assert_eq!(parse_private_domains_from_toml(&path), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_private_domains_from_toml_no_proxy_section() {
-        let dir = test_dir("toml-noproxy");
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "[sandbox]\nquiet = true\n").unwrap();
-
-        let result = parse_private_domains_from_toml(&path).unwrap();
-        assert!(result.is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn proxy_state_merges_cli_and_config_private_domains() {
-        let state = ProxyState {
-            blocked_file: PathBuf::from("/dev/null"),
-            blocked_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_domains_file: None,
-            allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
-            default_allowlist: Vec::new(),
-            subscription_blocklist: Vec::new(),
-            sticky_private_domains: vec!["cli.example.com".to_string()],
-            config_file: None,
-            private_domains_cache: Mutex::new(DomainCache::new(vec![
-                "config.example.com".to_string(),
-            ])),
-            allowed_ports: vec![443],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
-            resolver: None,
-        };
-
-        let domains = state.get_private_domains();
-        assert!(domains.contains(&"cli.example.com".to_string()));
-        assert!(domains.contains(&"config.example.com".to_string()));
-    }
-
-    #[test]
-    fn proxy_state_private_domains_deduplicates() {
-        let state = ProxyState {
-            blocked_file: PathBuf::from("/dev/null"),
-            blocked_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_domains_file: None,
-            allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
-            default_allowlist: Vec::new(),
-            subscription_blocklist: Vec::new(),
-            sticky_private_domains: vec!["shared.com".to_string()],
-            config_file: None,
-            private_domains_cache: Mutex::new(DomainCache::new(vec!["shared.com".to_string()])),
-            allowed_ports: vec![443],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
-            resolver: None,
-        };
-
-        let domains = state.get_private_domains();
-        assert_eq!(
-            domains.iter().filter(|d| *d == "shared.com").count(),
-            1,
-            "duplicates should be removed"
-        );
-    }
-
-    #[test]
-    fn proxy_state_allowlist_empty_when_no_file() {
-        let state = ProxyState {
-            blocked_file: PathBuf::from("/dev/null"),
-            blocked_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_domains_file: None,
-            allowlist_cache: Mutex::new(DomainCache::new(vec![
-                "should-not-appear.com".to_string(),
-            ])),
-            default_allowlist: Vec::new(),
-            subscription_blocklist: Vec::new(),
-            sticky_private_domains: Vec::new(),
-            config_file: None,
-            private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_ports: vec![443],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
-            resolver: None,
-        };
-
-        let domains = state.get_allowed_domains();
-        assert!(domains.is_empty(), "no file configured = no allowlist");
-    }
-
-    #[test]
-    fn proxy_state_blocked_domains_from_file() {
-        let dir = test_dir("blocked");
-        let path = dir.join("blocked.txt");
-        std::fs::write(&path, "evil.com\nbad.org\n").unwrap();
-
-        let state = ProxyState {
-            blocked_file: path,
-            blocked_cache: Mutex::new(DomainCache {
-                domains: Vec::new(),
-                last_attempt: Instant::now()
-                    .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-                    .unwrap(),
-            }),
-            allowed_domains_file: None,
-            allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
-            default_allowlist: Vec::new(),
-            subscription_blocklist: Vec::new(),
-            sticky_private_domains: Vec::new(),
-            config_file: None,
-            private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_ports: vec![443],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
-            resolver: None,
-        };
-
-        let blocked = state.get_blocked_domains();
-        assert_eq!(blocked, vec!["evil.com", "bad.org"]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn proxy_state_dynamic_reload_picks_up_changes() {
-        let dir = test_dir("dynamic-reload");
-        let config_path = dir.join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[proxy]\nallow_private_domains = [\"old.nav.no\"]\n",
-        )
-        .unwrap();
-
-        let state = ProxyState {
-            blocked_file: PathBuf::from("/dev/null"),
-            blocked_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_domains_file: None,
-            allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
-            default_allowlist: Vec::new(),
-            subscription_blocklist: Vec::new(),
-            sticky_private_domains: vec!["cli.nav.no".to_string()],
-            config_file: Some(config_path.clone()),
-            private_domains_cache: Mutex::new(DomainCache {
-                domains: vec!["old.nav.no".to_string()],
-                last_attempt: Instant::now()
-                    .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-                    .unwrap(),
-            }),
-            allowed_ports: vec![443],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
-            resolver: None,
-        };
-
-        // First read: picks up "old.nav.no" from cache reload + "cli.nav.no"
-        let domains = state.get_private_domains();
-        assert!(domains.contains(&"old.nav.no".to_string()));
-        assert!(domains.contains(&"cli.nav.no".to_string()));
-
-        // Simulate config edit mid-session
-        std::fs::write(
-            &config_path,
-            "[proxy]\nallow_private_domains = [\"new.nav.no\"]\n",
-        )
-        .unwrap();
-
-        // Force TTL expiry
-        state.private_domains_cache.lock().unwrap().last_attempt = Instant::now()
-            .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-            .unwrap();
-
-        let domains = state.get_private_domains();
-        assert!(domains.contains(&"new.nav.no".to_string()));
-        assert!(domains.contains(&"cli.nav.no".to_string()));
-        assert!(
-            !domains.contains(&"old.nav.no".to_string()),
-            "old config domain should be gone after reload"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #186: private domains whose source is read once — CLI flags and
-    /// trust-approved `[propose.proxy] allow_private_domains` from the repo
-    /// `.cplt.toml` — must survive the global config file's 5-second reload,
-    /// while domains that file actually supplies keep following it (including
-    /// being revoked when removed).
-    #[test]
-    fn private_domain_sources_survive_or_follow_the_config_reload() {
-        let dir = test_dir("private-domains-186");
-        let blocked = dir.join("blocked.txt");
-        std::fs::write(&blocked, "").unwrap();
-        let config_path = dir.join("config.toml");
-        // Multi-line array: the form `cplt init` writes for >1 entry
-        // (`init::write_string_array`), and the form the docs show.
-        std::fs::write(
-            &config_path,
-            "[allow]\nread = [\"~/.kube/config\"]\n\n[proxy]\nallow_private_domains = [\n  \"global-a.nav.no\",\n  \"global-b.nav.no\",\n]\n",
-        )
-        .unwrap();
-
-        // Built the way main.rs builds it: the resolved set (CLI + config file +
-        // trust-approved repo proposal) minus the two once-read sources, which
-        // it passes as their own fields. Hand-writing the reloadable list would
-        // test a shape the real wiring never produces.
-        let cli_private_domains = vec!["cli.nav.no".to_string()];
-        let repo_private_domains = vec!["mimir.nav.cloud.nais.io".to_string()];
-        let resolved_private_domains = [
-            "cli.nav.no",
-            "global-a.nav.no",
-            "global-b.nav.no",
-            "mimir.nav.cloud.nais.io",
-        ];
-        let config_private_domains: Vec<String> = resolved_private_domains
-            .iter()
-            .map(|d| (*d).to_string())
-            .filter(|d| {
-                !cli_private_domains
-                    .iter()
-                    .any(|c| normalize_hostname(c) == *d)
-                    && !repo_private_domains.contains(d)
-            })
-            .collect();
-        assert_eq!(
-            config_private_domains,
-            vec!["global-a.nav.no", "global-b.nav.no"],
-            "only the config file's own entries are reloadable"
-        );
-
-        let handle = start(ProxyOptions {
-            port: 0,
-            blocked_file: blocked,
-            allowed_ports: vec![],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            allowed_domains_file: None,
-            allowed_domains_initial: Vec::new(),
-            default_allowlist: Vec::new(),
-            subscription_blocklist: Vec::new(),
-            cli_private_domains,
-            config_private_domains,
-            repo_private_domains,
-            config_file: Some(config_path.clone()),
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            resolver: None,
-        })
-        .expect("proxy start failed");
-        let state = handle.state.clone().expect("test state handle");
-
-        let expire = || {
-            state.private_domains_cache.lock().unwrap().last_attempt = Instant::now()
-                .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-                .unwrap();
-        };
-        let has = |d: &str| state.get_private_domains().iter().any(|x| x == d);
-
-        for d in [
-            "cli.nav.no",
-            "global-a.nav.no",
-            "global-b.nav.no",
-            "mimir.nav.cloud.nais.io",
-        ] {
-            assert!(has(d), "{d} must be allowed at startup");
-        }
-
-        // The reload that fires 5 seconds into a real session.
-        expire();
-        assert!(
-            has("mimir.nav.cloud.nais.io"),
-            "trust-approved repo domain must survive the config reload"
-        );
-        assert!(has("cli.nav.no"), "CLI domain must survive the reload");
-        assert!(
-            has("global-a.nav.no") && has("global-b.nav.no"),
-            "multi-line config array must still be read on reload"
-        );
-
-        // Revoking one entry from the config file takes effect within the TTL.
-        std::fs::write(
-            &config_path,
-            "[proxy]\nallow_private_domains = [\"global-a.nav.no\"]  # b revoked\n",
-        )
-        .unwrap();
-        expire();
-        assert!(has("global-a.nav.no"), "remaining config entry stays");
-        assert!(
-            !has("global-b.nav.no"),
-            "config-file domain must be revocable by editing the file"
-        );
-        assert!(has("mimir.nav.cloud.nais.io") && has("cli.nav.no"));
-
-        // Dropping the section revokes the rest of the file's entries.
-        std::fs::write(&config_path, "[allow]\nread = []\n").unwrap();
-        expire();
-        assert!(
-            !has("global-a.nav.no"),
-            "removing the section must revoke its domains"
-        );
-        assert!(
-            has("mimir.nav.cloud.nais.io") && has("cli.nav.no"),
-            "once-read sources are not revoked by a config edit"
-        );
-
-        handle.shutdown();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2774,267 +2020,11 @@ mod tests {
     }
 
     #[test]
-    fn proxy_start_validates_blocklist_at_startup() {
-        let dir = test_dir("start-valid");
-        let blocked = dir.join("blocked.txt");
-        std::fs::write(&blocked, "test.com\n").unwrap();
-
-        let result = start(ProxyOptions {
-            port: 0,
-            blocked_file: blocked,
-            allowed_ports: vec![],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            allowed_domains_file: None,
-            allowed_domains_initial: Vec::new(),
-            default_allowlist: Vec::new(),
-            subscription_blocklist: Vec::new(),
-            cli_private_domains: Vec::new(),
-            config_private_domains: Vec::new(),
-            repo_private_domains: Vec::new(),
-            config_file: None,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            resolver: None,
-        });
-        assert!(result.is_ok());
-        result.unwrap().shutdown();
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn proxy_start_fails_on_unreadable_allowlist() {
-        let dir = test_dir("start-fail");
-        let blocked = dir.join("blocked.txt");
-        std::fs::write(&blocked, "").unwrap();
-
-        // Create a directory where a file is expected (unreadable as file)
-        let allowlist_path = dir.join("allowlist");
-        std::fs::create_dir(&allowlist_path).unwrap();
-
-        let result = start(ProxyOptions {
-            port: 0,
-            blocked_file: blocked,
-            allowed_ports: vec![],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            allowed_domains_file: Some(allowlist_path),
-            allowed_domains_initial: Vec::new(),
-            default_allowlist: Vec::new(),
-            subscription_blocklist: Vec::new(),
-            cli_private_domains: Vec::new(),
-            config_private_domains: Vec::new(),
-            repo_private_domains: Vec::new(),
-            config_file: None,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            resolver: None,
-        });
-        assert!(result.is_err(), "should fail when allowlist is unreadable");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn proxy_state_allowlist_reloads_from_file() {
-        let dir = test_dir("allowlist-reload");
-        let path = dir.join("allowed.txt");
-        std::fs::write(&path, "github.com\n").unwrap();
-
-        let state = ProxyState {
-            blocked_file: PathBuf::from("/dev/null"),
-            blocked_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_domains_file: Some(path.clone()),
-            allowlist_cache: Mutex::new(DomainCache {
-                domains: vec!["github.com".to_string()],
-                last_attempt: Instant::now()
-                    .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-                    .unwrap(),
-            }),
-            default_allowlist: Vec::new(),
-            subscription_blocklist: Vec::new(),
-            sticky_private_domains: Vec::new(),
-            config_file: None,
-            private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_ports: vec![443],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
-            resolver: None,
-        };
-
-        // Initial read picks up github.com from stale cache (triggers reload)
-        let domains = state.get_allowed_domains();
-        assert_eq!(domains, vec!["github.com"]);
-
-        // Edit file
-        std::fs::write(&path, "github.com\nnpm.pkg.github.com\n").unwrap();
-        state.allowlist_cache.lock().unwrap().last_attempt = Instant::now()
-            .checked_sub(RELOAD_TTL + Duration::from_millis(100))
-            .unwrap();
-
-        let domains = state.get_allowed_domains();
-        assert!(domains.contains(&"npm.pkg.github.com".to_string()));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ── Default allowlist (issue #52): effective-allowlist merge logic ──────
-
-    /// Build a ProxyState wired for default-allowlist merge tests: a frozen
-    /// agent `default_allowlist` plus an optional user `allowed_domains` file.
-    fn state_for_allowlist(default_allowlist: Vec<String>, file: Option<PathBuf>) -> ProxyState {
-        let initial = file
-            .as_deref()
-            .and_then(parse_lines_file)
-            .unwrap_or_default();
-        ProxyState {
-            blocked_file: PathBuf::from("/dev/null"),
-            blocked_cache: Mutex::new(DomainCache::new(Vec::new())),
-            subscription_blocklist: Vec::new(),
-            allowed_domains_file: file,
-            allowlist_cache: Mutex::new(DomainCache::new(initial)),
-            default_allowlist,
-            sticky_private_domains: Vec::new(),
-            config_file: None,
-            private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_ports: vec![443],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
-            resolver: None,
-        }
-    }
-
-    /// Build a ProxyState with an in-memory blocklist + subscription blocklist
-    /// for issue #144 merge tests. `blocked_file` is `/dev/null` and the caches
-    /// are seeded fresh, so `get_blocked_domains` reads the in-memory values.
-    fn state_for_blocklist(file_domains: Vec<String>, subscription: Vec<String>) -> ProxyState {
-        ProxyState {
-            blocked_file: PathBuf::from("/dev/null"),
-            blocked_cache: Mutex::new(DomainCache::new(file_domains)),
-            subscription_blocklist: subscription,
-            allowed_domains_file: None,
-            allowlist_cache: Mutex::new(DomainCache::new(Vec::new())),
-            default_allowlist: Vec::new(),
-            sticky_private_domains: Vec::new(),
-            config_file: None,
-            private_domains_cache: Mutex::new(DomainCache::new(Vec::new())),
-            allowed_ports: vec![443],
-            allow_localhost_ports: Vec::new(),
-            allow_localhost_any: false,
-            log_file: None,
-            log_level: ProxyLogLevel::None,
-            timeout: Duration::from_mins(1),
-            upstream: None,
-            upstream_no_proxy: Vec::new(),
-            resolver: None,
-            domain_collector: Arc::new(Mutex::new(BTreeMap::new())),
-        }
-    }
-
-    #[test]
-    fn subscription_blocklist_merges_into_effective_blocklist() {
-        // Cached subscription domains UNION with the local/built-in blocklist.
-        let state = state_for_blocklist(
-            vec!["local.example".to_string()],
-            vec!["sub.example".to_string()],
-        );
-        let eff = state.get_blocked_domains();
-        assert!(is_blocked_in_list("local.example", &eff), "local kept");
-        assert!(
-            is_blocked_in_list("sub.example", &eff),
-            "subscription added"
-        );
-        // Exact-or-subdomain matcher still applies to subscription domains.
-        assert!(is_blocked_in_list("host.sub.example", &eff));
-        assert!(!is_blocked_in_list("allowed.example", &eff));
-    }
-
-    #[test]
-    fn empty_subscription_blocklist_is_noop() {
-        // No-regression: empty subscription list → exactly the file domains,
-        // byte-identical to today's behaviour.
-        let with_empty = state_for_blocklist(vec!["local.example".to_string()], Vec::new());
-        assert_eq!(
-            with_empty.get_blocked_domains(),
-            vec!["local.example".to_string()]
-        );
-    }
-
-    #[test]
-    fn default_allowlist_merges_and_fails_closed() {
-        let defaults: Vec<String> = crate::agent::Agent::Copilot
-            .default_allowed_domains()
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        let state = state_for_allowlist(defaults, None);
-        let eff = state.get_allowed_domains();
-        // Non-empty => the BLOCKED-ALLOWLIST gate fail-closes on unknown domains.
-        assert!(!eff.is_empty(), "default allowlist must be enforced");
-        for d in ["github.com", "api.github.com", "registry.npmjs.org"] {
-            assert!(is_domain_match(d, &eff), "{d} must be allowed");
-        }
-        // Bare `githubcopilot.com` covers the `*.githubcopilot.com` subdomain.
-        assert!(is_domain_match("api.githubcopilot.com", &eff));
-        // Everything else is blocked.
-        assert!(!is_domain_match("evil.com", &eff));
-    }
-
-    #[test]
-    fn default_allowlist_merges_user_configured_domain() {
-        let dir = test_dir("default-allowlist-merge");
-        let path = dir.join("allowed.txt");
-        std::fs::write(&path, "internal.example.com\n").unwrap();
-
-        let state = state_for_allowlist(vec!["github.com".to_string()], Some(path));
-        let eff = state.get_allowed_domains();
-        assert!(is_domain_match("github.com", &eff), "agent default kept");
-        assert!(
-            is_domain_match("internal.example.com", &eff),
-            "user-configured domain must be merged in"
-        );
-        assert!(!is_domain_match("evil.com", &eff));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn empty_default_allowlist_is_allow_all_no_regression() {
-        // CRITICAL no-regression check: feature off (empty default_allowlist)
-        // and no file => empty effective allowlist => allow-all, exactly as
-        // before this change. `handle_connect` treats empty as "no allowlist".
-        let state = state_for_allowlist(Vec::new(), None);
-        assert!(
-            state.get_allowed_domains().is_empty(),
-            "default off must remain allow-all"
-        );
-    }
-
-    #[test]
     fn collector_records_verdicts_dedups_and_normalizes() {
         // The observation collector must record both allowed and blocked hosts
         // with the right verdict, collapse case/trailing-dot variants of the
         // same host into one entry, and count repeat CONNECTs.
-        let state = state_for_allowlist(Vec::new(), None);
+        let state = bare_state();
         state.record_observation("api.github.com", DomainVerdict::Allowed);
         // Same host, different spelling: uppercase + trailing dot must normalize
         // to the same key rather than creating a second entry.
@@ -3066,7 +2056,7 @@ mod tests {
         // A host seen blocked once must stay Blocked in the observed set even if
         // a later attempt is allowed, so the list always flags what policy
         // refused.
-        let state = state_for_allowlist(Vec::new(), None);
+        let state = bare_state();
         state.record_observation("x.example", DomainVerdict::Allowed);
         state.record_observation("x.example", DomainVerdict::Blocked);
         state.record_observation("x.example", DomainVerdict::Allowed);
@@ -3110,7 +2100,6 @@ mod tests {
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             port: 0,
             domain_collector: collector,
-            state: None,
         };
         let observed = handle.observed_domains();
         let hosts: Vec<&str> = observed.iter().map(|o| o.host.as_str()).collect();
