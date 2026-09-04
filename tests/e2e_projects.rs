@@ -1431,6 +1431,58 @@ if /bin/rm -rf test-spawn-dir 2>/dev/null; then echo "RESULT:exec_rm:OK"; else e
         assert_result_ok(&stdout, "exec_rm");
     }
 
+    /// The git guard must not break git.
+    ///
+    /// With `git_guard.enabled`, every `git` in the agent's PATH is a wrapper
+    /// that execs `cplt git-gate`, which decides and then execs the real git.
+    /// Read-only subcommands are supposed to sail straight through — the guard
+    /// blocks pushes, not `git status`. Nothing covered that: every existing
+    /// git test runs with the guard off (its default), and the one wrapper test
+    /// in `e2e_guards` invokes the wrapper directly with `/usr/bin/true` as the
+    /// real git, so it never exercises a real git through a real sandbox.
+    ///
+    /// `git --version` is here as the floor: it needs no repository, no remote,
+    /// and no filesystem access beyond the binary itself, so if even that fails
+    /// the wrapper is broken rather than the policy being strict.
+    ///
+    /// Each command's stderr is echoed on failure. Without it a broken wrapper
+    /// reports `FAIL` and nothing about why, which is how this went unnoticed.
+    #[test]
+    fn project_git_read_ops_work_under_the_git_guard() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+
+        let script = r#"
+run_git() {
+    name="$1"
+    shift
+    if git "$@" >/dev/null 2>git-err.txt; then
+        echo "RESULT:$name:OK"
+    else
+        echo "RESULT:$name:FAIL"
+        sed 's/^/GITERR: /' git-err.txt
+    fi
+    rm -f git-err.txt
+}
+
+run_git git_version --version
+run_git git_status status
+run_git git_log log --oneline -1
+run_git git_branch branch
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--git-guard"]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, "git_version");
+        assert_result_ok(&stdout, "git_status");
+        assert_result_ok(&stdout, "git_log");
+        assert_result_ok(&stdout, "git_branch");
+    }
+
     #[test]
     fn project_proxy_env_vars_injected() {
         require_sandbox!();
