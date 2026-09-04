@@ -70,10 +70,13 @@ fn git_gate(args: &[&str], prevent_push: bool, prevent_force_push: bool) -> (Str
 /// network on an allowed push.
 fn fake_push_git(dir: &std::path::Path) -> std::path::PathBuf {
     let script = dir.join("fake-git.sh");
+    // Any invocation carrying `push` as a word is the push itself; the guard's
+    // own resolution calls (`symbolic-ref`, `rev-parse`, `remote get-url`) never
+    // do. The git path is quoted — it can contain spaces.
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\ncase \"$1\" in push) exit 0 ;; esac\nexec {} \"$@\"\n",
+            "#!/bin/sh\ncase \" $* \" in *\" push \"*) exit 0 ;; esac\nexec '{}' \"$@\"\n",
             binary_in_path("git").display()
         ),
     )

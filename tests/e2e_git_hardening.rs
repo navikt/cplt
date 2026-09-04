@@ -303,7 +303,7 @@ use cplt::gh_proxy::gate_git;
 
 /// A repo whose `origin` is `url`, checked out on `branch`, recording `default`
 /// as the remote's default branch (`None`: never recorded, as in a fetch-only
-/// clone). `None` when git is unavailable.
+/// clone). `None` when the fixture could not be built.
 fn guard_repo(url: &str, branch: &str, default: Option<&str>) -> Option<tempfile::TempDir> {
     let tmp = tempfile::tempdir().ok()?;
     let dir = tmp.path();
@@ -343,7 +343,7 @@ fn git_bin() -> PathBuf {
 fn an_unpinned_allow_push_rule_authorizes_no_repository() {
     let Some(launch) = guard_repo("https://github.com/navikt/cplt.git", "main", Some("main"))
     else {
-        return; // no git available
+        return; // fixture setup failed
     };
     let Some(other) = guard_repo("https://github.com/someone/else.git", "main", Some("main"))
     else {
@@ -417,7 +417,7 @@ fn an_unpinned_allow_push_rule_authorizes_no_repository() {
 #[test]
 fn protect_default_branch_only_protects_a_default_that_is_not_main() {
     let Some(repo) = guard_repo("https://github.com/o/o.git", "develop", Some("develop")) else {
-        return; // no git available
+        return; // fixture setup failed
     };
     let git = git_bin();
     let dir = repo.path().to_string_lossy().into_owned();
@@ -458,7 +458,7 @@ fn protect_default_branch_only_protects_a_default_that_is_not_main() {
 fn the_default_branch_is_resolved_in_the_repo_the_command_targets() {
     let Some(develop) = guard_repo("https://github.com/o/dev.git", "develop", Some("develop"))
     else {
-        return; // no git available
+        return; // fixture setup failed
     };
     let Some(mainline) = guard_repo("https://github.com/o/main.git", "main", Some("main")) else {
         return;
@@ -492,7 +492,7 @@ fn the_default_branch_is_resolved_in_the_repo_the_command_targets() {
 #[test]
 fn protect_default_branch_only_grants_nothing_when_the_default_is_unknown() {
     let Some(repo) = guard_repo("https://github.com/o/o.git", "feature/x", None) else {
-        return; // no git available
+        return; // fixture setup failed
     };
     let git = git_bin();
     let dir = repo.path().to_string_lossy().into_owned();
