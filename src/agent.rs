@@ -544,8 +544,9 @@ impl Agent {
     ///   the match arm.
     /// - Shell (fish): `config.fish` and `conf.d/` are sourced at every shell
     ///   startup, `functions/` autoload on command-name invocation, and
-    ///   `completions/` on tab-completion; `vendor_functions.d` and
-    ///   `vendor_completions.d` are the data-dir equivalents. `fish_variables`
+    ///   `completions/` on tab-completion; `vendor_conf.d/` (sourced at every
+    ///   startup, first in `$__fish_vendor_confdirs`), `vendor_functions.d/`
+    ///   and `vendor_completions.d/` are the data-dir equivalents. `fish_variables`
     ///   stays writable so `set -U` works — a documented residual, since
     ///   `fish_user_paths` is a PATH hijack that touches no config file.
     /// - Pi: `extensions/*.ts` and `extensions/*/index.ts` are auto-discovered
@@ -648,9 +649,11 @@ impl Agent {
             // every shell startup, `functions/*.fish` autoload when a command
             // of that name is run (a planted `git.fish` shadows git), and
             // `completions/*.fish` are sourced on tab-completion. The data dir
-            // carries the same class: `vendor_functions.d` and
-            // `vendor_completions.d` are on `$fish_function_path` and
-            // `$fish_complete_path` by default. Each name is joined onto BOTH
+            // carries the same class, and `vendor_conf.d` is the worst of the
+            // set: it is FIRST in `$__fish_vendor_confdirs` and sourced at every
+            // startup, needing no invocation and no tab-completion at all.
+            // `vendor_functions.d` and `vendor_completions.d` are on
+            // `$fish_function_path` and `$fish_complete_path` by default. Each name is joined onto BOTH
             // writable grants and the joins with no real path are inert, which
             // is how one list covers the config dir and the data dir; for a
             // zsh session every entry is inert, since only the data dir is
@@ -671,6 +674,7 @@ impl Agent {
                 "conf.d",
                 "functions",
                 "completions",
+                "vendor_conf.d",
                 "vendor_functions.d",
                 "vendor_completions.d",
             ],
@@ -757,6 +761,39 @@ impl Agent {
         domains
     }
 
+    /// The writable dirs a shell session needs, by shell name.
+    ///
+    /// Split out of [`Agent::config_dirs`] for the same reason as
+    /// `credential_outside_keychain_on`: the environment is read in exactly one
+    /// place, so callers cannot drift, while tests can assert every shell from any
+    /// host without mutating `$SHELL` or the XDG vars — which `cargo test` runs in
+    /// parallel with everything else that resolves an app dir.
+    ///
+    /// Without this, the fish branch was asserted nowhere: CI's `$SHELL` is bash,
+    /// so `config_dirs` returned an empty vec and every loop over it passed
+    /// vacuously. Renaming `fish` to `fishX` here left the whole suite green.
+    fn shell_config_dirs(shell_name: &str, config_base: &Path, data_base: &Path) -> Vec<AgentDir> {
+        let writable = |path: PathBuf| AgentDir {
+            path,
+            write: true,
+            map_exec: false,
+            process_exec: false,
+            write_files: vec![],
+        };
+        match shell_name {
+            // Config dir: `fish_variables` (universal variables) is rewritten by
+            // temp-file-and-rename inside it. Data dir: `fish_history`.
+            "fish" => vec![
+                writable(config_base.join("fish")),
+                writable(data_base.join("fish")),
+            ],
+            // zsh keeps its startup files in $HOME, which is not granted; only the
+            // data dir (history) is needed.
+            "zsh" => vec![writable(data_base.join("zsh"))],
+            _ => vec![],
+        }
+    }
+
     /// Config directories under $HOME that need read/write access.
     /// Returns (relative_path, needs_write).
     pub fn config_dirs(&self, home: &Path) -> Vec<AgentDir> {
@@ -812,32 +849,7 @@ impl Agent {
                     .ok()
                     .map_or_else(|| home.join(".local/share"), PathBuf::from);
 
-                match shell_name {
-                    "fish" => vec![
-                        AgentDir {
-                            path: config_base.join("fish"),
-                            write: true,
-                            map_exec: false,
-                            process_exec: false,
-                            write_files: vec![],
-                        },
-                        AgentDir {
-                            path: data_base.join("fish"),
-                            write: true,
-                            map_exec: false,
-                            process_exec: false,
-                            write_files: vec![],
-                        },
-                    ],
-                    "zsh" => vec![AgentDir {
-                        path: data_base.join("zsh"),
-                        write: true,
-                        map_exec: false,
-                        process_exec: false,
-                        write_files: vec![],
-                    }],
-                    _ => vec![],
-                }
+                Self::shell_config_dirs(shell_name, &config_base, &data_base)
             }
             Agent::OpenCode => {
                 // Respect XDG_CONFIG_HOME for config dir
@@ -2176,6 +2188,7 @@ mod tests {
                 "conf.d",
                 "functions",
                 "completions",
+                "vendor_conf.d",
                 "vendor_functions.d",
                 "vendor_completions.d"
             ],
@@ -2637,6 +2650,71 @@ mod tests {
             assert_eq!(dirs.len(), 2, "empty override is ignored");
             assert_eq!(dirs[0].path, home.join(".claude"));
         });
+    }
+
+    /// The fish branch of `config_dirs`, asserted without touching `$SHELL`.
+    ///
+    /// It was asserted nowhere before: CI's `$SHELL` is bash, so
+    /// `Agent::Shell.config_dirs()` returned an empty vec and
+    /// `profile_denies_host_persistence_paths_for_every_agent` iterated it
+    /// zero times. Renaming `fish` to `fishX` in the match left the whole
+    /// suite green — the fish grants and every deny joined onto them were
+    /// covered by nothing.
+    #[test]
+    fn shell_config_dirs_grants_both_fish_dirs() {
+        let cfg = Path::new("/Users/test/.config");
+        let data = Path::new("/Users/test/.local/share");
+
+        let dirs = Agent::shell_config_dirs("fish", cfg, data);
+        assert_eq!(
+            dirs.iter().map(|d| d.path.clone()).collect::<Vec<_>>(),
+            vec![cfg.join("fish"), data.join("fish")],
+            "both fish dirs are granted, and the denies are joined onto both"
+        );
+        assert!(
+            dirs.iter().all(|d| d.write),
+            "fish needs write for fish_variables (config) and fish_history (data)"
+        );
+        assert!(
+            dirs.iter().all(|d| !d.process_exec && !d.map_exec),
+            "a shell config dir is never an exec grant"
+        );
+
+        // zsh keeps its startup files in $HOME, which is not granted at all.
+        assert_eq!(
+            Agent::shell_config_dirs("zsh", cfg, data)
+                .iter()
+                .map(|d| d.path.clone())
+                .collect::<Vec<_>>(),
+            vec![data.join("zsh")]
+        );
+        assert!(
+            Agent::shell_config_dirs("bash", cfg, data).is_empty(),
+            "an unhandled shell gets no grant rather than a guessed one"
+        );
+    }
+
+    /// Every fish deny must land in a directory that is actually granted, or
+    /// it is a string nothing enforces.
+    #[test]
+    fn every_fish_deny_lands_in_a_granted_fish_dir() {
+        let cfg = Path::new("/Users/test/.config");
+        let data = Path::new("/Users/test/.local/share");
+        let dirs = Agent::shell_config_dirs("fish", cfg, data);
+        let paths = Agent::Shell.host_persistence_paths(&dirs);
+
+        for sub in Agent::Shell.host_persistence_denies() {
+            assert!(
+                paths.iter().any(|p| p.ends_with(sub)),
+                "{sub} is denied but reaches no granted dir"
+            );
+        }
+        // vendor_conf.d is sourced at every startup and is first in
+        // $__fish_vendor_confdirs — the one that needs no user action at all.
+        assert!(
+            paths.contains(&data.join("fish/vendor_conf.d")),
+            "the data dir's vendor_conf.d must be denied, got {paths:?}"
+        );
     }
 
     #[test]

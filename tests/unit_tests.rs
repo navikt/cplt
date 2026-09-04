@@ -1110,6 +1110,7 @@ fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
         "/Users/test/.config/fish/conf.d",
         "/Users/test/.config/fish/functions",
         "/Users/test/.config/fish/completions",
+        "/Users/test/.local/share/fish/vendor_conf.d",
         "/Users/test/.local/share/fish/vendor_functions.d",
         "/Users/test/.local/share/fish/vendor_completions.d",
     ] {
