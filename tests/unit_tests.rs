@@ -9724,7 +9724,7 @@ fn repo_config_state_not_a_git_repo() {
 
 #[test]
 fn socket_masks_cover_the_escape_sockets() {
-    let masks = cplt::sandbox::socket_mask_paths(1000, false);
+    let masks = cplt::sandbox::socket_mask_paths(1000, None, false);
     for expected in [
         "/run/user/1000/bus",          // D-Bus session bus -> systemd-run --user
         "/run/user/1000/systemd",      // systemd's private socket
@@ -9744,8 +9744,8 @@ fn socket_masks_cover_the_escape_sockets() {
 
 #[test]
 fn allow_docker_lifts_only_the_container_masks() {
-    let with_docker = cplt::sandbox::socket_mask_paths(1000, true);
-    let docker_paths = cplt::sandbox::linux_docker_socket_paths(1000);
+    let with_docker = cplt::sandbox::socket_mask_paths(1000, None, true);
+    let docker_paths = cplt::sandbox::linux_docker_socket_paths(1000, None);
 
     for p in &docker_paths {
         assert!(
@@ -9770,8 +9770,59 @@ fn allow_docker_lifts_only_the_container_masks() {
     }
     assert_eq!(
         with_docker.len() + docker_paths.len(),
-        cplt::sandbox::socket_mask_paths(1000, false).len(),
+        cplt::sandbox::socket_mask_paths(1000, None, false).len(),
         "allow_docker must differ from the default set by exactly the container sockets"
+    );
+}
+
+#[test]
+fn socket_masks_follow_a_relocated_xdg_runtime_dir() {
+    // The docs say the masked set is `$XDG_RUNTIME_DIR/bus` and
+    // `$XDG_RUNTIME_DIR/systemd`. On a host where that variable does not point
+    // at `/run/user/<uid>`, keying the list on the systemd default alone masks
+    // a path that does not exist (silently dropped by the `exists()` filter at
+    // the call site) while the real bus — the one the agent finds, since cplt
+    // passes `XDG_RUNTIME_DIR` through — stays reachable, with the launch
+    // banner still counting the escape sockets as masked.
+    let xdg = std::path::Path::new("/run/somewhere-else/1000");
+    let masks = cplt::sandbox::socket_mask_paths(1000, Some(xdg), false);
+    for expected in [
+        "/run/somewhere-else/1000/bus",
+        "/run/somewhere-else/1000/systemd",
+        "/run/somewhere-else/1000/docker.sock",
+        "/run/somewhere-else/1000/podman",
+    ] {
+        assert!(
+            masks.iter().any(|p| p == std::path::Path::new(expected)),
+            "a relocated XDG_RUNTIME_DIR must be masked too: {expected} missing from {masks:?}"
+        );
+    }
+    // Additive, never a replacement: a poisoned or merely wrong variable must
+    // not be able to *remove* the systemd default from the list.
+    assert!(
+        masks
+            .iter()
+            .any(|p| p == std::path::Path::new("/run/user/1000/bus")),
+        "the systemd default must survive an XDG_RUNTIME_DIR override, got {masks:?}"
+    );
+}
+
+#[test]
+fn relative_xdg_runtime_dir_is_ignored() {
+    // Same rule as `AppDirKind::resolve`: a relative value would produce a
+    // relative mask path, which resolves against the process cwd.
+    let masks =
+        cplt::sandbox::socket_mask_paths(1000, Some(std::path::Path::new("relative/dir")), false);
+    assert!(
+        !masks
+            .iter()
+            .any(|p| p.to_string_lossy().contains("relative")),
+        "a relative XDG_RUNTIME_DIR must be ignored, got {masks:?}"
+    );
+    assert_eq!(
+        masks.len(),
+        cplt::sandbox::socket_mask_paths(1000, None, false).len(),
+        "a rejected value must leave the list exactly as it was"
     );
 }
 
@@ -9779,7 +9830,7 @@ fn allow_docker_lifts_only_the_container_masks() {
 fn socket_masks_follow_the_uid() {
     // The runtime-dir entries are per-user; a hardcoded uid would mask nothing
     // on any host but the developer's.
-    let masks = cplt::sandbox::socket_mask_paths(4242, false);
+    let masks = cplt::sandbox::socket_mask_paths(4242, None, false);
     assert!(
         masks
             .iter()

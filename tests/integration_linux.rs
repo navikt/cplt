@@ -753,13 +753,22 @@ except OSError as e:
     // here so the guarantee is pinned the moment a runner has it.
 
     /// Probe that tries to `connect()` to a pathname UNIX socket.
+    ///
+    /// The path is hex-encoded rather than interpolated. It crosses two
+    /// quoting layers — a double-quoted shell word and a single-quoted Python
+    /// literal — and at least one caller derives it from `$HOME`, where a
+    /// quote or a backslash is legal. Encoded, the payload is `[0-9a-f]` only,
+    /// so neither layer can misread it and a broken probe can never be
+    /// mistaken for a sandbox verdict. `connect()` takes the decoded bytes:
+    /// AF_UNIX addresses are bytes, not text.
     fn unix_connect_probe(path: &str) -> String {
+        let hex: String = path.bytes().map(|b| format!("{b:02x}")).collect();
         format!(
             r#"python3 -c "
-import socket, sys
+import binascii, socket
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
-    s.connect('{path}')
+    s.connect(binascii.unhexlify('{hex}'))
     print('CONNECTED')
 except OSError as e:
     print(f'REFUSED {{e.errno}}')
@@ -843,6 +852,85 @@ except OSError as e:
              if this now fails, the sandbox got stronger and the docs are stale.\n\
              stdout: {stdout}"
         );
+    }
+
+    /// A pathname UNIX socket at a path the policy grants nothing on, served
+    /// by a listener that lives **outside** the sandbox — the escape's shape
+    /// without its dependency on a session bus.
+    ///
+    /// The three tests above all key on `/run/user/<uid>/bus` and self-skip
+    /// without a session bus, and the Linux CI job runs `cargo test` without
+    /// `--nocapture`, so whether they ran there is not observable. This one
+    /// needs no bus and runs anywhere.
+    ///
+    /// `$HOME` is the right home for it: Landlock grants the home tree
+    /// per-file (`LINUX_HOME_CONFIG_FILES`) and never wholesale, so a
+    /// uniquely named dotfile there is reliably ungranted on any host.
+    struct OutsideSocket {
+        path: PathBuf,
+        _listener: std::os::unix::net::UnixListener,
+    }
+
+    impl OutsideSocket {
+        fn bind() -> Self {
+            let path = home_dir().join(format!(".cplt-test-{}.sock", std::process::id()));
+            let _ = fs::remove_file(&path);
+            let listener =
+                std::os::unix::net::UnixListener::bind(&path).expect("bind UNIX socket in $HOME");
+            Self {
+                path,
+                _listener: listener,
+            }
+        }
+    }
+
+    impl Drop for OutsideSocket {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn connect_to_an_ungranted_pathname_socket_follows_the_abi() {
+        // The one test in this group that needs nothing of the host, and
+        // therefore the only *observed* evidence for the claim the rest of
+        // the group documents: below ABI v9 nothing in the kernel gates
+        // connect(2) to a pathname UNIX socket, so an ungranted one — a
+        // session bus, a container daemon, whatever else the host is running —
+        // is reachable from inside the sandbox. From v9 up Landlock denies it.
+        //
+        // If this fails on the v9 side, `add_fs_rule`'s ResolveUnix grant is
+        // gone. If it fails on the other side, the sandbox got stronger than
+        // the docs claim and SECURITY.md's Linux limitations need updating.
+        require_landlock!();
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let sock = OutsideSocket::bind();
+        let path = sock.path.to_string_lossy().into_owned();
+        let project = create_test_project();
+
+        let (_, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--no-bubblewrap"],
+            &unix_connect_probe(&path),
+        );
+
+        if landlock_abi_version().is_some_and(|v| v >= 9) {
+            assert!(
+                !stdout.contains("CONNECTED"),
+                "ABI v9 must deny connect() to an ungranted pathname socket \
+                 ({path}).\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        } else {
+            assert!(
+                stdout.contains("CONNECTED"),
+                "below ABI v9 connect() to an ungranted pathname socket ({path}) is \
+                 not gated by anything; if this now fails the sandbox got stronger \
+                 and the docs are stale.\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
     }
 
     #[test]

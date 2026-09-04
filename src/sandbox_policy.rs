@@ -126,17 +126,65 @@ pub fn current_uid() -> u32 {
 ///
 /// Abstract-namespace sockets have no path and cannot be masked this way; they
 /// are covered (kernel ≥ 6.12 only) by `Scope::AbstractUnixSocket`.
-pub fn socket_mask_paths(uid: u32, allow_docker: bool) -> Vec<PathBuf> {
-    let run_user = format!("/run/user/{uid}");
-    let mut paths = vec![
-        PathBuf::from(format!("{run_user}/bus")),
-        PathBuf::from(format!("{run_user}/systemd")),
-        PathBuf::from("/run/dbus/system_bus_socket"),
-    ];
+///
+/// The runtime-dir entries are produced for every directory
+/// [`linux_runtime_dirs`] returns, so a host whose `$XDG_RUNTIME_DIR` is not
+/// `/run/user/<uid>` gets its real bus masked rather than a path nobody uses.
+pub fn socket_mask_paths(
+    uid: u32,
+    xdg_runtime_dir: Option<&Path>,
+    allow_docker: bool,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = linux_runtime_dirs(uid, xdg_runtime_dir)
+        .iter()
+        .flat_map(|d| [d.join("bus"), d.join("systemd")])
+        .collect();
+    paths.push(PathBuf::from("/run/dbus/system_bus_socket"));
     if !allow_docker {
-        paths.extend(linux_docker_socket_paths(uid));
+        paths.extend(linux_docker_socket_paths(uid, xdg_runtime_dir));
     }
     paths
+}
+
+/// The runtime directories a session socket can live in: systemd's
+/// `/run/user/<uid>` plus `$XDG_RUNTIME_DIR` when it points somewhere else.
+///
+/// # Why the environment is consulted at all
+///
+/// Everything that finds a session socket — D-Bus, systemd, rootless Podman,
+/// modern GnuPG — reads `$XDG_RUNTIME_DIR`, and cplt passes that variable
+/// through to the agent (`ENV_ALLOWLIST`). A mask list or an ABI-v9 grant
+/// keyed only on `/run/user/<uid>` therefore covers a path the agent may not
+/// be using: the mask is dropped as non-existent, the launch banner still says
+/// the escape sockets are masked, and the real bus stays reachable. That is a
+/// control that looks present and is absent, which is the whole subject of
+/// #240.
+///
+/// # Why it is safe to consult
+///
+/// The list is **additive**: `/run/user/<uid>` is always first and is never
+/// dropped, so a poisoned `XDG_RUNTIME_DIR` can only add a mask, never remove
+/// one. Relative values are rejected, matching [`AppDirKind::resolve`] — a
+/// relative path here would produce a relative mask or grant.
+///
+/// The value is read from cplt's own (parent) environment, before the agent
+/// exists. An attacker who can set it already controls the invocation.
+pub fn linux_runtime_dirs(uid: u32, xdg_runtime_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from(format!("/run/user/{uid}"))];
+    match xdg_runtime_dir {
+        Some(p) if p.is_absolute() && !dirs.iter().any(|d| d == p) => dirs.push(p.to_path_buf()),
+        _ => {}
+    }
+    dirs
+}
+
+/// `$XDG_RUNTIME_DIR` from cplt's own environment, for the call sites that
+/// feed [`linux_runtime_dirs`]. Read once at the top of policy construction so
+/// the path functions below stay pure and testable.
+pub fn xdg_runtime_dir_env() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.as_encoded_bytes().trim_ascii().is_empty())
+        .map(PathBuf::from)
 }
 
 /// Docker/Podman daemon endpoints on Linux.
@@ -157,14 +205,18 @@ pub fn socket_mask_paths(uid: u32, allow_docker: bool) -> Vec<PathBuf> {
 /// `~/.docker` is not a socket and not in this list; it is in
 /// [`DENIED_DOTFILES`] and gets its own read-only Landlock rule under
 /// `--allow-docker` (see `sandbox_landlock.rs`), mirroring the macOS profile.
-pub fn linux_docker_socket_paths(uid: u32) -> Vec<PathBuf> {
-    vec![
+pub fn linux_docker_socket_paths(uid: u32, xdg_runtime_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = vec![
         PathBuf::from("/run/docker.sock"),
         PathBuf::from("/var/run/docker.sock"),
-        PathBuf::from(format!("/run/user/{uid}/docker.sock")),
-        PathBuf::from(format!("/run/user/{uid}/podman")),
-        PathBuf::from("/run/podman"),
-    ]
+    ];
+    paths.extend(
+        linux_runtime_dirs(uid, xdg_runtime_dir)
+            .iter()
+            .flat_map(|d| [d.join("docker.sock"), d.join("podman")]),
+    );
+    paths.push(PathBuf::from("/run/podman"));
+    paths
 }
 
 /// Sensitive file patterns in the project directory that are denied by default.
