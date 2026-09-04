@@ -1064,6 +1064,83 @@ fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
     );
 }
 
+/// fish's auto-executing files are write-denied in BOTH granted dirs, and
+/// `fish_variables` is not.
+///
+/// The config dir stays writable for exactly one reason: fish rewrites
+/// `fish_variables` by temp-file-and-rename inside it, so `set -U` needs
+/// directory write. Everything in there that runs on the next host shell is
+/// denied at file level instead. `vendor_conf.d` (sourced at every startup,
+/// first in `$__fish_vendor_confdirs`), `vendor_functions.d` and
+/// `vendor_completions.d` cover the data dir, which was previously granted
+/// write with no guard at all.
+#[test]
+fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
+    // The two grants are built by hand rather than through
+    // `Agent::Shell.config_dirs`, which reads $SHELL and the XDG vars: mutating
+    // those for the duration of a test races every other test that resolves an
+    // app dir, and `cargo test` runs them in parallel. What is under test here
+    // is the profile, not the XDG resolution.
+    let agent_dirs = ["/Users/test/.config/fish", "/Users/test/.local/share/fish"].map(|p| {
+        cplt::agent::AgentDir {
+            path: std::path::PathBuf::from(p),
+            write: true,
+            map_exec: false,
+            process_exec: false,
+            write_files: vec![],
+        }
+    });
+    let conf = std::path::PathBuf::from("/Users/test/.config/fish");
+    let p = generate_profile(
+        &SandboxConfig {
+            // The wide grant is the one that used to swallow the denies.
+            extra_write: std::slice::from_ref(&conf),
+            agent: cplt::agent::Agent::Shell,
+            agent_dirs: &agent_dirs,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    let allow = p
+        .rfind("(allow file-write* (subpath \"/Users/test/.config/fish\"))")
+        .expect("user allow.write must be emitted");
+    for path in [
+        "/Users/test/.config/fish/config.fish",
+        "/Users/test/.config/fish/conf.d",
+        "/Users/test/.config/fish/functions",
+        "/Users/test/.config/fish/completions",
+        "/Users/test/.local/share/fish/vendor_conf.d",
+        "/Users/test/.local/share/fish/vendor_functions.d",
+        "/Users/test/.local/share/fish/vendor_completions.d",
+    ] {
+        let line = format!("(deny file-write* (subpath \"{path}\"))");
+        let deny = p
+            .find(&line)
+            .unwrap_or_else(|| panic!("{line} must be emitted"));
+        assert!(
+            deny > allow,
+            "{line} must come AFTER the user allow.write, or last-match-wins reopens it"
+        );
+    }
+
+    // Universal variables must keep working: denying the file, or the directory
+    // the rename happens in, breaks every `set -U`.
+    assert!(
+        !p.contains("(deny file-write* (subpath \"/Users/test/.config/fish/fish_variables\"))"),
+        "fish_variables must stay writable — documented residual, not an oversight"
+    );
+    assert!(
+        p.contains("(allow file-write* (subpath \"/Users/test/.config/fish\"))"),
+        "the config dir itself must stay writable for the fish_variables rename"
+    );
+    // History lives in the data dir and is written every session.
+    assert!(
+        !p.contains("(deny file-write* (subpath \"/Users/test/.local/share/fish/fish_history\"))"),
+        "fish_history must stay writable"
+    );
+}
+
 /// A default `SandboxConfig` for tests that only care about one or two fields.
 /// Every other test here spells the struct out; new ones need not.
 fn base_profile_options() -> SandboxConfig<'static> {

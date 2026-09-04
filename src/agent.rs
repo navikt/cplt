@@ -522,10 +522,17 @@ impl Agent {
         matches!(self, Agent::Copilot)
     }
 
-    /// Paths inside this agent's writable config dir(s) that auto-execute on
-    /// the HOST the next time the agent runs *outside* cplt — a persistence
-    /// vector the agent never needs to write mid-session. Each entry is joined
-    /// onto every writable [`Agent::config_dirs`] grant and denied for writing.
+    /// Paths inside this agent's writable grants that auto-execute on the HOST
+    /// the next time the agent runs *outside* cplt — a persistence vector the
+    /// agent never needs to write mid-session. Each entry is joined onto every
+    /// writable [`Agent::config_dirs`] grant and denied for writing.
+    ///
+    /// "Config dir" would be too narrow: `config_dirs` returns whatever an
+    /// agent needs granted, which for the shell includes the fish *data* dir
+    /// (`vendor_conf.d/` and friends live there), for Claude a top-level file
+    /// (`~/.claude.json`), and for OpenCode data, state and cache dirs. A join
+    /// that does not correspond to a real path is inert, which is how one list
+    /// covers grants of different shapes.
     ///
     /// - Claude: `statusline.sh` runs on every prompt render, `plugins/` loads
     ///   at startup, and `settings.json` carries `hooks` (`SessionStart`,
@@ -542,6 +549,13 @@ impl Agent {
     ///   native `.node` addons. `installed-plugins/` carries the same three
     ///   routes inside a plugin, and is denied with an unresolved cost — see
     ///   the match arm.
+    /// - Shell (fish): `config.fish` and `conf.d/` are sourced at every shell
+    ///   startup, `functions/` autoload on command-name invocation, and
+    ///   `completions/` on tab-completion; `vendor_conf.d/` (sourced at every
+    ///   startup, first in `$__fish_vendor_confdirs`), `vendor_functions.d/`
+    ///   and `vendor_completions.d/` are the data-dir equivalents. `fish_variables`
+    ///   stays writable so `set -U` works — a documented residual, since
+    ///   `fish_user_paths` is a PATH hijack that touches no config file.
     /// - Pi: `extensions/*.ts` and `extensions/*/index.ts` are auto-discovered
     ///   at startup (the trust gate covers only the project-local path), and
     ///   `settings.json` can name extension paths and npm/git packages, so
@@ -553,7 +567,9 @@ impl Agent {
     /// Cost: for Pi this breaks package management and every in-session
     /// setting that persists to `settings.json` — `/model` Ctrl+S,
     /// `/thinking`, `/settings`. For Copilot it breaks `/settings`, `/config`,
-    /// `/mcp add` and `/lsp`. Do those outside cplt — see SECURITY.md.
+    /// `/mcp add` and `/lsp`. For the shell it breaks `funcsave`,
+    /// `fish_config` and plugin managers that install functions. Do those
+    /// outside cplt — see SECURITY.md.
     ///
     /// Enforcement is macOS-first: Seatbelt emits these as write-denies after
     /// the dir-wide allow (last match wins). Landlock cannot sub-deny inside an
@@ -636,7 +652,40 @@ impl Agent {
             // denies are joined onto writable dirs only, so an entry here would
             // be inert anyway.) The data and state dirs hold sessions, logs and
             // downloaded model weights — nothing goose auto-executes.
-            Agent::Goose | Agent::OpenCode | Agent::Shell => &[],
+            // Shell (fish): `config.fish` and `conf.d/*.fish` are sourced at
+            // every shell startup, `functions/*.fish` autoload when a command
+            // of that name is run (a planted `git.fish` shadows git), and
+            // `completions/*.fish` are sourced on tab-completion. The data dir
+            // carries the same class, and `vendor_conf.d` is the worst of the
+            // set: it is FIRST in `$__fish_vendor_confdirs` and sourced at every
+            // startup, needing no invocation and no tab-completion at all.
+            // `vendor_functions.d` and `vendor_completions.d` are on
+            // `$fish_function_path` and `$fish_complete_path` by default. Each name is joined onto BOTH
+            // writable grants and the joins with no real path are inert, which
+            // is how one list covers the config dir and the data dir; for a
+            // zsh session every entry is inert, since only the data dir is
+            // granted and none of these live in it.
+            //
+            // fish writes none of them. Verified with fish 4.9: with the config
+            // dir read-only, both `fish -c` and `fish -i -c` start clean and
+            // only `set -U` fails. The cost is `funcsave`, `fish_config`, and
+            // plugin managers that install functions — do those outside cplt.
+            //
+            // `fish_variables` is deliberately NOT here, and it is a real
+            // residual: `set -U fish_user_paths /evil` prepends to PATH on the
+            // next shell with no config file touched. Denying it would break
+            // every `set -U`, which is the whole reason the directory is
+            // writable. See SECURITY.md.
+            Agent::Shell => &[
+                "config.fish",
+                "conf.d",
+                "functions",
+                "completions",
+                "vendor_conf.d",
+                "vendor_functions.d",
+                "vendor_completions.d",
+            ],
+            Agent::Goose | Agent::OpenCode => &[],
         }
     }
 
@@ -719,6 +768,39 @@ impl Agent {
         domains
     }
 
+    /// The writable dirs a shell session needs, by shell name.
+    ///
+    /// Split out of [`Agent::config_dirs`] for the same reason as
+    /// `credential_outside_keychain_on`: the environment is read in exactly one
+    /// place, so callers cannot drift, while tests can assert every shell from any
+    /// host without mutating `$SHELL` or the XDG vars — which `cargo test` runs in
+    /// parallel with everything else that resolves an app dir.
+    ///
+    /// Without this, the fish branch was asserted nowhere: CI's `$SHELL` is bash,
+    /// so `config_dirs` returned an empty vec and every loop over it passed
+    /// vacuously. Renaming `fish` to `fishX` here left the whole suite green.
+    fn shell_config_dirs(shell_name: &str, config_base: &Path, data_base: &Path) -> Vec<AgentDir> {
+        let writable = |path: PathBuf| AgentDir {
+            path,
+            write: true,
+            map_exec: false,
+            process_exec: false,
+            write_files: vec![],
+        };
+        match shell_name {
+            // Config dir: `fish_variables` (universal variables) is rewritten by
+            // temp-file-and-rename inside it. Data dir: `fish_history`.
+            "fish" => vec![
+                writable(config_base.join("fish")),
+                writable(data_base.join("fish")),
+            ],
+            // zsh keeps its startup files in $HOME, which is not granted; only the
+            // data dir (history) is needed.
+            "zsh" => vec![writable(data_base.join("zsh"))],
+            _ => vec![],
+        }
+    }
+
     /// Config directories under $HOME that need read/write access.
     /// Returns (relative_path, needs_write).
     pub fn config_dirs(&self, home: &Path) -> Vec<AgentDir> {
@@ -752,8 +834,15 @@ impl Agent {
                 }]
             }
             Agent::Shell => {
-                // Shell needs write access to its config/data dirs for history,
-                // variables, and sourcing config files.
+                // Shell needs write access to its config/data dirs for history
+                // and universal variables. NOT for sourcing config files —
+                // sourcing needs read, and that clause was the only stated
+                // reason the *config* directory was writable at all. It stays
+                // writable for one real reason: fish rewrites `fish_variables`
+                // by temp-file-and-rename inside `$__fish_config_dir`, which
+                // needs directory write, so `set -U` fails without it. The
+                // files in there that auto-execute are write-denied instead —
+                // see `host_persistence_denies`.
                 let shell_path = std::env::var("SHELL").unwrap_or_default();
                 let shell_name = Path::new(&shell_path)
                     .file_name()
@@ -767,32 +856,7 @@ impl Agent {
                     .ok()
                     .map_or_else(|| home.join(".local/share"), PathBuf::from);
 
-                match shell_name {
-                    "fish" => vec![
-                        AgentDir {
-                            path: config_base.join("fish"),
-                            write: true,
-                            map_exec: false,
-                            process_exec: false,
-                            write_files: vec![],
-                        },
-                        AgentDir {
-                            path: data_base.join("fish"),
-                            write: true,
-                            map_exec: false,
-                            process_exec: false,
-                            write_files: vec![],
-                        },
-                    ],
-                    "zsh" => vec![AgentDir {
-                        path: data_base.join("zsh"),
-                        write: true,
-                        map_exec: false,
-                        process_exec: false,
-                        write_files: vec![],
-                    }],
-                    _ => vec![],
-                }
+                Self::shell_config_dirs(shell_name, &config_base, &data_base)
             }
             Agent::OpenCode => {
                 // Respect XDG_CONFIG_HOME for config dir
@@ -2124,9 +2188,27 @@ mod tests {
              same three routes the other entries close, so leaving it out \
              denied the front door and left the side door"
         );
+        assert_eq!(
+            Agent::Shell.host_persistence_denies(),
+            [
+                "config.fish",
+                "conf.d",
+                "functions",
+                "completions",
+                "vendor_conf.d",
+                "vendor_functions.d",
+                "vendor_completions.d"
+            ],
+        );
+        assert!(
+            !Agent::Shell
+                .host_persistence_denies()
+                .contains(&"fish_variables"),
+            "fish_variables stays writable or `set -U` breaks — a documented \
+             residual, since fish_user_paths is a PATH hijack"
+        );
         assert!(Agent::Goose.host_persistence_denies().is_empty());
         assert!(Agent::OpenCode.host_persistence_denies().is_empty());
-        assert!(Agent::Shell.host_persistence_denies().is_empty());
     }
 
     /// `host_persistence_paths` is what BOTH backends consume — Seatbelt turns
@@ -2575,6 +2657,71 @@ mod tests {
             assert_eq!(dirs.len(), 2, "empty override is ignored");
             assert_eq!(dirs[0].path, home.join(".claude"));
         });
+    }
+
+    /// The fish branch of `config_dirs`, asserted without touching `$SHELL`.
+    ///
+    /// It was asserted nowhere before: CI's `$SHELL` is bash, so
+    /// `Agent::Shell.config_dirs()` returned an empty vec and
+    /// `profile_denies_host_persistence_paths_for_every_agent` iterated it
+    /// zero times. Renaming `fish` to `fishX` in the match left the whole
+    /// suite green — the fish grants and every deny joined onto them were
+    /// covered by nothing.
+    #[test]
+    fn shell_config_dirs_grants_both_fish_dirs() {
+        let cfg = Path::new("/Users/test/.config");
+        let data = Path::new("/Users/test/.local/share");
+
+        let dirs = Agent::shell_config_dirs("fish", cfg, data);
+        assert_eq!(
+            dirs.iter().map(|d| d.path.clone()).collect::<Vec<_>>(),
+            vec![cfg.join("fish"), data.join("fish")],
+            "both fish dirs are granted, and the denies are joined onto both"
+        );
+        assert!(
+            dirs.iter().all(|d| d.write),
+            "fish needs write for fish_variables (config) and fish_history (data)"
+        );
+        assert!(
+            dirs.iter().all(|d| !d.process_exec && !d.map_exec),
+            "a shell config dir is never an exec grant"
+        );
+
+        // zsh keeps its startup files in $HOME, which is not granted at all.
+        assert_eq!(
+            Agent::shell_config_dirs("zsh", cfg, data)
+                .iter()
+                .map(|d| d.path.clone())
+                .collect::<Vec<_>>(),
+            vec![data.join("zsh")]
+        );
+        assert!(
+            Agent::shell_config_dirs("bash", cfg, data).is_empty(),
+            "an unhandled shell gets no grant rather than a guessed one"
+        );
+    }
+
+    /// Every fish deny must land in a directory that is actually granted, or
+    /// it is a string nothing enforces.
+    #[test]
+    fn every_fish_deny_lands_in_a_granted_fish_dir() {
+        let cfg = Path::new("/Users/test/.config");
+        let data = Path::new("/Users/test/.local/share");
+        let dirs = Agent::shell_config_dirs("fish", cfg, data);
+        let paths = Agent::Shell.host_persistence_paths(&dirs);
+
+        for sub in Agent::Shell.host_persistence_denies() {
+            assert!(
+                paths.iter().any(|p| p.ends_with(sub)),
+                "{sub} is denied but reaches no granted dir"
+            );
+        }
+        // vendor_conf.d is sourced at every startup and is first in
+        // $__fish_vendor_confdirs — the one that needs no user action at all.
+        assert!(
+            paths.contains(&data.join("fish/vendor_conf.d")),
+            "the data dir's vendor_conf.d must be denied, got {paths:?}"
+        );
     }
 
     #[test]
