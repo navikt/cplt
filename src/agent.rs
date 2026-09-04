@@ -536,6 +536,11 @@ impl Agent {
     ///   names host commands, `config/mcp_config.json` holds `mcpServers` that
     ///   auto-start, and `antigravity-cli/bin/` holds binaries (`agentapi`,
     ///   `webm_encoder`) Antigravity runs on the host.
+    /// - Copilot: `settings.json` and `hooks/*.json` hold `hooks.<event>[]`
+    ///   commands, `mcp-config.json` and `lsp-config.json` name host processes
+    ///   the CLI spawns, `extensions/` runs Node modules, and `pkg` holds the
+    ///   native `.node` addons. `installed-plugins/` is the same class but is
+    ///   deliberately excluded — see the match arm.
     /// - Pi: `extensions/*.ts` and `extensions/*/index.ts` are auto-discovered
     ///   at startup (the trust gate covers only the project-local path), and
     ///   `settings.json` can name extension paths and npm/git packages, so
@@ -546,7 +551,8 @@ impl Agent {
     ///
     /// Cost: for Pi this breaks package management and every in-session
     /// setting that persists to `settings.json` — `/model` Ctrl+S,
-    /// `/thinking`, `/settings`. Do those outside cplt — see SECURITY.md.
+    /// `/thinking`, `/settings`. For Copilot it breaks `/settings`, `/config`,
+    /// `/mcp add` and `/lsp`. Do those outside cplt — see SECURITY.md.
     ///
     /// Enforcement is macOS-first: Seatbelt emits these as write-denies after
     /// the dir-wide allow (last match wins). Landlock cannot sub-deny inside an
@@ -562,13 +568,50 @@ impl Agent {
             // joined onto BOTH grants, and the join that does not correspond to
             // a real path is inert (same as ~/.claude.json/statusline.sh).
             Agent::Antigravity => &["hooks.json", "mcp_config.json", "bin"],
+            // Copilot: `settings.json` carries `hooks.<event>[]` entries with
+            // `bash` / `command` / `exec`+`args` that fire at lifecycle points,
+            // and `hooks/*.json` is the same schema in its own directory.
+            // `mcp-config.json` (`mcpServers.<n>.command`) and
+            // `lsp-config.json` (`lspServers.<n>.command`) both spawn host
+            // processes — LSP servers start automatically once the working
+            // directory is trusted. `extensions/` runs Node modules
+            // ("Extensions execute on your computer with your privileges",
+            // upstream's words); it is gated behind `--experimental` today,
+            // which is a flag the user flips, not a boundary. `pkg` holds the
+            // native `.node` addons: that deny predates this list as a
+            // hardcoded rule in the profile, and lives here now so both
+            // backends consume it from one place.
+            //
+            // None of the six is written by the CLI in normal operation. The
+            // cost is `/settings`, `/config`, `/mcp add` and `/lsp` inside the
+            // sandbox — do those outside cplt, see SECURITY.md. Everything
+            // Copilot rewrites every session — `config.json`,
+            // `permissions-config.json`, `session-state/`,
+            // `command-history-state/`, `session-store.db`, `logs/`, `ide/`,
+            // `mcp-oauth-config/`, `mcp-secrets/`, `plugin-data/` — stays
+            // writable.
+            //
+            // `installed-plugins/` is DELIBERATELY not here. It auto-executes
+            // by the same route (plugins ship their own hooks and MCP servers),
+            // but first-party plugins update themselves at the start of every
+            // session in a trusted directory, so denying it breaks that
+            // silently. Left open as a known residual rather than closed at
+            // that price.
+            Agent::Copilot => &[
+                "settings.json",
+                "hooks",
+                "mcp-config.json",
+                "lsp-config.json",
+                "extensions",
+                "pkg",
+            ],
             // goose needs no entries: its ONLY auto-execution vector is
             // config.yaml's `extensions:` list, and its config dir is granted
             // read-only, so there is nothing writable left to deny. (These
             // denies are joined onto writable dirs only, so an entry here would
             // be inert anyway.) The data and state dirs hold sessions, logs and
             // downloaded model weights — nothing goose auto-executes.
-            Agent::Goose | Agent::Copilot | Agent::OpenCode | Agent::Shell => &[],
+            Agent::Goose | Agent::OpenCode | Agent::Shell => &[],
         }
     }
 
@@ -656,10 +699,20 @@ impl Agent {
     pub fn config_dirs(&self, home: &Path) -> Vec<AgentDir> {
         match self {
             Agent::Copilot => {
-                vec![
-                    // ~/.copilot is handled separately in emit_home_access
-                    // (needs map-executable for native modules)
-                ]
+                // ~/.copilot holds auth, settings, the session store and the
+                // native `.node` addons. `map_exec` is what the addons actually
+                // need (dlopen from `pkg/universal/*/prebuilds/`), but Landlock
+                // has no map-only bit — its single execute right covers both
+                // mmap(PROT_EXEC) and execve — so `process_exec` has to be set
+                // too or the addons stop loading on Linux (#243, #319).
+                // Narrowing that is #324's job, not this grant's.
+                vec![AgentDir {
+                    path: home.join(".copilot"),
+                    write: true,
+                    map_exec: true,
+                    process_exec: true,
+                    write_files: vec![],
+                }]
             }
             Agent::Shell => {
                 // Shell needs write access to its config/data dirs for history,
@@ -2014,8 +2067,25 @@ mod tests {
         // No writable dir that hosts auto-executing config for these. goose's
         // one auto-exec vector, config.yaml's `extensions:`, lives in a config
         // dir granted read-only, so there is nothing writable left to deny.
+        assert_eq!(
+            Agent::Copilot.host_persistence_denies(),
+            [
+                "settings.json",
+                "hooks",
+                "mcp-config.json",
+                "lsp-config.json",
+                "extensions",
+                "pkg"
+            ],
+        );
+        assert!(
+            !Agent::Copilot
+                .host_persistence_denies()
+                .contains(&"installed-plugins"),
+            "installed-plugins is deliberately writable: first-party plugins \
+             self-update at session start and denying it breaks that silently"
+        );
         assert!(Agent::Goose.host_persistence_denies().is_empty());
-        assert!(Agent::Copilot.host_persistence_denies().is_empty());
         assert!(Agent::OpenCode.host_persistence_denies().is_empty());
         assert!(Agent::Shell.host_persistence_denies().is_empty());
     }
@@ -2155,13 +2225,28 @@ mod tests {
         assert!(!dirs[1].process_exec && !dirs[1].map_exec);
     }
 
+    /// `~/.copilot` moved out of the hand-written `emit_home_access` block and
+    /// into `config_dirs`, which is what makes `host_persistence_denies` reach
+    /// it at all — the denies are joined onto writable `config_dirs` entries,
+    /// so with an empty list every Copilot entry would have been inert.
     #[test]
-    fn copilot_has_no_extra_config_dirs() {
+    fn copilot_config_dir_is_the_writable_dot_copilot_grant() {
         let home = Path::new("/Users/test");
         let dirs = Agent::Copilot.config_dirs(home);
+        assert_eq!(dirs.len(), 1, "Copilot has exactly one config dir");
+        assert_eq!(dirs[0].path, home.join(".copilot"));
         assert!(
-            dirs.is_empty(),
-            "copilot dirs are handled in emit_home_access"
+            dirs[0].write,
+            "session store and config are written all session"
+        );
+        assert!(
+            dirs[0].map_exec,
+            "native .node addons are dlopen'd from pkg/universal/*/prebuilds"
+        );
+        assert!(
+            dirs[0].process_exec,
+            "Landlock's execute right covers mmap AND execve, so map_exec alone \
+             would stop the addons loading on Linux (#324 narrows this)"
         );
     }
 

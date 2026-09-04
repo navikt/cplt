@@ -760,18 +760,10 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     // ── Agent-specific directories ──
     if config.agent.needs_copilot_dir() {
-        // Copilot config — auth tokens, settings, native modules.
-        // Execute needed for dlopen() of native .node addons (keytar, pty, computer).
-        fs_rules.push(FsRule {
-            path: home.join(".copilot"),
-            access: FsAccess {
-                read: true,
-                write: true,
-                execute: true,
-                ioctl: false,
-            },
-        });
-
+        // ~/.copilot itself is an ordinary AgentDir now (agent.rs `config_dirs`)
+        // and is emitted by the agent_dirs loop below, execute included — the
+        // native .node addons need dlopen and Landlock has no map-only right.
+        //
         // Copilot SEA cache — auto-updaters download newer versions here.
         // Execute is required for Node to spawn the newer ripgrep / helpers.
         // (Write access is already inherited from the broader ~/.cache allow).
@@ -792,7 +784,10 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: dir.write,
                 // `process_exec` alone, for the reason spelled out on the home
-                // tool dirs above (#243). No AgentDir sets `map_exec` today.
+                // tool dirs above (#243). `map_exec` is deliberately ignored:
+                // Landlock's single execute right cannot express "mmap only",
+                // so an AgentDir that needs dlopen (Copilot's native addons)
+                // sets BOTH flags and gets execute here — see #324.
                 execute: dir.process_exec,
                 ioctl: false,
             },
@@ -3327,7 +3322,9 @@ mod tests {
     fn copilot_config_dir_is_writable_and_executable() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
-        let config = test_config(&project, &home);
+        let agent_dirs = crate::agent::Agent::Copilot.config_dirs(&home);
+        let mut config = test_config(&project, &home);
+        config.agent_dirs = &agent_dirs;
         let policy = generate_policy(&config);
 
         let rule = policy
@@ -3339,7 +3336,8 @@ mod tests {
         assert!(rule.access.write);
         assert!(
             rule.access.execute,
-            ".copilot needs execute for native .node module dlopen()"
+            ".copilot needs execute for native .node module dlopen() — Landlock \
+             has no map-only right, so map_exec alone would silently drop it"
         );
     }
 

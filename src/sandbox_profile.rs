@@ -357,27 +357,12 @@ fn emit_home_access(
     agent_dirs: &[AgentDir],
     credential_outside_keychain: bool,
 ) {
-    // Agent-specific directories (Copilot: ~/.copilot, OpenCode: ~/.config/opencode, etc.)
-    if agent.needs_copilot_dir() {
-        // Copilot config — the CLI needs its auth tokens and settings.
-        // file-map-executable is needed for native Node.js addons (keytar.node, pty.node, computer.node)
-        // which are loaded via dlopen() from ~/.copilot/pkg/universal/*/prebuilds/
-        sbpl!(sb, ";; Copilot config + native modules");
-        sbpl!(sb, "(allow file-read* (subpath \"{home}/.copilot\"))");
-        sbpl!(sb, "(allow file-write* (subpath \"{home}/.copilot\"))");
-        sbpl!(
-            sb,
-            "(allow file-map-executable (subpath \"{home}/.copilot\"))"
-        );
-        // Deny writes to Copilot's installed packages (native modules).
-        // Prevents persistence: a rogue agent could replace keytar.node with a
-        // malicious version that runs unsandboxed next time Copilot is launched.
-        // Must come after the allow (last-match-wins).
-        sbpl!(sb, "(deny file-write* (subpath \"{home}/.copilot/pkg\"))");
-        sbpl!(sb);
-    }
-
-    // Agent-specific directories from the Agent trait
+    // Agent-specific directories from the Agent trait.
+    // ~/.copilot used to be emitted by hand here, with its own `pkg` write-deny
+    // sitting right after the allow. It is an ordinary `AgentDir` now, and `pkg`
+    // is a `host_persistence_denies` entry emitted at the tail of the profile —
+    // after `emit_user_allows`, so an `allow.write = ["~/.copilot"]` can no
+    // longer silently reopen it the way it could here (#212, #256).
     if !agent_dirs.is_empty() {
         sbpl!(sb, ";; {} directories", agent.display_name());
         for dir in agent_dirs {

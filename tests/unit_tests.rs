@@ -893,8 +893,10 @@ fn profile_grants_project_access() {
 
 #[test]
 fn profile_grants_copilot_config_access() {
+    let agent_dirs = copilot_agent_dirs();
     let p = generate_profile(
         &SandboxConfig {
+            agent_dirs: &agent_dirs,
             ..base_profile_options()
         },
         &[],
@@ -1006,6 +1008,64 @@ fn host_persistence_denies_survive_a_later_user_allow_write() {
             "{line} must come AFTER the user allow.write, or last-match-wins reopens it"
         );
     }
+}
+
+/// Copilot's six host-persistence denies, and the one deliberately left out.
+///
+/// `~/.copilot` is granted write for the session store, the permissions file
+/// and the logs Copilot rewrites every run, so the persistence guard has to be
+/// file-level. These six auto-execute on the next host launch and are never
+/// written by the CLI in normal operation; `installed-plugins/` auto-executes
+/// too but first-party plugins self-update at session start, so denying it
+/// would break that silently.
+#[test]
+fn copilot_execution_bearing_paths_are_write_denied_and_survive_a_user_allow() {
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = cplt::agent::Agent::Copilot.config_dirs(home);
+    let whole_dir = home.join(".copilot");
+    let p = generate_profile(
+        &SandboxConfig {
+            extra_write: std::slice::from_ref(&whole_dir),
+            agent_dirs: &agent_dirs,
+            ..base_profile_options()
+        },
+        &[],
+    );
+
+    // rfind: the agent-dir grant emits the same allow line, so the LAST one is
+    // the user's allow.write — the grant the denies have to outlive.
+    let allow = p
+        .rfind("(allow file-write* (subpath \"/Users/test/.copilot\"))")
+        .expect("user allow.write must be emitted");
+    for sub in [
+        "settings.json",
+        "hooks",
+        "mcp-config.json",
+        "lsp-config.json",
+        "extensions",
+        "pkg",
+    ] {
+        let line = format!("(deny file-write* (subpath \"/Users/test/.copilot/{sub}\"))");
+        let deny = p
+            .find(&line)
+            .unwrap_or_else(|| panic!("{line} must be emitted"));
+        assert!(
+            deny > allow,
+            "{line} must come AFTER the user allow.write, or last-match-wins reopens it"
+        );
+    }
+
+    assert!(
+        !p.contains("(deny file-write* (subpath \"/Users/test/.copilot/installed-plugins\"))"),
+        "installed-plugins must stay writable — first-party plugins self-update \
+         at session start"
+    );
+    // The dirs Copilot rewrites every session keep the dir-wide write grant.
+    assert!(
+        !p.contains("(deny file-write* (subpath \"/Users/test/.copilot/session-store.db\"))")
+            && !p.contains("(deny file-write* (subpath \"/Users/test/.copilot/config.json\"))"),
+        "the CLI's own mutable state must not be caught by the persistence denies"
+    );
 }
 
 /// A default `SandboxConfig` for tests that only care about one or two fields.
@@ -1647,8 +1707,10 @@ fn profile_allows_gh_config_read_only() {
 
 #[test]
 fn profile_allows_file_map_executable_for_copilot() {
+    let agent_dirs = copilot_agent_dirs();
     let p = generate_profile(
         &SandboxConfig {
+            agent_dirs: &agent_dirs,
             ..base_profile_options()
         },
         &[],
@@ -1952,8 +2014,10 @@ fn profile_allows_all_tcp_outbound_when_jvm_and_localhost_any() {
 
 #[test]
 fn profile_denies_write_to_copilot_pkg() {
+    let agent_dirs = copilot_agent_dirs();
     let p = generate_profile(
         &SandboxConfig {
+            agent_dirs: &agent_dirs,
             ..base_profile_options()
         },
         &[],
@@ -2630,6 +2694,12 @@ fn profile_denies_write_to_cplt_toml() {
 // ============================================================
 
 /// Helper to generate a default profile for permission tests.
+/// Copilot's real config dirs — `~/.copilot` is an ordinary `AgentDir` now, so
+/// a profile built without them has no `~/.copilot` rules at all.
+fn copilot_agent_dirs() -> Vec<cplt::agent::AgentDir> {
+    cplt::agent::Agent::Copilot.config_dirs(std::path::Path::new("/Users/test"))
+}
+
 fn default_profile() -> String {
     generate_profile(
         &SandboxConfig {
