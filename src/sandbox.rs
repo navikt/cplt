@@ -511,8 +511,8 @@ pub fn describe(sandbox: &PreparedSandbox) -> &str {
 
 /// Verify the sandbox mechanism works on this system.
 ///
-/// On macOS, writes the profile to a temp file and runs `/usr/bin/true`
-/// inside `sandbox-exec` to confirm enforcement is active.
+/// On macOS, runs `/usr/bin/true` inside `sandbox-exec`, with the profile
+/// passed inline (`-p`), to confirm enforcement is active.
 ///
 /// On Linux, this is a no-op (ABI checks happen during prepare).
 pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
@@ -522,7 +522,7 @@ pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
 /// Execute a command inside the sandbox, forwarding signals to the child.
 ///
 /// Handles platform-specific sandbox setup internally:
-/// - macOS: writes SBPL profile to temp file, invokes `sandbox-exec`
+/// - macOS: invokes `sandbox-exec` with the SBPL profile passed inline (`-p`)
 /// - Linux: applies Landlock ruleset + seccomp filter via `pre_exec`
 ///
 /// Environment handling is controlled by `extra_pass_env`, `inherit_env`,

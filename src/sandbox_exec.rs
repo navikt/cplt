@@ -722,17 +722,26 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Verify the SBPL profile works by running `/usr/bin/true` inside sandbox-exec.
 #[cfg(target_os = "macos")]
 pub fn preflight(sandbox: &super::PreparedSandbox) -> Result<(), String> {
-    let profile_path = write_temp_profile(&sandbox.profile_text)?;
     // Absolute: `sandbox-exec` only ever lives in /usr/bin (SIP-protected), and
     // resolving it by name would go through the parent's PATH, which contains
     // directories the sandbox itself grants the agent write+exec on.
     let output = Command::new(SANDBOX_EXEC)
-        .arg("-f")
-        .arg(&profile_path)
+        .arg("-p")
+        .arg(&sandbox.profile_text)
         .arg("/usr/bin/true")
         .output()
-        .map_err(|e| format!("Failed to run sandbox-exec: {e}"));
-    let _ = std::fs::remove_file(&profile_path);
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::E2BIG) {
+                format!(
+                    "Sandbox profile is too large to pass to sandbox-exec ({} bytes; the \
+                     argument list must fit in kern.argmax, 1 MiB, alongside the environment). \
+                     Reduce the number of allow/deny grants.",
+                    sandbox.profile_text.len()
+                )
+            } else {
+                format!("Failed to run sandbox-exec: {e}")
+            }
+        });
 
     let output = output?;
     if output.status.success() {
@@ -748,8 +757,13 @@ pub fn preflight(sandbox: &super::PreparedSandbox) -> Result<(), String> {
 
 /// Execute copilot inside the macOS Seatbelt sandbox.
 ///
-/// Writes the SBPL profile to a temp file, invokes `sandbox-exec`, and
-/// cleans up the profile file on exit.
+/// The profile is passed to `sandbox-exec -p` as an argument, never as a
+/// pathname. A temp file would be a cross-session policy-replacement race: the
+/// profile itself grants every sandbox write throughout `/private/tmp` and
+/// `/private/var/folders`, so another sandboxed session could swap the file
+/// between our write and the kernel's read and choose the policy we enforce.
+/// `-p` leaves nothing to swap. Oversized profiles fail loudly with `E2BIG`
+/// (`preflight` explains it); the kernel never sees a truncated profile.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub fn exec(
@@ -763,16 +777,8 @@ pub fn exec(
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
 ) -> u8 {
-    let profile_path = match write_temp_profile(&sandbox.profile_text) {
-        Ok(p) => p,
-        Err(e) => {
-            ui::error(&e.clone());
-            return 1;
-        }
-    };
-
     let mut cmd = Command::new(SANDBOX_EXEC);
-    cmd.arg("-f").arg(&profile_path).arg(copilot_bin);
+    cmd.arg("-p").arg(&sandbox.profile_text).arg(copilot_bin);
 
     configure_command(
         &mut cmd,
@@ -797,42 +803,7 @@ pub fn exec(
 
     apply_deny_env_and_credential(&mut cmd, deny_env, sandbox.keychain_substitute.as_ref());
 
-    let exit_code = spawn_and_wait(&mut cmd);
-    let _ = std::fs::remove_file(&profile_path);
-    exit_code
-}
-
-/// Write SBPL profile text to a temp file with secure creation.
-///
-/// Uses O_CREAT|O_EXCL (create_new) to prevent symlink-following attacks,
-/// and mode 0600 to restrict read access.
-#[cfg(target_os = "macos")]
-fn write_temp_profile(profile_text: &str) -> Result<std::path::PathBuf, String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let path = std::env::temp_dir().join(format!(
-        "cplt-{}-{}.sb",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| format!("Cannot create sandbox profile: {e}"))?;
-
-    file.write_all(profile_text.as_bytes()).map_err(|e| {
-        let _ = std::fs::remove_file(&path);
-        format!("Cannot write sandbox profile: {e}")
-    })?;
-
-    Ok(path)
+    spawn_and_wait(&mut cmd)
 }
 
 // ── Linux: Landlock + seccomp ─────────────────────────────────

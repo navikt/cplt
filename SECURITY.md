@@ -903,14 +903,24 @@ The newline character is the dangerous one. A path containing `\n(allow file-rea
 
 Config file paths are additionally canonicalized (resolved to absolute paths) at load time.
 
-#### Temp file safety
+#### The profile never becomes a file
 
-The sandbox profile is written to a temp file with:
+The SBPL profile is passed to `sandbox-exec -p` as an argument. It is never written
+to disk and never handed over as a pathname.
 
-- **Unique filename:** `cplt-{PID}-{nanosecond_timestamp}.sb`
-- **Atomic creation:** `OpenOptions::create_new(true)`, which fails if the file exists and so prevents symlink following
-- **Restricted permissions:** mode `0o600`, owner read/write only
-- **Cleanup on exit:** the file is removed after sandbox-exec completes
+The profile grants every sandbox write throughout `/private/tmp` and
+`/private/var/folders`. While cplt wrote the profile to `$TMPDIR/cplt-*.sb` and
+passed `-f <path>`, one sandboxed session could overwrite another session's
+profile between the write and the kernel's read — a complete policy replacement,
+not merely corruption, since the attacker chooses the replacement text. Measured
+at 14 of 15 launches (`profile_cannot_be_swapped_by_another_session` in
+`tests/e2e.rs`, which still reproduces the attack against the old code).
+
+An oversized profile fails loudly with `E2BIG` — the argument list must fit in
+`kern.argmax` (1 MiB) alongside the environment. The kernel never sees a
+truncated profile: `sandbox-exec` either applies the whole thing or refuses to
+start. A default profile is about 25 KB and each allow/deny grant adds roughly
+2.5 KB, so the ceiling is in the low hundreds of grants.
 
 #### Unsafe root rejection
 

@@ -5095,4 +5095,122 @@ paths = [
             "refusal should say why: {stderr}"
         );
     }
+
+    // ============================================================
+    // Cross-session SBPL profile replacement
+    // ============================================================
+
+    /// The profile must never reach the kernel as a pathname.
+    ///
+    /// The generated profile grants every sandbox write throughout
+    /// `/private/tmp` and `/private/var/folders`. While cplt handed
+    /// `sandbox-exec` a `-f <path>` under the system temp dir, any other
+    /// sandboxed session could overwrite that file between our write and the
+    /// kernel's read and choose the policy actually enforced — not a denial of
+    /// service, a complete policy replacement.
+    ///
+    /// This is that attack, run for real: a thread rewrites every `cplt-*.sb`
+    /// it sees with `(allow default)` while cplt launches repeatedly with a
+    /// canary file explicitly denied. If even one launch reads the canary, the
+    /// kernel enforced the attacker's profile. With the profile passed inline
+    /// (`-p`) there is no file to swap and every launch is denied.
+    #[test]
+    fn profile_cannot_be_swapped_by_another_session() {
+        require_sandbox!();
+
+        let project = project_dir();
+        let canary = project.join(".cplt-e2e-profile-swap-canary");
+        std::fs::write(&canary, "canary").expect("write canary");
+
+        let fake_dir = tempfile::Builder::new()
+            .prefix(".cplt-e2e-fake-copilot-")
+            .tempdir_in(&project)
+            .expect("create fake copilot dir");
+        let script = fake_dir.path().join("copilot");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif cat {} >/dev/null 2>&1; then echo READ_ALLOWED; \
+                 else echo READ_DENIED; fi\n",
+                canary.display()
+            ),
+        )
+        .expect("write fake copilot");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake copilot");
+        }
+
+        // The attacker: another sandboxed cplt session, which the profile lets
+        // write anywhere under the system temp dir.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hits = std::sync::Arc::new(AtomicU32::new(0));
+        let attacker = {
+            let stop = std::sync::Arc::clone(&stop);
+            let hits = std::sync::Arc::clone(&hits);
+            std::thread::spawn(move || {
+                let temp = std::env::temp_dir();
+                while !stop.load(Ordering::Relaxed) {
+                    let Ok(entries) = std::fs::read_dir(&temp) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with("cplt-")
+                            && name.ends_with(".sb")
+                            && std::fs::write(entry.path(), "(version 1)\n(allow default)\n")
+                                .is_ok()
+                        {
+                            hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        };
+
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{current_path}", fake_dir.path().display());
+        let mut allowed = 0;
+        let mut denied = 0;
+        let mut transcript = String::new();
+        for attempt in 0..15 {
+            let output = cplt_cmd()
+                .args(["--yes", "--deny-path"])
+                .arg(&canary)
+                .args(["--", "--version"])
+                .current_dir(&project)
+                .env("PATH", &new_path)
+                .output()
+                .expect("binary should run");
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            if stdout.contains("READ_ALLOWED") {
+                allowed += 1;
+            } else if stdout.contains("READ_DENIED") {
+                denied += 1;
+            }
+            use std::fmt::Write as _;
+            let _ = writeln!(transcript, "attempt {attempt}: {}", stdout.trim());
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().expect("attacker thread");
+        let _ = std::fs::remove_file(&canary);
+
+        assert_eq!(
+            allowed,
+            0,
+            "an attacker's SBPL profile replaced ours in {allowed}/15 launches \
+             ({} temp-file overwrites landed) — the profile must not reach the \
+             kernel as a pathname:\n{transcript}",
+            hits.load(Ordering::Relaxed)
+        );
+        // Guard against a vacuous pass: the launches must actually have reached
+        // the fake agent inside the sandbox.
+        assert!(
+            denied > 0,
+            "no launch reached the sandboxed agent, so nothing was proven:\n{transcript}"
+        );
+    }
 }
