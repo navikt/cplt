@@ -199,6 +199,16 @@ pub(crate) fn test_functionality(
 /// itself are skipped in step 4 — binding host `/tmp` back over the tmpfs would
 /// re-expose host temp files and re-break the exec guarantee.
 ///
+/// 4b. For every **non-writable** rule whose path lives under `/tmp`,
+///    `--ro-bind <path> <path>`, after the tmpfs so it shadows it (#299).
+///    Step 1 covers read-only rules everywhere else, but not under the private
+///    tmpfs, so an `allow.read` or `allow.exec` grant naming a path there used
+///    to be in the Landlock ruleset and absent from the namespace: accepted,
+///    and silently doing nothing. Read-only keeps the "exec from `/tmp` is
+///    denied" guarantee — the agent still cannot write a payload into `/tmp`
+///    and run it; an `allow.exec` grant only reaches what already existed at
+///    launch, on a mount that stays EROFS.
+///
 /// 5. Finally, for every path in `ro_protect` that exists, `--ro-bind <p> <p>`
 ///    is emitted *after* the writable binds so it shadows them read-only. This
 ///    is the Finding 1 persistence mitigation: the project's `.git/hooks` lives
@@ -258,6 +268,7 @@ pub(crate) fn build_bwrap_args(
     //    children (bwrap applies operations in order). ──
     let mut writable: Vec<&FsRule> = fs_rules.iter().filter(|r| r.access.write).collect();
     writable.sort_by_key(|r| r.path.components().count());
+    let mut bound_writable: Vec<&Path> = Vec::new();
 
     for rule in writable {
         let path = &rule.path;
@@ -276,6 +287,47 @@ pub(crate) fn build_bwrap_args(
         }
         let path_str = path.to_string_lossy().into_owned();
         args.extend(["--bind".to_string(), path_str.clone(), path_str]);
+        bound_writable.push(path.as_path());
+    }
+
+    // ── Read-only overlays for non-writable rules under /tmp (#299) ──
+    // `--ro-bind / /` covers every read-only rule *outside* /tmp, but the
+    // private `--tmpfs /tmp` above hides the host's, so a grant naming a path
+    // under it was present in the Landlock ruleset and absent from the
+    // namespace — accepted at the CLI, silently doing nothing. Only user
+    // grants land here: `allow.read` and `allow.exec` are the sole non-writable
+    // rules that can name a path under /tmp (`allow.socket` and the /tmp rule
+    // itself are writable and handled above).
+    //
+    // Read-only, not writable, so the "exec from /tmp is denied" guarantee
+    // survives intact: an agent still cannot write a payload into /tmp and run
+    // it. What an `allow.exec` grant buys is exec on a path that already
+    // existed at launch and stays EROFS — which is what the same grant already
+    // does on macOS and on the Landlock-only Linux path, so this makes bwrap
+    // agree with the other two rather than opening a new door.
+    //
+    // Skipped when a writable bind already covers the path: that bind makes it
+    // visible, and a read-only bind on top would downgrade a write grant the
+    // user also asked for.
+    //
+    // `bound_writable` is the set that actually got a `--bind`, not every
+    // writable rule: the `/tmp` rule itself is writable and is deliberately
+    // never bound, so testing against the rules would skip every path under it.
+    for rule in fs_rules.iter().filter(|r| !r.access.write) {
+        let path = &rule.path;
+        if !path.starts_with("/tmp") || path == Path::new("/tmp") {
+            continue;
+        }
+        if bound_writable.iter().any(|w| path.starts_with(w)) {
+            continue;
+        }
+        // bwrap errors on a bind source that does not exist; Landlock drops
+        // such rules too, so mirror that rather than sinking the wrapper.
+        if !path.exists() {
+            continue;
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        args.extend(["--ro-bind".to_string(), path_str.clone(), path_str]);
     }
 
     // ── Read-only overlays for git-persistence paths (Finding 1) ──
@@ -985,6 +1037,107 @@ mod tests {
         assert!(
             bind_idx > tmpfs_idx,
             "writable bind under /tmp must come after --tmpfs /tmp to shadow it"
+        );
+    }
+
+    #[test]
+    fn read_only_rules_under_tmp_are_bound_back() {
+        // #299: the private --tmpfs /tmp hid the host's, so a non-writable rule
+        // under /tmp (allow.read, and allow.exec since #295) was in the policy
+        // and absent from the namespace. It must get a --ro-bind, after the
+        // tmpfs so it shadows it.
+        let dir = tempfile::TempDir::new_in("/tmp").expect("tempdir under /tmp");
+        let granted = dir.path().to_path_buf();
+        let rules = vec![FsRule {
+            path: granted.clone(),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: true,
+                ioctl: false,
+            },
+        }];
+        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+
+        let g = granted.to_string_lossy().into_owned();
+        let bind_idx = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == g && w[2] == g)
+            .expect("a non-writable rule under /tmp must be bound back read-only");
+        let tmpfs_idx = args
+            .windows(2)
+            .position(|w| w == ["--tmpfs", "/tmp"])
+            .expect("tmpfs");
+        assert!(
+            bind_idx > tmpfs_idx,
+            "the bind must come after --tmpfs /tmp to shadow it"
+        );
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == g && w[2] == g),
+            "a read/exec grant must never be bound writable"
+        );
+    }
+
+    #[test]
+    fn read_only_rules_outside_tmp_are_not_bound_back() {
+        // `--ro-bind / /` already covers them; emitting a bind per read rule
+        // would be hundreds of redundant arguments.
+        let dir = non_tmp_tempdir();
+        let granted = dir.path().to_path_buf();
+        let rules = vec![FsRule {
+            path: granted.clone(),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: false,
+                ioctl: false,
+            },
+        }];
+        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let g = granted.to_string_lossy().into_owned();
+        assert!(
+            !args.windows(3).any(|w| w[1] == g && w[2] == g),
+            "a read-only rule outside /tmp needs no bind of its own"
+        );
+    }
+
+    #[test]
+    fn a_writable_bind_under_tmp_is_not_downgraded_to_read_only() {
+        // A read grant nested inside a write grant must not produce a ro-bind
+        // over the writable one — the user asked for both.
+        let dir = tempfile::TempDir::new_in("/tmp").expect("tempdir under /tmp");
+        let writable = dir.path().to_path_buf();
+        let nested = writable.join("nested");
+        std::fs::create_dir(&nested).expect("nested dir");
+        let rules = vec![
+            FsRule {
+                path: writable.clone(),
+                access: FsAccess {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    ioctl: false,
+                },
+            },
+            FsRule {
+                path: nested.clone(),
+                access: FsAccess {
+                    read: true,
+                    write: false,
+                    execute: false,
+                    ioctl: false,
+                },
+            },
+        ];
+        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let n = nested.to_string_lossy().into_owned();
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == n && w[2] == n),
+            "a path already covered by a writable bind must not be re-bound read-only"
         );
     }
 
