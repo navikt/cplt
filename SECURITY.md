@@ -502,6 +502,29 @@ file.
 
 ## Defense layers
 
+### A property that holds across all of them: no silent grants
+
+A grant or setting that cannot be honoured fails loudly at the point it is
+written. It is never accepted and then quietly dropped.
+
+This is a security property, not a usability one. A restriction that silently
+does nothing leaves an operator believing a path is closed when it is open, and
+nothing in the tool contradicts that belief. The failure is invisible by
+construction: the config still lists the setting, `cplt config show` still prints
+it, and the sandbox still starts.
+
+The property has been broken in both directions and fixed each time: `allow.read`
+on a hard-denied file worked on Linux while being silently overridden on macOS
+(#207); `--allow-socket` emitted file rules that `connect()` never consults, so
+it granted and denied nothing on Linux (#240); `allow.write` inside a credential
+directory was inert on macOS while working on Linux (#291); read-only grants
+under `/tmp` disappeared inside bubblewrap's private tmpfs (#299); the `[audit]`
+section was settable and displayed while no code consumed it (#309).
+
+Where a control genuinely cannot be enforced on a platform, that is documented as
+a stated gap with the kernel reason for it, not left as an absence. The Linux
+sections below say where those gaps are.
+
 ### Layer 0: Environment variable sanitization
 
 By default `cplt` clears the child process environment and re-adds only safe variables from an allowlist, so credentials cannot leak through inherited env vars.
