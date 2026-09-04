@@ -1747,20 +1747,16 @@ fi
 // config can be approved. Asserting only on the state enum is how the
 // not-a-git-repo case slipped through review.
 mod trust_accept_guard {
-    use crate::common::cplt_cmd;
+    use crate::common::{cplt_cmd, git_cmd};
     use std::path::Path;
-    use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = git_cmd(dir)
             .args(args)
-            .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@e.x")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@e.x")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .expect("git should run");
         assert!(out.status.success(), "git {args:?} failed");
