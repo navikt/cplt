@@ -439,6 +439,10 @@ That last claim is not a guess. SBPL accepts only `*` or `localhost` as the host
 
 So the only rule that would match these workers is `*:*`, which allows every outbound address rather than loopback. `--allow-localhost-any` will not be widened to mean that.
 
+The same gap applies to the **proxy** settings cplt injects. The init script forwards `http(s).proxyHost`/`proxyPort`/`nonProxyHosts` from the daemon into `Test` and `JavaExec` forks alongside `preferIPv4Stack`, but `WorkerExecutor` forks are out of reach for the same reason: a worker that fetches anything connects directly and does not appear in the proxy log.
+
+One more case worth knowing: a **Gradle daemon started outside cplt and then reused inside** is not proxied either. `JAVA_TOOL_OPTIONS` is not part of Gradle's daemon-compatibility check, so an existing daemon can be reused without ever having seen the proxy properties. Use `--no-daemon`, or let the first daemon start inside cplt.
+
 **Workaround until the plugin propagates the environment:** run the affected tasks outside cplt, and keep the rest of the build inside.
 
 ```bash
@@ -522,6 +526,41 @@ cplt config set allow.ports 8443
 - FTP, SMTP, or other protocol connections
 
 Under `proxy.forced` an extra port opens no direct socket ([#297](https://github.com/navikt/cplt/issues/297)). The proxy still tunnels it, so the first two work; a tool that speaks its own protocol on a raw socket, such as FTP or SMTP, does not. Run those without proxy-forced — see [the proxy docs](proxy.md#proxy-forced-mode).
+
+## Internal Maven/Gradle repositories on private IPs
+
+**This is a behaviour change.** cplt now makes the JVM proxy-aware: it injects `http(s).proxyHost`/`proxyPort` into `JAVA_TOOL_OPTIONS`, so Gradle and Maven dependency resolution goes through cplt's CONNECT proxy and appears in the proxy log. It previously went straight out and was invisible.
+
+The proxy applies the same SSRF guard to the JVM that it has always applied to curl, npm and pip, which have had `HTTP_PROXY` set all along. An **in-house Nexus or Artifactory** — or a self-hosted Develocity — that resolves into private address space (RFC1918, CGNAT, link-local) is refused:
+
+```
+Could not resolve com.example:internal-lib:1.0.
+> Could not get resource 'https://nexus.intern.example.com/repository/maven-public/...'
+  > Failed to CONNECT: 403 Forbidden — Private target blocked by cplt.
+```
+
+Two cases, and they do not have the same answer.
+
+**The repository has a DNS name** — add it to `proxy.allow_private_domains`. Suffix matching, so one entry covers subdomains:
+
+```toml
+# ~/.config/cplt/config.toml, or .cplt.toml in the repo
+[proxy]
+allow_private_domains = ["intern.example.com"]
+```
+
+Or for a single run: `cplt --allow-private-domain intern.example.com` (singular — there is no `--allow-private-domains` flag).
+
+**The repository URL is a bare IP literal**, e.g. `https://10.20.30.40/repository/maven-public/` in a `build.gradle` or `settings.xml`. **This cannot be allowed.** Not by `allow_private_domains`, not by any other key. The private-target check for an IP literal is a pre-DNS gate: it fires on the literal before the allow list is ever consulted, and that list is only read by the post-DNS guard. There is no flag that reaches it.
+
+The fix is to give the host a DNS name and use that in the repository URL. If your infrastructure genuinely has no name for it, the repository cannot be reached from inside cplt with the proxy on.
+
+Verify either case without running a build:
+
+```bash
+cplt check net nexus.intern.example.com   # ALLOWED once the domain is listed
+cplt check net 10.20.30.40                # BLOCKED, and stays blocked
+```
 
 ## Private registries
 

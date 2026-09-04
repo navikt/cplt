@@ -953,7 +953,7 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         }
         NetVerdict::BlockedPrivate => {
             log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE");
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked\r\n");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nPrivate target blocked by cplt. For a trusted internal host, add its DNS name to proxy.allow_private_domains (or pass --allow-private-domain). An IP-literal target cannot be allowed: give the host a name.\r\n");
             let _ = client.shutdown(std::net::Shutdown::Both);
             return;
         }
@@ -1630,7 +1630,7 @@ impl Refusal {
             Refusal::ResolvedNonLoopback => {
                 b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to non-loopback IP\r\n"
             }
-            Refusal::ResolvedPrivate => b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to private IP\r\n",
+            Refusal::ResolvedPrivate => b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to a private IP, blocked by cplt. For a trusted internal host, add it to proxy.allow_private_domains (or pass --allow-private-domain).\r\n",
         }
     }
 
@@ -1938,6 +1938,30 @@ mod tests {
         assert_eq!(
             classify_connect(&np(&[], &[], &[443]), "169.254.169.254", 443),
             NetVerdict::BlockedPrivate
+        );
+    }
+
+    /// An IP-literal target cannot be rescued by `allow_private_domains`, and the
+    /// documentation says so (`docs/known-impacts.md`, "Internal Maven/Gradle
+    /// repositories on private IPs"). This pins the reason: the private check for
+    /// a literal is the PRE-DNS gate in `classify_connect`, which never consults
+    /// the private-domain list — that list is only read by the post-DNS guard in
+    /// `classify_resolved`. A repository URL written as `https://10.20.30.40/...`
+    /// therefore has no remedy short of giving the host a DNS name.
+    #[test]
+    fn ip_literal_stays_private_blocked_even_when_listed_as_a_private_domain() {
+        let mut policy = np(&[], &[], &[443]);
+        policy.private_domains = vec!["10.20.30.40".to_string()];
+        assert_eq!(
+            classify_connect(&policy, "10.20.30.40", 443),
+            NetVerdict::BlockedPrivate,
+            "listing the literal must not open it — the pre-DNS gate fires first"
+        );
+        // A NAMED host is not decided here at all: the pre-DNS gate passes it and
+        // the post-DNS guard, which does honour the list, gets the final say.
+        assert_eq!(
+            classify_connect(&policy, "nexus.intern.example.com", 443),
+            NetVerdict::Allowed
         );
     }
 
