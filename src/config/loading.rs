@@ -447,7 +447,7 @@ impl Config {
         // `sandbox.git_push_prevention` spelling at the config layer.
         let git_guard = GitGuardPolicy {
             enabled: bools.git_guard_enabled,
-            mode: self.git_guard.mode.unwrap_or(EnforcementMode::Block),
+            mode: self.git_guard.mode.unwrap_or(baseline.git_guard_mode),
             prevent_push: bools.git_prevent_push,
             prevent_force_push: bools.git_prevent_force_push,
             protect_default_branch_only: bools.git_protect_default_branch_only,
@@ -2878,15 +2878,74 @@ validate = false
         assert!(resolved.proxy_forced && resolved.gh_guard.enabled && resolved.git_guard.enabled);
     }
 
+    /// #122 Stage 1/2: the guards are on out of the box. Asserted on the
+    /// *resolved* policy rather than on `Preset::baseline()` or a registry
+    /// literal, because the ladder has several layers and only what `merge`
+    /// produces is what a user actually runs under.
     #[test]
-    fn preset_standard_leaves_guards_and_proxy_off() {
+    fn guards_are_enabled_with_no_config_and_no_flags() {
+        let resolved = Config::default().merge(CliFlags::default()).unwrap();
+        assert!(resolved.gh_guard.enabled, "gh guard must default on");
+        assert!(resolved.git_guard.enabled, "git guard must default on");
+    }
+
+    /// The git guard carries far more legitimate traffic than the gh guard, so
+    /// its default-on lands in `warn`: output changes for everyone, nothing is
+    /// blocked. Escalating to `block` is `strict`'s job, or the user's.
+    #[test]
+    fn git_guard_defaults_to_warn_not_block() {
+        let resolved = Config::default().merge(CliFlags::default()).unwrap();
+        assert_eq!(resolved.git_guard.mode, EnforcementMode::Warn);
+        // The sub-policies stay fail-closed underneath the warn: flipping the
+        // mode to block must not also require re-enabling them.
+        assert!(resolved.git_guard.prevent_push);
+        assert!(resolved.git_guard.prevent_force_push);
+    }
+
+    /// Warn-by-default must not quietly downgrade the one preset that promises
+    /// a lockdown.
+    #[test]
+    fn strict_keeps_the_git_guard_in_block_mode() {
+        let resolved = Config::default()
+            .merge(CliFlags {
+                preset: Some(Preset::Strict),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(resolved.git_guard.mode, EnforcementMode::Block);
+    }
+
+    /// The opt-out has to actually work, or the default is a trap.
+    #[test]
+    fn explicit_config_and_cli_both_turn_the_default_on_guards_back_off() {
+        let from_config: Config =
+            toml::from_str("[gh_guard]\nenabled = false\n[git_guard]\nenabled = false\n").unwrap();
+        let r = from_config.merge(CliFlags::default()).unwrap();
+        assert!(!r.gh_guard.enabled && !r.git_guard.enabled);
+
+        let r = Config::default()
+            .merge(CliFlags {
+                gh_guard: FeatureToggle::ForceOff,
+                git_push_prevention: FeatureToggle::ForceOff,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!r.gh_guard.enabled && !r.git_guard.enabled);
+    }
+
+    #[test]
+    fn preset_standard_enables_the_guards_and_leaves_the_proxy_alone() {
         let resolved = Config::default()
             .merge(CliFlags {
                 preset: Some(Preset::Standard),
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(posture_snapshot(&resolved), (false, false, false, false));
+        // Guards on (#122), forced proxy and fail-closed allowlist still off —
+        // those are `strict`-only.
+        assert_eq!(posture_snapshot(&resolved), (true, true, false, false));
+        // The git guard is on but only warns; escalating to block is strict's job.
+        assert_eq!(resolved.git_guard.mode, EnforcementMode::Warn);
     }
 
     #[test]
@@ -2916,8 +2975,8 @@ validate = false
     fn no_preset_equals_standard_posture_defaults() {
         // The critical no-regression test: no preset must resolve EXACTLY like
         // `standard` (and today's hardcoded defaults) across every posture
-        // field — guards off, forced proxy off, default allowlist off — not
-        // just the five toggles.
+        // field — guards on since #122, forced proxy off, default allowlist
+        // off — not just the five toggles.
         let none = Config::default().merge(CliFlags::default()).unwrap();
         let standard = Config::default()
             .merge(CliFlags {
@@ -2925,8 +2984,9 @@ validate = false
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(posture_snapshot(&none), (false, false, false, false));
+        assert_eq!(posture_snapshot(&none), (true, true, false, false));
         assert_eq!(posture_snapshot(&none), posture_snapshot(&standard));
+        assert_eq!(none.git_guard.mode, standard.git_guard.mode);
         assert_eq!(toggle_snapshot(&none), toggle_snapshot(&standard));
         // No preset must NOT enable the fail-closed allowlist — today's behavior.
         assert!(!none.default_allowlist);
@@ -3241,8 +3301,11 @@ mod precedence {
                 cli_on: Some(|c| c.gh_guard = FeatureToggle::ForceOn),
                 cli_off: Some(|c| c.gh_guard = FeatureToggle::ForceOff),
                 get: |r| r.gh_guard.enabled,
-                default: false,
-                preset: Some((Preset::Strict, true)),
+                default: true,
+                // Default-on since #122, so `strict` no longer differs from the
+                // default here. `permissive` does: it turns the guard back off,
+                // which is what keeps the preset layer of the ladder tested.
+                preset: Some((Preset::Permissive, false)),
             },
             Ladder {
                 key: "gh_guard.scope_check",
@@ -3281,8 +3344,11 @@ mod precedence {
                 cli_on: Some(|c| c.git_push_prevention = FeatureToggle::ForceOn),
                 cli_off: Some(|c| c.git_push_prevention = FeatureToggle::ForceOff),
                 get: |r| r.git_guard.enabled,
-                default: false,
-                preset: Some((Preset::Strict, true)),
+                default: true,
+                // Default-on since #122, so `strict` no longer differs from the
+                // default here. `permissive` does: it turns the guard back off,
+                // which is what keeps the preset layer of the ladder tested.
+                preset: Some((Preset::Permissive, false)),
             },
             Ladder {
                 key: "git_guard.prevent_push",

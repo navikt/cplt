@@ -160,18 +160,20 @@ impl<'de> Deserialize<'de> for UnknownCommandPolicy {
 /// forced-proxy egress). Individual flags and config values still override the
 /// baseline (see the merge logic in `loading.rs`).
 ///
-/// Only `Strict` enables the safety features; `Standard`/`Permissive`/
-/// `FullTrust` leave them at their default (off). `Standard` is a no-op
-/// baseline (all five toggles off, no guards, no forced proxy) identical to
-/// cplt's hardcoded defaults, so passing no preset behaves exactly like
-/// `standard`.
+/// `Standard` is the default posture and carries cplt's hardcoded defaults:
+/// all five toggles off, gh_guard and git_guard **on** (git_guard in `warn`
+/// mode), no forced proxy and no default allowlist. Passing no preset behaves
+/// exactly like `standard`. `Strict` adds forced-proxy egress, the fail-closed
+/// allowlist, and escalates the git guard to `block`. `Permissive` and
+/// `FullTrust` weaken the sandbox and turn both guards back off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Preset {
     /// Locked down. No localhost, env files, tmp exec, docker, or lifecycle
-    /// scripts, AND gh_guard + git_guard + forced-proxy egress on.
+    /// scripts, AND gh_guard + git_guard (in `block` mode) + forced-proxy
+    /// egress + the fail-closed default allowlist on.
     Strict,
-    /// The current defaults. Scratch dir stays on, all five toggles off, no
-    /// guards, no forced proxy.
+    /// The default posture. Scratch dir stays on, all five toggles off, both
+    /// guards on (git_guard warns rather than blocks), no forced proxy.
     Standard,
     /// Developer-friendly. Localhost, tmp exec, and lifecycle scripts on.
     Permissive,
@@ -197,6 +199,11 @@ pub struct PresetBaseline {
     pub gh_guard_enabled: bool,
     /// Safety feature: block dangerous `git` operations (push/force-push).
     pub git_guard_enabled: bool,
+    /// Enforcement mode for the git guard when the config does not set one.
+    /// `Strict` blocks; every other preset warns, because the git guard is now
+    /// on by default and warn is the transition mode for the guard with the
+    /// most legitimate traffic (#122 Stage 2).
+    pub git_guard_mode: EnforcementMode,
     /// Safety feature: mandatory proxy, kernel egress locked to the proxy port.
     pub proxy_forced: bool,
     /// Safety feature: fail-closed domain allowlist (#52). Restricts egress to
@@ -264,12 +271,11 @@ impl Preset {
     /// Map the preset to its baseline values (five sandbox toggles + four
     /// safety features).
     ///
-    /// `Strict` and `Standard` share the same five *toggle* values (all off),
-    /// but differ on the safety features: only `Strict` turns on gh_guard,
-    /// git_guard, forced-proxy egress, and the fail-closed default allowlist —
-    /// a genuine locked-down posture (full network lockdown).
-    /// `Standard` is the no-op baseline (everything off), identical to cplt's
-    /// hardcoded defaults. The scratch dir is not a preset-controlled toggle
+    /// `Strict` and `Standard` share the same five *toggle* values (all off) and
+    /// both enable gh_guard and git_guard; they differ in that only `Strict`
+    /// escalates the git guard to `block`, forces proxy egress, and turns on
+    /// the fail-closed default allowlist — a full network lockdown.
+    /// `Standard` carries cplt's hardcoded defaults. The scratch dir is not a preset-controlled toggle
     /// and stays at its default (on) for every preset.
     pub fn baseline(self) -> PresetBaseline {
         match self {
@@ -281,6 +287,7 @@ impl Preset {
                 allow_lifecycle_scripts: false,
                 gh_guard_enabled: true,
                 git_guard_enabled: true,
+                git_guard_mode: EnforcementMode::Block,
                 proxy_forced: true,
                 default_allowlist: true,
             },
@@ -290,8 +297,9 @@ impl Preset {
                 allow_tmp_exec: false,
                 allow_docker: false,
                 allow_lifecycle_scripts: false,
-                gh_guard_enabled: false,
-                git_guard_enabled: false,
+                gh_guard_enabled: true,
+                git_guard_enabled: true,
+                git_guard_mode: EnforcementMode::Warn,
                 proxy_forced: false,
                 default_allowlist: false,
             },
@@ -303,6 +311,7 @@ impl Preset {
                 allow_lifecycle_scripts: true,
                 gh_guard_enabled: false,
                 git_guard_enabled: false,
+                git_guard_mode: EnforcementMode::Warn,
                 proxy_forced: false,
                 default_allowlist: false,
             },
@@ -314,6 +323,7 @@ impl Preset {
                 allow_lifecycle_scripts: true,
                 gh_guard_enabled: false,
                 git_guard_enabled: false,
+                git_guard_mode: EnforcementMode::Warn,
                 proxy_forced: false,
                 default_allowlist: false,
             },
@@ -350,7 +360,8 @@ impl<'de> Deserialize<'de> for Preset {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct GhGuardConfig {
-    /// Enable the gh CLI proxy (default: false for soft rollout).
+    /// Enable the gh CLI proxy (default: true; `--preset permissive` and
+    /// `--preset full-trust` turn it back off).
     pub enabled: Option<bool>,
     /// Enforcement mode: "block" (default), "warn", or "audit".
     /// Controls how violations are handled across all gh proxy decisions.
@@ -377,9 +388,11 @@ pub struct GhGuardConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct GitGuardConfig {
-    /// Enable git command interception (default: false for soft rollout).
+    /// Enable git command interception (default: true; `--preset permissive`
+    /// and `--preset full-trust` turn it back off).
     pub enabled: Option<bool>,
-    /// Enforcement mode: "block" (default), "warn", or "audit".
+    /// Enforcement mode: "warn" (default), "block" (the default under
+    /// `--preset strict`), or "audit".
     pub mode: Option<EnforcementMode>,
     /// Block git push, request-pull, and send-pack (default: true).
     pub prevent_push: Option<bool>,

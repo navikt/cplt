@@ -435,7 +435,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         key: "enabled",
         value_type: ConfigValueType::Bool,
         dangerous: false,
-        default_display: "false",
+        default_display: "true",
         description: "Enable gh CLI proxy that blocks destructive GitHub operations (delete repo, merge PR, etc.).",
     },
     ConfigKeyInfo {
@@ -492,16 +492,16 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         key: "enabled",
         value_type: ConfigValueType::Bool,
         dangerous: false,
-        default_display: "false",
-        description: "Enable git command interception (blocks git push, request-pull, send-pack).",
+        default_display: "true",
+        description: "Intercept git push, request-pull and send-pack. What happens to an intercepted command is `mode`: warn (default) prints and runs it, block refuses it.",
     },
     ConfigKeyInfo {
         section: "git_guard",
         key: "mode",
         value_type: ConfigValueType::Str,
         dangerous: false,
-        default_display: "block",
-        description: "Enforcement mode: \"block\" (deny and exit), \"warn\" (print warning, allow), or \"audit\" (silent log).",
+        default_display: "warn",
+        description: "Enforcement mode: \"warn\" (default: print warning, allow), \"block\" (deny and exit; the default under --preset strict), or \"audit\" (silent log).",
     },
     ConfigKeyInfo {
         section: "git_guard",
@@ -509,7 +509,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "true",
-        description: "Block git push, request-pull, and send-pack.",
+        description: "Treat git push, request-pull and send-pack as violations. `mode` decides what a violation costs.",
     },
     ConfigKeyInfo {
         section: "git_guard",

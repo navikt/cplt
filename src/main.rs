@@ -2852,6 +2852,21 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 /// sandbox:`. In warn mode the command is allowed to run, so that prefix is
 /// swapped for the warning label instead of being stacked behind it — otherwise
 /// the user reads "WARNING … BLOCKED" for a command that just ran.
+/// The opt-out a refused command should name, for whichever guard refused it.
+///
+/// #122/#147 make the guards default-on, and both issues call naming the exact
+/// escape hatch on every block non-negotiable — a block that does not say how to
+/// undo it is how "cplt broke my git push" reports get filed. It lives here, on
+/// the one path that turns a verdict into a refusal, so the gh guard and the git
+/// guard cannot drift apart or gain a block that forgets to say it.
+fn escape_hatch(name: &str) -> String {
+    format!(
+        "Escape hatch: rerun cplt with --no-{name}-guard, or set \
+         `{name}_guard.mode = \"warn\"` (or `{name}_guard.enabled = false`) in \
+         your cplt config."
+    )
+}
+
 fn warn_mode_message(msg: &str) -> String {
     match msg.strip_prefix("⚠️ BLOCKED by sandbox:") {
         Some(rest) => format!("⚠️  WARNING (would block):{rest}"),
@@ -2960,7 +2975,7 @@ fn perform_gate_effect(
     match effect {
         GateEffect::ServeCachedToken => serve_cached_gh_token(),
         GateEffect::Refuse(msg) => {
-            eprintln!("{msg}");
+            eprintln!("{msg}\n{}", escape_hatch(name));
             ExitCode::FAILURE
         }
         GateEffect::ExecScoped(repo) => exec_real(real_binary, name, args, Some(&repo)),
@@ -6044,6 +6059,25 @@ mod tests {
         // No allowlist, no floor — every level passes through untouched.
         for level in [Silent, Error, Blocked, All] {
             assert_eq!(proxy_log_level(level, false), level);
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_the_flag_and_the_config_key_that_undo_it() {
+        for name in ["gh", "git"] {
+            let hatch = escape_hatch(name);
+            assert!(
+                hatch.contains(&format!("--no-{name}-guard")),
+                "the CLI opt-out must be named: {hatch}"
+            );
+            assert!(
+                hatch.contains(&format!("{name}_guard.enabled = false")),
+                "the config opt-out must be named: {hatch}"
+            );
+            assert!(
+                hatch.contains(&format!("{name}_guard.mode = \"warn\"")),
+                "the softer opt-out must be named: {hatch}"
+            );
         }
     }
 

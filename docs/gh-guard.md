@@ -10,21 +10,27 @@ Its sibling, the git guard, blocks `git push`, `git request-pull`, and
 
 ## Configuration
 
-Both guards are opt-in and disabled by default, so a rollout can be gradual.
+Both guards are **enabled by default**. The gh guard blocks; the git guard
+starts in `warn` mode, so a `git push` still goes through and only prints a
+warning until you escalate it.
 
 ```bash
-# Enable gh guard (blocks destructive gh operations)
-cplt config set gh_guard.enabled true
-cplt config set gh_guard.scope_check true          # enforce repo-scoping on write commands
-cplt config set gh_guard.block_auth_token true     # deny "gh auth token" exfiltration
+# gh guard — on by default, in block mode
+cplt config set gh_guard.enabled false              # opt out entirely
+cplt config set gh_guard.mode warn                  # block | warn | audit (default block)
+cplt config set gh_guard.scope_check true           # enforce repo-scoping on write commands
+cplt config set gh_guard.block_auth_token true      # deny "gh auth token" exfiltration
 cplt config set gh_guard.unknown_command block      # block unrecognized gh commands
-cplt config set gh_guard.mode block                 # block | warn | audit (default block)
 
-# Enable git guard (blocks git push)
-cplt config set git_guard.enabled true
+# git guard — on by default, in warn mode
+cplt config set git_guard.mode block                # block | warn | audit (default warn)
+cplt config set git_guard.enabled false             # opt out entirely
 cplt config set git_guard.prevent_push true         # block git push/request-pull
-cplt config set git_guard.mode block                # block | warn | audit (default block)
 ```
+
+`--preset strict` puts the git guard in `block` mode; `--preset permissive` and
+`--preset full-trust` turn both guards off. Every refusal prints the flag and
+the config key that undo it.
 
 Both guards take a `mode`. `block` prints the message and exits non-zero.
 `warn` prints the same message behind `⚠️  WARNING (would block):` and runs the
@@ -68,9 +74,9 @@ unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 
 [git_guard]
-enabled = true              # blocks git push
-mode = "block"              # block | warn | audit
-prevent_push = true         # block git push/request-pull
+enabled = true              # intercept git push, request-pull, send-pack
+mode = "warn"               # block | warn | audit (default warn)
+prevent_push = true         # treat push/request-pull as violations
 prevent_force_push = true   # block force push, even where a plain push is allowed
 ```
 </details>
