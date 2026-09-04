@@ -295,7 +295,7 @@ pub fn default_config_contents() -> String {
 # ── gh CLI proxy ────────────────────────────────────────────────────────────
 # Intercepts `gh` commands and enforces a command-level policy.
 # [gh_guard]
-# enabled = false             # enable the proxy (blocks destructive GitHub operations)
+# enabled = true              # enable the proxy (blocks destructive GitHub operations)
 # mode = "block"              # "block" | "warn" | "audit"
 # scope_check = true          # enforce same-repo check on write commands
 # block_auth_token = true     # deny 'gh auth token' exfiltration
@@ -306,8 +306,8 @@ pub fn default_config_contents() -> String {
 # ── git guard ───────────────────────────────────────────────────────────────
 # Intercepts `git` commands to prevent accidental pushes.
 # [git_guard]
-# enabled = false             # enable git command interception
-# mode = "block"              # "block" | "warn" | "audit"
+# enabled = true              # enable git command interception
+# mode = "warn"               # "block" | "warn" | "audit" (block under --preset strict)
 # prevent_push = true         # block push, request-pull, send-pack
 # prevent_force_push = true   # block force push (only when prevent_push = false)
 # [[git_guard.allow_push]]   # structured push exceptions

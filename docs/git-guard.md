@@ -7,14 +7,15 @@ branch, merge, and rebase all it wants. A human still reviews and pushes.
 
 ## Configuration
 
-The git guard is opt-in and disabled by default.
+The git guard is **on by default**, in `warn` mode: a push prints a warning and
+then runs. Set `mode = "block"` (or use `--preset strict`) to actually stop it.
 
 ```bash
-cplt config set git_guard.enabled true
+cplt config set git_guard.mode block                         # block | warn | audit (default warn)
+cplt config set git_guard.enabled false                      # opt out entirely
 cplt config set git_guard.prevent_push true                  # block git push/request-pull/send-pack (default true)
 cplt config set git_guard.prevent_force_push true            # block force push (default true)
 cplt config set git_guard.protect_default_branch_only false  # block all pushes (default)
-cplt config set git_guard.mode block                         # block | warn | audit (default block)
 ```
 
 `mode` controls what happens on a block. `block` prints the message and exits

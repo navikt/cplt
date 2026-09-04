@@ -435,7 +435,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         key: "enabled",
         value_type: ConfigValueType::Bool,
         dangerous: false,
-        default_display: "false",
+        default_display: "true",
         description: "Enable gh CLI proxy that blocks destructive GitHub operations (delete repo, merge PR, etc.).",
     },
     ConfigKeyInfo {
@@ -492,7 +492,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         key: "enabled",
         value_type: ConfigValueType::Bool,
         dangerous: false,
-        default_display: "false",
+        default_display: "true",
         description: "Enable git command interception (blocks git push, request-pull, send-pack).",
     },
     ConfigKeyInfo {
@@ -500,8 +500,8 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         key: "mode",
         value_type: ConfigValueType::Str,
         dangerous: false,
-        default_display: "block",
-        description: "Enforcement mode: \"block\" (deny and exit), \"warn\" (print warning, allow), or \"audit\" (silent log).",
+        default_display: "warn",
+        description: "Enforcement mode: \"warn\" (default: print warning, allow), \"block\" (deny and exit; the default under --preset strict), or \"audit\" (silent log).",
     },
     ConfigKeyInfo {
         section: "git_guard",

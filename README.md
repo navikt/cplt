@@ -76,10 +76,9 @@ cplt init --write
 # 2. Developers approve on first run
 cplt trust accept --all
 
-# 3. Enable command guards
-cplt config set gh_guard.enabled true
-cplt config set git_guard.enabled true
-cplt config set git_guard.protect_default_branch_only true
+# 3. Tune the command guards (both are on by default)
+cplt config set git_guard.mode block                       # escalate the git guard from warn
+cplt config set git_guard.protect_default_branch_only true # allow feature-branch pushes
 ```
 
 ## What it blocks
@@ -118,8 +117,8 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read `~/.config/gcloud`, `~/.config/op` | 🔒 Kernel-blocked | Individual files are overridable with `--allow-read`. See [Cloud credentials](docs/known-impacts.md#cloud-credential-directories) |
 | Read `~/.netrc`, `~/.pypirc`, `~/.vault-token` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | Read `~/.gem/credentials` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
-| `gh` CLI destructive operations (merge, delete, release) | 🔒 Command-gated (opt-in) | `--gh-guard`, see [gh guard](docs/gh-guard.md) |
-| `git push` to remote | 🔒 Command-gated (opt-in) | `--git-guard`. Protects the default branch or blocks all pushes |
+| `gh` CLI destructive operations (merge, delete, release) | 🔒 Command-gated (on by default) | Opt out with `--no-gh-guard`. See [gh guard](docs/gh-guard.md) |
+| `git push` to remote | ⚠️ Command-gated, warn-only by default | On by default in `warn` mode: the push runs, with a warning. `git_guard.mode = "block"` enforces; `--no-git-guard` opts out |
 | Child process inheritance | ✅ All restrictions apply to subprocesses | |
 
 That table is a summary. The sandbox also allows access to system files (SSL certs, `/etc/hosts`), temp directories (read and write, no exec), and system tool paths (`/usr/bin`, `/opt/homebrew`). Run `cplt --print-profile` for the complete SBPL rules.
@@ -664,8 +663,8 @@ cplt settings
 # Set global preferences
 cplt config set sandbox.quiet true
 cplt config set proxy.blocked_domains "~/.config/cplt/blocked-domains.txt"
-cplt config set gh_guard.enabled true
-cplt config set git_guard.enabled true
+cplt config set git_guard.mode block
+cplt config set gh_guard.enabled false   # opt out of the gh guard entirely
 
 # Set per-repo policy (committed to .cplt.toml)
 cplt config set --repo sandbox.allow_jvm_attach true

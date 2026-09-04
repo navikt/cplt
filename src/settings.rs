@@ -1101,10 +1101,10 @@ mod tests {
             snapshot.get(&("git_guard", "enabled")).unwrap().value,
             "true"
         );
-        assert_eq!(
-            snapshot.get(&("gh_guard", "enabled")).unwrap().source,
-            "preset"
-        );
+        // `proxy.forced` is the posture field `strict` still moves off its
+        // default; the guards are default-on since #122, so under `strict` they
+        // agree with the default and are attributed to it.
+        assert_eq!(snapshot.get(&("proxy", "forced")).unwrap().source, "preset");
     }
 
     #[test]
