@@ -114,11 +114,19 @@ const ANTIGRAVITY_DOMAINS: &[&str] = &["antigravity.google"];
 ///   widens what a connector can reach (#62); turn the connectors off with
 ///   `ENABLE_CLAUDEAI_MCP_SERVERS=false` or `disableClaudeAiConnectors` if
 ///   that is not a trade you want.
-/// - `statsig.anthropic.com` — inherited, and NOT corroborated by either
-///   source above: the docs attribute feature-flag fetches to
-///   `api.anthropic.com` and the 2.1.260 binary carries no statsig host. Kept
-///   because removing it can only break a session, but it is a candidate for
-///   deletion once someone observes a run with `--observe-domains`.
+///
+/// Two inherited entries are kept but NOT corroborated by either source above,
+/// so neither should be read as verified. Both are kept because removing an
+/// entry from a fail-closed list can only break a session, and this change is
+/// meant to be additive; both are candidates for deletion once someone
+/// observes a run with `--observe-domains`:
+///
+/// - `console.anthropic.com` — the old Console hostname. Anthropic's current
+///   table attributes Console authentication to `platform.claude.com`, and the
+///   2.1.260 binary carries no `console.` host at all, so this looks like a
+///   legacy redirect target rather than a host the CLI still reaches.
+/// - `statsig.anthropic.com` — the docs attribute feature-flag fetches to
+///   `api.anthropic.com`, and the binary carries no statsig host either.
 ///
 /// Deliberately left out, all documented but none on the path to a working
 /// terminal session: `storage.googleapis.com` (plugin metadata — far too broad
