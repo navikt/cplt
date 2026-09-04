@@ -27,6 +27,31 @@ pub const DENIED_DOTFILES: &[&str] = &[
 /// Sensitive files under $HOME that are always denied.
 pub const DENIED_FILES: &[&str] = &[".netrc", ".pypirc", ".gem/credentials", ".vault-token"];
 
+/// The [`DENIED_FILES`] entry `path` names, if any.
+///
+/// Hard denies are absolute: unlike [`DENIED_HOME_SUBPATHS`], no `allow.read`
+/// (or `allow.write`, or `allow.socket`) grant may re-open them. Both backends
+/// consult this — macOS to keep the SBPL deny authoritative, Linux to keep the
+/// path out of the grant-only Landlock ruleset, where an added grant would
+/// simply win.
+///
+/// Exact paths only. A grant on an *ancestor* (`~/.gem`, or `$HOME` itself)
+/// still exposes the file on Linux: Landlock cannot deny a subpath inside an
+/// allowed directory, the same limitation [`DENIED_HOME_SUBPATHS`] documents.
+///
+/// Both sides are canonicalized because grants arrive canonicalized
+/// (`--allow-read` through `canonicalize_paths`, config `allow.read` through
+/// `resolve_config_path`) while `$HOME/.netrc` may be a symlink into a
+/// dotfiles repo — comparing the unresolved forms would miss the match.
+pub fn hard_denied_file(home: &Path, path: &Path) -> Option<&'static str> {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let resolved = canon(path);
+    DENIED_FILES.iter().copied().find(|f| {
+        let denied = home.join(f);
+        path == denied || resolved == canon(&denied)
+    })
+}
+
 /// Credential files inside otherwise-allowed HOME_TOOL_DIRS.
 /// These are denied by default because they typically contain registry
 /// credentials (Nexus/Artifactory passwords, API tokens, master passwords).
