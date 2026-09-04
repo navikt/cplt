@@ -7090,8 +7090,11 @@ mod copilot_extraction_tests {
         let f = fixture("empty-dir", EXTRACTS_UNLESS_DIR_EXISTS);
         std::fs::create_dir_all(f.pkg.join("1.0.63")).unwrap();
         // Carry the error. A bare `is_ok()` here cost a CI round-trip to
-        // diagnose, because the failure said nothing about why.
-        assert!(f.run().is_ok(), "extraction failed: {:?}", f.run().err());
+        // diagnose, because the failure said nothing about why. Run once and
+        // report that result: a second run would see the state the first left
+        // behind and could well succeed, describing a failure that never was.
+        let result = f.run();
+        assert!(result.is_ok(), "extraction failed: {result:?}");
         assert!(f.pkg.join("1.0.63/.extraction-complete").exists());
     }
 
