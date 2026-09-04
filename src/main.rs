@@ -1374,7 +1374,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     //
     // Both messages ignore --quiet: a quiet run is exactly when a silent
     // config swap does the most damage.
-    if let Ok(custom) = std::env::var("CPLT_CONFIG") {
+    // An empty value is how a shell unsets the var in practice; it selects no
+    // file, so there is nothing to flag.
+    if let Some(custom) = std::env::var("CPLT_CONFIG").ok().filter(|s| !s.is_empty()) {
         let user_dir = home_dir.join(".config/cplt");
         match config::classify_custom_config(
             &config::expand_tilde(&custom),
