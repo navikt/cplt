@@ -858,9 +858,10 @@ except OSError as e:
     /// by a listener that lives **outside** the sandbox — the escape's shape
     /// without its dependency on a session bus.
     ///
-    /// The three tests above all key on `/run/user/<uid>/bus`, which a CI
-    /// runner does not have, so they self-skip there and the claim stays
-    /// code-reading only. This one runs anywhere.
+    /// The three tests above all key on `/run/user/<uid>/bus` and self-skip
+    /// without a session bus, and the Linux CI job runs `cargo test` without
+    /// `--nocapture`, so whether they ran there is not observable. This one
+    /// needs no bus and runs anywhere.
     ///
     /// `$HOME` is the right home for it: Landlock grants the home tree
     /// per-file (`LINUX_HOME_CONFIG_FILES`) and never wholesale, so a
@@ -891,8 +892,8 @@ except OSError as e:
 
     #[test]
     fn connect_to_an_ungranted_pathname_socket_follows_the_abi() {
-        // The one test in this group that actually executes on a CI runner,
-        // and therefore the only *observed* evidence for the claim the rest of
+        // The one test in this group that needs nothing of the host, and
+        // therefore the only *observed* evidence for the claim the rest of
         // the group documents: below ABI v9 nothing in the kernel gates
         // connect(2) to a pathname UNIX socket, so an ungranted one — a
         // session bus, a container daemon, whatever else the host is running —
