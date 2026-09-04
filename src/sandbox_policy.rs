@@ -3,6 +3,7 @@
 //! Defines the security policy shared by macOS Seatbelt and Linux Landlock:
 //! path validation, tool directory permissions, and hardening env vars.
 
+use crate::agent::Agent;
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
 
@@ -1423,6 +1424,54 @@ pub fn mise_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
         .into_iter()
         .flat_map(|d| [d.join("shims"), d.join("installs")])
         .collect()
+}
+
+/// Copilot's two package directories, which must be re-bound read-only by
+/// Bubblewrap on Linux.
+///
+/// macOS write-denies both in the SBPL profile — `~/.copilot/pkg` (native
+/// modules: `keytar.node`, `pty.node`) and `~/Library/Caches/copilot/pkg` (the
+/// SEA runtime). Landlock can express neither:
+///
+/// - `~/.copilot` is granted read+write+execute wholesale for Copilot, and
+///   Landlock cannot subtract `pkg` from an allowed tree.
+/// - `~/.cache/copilot/pkg` carries an execute rule so Node can spawn the
+///   extracted helpers, and Landlock unions that with the read+write grant
+///   `HOME_TOOL_DIRS` gives all of `~/.cache`. The result is writable **and**
+///   executable — the binary-drop pair, in the one tree whose whole purpose is
+///   holding code Copilot later runs on the host.
+///
+/// Both are the persistence class SECURITY.md's native-module write protection
+/// claims to cover, so the bwrap read-only overlay carries them for parity.
+/// Read-only rather than a deny mask: the runtime must stay readable and
+/// executable, and the SEA extraction that writes it happens outside the
+/// sandbox in `copilot_extract` by design.
+///
+/// `~/.cache` is spelled literally rather than resolved through
+/// `XDG_CACHE_HOME`, to match `copilot_extract`'s `copilot_cache_dirs` — the
+/// code that actually creates the directory. If that gains XDG support this
+/// must follow it.
+///
+/// Same caveats as every other `ro_protect` entry: without bubblewrap this is
+/// unenforced, and bwrap skips a path that does not exist at launch.
+///
+/// NOTE: `~/.copilot/pkg` also arrives from `Agent::host_persistence_denies`
+/// once Copilot's config dir is an `AgentDir`, so the set holds it twice — once
+/// as spelled here and once canonicalized by `canonicalize_agent_dirs`. The
+/// caller sorts and dedups, which collapses them only when the two strings
+/// match, so a symlinked `$HOME` leaves both. That is harmless (two identical
+/// read-only binds of the same path), but do not delete either believing the
+/// other covers it: this one still carries `~/.cache/copilot/pkg`, which is not
+/// in any agent config dir and has no other source.
+///
+/// Returns nothing for an agent that is not Copilot: the agent check lives here
+/// rather than at the call site so the whole decision is one unit-testable
+/// function on both platforms, instead of a Linux-only `if` no test can reach.
+pub fn copilot_ro_protect_paths(agent: Agent, home: &Path) -> Vec<PathBuf> {
+    if !agent.needs_copilot_dir() {
+        return Vec::new();
+    }
+    vec![home.join(".copilot/pkg"), home.join(".cache/copilot/pkg")]
 }
 
 /// A tool home relocated by an env var (`CARGO_HOME=~/.local/share/cargo`).
