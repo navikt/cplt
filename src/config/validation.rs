@@ -97,6 +97,15 @@ pub(super) fn describe_unknown_key(path: &str) -> String {
                  '{section}.{key}.{example}' — move it under its own [{key}] header"
             );
         }
+        // Same silent drop, scalar flavour: `config_version = 1` written below
+        // any header binds as `<section>.config_version` and is discarded.
+        if TOP_LEVEL_SCALARS.contains(&key) {
+            return format!(
+                "unknown key '{key}' in [{section}]: '{key}' is a top-level key; written \
+                 under [{section}] it reads as '{section}.{key}' and is not applied — \
+                 move it above the first [section] header"
+            );
+        }
         // Exclude the reported key itself from the suggestion candidates. The
         // candidates come from CONFIG_KEYS (a superset that includes repo-only
         // keys like `deny.env`), so a key that is valid in the registry but not
@@ -709,6 +718,28 @@ some_new_option = true
             });
         assert!(
             diagnostic.message.contains("[allow]"),
+            "got: {}",
+            diagnostic.message
+        );
+    }
+
+    /// The scalar flavour of the same drop: `config_version` is a top-level key,
+    /// so writing it below a header scopes it into that header and discards it.
+    #[test]
+    fn top_level_scalar_below_a_header_explains_the_drop() {
+        let toml = "[sandbox]\npreset = \"standard\"\n\nconfig_version = 1\n";
+        let diagnostic = validate_config(toml)
+            .into_iter()
+            .find(|d| {
+                d.message
+                    .contains("unknown key 'config_version' in [sandbox]")
+            })
+            .expect("should flag config_version under sandbox");
+        assert!(
+            diagnostic.message.contains("is not applied")
+                && diagnostic
+                    .message
+                    .contains("above the first [section] header"),
             "got: {}",
             diagnostic.message
         );
