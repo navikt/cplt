@@ -403,6 +403,7 @@ flow needs access cplt does not grant by default.
 | Copilot | never (unverified) | — | — |
 | Claude Code | `CLAUDE_CODE_OAUTH_TOKEN` is set | that OAuth token | none — see below |
 | Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` exists and is non-empty | that file | refreshes into that file |
+| goose | never (provider-dependent) | — | some providers refresh through the keyring mid-session |
 
 The trade is not free. Whole-Keychain read+write is exchanged for a full OAuth
 token sitting in the agent's environment, readable by every process it spawns and
@@ -461,6 +462,22 @@ Copilot. Only credentials that are durable for a whole session qualify.
   believes is revoked. Every other way the file goes bad — missing, empty,
   unreadable, corrupt, expired past its refresh token — surfaces as a plain sign-in
   error.
+
+- **goose** — not eligible, and unlike Copilot that is a finding rather than a
+  gap. goose's `Config::get_secret` does read the uppercased environment
+  variable before its keyring, so precedence is not the problem; the session
+  lifetime is. Its GitHub Copilot provider re-reads `GITHUB_COPILOT_TOKEN`
+  through that path whenever its cached API info expires, and its OAuth
+  persistence layer writes *refreshed* credentials back into the keyring with
+  `set_secret` — both mid-session, not at startup. Which of those applies
+  depends on the provider goose is configured for, out of the several hundred it
+  embeds, so a substitute would have to match the configured provider's key
+  rather than any variable from goose's env hints: a developer with
+  `OPENAI_API_KEY` exported and goose pointed at Anthropic would otherwise lose
+  the keyring and the login with it. `GOOSE_DISABLE_KEYRING` does not rescue it
+  either — it sends the same writes to `~/.config/goose/secrets.yaml`, which
+  cplt grants read-only. Determined by reading goose's source
+  (`aaif-goose/goose`), not by inspecting the credential's shape.
 
 **Copilot is deliberately not eligible.** Claude Code's substitute was
 confirmed by running the agent under a profile with the grant dropped; Copilot's
