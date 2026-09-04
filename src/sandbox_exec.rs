@@ -338,8 +338,20 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent, deny_env: &[String
     if agent != Agent::Copilot || child_keeps_a_github_token(deny_env) {
         return;
     }
+    // Into the first name the deny list does not strip. Injecting into
+    // GH_TOKEN unconditionally would hand the token to a variable
+    // `apply_deny_env_and_credential` removes moments later, so a repo denying
+    // GH_TOKEN alone would leave the agent tokenless even though Copilot reads
+    // GITHUB_TOKEN too. All three names are denied means no channel is left, so
+    // there is nothing to inject into.
+    let Some(target) = GH_TOKEN_VARS
+        .iter()
+        .find(|var| !deny_env.iter().any(|d| d == *var))
+    else {
+        return;
+    };
     if let Some(token) = extract_gh_token() {
-        cmd.env("GH_TOKEN", &token);
+        cmd.env(target, &token);
     }
 }
 
@@ -1116,6 +1128,34 @@ mod gh_token_extraction_tests {
                 "a denied token is stripped from the child, so extraction must still run"
             );
         });
+    }
+
+    /// Injecting into a denied name hands the token to a variable that is
+    /// stripped moments later. With GH_TOKEN denied and GITHUB_TOKEN free,
+    /// the surviving name is the one to use.
+    #[test]
+    fn injection_target_skips_denied_names() {
+        let pick = |deny: &[String]| -> Option<&'static str> {
+            GH_TOKEN_VARS
+                .iter()
+                .find(|var| !deny.iter().any(|d| d.as_str() == **var))
+                .copied()
+        };
+        assert_eq!(pick(&[]), Some("GH_TOKEN"), "no deny, first name wins");
+        assert_eq!(
+            pick(&["GH_TOKEN".to_string()]),
+            Some("GITHUB_TOKEN"),
+            "a denied name is skipped for the next surviving one"
+        );
+        assert_eq!(
+            pick(&[
+                "GH_TOKEN".to_string(),
+                "GITHUB_TOKEN".to_string(),
+                "COPILOT_GITHUB_TOKEN".to_string(),
+            ]),
+            None,
+            "all three denied leaves no channel to inject into"
+        );
     }
 
     /// Denying one variable says nothing about the others.
