@@ -2287,22 +2287,11 @@ pub fn gate_git(
     }
 
     // Find the subcommand by skipping global flags.
-    // Git global flags that take a value (must skip the next arg too).
-    const FLAGS_WITH_VALUE: &[&str] = &[
-        "-c",
-        "-C",
-        "--git-dir",
-        "--work-tree",
-        "--namespace",
-        "--super-prefix",
-        "--config-env",
-    ];
-
     let mut i = 0;
     let mut subcommand = None;
     while i < args.len() {
         let arg = args[i];
-        if FLAGS_WITH_VALUE.contains(&arg) {
+        if GIT_GLOBAL_FLAGS_WITH_VALUE.contains(&arg) {
             i += 2; // skip flag and its value
             continue;
         }
@@ -2345,6 +2334,11 @@ pub fn gate_git(
     // Arguments belonging to the subcommand (everything after it).
     let sub_args = &args[i + 1..];
 
+    // The repository this invocation targets. Every git call the guard makes to
+    // refine its verdict must go through these, or it decides from the launch
+    // repository's branch and remotes instead (#215).
+    let repo_args = repo_target_args(&args[..i]);
+
     // Scope integrity: block mutation of remote URLs while the guard is active.
     // The gh-guard reads `origin` to determine the enforced repo scope, so
     // rewriting a remote's URL would let an agent redirect in-scope operations
@@ -2384,7 +2378,8 @@ pub fn gate_git(
             } else {
                 // No explicit branch: `git push` pushes current branch.
                 // Resolve via real git to determine if we're on a protected branch.
-                let current_branch = real_git.and_then(resolve_current_branch);
+                let current_branch =
+                    real_git.and_then(|git| resolve_current_branch(git, &repo_args));
                 match current_branch {
                     Some(ref b) if !is_default_branch(b) => true,
                     Some(_) => false, // On default branch — fall through to block
@@ -2413,10 +2408,18 @@ pub fn gate_git(
         if sub == "push" && !allow_push_rules.is_empty() {
             let push_args = &args[i + 1..];
             let has_force = push_is_force(push_args);
-            let (remote, branch) = extract_push_remote_and_branch(push_args, real_git);
+            let (remote, branch) = extract_push_remote_and_branch(push_args, real_git, &repo_args);
+            // Resolve the destination remote's URL in the repository this
+            // command targets. A bare `git push` with no remote uses the
+            // branch's configured remote, which is `origin` in all but exotic
+            // setups; guessing wrong here only fails closed.
+            let remote_url = real_git.and_then(|git| {
+                resolve_remote_url(git, &repo_args, remote.as_deref().unwrap_or(SCOPE_REMOTE))
+            });
             if matches_allow_push_rule(
                 allow_push_rules,
                 remote.as_deref(),
+                remote_url.as_deref(),
                 branch.as_deref(),
                 has_force,
             ) {
@@ -2518,9 +2521,65 @@ fn extract_push_target_branch<'a>(push_args: &[&'a str]) -> Option<&'a str> {
     }
 }
 
-/// Resolve the current git branch by calling the real git binary.
-fn resolve_current_branch(real_git: &Path) -> Option<String> {
+/// Git global flags that redirect which repository a command operates on.
+///
+/// `-c`, `--namespace` and friends are deliberately absent: they change
+/// configuration, not the target repository, and forwarding attacker-chosen
+/// `-c` values into the guard's own git calls would hand the agent a way to
+/// influence the verdict.
+const REPO_TARGET_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree"];
+
+/// Git global flags that consume a following space-separated value, so a scan of
+/// the global-flag prefix never mistakes such a value for a flag of its own.
+const GIT_GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
+    "-c",
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--config-env",
+];
+
+/// The `-C` / `--git-dir` / `--work-tree` arguments of a git invocation, in
+/// order, so the guard's own git calls resolve against the repository the
+/// command actually targets rather than the launch repository (#215).
+///
+/// Both spellings are collected: the space-separated form (`-C dir`) and the
+/// `=`-attached long form (`--git-dir=dir`). Multiple `-C` are kept in order
+/// because git applies them cumulatively.
+fn repo_target_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if REPO_TARGET_FLAGS.contains(&arg) {
+            if let Some(value) = args.get(i + 1) {
+                out.push(arg);
+                out.push(value);
+            }
+            i += 2;
+            continue;
+        }
+        if GIT_GLOBAL_FLAGS_WITH_VALUE.contains(&arg) {
+            i += 2; // a value that must not be scanned as a flag
+            continue;
+        }
+        if arg.starts_with("--")
+            && let Some((flag, _)) = arg.split_once('=')
+            && REPO_TARGET_FLAGS.contains(&flag)
+        {
+            out.push(arg);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Resolve the current git branch of the repository `repo_args` targets.
+fn resolve_current_branch(real_git: &Path, repo_args: &[&str]) -> Option<String> {
     let output = std::process::Command::new(real_git)
+        .args(repo_args)
         .args(["symbolic-ref", "--short", "HEAD"])
         .output()
         .ok()?;
@@ -2536,16 +2595,68 @@ fn resolve_current_branch(real_git: &Path) -> Option<String> {
     }
 }
 
+/// Normalized URL of `remote` in the repository `repo_args` targets.
+///
+/// `None` when the remote does not exist, git fails, or no git binary is
+/// available — every caller treats that as "cannot prove identity" and fails
+/// closed.
+fn resolve_remote_url(real_git: &Path, repo_args: &[&str], remote: &str) -> Option<String> {
+    // `--` guards against a remote name that looks like a flag.
+    let output = std::process::Command::new(real_git)
+        .args(repo_args)
+        .args(["remote", "get-url", "--", remote])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(crate::trust::normalize_remote_url(&url))
+    }
+}
+
+/// Pin each rule's remote *name* to the URL that name has in the launch
+/// repository, so the rule identifies a repository and not just a name (#215).
+///
+/// Runs once at wrapper-install time, in the unsandboxed parent, so `real_git`
+/// must be a [`crate::git::trusted_git`] path. A name that does not resolve
+/// (no such remote) is left with `url: None` and keeps matching by name.
+#[must_use]
+pub fn resolve_push_rule_urls(
+    real_git: &Path,
+    project_dir: &Path,
+    rules: &[crate::config::ResolvedPushRule],
+) -> Vec<crate::config::ResolvedPushRule> {
+    let dir = project_dir.to_string_lossy().into_owned();
+    let repo_args = ["-C", dir.as_str()];
+    rules
+        .iter()
+        .map(|rule| {
+            let mut rule = rule.clone();
+            if rule.url.is_none()
+                && let Some(name) = rule.remote.as_deref()
+            {
+                rule.url = resolve_remote_url(real_git, &repo_args, name);
+            }
+            rule
+        })
+        .collect()
+}
+
 /// Extract the remote and branch from `git push` arguments.
 /// Returns (remote, branch) — either may be None.
 fn extract_push_remote_and_branch(
     push_args: &[&str],
     real_git: Option<&Path>,
+    repo_args: &[&str],
 ) -> (Option<String>, Option<String>) {
     let target = extract_push_target_branch(push_args);
     let branch = match target {
         Some(b) => Some(b.to_string()),
-        None => real_git.and_then(resolve_current_branch),
+        None => real_git.and_then(|git| resolve_current_branch(git, repo_args)),
     };
 
     // Extract remote (first positional — the remote name).
@@ -2559,6 +2670,7 @@ fn extract_push_remote_and_branch(
 fn matches_allow_push_rule(
     rules: &[crate::config::ResolvedPushRule],
     remote: Option<&str>,
+    remote_url: Option<&str>,
     branch: Option<&str>,
     is_force: bool,
 ) -> bool {
@@ -2567,11 +2679,25 @@ fn matches_allow_push_rule(
         if is_force && !rule.force {
             continue;
         }
-        // Check remote constraint
+        // Check remote constraint.
+        //
+        // When the rule's remote name resolved to a URL at launch, the rule
+        // identifies a *repository*: the push's remote must resolve to the same
+        // URL, so a rule for this repo's `origin` does not authorize a push to
+        // another repo's `origin` (#215). An unresolvable URL on either side
+        // fails closed. Only a rule whose name never resolved falls back to
+        // matching the bare name.
         if let Some(ref rule_remote) = rule.remote {
-            match remote {
-                Some(r) if r == rule_remote => {}
-                _ => continue,
+            if let Some(rule_url) = rule.url.as_deref() {
+                match remote_url {
+                    Some(u) if u == rule_url => {}
+                    _ => continue,
+                }
+            } else {
+                match remote {
+                    Some(r) if r == rule_remote => {}
+                    _ => continue,
+                }
             }
         }
         // Check branch constraints (glob patterns)
@@ -3624,12 +3750,14 @@ mod tests {
             remote: Some("fork".to_string()),
             branches: vec!["agent/*".to_string()],
             force: false,
+            url: None,
         }];
 
         // Matches: correct remote + matching branch
         assert!(matches_allow_push_rule(
             &rules,
             Some("fork"),
+            None,
             Some("agent/fix-123"),
             false
         ));
@@ -3637,6 +3765,7 @@ mod tests {
         assert!(!matches_allow_push_rule(
             &rules,
             Some("origin"),
+            None,
             Some("agent/fix-123"),
             false
         ));
@@ -3644,6 +3773,7 @@ mod tests {
         assert!(!matches_allow_push_rule(
             &rules,
             Some("fork"),
+            None,
             Some("main"),
             false
         ));
@@ -3651,6 +3781,7 @@ mod tests {
         assert!(!matches_allow_push_rule(
             &rules,
             Some("fork"),
+            None,
             Some("agent/fix"),
             true
         ));
@@ -3660,19 +3791,193 @@ mod tests {
             remote: None,
             branches: vec!["agent/*".to_string()],
             force: true,
+            url: None,
         }];
         assert!(matches_allow_push_rule(
             &rules_force,
             Some("origin"),
+            None,
             Some("agent/x"),
             true
         ));
         assert!(matches_allow_push_rule(
             &rules_force,
             Some("origin"),
+            None,
             Some("agent/x"),
             false
         ));
+    }
+
+    use std::path::PathBuf;
+
+    // ── multi-repo targeting (#215) ──
+    //
+    // The guard's conditional refinements must read the branch and the remotes
+    // of the repository the command targets, not of whatever repository the
+    // agent happens to have been launched in.
+
+    /// A scratch git repo on `branch`, with `origin` pointing at `origin_url`.
+    /// `None` when git is unavailable.
+    fn scratch_repo(branch: &str, origin_url: &str) -> Option<(tempfile::TempDir, PathBuf)> {
+        let git = which_git()?;
+        let tmp = tempfile::tempdir().ok()?;
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).ok()?;
+        let run = |args: &[&str]| {
+            std::process::Command::new(&git)
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+        };
+        run(&["init"])?;
+        // No commit needed: symbolic-ref and remotes work on an empty repo, and
+        // `git init -b` is not available on every git these tests may meet.
+        run(&["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])?;
+        run(&["remote", "add", "origin", origin_url])?;
+        Some((tmp, repo))
+    }
+
+    fn which_git() -> Option<PathBuf> {
+        let out = std::process::Command::new("/usr/bin/env")
+            .args(["which", "git"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        path.is_file().then_some(path)
+    }
+
+    #[test]
+    fn repo_target_args_forwards_only_repo_flags() {
+        assert_eq!(repo_target_args(&["-C", "/b"]), vec!["-C", "/b"]);
+        assert_eq!(
+            repo_target_args(&["--git-dir=/b/.git", "--work-tree", "/b"]),
+            vec!["--git-dir=/b/.git", "--work-tree", "/b"]
+        );
+        // `-c` and its value are configuration, not a repo target, and the
+        // value must not be scanned as a flag of its own.
+        assert!(repo_target_args(&["-c", "-C", "-c", "user.name=x"]).is_empty());
+    }
+
+    #[test]
+    fn branch_is_resolved_in_the_repo_dash_c_targets() {
+        let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/other/other.git") else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+
+        // `git -C <repo-on-main> push` must be blocked even though the repo the
+        // test process runs in may sit on a feature branch.
+        let blocked = gate_git(&["-C", &dir, "push"], true, true, true, &[], Some(&git));
+        assert!(
+            blocked.is_err(),
+            "push to main of the -C target must be blocked, got {blocked:?}"
+        );
+
+        // And the mirror image: a -C target on a feature branch is allowed even
+        // when the process's own repo cannot be resolved (detached CI checkout).
+        let Some((_tmp2, feature)) =
+            scratch_repo("feature/x", "https://github.com/other/other.git")
+        else {
+            return;
+        };
+        let feature_dir = feature.to_string_lossy().into_owned();
+        assert!(
+            gate_git(
+                &["-C", &feature_dir, "push"],
+                true,
+                false,
+                true,
+                &[],
+                Some(&git)
+            )
+            .is_ok(),
+            "push to a feature branch of the -C target must be allowed"
+        );
+    }
+
+    #[test]
+    fn allow_push_rule_does_not_match_a_same_named_remote_elsewhere() {
+        use crate::config::ResolvedPushRule;
+
+        let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/other/other.git") else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+
+        // A rule written for the launch repo's `origin`, pinned at launch to
+        // that repo's URL.
+        let rule = ResolvedPushRule {
+            remote: Some("origin".to_string()),
+            branches: vec!["main".to_string()],
+            force: false,
+            url: Some(crate::trust::normalize_remote_url(
+                "git@github.com:navikt/cplt.git",
+            )),
+        };
+        let args = ["-C", dir.as_str(), "push", "origin", "main"];
+        assert!(
+            gate_git(&args, true, true, false, &[rule], Some(&git)).is_err(),
+            "a rule for another repository's origin must not authorize this push"
+        );
+
+        // Same rule, and now the target repo really is that repository — spelled
+        // in a different but equivalent URL form.
+        let Some((_tmp2, same)) = scratch_repo("main", "https://github.com/navikt/cplt") else {
+            return;
+        };
+        let same_dir = same.to_string_lossy().into_owned();
+        let rule = ResolvedPushRule {
+            remote: Some("origin".to_string()),
+            branches: vec!["main".to_string()],
+            force: false,
+            url: Some(crate::trust::normalize_remote_url(
+                "git@github.com:navikt/cplt.git",
+            )),
+        };
+        let args = ["-C", same_dir.as_str(), "push", "origin", "main"];
+        assert!(
+            gate_git(&args, true, true, false, &[rule], Some(&git)).is_ok(),
+            "the same repository under an equivalent URL form must still match"
+        );
+    }
+
+    #[test]
+    fn push_rule_urls_are_pinned_from_the_launch_repo() {
+        use crate::config::ResolvedPushRule;
+
+        let Some((_tmp, repo)) = scratch_repo("main", "git@github.com:navikt/cplt.git") else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        let rules = vec![
+            ResolvedPushRule {
+                remote: Some("origin".to_string()),
+                branches: vec![],
+                force: false,
+                url: None,
+            },
+            // A name with no such remote stays unresolved and keeps matching by
+            // name — the documented back-compat fallback.
+            ResolvedPushRule {
+                remote: Some("fork".to_string()),
+                branches: vec![],
+                force: false,
+                url: None,
+            },
+        ];
+        let resolved = resolve_push_rule_urls(&git, &repo, &rules);
+        assert_eq!(resolved[0].url.as_deref(), Some("github.com/navikt/cplt"));
+        assert_eq!(resolved[1].url, None);
     }
 
     #[test]
@@ -3683,6 +3988,7 @@ mod tests {
             remote: Some("fork".to_string()),
             branches: vec!["agent/*".to_string()],
             force: false,
+            url: None,
         }];
 
         // Push to fork agent/fix should be allowed despite prevent_push=true
@@ -4232,6 +4538,7 @@ mod tests {
             remote: Some("origin".to_string()),
             branches: vec!["agent/*".to_string()],
             force: true,
+            url: None,
         }];
         // The remote/branch must parse correctly (not be eaten by --force-with-lease).
         assert!(
@@ -4247,11 +4554,11 @@ mod tests {
         );
         // Branch parsing is correct with the flag present.
         let (remote, branch) =
-            extract_push_remote_and_branch(&["--force-with-lease", "origin", "agent/x"], None);
+            extract_push_remote_and_branch(&["--force-with-lease", "origin", "agent/x"], None, &[]);
         assert_eq!(remote.as_deref(), Some("origin"));
         assert_eq!(branch.as_deref(), Some("agent/x"));
         let (remote, branch) =
-            extract_push_remote_and_branch(&["--signed", "origin", "agent/y"], None);
+            extract_push_remote_and_branch(&["--signed", "origin", "agent/y"], None, &[]);
         assert_eq!(remote.as_deref(), Some("origin"));
         assert_eq!(branch.as_deref(), Some("agent/y"));
     }

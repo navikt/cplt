@@ -545,10 +545,25 @@ fn install_command_wrappers(
             .map(std::path::Path::to_path_buf)
             .or_else(|| which_binary("git"))
     {
+        // Pin each allow_push rule's remote name to the URL that name has in
+        // the launch repository. Resolved here, in the unsandboxed parent with
+        // the trusted git, and baked into the wrapper — the same shape as the
+        // gh guard's repo scope. Without it a rule for this repo's `origin`
+        // also authorizes a push to an unrelated repo's `origin` (#215).
+        let mut git_guard = git_guard.clone();
+        if !git_guard.allow_push.is_empty()
+            && let Some(trusted) = crate::git::trusted_git()
+        {
+            git_guard.allow_push = crate::gh_proxy::resolve_push_rule_urls(
+                trusted,
+                project_dir,
+                &git_guard.allow_push,
+            );
+        }
         let script = crate::gh_proxy::generate_git_wrapper_script(
             &real_git.to_string_lossy(),
             &cplt_str,
-            git_guard,
+            &git_guard,
         );
         let wrapper_path = bin_dir.join("git");
         if std::fs::write(&wrapper_path, script).is_ok() {

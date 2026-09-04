@@ -728,6 +728,17 @@ pub struct ResolvedPushRule {
     pub remote: Option<String>,
     pub branches: Vec<String>,
     pub force: bool,
+    /// Normalized URL of `remote` as it resolved in the launch repository,
+    /// filled in at wrapper-install time by
+    /// [`crate::gh_proxy::resolve_push_rule_urls`]. Not a config key.
+    ///
+    /// A remote *name* is not a repository identity: every repo has an
+    /// `origin`. Pinning the name to the URL it had at launch is what stops a
+    /// rule written for this repo's `origin` from authorizing a push to some
+    /// other repo's `origin` (#215). `None` means the name could not be
+    /// resolved at launch, and matching falls back to the name alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// Resolved configuration after merging config file + CLI flags.
