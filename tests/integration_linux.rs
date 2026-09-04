@@ -571,11 +571,11 @@ EOF
     /// at once: exec'ing it needs execute, and its own interpreter plus the file
     /// it reads need read.
     ///
-    /// The prefix lives under the real `$HOME`, not the fake one: bubblewrap
-    /// mounts a private tmpfs over `/tmp` and binds back only the *writable*
-    /// rules, so a read-only grant on a path under `/tmp` — which every
-    /// `tempfile::tempdir()` is — would be invisible inside the namespace and the
-    /// test would fail for a reason that has nothing to do with the grant.
+    /// The prefix lives under the real `$HOME`, not the fake one: `/tmp` is
+    /// always writable, and since #299 an `allow.exec` grant under it is refused
+    /// at startup as a write+exec pair. Every `tempfile::tempdir()` is under
+    /// `/tmp`, so the run would fail for a reason that has nothing to do with
+    /// the grant this test is about.
     #[test]
     fn landlock_allow_exec_grants_read_and_execute_on_a_tool_prefix() {
         require_landlock!();
@@ -652,7 +652,12 @@ EOF
     fn allow_exec_overlapping_a_writable_grant_is_refused_at_startup() {
         let project = create_test_project();
         let fake_home = tempfile::tempdir().expect("Failed to create temp home");
-        let tree = fake_home.path().join("tools");
+        // Under the real $HOME, not the fake one: `tempfile::tempdir()` is under
+        // `/tmp`, which is itself an always-writable tree, so the refusal would
+        // fire on the temp dir (#299) and the test would pass without the
+        // `--allow-write` flag it is meant to be about.
+        let tree_dir = tempfile::TempDir::new_in(home_dir()).expect("tempdir under $HOME");
+        let tree = tree_dir.path();
         fs::create_dir_all(tree.join("bin")).unwrap();
         let tree_arg = tree.to_string_lossy().into_owned();
         let bin_arg = tree.join("bin").to_string_lossy().into_owned();
@@ -663,10 +668,16 @@ EOF
             &["--allow-write", &tree_arg, "--allow-exec", &bin_arg],
             "echo should not run",
         );
+
         assert!(code != 0, "an overlapping exec grant must refuse to launch");
         assert!(
             stderr.contains("allow.exec") && stderr.contains("overlaps"),
             "the refusal must name the collision: {stderr}"
+        );
+        assert!(
+            stderr.contains(&tree_arg),
+            "the refusal must name the allow.write grant, not some other \
+             writable tree: {stderr}"
         );
     }
 
@@ -1898,6 +1909,51 @@ print('CONNECTED')
         assert!(
             stdout.contains("exec blocked") || stdout.contains("Permission denied"),
             "exec from /tmp must be denied under bwrap: {stdout}"
+        );
+    }
+
+    /// #299: bwrap binds back only the *writable* Landlock rules over its
+    /// private `/tmp` tmpfs, so an `allow.read` grant on a path under `/tmp`
+    /// was accepted at the CLI and then absent inside the namespace. Both
+    /// directions here: the granted file must be readable, and an ungranted
+    /// sibling in the same host `/tmp` must stay hidden — a bind of all of
+    /// `/tmp`, or the loss of the tmpfs, fails the second assertion.
+    #[test]
+    fn bwrap_read_grant_under_tmp_is_visible_and_nothing_else_is() {
+        require_bwrap!();
+        let project = create_test_project();
+
+        // Under /tmp deliberately — that is the whole point — but a TempDir so
+        // it cleans itself up and cannot collide with a reused PID.
+        let base = tempfile::TempDir::new_in("/tmp").expect("tempdir under /tmp");
+        let granted = base.path().join("granted");
+        let hidden = base.path().join("hidden");
+        fs::create_dir_all(&granted).unwrap();
+        fs::create_dir_all(&hidden).unwrap();
+        fs::write(granted.join("marker"), "GRANTED_CONTENT\n").unwrap();
+        fs::write(hidden.join("marker"), "HIDDEN_CONTENT\n").unwrap();
+
+        let granted_arg = granted.to_string_lossy().into_owned();
+        let script = format!(
+            "cat {}/marker || echo GRANT_MISSING; cat {}/marker || echo HIDDEN_OK",
+            granted.display(),
+            hidden.display()
+        );
+        let (_, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--use-bubblewrap", "--allow-read", &granted_arg],
+            &script,
+        );
+
+        assert!(
+            stdout.contains("GRANTED_CONTENT"),
+            "an allow.read grant under /tmp must be visible inside the namespace \
+             \u{2014} stdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("HIDDEN_CONTENT") && stdout.contains("HIDDEN_OK"),
+            "the private /tmp tmpfs must still hide everything that was not \
+             granted \u{2014} stdout: {stdout}\nstderr: {stderr}"
         );
     }
 

@@ -321,12 +321,22 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
             if !(exec.starts_with(write) || write.starts_with(exec)) {
                 continue;
             }
+            // The temp dirs cannot be narrowed — they are writable with no
+            // grant to withdraw — so that case needs its own remedy or the
+            // message tells the user to do something impossible.
+            let remedy = if source == TEMP_DIR_SOURCE {
+                "Move the tree somewhere the sandbox does not make writable, or use the \
+                 scratch dir, which is write+exec by design. `--allow-tmp-exec` opens \
+                 execute on all of temp if that is really what you want."
+            } else {
+                "Narrow one of the two so they do not overlap \u{2014} exec grants belong \
+                 on read-only tool prefixes."
+            };
             return Err(format!(
                 "allow.exec {} overlaps {source} {}: a tree that is both writable and \
                  executable lets the agent drop a binary and run it. Neither backend can \
                  subtract the write grant from the exec grant, so cplt refuses the pair \
-                 instead of pretending to. Narrow one of the two so they do not overlap \
-                 \u{2014} exec grants belong on read-only tool prefixes.",
+                 instead of pretending to. {remedy}",
                 exec.display(),
                 write.display()
             ));
@@ -364,8 +374,38 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
                 .map(|d| (config.home_dir.join(d.path), "the writable tool directory")),
         ),
     }
+    // The system temp dirs are made writable by the backends themselves, not by
+    // config, which is why they were missing here (#299). An exec grant under
+    // one is the same writable-plus-executable staging pair as a grant under
+    // `~/.cache`, and the three code paths disagree about it today: on macOS
+    // the grant wins (`emit_user_allows` runs after `emit_temp_rules`, and
+    // last-match-wins), on Linux without bubblewrap it unions with the
+    // always-writable `/tmp` rule into exactly the binary-drop pair this
+    // function exists to refuse, and under bubblewrap the private `/tmp` tmpfs
+    // hides it so the grant does nothing at all. Refusing is the one answer
+    // that is the same on all three.
+    trees.extend(
+        SYSTEM_TEMP_DIRS
+            .iter()
+            .map(|d| (PathBuf::from(d), TEMP_DIR_SOURCE)),
+    );
     trees
 }
+
+/// Names the temp-dir collision in the refusal, and selects its remedy: a temp
+/// dir is writable with no grant to withdraw, so "narrow one of the two" is not
+/// advice a user can act on there.
+const TEMP_DIR_SOURCE: &str = "the always-writable system temp dir";
+
+/// Temp roots the backends grant write on unconditionally: Landlock seeds a
+/// read+write rule for `/tmp`, and the SBPL profile does the same for
+/// `/private/tmp` and `/private/var/folders` (the canonical form of the macOS
+/// `TMPDIR`). Grants reach [`validate_exec_grants`] canonicalized, so the
+/// macOS entries are the `/private` forms.
+#[cfg(target_os = "macos")]
+const SYSTEM_TEMP_DIRS: &[&str] = &["/private/tmp", "/private/var/folders"];
+#[cfg(not(target_os = "macos"))]
+const SYSTEM_TEMP_DIRS: &[&str] = &["/tmp"];
 
 /// Resolve the real `.git` directory of every writable granted path whose repo
 /// data does NOT live at `<path>/.git` — a worktree, a bare repo, or a grant
@@ -1045,6 +1085,66 @@ mod tests {
             assert!(error.contains("allow.exec"), "{error}");
             assert!(error.contains("defeats the sandbox"), "{error}");
         }
+    }
+
+    /// The system temp dirs are writable without any `allow.write`, so an exec
+    /// grant under one is the same write+exec staging pair (#299). It has to be
+    /// refused rather than honoured because the three code paths otherwise
+    /// disagree: macOS honours it (the user allow is emitted after
+    /// `emit_temp_rules`), Linux without bubblewrap honours it *and* unions it
+    /// with the always-writable `/tmp` rule, and Linux under bubblewrap drops it
+    /// silently behind the private tmpfs.
+    ///
+    /// The roots are spelled out rather than read from `SYSTEM_TEMP_DIRS`, so
+    /// emptying that constant fails this test instead of vacuously passing it.
+    #[test]
+    fn prepare_refuses_an_exec_grant_under_the_system_temp_dir() {
+        #[cfg(target_os = "macos")]
+        let roots = ["/private/tmp", "/private/var/folders"];
+        #[cfg(not(target_os = "macos"))]
+        let roots = ["/tmp"];
+
+        let home = Path::new("/home/test");
+        for root in roots {
+            let exec = Path::new(root).join("build-xyz/bin");
+            let exec_paths = vec![exec.clone()];
+            let mut config = test_config(home, &[]);
+            config.extra_exec = &exec_paths;
+
+            let error = prepare(&config).err().unwrap_or_else(|| {
+                panic!("allow.exec under {root} must be refused, not silently honoured")
+            });
+            assert!(error.contains("allow.exec"), "{error}");
+            assert!(
+                error.contains(&exec.display().to_string()),
+                "the refusal must name the grant: {error}"
+            );
+            assert!(
+                error.contains(root),
+                "the refusal must name the temp dir it collides with: {error}"
+            );
+            // "Narrow one of the two" is not actionable for a tree that is
+            // writable with no grant to withdraw — the message must say where
+            // to put the binaries instead.
+            assert!(
+                error.contains("Move the tree") && error.contains("scratch dir"),
+                "the refusal must tell the user what to do instead: {error}"
+            );
+        }
+    }
+
+    /// A grant on a sibling path that merely *starts with* the temp root's name
+    /// is not under it, and must still be accepted.
+    #[test]
+    fn prepare_accepts_an_exec_grant_beside_the_system_temp_dir() {
+        let home = Path::new("/home/test");
+        let exec_paths = vec![PathBuf::from("/tmpfoo/bin")];
+        let mut config = test_config(home, &[]);
+        config.extra_exec = &exec_paths;
+        assert!(
+            prepare(&config).is_ok(),
+            "/tmpfoo is not under /tmp and must not be refused"
+        );
     }
 
     /// The overlap refusal, in both directions and against both sources of
