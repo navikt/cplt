@@ -250,7 +250,8 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     prepare_impl(config, &extra_git_dirs(config.extra_write))
 }
 
-/// Refuse to launch when a grant names a file on the hard-deny list.
+/// Refuse to launch when a grant names a hard-denied file or a credential
+/// directory.
 ///
 /// [`policy::DENIED_FILES`] is documented as not overridable, unlike
 /// [`policy::DENIED_HOME_SUBPATHS`], which `allow.read` is meant to reopen.
@@ -259,6 +260,14 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 /// in force when it is not is exactly the failure this list exists to prevent.
 /// It also lands on both backends at once — silently ineffective on macOS,
 /// silently effective on Linux, which is how #207 stayed invisible.
+///
+/// [`policy::DENIED_DOTFILES`] directories are refused for the same reason
+/// pointing the other way (#291): the grant was silently ineffective on macOS
+/// and silently *effective* on Linux, where it opened `~/.ssh` wholesale. The
+/// error names the per-file grant, which is supported on both backends, so the
+/// Linux behaviour change arrives as a message with its own fix rather than as
+/// a rule that quietly stopped applying. Only the directory itself matches —
+/// a grant on a file inside it is the supported override and still works.
 fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
     for (key, paths) in [
         ("allow.read", config.extra_read),
@@ -270,6 +279,16 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
             if let Some(file) = policy::hard_denied_file(config.home_dir, p) {
                 return Err(format!(
                     "{key} names {} (~/{file}), which is on the hard-deny list and cannot be granted explicitly. Remove it from your config or command line.",
+                    p.display()
+                ));
+            }
+            if let Some(dir) = policy::denied_dotfile_dir(config.home_dir, p) {
+                return Err(format!(
+                    "{key} names {} (~/{dir}), a credential directory that cannot be granted \
+                     whole: macOS denies it whatever the grant says, so honouring it on Linux \
+                     alone would mean the same config opens every key in it on one platform \
+                     and nothing on the other. Name the specific files you need instead, e.g. \
+                     ~/{dir}/<file> — that grant works on both.",
                     p.display()
                 ));
             }
@@ -1067,6 +1086,83 @@ mod tests {
                 .expect("allow.socket must be refused");
             assert!(error.contains("allow.socket"), "{error}");
         }
+    }
+
+    /// A grant naming a `DENIED_DOTFILES` directory is refused on every key and
+    /// on both backends (#291).
+    ///
+    /// It was never honoured on macOS — the generic allow is emitted before the
+    /// subpath deny and loses to it — while Linux granted it for real. Refusing
+    /// is what makes the two the same; the error has to name the per-file grant,
+    /// because that is the route that still works.
+    #[test]
+    fn prepare_rejects_a_grant_on_a_denied_dotfile_directory() {
+        let home = Path::new("/home/test");
+        for &dir in policy::DENIED_DOTFILES {
+            let granted = vec![home.join(dir)];
+
+            let mut config = test_config(home, &granted);
+            let error = prepare(&config).err().expect("allow.read must be refused");
+            assert!(error.contains("allow.read"), "{error}");
+            assert!(error.contains(dir), "{error}");
+            assert!(
+                error.contains("Name the specific files"),
+                "the error must point at the grant that does work: {error}"
+            );
+
+            config.extra_read = &[];
+            config.extra_write = &granted;
+            let error = prepare(&config).err().expect("allow.write must be refused");
+            assert!(error.contains("allow.write"), "{error}");
+
+            config.extra_write = &[];
+            config.extra_socket = &granted;
+            let error = prepare(&config)
+                .err()
+                .expect("allow.socket must be refused");
+            assert!(error.contains("allow.socket"), "{error}");
+
+            config.extra_socket = &[];
+            config.extra_exec = &granted;
+            let error = prepare(&config).err().expect("allow.exec must be refused");
+            assert!(error.contains("allow.exec"), "{error}");
+        }
+    }
+
+    /// The per-file grant is the supported route and must survive: refusing it
+    /// would close the only door SSH has left on macOS, `~/.ssh/known_hosts`
+    /// included.
+    #[test]
+    fn prepare_accepts_a_grant_inside_a_denied_dotfile_directory() {
+        let home = Path::new("/home/test");
+        let granted = vec![
+            home.join(".ssh/id_ed25519"),
+            home.join(".ssh/known_hosts"),
+            home.join(".config/gcloud/application_default_credentials.json"),
+        ];
+
+        let mut config = test_config(home, &granted);
+        assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+        config.extra_read = &[];
+        config.extra_write = &granted;
+        assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+    }
+
+    /// `--allow-docker` grants `~/.docker` read-only, and `~/.docker` is a
+    /// `DENIED_DOTFILES` entry. It is a first-party rule the backends emit, not
+    /// a user grant, so the #291 refusal must not be able to see it — otherwise
+    /// the flag would refuse every run it is set on.
+    #[test]
+    fn prepare_does_not_refuse_the_allow_docker_dotfile_grant() {
+        let home = Path::new("/home/test");
+        let mut config = test_config(home, &[]);
+        config.allow_docker = true;
+
+        assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+        assert!(
+            prepare(&config).is_ok(),
+            "--allow-docker must not be caught by the denied-dotfile refusal"
+        );
     }
 
     /// `/` and `$HOME` are refused: an exec grant that wide is not a sandbox.

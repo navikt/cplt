@@ -535,13 +535,15 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 
     // ── Extra read paths from config ──
-    // Hard-denied files (policy::DENIED_FILES) are filtered out: Landlock is
-    // grant-only, so a grant on ~/.netrc has no deny to lose to and would make
-    // the documented "not overridable" guarantee false on Linux only (#207).
-    // `prepare()` rejects such a grant before we get here — this keeps the
-    // ruleset invariant true for every caller of `generate_policy`.
+    // Hard-denied files (policy::DENIED_FILES) and credential directories
+    // (policy::DENIED_DOTFILES) are filtered out: Landlock is grant-only, so a
+    // grant on ~/.netrc or ~/.ssh has no deny to lose to and would make the
+    // documented guarantee false on Linux only (#207, #291). A grant on a file
+    // *inside* a denied dotfile directory is the supported override and passes
+    // through. `prepare()` rejects the refused forms before we get here — this
+    // keeps the ruleset invariant true for every caller of `generate_policy`.
     for p in config.extra_read {
-        if policy::hard_denied_file(home, p).is_some() {
+        if policy::grant_is_refused(home, p) {
             continue;
         }
         fs_rules.push(FsRule {
@@ -557,7 +559,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     // ── Extra write paths from config ──
     for p in config.extra_write {
-        if policy::hard_denied_file(home, p).is_some() {
+        if policy::grant_is_refused(home, p) {
             continue;
         }
         fs_rules.push(FsRule {
@@ -578,7 +580,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // refuses an exec grant that overlaps a writable tree precisely because
     // Landlock unions the two and cannot subtract one from the other.
     for p in config.extra_exec {
-        if policy::hard_denied_file(home, p).is_some() {
+        if policy::grant_is_refused(home, p) {
             continue;
         }
         fs_rules.push(FsRule {
@@ -594,7 +596,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     // ── Extra socket paths from config ──
     for p in config.extra_socket {
-        if policy::hard_denied_file(home, p).is_some() {
+        if policy::grant_is_refused(home, p) {
             continue;
         }
         fs_rules.push(FsRule {
@@ -1947,6 +1949,76 @@ mod tests {
             let found = policy.fs_rules.iter().any(|r| r.path == path);
             assert!(!found, "denied dotfile {dotfile} should NOT be in ruleset");
         }
+    }
+
+    /// The other half of `denied_dotfiles_not_in_ruleset`: deny-by-omission is
+    /// not enough once the user *grants* the directory. Landlock is grant-only,
+    /// so an unfiltered `allow.read = "~/.ssh"` became a working read rule and
+    /// opened every key in it — on Linux only, since macOS's subpath deny beat
+    /// the same grant (#291). `prepare()` refuses the run, and this keeps the
+    /// invariant true for every other caller of `generate_policy`.
+    #[test]
+    fn a_granted_denied_dotfile_directory_stays_out_of_the_ruleset() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let granted: Vec<PathBuf> = policy::DENIED_DOTFILES
+            .iter()
+            .map(|d| home.join(d))
+            .collect();
+
+        let mut config = test_config(&project, &home);
+        for (read, write, exec, socket) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            config.extra_read = if read { &granted } else { &[] };
+            config.extra_write = if write { &granted } else { &[] };
+            config.extra_exec = if exec { &granted } else { &[] };
+            config.extra_socket = if socket { &granted } else { &[] };
+            let policy = generate_policy(&config);
+
+            for path in &granted {
+                assert!(
+                    !policy.fs_rules.iter().any(|r| &r.path == path),
+                    "granted denied dotfile {} must not enter the ruleset",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// A grant on a file *inside* one of those directories is the supported
+    /// override and must still reach the ruleset — the route the refusal above
+    /// tells users to take. `~/.ssh/known_hosts` needs write for `ssh` to append
+    /// to it on a first connection.
+    #[test]
+    fn a_granted_file_inside_a_denied_dotfile_directory_survives() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let key = vec![home.join(".ssh/id_ed25519")];
+        let known_hosts = vec![home.join(".ssh/known_hosts")];
+
+        let mut config = test_config(&project, &home);
+        config.extra_read = &key;
+        config.extra_write = &known_hosts;
+        let policy = generate_policy(&config);
+
+        let read = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == key[0])
+            .expect("~/.ssh/id_ed25519 must be in the ruleset");
+        assert!(read.access.read);
+        assert!(!read.access.write, "a read grant must not become writable");
+
+        let write = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == known_hosts[0])
+            .expect("~/.ssh/known_hosts must be in the ruleset");
+        assert!(write.access.read && write.access.write);
     }
 
     /// `--allow-docker` on Linux grants `~/.docker` read-only (#155). Off, the
