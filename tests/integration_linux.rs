@@ -656,7 +656,8 @@ EOF
         // `/tmp`, which is itself an always-writable tree, so the refusal would
         // fire on the temp dir (#299) and the test would pass without the
         // `--allow-write` flag it is meant to be about.
-        let tree = home_dir().join(format!(".cplt-overlap-test-{}", std::process::id()));
+        let tree_dir = tempfile::TempDir::new_in(home_dir()).expect("tempdir under $HOME");
+        let tree = tree_dir.path();
         fs::create_dir_all(tree.join("bin")).unwrap();
         let tree_arg = tree.to_string_lossy().into_owned();
         let bin_arg = tree.join("bin").to_string_lossy().into_owned();
@@ -667,7 +668,6 @@ EOF
             &["--allow-write", &tree_arg, "--allow-exec", &bin_arg],
             "echo should not run",
         );
-        fs::remove_dir_all(&tree).ok();
 
         assert!(code != 0, "an overlapping exec grant must refuse to launch");
         assert!(
@@ -1923,9 +1923,11 @@ print('CONNECTED')
         require_bwrap!();
         let project = create_test_project();
 
-        let base = PathBuf::from(format!("/tmp/cplt-read-grant-{}", std::process::id()));
-        let granted = base.join("granted");
-        let hidden = base.join("hidden");
+        // Under /tmp deliberately — that is the whole point — but a TempDir so
+        // it cleans itself up and cannot collide with a reused PID.
+        let base = tempfile::TempDir::new_in("/tmp").expect("tempdir under /tmp");
+        let granted = base.path().join("granted");
+        let hidden = base.path().join("hidden");
         fs::create_dir_all(&granted).unwrap();
         fs::create_dir_all(&hidden).unwrap();
         fs::write(granted.join("marker"), "GRANTED_CONTENT\n").unwrap();
@@ -1942,7 +1944,6 @@ print('CONNECTED')
             &["--use-bubblewrap", "--allow-read", &granted_arg],
             &script,
         );
-        fs::remove_dir_all(&base).ok();
 
         assert!(
             stdout.contains("GRANTED_CONTENT"),
