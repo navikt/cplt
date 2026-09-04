@@ -493,7 +493,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "true",
-        description: "Enable git command interception (blocks git push, request-pull, send-pack).",
+        description: "Intercept git push, request-pull and send-pack. What happens to an intercepted command is `mode`: warn (default) prints and runs it, block refuses it.",
     },
     ConfigKeyInfo {
         section: "git_guard",
@@ -509,7 +509,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "true",
-        description: "Block git push, request-pull, and send-pack.",
+        description: "Treat git push, request-pull and send-pack as violations. `mode` decides what a violation costs.",
     },
     ConfigKeyInfo {
         section: "git_guard",

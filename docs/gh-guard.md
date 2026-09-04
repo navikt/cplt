@@ -74,9 +74,9 @@ unknown_command = "block"   # block|allow unrecognized gh commands
 allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current repo (opt-in)
 
 [git_guard]
-enabled = true              # blocks git push
+enabled = true              # intercept git push, request-pull, send-pack
 mode = "warn"               # block | warn | audit (default warn)
-prevent_push = true         # block git push/request-pull
+prevent_push = true         # treat push/request-pull as violations
 prevent_force_push = true   # block force push, even where a plain push is allowed
 ```
 </details>
