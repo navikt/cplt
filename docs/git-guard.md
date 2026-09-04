@@ -46,6 +46,13 @@ the URL from then on. A rule for this repository's `origin` therefore does not
 authorize `git -C ../other-repo push origin main`, even though the other
 checkout also calls its remote `origin`.
 
+Pinning needs a *trusted* git binary (the same one the gh guard uses to capture
+its repo scope), because it runs unsandboxed in the parent at launch. On a
+machine where cplt cannot find one, it says so and the rules fall back to
+matching the bare name — which is where a rule does apply to another
+repository's same-named remote. Fix the git installation cplt is warning about
+rather than relying on the fallback.
+
 URLs are compared after normalization, so the spellings of one remote are one
 remote: `git@github.com:navikt/cplt.git`, `ssh://git@github.com/navikt/cplt`,
 `https://github.com/navikt/cplt.git` and `https://github.com/navikt/cplt` all
@@ -59,8 +66,10 @@ git reports.
 Nothing changes in the config file format, and a rule written against a remote
 name keeps working. The one behavior change is the intended one: such a rule
 now only covers the repository that name pointed at when the session started.
-If the name does not resolve at launch — no remote by that name in the launch
-repository — the rule falls back to matching the bare name, as before.
+
+Two cases keep the old name matching, both of them announced rather than
+silent: the launch repository has no remote by that name, and cplt found no
+trusted git to resolve it with.
 
 <details>
 <summary>CLI flag (override for a single run)</summary>

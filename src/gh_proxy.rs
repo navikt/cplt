@@ -3842,16 +3842,19 @@ mod tests {
         Some((tmp, repo))
     }
 
+    /// `git` if it runs, probed directly rather than through `which` so the
+    /// tests do not silently skip on a machine that has git but no `which`.
+    /// `Command` resolves the bare name through PATH.
+    /// `git` if it runs, probed directly rather than through `which` so the
+    /// tests do not silently skip on a machine that has git but no `which`.
+    /// `Command` resolves the bare name through PATH.
     fn which_git() -> Option<PathBuf> {
-        let out = std::process::Command::new("/usr/bin/env")
-            .args(["which", "git"])
+        std::process::Command::new("git")
+            .arg("--version")
             .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-        path.is_file().then_some(path)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|_| PathBuf::from("git"))
     }
 
     #[test]
