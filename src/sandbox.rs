@@ -635,6 +635,70 @@ fn report_unix_socket_regime(bwrap_active: bool, socket_masks: usize) {
     }
 }
 
+/// Every path the bubblewrap overlay must re-bind read-only.
+///
+/// Extracted from the Linux `prepare_impl` so the whole set is assertable in
+/// one place. It was not, and it mattered: a mutation that deleted the Copilot
+/// entry from the caller passed Linux CI green, because each helper had a test
+/// and the wiring that consumes them had none.
+#[cfg(target_os = "linux")]
+fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    // Finding 1: Landlock cannot deny subpaths inside the writable project tree,
+    // so the project's .git/hooks (and other git-persistence files) stay
+    // writable — a persistence-escape vector. When Bubblewrap is active we
+    // re-bind those pre-existing paths read-only to restore macOS parity. In a
+    // git worktree the real hooks live under the shared git_common_dir (which
+    // the sandbox grants write access to), so pass it through to cover them too.
+    //
+    // #212: every writable granted path is a candidate too — a sibling repo's
+    // .git/hooks was fully writable before, and hooks run unsandboxed.
+    let mut write_roots: Vec<&Path> = vec![config.project_dir];
+    write_roots.extend(config.extra_write.iter().map(PathBuf::as_path));
+    let mut git_dirs: Vec<&Path> = config.git_common_dir.into_iter().collect();
+    git_dirs.extend(extra_git_dirs.iter().map(PathBuf::as_path));
+    let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
+
+    // #237: same class, different tree — the agent's own config dir is granted
+    // writable, and some files in it auto-execute on the host the next time the
+    // agent runs outside cplt (Claude hooks, Pi extensions). macOS
+    // emits these as SBPL write-denies; Landlock cannot carve a sub-deny out of
+    // an allowed tree, so the bwrap read-only overlay is the only mechanism here
+    // — WITHOUT bwrap this is unenforced on Linux.
+    //
+    // KNOWN GAP: even with bwrap, `build_bwrap_args` skips a path that does not
+    // exist, because bwrap cannot bind a missing source. `.git/hooks` rarely
+    // hits this (`git init` creates it) but `extensions/` does not exist until
+    // the first extension is installed, so that deny is nominal in the common
+    // case. Masking a missing path with the `deny_masks` machinery (a `--tmpfs`
+    // over a directory, a mode-000 placeholder `--ro-bind` over a file) would
+    // close it, but it also makes the path *appear to exist* as an empty dir or
+    // empty file, which changes what the agent reads at startup. That is not a
+    // change to make untested, and this is a macOS host. Documented in
+    // SECURITY.md instead of half-done.
+    ro_protect.extend(config.agent.host_persistence_paths(config.agent_dirs));
+
+    // #238: mise's `shims/` and `installs/` are PATH-resolved binary drop
+    // points sitting inside the mise data dir, which stays writable for the
+    // rest of mise's state. The other PATH-resolved dirs (~/.bun/bin,
+    // ~/.deno/bin, $PNPM_HOME) need nothing here: HOME_TOOL_DIRS grants write
+    // to their sibling caches rather than to the parent, so Landlock enforces
+    // them on its own, with or without bwrap. Same "must already exist" caveat
+    // as everything else in this list.
+    ro_protect.extend(mise_ro_protect_paths(config.home_dir));
+
+    // #328: Copilot's package dirs. macOS write-denies both in the profile;
+    // Landlock cannot — `~/.copilot` is granted write wholesale, and
+    // `~/.cache/copilot/pkg`'s execute rule unions with the `~/.cache` write
+    // grant from HOME_TOOL_DIRS, leaving the SEA runtime writable AND
+    // executable. Only the bwrap overlay can take the write back. Empty for
+    // every other agent.
+    ro_protect.extend(copilot_ro_protect_paths(config.agent, config.home_dir));
+
+    ro_protect.sort();
+    ro_protect.dedup();
+    ro_protect
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_impl(
     config: &SandboxConfig,
@@ -703,59 +767,7 @@ fn prepare_impl(
     let policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);
 
-    // Finding 1: Landlock cannot deny subpaths inside the writable project tree,
-    // so the project's .git/hooks (and other git-persistence files) stay
-    // writable — a persistence-escape vector. When Bubblewrap is active we
-    // re-bind those pre-existing paths read-only to restore macOS parity. In a
-    // git worktree the real hooks live under the shared git_common_dir (which
-    // the sandbox grants write access to), so pass it through to cover them too.
-    //
-    // #212: every writable granted path is a candidate too — a sibling repo's
-    // .git/hooks was fully writable before, and hooks run unsandboxed.
-    let mut write_roots: Vec<&Path> = vec![config.project_dir];
-    write_roots.extend(config.extra_write.iter().map(PathBuf::as_path));
-    let mut git_dirs: Vec<&Path> = config.git_common_dir.into_iter().collect();
-    git_dirs.extend(extra_git_dirs.iter().map(PathBuf::as_path));
-    let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
-
-    // #237: same class, different tree — the agent's own config dir is granted
-    // writable, and some files in it auto-execute on the host the next time the
-    // agent runs outside cplt (Claude hooks, Pi extensions). macOS
-    // emits these as SBPL write-denies; Landlock cannot carve a sub-deny out of
-    // an allowed tree, so the bwrap read-only overlay is the only mechanism here
-    // — WITHOUT bwrap this is unenforced on Linux.
-    //
-    // KNOWN GAP: even with bwrap, `build_bwrap_args` skips a path that does not
-    // exist, because bwrap cannot bind a missing source. `.git/hooks` rarely
-    // hits this (`git init` creates it) but `extensions/` does not exist until
-    // the first extension is installed, so that deny is nominal in the common
-    // case. Masking a missing path with the `deny_masks` machinery (a `--tmpfs`
-    // over a directory, a mode-000 placeholder `--ro-bind` over a file) would
-    // close it, but it also makes the path *appear to exist* as an empty dir or
-    // empty file, which changes what the agent reads at startup. That is not a
-    // change to make untested, and this is a macOS host. Documented in
-    // SECURITY.md instead of half-done.
-    ro_protect.extend(config.agent.host_persistence_paths(config.agent_dirs));
-
-    // #238: mise's `shims/` and `installs/` are PATH-resolved binary drop
-    // points sitting inside the mise data dir, which stays writable for the
-    // rest of mise's state. The other PATH-resolved dirs (~/.bun/bin,
-    // ~/.deno/bin, $PNPM_HOME) need nothing here: HOME_TOOL_DIRS grants write
-    // to their sibling caches rather than to the parent, so Landlock enforces
-    // them on its own, with or without bwrap. Same "must already exist" caveat
-    // as everything else in this list.
-    ro_protect.extend(mise_ro_protect_paths(config.home_dir));
-
-    // #328: Copilot's package dirs. macOS write-denies both in the profile;
-    // Landlock cannot — `~/.copilot` is granted write wholesale, and
-    // `~/.cache/copilot/pkg`'s execute rule unions with the `~/.cache` write
-    // grant from HOME_TOOL_DIRS, leaving the SEA runtime writable AND
-    // executable. Only the bwrap overlay can take the write back. Empty for
-    // every other agent.
-    ro_protect.extend(copilot_ro_protect_paths(config.agent, config.home_dir));
-
-    ro_protect.sort();
-    ro_protect.dedup();
+    let ro_protect = ro_protect_paths(config, extra_git_dirs);
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied
@@ -1089,6 +1101,35 @@ mod tests {
         let error = validate_exec_grants(&config).expect_err("the overlap must be refused");
         assert!(error.contains(".local/share/opencode"), "{error}");
         assert!(error.contains("writable agent directory"), "{error}");
+    }
+
+    /// The ro_protect set the bwrap overlay consumes, end to end.
+    ///
+    /// The helpers each had a test; the wiring that assembles them did not, and
+    /// a mutation deleting the Copilot line from the caller passed Linux CI
+    /// green. This asserts the assembled set, which is what the overlay
+    /// actually re-binds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ro_protect_set_carries_the_copilot_package_dirs_for_copilot_only() {
+        let home = Path::new("/home/test");
+        let mut config = test_config(home, &[]);
+        config.agent = Agent::Copilot;
+        let paths = super::ro_protect_paths(&config, &[]);
+        for expected in [home.join(".copilot/pkg"), home.join(".cache/copilot/pkg")] {
+            assert!(
+                paths.contains(&expected),
+                "{} must be in the bwrap read-only set, got {paths:?}",
+                expected.display()
+            );
+        }
+
+        config.agent = Agent::Claude;
+        let paths = super::ro_protect_paths(&config, &[]);
+        assert!(
+            !paths.iter().any(|p| p.starts_with(home.join(".copilot"))),
+            "no Copilot package binds for a non-Copilot agent, got {paths:?}"
+        );
     }
 
     /// Same class, the file-level half: OpenCode's `auth.json` is a write grant
