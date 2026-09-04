@@ -87,14 +87,15 @@ pub(super) fn describe_unknown_key(path: &str) -> String {
                 return format!(
                     "unknown key '{key}' in [{section}]: the [{section}] header already \
                      scopes its keys, so '{key}.{example} = ...' reads as \
-                     '{section}.{key}.{example}' — drop the '{key}.' prefix and write \
-                     '{example} = ...'"
+                     '{section}.{key}.{example}', which is not applied — drop the \
+                     '{key}.' prefix and write '{example} = ...'"
                 );
             }
             return format!(
                 "unknown key '{key}' in [{section}]: '{key}' is a top-level section; TOML \
                  scopes '{key}.{example} = ...' written under [{section}] as \
-                 '{section}.{key}.{example}' — move it under its own [{key}] header"
+                 '{section}.{key}.{example}', which is not applied — move it under its \
+                 own [{key}] header, or above the first [section] header"
             );
         }
         // Same silent drop, scalar flavour: `config_version = 1` written below
@@ -695,6 +696,12 @@ some_new_option = true
         assert!(
             diagnostic.message.contains("[allow]"),
             "got: {}",
+            diagnostic.message
+        );
+        // The point of the message: the grant the user wrote is being discarded.
+        assert!(
+            diagnostic.message.contains("is not applied"),
+            "message must say the value is dropped, got: {}",
             diagnostic.message
         );
     }
