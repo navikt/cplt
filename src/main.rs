@@ -1582,6 +1582,26 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         );
     }
 
+    // Same reconciliation, one flag over (#297). Under proxy.forced the sandbox
+    // no longer opens a direct kernel path to `*:<port>` for `allow.ports`, so
+    // say so instead of letting the user believe the port is reachable raw. The
+    // ports stay in the proxy's allowed-port policy, so anything that honours
+    // HTTP_PROXY/HTTPS_PROXY still reaches them by CONNECT.
+    if resolved.proxy_forced && !resolved.allow_ports.is_empty() {
+        let ports = resolved
+            .allow_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui::warn(&format!(
+            "proxy.forced is active, so allow.ports ({ports}) no longer opens a direct \
+             kernel egress path. Those ports are still reachable through the proxy, so \
+             proxy-aware tools keep working; raw TCP does not. Drop proxy.forced if a \
+             tool needs a direct socket."
+        ));
+    }
+
     // A write grant on a directory the parent executes from cancels the
     // trusted-binary lookup (#236). Warned, not refused: it would break configs
     // that work today. Here, after every source is merged, so a repo-proposed
