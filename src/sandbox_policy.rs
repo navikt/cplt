@@ -1451,6 +1451,15 @@ pub fn mise_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
 /// Same caveats as every other `ro_protect` entry: without bubblewrap this is
 /// unenforced, and bwrap skips a path that does not exist at launch.
 ///
+/// NOTE: `~/.copilot/pkg` also arrives from `Agent::host_persistence_denies`
+/// once Copilot's config dir is an `AgentDir`, so the set holds it twice — once
+/// as spelled here and once canonicalized by `canonicalize_agent_dirs`. The
+/// caller sorts and dedups, which collapses them only when the two strings
+/// match, so a symlinked `$HOME` leaves both. That is harmless (two identical
+/// read-only binds of the same path), but do not delete either believing the
+/// other covers it: this one still carries `~/.cache/copilot/pkg`, which is not
+/// in any agent config dir and has no other source.
+///
 /// Returns nothing for an agent that is not Copilot: the agent check lives here
 /// rather than at the call site so the whole decision is one unit-testable
 /// function on both platforms, instead of a Linux-only `if` no test can reach.

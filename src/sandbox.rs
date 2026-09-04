@@ -1132,6 +1132,36 @@ mod tests {
         );
     }
 
+    /// The agent's own `host_persistence_denies` must reach the overlay too.
+    ///
+    /// `ro_protect_paths` extends with `host_persistence_paths(agent_dirs)`,
+    /// and that line had no test for any agent — the assembly test above uses
+    /// a config with `agent_dirs: &[]`, so it never exercised it. Claude is
+    /// used because its denies exist on every branch; whatever any agent
+    /// declares travels the same line, so this covers Copilot's once its
+    /// config dir grant lands.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ro_protect_set_carries_the_agent_config_dir_denies() {
+        temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
+            let home = Path::new("/home/test");
+            let agent_dirs = Agent::Claude.config_dirs(home);
+            let mut config = test_config(home, &[]);
+            config.agent = Agent::Claude;
+            config.agent_dirs = &agent_dirs;
+
+            let paths = super::ro_protect_paths(&config, &[]);
+            for sub in Agent::Claude.host_persistence_denies() {
+                let expected = home.join(".claude").join(sub);
+                assert!(
+                    paths.contains(&expected),
+                    "{} must be in the bwrap read-only set, got {paths:?}",
+                    expected.display()
+                );
+            }
+        });
+    }
+
     /// Same class, the file-level half: OpenCode's `auth.json` is a write grant
     /// inside an otherwise read-only agent dir.
     #[test]
