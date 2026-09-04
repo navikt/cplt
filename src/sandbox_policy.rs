@@ -846,12 +846,18 @@ pub const APP_DIRS: &[AppDir] = &[
         // Config/Preference dirs (~/.config/pnpm, ~/Library/Preferences/pnpm) are
         // writable: pnpm reads and writes its settings (hoisting, virtual store state)
         // there during normal operation. These dirs contain no credentials.
+        //
+        // Data/DataLocal (~/.local/share/pnpm) is deliberately NOT writable: it
+        // is $PNPM_HOME on Linux, so the global shims `pnpm setup` puts on PATH
+        // live directly in it. Its `store/` subdirectory is granted write by the
+        // matching HOME_TOOL_DIRS entry, which is what keeps ordinary
+        // `pnpm install` working. Removing write here rather than denying the
+        // shims afterwards is what makes the rule hold on Landlock too, which
+        // cannot subtract from an allowed tree.
         write: &[
             AppDirKind::Cache,
             AppDirKind::Config,
             AppDirKind::ConfigLocal,
-            AppDirKind::Data,
-            AppDirKind::DataLocal,
             AppDirKind::Preference,
             AppDirKind::Runtime,
             AppDirKind::State,
@@ -1026,14 +1032,34 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: true,
         write: false,
     },
+    // `deno install` and `deno upgrade` write executables into ~/.deno/bin,
+    // which the Deno installer prepends to PATH. Read-only for the same reason
+    // as .cargo/bin: a binary dropped there runs unsandboxed on the user's next
+    // shell command. Nothing else lives under ~/.deno — DENO_DIR (the module
+    // cache) defaults to ~/Library/Caches/deno or ~/.cache/deno, both of which
+    // stay writable through the cache entries below.
     HomeToolDir {
         path: ".deno",
         process_exec: true,
         map_exec: true,
-        write: true,
+        write: false,
     },
+    // ~/.bun holds bin/ (on PATH, `bun install -g` links here) next to
+    // install/ (the global module cache every `bun install` populates). Only
+    // the tree as a whole was writable, so the split is what keeps project
+    // installs working while bin/ goes read-only.
     HomeToolDir {
         path: ".bun",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    // Must follow `.bun`: SBPL is last-match-wins and Landlock unions a path's
+    // ancestors, so the narrower grant has to come second to take effect.
+    // Keeps the exec posture ~/.bun had before the split — bunx resolves
+    // packages out of this cache.
+    HomeToolDir {
+        path: ".bun/install",
         process_exec: true,
         map_exec: true,
         write: true,
@@ -1128,11 +1154,30 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: false,
         write: true,
     },
-    // pnpm global store: contains packages + executable shims
-    // macOS-native path not following conventions set out by AppDirs
+    // pnpm global dir ($PNPM_HOME): the global shims sit directly in it and
+    // `pnpm setup` prepends it to PATH, so the top level is read-only. The
+    // content-addressable store one level down stays writable — every ordinary
+    // `pnpm install` hardlinks packages out of it, sandboxed or not.
+    // macOS-native path not following conventions set out by AppDirs.
     HomeToolDir {
         path: "Library/pnpm",
         process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    // Must follow `Library/pnpm` (last-match-wins / ancestor union).
+    HomeToolDir {
+        path: "Library/pnpm/store",
+        process_exec: false,
+        map_exec: true,
+        write: true,
+    },
+    // XDG spelling of the same store. The parent (~/.local/share/pnpm) is
+    // granted read+exec by the pnpm AppDir entry, which no longer grants write
+    // there — this is the carve-out that keeps `pnpm install` working.
+    HomeToolDir {
+        path: ".local/share/pnpm/store",
+        process_exec: false,
         map_exec: true,
         write: true,
     },
@@ -1172,6 +1217,90 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
 /// the profile generator.
 pub fn home_tool_dirs() -> &'static [HomeToolDir] {
     HOME_TOOL_DIRS
+}
+
+// ── PATH-resolved bin and shim directories ─────────────────────────────────
+
+/// A directory that lands on the user's `PATH` ahead of `/usr/bin`, together
+/// with the shape of the write-deny that protects it.
+///
+/// These are the drop points for a trojan that outlives the sandbox: a file
+/// written to one of them is what the user's *next* unsandboxed `git`, `node`
+/// or `python` resolves to. `.cargo/bin` has been read-only for exactly this
+/// reason since long before the rest of the class was noticed.
+///
+/// Most of them are handled structurally instead — [`HOME_TOOL_DIRS`] grants
+/// write to the sibling cache rather than the parent, which is the only shape
+/// Landlock can express. This list is what remains: the same paths re-denied so
+/// a user `allow.write` cannot reopen them, plus the two mise directories that
+/// sit inside a tree which has to stay writable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathBinDir {
+    /// The directory and everything under it.
+    Subtree(PathBuf),
+    /// Only the entries directly inside it; subdirectories stay writable.
+    ///
+    /// The `$PNPM_HOME` shape — the global shims sit at the top level, while
+    /// `store/` below it must keep taking writes for ordinary `pnpm install`.
+    TopLevel(PathBuf),
+}
+
+/// Resolve the PATH-resolved bin/shim directories for `home`.
+///
+/// mise and pnpm are resolved through [`AppDirKind`] rather than spelled
+/// home-relative, so `XDG_DATA_HOME` relocations are followed.
+pub fn path_bin_dirs(home: &Path) -> Vec<PathBinDir> {
+    let mut dirs = vec![
+        PathBinDir::Subtree(home.join(".bun/bin")),
+        PathBinDir::Subtree(home.join(".deno/bin")),
+        PathBinDir::TopLevel(home.join("Library/pnpm")),
+    ];
+    for data in app_data_dirs("pnpm", home) {
+        dirs.push(PathBinDir::TopLevel(data));
+    }
+    for data in app_data_dirs("mise", home) {
+        // Shims are what `mise activate` puts on PATH.
+        dirs.push(PathBinDir::Subtree(data.join("shims")));
+        // The whole of `installs/`, not each `<tool>/<version>/bin`. mise only
+        // creates a `bin/` for tools that ship one — on a machine with 207
+        // installed version directories, 55 did. Everything else lands flat at
+        // `installs/<tool>/<version>/<name>` (`installs/actionlint/1.7.12/actionlint`),
+        // and in non-shim mode mise puts *that* directory on PATH, so a
+        // `bin`-anchored rule leaves the majority of tools writable. Denying
+        // the tree costs only `mise install` and `mise upgrade` from inside the
+        // sandbox, which is already the accepted cost for the shimmed ones.
+        dirs.push(PathBinDir::Subtree(data.join("installs")));
+    }
+    dirs
+}
+
+/// Data and data-local dirs of an XDG-resolved application, deduplicated.
+fn app_data_dirs(application: &str, home: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for kind in [AppDirKind::Data, AppDirKind::DataLocal] {
+        if let Some(p) = kind.resolve("", "", application, home)
+            && !out.contains(&p)
+        {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The mise directories that must be re-bound read-only by Bubblewrap on Linux.
+///
+/// Landlock cannot subtract from an allowed tree, and the mise data dir has to
+/// stay writable for the rest of mise's state, so `shims/` and `installs/` are
+/// carried by the same read-only overlay that already backs the git- and
+/// agent-persistence denies. The whole `installs/` tree is bound rather than
+/// each `installs/<tool>/<version>/bin`: bwrap takes no globs, and denying
+/// writes across all of `installs/` only widens the already-accepted breakage
+/// of `mise install` inside the sandbox.
+pub fn mise_ro_protect_paths(home: &Path) -> Vec<PathBuf> {
+    app_data_dirs("mise", home)
+        .into_iter()
+        .flat_map(|d| [d.join("shims"), d.join("installs")])
+        .collect()
 }
 
 /// A tool home relocated by an env var (`CARGO_HOME=~/.local/share/cargo`).

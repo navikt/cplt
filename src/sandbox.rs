@@ -54,11 +54,11 @@ pub use policy::{
     ENV_PREFIX_ALLOWLIST, HARDENING_ENV_VARS, HOME_TOOL_DIRS, HardeningCategory, HardeningEnvVar,
     HomeToolDir, PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX,
     PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
-    ResolvedToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
+    PathBinDir, ResolvedToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
     active_tool_dirs, app_dirs, current_uid, home_tool_dirs, linux_docker_socket_paths,
-    playwright_runtime_intent, relocatable_tool_prefix, socket_mask_paths,
-    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
-    validate_sbpl_path,
+    mise_ro_protect_paths, path_bin_dirs, playwright_runtime_intent, relocatable_tool_prefix,
+    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -536,6 +536,16 @@ fn prepare_impl(
     // change to make untested, and this is a macOS host. Documented in
     // SECURITY.md instead of half-done.
     ro_protect.extend(config.agent.host_persistence_paths(config.agent_dirs));
+
+    // #238: mise's `shims/` and `installs/` are PATH-resolved binary drop
+    // points sitting inside the mise data dir, which stays writable for the
+    // rest of mise's state. The other PATH-resolved dirs (~/.bun/bin,
+    // ~/.deno/bin, $PNPM_HOME) need nothing here: HOME_TOOL_DIRS grants write
+    // to their sibling caches rather than to the parent, so Landlock enforces
+    // them on its own, with or without bwrap. Same "must already exist" caveat
+    // as everything else in this list.
+    ro_protect.extend(mise_ro_protect_paths(config.home_dir));
+
     ro_protect.sort();
     ro_protect.dedup();
 
