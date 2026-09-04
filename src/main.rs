@@ -247,8 +247,9 @@ struct Cli {
 
     /// DANGEROUS: let the agent execute binaries from a tree outside the
     /// default tool directories, e.g. a relocated Homebrew or toolchain prefix.
-    /// Grants read + execute, never write. Refused for /, $HOME, and any tree
-    /// that overlaps a writable grant.
+    /// Grants read + execute, never write. Refused for an unsafe root (/, /tmp,
+    /// $HOME and its parents, the platform system dirs) and for any tree that
+    /// overlaps a writable one.
     /// Can be specified multiple times.
     #[arg(long = "allow-exec", value_name = "PATH")]
     allow_exec: Vec<PathBuf>,

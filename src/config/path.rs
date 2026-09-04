@@ -105,9 +105,10 @@ pub fn default_config_contents() -> String {
 # write = []
 #
 # DANGEROUS: trees the agent may execute binaries from, e.g. a relocated
-# Homebrew prefix. Read + execute, never write. A grant that names /, $HOME,
-# or any tree overlapping a writable one is refused at startup: writable +
-# executable is a binary-drop path.
+# Homebrew prefix. Read + execute, never write. A grant naming an unsafe root
+# (/, /tmp, $HOME and its parents, the platform system dirs), or overlapping a
+# writable tree, is refused at startup: writable + executable is a binary-drop
+# path.
 # exec = [
 #     "~/.linuxbrew",
 # ]

@@ -308,9 +308,10 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
     for exec in config.extra_exec {
         if !policy::tool_override_path_is_safe(exec, config.home_dir) {
             return Err(format!(
-                "allow.exec names {} \u{2014} `/`, `$HOME` and any parent of `$HOME` cannot be \
-                 granted execute rights: a grant that wide defeats the sandbox. \
-                 Name the specific tool prefix instead, e.g. ~/.linuxbrew.",
+                "allow.exec names {} \u{2014} an unsafe root cannot be granted execute \
+                 rights: `/`, `/tmp`, `$HOME` and any parent of `$HOME`, and the platform \
+                 system directories. A grant that wide defeats the sandbox. Name the \
+                 specific tool prefix instead, e.g. ~/.linuxbrew.",
                 exec.display()
             ));
         }
@@ -1029,7 +1030,7 @@ mod tests {
     #[test]
     fn prepare_refuses_an_unbounded_exec_grant() {
         let home = Path::new("/home/test");
-        for wide in ["/", "/home/test"] {
+        for wide in ["/", "/tmp", "/home/test"] {
             let granted = vec![PathBuf::from(wide)];
             let mut config = test_config(home, &[]);
             config.extra_exec = &granted;
