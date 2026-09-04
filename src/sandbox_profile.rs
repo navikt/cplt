@@ -229,7 +229,7 @@ pub fn generate_profile_with_playwright_socket_dir(
     emit_user_allows(&mut sb, opts.extra_read, opts.extra_write, opts.extra_exec);
     emit_deny_rules(&mut sb, &home, opts.extra_deny);
     emit_registry_config_overrides(&mut sb, &home, opts.extra_read);
-    emit_denied_dotfile_overrides(&mut sb, &home, opts.extra_read);
+    emit_denied_dotfile_overrides(&mut sb, &home, opts.extra_read, opts.extra_write);
     emit_gpg_signing_rules(&mut sb, &home, opts.allow_gpg_signing, opts.extra_deny);
     emit_docker_rules(&mut sb, &home, opts.allow_docker, opts.extra_deny);
     emit_socket_rules(&mut sb, opts.allow_socket, opts.extra_deny);
@@ -1734,48 +1734,83 @@ fn emit_registry_config_overrides(sb: &mut String, home: &str, extra_read: &[Pat
     }
 }
 
-/// Re-allow specific files inside DENIED_DOTFILES directories when the user
-/// has explicitly approved them via `allow.read`.
+/// Every spelling of `path` that needs a re-allow, when it names a file *inside*
+/// a [`DENIED_DOTFILES`] directory. Empty when it does not.
 ///
-/// DENIED_DOTFILES uses `(deny file-read* (subpath ...))` which blocks entire
-/// directories. When a user explicitly approves a file inside one of these dirs,
-/// we emit a targeted `(allow file-read* (literal ...))` AFTER the deny so
-/// SBPL last-match-wins grants access to that specific file only.
-fn emit_denied_dotfile_overrides(sb: &mut String, home: &str, extra_read: &[PathBuf]) {
+/// A grant naming the directory itself is not an override — `sandbox::prepare`
+/// refuses it outright (#291), and honouring it here would reopen a whole
+/// credential directory on the strength of one config line.
+fn denied_dotfile_override_paths(home: &Path, path: &Path) -> Vec<String> {
+    for &dotfile in DENIED_DOTFILES {
+        let denied_dir = home.join(dotfile);
+        let resolved_dir = resolved(denied_dir.clone());
+        let Ok(rel) = path.strip_prefix(&resolved_dir) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            return Vec::new();
+        }
+        let mut forms = vec![path.to_string_lossy().into_owned()];
+        // When `~/<dotfile>` is itself a symlink the deny names the $HOME
+        // path, and the macOS sandbox matches a rule against the path as
+        // opened — so the re-allow has to cover that form as well.
+        if resolved_dir != denied_dir {
+            forms.push(denied_dir.join(rel).to_string_lossy().into_owned());
+        }
+        return forms;
+    }
+    Vec::new()
+}
+
+/// Re-allow specific files inside DENIED_DOTFILES directories when the user
+/// has explicitly approved them via `allow.read` or `allow.write`.
+///
+/// DENIED_DOTFILES uses `(deny file-read* (subpath ...))` and the matching
+/// `file-write*` deny, which block entire directories. When a user explicitly
+/// approves a file inside one of these dirs, we emit a targeted
+/// `(allow ... (literal ...))` AFTER the deny so SBPL last-match-wins grants
+/// access to that specific file only.
+///
+/// A write grant gets read as well, matching [`emit_user_allows`]: a write
+/// grant that cannot read the file it writes is not a usable grant. That is
+/// what makes `~/.ssh/known_hosts` appendable, which stock `ssh` needs on a
+/// first connection under the default `StrictHostKeyChecking`. Before this,
+/// `emit_user_allows` emitted the write grant *before* `emit_deny_rules`, the
+/// deny won, and the grant silently did nothing on macOS while working on
+/// Linux — the same shape as #291, pointing the other way.
+fn emit_denied_dotfile_overrides(
+    sb: &mut String,
+    home: &str,
+    extra_read: &[PathBuf],
+    extra_write: &[PathBuf],
+) {
     let home_path = Path::new(home);
-    let mut overrides: Vec<String> = Vec::new();
+    // A path granted both ways is emitted once, from the write list.
+    let read_only: Vec<String> = extra_read
+        .iter()
+        .filter(|p| !extra_write.contains(p))
+        .flat_map(|p| denied_dotfile_override_paths(home_path, p))
+        .collect();
+    let writable: Vec<String> = extra_write
+        .iter()
+        .flat_map(|p| denied_dotfile_override_paths(home_path, p))
+        .collect();
 
-    for path in extra_read {
-        for &dotfile in DENIED_DOTFILES {
-            let denied_dir = home_path.join(dotfile);
-            let resolved_dir = resolved(denied_dir.clone());
-            let Ok(rel) = path.strip_prefix(&resolved_dir) else {
-                continue;
-            };
-            if rel.as_os_str().is_empty() {
-                continue;
-            }
-            overrides.push(path.to_string_lossy().into_owned());
-            // When `~/<dotfile>` is itself a symlink the deny names the $HOME
-            // path, and the macOS sandbox matches a rule against the path as
-            // opened — so the re-allow has to cover that form as well.
-            if resolved_dir != denied_dir {
-                overrides.push(denied_dir.join(rel).to_string_lossy().into_owned());
-            }
-            break;
-        }
+    if read_only.is_empty() && writable.is_empty() {
+        return;
     }
-
-    if !overrides.is_empty() {
-        sbpl!(
-            sb,
-            ";; User-overridden files in sensitive directories (allow.read)"
-        );
-        for path in &overrides {
-            sbpl!(sb, "(allow file-read* (literal \"{path}\"))");
-        }
-        sbpl!(sb);
+    sbpl!(
+        sb,
+        ";; User-overridden files in sensitive directories (allow.read / allow.write)"
+    );
+    for path in &read_only {
+        sbpl!(sb, "(allow file-read* (literal \"{path}\"))");
     }
+    for path in &writable {
+        sbpl!(sb, "(allow file-read* (literal \"{path}\"))");
+        sbpl!(sb, "(allow file-write* (literal \"{path}\"))");
+    }
+    sbpl!(sb);
 }
 
 /// Allow GPG commit signing when `--allow-gpg-signing` is set.
@@ -2125,6 +2160,78 @@ mod tests {
             r#"(deny file-write* (literal "/projects/app/.git/config"))"#,
         ] {
             assert!(p.contains(rule), "MISSING without git_common_dir: {rule}");
+        }
+    }
+
+    /// `allow.write` on a file inside a `DENIED_DOTFILES` directory must reach
+    /// the profile as a post-deny re-allow, exactly as `allow.read` does.
+    ///
+    /// The concrete case: stock `ssh` appends to `~/.ssh/known_hosts` on a first
+    /// connection under the default `StrictHostKeyChecking`. Before this, the
+    /// write grant was emitted by `emit_user_allows` — i.e. *before*
+    /// `emit_deny_rules` — lost to the subpath deny, and did nothing at all on
+    /// macOS while working on Linux. Verified against the live sandbox with
+    /// `cplt check path --write`, which reported the model/probe mismatch.
+    ///
+    /// Read comes with write deliberately: a grant that can write a file it
+    /// cannot read is not a usable grant, and `emit_user_allows` pairs them the
+    /// same way.
+    #[test]
+    fn profile_extra_write_overrides_a_denied_dotfile_file() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let granted = [PathBuf::from("/Users/test/.ssh/known_hosts")];
+        let mut opts = test_options(project, home);
+        opts.extra_write = &granted;
+        let p = generate_profile(&opts);
+
+        let deny = p
+            .find(r#"(deny file-write* (subpath "/Users/test/.ssh"))"#)
+            .expect("the blanket ~/.ssh write deny must still be emitted");
+        for rule in [
+            r#"(allow file-read* (literal "/Users/test/.ssh/known_hosts"))"#,
+            r#"(allow file-write* (literal "/Users/test/.ssh/known_hosts"))"#,
+        ] {
+            let at = p
+                .find(rule)
+                .unwrap_or_else(|| panic!("missing post-deny re-allow: {rule}"));
+            assert!(
+                at > deny,
+                "re-allow must come AFTER the subpath deny (SBPL last-match-wins): {rule}"
+            );
+        }
+        // Scoped to the granted file: a sibling key stays denied.
+        assert!(
+            !p.contains(r#"(literal "/Users/test/.ssh/id_ed25519")"#),
+            "a write grant must not reopen anything but the file it names:\n{p}"
+        );
+    }
+
+    /// A grant naming the directory itself is not an override. `sandbox::prepare`
+    /// refuses such a run outright (#291), and this is the second line: even if
+    /// one reached `generate_profile`, it must not turn into a subpath re-allow
+    /// that reopens every key in `~/.ssh`.
+    #[test]
+    fn profile_never_reopens_a_denied_dotfile_directory_itself() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let granted = [PathBuf::from("/Users/test/.ssh")];
+        for (read, write) in [(true, false), (false, true)] {
+            let mut opts = test_options(project, home);
+            if read {
+                opts.extra_read = &granted;
+            }
+            if write {
+                opts.extra_write = &granted;
+            }
+            let p = generate_profile(&opts);
+            let deny = p
+                .find(r#"(deny file-read* (subpath "/Users/test/.ssh"))"#)
+                .expect("the blanket ~/.ssh deny must still be emitted");
+            assert!(
+                !p[deny..].contains(r#"(literal "/Users/test/.ssh")"#),
+                "a directory grant must produce no post-deny re-allow:\n{p}"
+            );
         }
     }
 

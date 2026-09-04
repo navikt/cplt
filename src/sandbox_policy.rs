@@ -44,9 +44,49 @@ pub const DENIED_FILES: &[&str] = &[".netrc", ".pypirc", ".gem/credentials", ".v
 /// `resolve_config_path`) while `$HOME/.netrc` may be a symlink into a
 /// dotfiles repo — comparing the unresolved forms would miss the match.
 pub fn hard_denied_file(home: &Path, path: &Path) -> Option<&'static str> {
+    denied_entry(DENIED_FILES, home, path)
+}
+
+/// The [`DENIED_DOTFILES`] directory `path` names, if any.
+///
+/// Exact directory match only. A path *inside* one of these directories is a
+/// supported override on both backends — macOS re-allows it after the blanket
+/// deny (`emit_denied_dotfile_overrides`), Linux emits it as a plain rule — and
+/// must not match here.
+///
+/// The directory itself is refused (#291). macOS could never honour it: the
+/// generic `allow.read` is emitted before the subpath deny and loses to it, so
+/// the grant sat in config looking effective and did nothing. Linux did honour
+/// it, handing an agent every key in `~/.ssh` on the strength of one config
+/// line. Refusing is the only answer both backends give alike, and it leaves
+/// the per-file grant — which works on both — as the way in.
+///
+/// Canonicalized on both sides for the same reason [`hard_denied_file`] is:
+/// grants arrive canonicalized while `~/.ssh` may be a symlink into a dotfiles
+/// repo, and comparing the unresolved forms would miss the match.
+///
+/// `--allow-docker`'s read-only `~/.docker` grant is unaffected: it is a
+/// first-party rule emitted by the backends, never a user grant on this path.
+pub fn denied_dotfile_dir(home: &Path, path: &Path) -> Option<&'static str> {
+    denied_entry(DENIED_DOTFILES, home, path)
+}
+
+/// Whether a grant on `path` must never reach a backend ruleset.
+///
+/// `sandbox::prepare` refuses both classes before a run starts; the backends
+/// consult this too, so the invariant holds for every caller of
+/// `generate_policy` and not only the ones that went through `prepare`.
+#[must_use]
+pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
+    hard_denied_file(home, path).is_some() || denied_dotfile_dir(home, path).is_some()
+}
+
+/// Exact-path membership of `path` in a `$HOME`-relative deny list, comparing
+/// the literal and the canonicalized form.
+fn denied_entry(list: &[&'static str], home: &Path, path: &Path) -> Option<&'static str> {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let resolved = canon(path);
-    DENIED_FILES.iter().copied().find(|f| {
+    list.iter().copied().find(|f| {
         let denied = home.join(f);
         path == denied || resolved == canon(&denied)
     })
