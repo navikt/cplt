@@ -49,6 +49,18 @@ pub fn generate_profile(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> S
 /// a grant pointing inside a repo (`discover::git_dir_of`). Deny-only: the
 /// profile never *grants* access to them, it only places the protected-path
 /// denies there so a sibling repo cannot be used for hook persistence (#212).
+///
+/// # Every path here is interpolated, not validated
+///
+/// This function does no SBPL-injection checking, on `extra_git_dirs` or on any
+/// path in `config`. That is the module contract and predates this signature:
+/// `sandbox::prepare` runs `validate_config_paths` and `validate_sbpl_path` over
+/// every path — `extra_git_dirs` included — *before* calling in, and it is the
+/// only production caller. Re-checking here cannot improve on that, because the
+/// return type is a `String` with no error channel: a rejected path could only
+/// be dropped silently, which fails open and is worse than not checking. Call
+/// `prepare` rather than this directly; the `pub` is for unit tests that assert
+/// on profile text.
 pub fn generate_profile_with_playwright_socket_dir(
     config: &SandboxConfig,
     extra_git_dirs: &[PathBuf],

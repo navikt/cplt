@@ -421,7 +421,7 @@ mod macos_tests {
     // ============================================================
     // Real-profile integration tests
     //
-    // These use generate_profile(, &[]) to produce the REAL shipped profile,
+    // These use generate_profile() to produce the REAL shipped profile,
     // then verify kernel enforcement via sandbox-exec. This tests the
     // full pipeline: profile generation → SBPL → kernel enforcement.
     // ============================================================
