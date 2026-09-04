@@ -291,3 +291,222 @@ fn worktree_scope_content_filter_is_detected() {
         "worktree-scope filter.evil.clean executed in the parent process"
     );
 }
+
+// ── Git guard: a setting that cannot be honoured grants nothing (#215) ──
+//
+// Both properties below are instances of the "no silent grants" rule in
+// AGENTS.md and SECURITY.md: an authorization the guard cannot *prove* must be
+// refused, not extended on the strength of a name.
+
+use cplt::config::ResolvedPushRule;
+use cplt::gh_proxy::gate_git;
+
+/// A repo whose `origin` is `url`, checked out on `branch`, recording `default`
+/// as the remote's default branch (`None`: never recorded, as in a fetch-only
+/// clone). `None` when git is unavailable.
+fn guard_repo(url: &str, branch: &str, default: Option<&str>) -> Option<tempfile::TempDir> {
+    let tmp = tempfile::tempdir().ok()?;
+    let dir = tmp.path();
+    if !common::git_ok(dir, &["init", "--quiet"]) {
+        return None;
+    }
+    assert!(common::git_ok(
+        dir,
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")]
+    ));
+    assert!(common::git_ok(dir, &["remote", "add", "origin", url]));
+    if let Some(default) = default {
+        assert!(common::git_ok(
+            dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{default}"),
+            ]
+        ));
+    }
+    Some(tmp)
+}
+
+fn git_bin() -> PathBuf {
+    common::binary_in_path("git")
+}
+
+/// An `allow_push` rule whose remote name could not be pinned to a URL at
+/// launch matches nothing — in *any* repository.
+///
+/// Two repositories, each with a remote called `origin`, pointing at different
+/// URLs. Matching such a rule by bare name authorizes a push to whichever repo
+/// the command happens to target, which is the cross-repo grant #215 exists to
+/// prevent; the single-repo case cannot tell the two behaviours apart.
+#[test]
+fn an_unpinned_allow_push_rule_authorizes_no_repository() {
+    let Some(launch) = guard_repo("https://github.com/navikt/cplt.git", "main", Some("main"))
+    else {
+        return; // no git available
+    };
+    let Some(other) = guard_repo("https://github.com/someone/else.git", "main", Some("main"))
+    else {
+        return;
+    };
+    let git = git_bin();
+
+    // Written for the launch repo's `origin`, but pinning failed at launch.
+    let unpinned = ResolvedPushRule {
+        remote: Some("origin".to_string()),
+        branches: vec!["main".to_string()],
+        force: false,
+        url: None,
+    };
+
+    for repo in [launch.path(), other.path()] {
+        let dir = repo.to_string_lossy().into_owned();
+        let err = gate_git(
+            &["-C", &dir, "push", "origin", "main"],
+            true,
+            true,
+            false,
+            std::slice::from_ref(&unpinned),
+            Some(&git),
+        )
+        .expect_err("an unpinned rule must authorize nothing");
+        assert!(
+            err.contains("pinned to a repository URL"),
+            "the block must say the rule could not be pinned, got: {err}"
+        );
+    }
+
+    // Control: pinned to the launch repo, the same rule authorizes the push
+    // there and only there.
+    let pinned = ResolvedPushRule {
+        url: Some(cplt::trust::normalize_remote_url(
+            "https://github.com/navikt/cplt.git",
+        )),
+        ..unpinned
+    };
+    let launch_dir = launch.path().to_string_lossy().into_owned();
+    let other_dir = other.path().to_string_lossy().into_owned();
+    assert!(
+        gate_git(
+            &["-C", &launch_dir, "push", "origin", "main"],
+            true,
+            true,
+            false,
+            std::slice::from_ref(&pinned),
+            Some(&git),
+        )
+        .is_ok(),
+        "a pinned rule must still authorize its own repository"
+    );
+    assert!(
+        gate_git(
+            &["-C", &other_dir, "push", "origin", "main"],
+            true,
+            true,
+            false,
+            std::slice::from_ref(&pinned),
+            Some(&git),
+        )
+        .is_err(),
+        "a pinned rule must not authorize another repository's origin"
+    );
+}
+
+/// `protect_default_branch_only` protects the repository's *actual* default
+/// branch, not a hardcoded `main`/`master`.
+#[test]
+fn protect_default_branch_only_protects_a_default_that_is_not_main() {
+    let Some(repo) = guard_repo("https://github.com/o/o.git", "develop", Some("develop")) else {
+        return; // no git available
+    };
+    let git = git_bin();
+    let dir = repo.path().to_string_lossy().into_owned();
+    let gate = |branch: &str| {
+        gate_git(
+            &["-C", &dir, "push", "origin", branch],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+        )
+    };
+
+    assert!(
+        gate("develop").is_err(),
+        "the repository's default branch must be protected"
+    );
+    assert!(
+        gate("main").is_err(),
+        "main/master stay protected as a floor"
+    );
+    assert!(
+        gate("feature/x").is_ok(),
+        "a feature branch is still allowed"
+    );
+
+    // A bare `git push` on the default branch is blocked too — the branch is
+    // resolved from HEAD, the default from the remote, both in this repo.
+    assert!(
+        gate_git(&["-C", &dir, "push"], true, true, true, &[], Some(&git)).is_err(),
+        "bare push while on the default branch must be blocked"
+    );
+}
+
+/// Each repository is judged by its own default branch, including through `-C`.
+#[test]
+fn the_default_branch_is_resolved_in_the_repo_the_command_targets() {
+    let Some(develop) = guard_repo("https://github.com/o/dev.git", "develop", Some("develop"))
+    else {
+        return; // no git available
+    };
+    let Some(mainline) = guard_repo("https://github.com/o/main.git", "main", Some("main")) else {
+        return;
+    };
+    let git = git_bin();
+    let gate = |repo: &Path| {
+        let dir = repo.to_string_lossy().into_owned();
+        gate_git(
+            &["-C", &dir, "push", "origin", "develop"],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+        )
+    };
+
+    assert!(
+        gate(develop.path()).is_err(),
+        "develop is the default branch there"
+    );
+    assert!(
+        gate(mainline.path()).is_ok(),
+        "develop is an ordinary feature branch there"
+    );
+}
+
+/// When the default branch cannot be resolved the relaxation is refused rather
+/// than guessed: `protect_default_branch_only` only permits a push it can prove
+/// is *not* to the default branch.
+#[test]
+fn protect_default_branch_only_grants_nothing_when_the_default_is_unknown() {
+    let Some(repo) = guard_repo("https://github.com/o/o.git", "feature/x", None) else {
+        return; // no git available
+    };
+    let git = git_bin();
+    let dir = repo.path().to_string_lossy().into_owned();
+    let err = gate_git(
+        &["-C", &dir, "push", "origin", "feature/x"],
+        true,
+        true,
+        true,
+        &[],
+        Some(&git),
+    )
+    .expect_err("no resolved default branch means no push is proven safe");
+    assert!(
+        err.contains("git remote set-head"),
+        "the block must say how to record the default branch, got: {err}"
+    );
+}

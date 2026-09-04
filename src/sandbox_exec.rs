@@ -577,8 +577,8 @@ fn install_command_wrappers(
         // Pinning requires `trusted_git`, not the PATH git the wrapper itself
         // uses: this call runs in the UNSANDBOXED parent, where a planted git
         // would execute as the user. With no trusted git the rules stay
-        // unpinned and keep matching by name — the pre-#215 behavior — so the
-        // operator is warned rather than left assuming the stronger guarantee.
+        // unpinned, and an unpinned rule authorizes nothing, so the operator is
+        // warned rather than left with a rule that silently does not apply.
         let mut git_guard = git_guard.clone();
         if !git_guard.allow_push.is_empty() {
             if let Some(trusted) = crate::git::trusted_git() {
@@ -593,16 +593,18 @@ fn install_command_wrappers(
                     {
                         ui::warn(&format!(
                             "git guard: allow_push remote {name:?} does not exist in this \
-                             repository, so the rule matches by name and also applies to a \
-                             remote called {name:?} in another repository."
+                             repository, so the rule cannot be pinned to a repository and \
+                             authorizes no push. Add the remote before launch \
+                             (`git remote add {name} <url>`), or drop the rule."
                         ));
                     }
                 }
             } else {
                 ui::warn(
                     "git guard could not find a trusted Git to pin allow_push remotes to \
-                     their URLs. Those rules will match by remote name, so they also apply \
-                     to a same-named remote in another repository.",
+                     their URLs. Rules naming a remote authorize no push until they can be \
+                     pinned — a bare remote name would also match a same-named remote in \
+                     another repository.",
                 );
             }
         }
