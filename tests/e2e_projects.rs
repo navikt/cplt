@@ -1447,6 +1447,14 @@ if /bin/rm -rf test-spawn-dir 2>/dev/null; then echo "RESULT:exec_rm:OK"; else e
     ///
     /// Each command's stderr is echoed on failure. Without it a broken wrapper
     /// reports `FAIL` and nothing about why, which is how this went unnoticed.
+    ///
+    /// This discriminates only while the machine's `xcode-select` points
+    /// somewhere other than the literal `/Applications/Xcode.app`, which is the
+    /// one path `TOOL_READ_DIRS` grants. On a runner whose `xcode-select` is
+    /// that exact path, `/usr/bin/git`'s xcrun shim works inside the sandbox
+    /// under the existing grant, and this test would go green even with the
+    /// wrapper resolving the shim again. The push assertion is what keeps it
+    /// honest about the *wrapper*; the shim grant itself is a separate bug.
     #[test]
     fn project_git_read_ops_work_under_the_git_guard() {
         require_sandbox!();
@@ -1469,6 +1477,15 @@ run_git git_version --version
 run_git git_status status
 run_git git_log log --oneline -1
 run_git git_branch branch
+
+# Proof the wrapper is actually in play, not that git works without it.
+if git push origin main >/dev/null 2>push-err.txt; then
+    echo "RESULT:git_push:ALLOWED"
+else
+    echo "RESULT:git_push:REFUSED"
+    sed 's/^/PUSHERR: /' push-err.txt
+fi
+rm -f push-err.txt
 "#;
         let fake_dir = create_fake_copilot(&project, script);
         let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--git-guard"]);
@@ -1481,6 +1498,23 @@ run_git git_branch branch
         assert_result_ok(&stdout, "git_status");
         assert_result_ok(&stdout, "git_log");
         assert_result_ok(&stdout, "git_branch");
+
+        // Without this the test passes vacuously. `install_command_wrappers`
+        // installs nothing and warns about nothing when it cannot resolve a
+        // git, so the agent would get its bare PATH git and all four
+        // assertions above would still pass — proving only that git works,
+        // which was never in doubt.
+        //
+        // The exit status alone would not discriminate either: this project has
+        // no `origin`, so an unguarded push also fails, just with git's own
+        // "does not appear to be a git repository". Only the guard's own
+        // refusal text proves the wrapper ran and decided.
+        assert!(
+            stdout.contains("PUSHERR: \u{26a0}\u{fe0f} BLOCKED by sandbox"),
+            "the guard must have refused the push — without its refusal in the \
+             output the read-only assertions above prove nothing about the \
+             wrapper.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
     }
 
     #[test]
