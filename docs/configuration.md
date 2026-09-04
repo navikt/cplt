@@ -111,6 +111,8 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.yes` | local prompt-skip preference |
 | `sandbox.validate` | local launch behavior |
 | `sandbox.scratch_dir` | local temp handling |
+| `sandbox.brief` | local agent-context preference |
+| `sandbox.agents_md` | a repo must not be able to make cplt write into its own `AGENTS.md` |
 | `sandbox.use_bubblewrap` | depends on bwrap being installed on the machine |
 | `sandbox.pass_env` | machine-specific env passthrough |
 | `sandbox.audit` | local output preference, not project sandbox policy |
@@ -165,6 +167,64 @@ cplt config explain proxy.forced
 For arrays of objects, multi-line values, and other complex configuration, edit the file directly and run `cplt config validate` afterwards.
 
 **Dotted keys:** a dotted key belongs to whatever section header precedes it. `allow.read = [...]` is valid on its own — above every header, or written as `read = [...]` under `[allow]` — but the same line below `[git_guard]` means `git_guard.allow.read`. cplt then sees an unknown key and ignores it, with a warning at launch and an error from `cplt config validate`, so the grant never takes effect.
+
+## Agent sandbox brief (`sandbox.brief`, `sandbox.agents_md`) — EXPERIMENTAL
+
+> **EXPERIMENTAL.** Both keys, and the `--brief` / `--no-brief` /
+> `--agents-md` / `--no-agents-md` flags, are
+> unstable: their names, defaults and output are not covered by any stability
+> guarantee and may change or be removed in a future release. Don't build
+> tooling on the brief's wording or on the AGENTS.md block's markers.
+
+An agent inside the sandbox has no way of knowing it is sandboxed: it hits
+`EPERM`, assumes a bug, and retries. cplt can hand it the answer up front, in
+two layers. Both are off by default — cplt writing files that an agent then
+reads is a behaviour change, so you ask for it.
+
+**`sandbox.brief` (default `false`)** — writes `CPLT_BRIEF.md` into the
+per-session scratch directory (the one `$TMPDIR` points at inside the sandbox).
+It is rendered from the resolved policy for *that* launch — network mode,
+`.env` handling, credential denies — and disappears with the scratch dir when
+the session ends. It never touches your project. Turn it on for one run with
+`--brief`, or for good with `cplt config set sandbox.brief true`.
+
+**`sandbox.agents_md` (default `false`)** — additionally injects a managed
+block into `<project>/AGENTS.md`, creating the file if it does not exist. This
+writes into your repository, so it is a second opt-in on top of the first:
+
+- The block is delimited by `<!-- cplt:sandbox begin -->` /
+  `<!-- cplt:sandbox end -->` markers. Re-runs replace it in place; content
+  outside the markers is never touched.
+- It contains no policy detail from your machine — the same generic text for
+  every repo, safe to commit.
+- It is written only on an actual agent launch, after the confirmation prompt.
+  `--print-profile`, `cplt check`, `cplt exec` and a declined prompt leave the
+  repo untouched.
+- Skipped outside a git work tree, and skipped with a warning if the file
+  somehow ends up with more than one marker pair.
+- It requires `sandbox.brief` as well. With the brief off — the default — the
+  AGENTS.md block is never written, whatever `agents_md` says.
+
+Turn both on for one run, or globally:
+
+```bash
+cplt --brief --agents-md            # this launch only
+cplt config set sandbox.brief true  # every launch
+cplt config set sandbox.agents_md true
+```
+
+And back off again for a single run, without editing the config:
+
+```bash
+cplt --no-brief       # no CPLT_BRIEF.md, and no AGENTS.md block either
+cplt --no-agents-md   # keep the brief, leave the repository alone
+```
+
+The flag always beats the config key, in both directions. `--no-brief` covers
+both layers because the AGENTS.md block is gated on the brief.
+
+Both are global-only keys — a repository cannot ask cplt to write into its own
+`AGENTS.md`.
 
 ## Per-repo configuration (`.cplt.toml`)
 

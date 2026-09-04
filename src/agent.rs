@@ -2498,16 +2498,33 @@ mod tests {
         // vector: the sandboxed agent plants an extension, it runs unsandboxed
         // on the user's next launch. No write_files carve-out either — goose
         // rewrites those files by rename, which needs directory write.
-        let dirs = Agent::Goose.config_dirs(Path::new("/Users/test"));
-        let config_dir = dirs
-            .iter()
-            .find(|d| d.path.ends_with("goose") && d.path.to_string_lossy().contains("config"))
-            .expect("goose config dir");
-        assert!(!config_dir.write, "goose config dir must stay read-only");
-        assert!(
-            config_dir.write_files.is_empty(),
-            "no write_files carve-out: goose writes config.yaml by rename, \
-             which needs directory write and would reopen the vector"
+        // Guarded: `config_dirs` reads XDG_CONFIG_HOME, and `temp_env` mutates
+        // the real process environment, so an unguarded read here races every
+        // other test in this binary that sets it. On a runner with
+        // XDG_CONFIG_HOME pointing somewhere without "config" in the path, the
+        // `find` returns None and this panics — which is how it failed CI once
+        // there were enough tests to change the scheduling.
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", None::<&str>),
+                ("XDG_DATA_HOME", None),
+                ("XDG_STATE_HOME", None),
+            ],
+            || {
+                let dirs = Agent::Goose.config_dirs(Path::new("/Users/test"));
+                let config_dir = dirs
+                    .iter()
+                    .find(|d| {
+                        d.path.ends_with("goose") && d.path.to_string_lossy().contains("config")
+                    })
+                    .expect("goose config dir");
+                assert!(!config_dir.write, "goose config dir must stay read-only");
+                assert!(
+                    config_dir.write_files.is_empty(),
+                    "no write_files carve-out: goose writes config.yaml by rename, \
+                     which needs directory write and would reopen the vector"
+                );
+            },
         );
     }
 
