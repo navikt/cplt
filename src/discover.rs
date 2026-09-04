@@ -313,8 +313,19 @@ pub fn discover_agents() -> Vec<AgentInfo> {
 // ── Tool discovery ──────────────────────────────────────────────
 
 const TOOLS_TO_CHECK: &[&str] = &[
-    "gh", "git", "node", "cargo", "python3", "java", "go", "gradle", "yarn",
+    "gh", "git", "node", "npm", "cargo", "python3", "java", "go", "gradle", "yarn",
 ];
+
+/// Tools whose Windows-side resolution under WSL is a hard failure, not a
+/// warning.
+///
+/// These are the tools cplt itself and the agents depend on: a Windows `npm`
+/// installs the win32 platform package into the Windows tree, which is exactly
+/// how a user ended up with a Copilot CLI that could not start (#271). The
+/// build tools (`gradle`, `yarn`, `java`, ...) are only warned about: a build
+/// started from one runs as a Windows process outside the sandbox, which is
+/// worth saying but is not a broken install.
+const WSL_CRITICAL_TOOLS: &[&str] = &["gh", "git", "node", "npm"];
 
 use crate::sandbox::app_dirs;
 use crate::sandbox::home_tool_dirs;
@@ -433,6 +444,58 @@ pub fn discover_all(home_dir: &Path, project_dir: &Path) -> Discovery {
 }
 
 // ── Reporting ───────────────────────────────────────────────────
+
+/// The lines doctor prints for the discovered tools, and whether they leave the
+/// critical checks passing.
+///
+/// Split out of `print_report` so a test can assert on what doctor actually
+/// emits for a Windows-side tool, not merely on the predicate in isolation.
+///
+/// Under WSL, interop appends the Windows `PATH` after the distro's, so a tool
+/// only resolves to `/mnt/<drive>/…` when no Linux-side install exists. Such a
+/// binary cannot run in the Linux namespace and cannot be sandboxed by
+/// Landlock, so printing an unconditional green tick for it was how doctor
+/// concluded "all critical checks passed" for a setup that could not work
+/// (#271). Same predicate, and the same reasoning, as the agents loop above.
+fn tool_lines(tools: &[ToolInfo], wsl: bool) -> (Vec<String>, bool) {
+    let mut critical_ok = true;
+    let lines = tools
+        .iter()
+        .map(|tool| {
+            if !crate::agent::is_wsl_interop_binary(&tool.path, wsl) {
+                return format!(
+                    "  {}\u{2713}{} {}: {}",
+                    ui::stdout_color(ui::GREEN),
+                    ui::stdout_color(ui::RESET),
+                    tool.name,
+                    tool.path.display()
+                );
+            }
+            if WSL_CRITICAL_TOOLS.contains(&tool.name.as_str()) {
+                critical_ok = false;
+                format!(
+                    "  {}\u{2717}{} {}: {} is a Windows install reached through WSL interop \
+                     and cannot run in the Linux sandbox. Install {} inside the WSL distro.",
+                    ui::stdout_color(ui::RED),
+                    ui::stdout_color(ui::RESET),
+                    tool.name,
+                    tool.path.display(),
+                    tool.name
+                )
+            } else {
+                format!(
+                    "  {}\u{26a0}{} {}: {} is a Windows install reached through WSL interop; \
+                     a build started from it runs as a Windows process, outside the sandbox.",
+                    ui::stdout_color(ui::YELLOW),
+                    ui::stdout_color(ui::RESET),
+                    tool.name,
+                    tool.path.display()
+                )
+            }
+        })
+        .collect();
+    (lines, critical_ok)
+}
 
 impl Discovery {
     /// Print a human-readable diagnostic report. Returns true if all critical checks pass.
@@ -606,15 +669,14 @@ impl Discovery {
             ui::stdout_color(ui::BOLD),
             ui::stdout_color(ui::RESET)
         );
-        for tool in &self.tools.tools {
-            println!(
-                "  {}✓{} {}: {}",
-                ui::stdout_color(ui::GREEN),
-                ui::stdout_color(ui::RESET),
-                tool.name,
-                tool.path.display()
-            );
+        let (tool_lines, tools_ok) = tool_lines(
+            &self.tools.tools,
+            cfg!(target_os = "linux") && crate::agent::is_wsl(),
+        );
+        for line in &tool_lines {
+            println!("{line}");
         }
+        critical_ok &= tools_ok;
         let missing: Vec<&&str> = TOOLS_TO_CHECK
             .iter()
             .filter(|name| !self.tools.tools.iter().any(|t| t.name == **name))
@@ -2098,5 +2160,71 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/Visual Studio Code.app/Contents/Frameworks
         // Non-zero exit is "ran, said nothing useful" — not a timeout.
         let bad = fake_binary(dir.path(), "broken", "exec false");
         assert_eq!(probe_version(&bad, &["--version"]), VersionProbe::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod wsl_tool_report_tests {
+    use super::*;
+
+    fn tool(name: &str, path: &str) -> ToolInfo {
+        ToolInfo {
+            name: name.to_string(),
+            path: PathBuf::from(path),
+        }
+    }
+
+    /// The doctor line itself, not the predicate: a Windows-side `npm` must be
+    /// graded red and must fail the critical checks (#271).
+    #[test]
+    fn windows_side_critical_tool_is_reported_red_and_fails_critical() {
+        let tools = vec![tool("npm", "/mnt/c/Users/N129069/AppData/Roaming/npm/npm")];
+        let (lines, ok) = tool_lines(&tools, true);
+        assert!(!ok, "a Windows-side npm must fail the critical checks");
+        assert!(
+            lines[0].contains('\u{2717}') && !lines[0].contains('\u{2713}'),
+            "expected a red cross, got: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("/mnt/c/Users/N129069/AppData/Roaming/npm/npm"),
+            "the line must name the offending path, got: {}",
+            lines[0]
+        );
+    }
+
+    /// A build tool is only warned about — it is not a broken install.
+    #[test]
+    fn windows_side_build_tool_is_warned_not_failed() {
+        let tools = vec![tool(
+            "gradle",
+            "/mnt/c/apps/Gradle/gradle-8.10.2/bin/gradle",
+        )];
+        let (lines, ok) = tool_lines(&tools, true);
+        assert!(
+            ok,
+            "a Windows-side gradle is a warning, not a critical failure"
+        );
+        assert!(
+            lines[0].contains('\u{26a0}'),
+            "expected a warning sign, got: {}",
+            lines[0]
+        );
+    }
+
+    /// Off WSL, `/mnt/c` is an ordinary mount and the tool is fine.
+    #[test]
+    fn mnt_path_outside_wsl_stays_green() {
+        let tools = vec![tool("npm", "/mnt/c/npm")];
+        let (lines, ok) = tool_lines(&tools, false);
+        assert!(ok);
+        assert!(lines[0].contains('\u{2713}'), "got: {}", lines[0]);
+    }
+
+    /// npm is the tool the reporter actually tripped over, so it has to be
+    /// probed at all (#271).
+    #[test]
+    fn npm_is_checked() {
+        assert!(TOOLS_TO_CHECK.contains(&"npm"));
     }
 }
