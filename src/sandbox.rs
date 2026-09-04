@@ -236,7 +236,35 @@ impl PreparedSandbox {
 /// - The platform does not support sandboxing
 pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
     validate_playwright_socket_capability(config.playwright_socket_dir)?;
+    validate_hard_denied_grants(config)?;
     prepare_impl(config, &extra_git_dirs(config.extra_write))
+}
+
+/// Refuse to launch when a grant names a file on the hard-deny list.
+///
+/// [`policy::DENIED_FILES`] is documented as not overridable, unlike
+/// [`policy::DENIED_HOME_SUBPATHS`], which `allow.read` is meant to reopen.
+/// A hard error rather than a dropped rule and a warning: the grant is written
+/// in config, it will be read back as fact, and a user who believes a rule is
+/// in force when it is not is exactly the failure this list exists to prevent.
+/// It also lands on both backends at once — silently ineffective on macOS,
+/// silently effective on Linux, which is how #207 stayed invisible.
+fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
+    for (key, paths) in [
+        ("allow.read", config.extra_read),
+        ("allow.write", config.extra_write),
+        ("allow.socket", config.extra_socket),
+    ] {
+        for p in paths {
+            if let Some(file) = policy::hard_denied_file(config.home_dir, p) {
+                return Err(format!(
+                    "{key} grants {} (~/{file}), which is on the hard-deny list and cannot be granted on any platform. Remove it from your config or command line.",
+                    p.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the real `.git` directory of every writable granted path whose repo
@@ -810,13 +838,11 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn prepare_rejects_playwright_socket_capability_off_macos() {
-        let config = SandboxConfig {
+    fn test_config<'a>(home_dir: &'a Path, grants: &'a [PathBuf]) -> SandboxConfig<'a> {
+        SandboxConfig {
             project_dir: Path::new("/project"),
-            home_dir: Path::new("/home/test"),
-            extra_read: &[],
+            home_dir,
+            extra_read: grants,
             extra_write: &[],
             extra_socket: &[],
             extra_deny: &[],
@@ -830,9 +856,7 @@ mod tests {
             allow_localhost_any: false,
             scratch_dir: None,
             keychain_substitute: None,
-            playwright_socket_dir: Some(Path::new(
-                "/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef",
-            )),
+            playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
             java_home: None,
@@ -851,13 +875,63 @@ mod tests {
             allow_cache_exec_any: false,
             allow_browser: false,
             use_bubblewrap: None,
-        };
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn prepare_rejects_playwright_socket_capability_off_macos() {
+        let mut config = test_config(Path::new("/home/test"), &[]);
+        config.playwright_socket_dir = Some(Path::new(
+            "/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef",
+        ));
 
         let error = prepare(&config).err().expect("non-macOS must fail closed");
         assert_eq!(
             error,
             "Playwright socket directories are supported only on macOS; refusing configured path"
         );
+    }
+
+    /// `DENIED_FILES` is documented as not overridable. A grant naming one is a
+    /// config error, not a rule to drop quietly — see
+    /// [`validate_hard_denied_grants`]. Same answer on both backends (#207).
+    #[test]
+    fn prepare_rejects_a_grant_on_a_hard_denied_file() {
+        let home = Path::new("/home/test");
+        for &file in policy::DENIED_FILES {
+            let granted = vec![home.join(file)];
+
+            let mut config = test_config(home, &granted);
+            let error = prepare(&config).err().expect("allow.read must be refused");
+            assert!(error.contains("allow.read"), "{error}");
+            assert!(error.contains(file), "{error}");
+
+            config.extra_read = &[];
+            config.extra_write = &granted;
+            let error = prepare(&config).err().expect("allow.write must be refused");
+            assert!(error.contains("allow.write"), "{error}");
+
+            config.extra_write = &[];
+            config.extra_socket = &granted;
+            let error = prepare(&config)
+                .err()
+                .expect("allow.socket must be refused");
+            assert!(error.contains("allow.socket"), "{error}");
+        }
+    }
+
+    /// The overridable list keeps working: refusing these would be a regression.
+    #[test]
+    fn prepare_accepts_a_grant_on_an_overridable_credential_file() {
+        let home = Path::new("/home/test");
+        let granted: Vec<PathBuf> = policy::DENIED_HOME_SUBPATHS
+            .iter()
+            .map(|f| home.join(f))
+            .collect();
+
+        let config = test_config(home, &granted);
+        assert_eq!(validate_hard_denied_grants(&config), Ok(()));
     }
 
     /// The invariant behind [`crate::git::TRUSTED_BIN_DIRS`], not just its

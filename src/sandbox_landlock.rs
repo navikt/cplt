@@ -535,7 +535,15 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     }
 
     // ── Extra read paths from config ──
+    // Hard-denied files (policy::DENIED_FILES) are filtered out: Landlock is
+    // grant-only, so a grant on ~/.netrc has no deny to lose to and would make
+    // the documented "not overridable" guarantee false on Linux only (#207).
+    // `prepare()` rejects such a grant before we get here — this keeps the
+    // ruleset invariant true for every caller of `generate_policy`.
     for p in config.extra_read {
+        if policy::hard_denied_file(home, p).is_some() {
+            continue;
+        }
         fs_rules.push(FsRule {
             path: p.clone(),
             access: FsAccess {
@@ -549,6 +557,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     // ── Extra write paths from config ──
     for p in config.extra_write {
+        if policy::hard_denied_file(home, p).is_some() {
+            continue;
+        }
         fs_rules.push(FsRule {
             path: p.clone(),
             access: FsAccess {
@@ -562,6 +573,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     // ── Extra socket paths from config ──
     for p in config.extra_socket {
+        if policy::hard_denied_file(home, p).is_some() {
+            continue;
+        }
         fs_rules.push(FsRule {
             path: p.clone(),
             access: FsAccess {
@@ -1919,17 +1933,58 @@ mod tests {
         );
     }
 
+    /// Landlock is grant-only: nothing emits a deny for a `DENIED_FILES` entry,
+    /// the path is simply never granted. So the interesting case is not the
+    /// default config — it is a user who explicitly asked for the path. Before
+    /// #207 that grant went into the ruleset unfiltered and won, which made the
+    /// documented "not overridable" guarantee false on Linux while this test
+    /// still passed.
     #[test]
     fn denied_files_not_in_ruleset() {
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
-        let config = test_config(&project, &home);
+        let granted: Vec<PathBuf> = policy::DENIED_FILES.iter().map(|f| home.join(f)).collect();
+
+        let mut config = test_config(&project, &home);
+        config.extra_read = &granted;
+        config.extra_write = &granted;
+        config.extra_socket = &granted;
         let policy = generate_policy(&config);
 
         for file in policy::DENIED_FILES {
             let path = home.join(file);
             let found = policy.fs_rules.iter().any(|r| r.path == path);
-            assert!(!found, "denied file {file} should NOT be in ruleset");
+            assert!(
+                !found,
+                "denied file {file} should NOT be in ruleset even when granted"
+            );
+        }
+    }
+
+    /// The other half of the guarantee: `DENIED_HOME_SUBPATHS` is documented as
+    /// overridable, so an `allow.read` on one must still produce a grant.
+    /// Filtering it here would be a regression, not a fix.
+    #[test]
+    fn denied_home_subpath_grant_survives() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let granted: Vec<PathBuf> = policy::DENIED_HOME_SUBPATHS
+            .iter()
+            .map(|f| home.join(f))
+            .collect();
+
+        let mut config = test_config(&project, &home);
+        config.extra_read = &granted;
+        let policy = generate_policy(&config);
+
+        for file in policy::DENIED_HOME_SUBPATHS {
+            let path = home.join(file);
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == path)
+                .unwrap_or_else(|| panic!("overridable file {file} should be granted"));
+            assert!(rule.access.read);
         }
     }
 

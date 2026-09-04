@@ -116,8 +116,8 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read `~/.kube`, `~/.docker`, `~/.nais` | 🔒 Kernel-blocked | |
 | Read `~/.password-store`, `~/.terraform.d` | 🔒 Kernel-blocked | |
 | Read `~/.config/gcloud`, `~/.config/op` | 🔒 Kernel-blocked | Individual files are overridable with `--allow-read`. See [Cloud credentials](docs/known-impacts.md#cloud-credential-directories) |
-| Read `~/.netrc`, `~/.pypirc`, `~/.vault-token` | 🔒 Kernel-blocked | Un-overridable on macOS. On Linux `allow.read` currently still grants these |
-| Read `~/.gem/credentials` | 🔒 Kernel-blocked | Un-overridable on macOS. On Linux `allow.read` currently still grants these |
+| Read `~/.netrc`, `~/.pypirc`, `~/.vault-token` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
+| Read `~/.gem/credentials` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | `gh` CLI destructive operations (merge, delete, release) | 🔒 Command-gated (opt-in) | `--gh-guard`, see [gh guard](docs/gh-guard.md) |
 | `git push` to remote | 🔒 Command-gated (opt-in) | `--git-guard`. Protects the default branch or blocks all pushes |
 | Child process inheritance | ✅ All restrictions apply to subprocesses | |
