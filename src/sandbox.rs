@@ -321,12 +321,22 @@ fn validate_exec_grants(config: &SandboxConfig) -> Result<(), String> {
             if !(exec.starts_with(write) || write.starts_with(exec)) {
                 continue;
             }
+            // The temp dirs cannot be narrowed — they are writable with no
+            // grant to withdraw — so that case needs its own remedy or the
+            // message tells the user to do something impossible.
+            let remedy = if source == TEMP_DIR_SOURCE {
+                "Move the tree somewhere the sandbox does not make writable, or use the \
+                 scratch dir, which is write+exec by design. `--allow-tmp-exec` opens \
+                 execute on all of temp if that is really what you want."
+            } else {
+                "Narrow one of the two so they do not overlap \u{2014} exec grants belong \
+                 on read-only tool prefixes."
+            };
             return Err(format!(
                 "allow.exec {} overlaps {source} {}: a tree that is both writable and \
                  executable lets the agent drop a binary and run it. Neither backend can \
                  subtract the write grant from the exec grant, so cplt refuses the pair \
-                 instead of pretending to. Narrow one of the two so they do not overlap \
-                 \u{2014} exec grants belong on read-only tool prefixes.",
+                 instead of pretending to. {remedy}",
                 exec.display(),
                 write.display()
             ));
@@ -377,10 +387,15 @@ fn writable_trees(config: &SandboxConfig) -> Vec<(PathBuf, &'static str)> {
     trees.extend(
         SYSTEM_TEMP_DIRS
             .iter()
-            .map(|d| (PathBuf::from(d), "the always-writable system temp dir")),
+            .map(|d| (PathBuf::from(d), TEMP_DIR_SOURCE)),
     );
     trees
 }
+
+/// Names the temp-dir collision in the refusal, and selects its remedy: a temp
+/// dir is writable with no grant to withdraw, so "narrow one of the two" is not
+/// advice a user can act on there.
+const TEMP_DIR_SOURCE: &str = "the always-writable system temp dir";
 
 /// Temp roots the backends grant write on unconditionally: Landlock seeds a
 /// read+write rule for `/tmp`, and the SBPL profile does the same for
@@ -1107,6 +1122,13 @@ mod tests {
             assert!(
                 error.contains(root),
                 "the refusal must name the temp dir it collides with: {error}"
+            );
+            // "Narrow one of the two" is not actionable for a tree that is
+            // writable with no grant to withdraw — the message must say where
+            // to put the binaries instead.
+            assert!(
+                error.contains("Move the tree") && error.contains("scratch dir"),
+                "the refusal must tell the user what to do instead: {error}"
             );
         }
     }
