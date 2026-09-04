@@ -1463,8 +1463,7 @@ mod sandbox_integration {
         Command::new("sandbox-exec")
             .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox

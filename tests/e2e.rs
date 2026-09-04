@@ -32,8 +32,7 @@ mod e2e_tests {
         Command::new("which")
             .arg("copilot")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Check if sandbox-exec can apply a trivial profile.
@@ -42,8 +41,7 @@ mod e2e_tests {
         Command::new("sandbox-exec")
             .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     /// When `CPLT_TEST_REQUIRE_SANDBOX=1` is set (CI), a missing sandbox
