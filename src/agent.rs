@@ -542,6 +542,12 @@ impl Agent {
     ///   native `.node` addons. `installed-plugins/` carries the same three
     ///   routes inside a plugin, and is denied with an unresolved cost — see
     ///   the match arm.
+    /// - Shell (fish): `config.fish` and `conf.d/` are sourced at every shell
+    ///   startup, `functions/` autoload on command-name invocation, and
+    ///   `completions/` on tab-completion; `vendor_functions.d` and
+    ///   `vendor_completions.d` are the data-dir equivalents. `fish_variables`
+    ///   stays writable so `set -U` works — a documented residual, since
+    ///   `fish_user_paths` is a PATH hijack that touches no config file.
     /// - Pi: `extensions/*.ts` and `extensions/*/index.ts` are auto-discovered
     ///   at startup (the trust gate covers only the project-local path), and
     ///   `settings.json` can name extension paths and npm/git packages, so
@@ -553,7 +559,9 @@ impl Agent {
     /// Cost: for Pi this breaks package management and every in-session
     /// setting that persists to `settings.json` — `/model` Ctrl+S,
     /// `/thinking`, `/settings`. For Copilot it breaks `/settings`, `/config`,
-    /// `/mcp add` and `/lsp`. Do those outside cplt — see SECURITY.md.
+    /// `/mcp add` and `/lsp`. For the shell it breaks `funcsave`,
+    /// `fish_config` and plugin managers that install functions. Do those
+    /// outside cplt — see SECURITY.md.
     ///
     /// Enforcement is macOS-first: Seatbelt emits these as write-denies after
     /// the dir-wide allow (last match wins). Landlock cannot sub-deny inside an
@@ -636,7 +644,37 @@ impl Agent {
             // denies are joined onto writable dirs only, so an entry here would
             // be inert anyway.) The data and state dirs hold sessions, logs and
             // downloaded model weights — nothing goose auto-executes.
-            Agent::Goose | Agent::OpenCode | Agent::Shell => &[],
+            // Shell (fish): `config.fish` and `conf.d/*.fish` are sourced at
+            // every shell startup, `functions/*.fish` autoload when a command
+            // of that name is run (a planted `git.fish` shadows git), and
+            // `completions/*.fish` are sourced on tab-completion. The data dir
+            // carries the same class: `vendor_functions.d` and
+            // `vendor_completions.d` are on `$fish_function_path` and
+            // `$fish_complete_path` by default. Each name is joined onto BOTH
+            // writable grants and the joins with no real path are inert, which
+            // is how one list covers the config dir and the data dir; for a
+            // zsh session every entry is inert, since only the data dir is
+            // granted and none of these live in it.
+            //
+            // fish writes none of them. Verified with fish 4.9: with the config
+            // dir read-only, both `fish -c` and `fish -i -c` start clean and
+            // only `set -U` fails. The cost is `funcsave`, `fish_config`, and
+            // plugin managers that install functions — do those outside cplt.
+            //
+            // `fish_variables` is deliberately NOT here, and it is a real
+            // residual: `set -U fish_user_paths /evil` prepends to PATH on the
+            // next shell with no config file touched. Denying it would break
+            // every `set -U`, which is the whole reason the directory is
+            // writable. See SECURITY.md.
+            Agent::Shell => &[
+                "config.fish",
+                "conf.d",
+                "functions",
+                "completions",
+                "vendor_functions.d",
+                "vendor_completions.d",
+            ],
+            Agent::Goose | Agent::OpenCode => &[],
         }
     }
 
@@ -752,8 +790,15 @@ impl Agent {
                 }]
             }
             Agent::Shell => {
-                // Shell needs write access to its config/data dirs for history,
-                // variables, and sourcing config files.
+                // Shell needs write access to its config/data dirs for history
+                // and universal variables. NOT for sourcing config files —
+                // sourcing needs read, and that clause was the only stated
+                // reason the *config* directory was writable at all. It stays
+                // writable for one real reason: fish rewrites `fish_variables`
+                // by temp-file-and-rename inside `$__fish_config_dir`, which
+                // needs directory write, so `set -U` fails without it. The
+                // files in there that auto-execute are write-denied instead —
+                // see `host_persistence_denies`.
                 let shell_path = std::env::var("SHELL").unwrap_or_default();
                 let shell_name = Path::new(&shell_path)
                     .file_name()
@@ -2124,9 +2169,26 @@ mod tests {
              same three routes the other entries close, so leaving it out \
              denied the front door and left the side door"
         );
+        assert_eq!(
+            Agent::Shell.host_persistence_denies(),
+            [
+                "config.fish",
+                "conf.d",
+                "functions",
+                "completions",
+                "vendor_functions.d",
+                "vendor_completions.d"
+            ],
+        );
+        assert!(
+            !Agent::Shell
+                .host_persistence_denies()
+                .contains(&"fish_variables"),
+            "fish_variables stays writable or `set -U` breaks — a documented \
+             residual, since fish_user_paths is a PATH hijack"
+        );
         assert!(Agent::Goose.host_persistence_denies().is_empty());
         assert!(Agent::OpenCode.host_persistence_denies().is_empty());
-        assert!(Agent::Shell.host_persistence_denies().is_empty());
     }
 
     /// `host_persistence_paths` is what BOTH backends consume — Seatbelt turns
