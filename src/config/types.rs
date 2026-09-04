@@ -624,6 +624,13 @@ pub struct SandboxConfig {
     /// Allow Launch Services (`open` command) for OAuth browser flows (default: false).
     /// Lets the sandboxed agent open URLs in your default browser.
     pub allow_browser: Option<bool>,
+    /// EXPERIMENTAL (default: false). Drop the macOS Keychain grant for runs
+    /// where the agent has a credential it can reach without it (#242).
+    ///
+    /// Off by default on purpose: when this misjudges an agent the user can
+    /// neither authenticate nor recover from inside the sandbox, because the
+    /// recovery path *is* the credential store the trade just removed.
+    pub keychain_substitute: Option<bool>,
     /// Enable per-session scratch directory for TMPDIR redirect (default: true).
     /// Creates an executable temp dir so tools like `go test` and `mise` can work.
     pub scratch_dir: Option<bool>,
@@ -775,6 +782,9 @@ pub struct Resolved {
     pub allow_cache_exec: Vec<String>,
     pub allow_cache_exec_any: bool,
     pub allow_browser: bool,
+    /// EXPERIMENTAL: trade the macOS Keychain grant for a credential the agent
+    /// can reach without it (`sandbox.keychain_substitute`, default false).
+    pub keychain_substitute: bool,
     pub scratch_dir: bool,
     pub use_bubblewrap: Option<bool>,
     pub quiet: bool,

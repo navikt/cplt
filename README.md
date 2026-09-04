@@ -103,7 +103,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read global git hooks (`core.hooksPath`) | ✅ Allowed (read-only, write-denied) | Auto-detected. Must be under `$HOME` with depth ≥3. Writes are explicitly blocked |
 | Commit/tag signing (`commit.gpgsign`, `tag.gpgsign`) | 🔒 Disabled | Private keys in `~/.ssh` and `~/.gnupg` are blocked, so signing is disabled via an env var override |
 | Read `~/Library/Application Support/Microsoft` | ✅ Allowed (read-only) | Device ID for telemetry |
-| Access macOS Keychain | ✅ Allowed (read+write) | The Security framework locks the db during access. Copilot uses `keytar.node` for token storage |
+| Access macOS Keychain | ⚠️ Allowed (read+write) for agents that store auth there | The grant cannot be scoped to one item, so it reaches every keychain entry the agent can unlock. Opt in to `sandbox.keychain_substitute` (EXPERIMENTAL, default off) to drop it on runs where the agent can authenticate without it — `CLAUDE_CODE_OAUTH_TOKEN` for Claude Code, an existing fallback token file for Antigravity. See [SECURITY.md](SECURITY.md#keychain-access-is-all-or-nothing) |
 | Outbound network (port 443) | ✅ Allowed | Every other port is blocked. Add extras with `--allow-port` |
 | Localhost outbound | 🔒 Kernel-blocked (macOS), ⚠️ port-based on Linux | Prevents local service access. Inbound still works for the proxy. **Linux:** Landlock rules are port numbers only and cannot tell `localhost:443` from `remote:443`, so a local service on an allowed port is reachable and there is no localhost-specific deny. Use `--with-proxy` for SSRF protection, see [Linux limitations](docs/security.md#linux) |
 | SSH agent (unix socket) | 🔒 Kernel-blocked (macOS), ⚠️ env-only on Linux | Prevents signing git operations or SSH to hosts. **Linux:** unix socket `connect()` is not gated, so the withheld `SSH_AUTH_SOCK` is the only barrier and an agent that sets it itself can use the loaded keys. `bwrap` hides the stock OpenSSH socket under `/tmp`, but not a gnome-keyring/gcr or systemd agent under `$XDG_RUNTIME_DIR`. See [Linux limitations](docs/security.md#linux) |
@@ -512,7 +512,7 @@ Pick one with `--agent <name>`, or make it the default with `cplt config set san
 | [OpenCode](https://opencode.ai/) | `opencode` | yes, priority 2 | Copilot subscription via `/connect`, or `--pass-env ANTHROPIC_API_KEY` |
 | [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) | `antigravity`, aliases `agy` and `agi` | yes, priority 3 | Google OAuth in the browser |
 | [Pi](https://github.com/earendil-works/pi) | `pi` | no | `--pass-env ANTHROPIC_API_KEY` and friends |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude`, aliases `cc` and `claude-code` | no | Subscription OAuth in `~/.claude` or the Keychain, or `--pass-env ANTHROPIC_API_KEY` |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude`, aliases `cc` and `claude-code` | no | Subscription OAuth in `~/.claude` or the Keychain, `CLAUDE_CODE_OAUTH_TOKEN` (drops the Keychain grant), or `--pass-env ANTHROPIC_API_KEY` |
 | Your shell | `shell` | no | none |
 
 - **Pi and Claude Code are never auto-detected.** `pi` is a generic binary name that could collide with something else on your machine, and Claude Code has to be chosen on purpose.
@@ -770,7 +770,7 @@ What cplt does not protect against:
 - Logic bugs the agent introduces. You still review the code
 - A sophisticated adversary bypassing the command guard. Use server-side branch protection
 - Network attacks on allowed domains. If github.com is allowed, the agent can read and write there
-- macOS Keychain access, which Copilot auth needs. Contents are password-protected
+- macOS Keychain access, for agents that store auth there. Contents are password-protected, and `sandbox.keychain_substitute` can trade the grant away where an agent has another credential
 
 Our priorities, in order: **correct** (every claim is tested, every edge case has a CVE or research reference), **transparent** ([SECURITY.md](SECURITY.md) hides nothing), **simple** (one static binary, zero config required, sane defaults), and **useful** (get out of the way and let the agent work, safely).
 
