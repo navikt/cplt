@@ -812,6 +812,7 @@ mod tests {
             allow_env_files: false,
             allow_localhost_any: false,
             scratch_dir: None,
+            keychain_substitute: None,
             playwright_socket_dir: Some(Path::new(
                 "/private/tmp/cplt-pw-0123456789abcdef0123456789abcdef",
             )),
