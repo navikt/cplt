@@ -404,16 +404,18 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent, deny_env: &[String
 /// inside the sandbox would honour the letter of that and not the intent
 /// (#225).
 ///
-/// So: cache only for Copilot, only when no token var is denied, and only when
-/// the child would not already have one of its own.
+/// So: cache only for Copilot, only when `GH_TOKEN` itself is not denied, and
+/// only when the child would not already have one of its own.
 fn should_cache_token(agent: Agent, deny_env: &[String]) -> bool {
     if agent != Agent::Copilot {
         return false;
     }
-    let any_denied = GH_TOKEN_VARS
-        .iter()
-        .any(|var| deny_env.iter().any(|d| d.as_str() == *var));
-    !any_denied && !child_keeps_a_github_token(deny_env)
+    // GH_TOKEN specifically, not any of the three. #225 asks for the cache to
+    // follow the injection target: denying GH_TOKEN is the repo saying "no
+    // GitHub credential", while denying only COPILOT_GITHUB_TOKEN is a narrower
+    // statement that should not cost the agent the cache channel as well.
+    let target_denied = deny_env.iter().any(|d| d == "GH_TOKEN");
+    !target_denied && !child_keeps_a_github_token(deny_env)
 }
 
 fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent, deny_env: &[String]) {
@@ -1182,7 +1184,7 @@ mod gh_token_extraction_tests {
     /// scratch cache would otherwise still serve one through `gh auth token`
     /// inside the sandbox, honouring the letter of the deny and not the intent.
     #[test]
-    fn a_denied_token_var_suppresses_the_scratch_cache() {
+    fn a_denied_gh_token_suppresses_the_scratch_cache() {
         temp_env::with_vars(
             [
                 ("GH_TOKEN", None::<&str>),
@@ -1194,10 +1196,17 @@ mod gh_token_extraction_tests {
                     should_cache_token(Agent::Copilot, &[]),
                     "no deny and no ambient token: the cache is the only channel"
                 );
-                for denied in ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"] {
+                assert!(
+                    !should_cache_token(Agent::Copilot, &["GH_TOKEN".to_string()]),
+                    "denying the injection target must silence the cache too"
+                );
+                // Narrower denies do not cost the cache. #225 ties the cache to
+                // GH_TOKEN specifically: denying only COPILOT_GITHUB_TOKEN is a
+                // statement about that variable, not "no GitHub credential".
+                for other in ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"] {
                     assert!(
-                        !should_cache_token(Agent::Copilot, &[denied.to_string()]),
-                        "{denied} denied must silence the cache too"
+                        should_cache_token(Agent::Copilot, &[other.to_string()]),
+                        "{other} denied alone must leave the cache channel open"
                     );
                 }
             },
