@@ -591,10 +591,13 @@ fn create_mask_placeholder(scratch: &Path) -> Result<PathBuf, String> {
 /// downstream (see [`build_bwrap_args`]), and the result is deduplicated, so
 /// overlapping roots never double-bind.
 pub(crate) fn git_persistence_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(write_roots.len() * 2 + git_dirs.len());
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(write_roots.len() * 3 + git_dirs.len());
     for root in write_roots {
         paths.push(root.join(".git/hooks"));
         paths.push(root.join(".cplt.toml"));
+        // #267: goose auto-spawns MCP servers declared here on the next host
+        // run, so a manifest written this session executes outside the sandbox.
+        paths.push(root.join(".agents/plugins"));
     }
     for dir in git_dirs {
         paths.push(dir.join("hooks"));
