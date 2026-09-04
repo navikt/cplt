@@ -629,9 +629,11 @@ fn resolve_bool(cli: FeatureToggle, config: Option<bool>, baseline: bool) -> boo
 /// A registry row for a boolean config key: which key it is, and how to read
 /// its final value back off a [`Resolved`].
 ///
-/// `resolved` exists so consumers that report the *effective* value (`config
-/// show`, `cplt settings`) read it from this table instead of keeping their own
-/// parallel list of keys — a list that drifts, silently, behind a catch-all arm.
+/// `resolved` exists so a consumer reporting the *effective* value reads it
+/// from this table instead of keeping its own parallel list of keys — a list
+/// that drifts, silently, behind a catch-all arm. `cplt settings` is the only
+/// such consumer today; `config show` renders the config file, not the
+/// resolved result, so it has no use for this.
 pub struct BoolKeyRow {
     pub section: &'static str,
     pub key: &'static str,

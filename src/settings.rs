@@ -490,9 +490,13 @@ fn resolved_values(
                 get_value_from_doc(global_doc, key)
                     .unwrap_or_else(|| key.default_display.to_string())
             };
-            // Booleans read their effective value straight off the registry
-            // row, so this match never has to keep a parallel list of them —
-            // the list that silently drifted behind the `_ => fallback()` arm.
+            // A boolean on the precedence ladder reads its effective value
+            // straight off the registry row, so this match no longer keeps a
+            // parallel list of those — the list that silently drifted behind
+            // the `_ => fallback()` arm. The booleans in `BOOL_KEYS_EXEMPT`
+            // (the legacy `sandbox.gh_proxy` / `sandbox.git_push_prevention`
+            // spellings, and `sandbox.use_bubblewrap`) are not on the ladder
+            // and still need an arm below.
             if let Some(row) = crate::config::bool_key(key.section, key.key) {
                 return ((key.section, key.key), (row.resolved)(resolved).to_string());
             }
