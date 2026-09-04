@@ -761,8 +761,9 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // ── Agent-specific directories ──
     if config.agent.needs_copilot_dir() {
         // ~/.copilot itself is an ordinary AgentDir now (agent.rs `config_dirs`)
-        // and is emitted by the agent_dirs loop below, execute included — the
-        // native .node addons need dlopen and Landlock has no map-only right.
+        // and is emitted by the agent_dirs loop below, execute included — that
+        // execve grant is carried over from the rule this replaced, not
+        // required by the .node addons, which dlopen with READ_FILE (#243).
         //
         // Copilot SEA cache — auto-updaters download newer versions here.
         // Execute is required for Node to spawn the newer ripgrep / helpers.
@@ -784,10 +785,12 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 read: true,
                 write: dir.write,
                 // `process_exec` alone, for the reason spelled out on the home
-                // tool dirs above (#243). `map_exec` is deliberately ignored:
-                // Landlock's single execute right cannot express "mmap only",
-                // so an AgentDir that needs dlopen (Copilot's native addons)
-                // sets BOTH flags and gets execute here — see #324.
+                // tool dirs above (#243). `map_exec` is deliberately ignored
+                // rather than unused: Landlock EXECUTE is checked on execve()
+                // and the loader reaches mmap(PROT_EXEC) with READ_FILE, so
+                // honouring it would grant full execve for a right dlopen does
+                // not need. Copilot is the first AgentDir to set it, and its
+                // addons load here without it.
                 execute: dir.process_exec,
                 ioctl: false,
             },
@@ -3336,8 +3339,9 @@ mod tests {
         assert!(rule.access.write);
         assert!(
             rule.access.execute,
-            ".copilot needs execute for native .node module dlopen() — Landlock \
-             has no map-only right, so map_exec alone would silently drop it"
+            ".copilot keeps the execve grant the hand-written rule carried. NOT \
+             for the .node addons — Landlock EXECUTE is execve-only and dlopen \
+             needs READ_FILE (#243). #324 asks whether it is needed at all"
         );
     }
 

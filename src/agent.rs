@@ -700,12 +700,24 @@ impl Agent {
         match self {
             Agent::Copilot => {
                 // ~/.copilot holds auth, settings, the session store and the
-                // native `.node` addons. `map_exec` is what the addons actually
-                // need (dlopen from `pkg/universal/*/prebuilds/`), but Landlock
-                // has no map-only bit — its single execute right covers both
-                // mmap(PROT_EXEC) and execve — so `process_exec` has to be set
-                // too or the addons stop loading on Linux (#243, #319).
-                // Narrowing that is #324's job, not this grant's.
+                // native `.node` addons.
+                //
+                // `map_exec` is for the addons: on macOS they are dlopen'd from
+                // `pkg/universal/*/prebuilds/` and Seatbelt gates that with
+                // `file-map-executable`. Landlock has no equivalent — EXECUTE
+                // is checked on execve() alone and the loader reaches
+                // mmap(PROT_EXEC) with READ_FILE — so `map_exec` is ignored
+                // there and the addons load without it (#243).
+                //
+                // `process_exec` is therefore NOT about the addons. It is set
+                // to keep this grant identical to the hand-written rules it
+                // replaces: the Linux FsRule carried `execute: true` and macOS
+                // reached `~/.copilot` through the blanket `(allow
+                // process-exec)`. Whether Copilot needs to execve anything from
+                // its config dir is unverified and is exactly the question
+                // #324 asks; this is a refactor and deliberately does not
+                // answer it. Dropping `process_exec` here would withdraw
+                // execve, not break dlopen.
                 vec![AgentDir {
                     path: home.join(".copilot"),
                     write: true,
@@ -2241,12 +2253,14 @@ mod tests {
         );
         assert!(
             dirs[0].map_exec,
-            "native .node addons are dlopen'd from pkg/universal/*/prebuilds"
+            "native .node addons are dlopen'd from pkg/universal/*/prebuilds, \
+             which Seatbelt gates with file-map-executable (Landlock ignores \
+             map_exec — its EXECUTE is execve-only, #243)"
         );
         assert!(
             dirs[0].process_exec,
-            "Landlock's execute right covers mmap AND execve, so map_exec alone \
-             would stop the addons loading on Linux (#324 narrows this)"
+            "keeps the execve grant the hand-written rules carried; whether \
+             Copilot needs it is #324's question, not this refactor's"
         );
     }
 
