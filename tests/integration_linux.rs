@@ -353,15 +353,29 @@ mod linux_tests {
         );
         assert!(stdout.contains("registry.example.com"), "{stdout}");
 
-        let (code, stdout, _) = run_sandboxed_home_with_flags(
+        // No `2>&1` here. The shell applies redirections left to right, so the
+        // failing one aborts the command and its error goes to the real stderr
+        // — a merge into stdout would never see it. Check both the exit status
+        // and the message, so an unrelated non-zero exit cannot pass this.
+        let (code, stdout, stderr) = run_sandboxed_home_with_flags(
             project.path(),
             fake_home.path(),
             &["--allow-docker"],
-            "echo x > ~/.docker/pwned 2>&1",
+            "echo x > ~/.docker/pwned",
+        );
+        assert_ne!(
+            code, 0,
+            "writing into ~/.docker must fail under --allow-docker — stdout: {stdout}, stderr: {stderr}"
         );
         assert!(
-            code != 0 || stdout.contains("Permission denied"),
-            "~/.docker must stay read-only under --allow-docker — code: {code}, stdout: {stdout}"
+            stderr.contains("Permission denied"),
+            "the write must fail on permissions, not something else — stderr: {stderr}"
+        );
+        // fake_home is a real directory on the host, so the strongest check is
+        // simply that nothing landed there.
+        assert!(
+            !fake_home.path().join(".docker/pwned").exists(),
+            "the denied write must leave no file behind"
         );
     }
 
