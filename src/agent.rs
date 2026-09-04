@@ -536,6 +536,12 @@ impl Agent {
     ///   names host commands, `config/mcp_config.json` holds `mcpServers` that
     ///   auto-start, and `antigravity-cli/bin/` holds binaries (`agentapi`,
     ///   `webm_encoder`) Antigravity runs on the host.
+    /// - Copilot: `settings.json` and `hooks/*.json` hold `hooks.<event>[]`
+    ///   commands, `mcp-config.json` and `lsp-config.json` name host processes
+    ///   the CLI spawns, `extensions/` runs Node modules, and `pkg` holds the
+    ///   native `.node` addons. `installed-plugins/` carries the same three
+    ///   routes inside a plugin, and is denied with an unresolved cost — see
+    ///   the match arm.
     /// - Pi: `extensions/*.ts` and `extensions/*/index.ts` are auto-discovered
     ///   at startup (the trust gate covers only the project-local path), and
     ///   `settings.json` can name extension paths and npm/git packages, so
@@ -546,7 +552,8 @@ impl Agent {
     ///
     /// Cost: for Pi this breaks package management and every in-session
     /// setting that persists to `settings.json` — `/model` Ctrl+S,
-    /// `/thinking`, `/settings`. Do those outside cplt — see SECURITY.md.
+    /// `/thinking`, `/settings`. For Copilot it breaks `/settings`, `/config`,
+    /// `/mcp add` and `/lsp`. Do those outside cplt — see SECURITY.md.
     ///
     /// Enforcement is macOS-first: Seatbelt emits these as write-denies after
     /// the dir-wide allow (last match wins). Landlock cannot sub-deny inside an
@@ -562,13 +569,74 @@ impl Agent {
             // joined onto BOTH grants, and the join that does not correspond to
             // a real path is inert (same as ~/.claude.json/statusline.sh).
             Agent::Antigravity => &["hooks.json", "mcp_config.json", "bin"],
+            // Copilot: `settings.json` carries `hooks.<event>[]` entries with
+            // `bash` / `command` / `exec`+`args` that fire at lifecycle points,
+            // and `hooks/*.json` is the same schema in its own directory.
+            // `mcp-config.json` (`mcpServers.<n>.command`) and
+            // `lsp-config.json` (`lspServers.<n>.command`) both spawn host
+            // processes — LSP servers start automatically once the working
+            // directory is trusted. `extensions/` runs Node modules
+            // ("Extensions execute on your computer with your privileges",
+            // upstream's words); it is gated behind `--experimental` today,
+            // which is a flag the user flips, not a boundary. `pkg` holds the
+            // native `.node` addons: that deny predates this list as a
+            // hardcoded rule in the profile, and lives here now so both
+            // backends consume it from one place.
+            //
+            // None of the six is written by the CLI in normal operation. The
+            // cost is `/settings`, `/config`, `/mcp add` and `/lsp` inside the
+            // sandbox — do those outside cplt, see SECURITY.md. Everything
+            // Copilot rewrites every session — `config.json`,
+            // `permissions-config.json`, `session-state/`,
+            // `command-history-state/`, `session-store.db`, `logs/`, `ide/`,
+            // `mcp-oauth-config/`, `mcp-secrets/`, `plugin-data/` — stays
+            // writable.
+            //
+            // `installed-plugins/` is here too, and it is the one entry with
+            // an unresolved cost. Plugins carry their own `hooks.json`,
+            // `.mcp.json` and `lsp.json` — the same three routes the entries
+            // above close — so leaving it out denied the front door and left
+            // the side door. Against that: first-party plugins are documented
+            // as updating themselves at the start of every session in a
+            // trusted directory, and this deny would stop that.
+            //
+            // Whether it actually stops anything *inside cplt* could not be
+            // determined. `COPILOT_AUTO_UPDATE=false` and `--no-auto-update`
+            // are the same boolean in the shipped SEA bootstrap, and
+            // `extra_args` already passes the flag for every Copilot run — but
+            // that bootstrap is the binary self-update path, and the code that
+            // would show whether the flag also covers session-start *plugin*
+            // updates is not in the published artifact. Read
+            // `@github/copilot-darwin-arm64@1.0.83` end to end:
+            // `COPILOT_AUTO_UPDATE` occurs once, and `installed-plugins`,
+            // `mcp-config.json` and `session-store.db` occur zero times — the
+            // application is fetched into `pkg/` on first run.
+            //
+            // So: if the flag already covers plugin updates, this deny costs
+            // nothing, because plugins never self-update inside cplt anyway.
+            // If it does not, plugin auto-update fails inside the sandbox and
+            // the plugin has to be updated outside it, like every other denied
+            // path here. One `cplt --agent copilot` session on a host with a
+            // first-party plugin installed settles it: watch whether
+            // `installed-plugins/` is touched at startup. Documented in
+            // SECURITY.md so the next person finds the answer rather than
+            // repeating the investigation.
+            Agent::Copilot => &[
+                "settings.json",
+                "hooks",
+                "mcp-config.json",
+                "lsp-config.json",
+                "extensions",
+                "installed-plugins",
+                "pkg",
+            ],
             // goose needs no entries: its ONLY auto-execution vector is
             // config.yaml's `extensions:` list, and its config dir is granted
             // read-only, so there is nothing writable left to deny. (These
             // denies are joined onto writable dirs only, so an entry here would
             // be inert anyway.) The data and state dirs hold sessions, logs and
             // downloaded model weights — nothing goose auto-executes.
-            Agent::Goose | Agent::Copilot | Agent::OpenCode | Agent::Shell => &[],
+            Agent::Goose | Agent::OpenCode | Agent::Shell => &[],
         }
     }
 
@@ -656,10 +724,32 @@ impl Agent {
     pub fn config_dirs(&self, home: &Path) -> Vec<AgentDir> {
         match self {
             Agent::Copilot => {
-                vec![
-                    // ~/.copilot is handled separately in emit_home_access
-                    // (needs map-executable for native modules)
-                ]
+                // ~/.copilot holds auth, settings, the session store and the
+                // native `.node` addons.
+                //
+                // `map_exec` is for the addons: on macOS they are dlopen'd from
+                // `pkg/universal/*/prebuilds/` and Seatbelt gates that with
+                // `file-map-executable`. Landlock has no equivalent — EXECUTE
+                // is checked on execve() alone and the loader reaches
+                // mmap(PROT_EXEC) with READ_FILE — so `map_exec` is ignored
+                // there and the addons load without it (#243).
+                //
+                // `process_exec` is therefore NOT about the addons. It is set
+                // to keep this grant identical to the hand-written rules it
+                // replaces: the Linux FsRule carried `execute: true` and macOS
+                // reached `~/.copilot` through the blanket `(allow
+                // process-exec)`. Whether Copilot needs to execve anything from
+                // its config dir is unverified and is exactly the question
+                // #324 asks; this is a refactor and deliberately does not
+                // answer it. Dropping `process_exec` here would withdraw
+                // execve, not break dlopen.
+                vec![AgentDir {
+                    path: home.join(".copilot"),
+                    write: true,
+                    map_exec: true,
+                    process_exec: true,
+                    write_files: vec![],
+                }]
             }
             Agent::Shell => {
                 // Shell needs write access to its config/data dirs for history,
@@ -2014,8 +2104,27 @@ mod tests {
         // No writable dir that hosts auto-executing config for these. goose's
         // one auto-exec vector, config.yaml's `extensions:`, lives in a config
         // dir granted read-only, so there is nothing writable left to deny.
+        assert_eq!(
+            Agent::Copilot.host_persistence_denies(),
+            [
+                "settings.json",
+                "hooks",
+                "mcp-config.json",
+                "lsp-config.json",
+                "extensions",
+                "installed-plugins",
+                "pkg"
+            ],
+        );
+        assert!(
+            Agent::Copilot
+                .host_persistence_denies()
+                .contains(&"installed-plugins"),
+            "a plugin ships its own hooks.json, .mcp.json and lsp.json — the \
+             same three routes the other entries close, so leaving it out \
+             denied the front door and left the side door"
+        );
         assert!(Agent::Goose.host_persistence_denies().is_empty());
-        assert!(Agent::Copilot.host_persistence_denies().is_empty());
         assert!(Agent::OpenCode.host_persistence_denies().is_empty());
         assert!(Agent::Shell.host_persistence_denies().is_empty());
     }
@@ -2155,13 +2264,30 @@ mod tests {
         assert!(!dirs[1].process_exec && !dirs[1].map_exec);
     }
 
+    /// `~/.copilot` moved out of the hand-written `emit_home_access` block and
+    /// into `config_dirs`, which is what makes `host_persistence_denies` reach
+    /// it at all — the denies are joined onto writable `config_dirs` entries,
+    /// so with an empty list every Copilot entry would have been inert.
     #[test]
-    fn copilot_has_no_extra_config_dirs() {
+    fn copilot_config_dir_is_the_writable_dot_copilot_grant() {
         let home = Path::new("/Users/test");
         let dirs = Agent::Copilot.config_dirs(home);
+        assert_eq!(dirs.len(), 1, "Copilot has exactly one config dir");
+        assert_eq!(dirs[0].path, home.join(".copilot"));
         assert!(
-            dirs.is_empty(),
-            "copilot dirs are handled in emit_home_access"
+            dirs[0].write,
+            "session store and config are written all session"
+        );
+        assert!(
+            dirs[0].map_exec,
+            "native .node addons are dlopen'd from pkg/universal/*/prebuilds, \
+             which Seatbelt gates with file-map-executable (Landlock ignores \
+             map_exec — its EXECUTE is execve-only, #243)"
+        );
+        assert!(
+            dirs[0].process_exec,
+            "keeps the execve grant the hand-written rules carried; whether \
+             Copilot needs it is #324's question, not this refactor's"
         );
     }
 
