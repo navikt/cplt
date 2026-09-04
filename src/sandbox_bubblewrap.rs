@@ -595,6 +595,9 @@ pub(crate) fn git_persistence_paths(write_roots: &[&Path], git_dirs: &[&Path]) -
     for root in write_roots {
         paths.push(root.join(".git/hooks"));
         paths.push(root.join(".cplt.toml"));
+        // #267: goose auto-spawns MCP servers declared here on the next host
+        // run, so a manifest written this session executes outside the sandbox.
+        paths.push(root.join(".agents/plugins"));
     }
     for dir in git_dirs {
         paths.push(dir.join("hooks"));
