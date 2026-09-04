@@ -86,7 +86,7 @@ cplt assumes the sandboxed agent is **untrusted**, because it executes arbitrary
 | **Org/user data enumeration** | `gh api /orgs/.../audit-log` leaks PII | gh guard restricts API to `/repos/{current-repo}/...` endpoints only |
 | **DNS rebinding SSRF** | Domain resolves to `127.0.0.1` after check | Post-DNS-resolution IP validation; `--allow-private-domain` opt-in bypass for explicitly trusted internal domains |
 | **Sandbox profile injection** | Path with `\n(allow file-read* (subpath "/"))` | SBPL path character validation (macOS) |
-| **Temp file symlink attack** | Symlink at predictable `/tmp/cplt.sb` | Unique filename plus `O_CREAT\|O_EXCL` |
+| **Cross-session profile replacement** | Overwrite another session's SBPL profile in the shared temp dir before the kernel reads it | The profile is passed to `sandbox-exec -p` as an argument; it is never written to disk, so there is no file to swap |
 | **Write-then-exec in /tmp** | Drop binary in `/tmp`, execute it | Seatbelt deny (macOS) / Landlock deny (Linux); `--scratch-dir` provides a safe alternative |
 | **Cloud metadata access** | Fetch `169.254.169.254` or CGNAT range | Private IP blocklist covering all reserved ranges |
 | **Cross-project access** | Read files outside project directory | Seatbelt subpath (macOS) / Landlock ruleset (Linux) |
@@ -903,14 +903,24 @@ The newline character is the dangerous one. A path containing `\n(allow file-rea
 
 Config file paths are additionally canonicalized (resolved to absolute paths) at load time.
 
-#### Temp file safety
+#### The profile never becomes a file
 
-The sandbox profile is written to a temp file with:
+The SBPL profile is passed to `sandbox-exec -p` as an argument. It is never written
+to disk and never handed over as a pathname.
 
-- **Unique filename:** `cplt-{PID}-{nanosecond_timestamp}.sb`
-- **Atomic creation:** `OpenOptions::create_new(true)`, which fails if the file exists and so prevents symlink following
-- **Restricted permissions:** mode `0o600`, owner read/write only
-- **Cleanup on exit:** the file is removed after sandbox-exec completes
+The profile grants every sandbox write throughout `/private/tmp` and
+`/private/var/folders`. While cplt wrote the profile to `$TMPDIR/cplt-*.sb` and
+passed `-f <path>`, one sandboxed session could overwrite another session's
+profile between the write and the kernel's read — a complete policy replacement,
+not merely corruption, since the attacker chooses the replacement text. Measured
+at 14 of 15 launches (`profile_cannot_be_swapped_by_another_session` in
+`tests/e2e.rs`, which still reproduces the attack against the old code).
+
+An oversized profile fails loudly with `E2BIG` — the argument list must fit in
+`kern.argmax` (1 MiB) alongside the environment. The kernel never sees a
+truncated profile: `sandbox-exec` either applies the whole thing or refuses to
+start. A default profile is about 25 KB and each allow/deny grant adds roughly
+2.5 KB, so the ceiling is in the low hundreds of grants.
 
 #### Unsafe root rejection
 
@@ -1180,7 +1190,7 @@ The GitHub Actions workflow runs in two stages:
 
 ### Secure temporary files
 
-- [CWE-377: Insecure Temporary File](https://cwe.mitre.org/data/definitions/377.html). Motivation for unique filenames and `O_CREAT|O_EXCL`.
+- [CWE-377: Insecure Temporary File](https://cwe.mitre.org/data/definitions/377.html). Why the SBPL profile is never written to a temp file at all, and why the files that do live in the scratch dir use `O_CREAT|O_EXCL` with mode `0600`.
 - [CWE-59: Improper Link Resolution Before File Access](https://cwe.mitre.org/data/definitions/59.html). Symlink attacks on predictable temp paths.
 
 ### AI agent sandboxing (broader context)
