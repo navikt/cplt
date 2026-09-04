@@ -485,8 +485,10 @@ fn prepare_impl(
         ui::warn(
             "--allow-docker on Linux grants the Docker/Podman daemon sockets and \
              exempts them from the Bubblewrap socket masks — daemon socket access is \
-             effectively host root. ~/.docker stays denied, so Docker CLI contexts and \
-             registry auth are still unavailable (#155).",
+             effectively host root. ~/.docker is readable (not writable), including \
+             any registry credentials stored inline in config.json and, unlike macOS, \
+             ~/.docker/trust/private: Landlock cannot deny a subpath of a granted \
+             directory.",
         );
     }
     // Finding 2: on Linux, allow_localhost_any drops EVERY Landlock TCP-connect
