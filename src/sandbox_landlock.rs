@@ -619,15 +619,20 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         // the omission was invisible; from v9 on, `ResolveUnix` is enforced and
         // signing would break without this rule. Scoped to `gnupg/` — not the
         // whole runtime dir, which holds the D-Bus and systemd sockets.
-        fs_rules.push(FsRule {
-            path: PathBuf::from(format!("/run/user/{}/gnupg", policy::current_uid())),
-            access: FsAccess {
-                read: true,
-                write: true,
-                execute: false,
-                ioctl: false,
-            },
-        });
+        for dir in policy::linux_runtime_dirs(
+            policy::current_uid(),
+            policy::xdg_runtime_dir_env().as_deref(),
+        ) {
+            fs_rules.push(FsRule {
+                path: dir.join("gnupg"),
+                access: FsAccess {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    ioctl: false,
+                },
+            });
+        }
     }
 
     // ── Docker/Podman daemon sockets and ~/.docker (--allow-docker) ──
@@ -644,7 +649,10 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // macOS there is no carve-out for `~/.docker/trust/private`: Landlock
     // cannot deny a subpath of a granted directory.
     if config.allow_docker {
-        for path in policy::linux_docker_socket_paths(policy::current_uid()) {
+        for path in policy::linux_docker_socket_paths(
+            policy::current_uid(),
+            policy::xdg_runtime_dir_env().as_deref(),
+        ) {
             fs_rules.push(FsRule {
                 path,
                 access: FsAccess {

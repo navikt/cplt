@@ -845,6 +845,84 @@ except OSError as e:
         );
     }
 
+    /// A pathname UNIX socket at a path the policy grants nothing on, served
+    /// by a listener that lives **outside** the sandbox — the escape's shape
+    /// without its dependency on a session bus.
+    ///
+    /// The three tests above all key on `/run/user/<uid>/bus`, which a CI
+    /// runner does not have, so they self-skip there and the claim stays
+    /// code-reading only. This one runs anywhere.
+    ///
+    /// `$HOME` is the right home for it: Landlock grants the home tree
+    /// per-file (`LINUX_HOME_CONFIG_FILES`) and never wholesale, so a
+    /// uniquely named dotfile there is reliably ungranted on any host.
+    struct OutsideSocket {
+        path: PathBuf,
+        _listener: std::os::unix::net::UnixListener,
+    }
+
+    impl OutsideSocket {
+        fn bind() -> Self {
+            let path = home_dir().join(format!(".cplt-test-{}.sock", std::process::id()));
+            let _ = fs::remove_file(&path);
+            let listener =
+                std::os::unix::net::UnixListener::bind(&path).expect("bind UNIX socket in $HOME");
+            Self {
+                path,
+                _listener: listener,
+            }
+        }
+    }
+
+    impl Drop for OutsideSocket {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn connect_to_an_ungranted_pathname_socket_follows_the_abi() {
+        // The one test in this group that actually executes on a CI runner,
+        // and therefore the only *observed* evidence for the claim the rest of
+        // the group documents: below ABI v9 nothing in the kernel gates
+        // connect(2) to a pathname UNIX socket, so an ungranted one — a
+        // session bus, a container daemon, whatever else the host is running —
+        // is reachable from inside the sandbox. From v9 up Landlock denies it.
+        //
+        // If this fails on the v9 side, `add_fs_rule`'s ResolveUnix grant is
+        // gone. If it fails on the other side, the sandbox got stronger than
+        // the docs claim and SECURITY.md's Linux limitations need updating.
+        require_landlock!();
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let sock = OutsideSocket::bind();
+        let path = sock.path.to_string_lossy().into_owned();
+        let project = create_test_project();
+
+        let (_, stdout, stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--no-bubblewrap"],
+            &unix_connect_probe(&path),
+        );
+
+        if landlock_abi_version().is_some_and(|v| v >= 9) {
+            assert!(
+                !stdout.contains("CONNECTED"),
+                "ABI v9 must deny connect() to an ungranted pathname socket \
+                 ({path}).\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        } else {
+            assert!(
+                stdout.contains("CONNECTED"),
+                "below ABI v9 connect() to an ungranted pathname socket ({path}) is \
+                 not gated by anything; if this now fails the sandbox got stronger \
+                 and the docs are stale.\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+    }
+
     #[test]
     fn abi_v9_gates_unix_socket_connect_without_bwrap() {
         // Kernel 7.1+ only. Deliberately NOT `require_landlock!(9)`: that

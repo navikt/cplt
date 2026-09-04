@@ -56,9 +56,10 @@ pub use policy::{
     PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX,
     PathBinDir, ResolvedToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot,
     active_tool_dirs, app_dirs, current_uid, home_tool_dirs, linux_docker_socket_paths,
-    mise_ro_protect_paths, path_bin_dirs, playwright_runtime_intent, relocatable_tool_prefix,
-    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path,
+    linux_runtime_dirs, mise_ro_protect_paths, path_bin_dirs, playwright_runtime_intent,
+    relocatable_tool_prefix, socket_mask_paths, tool_override_path_is_safe,
+    tool_path_env_overrides, validate_playwright_socket_dir, validate_sbpl_path,
+    xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -595,11 +596,14 @@ fn prepare_impl(
     // thing that can take them away. Non-existent entries are dropped here so
     // they never show up in the "could not be mount-masked" warning; the masks
     // are only ever applied when bwrap actually wraps the run.
-    let socket_masks: Vec<PathBuf> =
-        policy::socket_mask_paths(policy::current_uid(), config.allow_docker)
-            .into_iter()
-            .filter(|p| p.exists())
-            .collect();
+    let socket_masks: Vec<PathBuf> = policy::socket_mask_paths(
+        policy::current_uid(),
+        policy::xdg_runtime_dir_env().as_deref(),
+        config.allow_docker,
+    )
+    .into_iter()
+    .filter(|p| p.exists())
+    .collect();
     let deny_masks =
         bubblewrap::build_deny_masks(config.extra_deny, &socket_masks, config.scratch_dir);
 
