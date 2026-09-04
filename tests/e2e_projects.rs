@@ -351,11 +351,17 @@ fun main() {
     }
 
     /// Assert that a RESULT line is present and OK.
-    fn assert_result_ok(stdout: &str, operation: &str) {
+    ///
+    /// The fake agent's scripts send every command's own stderr to /dev/null, so
+    /// a failed operation reports `FAIL` and nothing else. cplt's stderr —
+    /// sandbox denials, guard verdicts, wrapper warnings — is the only place the
+    /// reason survives, and the harness prints a failing test's output, so this
+    /// echoes it. Diagnosing a red run without it means guessing.
+    fn assert_result_ok(stdout: &str, stderr: &str, operation: &str) {
         let expected = format!("RESULT:{operation}:OK");
         assert!(
             stdout.contains(&expected),
-            "Expected {expected} in output.\nstdout:\n{stdout}"
+            "Expected {expected} in output.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
@@ -630,12 +636,12 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_package.json");
-        assert_result_ok(&stdout, "read_src/index.js");
-        assert_result_ok(&stdout, "read_src/utils.js");
-        assert_result_ok(&stdout, "read_README.md");
-        assert_result_ok(&stdout, "write_dist/bundle.js");
-        assert_result_ok(&stdout, "create_dir");
+        assert_result_ok(&stdout, &stderr, "read_package.json");
+        assert_result_ok(&stdout, &stderr, "read_src/index.js");
+        assert_result_ok(&stdout, &stderr, "read_src/utils.js");
+        assert_result_ok(&stdout, &stderr, "read_README.md");
+        assert_result_ok(&stdout, &stderr, "write_dist/bundle.js");
+        assert_result_ok(&stdout, &stderr, "create_dir");
     }
 
     #[test]
@@ -653,11 +659,11 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_go.mod");
-        assert_result_ok(&stdout, "read_main.go");
-        assert_result_ok(&stdout, "read_internal/handler.go");
-        assert_result_ok(&stdout, "write_internal/handler_test.go");
-        assert_result_ok(&stdout, "create_dir");
+        assert_result_ok(&stdout, &stderr, "read_go.mod");
+        assert_result_ok(&stdout, &stderr, "read_main.go");
+        assert_result_ok(&stdout, &stderr, "read_internal/handler.go");
+        assert_result_ok(&stdout, &stderr, "write_internal/handler_test.go");
+        assert_result_ok(&stdout, &stderr, "create_dir");
     }
 
     #[test]
@@ -675,11 +681,11 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_requirements.txt");
-        assert_result_ok(&stdout, "read_app.py");
-        assert_result_ok(&stdout, "read_tests/test_app.py");
-        assert_result_ok(&stdout, "write_tests/test_new.py");
-        assert_result_ok(&stdout, "create_dir");
+        assert_result_ok(&stdout, &stderr, "read_requirements.txt");
+        assert_result_ok(&stdout, &stderr, "read_app.py");
+        assert_result_ok(&stdout, &stderr, "read_tests/test_app.py");
+        assert_result_ok(&stdout, &stderr, "write_tests/test_new.py");
+        assert_result_ok(&stdout, &stderr, "create_dir");
     }
 
     #[test]
@@ -694,11 +700,11 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_Cargo.toml");
-        assert_result_ok(&stdout, "read_src/main.rs");
-        assert_result_ok(&stdout, "read_src/lib.rs");
-        assert_result_ok(&stdout, "write_src/utils.rs");
-        assert_result_ok(&stdout, "create_dir");
+        assert_result_ok(&stdout, &stderr, "read_Cargo.toml");
+        assert_result_ok(&stdout, &stderr, "read_src/main.rs");
+        assert_result_ok(&stdout, &stderr, "read_src/lib.rs");
+        assert_result_ok(&stdout, &stderr, "write_src/utils.rs");
+        assert_result_ok(&stdout, &stderr, "create_dir");
     }
 
     // ============================================================
@@ -717,10 +723,10 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "git_status");
-        assert_result_ok(&stdout, "git_log");
-        assert_result_ok(&stdout, "git_diff");
-        assert_result_ok(&stdout, "git_branch");
+        assert_result_ok(&stdout, &stderr, "git_status");
+        assert_result_ok(&stdout, &stderr, "git_log");
+        assert_result_ok(&stdout, &stderr, "git_diff");
+        assert_result_ok(&stdout, &stderr, "git_branch");
     }
 
     #[test]
@@ -736,10 +742,10 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_source");
-        assert_result_ok(&stdout, "transform");
-        assert_result_ok(&stdout, "write_target");
-        assert_result_ok(&stdout, "verify");
+        assert_result_ok(&stdout, &stderr, "read_source");
+        assert_result_ok(&stdout, &stderr, "transform");
+        assert_result_ok(&stdout, &stderr, "write_target");
+        assert_result_ok(&stdout, &stderr, "verify");
     }
 
     // ============================================================
@@ -853,7 +859,7 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
             "git_gc",
             "git_reflog",
         ] {
-            assert_result_ok(&stdout, op);
+            assert_result_ok(&stdout, &stderr, op);
         }
     }
 
@@ -993,7 +999,7 @@ fi
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
         // The grant is real: ordinary files in the sibling ARE writable.
-        assert_result_ok(&stdout, "write_control");
+        assert_result_ok(&stdout, &stderr, "write_control");
         // ...but its git-persistence paths are not.
         assert_result_fail(&stdout, "git_hook_write");
         assert_result_fail(&stdout, "git_config_write");
@@ -1038,7 +1044,7 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "write_control");
+        assert_result_ok(&stdout, &stderr, "write_control");
         assert_result_fail(&stdout, "bare_hook_write");
     }
 
@@ -1073,7 +1079,7 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "sibling_write");
+        assert_result_ok(&stdout, &stderr, "sibling_write");
         // The project itself really is unchanged — this is the report that used
         // to stand alone and read as "nothing happened".
         assert!(
@@ -1107,8 +1113,8 @@ fi
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
         // With --allow-env-files, .env files should be readable
-        assert_result_ok(&stdout, "_env");
-        assert_result_ok(&stdout, "_env_local");
+        assert_result_ok(&stdout, &stderr, "_env");
+        assert_result_ok(&stdout, &stderr, "_env_local");
     }
 
     #[test]
@@ -1145,9 +1151,9 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "scratch_env");
-        assert_result_ok(&stdout, "scratch_write");
-        assert_result_ok(&stdout, "scratch_exec");
+        assert_result_ok(&stdout, &stderr, "scratch_env");
+        assert_result_ok(&stdout, &stderr, "scratch_write");
+        assert_result_ok(&stdout, &stderr, "scratch_exec");
     }
 
     #[test]
@@ -1191,7 +1197,7 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_normal");
+        assert_result_ok(&stdout, &stderr, "read_normal");
         assert_result_fail(&stdout, "read_denied");
         assert_result_fail(&stdout, "write_denied");
     }
@@ -1238,7 +1244,7 @@ allow_env_files = true
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
         // Config enables allow_env_files, so .env should be readable
-        assert_result_ok(&stdout, "_env");
+        assert_result_ok(&stdout, &stderr, "_env");
     }
 
     #[test]
@@ -1284,7 +1290,7 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_external");
+        assert_result_ok(&stdout, &stderr, "read_external");
         assert_result_fail(&stdout, "write_external");
     }
 
@@ -1307,7 +1313,7 @@ fi
             success,
             "cplt should succeed with proxy.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_package.json");
+        assert_result_ok(&stdout, &stderr, "read_package.json");
         assert!(
             stderr.contains("Proxy running"),
             "proxy should have started.\nstderr: {stderr}"
@@ -1362,8 +1368,8 @@ if [ "${GIT_TERMINAL_PROMPT:-}" = "0" ]; then echo "RESULT:env_hardening_git:OK"
         );
 
         // Safe vars present
-        assert_result_ok(&stdout, "env_home");
-        assert_result_ok(&stdout, "env_path");
+        assert_result_ok(&stdout, &stderr, "env_home");
+        assert_result_ok(&stdout, &stderr, "env_path");
 
         // Dangerous vars stripped
         assert_result_fail(&stdout, "env_aws");
@@ -1371,8 +1377,8 @@ if [ "${GIT_TERMINAL_PROMPT:-}" = "0" ]; then echo "RESULT:env_hardening_git:OK"
         assert_result_fail(&stdout, "env_npm");
 
         // Hardening vars injected
-        assert_result_ok(&stdout, "env_hardening_npm");
-        assert_result_ok(&stdout, "env_hardening_git");
+        assert_result_ok(&stdout, &stderr, "env_hardening_npm");
+        assert_result_ok(&stdout, &stderr, "env_hardening_git");
     }
 
     #[test]
@@ -1423,12 +1429,12 @@ if /bin/rm -rf test-spawn-dir 2>/dev/null; then echo "RESULT:exec_rm:OK"; else e
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "exec_true");
-        assert_result_ok(&stdout, "exec_cat");
-        assert_result_ok(&stdout, "exec_wc");
-        assert_result_ok(&stdout, "exec_git");
-        assert_result_ok(&stdout, "exec_mkdir");
-        assert_result_ok(&stdout, "exec_rm");
+        assert_result_ok(&stdout, &stderr, "exec_true");
+        assert_result_ok(&stdout, &stderr, "exec_cat");
+        assert_result_ok(&stdout, &stderr, "exec_wc");
+        assert_result_ok(&stdout, &stderr, "exec_git");
+        assert_result_ok(&stdout, &stderr, "exec_mkdir");
+        assert_result_ok(&stdout, &stderr, "exec_rm");
     }
 
     /// The git guard must not break git.
@@ -1544,13 +1550,13 @@ if [ -n "${no_proxy:-}" ]; then echo "RESULT:no_proxy_lower:OK"; else echo "RESU
             success,
             "cplt should succeed with proxy.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "node_use_env_proxy");
-        assert_result_ok(&stdout, "http_proxy_upper");
-        assert_result_ok(&stdout, "https_proxy_upper");
-        assert_result_ok(&stdout, "http_proxy_lower");
-        assert_result_ok(&stdout, "https_proxy_lower");
-        assert_result_ok(&stdout, "no_proxy_upper");
-        assert_result_ok(&stdout, "no_proxy_lower");
+        assert_result_ok(&stdout, &stderr, "node_use_env_proxy");
+        assert_result_ok(&stdout, &stderr, "http_proxy_upper");
+        assert_result_ok(&stdout, &stderr, "https_proxy_upper");
+        assert_result_ok(&stdout, &stderr, "http_proxy_lower");
+        assert_result_ok(&stdout, &stderr, "https_proxy_lower");
+        assert_result_ok(&stdout, &stderr, "no_proxy_upper");
+        assert_result_ok(&stdout, &stderr, "no_proxy_lower");
     }
 
     #[test]
@@ -1588,9 +1594,9 @@ if echo "$RESP8080" | grep -q "403"; then echo "RESULT:port_8080:OK"; else echo 
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "port_443");
-        assert_result_ok(&stdout, "port_80");
-        assert_result_ok(&stdout, "port_8080");
+        assert_result_ok(&stdout, &stderr, "port_443");
+        assert_result_ok(&stdout, &stderr, "port_80");
+        assert_result_ok(&stdout, &stderr, "port_8080");
     }
 
     #[test]
@@ -1611,9 +1617,9 @@ if [ -z "${HTTPS_PROXY:-}" ]; then echo "RESULT:no_https_proxy:OK"; else echo "R
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "no_node_proxy");
-        assert_result_ok(&stdout, "no_http_proxy");
-        assert_result_ok(&stdout, "no_https_proxy");
+        assert_result_ok(&stdout, &stderr, "no_node_proxy");
+        assert_result_ok(&stdout, &stderr, "no_http_proxy");
+        assert_result_ok(&stdout, &stderr, "no_https_proxy");
     }
 
     #[test]
@@ -1650,7 +1656,7 @@ if echo "$RESP" | grep -q "403"; then echo "RESULT:blocked_unlisted:OK"; else ec
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "blocked_unlisted");
+        assert_result_ok(&stdout, &stderr, "blocked_unlisted");
     }
 
     #[test]
@@ -1684,7 +1690,7 @@ echo "RESULT:sent:OK"
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "sent");
+        assert_result_ok(&stdout, &stderr, "sent");
 
         let log_contents = std::fs::read_to_string(&log_path)
             .unwrap_or_else(|e| panic!("Audit log should exist at {}: {e}", log_path.display()));
@@ -1751,8 +1757,8 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "go_build");
-        assert_result_ok(&stdout, "go_exec");
+        assert_result_ok(&stdout, &stderr, "go_build");
+        assert_result_ok(&stdout, &stderr, "go_exec");
     }
 
     /// Go test works with --scratch-dir: GOTMPDIR is redirected to a
@@ -1801,8 +1807,8 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "gotmpdir_redirected");
-        assert_result_ok(&stdout, "go_test");
+        assert_result_ok(&stdout, &stderr, "gotmpdir_redirected");
+        assert_result_ok(&stdout, &stderr, "go_test");
     }
 
     /// GOCACHE is redirected to scratch dir so cached test binaries can execute.
@@ -1859,9 +1865,9 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "gocache_redirected");
-        assert_result_ok(&stdout, "go_test_first");
-        assert_result_ok(&stdout, "go_test_cached");
+        assert_result_ok(&stdout, &stderr, "gocache_redirected");
+        assert_result_ok(&stdout, &stderr, "go_test_first");
+        assert_result_ok(&stdout, &stderr, "go_test_cached");
     }
 
     /// Without --scratch-dir, go test is blocked because the compiled test
@@ -1915,7 +1921,7 @@ esac
         );
         // go test should be blocked: sandbox denies exec from temp dirs
         assert_result_fail(&stdout, "go_test_no_scratch");
-        assert_result_ok(&stdout, "deny_signature");
+        assert_result_ok(&stdout, &stderr, "deny_signature");
     }
 
     // ============================================================
@@ -2052,7 +2058,7 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "dotnet_server_disabled");
+        assert_result_ok(&stdout, &stderr, "dotnet_server_disabled");
     }
 
     /// Without --allow-msbuild, a project run must not be able to open an
@@ -2085,7 +2091,7 @@ finally:
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "msbuild_socket");
+        assert_result_ok(&stdout, &stderr, "msbuild_socket");
         assert!(
             stdout.contains("BLOCKED"),
             "MSBuild socket must be blocked without --allow-msbuild, got: {stdout}"
@@ -2180,7 +2186,7 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "gradle_sandbox_env");
+        assert_result_ok(&stdout, &stderr, "gradle_sandbox_env");
     }
 
     /// Kotlin/Ktor project file operations work normally in the sandbox.
@@ -2205,15 +2211,20 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_build.gradle.kts");
-        assert_result_ok(&stdout, "read_settings.gradle.kts");
-        assert_result_ok(&stdout, "read_src/main/kotlin/com/example/Application.kt");
-        assert_result_ok(&stdout, "read_README.md");
+        assert_result_ok(&stdout, &stderr, "read_build.gradle.kts");
+        assert_result_ok(&stdout, &stderr, "read_settings.gradle.kts");
         assert_result_ok(
             &stdout,
+            &stderr,
+            "read_src/main/kotlin/com/example/Application.kt",
+        );
+        assert_result_ok(&stdout, &stderr, "read_README.md");
+        assert_result_ok(
+            &stdout,
+            &stderr,
             "write_src/test/kotlin/com/example/ApplicationTest.kt",
         );
-        assert_result_ok(&stdout, "create_dir");
+        assert_result_ok(&stdout, &stderr, "create_dir");
     }
 
     // ============================================================
@@ -2487,13 +2498,25 @@ class UserService {
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_pom.xml");
-        assert_result_ok(&stdout, "read_src/main/java/com/example/App.java");
-        assert_result_ok(&stdout, "read_src/test/java/com/example/AppTest.java");
-        assert_result_ok(&stdout, "read_src/main/resources/application.properties");
-        assert_result_ok(&stdout, "read_README.md");
-        assert_result_ok(&stdout, "write_src/main/java/com/example/NewService.java");
-        assert_result_ok(&stdout, "create_dir");
+        assert_result_ok(&stdout, &stderr, "read_pom.xml");
+        assert_result_ok(&stdout, &stderr, "read_src/main/java/com/example/App.java");
+        assert_result_ok(
+            &stdout,
+            &stderr,
+            "read_src/test/java/com/example/AppTest.java",
+        );
+        assert_result_ok(
+            &stdout,
+            &stderr,
+            "read_src/main/resources/application.properties",
+        );
+        assert_result_ok(&stdout, &stderr, "read_README.md");
+        assert_result_ok(
+            &stdout,
+            &stderr,
+            "write_src/main/java/com/example/NewService.java",
+        );
+        assert_result_ok(&stdout, &stderr, "create_dir");
     }
 
     /// Maven hidden config dir (.mvn/) is readable — Maven wrapper properties,
@@ -2531,9 +2554,9 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "mvn_config");
-        assert_result_ok(&stdout, "mvn_wrapper_props");
-        assert_result_ok(&stdout, "mvn_write_extensions");
+        assert_result_ok(&stdout, &stderr, "mvn_config");
+        assert_result_ok(&stdout, &stderr, "mvn_wrapper_props");
+        assert_result_ok(&stdout, &stderr, "mvn_write_extensions");
     }
 
     /// Kotlin Maven project: read/write across Kotlin source directories.
@@ -2556,11 +2579,19 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_pom.xml");
-        assert_result_ok(&stdout, "read_src/main/kotlin/com/example/App.kt");
-        assert_result_ok(&stdout, "read_src/test/kotlin/com/example/AppTest.kt");
-        assert_result_ok(&stdout, "write_src/main/kotlin/com/example/Repository.kt");
-        assert_result_ok(&stdout, "create_dir");
+        assert_result_ok(&stdout, &stderr, "read_pom.xml");
+        assert_result_ok(&stdout, &stderr, "read_src/main/kotlin/com/example/App.kt");
+        assert_result_ok(
+            &stdout,
+            &stderr,
+            "read_src/test/kotlin/com/example/AppTest.kt",
+        );
+        assert_result_ok(
+            &stdout,
+            &stderr,
+            "write_src/main/kotlin/com/example/Repository.kt",
+        );
+        assert_result_ok(&stdout, &stderr, "create_dir");
     }
 
     /// Multi-module Maven project: agent can read/write across module boundaries.
@@ -2603,14 +2634,14 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "read_parent_pom");
-        assert_result_ok(&stdout, "read_mvn_config");
-        assert_result_ok(&stdout, "read_api_pom");
-        assert_result_ok(&stdout, "read_core_pom");
-        assert_result_ok(&stdout, "read_api_src");
-        assert_result_ok(&stdout, "read_core_src");
-        assert_result_ok(&stdout, "write_api_test");
-        assert_result_ok(&stdout, "write_core_test");
+        assert_result_ok(&stdout, &stderr, "read_parent_pom");
+        assert_result_ok(&stdout, &stderr, "read_mvn_config");
+        assert_result_ok(&stdout, &stderr, "read_api_pom");
+        assert_result_ok(&stdout, &stderr, "read_core_pom");
+        assert_result_ok(&stdout, &stderr, "read_api_src");
+        assert_result_ok(&stdout, &stderr, "read_core_src");
+        assert_result_ok(&stdout, &stderr, "write_api_test");
+        assert_result_ok(&stdout, &stderr, "write_core_test");
     }
 
     /// Java/Maven env vars pass through the sandbox: MAVEN_OPTS,
@@ -2662,12 +2693,12 @@ if [ -n "${CLASSPATH:-}" ]; then echo "RESULT:env_classpath:OK"; else echo "RESU
         );
 
         // Allowed env vars pass through
-        assert_result_ok(&stdout, "env_java_home");
-        assert_result_ok(&stdout, "env_maven_opts");
-        assert_result_ok(&stdout, "env_java_tool_options");
-        assert_result_ok(&stdout, "env_maven_home");
-        assert_result_ok(&stdout, "env_m2_home");
-        assert_result_ok(&stdout, "env_gradle_home");
+        assert_result_ok(&stdout, &stderr, "env_java_home");
+        assert_result_ok(&stdout, &stderr, "env_maven_opts");
+        assert_result_ok(&stdout, &stderr, "env_java_tool_options");
+        assert_result_ok(&stdout, &stderr, "env_maven_home");
+        assert_result_ok(&stdout, &stderr, "env_m2_home");
+        assert_result_ok(&stdout, &stderr, "env_gradle_home");
 
         // CLASSPATH should be stripped
         assert_result_fail(&stdout, "env_classpath");
@@ -2738,11 +2769,11 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "jto_set");
-        assert_result_ok(&stdout, "jto_has_tmpdir");
-        assert_result_ok(&stdout, "jto_has_jansi");
-        assert_result_ok(&stdout, "jto_has_rmi_hostname");
-        assert_result_ok(&stdout, "jto_tmpdir_matches");
+        assert_result_ok(&stdout, &stderr, "jto_set");
+        assert_result_ok(&stdout, &stderr, "jto_has_tmpdir");
+        assert_result_ok(&stdout, &stderr, "jto_has_jansi");
+        assert_result_ok(&stdout, &stderr, "jto_has_rmi_hostname");
+        assert_result_ok(&stdout, &stderr, "jto_tmpdir_matches");
     }
 
     /// Simulate what JVM libraries (Jansi, JNI) actually do: extract a native binary
@@ -2813,11 +2844,11 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "jvm_tmpdir_extracted");
-        assert_result_ok(&stdout, "jvm_tmpdir_not_var_folders");
-        assert_result_ok(&stdout, "native_lib_write");
-        assert_result_ok(&stdout, "native_lib_exec");
-        assert_result_ok(&stdout, "var_folders_exec_blocked");
+        assert_result_ok(&stdout, &stderr, "jvm_tmpdir_extracted");
+        assert_result_ok(&stdout, &stderr, "jvm_tmpdir_not_var_folders");
+        assert_result_ok(&stdout, &stderr, "native_lib_write");
+        assert_result_ok(&stdout, &stderr, "native_lib_exec");
+        assert_result_ok(&stdout, &stderr, "var_folders_exec_blocked");
     }
 
     /// JAVA_TOOL_OPTIONS should append to user's existing value, not replace it.
@@ -2871,8 +2902,8 @@ esac
             output.status.success(),
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "preserves_user_flags");
-        assert_result_ok(&stdout, "has_injected_flags");
+        assert_result_ok(&stdout, &stderr, "preserves_user_flags");
+        assert_result_ok(&stdout, &stderr, "has_injected_flags");
     }
 
     /// JVM cache dirs (~/.m2, ~/.gradle) allow writes and map-exec (for loading
@@ -2950,10 +2981,10 @@ fi
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "m2_write");
-        assert_result_ok(&stdout, "gradle_write");
-        assert_result_ok(&stdout, "m2_exec_denied");
-        assert_result_ok(&stdout, "gradle_exec_denied");
+        assert_result_ok(&stdout, &stderr, "m2_write");
+        assert_result_ok(&stdout, &stderr, "gradle_write");
+        assert_result_ok(&stdout, &stderr, "m2_exec_denied");
+        assert_result_ok(&stdout, &stderr, "gradle_exec_denied");
     }
 
     /// Test Gradle daemon-style Unix domain socket communication inside sandbox.
@@ -3165,11 +3196,11 @@ fi
             return;
         }
 
-        assert_result_ok(&stdout, "gradle_uds_bind");
-        assert_result_ok(&stdout, "gradle_uds_connect");
-        assert_result_ok(&stdout, "uds_scratch");
-        assert_result_ok(&stdout, "tcp_localhost_bind");
-        assert_result_ok(&stdout, "tcp_ipv6_bind");
-        assert_result_ok(&stdout, "tcp_wildcard_bind");
+        assert_result_ok(&stdout, &stderr, "gradle_uds_bind");
+        assert_result_ok(&stdout, &stderr, "gradle_uds_connect");
+        assert_result_ok(&stdout, &stderr, "uds_scratch");
+        assert_result_ok(&stdout, &stderr, "tcp_localhost_bind");
+        assert_result_ok(&stdout, &stderr, "tcp_ipv6_bind");
+        assert_result_ok(&stdout, &stderr, "tcp_wildcard_bind");
     }
 }
