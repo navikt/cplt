@@ -7817,3 +7817,15 @@ fn profile_keychain_grant_follows_resolved_credential() {
         );
     }
 }
+
+/// `cplt update` stages the download under `~/.config/cplt/update`. That only
+/// helps if a sandboxed agent cannot write there — the whole point of moving off
+/// the system temp dir, which every sandbox can write.
+#[test]
+fn profile_denies_write_to_cplt_config_dir() {
+    let p = generate_profile(&base_profile_options(), &[]);
+    assert!(
+        p.contains("(deny file-write* (subpath \"/Users/test/.config/cplt\"))"),
+        "sandboxed agents must not be able to write cplt's own config/staging dir"
+    );
+}

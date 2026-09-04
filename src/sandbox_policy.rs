@@ -22,6 +22,10 @@ pub const DENIED_DOTFILES: &[&str] = &[
     ".config/gcloud",
     ".config/op",
     ".terraform.d",
+    // cplt's own state: the trust store, blocklist caches, and the self-update
+    // staging area. An agent that can write here can tamper with the sandbox
+    // that contains it, or swap the binary `cplt update` is about to install.
+    ".config/cplt",
 ];
 
 /// Sensitive files under $HOME that are always denied.
