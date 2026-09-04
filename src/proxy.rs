@@ -960,123 +960,72 @@ fn handle_connect(mut client: TcpStream, target: &str, state: &ProxyState) {
         NetVerdict::Allowed => {}
     }
 
-    // ── Upstream (corporate) proxy chaining ──────────────────────────────
-    // If an upstream proxy is configured, forward the tunnel through it rather
-    // than connecting to the target directly. This branch is deliberately placed
-    // AFTER every hostname-based policy gate above — the port check, the
-    // allowlist check, the blocklist check, and the private-hostname check — so
-    // the upstream proxy can NEVER receive a CONNECT that cplt's policy would
-    // block. A blocked/blocklisted/wrong-port target has already returned 403
-    // above and never reaches this code.
+    // ── Resolve, then classify, then act ─────────────────────────────────
     //
-    // Loopback carve-out (--allow-localhost): a target permitted only because
-    // it is loopback must connect DIRECTLY, never via the upstream. Forwarding
-    // `127.0.0.1`/`localhost` to the corporate proxy is nonsensical — it would
-    // resolve loopback on the UPSTREAM's side, reaching a service on the proxy
-    // host rather than the user's machine. Skipping the branch here keeps every
-    // localhost carve-out local, and the direct path's stricter resolved-IP
-    // loopback check (below) still applies.
+    // Everything below is decided by `classify_resolved` from the DNS answer;
+    // this function only carries out the verdict. The resolved-IP SSRF guard
+    // used to be written twice — once in the upstream-forward branch, once in
+    // the direct branch — and now exists once inside that classifier.
     //
-    // No-proxy carve-out (upstream_no_proxy / NO_PROXY): a target whose host
-    // matches the no-proxy list must ALSO skip this branch and fall through to
-    // the direct-connect path below, exactly as NO_PROXY makes a host bypass a
-    // corporate proxy. `host_matches_no_proxy` gates the branch. Security is
-    // preserved for free: every hostname policy gate above already ran, and the
-    // direct path re-applies the resolved-IP SSRF guard (`resolved_ip_is_blocked`
-    // at ~line 1000), so a no-proxy host is still fully policy-checked — it is
-    // just connected DIRECTLY by cplt (which runs OUTSIDE the sandbox) instead
-    // of being forwarded. Because cplt makes that connection, this also works
-    // under `proxy.forced`, where the agent itself cannot reach the network.
-    if !localhost_connect_allowed
-        && let Some(upstream) = state.upstream.as_ref()
-        && !host_matches_no_proxy(&host, &state.upstream_no_proxy)
-    {
-        // SSRF / DNS-rebinding guard for the forwarded path. We apply the SAME
-        // resolved-IP check the direct path applies below, so upstream and
-        // direct mode treat a *resolvable* host identically: a public name
-        // whose A record points at a private/link-local IP (e.g. an
-        // attacker-registered domain aimed at 10.x or the 169.254.169.254 cloud
-        // metadata endpoint) is BLOCKED, never forwarded. Hosts explicitly
-        // trusted via `allow_private_domains` are forwarded exactly as they are
-        // permitted in direct mode — that is how legitimate corporate-internal
-        // targets that resolve to private IPs keep working.
-        //
-        // Residual, stated honestly: a name that ONLY the corporate proxy can
-        // resolve (split-horizon DNS, not resolvable from this host) yields no
-        // local IP to check, so it is forwarded without a resolved-IP check.
-        // Reaching such names is the intended purpose of upstream mode; the
-        // hostname allow/block/port gates above still constrain it.
-        if let Some(socket_addr) = resolve_locally(state, &host, port)
-            && resolved_ip_is_blocked(
-                &socket_addr.ip(),
-                is_domain_match(&host, &state.get_private_domains()),
-                localhost_opt_in,
-            )
-        {
-            log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE-RESOLVED");
-            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to private IP\r\n");
-            let _ = client.shutdown(std::net::Shutdown::Both);
-            return;
-        }
-        connect_via_upstream(client, &host, port, target, upstream, state);
-        return;
-    }
+    // Upstream eligibility is decided here because it is a property of this
+    // connection, not of DNS. The branch sits AFTER every hostname gate above,
+    // so the upstream proxy can NEVER receive a CONNECT cplt's policy would
+    // block. Two targets are ineligible and fall through to a direct connect:
+    //
+    // - a loopback carve-out (`--allow-localhost`): forwarding `127.0.0.1` to
+    //   the corporate proxy would resolve loopback on the UPSTREAM's side,
+    //   reaching a service on the proxy host rather than the user's machine;
+    // - a `NO_PROXY` host (`upstream_no_proxy`), exactly as NO_PROXY makes a
+    //   host bypass a corporate proxy. Security is preserved for free: every
+    //   hostname gate above already ran and the post-DNS guard below still
+    //   applies, so such a host is fully policy-checked — it is just connected
+    //   DIRECTLY by cplt, which runs OUTSIDE the sandbox. That also makes it
+    //   work under `proxy.forced`, where the agent cannot reach the network.
+    let via_upstream = !localhost_connect_allowed
+        && state.upstream.is_some()
+        && !host_matches_no_proxy(&host, &state.upstream_no_proxy);
 
-    // Resolve DNS FIRST, then check the resolved IP. A local resolution failure
-    // on the direct path is a hard error — there is no upstream to defer to.
-    let Some(socket_addr) = resolve_locally(state, &host, port) else {
-        log_connection(state, "CONNECT", target, "DNS-FAIL");
-        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-        return;
-    };
-
-    // Hard requirement for the localhost carve-out: a target that was only
-    // permitted because of --allow-localhost(-any) MUST resolve to a loopback
-    // address. `*.localhost` is supposed to map to 127.0.0.1/::1, but a hostile
-    // resolver or /etc/hosts entry could point `evil.localhost` at a public or
-    // private non-loopback IP. Without this check the carve-out (which already
-    // bypassed the port policy and private-hostname block) would tunnel to an
-    // arbitrary port on an arbitrary host — an SSRF / egress-widening vector.
-    // The earlier is_private_ip guard below only catches *private* IPs; this also
-    // closes the *public* non-loopback case.
-    if localhost_connect_allowed && !socket_addr.ip().is_loopback() {
-        log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE-RESOLVED");
-        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to non-loopback IP\r\n");
-        let _ = client.shutdown(std::net::Shutdown::Both);
-        return;
-    }
-
-    // Check the RESOLVED IP address (prevents DNS rebinding attacks).
-    // Domains in allow_private_domains are explicitly trusted to resolve to private IPs
-    // (e.g. corporate internal services). All other checks still apply.
-    //
-    // For --allow-localhost: we use the *resolved* IP to confirm loopback, not the
-    // hostname. `*.localhost` in DNS is supposed to resolve to 127.0.0.1, but a
-    // compromised DNS or /etc/hosts entry could make `evil.localhost` resolve to
-    // 169.254.169.254 (cloud IMDS) or an internal host. Using the hostname pattern
-    // alone would bypass this check entirely, enabling SSRF to cloud metadata.
-    //
-    // Crucially, a loopback-resolving target is exempted only when the user opted
-    // into localhost access for this connection (`localhost_opt_in`) — NOT based on
-    // whether the hostname literally spells "localhost". Once the target has
-    // resolved to a loopback IP, the spelling of the name is irrelevant: a user who
-    // opted in with `--allow-localhost-any` (or `--allow-localhost <PORT>`) may
-    // legitimately reach loopback via a loopback-aliasing name (`lvh.me`,
-    // `127.0.0.1.nip.io`). With no opt-in, loopback stays blocked regardless of the
-    // name, preserving the no-localhost default. See `resolved_ip_is_blocked`.
-    let private_domains = state.get_private_domains();
-    if resolved_ip_is_blocked(
-        &socket_addr.ip(),
-        is_domain_match(&host, &private_domains),
+    let resolved = resolve_locally(state, &host, port);
+    let route = classify_resolved(
+        resolved,
+        via_upstream,
+        localhost_connect_allowed,
         localhost_opt_in,
-    ) {
-        log_connection(state, "CONNECT", target, "BLOCKED-PRIVATE-RESOLVED");
-        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to private IP\r\n");
-        let _ = client.shutdown(std::net::Shutdown::Both);
-        return;
-    }
+        is_domain_match(&host, &state.get_private_domains()),
+    );
 
-    // Connect to resolved address (not re-resolving)
+    match route {
+        ConnectRoute::Refuse(refusal) => {
+            log_connection(state, "CONNECT", target, refusal.status());
+            let _ = client.write_all(refusal.response());
+            if refusal.half_close() {
+                let _ = client.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        ConnectRoute::Upstream => {
+            // `via_upstream` is only true when `state.upstream` is `Some`.
+            if let Some(upstream) = state.upstream.as_ref() {
+                connect_via_upstream(client, &host, port, target, upstream, state);
+            }
+        }
+        ConnectRoute::Direct(socket_addr) => connect_direct(client, socket_addr, target, state),
+    }
+}
+
+/// Connect straight to an already-resolved, already-approved address and splice
+/// bytes between it and the client.
+///
+/// Precondition: every cplt policy check has passed — the pre-DNS gates in
+/// [`classify_connect`] and the post-DNS gates in [`classify_resolved`], which
+/// is what produced `socket_addr`. This function filters nothing. It connects to
+/// the resolved address rather than the hostname so DNS is never consulted a
+/// second time (no TOCTOU between the checked answer and the connection).
+fn connect_direct(
+    mut client: TcpStream,
+    socket_addr: std::net::SocketAddr,
+    target: &str,
+    state: &ProxyState,
+) {
     let remote = match TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT) {
         Ok(s) => {
             s.set_nodelay(true).ok();
@@ -1641,6 +1590,129 @@ pub fn resolved_ip_is_blocked(
     !(ip.is_loopback() && localhost_allowed)
 }
 
+/// Why a CONNECT was refused after DNS answered.
+///
+/// Each variant carries the audit-log status and the exact 403/502 the client
+/// sees, so the decision and its wire effect cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The host does not resolve locally and there is no upstream to defer to.
+    DnsFail,
+    /// A target permitted ONLY by the `--allow-localhost` carve-out resolved to
+    /// something other than loopback. The carve-out already bypassed the port
+    /// policy and the private-hostname block, so without this it would tunnel to
+    /// an arbitrary port on an arbitrary host. `ResolvedPrivate` only catches
+    /// the *private* case; this also closes the *public* non-loopback one.
+    ResolvedNonLoopback,
+    /// The host resolved to a private/link-local IP that is neither loopback the
+    /// user opted into nor covered by `allow_private_domains` — the DNS-rebinding
+    /// and cloud-metadata (169.254.169.254) guard.
+    ResolvedPrivate,
+}
+
+impl Refusal {
+    /// Audit-log status string.
+    #[must_use]
+    pub fn status(self) -> &'static str {
+        match self {
+            Refusal::DnsFail => "DNS-FAIL",
+            Refusal::ResolvedNonLoopback | Refusal::ResolvedPrivate => "BLOCKED-PRIVATE-RESOLVED",
+        }
+    }
+
+    /// The exact bytes written back to the client.
+    #[must_use]
+    pub fn response(self) -> &'static [u8] {
+        match self {
+            Refusal::DnsFail => b"HTTP/1.1 502 Bad Gateway\r\n\r\n",
+            Refusal::ResolvedNonLoopback => {
+                b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to non-loopback IP\r\n"
+            }
+            Refusal::ResolvedPrivate => b"HTTP/1.1 403 Forbidden\r\n\r\nResolved to private IP\r\n",
+        }
+    }
+
+    /// Whether the client socket is half-closed after the refusal. A policy
+    /// block does; a gateway error does not.
+    #[must_use]
+    pub fn half_close(self) -> bool {
+        !matches!(self, Refusal::DnsFail)
+    }
+}
+
+/// What to do with a CONNECT target once DNS has answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectRoute {
+    /// Forward the tunnel through the configured upstream proxy.
+    Upstream,
+    /// Connect directly to this resolved address (never re-resolving).
+    Direct(std::net::SocketAddr),
+    /// Refuse the tunnel.
+    Refuse(Refusal),
+}
+
+/// Classify a CONNECT target against the post-DNS policy gates.
+///
+/// The pre-DNS half is [`classify_connect`]; this is its counterpart, and the
+/// two together are the whole decision. Being a pure function of the DNS answer
+/// means the resolved-IP SSRF block exists ONCE for both the upstream-forward
+/// and direct-connect paths, which previously carried a copy each.
+///
+/// Precondition: every pre-DNS gate has already passed — this never *widens*
+/// what [`classify_connect`] permitted, it only narrows it further.
+///
+/// - `via_upstream`: an upstream proxy is configured AND this target is
+///   eligible to be forwarded to it (not a loopback carve-out, not `NO_PROXY`).
+/// - `localhost_connect_allowed`: the target is spelled as loopback and the user
+///   opted into localhost for this port.
+/// - `localhost_opt_in`: the user opted into localhost for this port, however
+///   the target is spelled — the sole gate for a target that *resolves* to
+///   loopback.
+/// - `host_is_private_domain`: the host matches `allow_private_domains`.
+///
+/// Unresolvable hosts: on the upstream path a name only the corporate proxy can
+/// resolve (split-horizon DNS) yields no local IP to check, so it is forwarded
+/// unchecked — that is the purpose of upstream mode, and the hostname
+/// allow/block/port gates above still constrain it. On the direct path there is
+/// no upstream to defer to, so it is a hard error.
+#[must_use]
+pub fn classify_resolved(
+    resolved: Option<std::net::SocketAddr>,
+    via_upstream: bool,
+    localhost_connect_allowed: bool,
+    localhost_opt_in: bool,
+    host_is_private_domain: bool,
+) -> ConnectRoute {
+    let Some(addr) = resolved else {
+        return if via_upstream {
+            ConnectRoute::Upstream
+        } else {
+            ConnectRoute::Refuse(Refusal::DnsFail)
+        };
+    };
+
+    if localhost_connect_allowed && !addr.ip().is_loopback() {
+        return ConnectRoute::Refuse(Refusal::ResolvedNonLoopback);
+    }
+
+    // The resolved IP, not the hostname, decides. `*.localhost` is supposed to
+    // resolve to 127.0.0.1, but a compromised resolver or /etc/hosts entry could
+    // point `evil.localhost` at 169.254.169.254 or an internal host; matching on
+    // the name alone would bypass this entirely. Conversely a loopback-resolving
+    // target is exempt only when the user opted in (`localhost_opt_in`), NOT
+    // because the name literally spells "localhost" — so a loopback-aliasing name
+    // (`lvh.me`, `127.0.0.1.nip.io`) works with an opt-in and is blocked without.
+    if resolved_ip_is_blocked(&addr.ip(), host_is_private_domain, localhost_opt_in) {
+        return ConnectRoute::Refuse(Refusal::ResolvedPrivate);
+    }
+
+    if via_upstream {
+        ConnectRoute::Upstream
+    } else {
+        ConnectRoute::Direct(addr)
+    }
+}
+
 /// Check hostname patterns that are known to be private (pre-DNS fast path).
 pub fn is_private_hostname(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
@@ -1992,6 +2064,132 @@ mod tests {
         // Public IPs are never blocked by this gate.
         let public: std::net::IpAddr = "93.184.216.34".parse().unwrap();
         assert!(!resolved_ip_is_blocked(&public, false, false));
+    }
+
+    // ── Post-DNS classification (`classify_resolved`) ───────────────────
+
+    fn addr(ip: &str) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(ip.parse().unwrap(), 443)
+    }
+
+    #[test]
+    fn resolved_public_ip_connects_directly() {
+        let a = addr("93.184.216.34");
+        assert_eq!(
+            classify_resolved(Some(a), false, false, false, false),
+            ConnectRoute::Direct(a)
+        );
+    }
+
+    #[test]
+    fn resolved_private_ip_is_blocked_on_both_paths() {
+        // The rebinding / cloud-metadata guard is the SAME decision whether the
+        // tunnel would be forwarded upstream or connected directly — the block
+        // that used to be duplicated in both branches.
+        for via_upstream in [false, true] {
+            assert_eq!(
+                classify_resolved(
+                    Some(addr("169.254.169.254")),
+                    via_upstream,
+                    false,
+                    false,
+                    false
+                ),
+                ConnectRoute::Refuse(Refusal::ResolvedPrivate),
+                "via_upstream={via_upstream}: metadata IP must never be reached"
+            );
+            assert_eq!(
+                classify_resolved(Some(addr("10.0.0.5")), via_upstream, false, false, false),
+                ConnectRoute::Refuse(Refusal::ResolvedPrivate),
+                "via_upstream={via_upstream}: private IP must never be reached"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_private_domain_waives_the_resolved_ip_block_on_both_paths() {
+        for via_upstream in [false, true] {
+            let route = classify_resolved(Some(addr("10.0.0.5")), via_upstream, false, false, true);
+            let expected = if via_upstream {
+                ConnectRoute::Upstream
+            } else {
+                ConnectRoute::Direct(addr("10.0.0.5"))
+            };
+            assert_eq!(route, expected, "via_upstream={via_upstream}");
+        }
+    }
+
+    #[test]
+    fn localhost_carve_out_requires_a_loopback_answer() {
+        // Permitted only because it is spelled as loopback, but DNS says
+        // otherwise: refuse before the private-IP guard even runs, so a PUBLIC
+        // non-loopback answer is caught too.
+        assert_eq!(
+            classify_resolved(Some(addr("93.184.216.34")), false, true, true, false),
+            ConnectRoute::Refuse(Refusal::ResolvedNonLoopback)
+        );
+        assert_eq!(
+            classify_resolved(Some(addr("169.254.169.254")), false, true, true, false),
+            ConnectRoute::Refuse(Refusal::ResolvedNonLoopback)
+        );
+        let lo = addr("127.0.0.1");
+        assert_eq!(
+            classify_resolved(Some(lo), false, true, true, false),
+            ConnectRoute::Direct(lo)
+        );
+    }
+
+    #[test]
+    fn loopback_needs_an_opt_in_however_the_name_is_spelled() {
+        let lo = addr("127.0.0.1");
+        // A loopback-aliasing name (`lvh.me`) with no opt-in stays blocked.
+        assert_eq!(
+            classify_resolved(Some(lo), false, false, false, false),
+            ConnectRoute::Refuse(Refusal::ResolvedPrivate)
+        );
+        // With the opt-in it is reachable even though the name is not "localhost".
+        assert_eq!(
+            classify_resolved(Some(lo), false, false, true, false),
+            ConnectRoute::Direct(lo)
+        );
+    }
+
+    #[test]
+    fn unresolvable_host_fails_direct_but_forwards_upstream() {
+        // Split-horizon DNS: only the corporate proxy can resolve the name, so
+        // there is no local IP to check and forwarding it is the point of
+        // upstream mode. With no upstream there is nothing to defer to.
+        assert_eq!(
+            classify_resolved(None, true, false, false, false),
+            ConnectRoute::Upstream
+        );
+        assert_eq!(
+            classify_resolved(None, false, false, false, false),
+            ConnectRoute::Refuse(Refusal::DnsFail)
+        );
+    }
+
+    #[test]
+    fn refusal_statuses_and_wire_effects() {
+        assert_eq!(Refusal::DnsFail.status(), "DNS-FAIL");
+        assert_eq!(
+            Refusal::ResolvedPrivate.status(),
+            "BLOCKED-PRIVATE-RESOLVED"
+        );
+        assert_eq!(
+            Refusal::ResolvedNonLoopback.status(),
+            "BLOCKED-PRIVATE-RESOLVED"
+        );
+        // A policy block half-closes the socket; a gateway error does not.
+        assert!(Refusal::ResolvedPrivate.half_close());
+        assert!(Refusal::ResolvedNonLoopback.half_close());
+        assert!(!Refusal::DnsFail.half_close());
+        assert!(Refusal::DnsFail.response().starts_with(b"HTTP/1.1 502"));
+        assert!(
+            Refusal::ResolvedPrivate
+                .response()
+                .starts_with(b"HTTP/1.1 403")
+        );
     }
 
     /// A minimal `ProxyState` for tests that exercise something other than
