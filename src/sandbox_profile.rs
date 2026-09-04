@@ -21,8 +21,8 @@ macro_rules! sbpl {
 
 use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS,
-    GPG_SIGNING_ALLOW_FILES, HOME_TOOL_DIRS, HomeToolDir, SENSITIVE_PROJECT_PATTERNS,
-    SYSTEM_READ_FILES, TOOL_READ_DIRS, app_dirs, playwright_runtime_intent,
+    GPG_SIGNING_ALLOW_FILES, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES,
+    TOOL_READ_DIRS, active_tool_dirs, app_dirs, playwright_runtime_intent,
     validate_playwright_socket_dir, validate_sbpl_path,
 };
 
@@ -36,9 +36,10 @@ pub struct ProfileOptions<'a> {
     pub extra_write: &'a [PathBuf],
     pub allow_socket: &'a [PathBuf],
     pub extra_deny: &'a [PathBuf],
-    /// If `Some`, only include these home tool dirs (tighter profile via discovery).
-    /// If `None`, all known home tool dirs are included.
-    pub existing_home_tool_dirs: Option<&'a [String]>,
+    /// If `Some`, only include these home tool dirs (tighter profile via discovery,
+    /// relocated tool homes already resolved). If `None`, all known home tool
+    /// dirs are included at their defaults.
+    pub existing_home_tool_dirs: Option<&'a [ResolvedToolDir]>,
     /// If `Some`, only include these app dirs (tighter profile via discovery).
     /// If `None`, all known app dirs are included.
     pub existing_app_dirs: Option<&'a [String]>,
@@ -973,7 +974,7 @@ fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
 fn emit_tool_dirs(
     sb: &mut String,
     home_dir: &std::path::Path,
-    existing_home_tool_dirs: Option<&[String]>,
+    existing_home_tool_dirs: Option<&[ResolvedToolDir]>,
     existing_app_dirs: Option<&[String]>,
     agent: Agent,
     allow_cache_exec: &[String],
@@ -986,38 +987,32 @@ fn emit_tool_dirs(
         sbpl!(sb, "(allow file-map-executable (subpath \"{dir}\"))");
     }
     // Home tool dirs: use discovered existing dirs if available, else include all
-    let active_dirs: Vec<&HomeToolDir> = match existing_home_tool_dirs {
-        Some(dirs) => HOME_TOOL_DIRS
-            .iter()
-            .filter(|d| dirs.iter().any(|s| s == d.path))
-            .collect(),
-        None => HOME_TOOL_DIRS.iter().collect(),
-    };
+    let active_dirs = active_tool_dirs(home_dir, existing_home_tool_dirs);
 
-    for dir in &active_dirs {
-        let p = dir.path;
-        sbpl!(sb, "(allow file-read* (subpath \"{home}/{p}\"))");
+    for ResolvedToolDir { path, dir } in &active_dirs {
+        let p = path.to_string_lossy();
+        sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
         if dir.process_exec {
-            sbpl!(sb, "(allow process-exec (subpath \"{home}/{p}\"))");
+            sbpl!(sb, "(allow process-exec (subpath \"{p}\"))");
         }
         if dir.map_exec {
-            sbpl!(sb, "(allow file-map-executable (subpath \"{home}/{p}\"))");
+            sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
         }
         if dir.write {
-            sbpl!(sb, "(allow file-write* (subpath \"{home}/{p}\"))");
+            sbpl!(sb, "(allow file-write* (subpath \"{p}\"))");
         }
     }
     // Deny exec from writable dirs that should not have it.
     // Must come AFTER allows (last-match-wins in Seatbelt).
     // The blanket (allow process-exec) means we need explicit denies,
     // not just absence of a per-dir allow.
-    for dir in &active_dirs {
-        let p = dir.path;
+    for ResolvedToolDir { path, dir } in &active_dirs {
+        let p = path.to_string_lossy();
         if dir.write && !dir.process_exec {
-            sbpl!(sb, "(deny process-exec (subpath \"{home}/{p}\"))");
+            sbpl!(sb, "(deny process-exec (subpath \"{p}\"))");
         }
         if dir.write && !dir.map_exec {
-            sbpl!(sb, "(deny file-map-executable (subpath \"{home}/{p}\"))");
+            sbpl!(sb, "(deny file-map-executable (subpath \"{p}\"))");
         }
     }
 

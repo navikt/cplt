@@ -245,6 +245,13 @@ This path applies only:
 - to the Copilot agent (other agents have their own auth mechanisms)
 - when `block_auth_token = true` (default)
 - when `GH_TOKEN`/`GITHUB_TOKEN` is not already set in the environment
+- when the repo's `[deny] env` does not list `GH_TOKEN`
+
+That last one matters: a repo denying `GH_TOKEN` is saying the agent gets no
+GitHub credential, so the cache is suppressed as well as the environment
+variable. `gh auth token` inside such a sandbox returns nothing and no
+`.gh-token` file is written. Denying only `GITHUB_TOKEN` or
+`COPILOT_GITHUB_TOKEN` is a narrower statement and leaves this channel open.
 
 It falls back gracefully if `gh` is not installed or not authenticated.
 

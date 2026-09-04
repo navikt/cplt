@@ -69,11 +69,16 @@ fn top_level_keys() -> Vec<&'static str> {
 /// Candidate keys for the suggestion come from `CONFIG_KEYS`, so suggestions
 /// automatically cover any option present in the registry.
 pub(super) fn describe_unknown_key(path: &str) -> String {
-    if let Some((section, key)) = path.split_once('.') {
+    // Split off the LAST segment: everything before it is the enclosing table
+    // path. Nested tables exist ([proxy.subscriptions], [[git_guard.allow_push]]),
+    // and splitting on the FIRST dot would report `proxy.subscriptions.allow` as
+    // key `subscriptions.allow` in [proxy] — missing the scoping diagnosis below
+    // and suggesting typo candidates from the wrong section.
+    if let Some((section, key)) = path.rsplit_once('.') {
         // A section name showing up as a key inside another section is a dotted
         // key written below the wrong header: TOML scopes `allow.read = [...]`
         // under the preceding `[git_guard]` header as `git_guard.allow.read`,
-        // so the grant is silently dropped (#228).
+        // so the grant is silently dropped (#228). Same under a nested header.
         if known_sections().contains(&key) {
             let example = section_keys(key).first().copied().unwrap_or("x");
             // Repeating the section name under its own header (`[allow]` +
@@ -82,14 +87,24 @@ pub(super) fn describe_unknown_key(path: &str) -> String {
                 return format!(
                     "unknown key '{key}' in [{section}]: the [{section}] header already \
                      scopes its keys, so '{key}.{example} = ...' reads as \
-                     '{section}.{key}.{example}' — drop the '{key}.' prefix and write \
-                     '{example} = ...'"
+                     '{section}.{key}.{example}', which is not applied — drop the \
+                     '{key}.' prefix and write '{example} = ...'"
                 );
             }
             return format!(
                 "unknown key '{key}' in [{section}]: '{key}' is a top-level section; TOML \
                  scopes '{key}.{example} = ...' written under [{section}] as \
-                 '{section}.{key}.{example}' — move it under its own [{key}] header"
+                 '{section}.{key}.{example}', which is not applied — move it under its \
+                 own [{key}] header, or above the first [section] header"
+            );
+        }
+        // Same silent drop, scalar flavour: `config_version = 1` written below
+        // any header binds as `<section>.config_version` and is discarded.
+        if TOP_LEVEL_SCALARS.contains(&key) {
+            return format!(
+                "unknown key '{key}' in [{section}]: '{key}' is a top-level key; written \
+                 under [{section}] it reads as '{section}.{key}' and is not applied — \
+                 move it above the first [section] header"
             );
         }
         // Exclude the reported key itself from the suggestion candidates. The
@@ -682,6 +697,69 @@ some_new_option = true
             diagnostic.message.contains("[allow]"),
             "got: {}",
             diagnostic.message
+        );
+        // The point of the message: the grant the user wrote is being discarded.
+        assert!(
+            diagnostic.message.contains("is not applied"),
+            "message must say the value is dropped, got: {}",
+            diagnostic.message
+        );
+    }
+
+    /// The same silent drop happens under a NESTED header: `[proxy.subscriptions]`
+    /// scopes a following `allow.read = [...]` as `proxy.subscriptions.allow.read`.
+    /// The diagnosis must name the enclosing table it actually landed in, and the
+    /// key must be the last segment — not `subscriptions.allow` in [proxy].
+    #[test]
+    fn section_name_used_as_key_under_a_nested_header() {
+        let toml = "[proxy.subscriptions]\nrefresh = \"daily\"\n\nallow.read = [\"~/x\"]\n";
+        let diagnostics = validate_config(toml);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| {
+                d.message
+                    .contains("unknown key 'allow' in [proxy.subscriptions]")
+            })
+            .unwrap_or_else(|| {
+                panic!("should flag allow under proxy.subscriptions: {diagnostics:?}")
+            });
+        assert!(
+            diagnostic.message.contains("[allow]"),
+            "got: {}",
+            diagnostic.message
+        );
+    }
+
+    /// The scalar flavour of the same drop: `config_version` is a top-level key,
+    /// so writing it below a header scopes it into that header and discards it.
+    #[test]
+    fn top_level_scalar_below_a_header_explains_the_drop() {
+        let toml = "[sandbox]\npreset = \"standard\"\n\nconfig_version = 1\n";
+        let diagnostic = validate_config(toml)
+            .into_iter()
+            .find(|d| {
+                d.message
+                    .contains("unknown key 'config_version' in [sandbox]")
+            })
+            .expect("should flag config_version under sandbox");
+        assert!(
+            diagnostic.message.contains("is not applied")
+                && diagnostic
+                    .message
+                    .contains("above the first [section] header"),
+            "got: {}",
+            diagnostic.message
+        );
+    }
+
+    /// A plain typo inside a nested table must be reported against that table,
+    /// not against its parent with the subtable name glued onto the key.
+    #[test]
+    fn typo_in_nested_table_names_the_nested_table() {
+        let msg = describe_unknown_key("proxy.subscriptions.refrsh");
+        assert!(
+            msg.contains("unknown key 'refrsh' in [proxy.subscriptions]"),
+            "got: {msg}"
         );
     }
 

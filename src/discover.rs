@@ -69,8 +69,9 @@ pub struct ToolDiscovery {
     pub tools: Vec<ToolInfo>,
     /// Homebrew prefix (e.g. `/opt/homebrew` or `/usr/local`).
     pub homebrew_prefix: Option<PathBuf>,
-    /// Which HOME_TOOL_DIRS actually exist on disk.
-    pub existing_home_tool_dirs: Vec<String>,
+    /// Which HOME_TOOL_DIRS actually exist on disk, at their effective paths
+    /// (relocated tool homes such as `CARGO_HOME` already applied).
+    pub existing_home_tool_dirs: Vec<ResolvedToolDir>,
     /// Writable APP_DIRS considered during discovery, including paths that may not yet exist.
     pub existing_app_dirs: Vec<String>,
 }
@@ -244,8 +245,11 @@ const TOOLS_TO_CHECK: &[&str] = &[
 
 use crate::sandbox::app_dirs;
 use crate::sandbox::home_tool_dirs;
+use crate::sandbox::{ResolvedToolDir, ToolRoot};
 
-pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
+/// `tool_roots` relocates HOME_TOOL_DIRS trees named by env vars
+/// (`CARGO_HOME`, `GOPATH`, ...); see `ToolRoot`.
+pub fn discover_tools(home_dir: &Path, tool_roots: &[ToolRoot]) -> ToolDiscovery {
     let tools: Vec<ToolInfo> = TOOLS_TO_CHECK
         .iter()
         .chain(app_dirs().iter().map(|app_dir| &app_dir.application))
@@ -266,13 +270,13 @@ pub fn discover_tools(home_dir: &Path) -> ToolDiscovery {
     .map(PathBuf::from)
     .find(|p| p.exists());
 
-    let existing_home_tool_dirs: Vec<String> = home_tool_dirs()
+    let existing_home_tool_dirs: Vec<ResolvedToolDir> = home_tool_dirs()
         .iter()
+        .map(|d| d.resolve(home_dir, tool_roots))
         // Writable cache dirs are always included: tools create them on first use,
         // and the profile must permit the write that creates the directory.
         // Non-writable dirs (tool runtimes) are pruned to existing only.
-        .filter(|d| d.write || home_dir.join(d.path).exists())
-        .map(|d| d.path.to_string())
+        .filter(|d| d.dir.write || d.path.exists())
         .collect();
 
     // Writable app dirs are always included in this list because they potentially could be created on first use.
@@ -350,7 +354,7 @@ pub fn discover_all(home_dir: &Path, project_dir: &Path) -> Discovery {
         auth: discover_auth(home_dir),
         copilot: discover_copilot(home_dir),
         agents: discover_agents(),
-        tools: discover_tools(home_dir),
+        tools: discover_tools(home_dir, &[]),
         paths: discover_paths(home_dir, project_dir),
     }
 }
@@ -545,17 +549,29 @@ impl Discovery {
             );
         }
         if !self.tools.existing_home_tool_dirs.is_empty() {
+            let joined: Vec<String> = self
+                .tools
+                .existing_home_tool_dirs
+                .iter()
+                .map(|d| d.path.display().to_string())
+                .collect();
             println!(
-                "  {}✓{} Tool dirs: ~/{}",
+                "  {}✓{} Tool dirs: {}",
                 ui::stdout_color(ui::GREEN),
                 ui::stdout_color(ui::RESET),
-                self.tools.existing_home_tool_dirs.join(", ~/")
+                joined.join(", ")
             );
         }
         let missing_dirs: Vec<&str> = home_tool_dirs()
             .iter()
             .map(|d| d.path)
-            .filter(|p| !self.tools.existing_home_tool_dirs.iter().any(|e| e == p))
+            .filter(|p| {
+                !self
+                    .tools
+                    .existing_home_tool_dirs
+                    .iter()
+                    .any(|e| e.dir.path == *p)
+            })
             .collect();
         if !missing_dirs.is_empty() {
             let joined: Vec<String> = missing_dirs.iter().map(|d| format!("~/{d}")).collect();
@@ -1765,7 +1781,7 @@ mod tests {
     #[test]
     fn tool_discovery_finds_git() {
         let home = PathBuf::from(std::env::var("HOME").unwrap());
-        let tools = discover_tools(&home);
+        let tools = discover_tools(&home, &[]);
         assert!(
             tools.tools.iter().any(|t| t.name == "git"),
             "git should be found on any dev machine"

@@ -394,9 +394,32 @@ fn inject_gh_token_if_needed(cmd: &mut Command, agent: Agent, deny_env: &[String
 /// window. They do NOT prevent a determined same-UID agent from `cat`-ing
 /// `$TMPDIR/.gh-token` before the legitimate read. Do not treat this as
 /// confidentiality against an adversarial agent.
+/// Whether the resolved token should be written to the scratch cache.
+///
+/// Split out because the two channels want opposite things from `deny_env`.
+/// For the ENV channel a denied name means "extract, and inject into one that
+/// survives" — the agent should still get a credential. For the CACHE channel a
+/// denied name means silence: `deny.env` on the token vars is a repo saying the
+/// agent gets no GitHub credential, and serving one through `gh auth token`
+/// inside the sandbox would honour the letter of that and not the intent
+/// (#225).
+///
+/// So: cache only for Copilot, only when `GH_TOKEN` itself is not denied, and
+/// only when the child would not already have one of its own.
+fn should_cache_token(agent: Agent, deny_env: &[String]) -> bool {
+    if agent != Agent::Copilot {
+        return false;
+    }
+    // GH_TOKEN specifically, not any of the three. #225 asks for the cache to
+    // follow the injection target: denying GH_TOKEN is the repo saying "no
+    // GitHub credential", while denying only COPILOT_GITHUB_TOKEN is a narrower
+    // statement that should not cost the agent the cache channel as well.
+    let target_denied = deny_env.iter().any(|d| d == "GH_TOKEN");
+    !target_denied && !child_keeps_a_github_token(deny_env)
+}
+
 fn cache_gh_token_to_file(scratch_dir: &Path, agent: Agent, deny_env: &[String]) {
-    // Only cache for Copilot — other agents have their own auth.
-    if agent != Agent::Copilot || child_keeps_a_github_token(deny_env) {
+    if !should_cache_token(agent, deny_env) {
         return;
     }
     let Some(token) = extract_gh_token() else {
@@ -1154,6 +1177,48 @@ mod gh_token_extraction_tests {
                 "a denied token is stripped from the child, so extraction must still run"
             );
         });
+    }
+
+    /// #225: a repo denying the token vars means the agent gets no GitHub
+    /// credential by ANY channel. The env channel is stripped already; the
+    /// scratch cache would otherwise still serve one through `gh auth token`
+    /// inside the sandbox, honouring the letter of the deny and not the intent.
+    #[test]
+    fn a_denied_gh_token_suppresses_the_scratch_cache() {
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", None),
+                ("COPILOT_GITHUB_TOKEN", None),
+            ],
+            || {
+                assert!(
+                    should_cache_token(Agent::Copilot, &[]),
+                    "no deny and no ambient token: the cache is the only channel"
+                );
+                assert!(
+                    !should_cache_token(Agent::Copilot, &["GH_TOKEN".to_string()]),
+                    "denying the injection target must silence the cache too"
+                );
+                // Narrower denies do not cost the cache. #225 ties the cache to
+                // GH_TOKEN specifically: denying only COPILOT_GITHUB_TOKEN is a
+                // statement about that variable, not "no GitHub credential".
+                for other in ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"] {
+                    assert!(
+                        should_cache_token(Agent::Copilot, &[other.to_string()]),
+                        "{other} denied alone must leave the cache channel open"
+                    );
+                }
+            },
+        );
+    }
+
+    /// The cache was always Copilot-only; the new predicate must not widen it.
+    #[test]
+    fn other_agents_never_get_the_token_cache() {
+        for agent in [Agent::Claude, Agent::OpenCode, Agent::Shell, Agent::Goose] {
+            assert!(!should_cache_token(agent, &[]), "{agent:?}");
+        }
     }
 
     /// Injecting into a denied name hands the token to a variable that is
