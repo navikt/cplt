@@ -445,42 +445,12 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
 pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     let mut keys = Vec::new();
 
-    if propose.allow_localhost_any == Some(true) {
-        keys.push("allow_localhost_any");
+    for row in crate::config::PROPOSE_BOOLS {
+        if (row.propose)(propose) == Some(true) {
+            keys.push(row.key);
+        }
     }
-    if propose.allow_jvm_attach == Some(true) {
-        keys.push("allow_jvm_attach");
-    }
-    if propose.allow_msbuild == Some(true) {
-        keys.push("allow_msbuild");
-    }
-    if propose.gradle_init == Some(true) {
-        keys.push("gradle_init");
-    }
-    if propose.allow_docker == Some(true) {
-        keys.push("allow_docker");
-    }
-    if propose.allow_tmp_exec == Some(true) {
-        keys.push("allow_tmp_exec");
-    }
-    if propose.allow_gpg_signing == Some(true) {
-        keys.push("allow_gpg_signing");
-    }
-    if propose.allow_lifecycle_scripts == Some(true) {
-        keys.push("allow_lifecycle_scripts");
-    }
-    if propose.allow_browser == Some(true) {
-        keys.push("allow_browser");
-    }
-    if propose.allow_env_files == Some(true) {
-        keys.push("allow_env_files");
-    }
-    if propose.gh_guard == Some(true) {
-        keys.push("gh_guard");
-    }
-    if propose.git_push_prevention == Some(true) {
-        keys.push("git_push_prevention");
-    }
+
     if !propose.allow.read.is_empty() {
         keys.push("allow.read");
     }
