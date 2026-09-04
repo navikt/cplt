@@ -457,6 +457,11 @@ impl Config {
             self.sandbox.allow_browser.unwrap_or(false)
         };
 
+        // Keychain substitution (#242): experimental, config-only, default off.
+        // With it off the Keychain grant is exactly what `needs_keychain()` says,
+        // matching every release before this key existed.
+        let keychain_substitute = self.sandbox.keychain_substitute.unwrap_or(false);
+
         // Scratch-dir: FeatureToggle resolves --scratch-dir/--no-scratch-dir (default: on)
         let scratch_dir = cli
             .scratch
@@ -607,6 +612,7 @@ impl Config {
             allow_cache_exec,
             allow_cache_exec_any,
             allow_browser,
+            keychain_substitute,
             scratch_dir,
             use_bubblewrap,
             quiet,
@@ -915,9 +921,20 @@ impl Resolved {
         }
         if agent.needs_keychain() {
             #[cfg(target_os = "macos")]
-            eprintln!(
-                "{blue}[cplt]{nc}    Keychain:      {green}allowed{nc}     {dim}~/Library/Keychains{nc}"
-            );
+            match agent.credential_outside_keychain(
+                home_dir,
+                &self.deny_env,
+                self.keychain_substitute,
+            ) {
+                // The whole-Keychain grant is dropped: the agent has a
+                // credential it can reach without it (#242).
+                Some(source) => eprintln!(
+                    "{blue}[cplt]{nc}    Keychain:      {green}denied{nc}      {dim}{source} used instead{nc}"
+                ),
+                None => eprintln!(
+                    "{blue}[cplt]{nc}    Keychain:      {yellow}allowed{nc}     {dim}~/Library/Keychains — every item {agent} can unlock{nc}"
+                ),
+            }
         }
         eprintln!(
             "{blue}[cplt]{nc}    GH CLI config: {green}read-only{nc}   {dim}~/.config/gh/{{hosts,config}}.yml{nc}"

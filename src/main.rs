@@ -29,10 +29,10 @@ const LONG_VERSION: &str = match option_env!("CPLT_LONG_VERSION") {
 /// Apple Seatbelt (SBPL) via sandbox-exec. On Linux it is Landlock LSM plus
 /// seccomp-BPF, needing kernel 5.13+, or 6.7+ for full network filtering.
 ///
-/// cplt sandboxes GitHub Copilot CLI, OpenCode, Google Gemini CLI, Antigravity
-/// CLI, Pi, and Claude Code. It auto-detects Copilot, OpenCode, Gemini, and
-/// Antigravity from PATH. Pick Pi or Claude Code with --agent, which also
-/// overrides the detected agent at any time.
+/// cplt sandboxes GitHub Copilot CLI, OpenCode, Antigravity CLI, Pi, and
+/// Claude Code. It auto-detects Copilot, OpenCode, and Antigravity from PATH.
+/// Pick Pi or Claude Code with --agent, which also overrides the detected agent
+/// at any time.
 ///
 /// Save your defaults in ~/.config/cplt/config.toml to stop passing flags every
 /// time. Run `cplt config init` for a starter config, or `cplt config validate`
@@ -50,8 +50,8 @@ EXAMPLES:
   cplt --agent opencode --pass-env ANTHROPIC_API_KEY
     Run OpenCode in sandbox with Anthropic API key
 
-  cplt --agent gemini
-    Run Gemini CLI in sandbox (uses Google OAuth or GEMINI_API_KEY)
+  cplt --agent agy
+    Run Antigravity CLI in sandbox (uses Google OAuth)
 
   cplt --with-proxy -- -p \"fix the tests\"
     Run with proxy for connection logging and domain blocking
@@ -105,7 +105,7 @@ EXAMPLES:
 struct Cli {
     /// Which AI coding agent to sandbox. This flag wins over the sandbox.agent
     /// config key, which wins over auto-detection from PATH.
-    /// Supported: copilot, opencode, gemini, antigravity, pi, claude, shell
+    /// Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, shell
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 
@@ -437,7 +437,7 @@ grants exec to every binary cached by any application. Prefer
     allow_cache_exec_any: bool,
 
     /// Allow the agent to open URLs in your default browser.
-    /// Needed for OAuth code flows (MCP servers, Gemini CLI, gh auth login).
+    /// Needed for OAuth code flows (MCP servers, Antigravity, gh auth login).
     /// Disabled by default because it lets the agent use your browser session.
     #[arg(long)]
     allow_browser: bool,
@@ -579,7 +579,7 @@ grants exec to every binary cached by any application. Prefer
     resume: Option<String>,
 
     /// Resume the most recent session in this directory.
-    /// Supported for Copilot, OpenCode, and Antigravity (--continue).
+    /// Supported for Copilot, OpenCode, Antigravity and goose (--continue).
     /// Ignored for other agents.
     #[arg(long = "continue", conflicts_with = "resume")]
     continue_session: bool,
@@ -590,8 +590,10 @@ grants exec to every binary cached by any application. Prefer
     #[arg(long)]
     remote: bool,
 
-    /// Name the Copilot session for later resumption with --resume=NAME.
-    /// Copilot-only (ignored for other agents).
+    /// Name the session for later resumption with --resume=NAME.
+    /// Copilot and goose (goose maps it to `session --name`); ignored for
+    /// other agents. An explicit --resume=ID wins over --name for goose,
+    /// which treats them as alternative selectors.
     #[arg(long = "name", value_name = "SESSION")]
     session_name: Option<String>,
 
@@ -796,6 +798,10 @@ NOTE:
         /// Repository scope captured before the sandboxed agent started.
         #[arg(long)]
         repo_scope: Option<String>,
+
+        /// Trusted Git binary used to verify implicit repository targets from cwd.
+        #[arg(long)]
+        real_git: Option<PathBuf>,
 
         /// Enforcement mode: block, warn, or audit.
         #[arg(long, default_value = "block")]
@@ -1570,11 +1576,10 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                              Install one of:\n\
                              [cplt]   Copilot CLI: brew install --cask copilot-cli\n\
                              [cplt]   OpenCode:    npm i -g opencode-ai\n\
-                             [cplt]   Gemini CLI:  npm i -g @google/gemini-cli\n\
                              [cplt]   Antigravity: https://antigravity.google/docs/cli-getting-started\n\
                              [cplt]   Pi:          npm i -g @earendil-works/pi-coding-agent\n\
                              [cplt]   Claude Code: npm i -g @anthropic-ai/claude-code\n\
-                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|gemini|antigravity|pi|claude|shell"
+                             [cplt] Or specify explicitly: cplt --agent copilot|opencode|antigravity|pi|claude|shell"
                         );
                     }
                 }
@@ -1593,8 +1598,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         let has_api_key = hints.iter().any(|key| {
             parent_env.iter().any(|(k, _)| k == *key) && resolved.pass_env.iter().any(|v| v == *key)
         });
-        // OAuth-first agents (Copilot, OpenCode, Gemini, Antigravity, Claude
-        // Code) keep their credentials on disk in a granted config dir or the
+        // OAuth-first agents (Copilot, OpenCode, Antigravity, Claude Code)
+        // keep their credentials on disk in a granted config dir or the
         // macOS Keychain after an interactive login, so they authenticate with
         // no env var. Don't nag them about API keys: they prompt for login
         // themselves when unauthenticated, and the warning otherwise fires for
@@ -1621,41 +1626,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             ));
         }
 
-        // #237: the host-persistence guard write-denies the agent's own
-        // settings.json, which for Gemini is also where first-run login records
-        // the auth method. Warn up front rather than letting the user meet it
-        // as an opaque permission error from inside the agent, with nothing
-        // naming cplt anywhere in it.
-        //
-        // A warning, not a refusal: the login may well be the only thing that
-        // breaks, and blocking the launch over it takes the choice away. The
-        // cost is that the user can still walk into the failure, so the text
-        // has to be complete enough to be *recognised* later, not just read
-        // now — see `Agent::login_warning`.
-        //
-        // Skipped only where the premise is wrong: a provider API key passed
-        // through authenticates without touching the file, and --inherit-env
-        // may carry one we cannot see. Diagnostic paths (`cplt check`,
-        // --print-profile, --doctor) are NOT exempt — now that nothing is
-        // blocked, the warning is information there too.
-        //
-        // Emitted BEFORE the --allow-browser hint below, deliberately: telling
-        // someone to add a flag for a login that cannot succeed in here is the
-        // contradiction this warning exists to remove.
-        if !has_api_key
-            && !resolved.inherit_env
-            && let Some(msg) = active_agent.login_warning(&home_dir)
-        {
-            ui::warn(&msg);
-        }
-
         // Suppressing the API-key hint for OAuth-first agents leaves the
         // browser-flow ones with no signal at all: Google's login opens a
         // browser, and --allow-browser is off by default, so a user who hits a
         // sign-in prompt hits a dead end. Point at the flag rather than the key.
-        // Says "if you are prompted", not "on first run": for Gemini the
-        // warning above already covers first run, so the prompts this is
-        // really about are re-auth and OAuth from an MCP server.
+        // Says "if you are prompted", not "on first run": the login warning
+        // above already covers first run for the agents that have one, so the
+        // prompts this is really about are re-auth and OAuth from an MCP
+        // server.
         if active_agent.oauth_first()
             && active_agent.oauth_needs_browser()
             && !resolved.allow_browser
@@ -2264,6 +2242,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             Command::GhGate {
                 real_gh,
                 repo_scope,
+                real_git,
                 mode,
                 scope_check,
                 no_scope_check,
@@ -2289,7 +2268,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     },
                     allow_api_write: allow_api_write && !no_allow_api_write,
                 };
-                run_gh_gate(&real_gh, repo_scope.as_deref(), &args, &policy)
+                run_gh_gate(
+                    &real_gh,
+                    repo_scope.as_deref(),
+                    real_git.as_deref(),
+                    &args,
+                    &policy,
+                )
             }
             Command::GitGate {
                 real_git,
@@ -2477,6 +2462,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // by prepare(), so callers don't need to know about backend-specific risks.
     // proxy_port comes from the running handle so the actual ephemeral port is embedded.
     let proxy_port_for_profile = proxy_handle.as_ref().map(|h| h.port);
+    // #242: drop the whole-Keychain grant only when the agent can authenticate
+    // without it. Resolved against `deny_env` because that list is stripped from
+    // the child environment later — a repo `.cplt.toml` naming the token var
+    // must not leave the run with neither Keychain nor token.
+    let keychain_substitute = active_agent.credential_outside_keychain(
+        &home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
     let prepared = match sandbox::prepare(&sandbox::SandboxConfig {
         project_dir: &project_dir,
         home_dir: &home_dir,
@@ -2511,6 +2505,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         allow_cache_exec: &resolved.allow_cache_exec,
         allow_cache_exec_any: resolved.allow_cache_exec_any,
         allow_browser: resolved.allow_browser,
+        keychain_substitute,
         use_bubblewrap: resolved.use_bubblewrap,
     }) {
         Ok(s) => s,
@@ -2678,19 +2673,29 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 
     // Auto-resume: when no explicit args are given and no session flags are set,
     // default to --resume so the agent continues the previous session.
-    // Applies to Copilot and Gemini. Skipped if user passes -- args or uses
-    // explicit session management flags (--resume, --continue, --name).
+    // Applies to Copilot. Skipped if user passes -- args or uses explicit
+    // session management flags (--resume, --continue, --name).
     let has_session_flags =
         cli.resume.is_some() || cli.continue_session || cli.session_name.is_some();
-    if matches!(agent, agent::Agent::Copilot | agent::Agent::Gemini)
-        && cli.copilot_args.is_empty()
-        && !has_session_flags
-    {
+    if matches!(agent, agent::Agent::Copilot) && cli.copilot_args.is_empty() && !has_session_flags {
         args.push("--resume".into());
     }
 
     args.extend(cli.copilot_args.iter().cloned());
     args
+}
+
+/// Restate a block-mode policy message for warn mode.
+///
+/// Policy errors are written for block mode and lead with `⚠️ BLOCKED by
+/// sandbox:`. In warn mode the command is allowed to run, so that prefix is
+/// swapped for the warning label instead of being stacked behind it — otherwise
+/// the user reads "WARNING … BLOCKED" for a command that just ran.
+fn warn_mode_message(msg: &str) -> String {
+    match msg.strip_prefix("⚠️ BLOCKED by sandbox:") {
+        Some(rest) => format!("⚠️  WARNING (would block):{rest}"),
+        None => format!("⚠️  WARNING (would block): {msg}"),
+    }
 }
 
 /// Handle `cplt gh-gate` — evaluate a gh command and exec the real binary if allowed.
@@ -2701,6 +2706,7 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
 fn run_gh_gate(
     real_gh: &Path,
     repo_scope: Option<&str>,
+    real_git: Option<&Path>,
     args: &[String],
     policy: &gh_proxy::GatePolicy,
 ) -> ExitCode {
@@ -2713,7 +2719,7 @@ fn run_gh_gate(
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope) {
+    match gh_proxy::gate_with_repo_scope(&arg_refs, policy, repo_scope, real_git) {
         Ok(approval) => exec_gh(real_gh, args, approval.repo_scope.as_deref()),
         Err(msg) => match policy.mode {
             config::EnforcementMode::Block => {
@@ -2721,7 +2727,7 @@ fn run_gh_gate(
                 ExitCode::FAILURE
             }
             config::EnforcementMode::Warn => {
-                eprintln!("⚠️  WARNING (would block): {msg}");
+                eprintln!("{}", warn_mode_message(&msg));
                 // Allow through in warn mode
                 exec_gh(real_gh, args, None)
             }
@@ -2831,7 +2837,7 @@ fn run_git_gate(
                 ExitCode::FAILURE
             }
             config::EnforcementMode::Warn => {
-                eprintln!("⚠️  WARNING (would block): {msg}");
+                eprintln!("{}", warn_mode_message(&msg));
                 use std::os::unix::process::CommandExt;
                 let err = std::process::Command::new(real_git).args(args).exec();
                 ui::error(&format!("Failed to exec git: {err}"));
@@ -3035,6 +3041,12 @@ fn prepare_shell_sandbox(
     // Grant access to tool paths relocated via env vars (GOPATH, CARGO_HOME, ...).
     merge_tool_path_env_overrides(resolved, home_dir);
 
+    // See the #242 note at the other `SandboxConfig` construction.
+    let keychain_substitute = active_agent.credential_outside_keychain(
+        home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
     let sandbox_config = sandbox::SandboxConfig {
         project_dir,
         home_dir,
@@ -3070,6 +3082,7 @@ fn prepare_shell_sandbox(
         allow_cache_exec: &resolved.allow_cache_exec,
         allow_cache_exec_any: resolved.allow_cache_exec_any,
         allow_browser: resolved.allow_browser,
+        keychain_substitute,
         use_bubblewrap: resolved.use_bubblewrap,
     };
 
@@ -6268,6 +6281,26 @@ mod tests {
     }
 
     #[test]
+    fn warn_mode_message_replaces_the_block_prefix() {
+        let blocked = "\u{26a0}\u{fe0f} BLOCKED by sandbox: 'gh pr merge' is not allowed.\nReason: needs a human.";
+        let warned = warn_mode_message(blocked);
+        assert!(
+            !warned.contains("BLOCKED"),
+            "warn mode must not tell the user the command was blocked: {warned}"
+        );
+        assert!(warned.starts_with("\u{26a0}\u{fe0f}  WARNING (would block): 'gh pr merge'"));
+        assert!(
+            warned.ends_with("Reason: needs a human."),
+            "the body must survive: {warned}"
+        );
+        // A message without the block prefix still gets labelled.
+        assert_eq!(
+            warn_mode_message("nope"),
+            "\u{26a0}\u{fe0f}  WARNING (would block): nope"
+        );
+    }
+
+    #[test]
     fn observe_domains_flags_parse() {
         let cli = parse(&["--observe-domains", "--observe-domains-out", "/tmp/obs.txt"]);
         assert!(cli.observe_domains);
@@ -6520,20 +6553,6 @@ mod tests {
         let cli = parse(&["--", "run", "fix tests"]);
         let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
         assert_eq!(args, vec!["run", "fix tests"]);
-    }
-
-    #[test]
-    fn gemini_auto_resume_when_no_args() {
-        let cli = parse(&[]);
-        let args = build_copilot_args(&cli, &agent::Agent::Gemini);
-        assert_eq!(args, vec!["--resume"]);
-    }
-
-    #[test]
-    fn gemini_no_auto_resume_when_args_given() {
-        let cli = parse(&["--", "-p", "fix tests"]);
-        let args = build_copilot_args(&cli, &agent::Agent::Gemini);
-        assert_eq!(args, vec!["-p", "fix tests"]);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

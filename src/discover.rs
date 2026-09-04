@@ -198,7 +198,6 @@ pub fn discover_copilot(home_dir: &Path) -> CopilotDiscovery {
 const AGENTS_TO_CHECK: &[(&str, &[&str], &[&str])] = &[
     ("Copilot", &["copilot"], &["--version"]),
     ("OpenCode", &["opencode"], &["--version"]),
-    ("Gemini", &["gemini"], &["--version"]),
     ("Antigravity", &["antigravity", "agy"], &["--version"]),
     ("Claude", &["claude"], &["--version"]),
 ];

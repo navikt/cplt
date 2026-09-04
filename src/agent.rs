@@ -1,7 +1,7 @@
 //! Agent abstraction for different AI coding tools.
 //!
 //! cplt can sandbox multiple AI coding agents — currently GitHub Copilot CLI,
-//! OpenCode, Google Gemini CLI, Antigravity, Pi, and Claude Code. Each agent has
+//! OpenCode, Google Gemini CLI, Antigravity, Pi, Claude Code, and goose. Each agent has
 //! different binary names, config directories, and runtime requirements, but
 //! shares the same core sandbox infrastructure.
 
@@ -65,14 +65,14 @@ const COPILOT_INFRA_DOMAINS: &[&str] = &[
     "default.exp2.cds.s9ch.io",
 ];
 
-/// Google AI infrastructure shared by the Gemini CLI and Antigravity (both are
-/// Google products; Antigravity stores its config under `~/.gemini`). Covers
-/// the Gemini API, the Code Assist backend, and Google OAuth for login.
+/// Google AI infrastructure used by Antigravity (a Google product, which stores
+/// its config under `~/.gemini`). Covers the Gemini API, the Code Assist
+/// backend, and Google OAuth for login.
 ///
 /// BARE domains, matched exact-or-subdomain by `crate::proxy::is_domain_match`.
 /// Do not add a leading `*.`; the matcher does not interpret glob syntax.
 ///
-/// Google Gemini API + Code Assist backend + Google OAuth. High confidence.
+/// Gemini API + Code Assist backend + Google OAuth. High confidence.
 const GOOGLE_AI_DOMAINS: &[&str] = &[
     "generativelanguage.googleapis.com",
     "cloudcode-pa.googleapis.com",
@@ -107,6 +107,41 @@ const ANTHROPIC_DOMAINS: &[&str] = &[
 /// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
 const OPENCODE_DOMAINS: &[&str] = &["opencode.ai", "models.dev"];
 
+/// A credential an agent can use instead of the macOS login Keychain (#242).
+///
+/// Returned by [`Agent::credential_outside_keychain`]. The variants exist
+/// because the two kinds need different handling downstream: an env var has to
+/// be forwarded into the sandbox explicitly (credential vars that were not
+/// already in `ENV_ALLOWLIST` on main are deliberately still not in it, so they
+/// reach the agent only as part of this trade), while a file the agent reads
+/// itself needs nothing forwarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeychainSubstitute {
+    /// A credential already set in the parent environment.
+    EnvVar(&'static str),
+    /// A credential file inside a directory the sandbox already grants.
+    File(PathBuf),
+}
+
+impl KeychainSubstitute {
+    /// The variable to forward into the sandbox, if this substitute is one.
+    pub fn env_var(&self) -> Option<&'static str> {
+        match self {
+            KeychainSubstitute::EnvVar(v) => Some(v),
+            KeychainSubstitute::File(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for KeychainSubstitute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeychainSubstitute::EnvVar(v) => write!(f, "${v}"),
+            KeychainSubstitute::File(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
+
 /// Supported AI coding agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -115,28 +150,39 @@ pub enum Agent {
     Copilot,
     /// OpenCode (anomalyco/opencode) — open source AI coding agent.
     OpenCode,
-    /// Google Gemini CLI — AI coding agent powered by Gemini models.
-    Gemini,
     /// Antigravity CLI (`antigravity` / `agy`).
     Antigravity,
     /// Pi coding agent (https://github.com/earendil-works/pi).
     Pi,
     /// Claude Code (Anthropic's `claude` CLI).
     Claude,
+    /// goose — open-source AI agent (github.com/aaif-goose/goose).
+    Goose,
     /// Plain sandboxed shell — no AI agent, just a secure shell session.
     Shell,
 }
 
 impl Agent {
+    /// Every agent variant, for exhaustive iteration in tests and lookups.
+    pub const ALL: &'static [Agent] = &[
+        Agent::Copilot,
+        Agent::OpenCode,
+        Agent::Antigravity,
+        Agent::Pi,
+        Agent::Claude,
+        Agent::Goose,
+        Agent::Shell,
+    ];
+
     /// The binary name to search for in PATH.
     pub fn binary_name(&self) -> &'static str {
         match self {
             Agent::Copilot => "copilot",
             Agent::OpenCode => "opencode",
-            Agent::Gemini => "gemini",
             Agent::Antigravity => "antigravity",
             Agent::Pi => "pi",
             Agent::Claude => "claude",
+            Agent::Goose => "goose",
             Agent::Shell => "shell",
         }
     }
@@ -146,10 +192,10 @@ impl Agent {
         match self {
             Agent::Copilot => "Copilot",
             Agent::OpenCode => "OpenCode",
-            Agent::Gemini => "Gemini",
             Agent::Antigravity => "Antigravity",
             Agent::Pi => "Pi",
             Agent::Claude => "Claude Code",
+            Agent::Goose => "goose",
             Agent::Shell => "Shell",
         }
     }
@@ -167,10 +213,10 @@ impl Agent {
         match self {
             Agent::Copilot => &["--no-auto-update"],
             Agent::OpenCode
-            | Agent::Gemini
             | Agent::Antigravity
             | Agent::Pi
             | Agent::Claude
+            | Agent::Goose
             | Agent::Shell => &[],
         }
     }
@@ -263,27 +309,189 @@ impl Agent {
                 }
                 // --remote and --name have no claude equivalent; dropped.
             }
-            // Gemini still receives auto-resume handling in main.rs; Pi and Shell
-            // have no recognized session flags. None get explicit translation here.
-            Agent::Gemini | Agent::Pi | Agent::Shell => {}
+            Agent::Goose => {
+                // Verified against goose 1.48.0 (`goose --help`, `goose session
+                // --help`): the session flags live on the `session` SUBCOMMAND,
+                // not the top level — `goose --resume` is rejected with
+                // "unexpected argument '--resume' found". Bare `goose` already
+                // starts a session, so only emit the subcommand when there is
+                // something to translate.
+                //
+                // `-r/--resume` continues the most recent session;
+                // `--session-id ID` (requires `--resume`) selects one by id and
+                // `-n/--name NAME` selects one by name. They are alternative
+                // selectors, so at most one is emitted — cplt's explicit
+                // `--resume=ID` wins over `--name`.
+                let resuming = resume.is_some() || continue_session;
+                let selector = resume.filter(|s| !s.is_empty());
+                // Same emptiness filter as `selector` above: `--name ""` is not
+                // a session goose can select, and emitting it would turn a bare
+                // run into a rejected `session --name ""`.
+                let session_name = session_name.filter(|s| !s.is_empty());
+                if resuming || session_name.is_some() {
+                    args.push("session".to_string());
+                }
+                if resuming {
+                    args.push("--resume".to_string());
+                }
+                if let Some(id) = selector {
+                    args.push("--session-id".to_string());
+                    args.push(id.to_string());
+                } else if let Some(name) = session_name {
+                    args.push("--name".to_string());
+                    args.push(name.to_string());
+                }
+                // --remote has no goose equivalent; dropped.
+            }
+            // Pi and Shell have no recognized session flags, so they get no
+            // explicit translation here.
+            Agent::Pi | Agent::Shell => {}
         }
         args
     }
 
     /// Whether this agent needs macOS Keychain access for auth tokens.
-    /// Copilot stores GitHub auth tokens in the Keychain.
-    /// Gemini uses Keychain for extension integrity verification.
+    ///
+    /// Copilot stores GitHub auth tokens in the Keychain (`copilot-cli`).
+    /// Gemini CLI bundles `@github/keytar` with the service name
+    /// `gemini-cli-oauth` and refreshes that token in place.
+    /// Antigravity's `agy` stores its Google OAuth token under
+    /// `gemini`/`antigravity` and refreshes it there.
     /// Claude Code stores its OAuth token in the login Keychain on macOS
     /// ("Claude Code-credentials"); on Linux it uses ~/.claude/.credentials.json.
     /// OpenCode authenticates via the `/connect` device flow by default;
     /// third-party providers use API keys from env vars or config files.
+    /// goose stores provider API keys in the OS keyring by default (the macOS
+    /// login Keychain); `GOOSE_DISABLE_KEYRING=1` switches it to a plaintext
+    /// `secrets.yaml` in the config dir instead, which needs no grant.
+    ///
+    /// This is the *base* term only. Whether a given run actually gets the grant
+    /// is decided at launch by [`Agent::credential_outside_keychain`] (#242).
     pub fn needs_keychain(&self) -> bool {
         matches!(
             self,
-            Agent::Copilot | Agent::Gemini | Agent::Antigravity | Agent::Claude
+            Agent::Copilot | Agent::Antigravity | Agent::Claude | Agent::Goose
         )
     }
 
+    /// Environment variables that fully replace this agent's Keychain
+    /// credential, in the agent's own precedence order.
+    ///
+    /// Only variables carrying a credential that is **durable for a session**
+    /// belong here. The Keychain items themselves are refresh blobs: Claude
+    /// Code's `Claude Code-credentials` holds an access token that expires in
+    /// hours and is rewritten in place, and Antigravity's `gemini`/`antigravity`
+    /// item is likewise rewritten. Pre-extracting *those* would hand the agent a
+    /// token that dies mid-session with no way to refresh and no Keychain left
+    /// to re-authenticate against, so cplt does not do it.
+    ///
+    /// `ANTHROPIC_AUTH_TOKEN` is omitted deliberately: Claude Code treats it as a
+    /// gateway token it may itself try to refresh, so it is not a safe stand-in.
+    pub fn keychain_substitute_env_vars(&self) -> &'static [&'static str] {
+        match self {
+            // Copilot gets no substitute until somebody probes it. It is the
+            // default, priority-1 agent, GITHUB_TOKEN is the most commonly
+            // exported token on a developer machine, and whether Copilot CLI
+            // prefers the env var over the Keychain is exactly the precedence
+            // question this trade declines to assume for Gemini. PR #173 asserts
+            // an injected token suffices; asserting is not probing, and the
+            // default agent is the wrong place to find out. Re-enable this with
+            // `["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]` once a run
+            // under a grant-dropped profile has been confirmed to authenticate.
+            Agent::Copilot => &[],
+            // Antigravity has no env substitute either — its credential lives in
+            // a file instead, see `credential_outside_keychain`.
+            Agent::Antigravity => &[],
+            // `claude setup-token` mints a long-lived token for
+            // CLAUDE_CODE_OAUTH_TOKEN. Verified against claude 2.1.258: with it
+            // set, `claude auth status` reports `authMethod: oauth_token`
+            // whether the Keychain is reachable or not — the Keychain item is
+            // never consulted, so dropping the grant changes nothing.
+            //
+            // ANTHROPIC_API_KEY is deliberately NOT here. Claude Code *prefers*
+            // the Keychain claude.ai login over it (`authMethod: claude.ai` with
+            // the key merely listed as `apiKeySource`), so dropping the grant
+            // would silently move a subscription user onto per-token API
+            // billing. Users who want that can pass it explicitly with
+            // `--pass-env ANTHROPIC_API_KEY`.
+            Agent::Claude => &["CLAUDE_CODE_OAUTH_TOKEN"],
+            _ => &[],
+        }
+    }
+
+    /// Where this agent's credential can be read from *without* the login
+    /// Keychain, if anywhere. `Some(_)` means the whole-Keychain grant can be
+    /// dropped for this run; `None` means the grant must stay (#242).
+    ///
+    /// `enabled` is `sandbox.keychain_substitute`, off by default. The whole
+    /// trade is gated on it because the failure mode when it misjudges an agent
+    /// is that the user can neither authenticate nor recover from inside the
+    /// sandbox — the recovery path *is* the credential store the trade removed.
+    /// With it off this always returns `None`, so both the emitted profile and
+    /// the environment reaching the agent are what they were before this key
+    /// existed.
+    ///
+    /// `deny_env` is the resolved `deny.env` list. A repo `.cplt.toml` can name
+    /// a credential var there, and it is stripped from the child environment —
+    /// so a var listed there is NOT a substitute, or the run would end up with
+    /// no Keychain *and* no token. That is the exact failure PR #173 hit, and
+    /// here it would be reachable from a checked-in file.
+    pub fn credential_outside_keychain(
+        &self,
+        home: &Path,
+        deny_env: &[String],
+        enabled: bool,
+    ) -> Option<KeychainSubstitute> {
+        self.credential_outside_keychain_on(home, deny_env, enabled, cfg!(target_os = "macos"))
+    }
+
+    /// [`Agent::credential_outside_keychain`] with the platform as a parameter.
+    ///
+    /// The only reason this is separate: `cfg!` is read in exactly one place
+    /// (the wrapper above), so callers cannot drift, while tests can assert
+    /// *both* platform outcomes from either host. A `#[cfg]`-gated test would
+    /// leave the Linux answer — "the trade never applies" — asserted nowhere.
+    pub(crate) fn credential_outside_keychain_on(
+        &self,
+        home: &Path,
+        deny_env: &[String],
+        enabled: bool,
+        macos: bool,
+    ) -> Option<KeychainSubstitute> {
+        // The whole trade is about the macOS login Keychain. On Linux these
+        // agents read credential files the sandbox already grants, so there is
+        // no grant to drop — and forwarding a token there would be a change with
+        // nothing bought for it.
+        if !enabled || !macos {
+            return None;
+        }
+        if let Some(var) = self
+            .keychain_substitute_env_vars()
+            .iter()
+            .filter(|k| !deny_env.iter().any(|d| d == *k))
+            .find(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+        {
+            return Some(KeychainSubstitute::EnvVar(var));
+        }
+        // Antigravity's `agy` falls back to a plaintext token file when its
+        // keyring is unavailable ("Failed to load token from keyring, falling
+        // back to file"). The file is a *fallback*, not a mirror: a healthy
+        // keyring is written in place and the file is never created, so its mere
+        // existence is the only safe signal that the agent can still
+        // authenticate without the grant. cplt already grants
+        // `~/.gemini/antigravity-cli` read+write, so refreshes persist there.
+        if *self == Agent::Antigravity {
+            let token = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+            // `is_file()` as well as non-empty: a directory reports a non-zero
+            // len (64 on macOS, 4096 on ext4), so a stray directory at this path
+            // would read as a valid credential and drop the Keychain grant,
+            // stranding the agent at a browser re-login it cannot reach.
+            if std::fs::metadata(&token).is_ok_and(|m| m.is_file() && m.len() > 0) {
+                return Some(KeychainSubstitute::File(token));
+            }
+        }
+        None
+    }
     /// Whether this agent needs access to ~/.copilot directory.
     pub fn needs_copilot_dir(&self) -> bool {
         matches!(self, Agent::Copilot)
@@ -299,16 +507,6 @@ impl Agent {
     ///   `UserPromptSubmit`, …) which fire automatically. `commands/`,
     ///   `agents/` and `skills/` stay writable — those do require explicit user
     ///   invocation.
-    /// - Gemini: `settings.json` holds `hooks.SessionStart[]`, which fires on
-    ///   startup, on resume and after `/clear`; folder trust is workspace-scoped
-    ///   and does not gate user-level hooks. `extensions/` is auto-loaded.
-    ///   `policies/*.toml` is the user policy tier, also not trust-gated, where
-    ///   `decision = "allow"` on `run_shell_command` makes the next host run
-    ///   auto-execute without confirmation — nothing legitimate writes it from
-    ///   inside a session. `hooks/` is where the scripts `settings.json` names
-    ///   conventionally live: denying the settings file stops a *new* hook
-    ///   being pointed at, but an existing entry's script body would still be
-    ///   rewritable in place (same reasoning as Pi's `npm`/`git`).
     /// - Antigravity: its own grants carry the same class. `config/hooks.json`
     ///   names host commands, `config/mcp_config.json` holds `mcpServers` that
     ///   auto-start, and `antigravity-cli/bin/` holds binaries (`agentapi`,
@@ -321,11 +519,9 @@ impl Agent {
     ///   `settings.json` stops a *new* entry being added but leaves installed
     ///   package code editable in place, and it loads on the next host run.
     ///
-    /// Cost: denying `settings.json` breaks *first-run login inside the
-    /// sandbox* for Gemini (it writes `selectedAuthType` there). For Pi it
-    /// breaks package management and every in-session setting that persists
-    /// there — `/model` Ctrl+S, `/thinking`, `/settings`. Do those outside
-    /// cplt — see SECURITY.md.
+    /// Cost: for Pi this breaks package management and every in-session
+    /// setting that persists to `settings.json` — `/model` Ctrl+S,
+    /// `/thinking`, `/settings`. Do those outside cplt — see SECURITY.md.
     ///
     /// Enforcement is macOS-first: Seatbelt emits these as write-denies after
     /// the dir-wide allow (last match wins). Landlock cannot sub-deny inside an
@@ -334,7 +530,6 @@ impl Agent {
     pub fn host_persistence_denies(&self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &["statusline.sh", "plugins", "settings.json"],
-            Agent::Gemini => &["settings.json", "extensions", "policies", "hooks"],
             Agent::Pi => &["settings.json", "extensions", "npm", "git"],
             // Antigravity's grants are ~/.gemini/config and
             // ~/.gemini/antigravity-cli, not ~/.gemini itself, so Gemini's own
@@ -342,7 +537,13 @@ impl Agent {
             // joined onto BOTH grants, and the join that does not correspond to
             // a real path is inert (same as ~/.claude.json/statusline.sh).
             Agent::Antigravity => &["hooks.json", "mcp_config.json", "bin"],
-            Agent::Copilot | Agent::OpenCode | Agent::Shell => &[],
+            // goose needs no entries: its ONLY auto-execution vector is
+            // config.yaml's `extensions:` list, and its config dir is granted
+            // read-only, so there is nothing writable left to deny. (These
+            // denies are joined onto writable dirs only, so an entry here would
+            // be inert anyway.) The data and state dirs hold sessions, logs and
+            // downloaded model weights — nothing goose auto-executes.
+            Agent::Goose | Agent::Copilot | Agent::OpenCode | Agent::Shell => &[],
         }
     }
 
@@ -373,8 +574,8 @@ impl Agent {
     ///
     /// Every agent gets the shared package-registry base. On top of that, each
     /// agent with documented infrastructure gets its own endpoints: Copilot the
-    /// GitHub Copilot infra (#52), Gemini/Antigravity the Google AI infra
-    /// (Antigravity additionally its own domain), Claude the Anthropic infra,
+    /// GitHub Copilot infra (#52), Antigravity the Google AI infra plus its own
+    /// domain, Claude the Anthropic infra,
     /// and OpenCode only its own infra (see below). Entries are bare domains
     /// matched by `crate::proxy::is_domain_match` (exact or subdomain).
     ///
@@ -395,11 +596,27 @@ impl Agent {
         // is not an AI agent so it has no model/auth traffic of its own.
         let infra: &[&[&str]] = match self {
             Agent::Copilot => &[COPILOT_INFRA_DOMAINS],
-            Agent::Gemini => &[GOOGLE_AI_DOMAINS],
             Agent::Antigravity => &[GOOGLE_AI_DOMAINS, ANTIGRAVITY_DOMAINS],
             Agent::Claude => &[ANTHROPIC_DOMAINS],
             Agent::OpenCode => &[OPENCODE_DOMAINS],
-            Agent::Pi | Agent::Shell => &[],
+            // goose gets the package-registry base and NOTHING else. This is
+            // an observed result, not an omission: `cplt --agent goose
+            // --observe-domains -- run -t "…"` with goose 1.48.0 on 2026-09-03
+            // recorded only `api.openai.com` — the configured provider — and
+            // no goose-owned host at all. goose is provider-agnostic, so the
+            // provider domain belongs in the user's `allowed_domains`, not
+            // here.
+            //
+            // Deliberately excluded, both observed but neither on a default
+            // path: `us.i.posthog.com` (telemetry, opt-in — the same run with
+            // GOOSE_TELEMETRY_OFF=1 contacted nothing but the provider) and
+            // `github.com` (only `goose update`, which is self-update inside
+            // the sandbox and is not something to enable by default).
+            //
+            // `block.github.io` from the original patch was never contacted;
+            // goose's docs moved to goose-docs.ai and the repo to
+            // github.com/aaif-goose/goose.
+            Agent::Goose | Agent::Pi | Agent::Shell => &[],
         };
         let mut domains: Vec<&'static str> = Vec::new();
         for slice in infra {
@@ -527,16 +744,6 @@ impl Agent {
                     },
                 ]
             }
-            Agent::Gemini => {
-                // ~/.gemini stores auth, settings, sessions, and agents
-                vec![AgentDir {
-                    path: home.join(".gemini"),
-                    write: true,
-                    map_exec: false,
-                    process_exec: false,
-                    write_files: vec![],
-                }]
-            }
             Agent::Antigravity => {
                 // Antigravity stores project config under ~/.gemini/config
                 // and runtime/session data under ~/.gemini/antigravity-cli.
@@ -618,6 +825,79 @@ impl Agent {
                     },
                 ]
             }
+            Agent::Goose => {
+                // goose keeps its files under XDG dirs on BOTH macOS and Linux —
+                // it does not use ~/Library/Application Support. Verified with
+                // goose 1.48.0 on macOS via `goose info`, with and without the
+                // XDG_* overrides set:
+                //   ~/.config/goose        — config.yaml, secrets.yaml, skills
+                //   ~/.local/share/goose   — sessions/sessions.db, apps
+                //   ~/.local/state/goose   — logs
+                // `goose info` reports no cache dir and a full `goose run`
+                // created none, so ~/.cache/goose is not granted.
+                //
+                // The config dir is READ-ONLY, and no `write_files` narrow it
+                // back open. config.yaml's `extensions:` entries carry a `cmd`
+                // + `args` that goose spawns as a subprocess on every session
+                // start, so a writable config dir lets a sandboxed agent plant
+                // a command that runs UNSANDBOXED the next time the user
+                // launches goose — the same class as .git/hooks and .cplt.toml.
+                //
+                // A `write_files` carve-out cannot help here anyway: goose
+                // rewrites config.yaml, permission.yaml and
+                // permissions/tool_permissions.json by creating a temp file in
+                // the directory and renaming over the target, which needs
+                // directory write, not file write.
+                //
+                // What read-only costs, all of it a deliberate act that belongs
+                // outside the sandbox: `/mode` and theme changes, the first-run
+                // telemetry prompt, and persisting "always allow" tool
+                // permissions — that last one being a privilege the sandboxed
+                // agent should not be able to grant itself for future runs. A
+                // full `goose run` against a pre-configured config.yaml left
+                // the file byte-identical and wrote only under the data and
+                // state dirs.
+                //
+                // NOT covered here: goose also auto-spawns MCP servers declared
+                // in plugin manifests under `~/.agents/plugins/` and
+                // `<project>/.agents/plugins/`. The former is outside every
+                // granted dir, so it is unreadable and unwritable in the
+                // sandbox; the latter sits in the writable project tree and is
+                // the same in-repo persistence class as `.git/hooks`, which is
+                // handled by the global protected set, not per-agent.
+                let config_base = std::env::var("XDG_CONFIG_HOME")
+                    .ok()
+                    .map_or_else(|| home.join(".config"), PathBuf::from);
+                let data_base = std::env::var("XDG_DATA_HOME")
+                    .ok()
+                    .map_or_else(|| home.join(".local/share"), PathBuf::from);
+                let state_base = std::env::var("XDG_STATE_HOME")
+                    .ok()
+                    .map_or_else(|| home.join(".local/state"), PathBuf::from);
+                vec![
+                    AgentDir {
+                        path: config_base.join("goose"),
+                        write: false,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                    AgentDir {
+                        path: data_base.join("goose"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                    AgentDir {
+                        path: state_base.join("goose"),
+                        write: true,
+                        map_exec: false,
+                        process_exec: false,
+                        write_files: vec![],
+                    },
+                ]
+            }
         }
     }
 
@@ -639,15 +919,15 @@ impl Agent {
             // `/connect` device flow against a GitHub Copilot subscription;
             // credentials stored in ~/.local/share/opencode/auth.json.
             Agent::OpenCode => true,
-            // Google OAuth browser flow by default; credentials in ~/.gemini/.
-            Agent::Gemini => true,
             // Google OAuth with keychain/session storage.
             Agent::Antigravity => true,
             // Subscription OAuth token in ~/.claude (.credentials.json on
             // Linux) or the macOS login Keychain.
             Agent::Claude => true,
-            // Provider API keys only — no interactive login flow.
-            Agent::Pi => false,
+            // Provider API keys only — no interactive login flow. goose's own
+            // `configure` stores the provider key in the OS keyring; there is
+            // no goose account to log into.
+            Agent::Pi | Agent::Goose => false,
             // Not an AI agent: no auth of its own.
             Agent::Shell => false,
         }
@@ -665,11 +945,11 @@ impl Agent {
     pub fn oauth_needs_browser(&self) -> bool {
         match self {
             // Google OAuth browser flow on first run.
-            Agent::Gemini | Agent::Antigravity => true,
+            Agent::Antigravity => true,
             // Device flow: a code and a URL, no browser required from here.
             Agent::Copilot | Agent::OpenCode | Agent::Claude => false,
             // Not OAuth-first at all.
-            Agent::Pi | Agent::Shell => false,
+            Agent::Pi | Agent::Goose | Agent::Shell => false,
         }
     }
 
@@ -679,66 +959,63 @@ impl Agent {
     ///
     /// Warn-and-launch, not refuse: the login may be the only thing the deny
     /// breaks, and blocking the run takes that judgement away from the user.
-    /// The trade is that they can still walk into the failure — Gemini's
-    /// `saveSettings` catches the `EPERM` and prints "Failed to save settings:
-    /// …" with no mention of cplt — so this text is written to be **recognised
-    /// later**, not merely read at startup: it names the exact file, the reason
-    /// it is denied, what will fail, the one-time fix, and why no flag helps.
+    /// The trade is that they can still walk into the failure with this text
+    /// already scrolled off, so it is written to be **recognised later**, not
+    /// merely read at startup: it names the exact file, the reason it is
+    /// denied, what will fail, the one-time fix, and why no flag helps.
     /// Shortening it defeats the point.
     ///
-    /// Only Gemini is affected. It records the auth method it picked as
-    /// `selectedAuthType` in `~/.gemini/settings.json` — denied because the
-    /// same file carries auto-firing `SessionStart` hooks. Pi has no
-    /// interactive login at all (see `oauth_first`: provider API keys only) and
-    /// Claude Code's OAuth token lands in the macOS Keychain or
+    /// Only goose is affected today. `~/.config/goose` is granted read-only
+    /// because `config.yaml` names `extensions:` commands that auto-run on the
+    /// host, so `goose configure` cannot complete from inside the sandbox. Pi
+    /// has no interactive login at all (see `oauth_first`: provider API keys
+    /// only) and Claude Code's OAuth token lands in the macOS Keychain or
     /// `~/.claude/.credentials.json`, neither of which is denied. For those two
     /// the deny costs package management and statusline/plugin authoring, not
     /// sign-in.
     ///
-    /// "Authenticated" for Gemini means either `~/.gemini/oauth_creds.json`
-    /// exists (the browser OAuth flow completed) or `settings.json` already
-    /// records a `selectedAuthType` (any auth method — API key, Vertex, OAuth).
-    /// Callers additionally skip this when a provider API key is passed
-    /// through, which authenticates without touching the file.
-    ///
-    /// Deliberately cheap and infallible: one `exists()` and at most one small
-    /// read. Any I/O error is read as "assume authenticated", so a filesystem
-    /// hiccup can never turn into a spurious warning.
+    /// Deliberately cheap and infallible: any I/O error is read as "assume
+    /// configured", so a filesystem hiccup can never turn into a spurious
+    /// warning.
     pub fn login_warning(&self, home: &Path) -> Option<String> {
-        if !matches!(self, Agent::Gemini) {
+        if matches!(self, Agent::Goose) {
+            return Self::goose_unconfigured_warning(home);
+        }
+        None
+    }
+
+    /// The goose case: `~/.config/goose` is granted
+    /// read-only, so a first run inside cplt cannot complete `goose configure`.
+    ///
+    /// The deny is the point,
+    /// and the one-time setup belongs on the host. Only a genuinely missing
+    /// `config.yaml` counts as unconfigured; any other error is read as
+    /// "assume configured" so a filesystem hiccup stays silent.
+    fn goose_unconfigured_warning(home: &Path) -> Option<String> {
+        let config = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map_or_else(|| home.join(".config"), PathBuf::from)
+            .join("goose/config.yaml");
+        if config.try_exists().unwrap_or(true) {
             return None;
         }
-        let dir = home.join(".gemini");
-        // Only a genuinely missing file proves "not signed in". Any other
-        // error — permissions, invalid UTF-8, a flaky mount — is read as
-        // "assume authenticated" so a filesystem hiccup stays silent.
-        let authenticated = dir.join("oauth_creds.json").try_exists().unwrap_or(true)
-            || match std::fs::read_to_string(dir.join("settings.json")) {
-                Ok(s) => s.contains("selectedAuthType"),
-                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-            };
-        if authenticated {
-            return None;
-        }
-        let settings = dir.join("settings.json").display().to_string();
+        let shown = config.display();
         Some(format!(
-            "Gemini is not signed in yet, and cplt write-denies {settings}.\n\
-             That file is where Gemini records the auth method you pick on first \
-             login, but it also holds `hooks.SessionStart[]`, which auto-fires the \
-             next time `gemini` starts outside the sandbox — so cplt denies writes \
-             to it.\n\
+            "goose is not configured yet, and cplt grants {shown}'s directory \
+             read-only.\n\
+             That directory is where goose stores config.yaml, whose \
+             `extensions:` entries name a command goose spawns on every session \
+             start — so a sandboxed agent that could write it would be planting \
+             code that runs outside the sandbox on your next launch.\n\
              \n\
-             Launching anyway. If you sign in from in here, Gemini will fail to \
-             save the choice and print something like \"Failed to save settings\" \
-             — that error is this deny, not a Gemini bug.\n\
+             Launching anyway. If you configure from in here, goose will fail to \
+             save the choice — that error is this deny, not a goose bug.\n\
              \n\
-             To fix it, sign in once outside cplt — a one-time step:\n\
+             To fix it, configure once outside cplt — a one-time step:\n\
              \n\
-             \x20   gemini\n\
+             \x20   goose configure\n\
              \n\
-             Then run cplt as normal. There is deliberately no flag for doing it \
-             in here: the deny is emitted after every user allow, so not even \
-             `--allow-write` reopens the file."
+             Then run cplt as normal."
         ))
     }
 
@@ -777,9 +1054,6 @@ impl Agent {
                 "CLOUDFLARE_API_TOKEN",
                 "GITLAB_TOKEN",
             ],
-            // Gemini uses Google OAuth by default (browser flow, stored in ~/.gemini/).
-            // API key or Vertex AI project are alternatives.
-            Agent::Gemini => &["GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT"],
             // Antigravity uses Google OAuth with keychain/session storage.
             Agent::Antigravity => &[],
             // Pi supports many LLM providers via API keys.
@@ -826,6 +1100,32 @@ impl Agent {
                 "CLAUDE_CODE_USE_VERTEX",
                 "ANTHROPIC_VERTEX_PROJECT_ID",
                 "GOOGLE_CLOUD_PROJECT",
+            ],
+            // goose is provider-agnostic (github.com/aaif-goose/goose): it reads the
+            // active provider's API key from the environment or its keyring.
+            // goose 1.48.0 embeds a catalogue of several hundred providers, so
+            // this is deliberately the common subset — each name below was
+            // confirmed present in the goose 1.48.0 binary. NOTE: goose reads
+            // GOOGLE_API_KEY for its Google provider and does NOT read
+            // GEMINI_API_KEY; anything outside this subset still works via an
+            // explicit `--pass-env`.
+            Agent::Goose => &[
+                // Anthropic
+                "ANTHROPIC_API_KEY",
+                // OpenAI + Azure OpenAI
+                "OPENAI_API_KEY",
+                "AZURE_OPENAI_API_KEY",
+                // Google
+                "GOOGLE_API_KEY",
+                // Databricks (a first-class goose provider)
+                "DATABRICKS_HOST",
+                "DATABRICKS_TOKEN",
+                // Popular API providers
+                "GROQ_API_KEY",
+                "OPENROUTER_API_KEY",
+                "XAI_API_KEY",
+                // AWS Bedrock (bearer token auth)
+                "AWS_BEARER_TOKEN_BEDROCK",
             ],
             Agent::Shell => &[],
         }
@@ -941,13 +1241,14 @@ impl Agent {
             Agent::OpenCode => {
                 "Install OpenCode: npm i -g opencode-ai, or brew install anomalyco/tap/opencode"
             }
-            Agent::Gemini => {
-                "Install Gemini CLI: npm i -g @google/gemini-cli, or brew install gemini-cli"
-            }
             Agent::Antigravity => {
                 "Install Antigravity CLI: see https://antigravity.google/docs/cli-getting-started"
             }
             Agent::Pi => "Install Pi: npm i -g @earendil-works/pi-coding-agent",
+            Agent::Goose => {
+                "Install goose: brew install block-goose-cli, or see \
+                 https://goose-docs.ai/docs/getting-started/installation"
+            }
             Agent::Claude => {
                 "Install Claude Code: npm i -g @anthropic-ai/claude-code, \
                  or see https://docs.anthropic.com/en/docs/claude-code"
@@ -976,8 +1277,8 @@ impl Agent {
     }
 
     /// Auto-detect which agent to use based on what's available in PATH.
-    /// Returns Copilot if found (backward compat), else OpenCode, else Gemini,
-    /// else Antigravity.
+    /// Returns Copilot if found (backward compat), else OpenCode, else
+    /// Antigravity.
     /// Pi and Claude are explicit-only (`--agent pi` / `--agent claude`) and are
     /// never auto-detected, to avoid silently changing the default for existing users.
     /// Returns None if none are found.
@@ -996,7 +1297,6 @@ impl Agent {
 
         let mut found_copilot = false;
         let mut found_opencode = false;
-        let mut found_gemini = false;
         let mut found_antigravity = false;
 
         for dir in path_var.split(':') {
@@ -1020,16 +1320,6 @@ impl Agent {
                     }
                 }
             }
-            if !found_gemini {
-                let candidate = PathBuf::from(dir).join("gemini");
-                if candidate.is_file() {
-                    let resolved =
-                        std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-                    if usable(&resolved) {
-                        found_gemini = true;
-                    }
-                }
-            }
             if !found_antigravity {
                 let antigravity_bin = PathBuf::from(dir).join("antigravity");
                 let agy_bin = PathBuf::from(dir).join("agy");
@@ -1050,8 +1340,6 @@ impl Agent {
             Some(Agent::Copilot)
         } else if found_opencode {
             Some(Agent::OpenCode)
-        } else if found_gemini {
-            Some(Agent::Gemini)
         } else if found_antigravity {
             Some(Agent::Antigravity)
         } else {
@@ -1067,13 +1355,22 @@ impl FromStr for Agent {
         match s.to_lowercase().as_str() {
             "copilot" => Ok(Agent::Copilot),
             "opencode" => Ok(Agent::OpenCode),
-            "gemini" | "gem" => Ok(Agent::Gemini),
+            // Removed in favour of Antigravity, which is Google's supported
+            // successor and shares the same ~/.gemini tree. A plain "unknown
+            // agent" would be unhelpful for a value that worked before.
+            "gemini" | "gem" => Err(
+                "The Gemini CLI agent was removed from cplt — Google deprecated it in \
+                 favour of Antigravity. Use `--agent agy` (or `sandbox.agent = \
+                 \"antigravity\"`) instead."
+                    .to_string(),
+            ),
             "antigravity" | "agy" | "agi" => Ok(Agent::Antigravity),
             "pi" => Ok(Agent::Pi),
             "claude" | "cc" | "claude-code" => Ok(Agent::Claude),
+            "goose" => Ok(Agent::Goose),
             "shell" | "sh" | "bash" | "zsh" => Ok(Agent::Shell),
             _ => Err(format!(
-                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, shell"
+                "Unknown agent '{s}'. Supported: copilot, opencode, gemini, antigravity, pi, claude, goose, shell"
             )),
         }
     }
@@ -1307,6 +1604,40 @@ impl std::fmt::Display for Agent {
 mod tests {
     use super::*;
 
+    /// Every `Agent` variant, for the tests that must cover all of them.
+    /// `all_agents_covers_every_variant` keeps this honest.
+    const ALL_AGENTS: [Agent; 7] = [
+        Agent::Copilot,
+        Agent::OpenCode,
+        Agent::Antigravity,
+        Agent::Pi,
+        Agent::Claude,
+        Agent::Goose,
+        Agent::Shell,
+    ];
+
+    #[test]
+    fn all_agents_covers_every_variant() {
+        // The match is exhaustive, so adding a variant to `Agent` fails to
+        // compile until it is named here; the length check then forces it into
+        // ALL_AGENTS as well. Together they stop a new agent from quietly
+        // skipping every cross-agent contract test below.
+        for agent in ALL_AGENTS {
+            match agent {
+                Agent::Copilot
+                | Agent::OpenCode
+                | Agent::Antigravity
+                | Agent::Pi
+                | Agent::Claude
+                | Agent::Goose
+                | Agent::Shell => {}
+            }
+        }
+        let mut seen = ALL_AGENTS.to_vec();
+        seen.dedup();
+        assert_eq!(seen.len(), ALL_AGENTS.len(), "ALL_AGENTS has a duplicate");
+    }
+
     fn agent_dir(path: PathBuf) -> AgentDir {
         AgentDir {
             path,
@@ -1457,12 +1788,11 @@ mod tests {
         assert_eq!(Agent::from_str("Copilot").unwrap(), Agent::Copilot);
         assert_eq!(Agent::from_str("opencode").unwrap(), Agent::OpenCode);
         assert_eq!(Agent::from_str("OpenCode").unwrap(), Agent::OpenCode);
-        assert_eq!(Agent::from_str("gemini").unwrap(), Agent::Gemini);
-        assert_eq!(Agent::from_str("Gemini").unwrap(), Agent::Gemini);
-        assert_eq!(Agent::from_str("gem").unwrap(), Agent::Gemini);
         assert_eq!(Agent::from_str("antigravity").unwrap(), Agent::Antigravity);
         assert_eq!(Agent::from_str("agi").unwrap(), Agent::Antigravity);
         assert_eq!(Agent::from_str("agy").unwrap(), Agent::Antigravity);
+        assert_eq!(Agent::from_str("goose").unwrap(), Agent::Goose);
+        assert_eq!(Agent::from_str("Goose").unwrap(), Agent::Goose);
         assert!(Agent::from_str("unknown").is_err());
     }
 
@@ -1477,11 +1807,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_binary_name() {
-        assert_eq!(Agent::Gemini.binary_name(), "gemini");
-    }
-
-    #[test]
     fn antigravity_binary_name() {
         assert_eq!(Agent::Antigravity.binary_name(), "antigravity");
     }
@@ -1490,7 +1815,6 @@ mod tests {
     fn copilot_needs_sea_extraction() {
         assert!(Agent::Copilot.needs_sea_extraction());
         assert!(!Agent::OpenCode.needs_sea_extraction());
-        assert!(!Agent::Gemini.needs_sea_extraction());
         assert!(!Agent::Antigravity.needs_sea_extraction());
     }
 
@@ -1498,7 +1822,6 @@ mod tests {
     fn copilot_extra_args() {
         assert_eq!(Agent::Copilot.extra_args(), &["--no-auto-update"]);
         assert!(Agent::OpenCode.extra_args().is_empty());
-        assert!(Agent::Gemini.extra_args().is_empty());
         assert!(Agent::Antigravity.extra_args().is_empty());
     }
 
@@ -1599,7 +1922,7 @@ mod tests {
 
     #[test]
     fn session_args_unsupported_agents_drop_all() {
-        for agent in [Agent::Gemini, Agent::Pi, Agent::Shell] {
+        for agent in [Agent::Pi, Agent::Shell] {
             assert!(
                 agent
                     .session_args(Some("id"), true, Some("name"), true)
@@ -1609,11 +1932,40 @@ mod tests {
         }
     }
 
+    /// `Agent::ALL` must list every variant. The wildcard-free `match` makes a
+    /// new variant a compile error here rather than a silently-skipped agent in
+    /// every caller that iterates `ALL`.
+    #[test]
+    fn agent_all_covers_every_variant() {
+        fn tag(a: Agent) -> u8 {
+            match a {
+                Agent::Copilot => 0,
+                Agent::OpenCode => 1,
+                Agent::Antigravity => 2,
+                Agent::Pi => 3,
+                Agent::Claude => 4,
+                Agent::Goose => 5,
+                Agent::Shell => 6,
+            }
+        }
+        assert_eq!(Agent::ALL.len(), 7, "add the new variant to Agent::ALL");
+        let mut seen: Vec<u8> = Agent::ALL.iter().copied().map(tag).collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..7).collect::<Vec<u8>>(),
+            "Agent::ALL has a gap or a duplicate"
+        );
+    }
+
     #[test]
     fn keychain_needs() {
+        // All four are the *base* term — the grant is still conditional on
+        // `credential_outside_keychain` at launch (#242).
         assert!(Agent::Copilot.needs_keychain());
-        assert!(Agent::Gemini.needs_keychain());
         assert!(Agent::Antigravity.needs_keychain());
+        assert!(Agent::Claude.needs_keychain());
+        assert!(Agent::Goose.needs_keychain());
         assert!(!Agent::OpenCode.needs_keychain());
     }
 
@@ -1625,10 +1977,6 @@ mod tests {
             "Claude's settings.json hooks auto-fire — it must be denied (#237)"
         );
         assert_eq!(
-            Agent::Gemini.host_persistence_denies(),
-            ["settings.json", "extensions", "policies", "hooks"]
-        );
-        assert_eq!(
             Agent::Pi.host_persistence_denies(),
             // npm/ and git/ hold already-installed package code, editable in
             // place: denying settings.json alone only stops a NEW entry.
@@ -1638,7 +1986,10 @@ mod tests {
             Agent::Antigravity.host_persistence_denies(),
             ["hooks.json", "mcp_config.json", "bin"]
         );
-        // No writable dir that hosts auto-executing config for these.
+        // No writable dir that hosts auto-executing config for these. goose's
+        // one auto-exec vector, config.yaml's `extensions:`, lives in a config
+        // dir granted read-only, so there is nothing writable left to deny.
+        assert!(Agent::Goose.host_persistence_denies().is_empty());
         assert!(Agent::Copilot.host_persistence_denies().is_empty());
         assert!(Agent::OpenCode.host_persistence_denies().is_empty());
         assert!(Agent::Shell.host_persistence_denies().is_empty());
@@ -1678,83 +2029,33 @@ mod tests {
     }
 
     #[test]
-    fn login_warning_only_for_unauthenticated_gemini() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path();
-        std::fs::create_dir_all(home.join(".gemini")).expect("mkdir");
+    fn login_warning_for_unconfigured_goose() {
+        temp_env::with_var_unset("XDG_CONFIG_HOME", || {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let home = tmp.path();
 
-        // Nothing on disk: warn, and say enough to be recognised later. cplt
-        // launches anyway, so the user may well meet the failure inside Gemini
-        // with this text already scrolled off — every one of these parts is
-        // what lets them connect the two.
-        let msg = Agent::Gemini
-            .login_warning(home)
-            .expect("unauthenticated Gemini must warn");
-        assert!(msg.contains("not signed in"), "{msg}");
-        assert!(
-            msg.contains("hooks.SessionStart[]"),
-            "why it is denied: {msg}"
-        );
-        assert!(
-            msg.contains("Failed to save settings"),
-            "must quote the error Gemini will actually print: {msg}"
-        );
-        assert!(msg.contains("one-time"), "{msg}");
-        assert!(msg.contains("gemini"), "{msg}");
-        assert!(
-            msg.contains(&home.join(".gemini/settings.json").display().to_string()),
-            "message must name the denied file: {msg}"
-        );
-        // No in-cplt escape hatch is offered, because there is none: the deny
-        // is emitted after every user allow. Advertising one would be a lie.
-        assert!(
-            !msg.contains("cplt --agent"),
-            "must not hand out an in-cplt command that cannot work: {msg}"
-        );
-        assert!(msg.contains("no flag"), "{msg}");
-
-        // Agents whose login does not touch a denied file never refuse, even
-        // with an equally empty home.
-        for agent in [
-            Agent::Pi,
-            Agent::Claude,
-            Agent::Copilot,
-            Agent::OpenCode,
-            Agent::Antigravity,
-            Agent::Shell,
-        ] {
+            // No config.yaml: goose's first run would try to write it into a
+            // read-only dir, so say so before the user meets the bare failure.
+            let msg = Agent::Goose
+                .login_warning(home)
+                .expect("unconfigured goose must warn");
+            assert!(msg.contains("not configured"), "{msg}");
+            assert!(msg.contains("extensions:"), "why it is denied: {msg}");
+            assert!(msg.contains("goose configure"), "must name the fix: {msg}");
             assert!(
-                agent.login_warning(home).is_none(),
-                "{agent:?} must not warn"
+                msg.contains(&home.join(".config/goose/config.yaml").display().to_string()),
+                "message must name the path: {msg}"
             );
-        }
 
-        // Any recorded auth method counts as authenticated (API key, Vertex, …).
-        std::fs::write(
-            home.join(".gemini/settings.json"),
-            r#"{"security":{"auth":{"selectedAuthType":"gemini-api-key"}}}"#,
-        )
-        .expect("write settings");
-        assert!(Agent::Gemini.login_warning(home).is_none());
-
-        // So does a completed browser OAuth flow, even with no settings.json.
-        let tmp2 = tempfile::tempdir().expect("tempdir");
-        let home2 = tmp2.path();
-        std::fs::create_dir_all(home2.join(".gemini")).expect("mkdir");
-        std::fs::write(home2.join(".gemini/oauth_creds.json"), "{}").expect("write creds");
-        assert!(Agent::Gemini.login_warning(home2).is_none());
-
-        // A read that fails for any reason other than "not there" is a
-        // filesystem problem, not proof of a missing login: a directory where
-        // settings.json belongs makes read_to_string fail with EISDIR, and the
-        // documented contract is to assume authenticated and stay quiet.
-        let tmp3 = tempfile::tempdir().expect("tempdir");
-        let home3 = tmp3.path();
-        std::fs::create_dir_all(home3.join(".gemini/settings.json")).expect("mkdir");
-        assert!(
-            Agent::Gemini.login_warning(home3).is_none(),
-            "an unreadable settings.json must not produce a spurious warning"
-        );
+            // Configured: silent.
+            std::fs::create_dir_all(home.join(".config/goose")).expect("mkdir");
+            std::fs::write(
+                home.join(".config/goose/config.yaml"),
+                "GOOSE_PROVIDER: openai\n",
+            )
+            .expect("write config");
+            assert!(Agent::Goose.login_warning(home).is_none());
+        });
     }
 
     #[test]
@@ -1813,16 +2114,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_config_dirs() {
-        let home = Path::new("/Users/test");
-        let dirs = Agent::Gemini.config_dirs(home);
-        assert_eq!(dirs.len(), 1, "should have ~/.gemini dir");
-        assert_eq!(dirs[0].path, home.join(".gemini"));
-        assert!(dirs[0].write, "gemini dir should be writable");
-        assert!(!dirs[0].process_exec && !dirs[0].map_exec);
-    }
-
-    #[test]
     fn antigravity_config_dirs() {
         let home = Path::new("/Users/test");
         let dirs = Agent::Antigravity.config_dirs(home);
@@ -1864,28 +2155,25 @@ mod tests {
     }
 
     #[test]
-    fn gemini_auth_env_hints() {
-        let hints = Agent::Gemini.auth_env_hint();
-        assert!(hints.contains(&"GEMINI_API_KEY"));
-        assert!(hints.contains(&"GOOGLE_CLOUD_PROJECT"));
-    }
-
-    #[test]
     fn every_agent_declares_its_auth_model() {
-        // Pinned per agent so a new one has to make a deliberate choice: the
-        // exhaustive match in `oauth_first` forces the decision at compile
-        // time, this pins the answer. OAuth-first agents get no "No API keys
-        // passed" warning (#187) — their credentials land on disk or in the
-        // Keychain after an interactive login.
-        for (agent, expected) in [
-            (Agent::Copilot, true),     // GitHub device flow + Keychain
-            (Agent::OpenCode, true),    // /connect device flow -> auth.json
-            (Agent::Gemini, true),      // Google OAuth browser flow
-            (Agent::Antigravity, true), // Google OAuth + keychain
-            (Agent::Claude, true),      // subscription OAuth token
-            (Agent::Pi, false),         // provider API keys only
-            (Agent::Shell, false),      // not an AI agent, no auth
-        ] {
+        // The expectation comes from an EXHAUSTIVE match, not a pinned list: a
+        // new agent variant stops compiling here until someone states its auth
+        // model, so it cannot slip in uncovered. OAuth-first agents get no
+        // "No API keys passed" warning (#187) — their credentials land on disk
+        // or in the Keychain after an interactive login.
+        fn expected_oauth_first(agent: Agent) -> bool {
+            match agent {
+                Agent::Copilot => true,     // GitHub device flow + Keychain
+                Agent::OpenCode => true,    // /connect device flow -> auth.json
+                Agent::Antigravity => true, // Google OAuth + keychain
+                Agent::Claude => true,      // subscription OAuth token
+                Agent::Pi => false,         // provider API keys only
+                Agent::Goose => false,      // provider API keys in the keyring
+                Agent::Shell => false,      // not an AI agent, no auth
+            }
+        }
+        for agent in ALL_AGENTS {
+            let (agent, expected) = (agent, expected_oauth_first(agent));
             assert_eq!(
                 agent.oauth_first(),
                 expected,
@@ -1925,7 +2213,6 @@ mod tests {
     fn display_names() {
         assert_eq!(format!("{}", Agent::Copilot), "Copilot");
         assert_eq!(format!("{}", Agent::OpenCode), "OpenCode");
-        assert_eq!(format!("{}", Agent::Gemini), "Gemini");
         assert_eq!(format!("{}", Agent::Antigravity), "Antigravity");
         assert_eq!(format!("{}", Agent::Pi), "Pi");
     }
@@ -2002,6 +2289,19 @@ mod tests {
         );
         assert!(err.contains("pi"), "error should mention pi: {err}");
         assert!(err.contains("claude"), "error should mention claude: {err}");
+        assert!(err.contains("goose"), "error should mention goose: {err}");
+    }
+
+    /// `--agent gemini` / `sandbox.agent = "gemini"` worked until the agent was
+    /// removed, so the error has to say that rather than "unknown agent".
+    #[test]
+    fn removed_gemini_agent_points_at_antigravity() {
+        for name in ["gemini", "Gemini", "gem"] {
+            let err = Agent::from_str(name).unwrap_err();
+            assert!(err.contains("removed"), "{name}: {err}");
+            assert!(err.contains("agy"), "{name}: {err}");
+            assert!(err.contains("antigravity"), "{name}: {err}");
+        }
     }
 
     #[test]
@@ -2102,6 +2402,185 @@ mod tests {
     }
 
     #[test]
+    fn parse_goose_agent() {
+        assert_eq!(Agent::from_str("goose").unwrap(), Agent::Goose);
+        assert_eq!(Agent::from_str("Goose").unwrap(), Agent::Goose);
+        assert_eq!(Agent::from_str("GOOSE").unwrap(), Agent::Goose);
+    }
+
+    #[test]
+    fn goose_binary_and_display_name() {
+        assert_eq!(Agent::Goose.binary_name(), "goose");
+        assert_eq!(format!("{}", Agent::Goose), "goose");
+    }
+
+    #[test]
+    fn goose_no_sea_extraction_or_extra_args() {
+        assert!(!Agent::Goose.needs_sea_extraction());
+        assert!(Agent::Goose.extra_args().is_empty());
+    }
+
+    #[test]
+    fn goose_needs_keychain() {
+        // goose stores provider secrets in the login Keychain by default.
+        assert!(Agent::Goose.needs_keychain());
+    }
+
+    #[test]
+    fn goose_no_copilot_dir() {
+        assert!(!Agent::Goose.needs_copilot_dir());
+    }
+
+    #[test]
+    fn goose_not_auto_detected() {
+        // goose is explicit-only; auto_detect must never return it.
+        assert_ne!(Agent::auto_detect(), Some(Agent::Goose));
+    }
+
+    #[test]
+    fn goose_config_dirs_xdg_default() {
+        // Wrapped: config_dirs reads XDG_*, so an unwrapped test fails on a
+        // machine that sets them.
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", None::<&str>),
+                ("XDG_DATA_HOME", None),
+                ("XDG_STATE_HOME", None),
+            ],
+            || {
+                let home = Path::new("/Users/test");
+                let dirs = Agent::Goose.config_dirs(home);
+                assert_eq!(dirs.len(), 3, "config + data + state, no cache dir");
+                let config_dir = dirs
+                    .iter()
+                    .find(|d| d.path == home.join(".config/goose"))
+                    .expect("~/.config/goose");
+                let data_dir = dirs
+                    .iter()
+                    .find(|d| d.path == home.join(".local/share/goose"))
+                    .expect("~/.local/share/goose");
+                let state_dir = dirs
+                    .iter()
+                    .find(|d| d.path == home.join(".local/state/goose"))
+                    .expect("~/.local/state/goose");
+                for d in [data_dir, state_dir] {
+                    assert!(d.write, "{:?} should be writable", d.path);
+                }
+                for d in [config_dir, data_dir, state_dir] {
+                    assert!(!d.process_exec && !d.map_exec);
+                }
+            },
+        );
+    }
+
+    /// `--name ""` is not a session goose can select. Without the emptiness
+    /// filter it emits `session --name ""`, turning a bare run into one goose
+    /// rejects. `--resume=""` is already filtered the same way.
+    #[test]
+    fn goose_ignores_an_empty_session_name() {
+        assert!(
+            Agent::Goose
+                .session_args(None, false, Some(""), false)
+                .is_empty(),
+            "an empty --name must not produce a session subcommand"
+        );
+        assert_eq!(
+            Agent::Goose.session_args(None, false, Some("work"), false),
+            vec!["session", "--name", "work"],
+            "a real name still selects by name"
+        );
+    }
+
+    #[test]
+    fn goose_config_dir_is_not_writable() {
+        // config.yaml's `extensions:` entries name a `cmd` goose spawns on every
+        // session start, so a writable ~/.config/goose is a host-persistence
+        // vector: the sandboxed agent plants an extension, it runs unsandboxed
+        // on the user's next launch. No write_files carve-out either — goose
+        // rewrites those files by rename, which needs directory write.
+        let dirs = Agent::Goose.config_dirs(Path::new("/Users/test"));
+        let config_dir = dirs
+            .iter()
+            .find(|d| d.path.ends_with("goose") && d.path.to_string_lossy().contains("config"))
+            .expect("goose config dir");
+        assert!(!config_dir.write, "goose config dir must stay read-only");
+        assert!(
+            config_dir.write_files.is_empty(),
+            "no write_files carve-out: goose writes config.yaml by rename, \
+             which needs directory write and would reopen the vector"
+        );
+    }
+
+    #[test]
+    fn goose_config_dirs_respect_xdg() {
+        temp_env::with_vars(
+            [
+                ("XDG_CONFIG_HOME", Some("/xdg/cfg")),
+                ("XDG_DATA_HOME", Some("/xdg/data")),
+                ("XDG_STATE_HOME", Some("/xdg/state")),
+            ],
+            || {
+                let dirs = Agent::Goose.config_dirs(Path::new("/Users/test"));
+                let paths: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+                assert!(paths.contains(&PathBuf::from("/xdg/cfg/goose")));
+                assert!(paths.contains(&PathBuf::from("/xdg/data/goose")));
+                assert!(paths.contains(&PathBuf::from("/xdg/state/goose")));
+            },
+        );
+    }
+
+    #[test]
+    fn goose_auth_env_hints() {
+        let hints = Agent::Goose.auth_env_hint();
+        assert!(hints.contains(&"ANTHROPIC_API_KEY"));
+        assert!(hints.contains(&"OPENAI_API_KEY"));
+        assert!(hints.contains(&"DATABRICKS_HOST"));
+        assert!(hints.contains(&"DATABRICKS_TOKEN"));
+        assert!(hints.contains(&"OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn session_args_goose() {
+        // Verified against goose 1.48.0: the flags belong to the `session`
+        // SUBCOMMAND — top-level `goose --resume` is rejected by clap — so
+        // every translation has to lead with `session`.
+
+        // --resume=ID selects a session by id; --session-id requires --resume.
+        assert_eq!(
+            Agent::Goose.session_args(Some("sess1"), false, None, false),
+            vec!["session", "--resume", "--session-id", "sess1"]
+        );
+        // Bare --resume resumes the most recent session.
+        assert_eq!(
+            Agent::Goose.session_args(Some(""), false, None, false),
+            vec!["session", "--resume"]
+        );
+        // --continue is the same thing: goose has no separate continue flag.
+        assert_eq!(
+            Agent::Goose.session_args(None, true, None, false),
+            vec!["session", "--resume"]
+        );
+        // --name alone starts (or reuses) a named session; --remote is dropped.
+        assert_eq!(
+            Agent::Goose.session_args(None, false, Some("x"), true),
+            vec!["session", "--name", "x"]
+        );
+        // --name and --session-id are in the same mutually exclusive clap
+        // group, so an explicit id wins and --name is never emitted twice.
+        assert_eq!(
+            Agent::Goose.session_args(Some("sess1"), false, Some("x"), false),
+            vec!["session", "--resume", "--session-id", "sess1"]
+        );
+        // Nothing to translate: bare `goose` already starts a session, so no
+        // subcommand is injected and `-- <args>` reach goose unprefixed.
+        assert!(
+            Agent::Goose
+                .session_args(None, false, None, false)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn copilot_default_allowed_domains_matches_issue_52() {
         let domains = Agent::Copilot.default_allowed_domains();
         // 6 GitHub Copilot infra domains + 8 package registries = 14.
@@ -2160,28 +2639,11 @@ mod tests {
     }
 
     #[test]
-    fn gemini_default_domains_include_google_ai_and_registry() {
-        let domains = Agent::Gemini.default_allowed_domains();
-        assert!(
-            domains.contains(&"generativelanguage.googleapis.com"),
-            "Gemini must include the Gemini API endpoint"
-        );
-        assert!(domains.contains(&"accounts.google.com"));
-        assert!(
-            domains.contains(&"registry.npmjs.org"),
-            "Gemini must include the package-registry base"
-        );
-        assert!(
-            !domains.contains(&"githubcopilot.com"),
-            "Gemini must not get Copilot infra"
-        );
-    }
-
-    #[test]
     fn antigravity_default_domains_include_google_and_own_domain() {
         let domains = Agent::Antigravity.default_allowed_domains();
-        // Google AI infra (shared with Gemini)...
+        // Google AI infra...
         assert!(domains.contains(&"generativelanguage.googleapis.com"));
+        assert!(domains.contains(&"accounts.google.com"));
         // ...plus Antigravity's own domain.
         assert!(
             domains.contains(&"antigravity.google"),
@@ -2220,6 +2682,28 @@ mod tests {
     }
 
     #[test]
+    fn goose_gets_registry_base_only() {
+        // Observed with goose 1.48.0 on 2026-09-03 via `--observe-domains`: a
+        // full session contacted only the configured provider, no goose-owned
+        // host. Keep the list at the registry base until someone observes one.
+        let domains = Agent::Goose.default_allowed_domains();
+        assert_eq!(
+            domains.len(),
+            PACKAGE_REGISTRY_DOMAINS.len(),
+            "goose has no observed own-infra domain; do not fabricate one"
+        );
+        assert!(domains.contains(&"registry.npmjs.org"));
+        // Never contacted by goose 1.48.0; its docs moved to goose-docs.ai.
+        assert!(!domains.contains(&"block.github.io"));
+        // goose is provider-agnostic: no provider LLM domain is baked in.
+        assert!(
+            !domains.contains(&"api.anthropic.com")
+                && !domains.contains(&"generativelanguage.googleapis.com"),
+            "goose must not assume a specific model provider"
+        );
+    }
+
+    #[test]
     fn pi_and_shell_get_registry_base_only() {
         // Pi's infra is not yet documented; Shell is not an AI agent. Both get
         // only the shared package-registry base (8 domains).
@@ -2238,15 +2722,7 @@ mod tests {
     fn every_agent_default_domains_nonempty_bare_and_registry_backed() {
         // Contract across ALL agents: non-empty, registry base present, and no
         // glob syntax (the proxy matcher does exact/subdomain matching only).
-        for agent in [
-            Agent::Copilot,
-            Agent::OpenCode,
-            Agent::Gemini,
-            Agent::Antigravity,
-            Agent::Pi,
-            Agent::Claude,
-            Agent::Shell,
-        ] {
+        for agent in ALL_AGENTS {
             let domains = agent.default_allowed_domains();
             assert!(!domains.is_empty(), "{agent:?} list must not be empty");
             assert!(

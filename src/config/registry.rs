@@ -202,7 +202,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Str,
         dangerous: false,
         default_display: "",
-        description: "Preferred AI coding agent (copilot, opencode, gemini, antigravity, pi, claude, shell). Auto-detected from PATH if not set.",
+        description: "Preferred AI coding agent (copilot, opencode, gemini, antigravity, pi, claude, goose, shell). Auto-detected from PATH if not set.",
     },
     ConfigKeyInfo {
         section: "sandbox",
@@ -371,6 +371,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         dangerous: false,
         default_display: "false",
         description: "Allow the agent to open URLs in your default browser (needed for OAuth code flows).",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
+        key: "keychain_substitute",
+        value_type: ConfigValueType::Bool,
+        dangerous: false,
+        default_display: "false",
+        description: "EXPERIMENTAL: drop the macOS Keychain grant when the agent has a credential it can reach without it.",
     },
     ConfigKeyInfo {
         section: "sandbox",

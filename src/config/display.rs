@@ -385,6 +385,12 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         allow_browser,
         src(c.sandbox.allow_browser.is_some())
     );
+    let keychain_substitute = c.sandbox.keychain_substitute.unwrap_or(false);
+    println!(
+        "{blue}[cplt]{nc}    keychain_substitute   = {}{} {dim}(experimental){nc}",
+        keychain_substitute,
+        src(c.sandbox.keychain_substitute.is_some())
+    );
     let scratch = c.sandbox.scratch_dir.unwrap_or(true);
     println!(
         "{blue}[cplt]{nc}    scratch_dir           = {}{}",
