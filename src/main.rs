@@ -1263,6 +1263,78 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     let cli_allow_socket = canonicalize_paths(&cli.allow_socket, "--allow-socket");
     let cli_deny_paths = canonicalize_deny_paths(&cli.deny_paths)?;
 
+    // Resolve home directory
+    let home_dir = match std::env::var("HOME") {
+        Ok(h) => std::fs::canonicalize(&h)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve $HOME ({h}): {e}"))?,
+        Err(_) => bail!("$HOME not set"),
+    };
+
+    // Resolve project directory
+    let project_dir = match &cli.project_dir {
+        Some(p) => std::fs::canonicalize(p)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve project dir: {e}"))?,
+        None => {
+            if let Some(root) = detect_project_root() {
+                match std::fs::canonicalize(&root) {
+                    Ok(p) => p,
+                    Err(_) => root,
+                }
+            } else {
+                ui::warn("No git repo detected, using cwd");
+                std::env::current_dir()
+                    .and_then(std::fs::canonicalize)
+                    .map_err(|e| anyhow::anyhow!("Cannot resolve cwd: {e}"))?
+            }
+        }
+    };
+
+    // ── CPLT_CONFIG sanity check (issue #261) ────────────────────
+    // The env var replaces the whole user config, every [sandbox] key included,
+    // bypassing the repo-config trust machinery that only ever lets a repo
+    // tighten the sandbox. Warn whenever it points somewhere unusual, and
+    // refuse outright when the project directory controls the file.
+    //
+    // Both messages ignore --quiet: a quiet run is exactly when a silent
+    // config swap does the most damage.
+    // An empty value is how a shell unsets the var in practice; it selects no
+    // file, so there is nothing to flag.
+    if let Some(custom) = std::env::var("CPLT_CONFIG").ok().filter(|s| !s.is_empty()) {
+        let user_dir = home_dir.join(".config/cplt");
+        match config::classify_custom_config(
+            &config::expand_tilde(&custom),
+            &home_dir,
+            &project_dir,
+        ) {
+            config::CustomConfigVerdict::UserConfigDir => {}
+            config::CustomConfigVerdict::Outside(p) => {
+                ui::warn("CPLT_CONFIG replaces your whole cplt config, sandbox settings included:");
+                eprintln!("  {}", p.display());
+                eprintln!("  It is not under {}.", user_dir.display());
+                eprintln!(
+                    "  If you did not set it yourself, your shell did (direnv, mise, .envrc)."
+                );
+            }
+            config::CustomConfigVerdict::InsideProject(p) => bail!(
+                "CPLT_CONFIG points inside the project directory:\n  \
+                 {}\n  \
+                 That file is repository content, and it would replace your whole cplt \
+                 config — sandbox settings included — with none of the review a .cplt.toml \
+                 gets. Refusing.\n  \
+                 Unset CPLT_CONFIG (check .envrc / mise config) and re-run.",
+                p.display()
+            ),
+        }
+    }
+
+    // Safety check: reject overly broad project roots
+    if is_unsafe_root(&project_dir, &home_dir) {
+        bail!(
+            "cplt refuses to sandbox '{}', it is too broad. Use a specific project directory.",
+            project_dir.display()
+        );
+    }
+
     let (cfg, config_path) = match config::Config::load_file() {
         Ok(Some(loaded)) => (loaded.config, Some(loaded.path)),
         Ok(None) => (config::Config::default(), None),
@@ -1339,78 +1411,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };
-
-    // Resolve home directory
-    let home_dir = match std::env::var("HOME") {
-        Ok(h) => std::fs::canonicalize(&h)
-            .map_err(|e| anyhow::anyhow!("Cannot resolve $HOME ({h}): {e}"))?,
-        Err(_) => bail!("$HOME not set"),
-    };
-
-    // Resolve project directory
-    let project_dir = match &cli.project_dir {
-        Some(p) => std::fs::canonicalize(p)
-            .map_err(|e| anyhow::anyhow!("Cannot resolve project dir: {e}"))?,
-        None => {
-            if let Some(root) = detect_project_root() {
-                match std::fs::canonicalize(&root) {
-                    Ok(p) => p,
-                    Err(_) => root,
-                }
-            } else {
-                ui::warn("No git repo detected, using cwd");
-                std::env::current_dir()
-                    .and_then(std::fs::canonicalize)
-                    .map_err(|e| anyhow::anyhow!("Cannot resolve cwd: {e}"))?
-            }
-        }
-    };
-
-    // ── CPLT_CONFIG sanity check (issue #261) ────────────────────
-    // The env var replaces the whole user config, every [sandbox] key included,
-    // bypassing the repo-config trust machinery that only ever lets a repo
-    // tighten the sandbox. Warn whenever it points somewhere unusual, and
-    // refuse outright when the project directory controls the file.
-    //
-    // Both messages ignore --quiet: a quiet run is exactly when a silent
-    // config swap does the most damage.
-    // An empty value is how a shell unsets the var in practice; it selects no
-    // file, so there is nothing to flag.
-    if let Some(custom) = std::env::var("CPLT_CONFIG").ok().filter(|s| !s.is_empty()) {
-        let user_dir = home_dir.join(".config/cplt");
-        match config::classify_custom_config(
-            &config::expand_tilde(&custom),
-            &home_dir,
-            &project_dir,
-        ) {
-            config::CustomConfigVerdict::UserConfigDir => {}
-            config::CustomConfigVerdict::Outside(p) => {
-                ui::warn("CPLT_CONFIG replaces your whole cplt config, sandbox settings included:");
-                eprintln!("  {}", p.display());
-                eprintln!("  It is not under {}.", user_dir.display());
-                eprintln!(
-                    "  If you did not set it yourself, your shell did (direnv, mise, .envrc)."
-                );
-            }
-            config::CustomConfigVerdict::InsideProject(p) => bail!(
-                "CPLT_CONFIG points inside the project directory:\n  \
-                 {}\n  \
-                 That file is repository content, and it would replace your whole cplt \
-                 config — sandbox settings included — with none of the review a .cplt.toml \
-                 gets. Refusing.\n  \
-                 Unset CPLT_CONFIG (check .envrc / mise config) and re-run.",
-                p.display()
-            ),
-        }
-    }
-
-    // Safety check: reject overly broad project roots
-    if is_unsafe_root(&project_dir, &home_dir) {
-        bail!(
-            "cplt refuses to sandbox '{}', it is too broad. Use a specific project directory.",
-            project_dir.display()
-        );
-    }
 
     // ── Load and apply per-repo config (.cplt.toml) ──────────────
     let mut unapproved_proposals: Vec<String> = Vec::new();

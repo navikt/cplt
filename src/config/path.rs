@@ -449,6 +449,8 @@ pub enum CustomConfigVerdict {
 
 /// Resolve a path far enough that containment checks cannot be sidestepped.
 ///
+/// A relative path is anchored to `relative_anchor` first (the cwd, in practice).
+///
 /// `canonicalize` alone is not enough: it fails whole-path on a file that does
 /// not exist yet, and `canonicalize_deepest`'s walk gives up entirely on a `..`
 /// component (`file_name()` is `None` there). So walk the components, resolving
@@ -458,9 +460,9 @@ pub enum CustomConfigVerdict {
 ///
 /// Without this, `<project>/sub/../cplt.toml` and
 /// `~/.config/cplt/sub/../../../evil.toml` both dodge a plain `starts_with`.
-fn fully_resolved(path: &Path) -> PathBuf {
+fn fully_resolved(path: &Path, relative_anchor: &Path) -> PathBuf {
     let anchored = if path.is_relative() {
-        std::env::current_dir().unwrap_or_default().join(path)
+        relative_anchor.join(path)
     } else {
         path.to_path_buf()
     };
@@ -479,11 +481,16 @@ fn fully_resolved(path: &Path) -> PathBuf {
 /// Classify a `CPLT_CONFIG` value. Pure apart from resolving `path` on disk:
 /// `home` and `project_dir` are passed in, already canonicalized by the caller.
 pub fn classify_custom_config(path: &Path, home: &Path, project_dir: &Path) -> CustomConfigVerdict {
-    let resolved = fully_resolved(path);
-    if resolved.starts_with(fully_resolved(project_dir)) {
+    // A relative value resolves against the cwd, as it would for the open()
+    // itself. If the cwd cannot be read at all, fall back to the project
+    // directory: an unanchorable relative path then lands inside the project
+    // and is refused, so the failure mode is a refusal rather than a pass.
+    let anchor = std::env::current_dir().unwrap_or_else(|_| project_dir.to_path_buf());
+    let resolved = fully_resolved(path, &anchor);
+    if resolved.starts_with(fully_resolved(project_dir, &anchor)) {
         return CustomConfigVerdict::InsideProject(resolved);
     }
-    if resolved.starts_with(fully_resolved(&home.join(CONFIG_DIR))) {
+    if resolved.starts_with(fully_resolved(&home.join(CONFIG_DIR), &anchor)) {
         return CustomConfigVerdict::UserConfigDir;
     }
     CustomConfigVerdict::Outside(resolved)
