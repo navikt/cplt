@@ -1500,10 +1500,10 @@ rm -f push-err.txt
             success,
             "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
         );
-        assert_result_ok(&stdout, "git_version");
-        assert_result_ok(&stdout, "git_status");
-        assert_result_ok(&stdout, "git_log");
-        assert_result_ok(&stdout, "git_branch");
+        assert_result_ok(&stdout, &stderr, "git_version");
+        assert_result_ok(&stdout, &stderr, "git_status");
+        assert_result_ok(&stdout, &stderr, "git_log");
+        assert_result_ok(&stdout, &stderr, "git_branch");
 
         // Without this the test passes vacuously. `install_command_wrappers`
         // installs nothing and warns about nothing when it cannot resolve a
@@ -1515,9 +1515,18 @@ rm -f push-err.txt
         // no `origin`, so an unguarded push also fails, just with git's own
         // "does not appear to be a git repository". Only the guard's own
         // refusal text proves the wrapper ran and decided.
+        //
+        // Either verdict counts. `--git-guard` sets `enabled`, not `mode`, and
+        // the mode default is `warn` (#122 Stage 2) — so the guard announces
+        // "would block" and lets the push run. Both strings are written by the
+        // guard and appear in neither git's output nor the shell's, so either
+        // one proves the wrapper ran and decided. Asserting only on `block`
+        // would tie this test to a default it does not care about.
+        let verdict =
+            stdout.contains("BLOCKED by sandbox") || stdout.contains("WARNING (would block)");
         assert!(
-            stdout.contains("PUSHERR: \u{26a0}\u{fe0f} BLOCKED by sandbox"),
-            "the guard must have refused the push — without its refusal in the \
+            verdict,
+            "the guard must have ruled on the push — without its verdict in the \
              output the read-only assertions above prove nothing about the \
              wrapper.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
