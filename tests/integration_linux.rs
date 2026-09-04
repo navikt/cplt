@@ -1931,11 +1931,12 @@ print('CONNECTED')
         let host_init = host_init.trim();
         assert!(!host_init.is_empty(), "host /proc/1/comm was empty");
 
-        let (exit, stdout, _) = run_sandboxed_with_flags(
-            project.path(),
-            &["--no-bubblewrap"],
-            "cat /proc/1/comm 2>&1 || echo 'blocked'",
-        ); // MUTATION
+        // MUTATION: model the defect directly — the namespace fails to isolate,
+        // so PID 1 inside reads back as the host's init. (--no-bubblewrap was
+        // the wrong model: /proc/1/comm is unreadable on that path, so the
+        // script falls through to `blocked` and both assertions pass.)
+        let script = format!("echo '{host_init}'");
+        let (exit, stdout, _) = run_sandboxed_bwrap(project.path(), &script);
         assert_eq!(exit, 0);
         // PID 1 inside the namespace is bwrap/the helper, never the host init.
         assert!(
