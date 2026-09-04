@@ -18,6 +18,19 @@ Point `CPLT_CONFIG` at another file to use it instead of the default location:
 CPLT_CONFIG=/path/to/custom.toml cplt -- --version
 ```
 
+`CPLT_CONFIG` replaces the whole config file, `[sandbox]` keys included, so it
+can widen the sandbox in ways a repo's `.cplt.toml` never can. Because a shell
+that auto-loads repository environment (direnv, mise) can set it just by you
+entering a directory, cplt keeps the substitution visible:
+
+- Pointing it anywhere other than `~/.config/cplt/` prints a warning naming the
+  file. The warning is not suppressed by `--quiet`.
+- Pointing it **inside the project directory** is refused and cplt exits: that
+  file is repository content, and it would replace your config with none of the
+  review a `.cplt.toml` gets. Symlinks and `..` are resolved first, so a link
+  from outside the repo back into it is refused too. Unset `CPLT_CONFIG` (check
+  `.envrc` and mise config) to run.
+
 Paths in `[allow]` and `[deny]` support `~/` expansion and resolve relative to the config file's directory. `proxy.blocked_domains` supports `~/` expansion only.
 
 ## Quick setup

@@ -1282,6 +1282,86 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     let cli_allow_socket = canonicalize_paths(&cli.allow_socket, "--allow-socket");
     let cli_deny_paths = canonicalize_deny_paths(&cli.deny_paths)?;
 
+    // Resolve home directory
+    let home_dir = match std::env::var("HOME") {
+        Ok(h) => std::fs::canonicalize(&h)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve $HOME ({h}): {e}"))?,
+        Err(_) => bail!("$HOME not set"),
+    };
+
+    // Resolve project directory
+    let project_dir = match &cli.project_dir {
+        Some(p) => std::fs::canonicalize(p)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve project dir: {e}"))?,
+        None => {
+            if let Some(root) = detect_project_root() {
+                match std::fs::canonicalize(&root) {
+                    Ok(p) => p,
+                    Err(_) => root,
+                }
+            } else {
+                ui::warn("No git repo detected, using cwd");
+                std::env::current_dir()
+                    .and_then(std::fs::canonicalize)
+                    .map_err(|e| anyhow::anyhow!("Cannot resolve cwd: {e}"))?
+            }
+        }
+    };
+
+    // ── CPLT_CONFIG sanity check (issue #261) ────────────────────
+    // The env var replaces the whole user config, every [sandbox] key included,
+    // bypassing the repo-config trust machinery that only ever lets a repo
+    // tighten the sandbox. Warn whenever it points somewhere unusual, and
+    // refuse outright when the project directory controls the file.
+    //
+    // Both messages ignore --quiet: a quiet run is exactly when a silent
+    // config swap does the most damage.
+    // An empty value is how a shell unsets the var in practice; it selects no
+    // file, so there is nothing to flag.
+    if let Some(custom) = std::env::var("CPLT_CONFIG").ok().filter(|s| !s.is_empty()) {
+        let user_dir = home_dir.join(".config/cplt");
+        match config::classify_custom_config(
+            &config::expand_tilde(&custom),
+            &home_dir,
+            &project_dir,
+        ) {
+            config::CustomConfigVerdict::UserConfigDir => {}
+            // Only warn for a file that is actually there: a CPLT_CONFIG naming
+            // a path that does not exist selects no config, so nothing was
+            // substituted and there is nothing to flag. (`cplt exec` promises a
+            // clean stderr, and tests point the var at a deliberate dead end to
+            // ignore the developer's real config.) The refusal below is not
+            // gated the same way — a path the repo controls is worth refusing
+            // whether or not the file exists yet.
+            config::CustomConfigVerdict::Outside(p) if p.exists() => {
+                ui::warn("CPLT_CONFIG replaces your whole cplt config, sandbox settings included:");
+                eprintln!("  {}", p.display());
+                eprintln!("  It is not under {}.", user_dir.display());
+                eprintln!(
+                    "  If you did not set it yourself, your shell did (direnv, mise, .envrc)."
+                );
+            }
+            config::CustomConfigVerdict::Outside(_) => {}
+            config::CustomConfigVerdict::InsideProject(p) => bail!(
+                "CPLT_CONFIG points inside the project directory:\n  \
+                 {}\n  \
+                 That file is repository content, and it would replace your whole cplt \
+                 config — sandbox settings included — with none of the review a .cplt.toml \
+                 gets. Refusing.\n  \
+                 Unset CPLT_CONFIG (check .envrc / mise config) and re-run.",
+                p.display()
+            ),
+        }
+    }
+
+    // Safety check: reject overly broad project roots
+    if is_unsafe_root(&project_dir, &home_dir) {
+        bail!(
+            "cplt refuses to sandbox '{}', it is too broad. Use a specific project directory.",
+            project_dir.display()
+        );
+    }
+
     let (cfg, config_path) = match config::Config::load_file() {
         Ok(Some(loaded)) => (loaded.config, Some(loaded.path)),
         Ok(None) => (config::Config::default(), None),
@@ -1358,40 +1438,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };
-
-    // Resolve home directory
-    let home_dir = match std::env::var("HOME") {
-        Ok(h) => std::fs::canonicalize(&h)
-            .map_err(|e| anyhow::anyhow!("Cannot resolve $HOME ({h}): {e}"))?,
-        Err(_) => bail!("$HOME not set"),
-    };
-
-    // Resolve project directory
-    let project_dir = match &cli.project_dir {
-        Some(p) => std::fs::canonicalize(p)
-            .map_err(|e| anyhow::anyhow!("Cannot resolve project dir: {e}"))?,
-        None => {
-            if let Some(root) = detect_project_root() {
-                match std::fs::canonicalize(&root) {
-                    Ok(p) => p,
-                    Err(_) => root,
-                }
-            } else {
-                ui::warn("No git repo detected, using cwd");
-                std::env::current_dir()
-                    .and_then(std::fs::canonicalize)
-                    .map_err(|e| anyhow::anyhow!("Cannot resolve cwd: {e}"))?
-            }
-        }
-    };
-
-    // Safety check: reject overly broad project roots
-    if is_unsafe_root(&project_dir, &home_dir) {
-        bail!(
-            "cplt refuses to sandbox '{}', it is too broad. Use a specific project directory.",
-            project_dir.display()
-        );
-    }
 
     // ── Load and apply per-repo config (.cplt.toml) ──────────────
     let mut unapproved_proposals: Vec<String> = Vec::new();
@@ -6951,8 +6997,16 @@ mod copilot_extraction_tests {
         std::fs::create_dir_all(&bindir).unwrap();
         std::fs::create_dir_all(&pkg).unwrap();
         let bin = bindir.join("copilot");
+        // Staged write, then rename. Writing this script and exec'ing it under
+        // its final name races every other test thread: `Command::spawn` forks,
+        // and a fork that happens while this file is still open for writing
+        // inherits the writable descriptor, so the exec comes back ETXTBSY.
+        // Under `cargo test` that surfaces as an unexplained intermittent
+        // failure on whichever extraction test lost the race. A rename is
+        // atomic, and the descriptor is closed before the name exists.
+        let staging = bindir.join("copilot.staging");
         std::fs::write(
-            &bin,
+            &staging,
             format!(
                 "#!/bin/sh\nPKG=\"{}\"\nCOUNT=\"{}\"\n{script}\n",
                 pkg.to_string_lossy().replace('"', "\\\""),
@@ -6962,7 +7016,8 @@ mod copilot_extraction_tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&staging, &bin).unwrap();
         Fixture {
             root,
             home,
@@ -7080,7 +7135,12 @@ mod copilot_extraction_tests {
     fn recovers_from_an_empty_current_version_dir() {
         let f = fixture("empty-dir", EXTRACTS_UNLESS_DIR_EXISTS);
         std::fs::create_dir_all(f.pkg.join("1.0.63")).unwrap();
-        assert!(f.run().is_ok());
+        // Carry the error. A bare `is_ok()` here cost a CI round-trip to
+        // diagnose, because the failure said nothing about why. Run once and
+        // report that result: a second run would see the state the first left
+        // behind and could well succeed, describing a failure that never was.
+        let result = f.run();
+        assert!(result.is_ok(), "extraction failed: {result:?}");
         assert!(f.pkg.join("1.0.63/.extraction-complete").exists());
     }
 

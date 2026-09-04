@@ -1013,6 +1013,15 @@ Trust model: cplt trusts that binaries in your PATH are legitimate, the same tru
 
 On shared systems, give `~/.config/cplt/` restrictive permissions (0700). A user who can write to this directory can weaken the sandbox configuration.
 
+`CPLT_CONFIG` moves that trusted input somewhere else, replacing the whole file — every `[sandbox]` key included. It is read from the ambient environment, so a shell that auto-loads repository-provided environment (direnv's `.envrc`, mise) can set it just by you entering a directory, and the repo-config trust model below (which only ever lets a repository *tighten* the sandbox) never sees it.
+
+Two guards keep that visible rather than silent:
+
+- A `CPLT_CONFIG` outside `~/.config/cplt/` prints a warning naming the resolved file. It is deliberately not suppressed by `--quiet` — a quiet run is when a silent substitution costs the most.
+- A `CPLT_CONFIG` that resolves **inside the project directory** is refused and cplt exits non-zero. Falling back to the real user config would be another invisible substitution, so this fails loudly instead. Symlinks and `..` are resolved before the comparison, so a path outside the repo that links back into it is refused too.
+
+Neither guard covers a repository that writes a config *outside* the project and points `CPLT_CONFIG` at that. The warning is what makes that case visible.
+
 ### Scratch directory session IDs
 
 Session IDs for per-session scratch directories come from `/dev/urandom` (16 random bytes, hex-encoded), falling back to PID plus nanosecond timestamp if `/dev/urandom` is unavailable, which is not expected on standard macOS or Linux. The fallback is predictable, but the failure mode is denial-of-service (directory creation fails if it already exists), not compromise.
