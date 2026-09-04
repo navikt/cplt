@@ -66,7 +66,7 @@ pub use policy::{
 // SBPL profile generation — kept public for unit tests.
 // The SBPL module is pure string manipulation with no macOS dependencies,
 // so tests run cross-platform even though the output is macOS-specific.
-pub use profile::{ProfileOptions, generate_profile, generate_profile_with_playwright_socket_dir};
+pub use profile::{generate_profile, generate_profile_with_playwright_socket_dir};
 
 // Environment construction — already platform-agnostic.
 pub use env::{
@@ -525,45 +525,9 @@ fn prepare_impl(
             .then_some(config.playwright_socket_dir)
             .flatten();
 
-    let profile_options = profile::ProfileOptions {
-        project_dir: config.project_dir,
-        home_dir: config.home_dir,
-        extra_read: config.extra_read,
-        extra_write: config.extra_write,
-        extra_exec: config.extra_exec,
-        allow_socket: config.extra_socket,
-        extra_deny: config.extra_deny,
-        existing_home_tool_dirs: config.existing_home_tool_dirs,
-        existing_app_dirs: config.existing_app_dirs,
-        extra_ports: config.extra_ports,
-        localhost_ports: config.localhost_ports,
-        proxy_port: config.proxy_port,
-        proxy_forced: config.proxy_forced,
-        allow_env_files: config.allow_env_files,
-        allow_localhost_any: config.allow_localhost_any,
-        scratch_dir: config.scratch_dir,
-        allow_tmp_exec: config.allow_tmp_exec,
-        copilot_install_dir: config.copilot_install_dir,
-        java_home: config.java_home,
-        dotnet_root: config.dotnet_root,
-        git_hooks_path: config.git_hooks_path,
-        git_common_dir: config.git_common_dir,
-        extra_git_dirs,
-        allow_gpg_signing: config.allow_gpg_signing,
-        deny_clipboard: config.deny_clipboard,
-        allow_jvm_attach: config.allow_jvm_attach,
-        allow_msbuild: config.allow_msbuild,
-        allow_docker: config.allow_docker,
-        electron_app_dir: config.electron_app_dir,
-        agent: config.agent,
-        agent_dirs: config.agent_dirs,
-        allow_cache_exec: config.allow_cache_exec,
-        allow_cache_exec_any: config.allow_cache_exec_any,
-        allow_browser: config.allow_browser,
-        credential_outside_keychain: config.keychain_substitute.is_some(),
-    };
     let profile_text = profile::generate_profile_with_playwright_socket_dir(
-        &profile_options,
+        config,
+        extra_git_dirs,
         playwright_socket_dir,
     );
 

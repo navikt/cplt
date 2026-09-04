@@ -427,39 +427,39 @@ mod macos_tests {
     // ============================================================
 
     use cplt::sandbox::{
-        ProfileOptions, generate_profile, generate_profile_with_playwright_socket_dir,
+        SandboxConfig, generate_profile, generate_profile_with_playwright_socket_dir,
     };
 
     /// Write a real cplt-generated profile to a temp file.
-    fn write_real_profile(opts: &ProfileOptions) -> PathBuf {
-        let profile = generate_profile(opts);
+    fn write_real_profile(opts: &SandboxConfig) -> PathBuf {
+        let profile = generate_profile(opts, &[]);
         let path = unique_profile_path();
         fs::write(&path, &profile).unwrap();
         path
     }
 
     fn write_real_profile_with_playwright_socket(
-        opts: &ProfileOptions,
+        opts: &SandboxConfig,
         socket_dir: &Path,
     ) -> PathBuf {
-        let profile = generate_profile_with_playwright_socket_dir(opts, Some(socket_dir));
+        let profile = generate_profile_with_playwright_socket_dir(opts, &[], Some(socket_dir));
         let path = unique_profile_path();
         fs::write(&path, &profile).unwrap();
         path
     }
 
-    /// Default ProfileOptions pointing at the given project/home dirs.
+    /// Default SandboxConfig pointing at the given project/home dirs.
     fn default_opts<'a>(
         project: &'a std::path::Path,
         home: &'a std::path::Path,
-    ) -> ProfileOptions<'a> {
-        ProfileOptions {
+    ) -> SandboxConfig<'a> {
+        SandboxConfig {
             project_dir: project,
             home_dir: home,
             extra_read: &[],
             extra_write: &[],
             extra_exec: &[],
-            allow_socket: &[],
+            extra_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
             existing_app_dirs: None,
@@ -470,13 +470,13 @@ mod macos_tests {
             allow_env_files: false,
             allow_localhost_any: false,
             scratch_dir: None,
+            playwright_socket_dir: None,
             allow_tmp_exec: false,
             copilot_install_dir: None,
             java_home: None,
             dotnet_root: None,
             git_hooks_path: None,
             git_common_dir: None,
-            extra_git_dirs: &[],
             allow_gpg_signing: false,
             deny_clipboard: false,
             allow_jvm_attach: false,
@@ -488,7 +488,8 @@ mod macos_tests {
             allow_cache_exec: &[],
             allow_cache_exec_any: false,
             allow_browser: false,
-            credential_outside_keychain: false,
+            keychain_substitute: None,
+            use_bubblewrap: None,
         }
     }
 
@@ -1206,7 +1207,8 @@ mod macos_tests {
         let profile = tempfile::NamedTempFile::new()
             .expect("create generated Chrome test profile")
             .into_temp_path();
-        fs::write(&profile, generate_profile(&opts)).expect("write generated Chrome test profile");
+        fs::write(&profile, generate_profile(&opts, &[]))
+            .expect("write generated Chrome test profile");
         let sandbox_data_dir = tempfile::tempdir().expect("create sandboxed browser state");
         let sandbox_token = unique_render_token();
         let sandbox_url = render_probe_document(&sandbox_token);
@@ -2792,7 +2794,7 @@ except Exception as e:
         let mut opts = default_opts(&project, &home);
         opts.proxy_forced = true;
         opts.proxy_port = Some(45123);
-        let profile = generate_profile(&opts);
+        let profile = generate_profile(&opts, &[]);
 
         assert!(
             profile.contains("(allow network-outbound (remote ip \"localhost:45123\"))"),
@@ -2841,7 +2843,7 @@ except Exception as e:
         let localhost_ports = [allowed_port];
         let mut opts = default_opts(&project, &home);
         opts.localhost_ports = &localhost_ports;
-        let profile_text = generate_profile(&opts);
+        let profile_text = generate_profile(&opts, &[]);
 
         let profile_path =
             std::env::temp_dir().join(format!("cplt-portfilter-{}.sb", std::process::id()));
@@ -2873,7 +2875,7 @@ except Exception as e:
         let project = fs::canonicalize(".").unwrap();
         let home = home_dir();
         let opts = default_opts(&project, &home);
-        let profile = generate_profile(&opts);
+        let profile = generate_profile(&opts, &[]);
 
         assert!(
             profile.contains("\"*:443\""),
