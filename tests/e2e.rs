@@ -3263,8 +3263,10 @@ paths = [
             .output()
             .unwrap();
 
-        // Isolated config dir (no interference from user's real config)
-        let config_dir = repo.join(".cplt-config");
+        // Isolated config dir (no interference from user's real config).
+        // Deliberately NOT inside the repo: cplt refuses a CPLT_CONFIG the
+        // project controls (issue #261).
+        let config_dir = std::env::temp_dir().join(format!(".cplt-e2e-trust-cfg-{label}-{id}"));
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_file = config_dir.join("config.toml");
         std::fs::write(&config_file, "").unwrap();

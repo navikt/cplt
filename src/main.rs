@@ -1307,7 +1307,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             &project_dir,
         ) {
             config::CustomConfigVerdict::UserConfigDir => {}
-            config::CustomConfigVerdict::Outside(p) => {
+            // Only warn for a file that is actually there: a CPLT_CONFIG naming
+            // a path that does not exist selects no config, so nothing was
+            // substituted and there is nothing to flag. (`cplt exec` promises a
+            // clean stderr, and tests point the var at a deliberate dead end to
+            // ignore the developer's real config.) The refusal below is not
+            // gated the same way — a path the repo controls is worth refusing
+            // whether or not the file exists yet.
+            config::CustomConfigVerdict::Outside(p) if p.exists() => {
                 ui::warn("CPLT_CONFIG replaces your whole cplt config, sandbox settings included:");
                 eprintln!("  {}", p.display());
                 eprintln!("  It is not under {}.", user_dir.display());
@@ -1315,6 +1322,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
                     "  If you did not set it yourself, your shell did (direnv, mise, .envrc)."
                 );
             }
+            config::CustomConfigVerdict::Outside(_) => {}
             config::CustomConfigVerdict::InsideProject(p) => bail!(
                 "CPLT_CONFIG points inside the project directory:\n  \
                  {}\n  \
