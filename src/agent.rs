@@ -415,6 +415,31 @@ impl Agent {
             // billing. Users who want that can pass it explicitly with
             // `--pass-env ANTHROPIC_API_KEY`.
             Agent::Claude => &["CLAUDE_CODE_OAUTH_TOKEN"],
+            // goose gets no substitute either, but this one is not "unprobed" —
+            // it was read in goose's own source (aaif-goose/goose, `main`), and
+            // the answer is that goose reaches its keyring *during* a session,
+            // not only at startup:
+            //
+            // - `Config::get_secret` (crates/goose/src/config/base.rs) does
+            //   check the uppercased env var before the keyring, so the
+            //   precedence half is fine.
+            // - `providers/githubcopilot.rs` re-reads `GITHUB_COPILOT_TOKEN`
+            //   through that path every time its cached API info expires
+            //   (`refresh_in`), which is mid-session, not at startup.
+            // - `oauth/persist.rs::save_persisted` *writes* refreshed
+            //   credentials back through `set_secret`, i.e. into the keyring,
+            //   mid-session — reached by the gateway and declarative providers.
+            //
+            // So the right answer depends on which provider goose is configured
+            // for, and goose embeds several hundred of them. A substitute would
+            // have to match the *configured* provider's key rather than find any
+            // var from `auth_env_hint()`: a developer with OPENAI_API_KEY
+            // exported and goose pointed at Anthropic would otherwise lose the
+            // keyring and the login with it. `GOOSE_DISABLE_KEYRING` is not the
+            // escape hatch either — it redirects those same writes to
+            // `secrets.yaml` in goose's config dir ($XDG_CONFIG_HOME/goose,
+            // ~/.config/goose by default), which cplt grants read-only.
+            Agent::Goose => &[],
             _ => &[],
         }
     }
@@ -2196,6 +2221,49 @@ mod tests {
                 assert!(
                     !agent.auth_env_hint().is_empty(),
                     "{agent:?} is not OAuth-first, so it needs an env hint to suggest"
+                );
+            }
+        }
+    }
+
+    /// Every agent that wants the Keychain must state whether it has a
+    /// substitute credential, and an empty answer must be a decision.
+    ///
+    /// Same shape as `every_agent_declares_its_auth_model`, for the same reason:
+    /// the expectation is an EXHAUSTIVE match, so a new agent variant stops
+    /// compiling here until someone says where its credential can be read
+    /// without the login Keychain (#242). The two empty answers are not the
+    /// same kind of empty and the comments say which is which — Copilot's is
+    /// unprobed (#277), goose's is probed and negative.
+    #[test]
+    fn every_keychain_agent_states_its_substitute() {
+        fn expected_substitutes(agent: Agent) -> &'static [&'static str] {
+            match agent {
+                // Unprobed: filling this in needs the run #277 asks for, not an
+                // argument. See the comment in `keychain_substitute_env_vars`.
+                Agent::Copilot => &[],
+                // Probed and negative: goose re-reads and rewrites its keyring
+                // mid-session for some providers, so a one-shot substitute
+                // cannot be safe for all of them.
+                Agent::Goose => &[],
+                // File-based substitute instead, in `credential_outside_keychain`.
+                Agent::Antigravity => &[],
+                Agent::Claude => &["CLAUDE_CODE_OAUTH_TOKEN"],
+                // Agents that never wanted the grant have nothing to trade.
+                Agent::OpenCode | Agent::Pi | Agent::Shell => &[],
+            }
+        }
+        for agent in ALL_AGENTS {
+            assert_eq!(
+                agent.keychain_substitute_env_vars(),
+                expected_substitutes(agent),
+                "{agent:?}'s Keychain substitute changed — update SECURITY.md's \
+                 per-agent table and say what verified it"
+            );
+            if !agent.needs_keychain() {
+                assert!(
+                    agent.keychain_substitute_env_vars().is_empty(),
+                    "{agent:?} offers a substitute for a grant it never gets"
                 );
             }
         }
