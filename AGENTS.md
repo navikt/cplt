@@ -79,6 +79,7 @@ set.
 - `src/main.rs` CLI entry point, orchestration
 - `src/lib.rs` library crate root (re-exports modules for test access)
 - `src/proxy.rs` CONNECT proxy, domain blocking, audit log
+- `tests/common/mod.rs` test isolation helpers, shared by every suite
 - `tests/unit_tests.rs` cross-platform unit tests
 - `tests/integration.rs` macOS sandbox-exec kernel-level tests
 - `tests/integration_linux.rs` Linux Landlock+seccomp kernel-level tests
@@ -104,6 +105,26 @@ The four tiers each prove something the others cannot, so all four are needed.
 4. **E2E project tests** verify that realistic developer workflows (git, node,
    python, rust file ops, config files) work inside the sandbox. Catches
    real-world breakage that synthetic tests miss.
+
+### Isolation
+
+A test must not inherit the machine it runs on. Build every subprocess with the
+helpers in `tests/common/mod.rs`, never `Command::new` directly:
+
+- `cplt_cmd()` — the binary with `CPLT_CONFIG` pointed at a dead end, so config
+  resolution (CLI flag > config > preset > default) sees the defaults rather
+  than the developer's `~/.config/cplt/config.toml`.
+- `cplt_cmd_with_ambient_config()` — the explicit opt-out, for a test that is
+  itself about config discovery.
+- `git_cmd(dir)` — git with `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_NOSYSTEM` cleared,
+  so `commit.gpgsign`, `core.hooksPath` and `init.defaultBranch` cannot decide
+  whether fixture setup succeeds.
+- `temp_repo(remote)` — a throwaway repo with a known `origin`. Anything that
+  resolves a repository from the cwd belongs here, not in the checkout, whose
+  `origin` is `navikt/cplt` only for people who cloned it directly.
+
+Two failures came from skipping this (issue #245), and both reported success
+while exercising nothing.
 
 Which tier to use:
 

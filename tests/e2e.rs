@@ -9,17 +9,17 @@
 //! Run live tests that hit the Copilot API:
 //!   cargo test --test e2e -- --ignored
 
+mod common;
+
 #[cfg(target_os = "macos")]
 mod e2e_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    use crate::common::{binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    fn binary_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_BIN_EXE_cplt"))
-    }
 
     fn project_dir() -> PathBuf {
         std::fs::canonicalize(".").unwrap()
@@ -96,20 +96,6 @@ mod e2e_tests {
         };
     }
 
-    /// Configure a Command to ignore the user's config file.
-    /// Prevents user settings (e.g., allow_localhost_any) from affecting test assertions.
-    fn no_user_config(cmd: &mut Command) -> &mut Command {
-        cmd.env("CPLT_CONFIG", "/dev/null/nonexistent")
-    }
-
-    /// Create a cplt Command pre-configured to ignore the user's config.
-    /// Use for tests that assert on profile/output content that config could affect.
-    fn cplt_cmd() -> Command {
-        let mut cmd = Command::new(binary_path());
-        no_user_config(&mut cmd);
-        cmd
-    }
-
     // ============================================================
     // Full pipeline tests (sandbox-exec → copilot child process)
     // ============================================================
@@ -118,7 +104,7 @@ mod e2e_tests {
     fn e2e_copilot_version_inside_sandbox() {
         require_copilot!();
         require_sandbox!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate", "--", "--version"])
             .current_dir(project_dir())
             .output()
@@ -466,7 +452,7 @@ mod e2e_tests {
     #[test]
     fn e2e_doctor_exits_successfully() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--doctor"])
             .current_dir(project_dir())
             .output()
@@ -484,7 +470,7 @@ mod e2e_tests {
     fn e2e_doctor_reports_auth_section() {
         // No require_copilot!: doctor always prints the Auth section header
         // regardless of whether Copilot is installed, so this runs in CI.
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--doctor"])
             .current_dir(project_dir())
             .output()
@@ -501,7 +487,7 @@ mod e2e_tests {
     #[test]
     fn e2e_doctor_reports_copilot_section() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--doctor"])
             .current_dir(project_dir())
             .output()
@@ -519,7 +505,7 @@ mod e2e_tests {
     fn e2e_doctor_reports_tools_section() {
         // No require_copilot!: doctor always prints the Tools section (git is
         // present on the runner) regardless of Copilot, so this runs in CI.
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--doctor"])
             .current_dir(project_dir())
             .output()
@@ -536,7 +522,7 @@ mod e2e_tests {
     #[test]
     fn e2e_doctor_reports_sandbox_paths() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--doctor"])
             .current_dir(project_dir())
             .output()
@@ -553,7 +539,7 @@ mod e2e_tests {
     #[test]
     fn e2e_doctor_subcommand_works() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["doctor"])
             .current_dir(project_dir())
             .output()
@@ -580,7 +566,7 @@ mod e2e_tests {
     #[test]
     fn e2e_doctor_flag_shows_deprecation() {
         require_copilot!();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--doctor"])
             .current_dir(project_dir())
             .output()
@@ -608,7 +594,7 @@ mod e2e_tests {
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["doctor"])
             .current_dir(dir.path())
             .output()
@@ -637,7 +623,7 @@ mod e2e_tests {
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["doctor"])
             .current_dir(dir.path())
             .env("NO_COLOR", "1")
@@ -661,7 +647,7 @@ mod e2e_tests {
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["doctor"])
             .current_dir(dir.path())
             .env("TERM", "dumb")
@@ -687,7 +673,7 @@ mod e2e_tests {
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["doctor"])
             .current_dir(dir.path())
             .env("NO_COLOR", "1")
@@ -959,7 +945,7 @@ mod e2e_tests {
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = cplt_cmd();
         cmd.args(["--yes", "--no-validate"])
             .args(extra_args)
             .args(["--", "--version"]) // fake copilot ignores args, prints env
@@ -987,7 +973,7 @@ mod e2e_tests {
         let fake_dir = create_fake_copilot();
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.path().display());
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = cplt_cmd();
         cmd.current_dir(project_dir()).env("PATH", &new_path);
         (cmd, fake_dir)
     }
@@ -1126,7 +1112,7 @@ mod e2e_tests {
     ) -> (String, String, bool) {
         use std::process::Stdio;
 
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = cplt_cmd();
         cmd.args(["--yes", "--no-validate"])
             .args(extra_cplt_args)
             .arg("--");
@@ -1167,9 +1153,8 @@ mod e2e_tests {
 
         // Initialize git so Copilot doesn't complain
         let run_git = |args: &[&str]| {
-            Command::new("git")
+            git_cmd(dir.path())
                 .args(args)
-                .current_dir(dir.path())
                 .env("GIT_AUTHOR_NAME", "Test")
                 .env("GIT_AUTHOR_EMAIL", "test@test.com")
                 .env("GIT_COMMITTER_NAME", "Test")
@@ -1202,18 +1187,16 @@ mod e2e_tests {
         std::fs::write(dir.join("canary.txt"), &token).unwrap();
 
         // Commit the file so git doesn't show it as untracked noise
-        Command::new("git")
+        git_cmd(&dir)
             .args(["add", "."])
-            .current_dir(&dir)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "test@test.com")
             .output()
             .ok();
-        Command::new("git")
+        git_cmd(&dir)
             .args(["commit", "-m", "add canary"])
-            .current_dir(&dir)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "Test")
@@ -1290,18 +1273,16 @@ mod e2e_tests {
         }
 
         // Commit so it's visible
-        Command::new("git")
+        git_cmd(&dir)
             .args(["add", "."])
-            .current_dir(&dir)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "test@test.com")
             .output()
             .ok();
-        Command::new("git")
+        git_cmd(&dir)
             .args(["commit", "-m", "add script"])
-            .current_dir(&dir)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "Test")
@@ -1338,18 +1319,16 @@ mod e2e_tests {
         std::fs::write(dir.join(".env"), format!("SECRET_TOKEN={token}\n")).unwrap();
 
         // Commit so it's in the repo
-        Command::new("git")
+        git_cmd(&dir)
             .args(["add", "-f", ".env"])
-            .current_dir(&dir)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "test@test.com")
             .output()
             .ok();
-        Command::new("git")
+        git_cmd(&dir)
             .args(["commit", "-m", "add env"])
-            .current_dir(&dir)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "Test")
@@ -1449,18 +1428,16 @@ mod e2e_tests {
             .unwrap();
         }
 
-        Command::new("git")
+        git_cmd(&dir)
             .args(["add", "."])
-            .current_dir(&dir)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "test@test.com")
             .output()
             .ok();
-        Command::new("git")
+        git_cmd(&dir)
             .args(["commit", "-m", "add script"])
-            .current_dir(&dir)
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "Test")
@@ -1499,7 +1476,7 @@ mod e2e_tests {
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate", "--", "--version"])
             .current_dir(project_dir())
             .env("PATH", &new_path)
@@ -1558,7 +1535,7 @@ mod e2e_tests {
         std::os::unix::fs::symlink(binary_path(), dir.path().join("copilot")).unwrap();
 
         // PATH contains ONLY the symlink dir — no real copilot anywhere
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate", "--", "--version"])
             .current_dir(project_dir())
             .env("PATH", dir.path().display().to_string())
@@ -1579,7 +1556,7 @@ mod e2e_tests {
 
     #[test]
     fn e2e_shell_setup_prints_alias() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .arg("--shell-setup")
             .output()
             .expect("binary should run");
@@ -1596,7 +1573,7 @@ mod e2e_tests {
         let zshrc = fake_home.join(".zshrc");
 
         // First install — should create the file with the eval line
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .arg("--shell-install")
             .env("HOME", &fake_home)
             .env("SHELL", "/bin/zsh")
@@ -1615,7 +1592,7 @@ mod e2e_tests {
         );
 
         // Second install — should be idempotent
-        let output2 = Command::new(binary_path())
+        let output2 = cplt_cmd()
             .arg("--shell-install")
             .env("HOME", &fake_home)
             .env("SHELL", "/bin/zsh")
@@ -1641,15 +1618,24 @@ mod e2e_tests {
 
     #[test]
     fn e2e_config_path_prints_path() {
-        let output = Command::new(binary_path())
+        // Asserts config *discovery*, so CPLT_CONFIG must stay unset — but the
+        // fallback is $HOME-derived, so point HOME at a temp dir and assert the
+        // exact path instead of the substring the reader's machine happens to
+        // produce.
+        let home = tempfile::tempdir().unwrap();
+        let output = cplt_cmd_with_ambient_config()
             .args(["config", "path"])
+            .env("HOME", home.path())
+            .env_remove("CPLT_CONFIG")
             .output()
             .expect("should run");
         assert!(output.status.success(), "config path should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = home.path().join(".config/cplt/config.toml");
         assert!(
-            stdout.contains("config.toml"),
-            "should print config path: {stdout}"
+            stdout.contains(&*expected.to_string_lossy()),
+            "should print the HOME-derived config path {}: {stdout}",
+            expected.display()
         );
     }
 
@@ -1662,7 +1648,7 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "validate"])
             .env("HOME", &fake_home)
             .env(
@@ -1698,7 +1684,7 @@ mod e2e_tests {
         let config_file = fake_home.join("config.toml");
         std::fs::write(&config_file, "[sandbox]\nquiet = true\n").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "validate"])
             .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
@@ -1726,7 +1712,7 @@ mod e2e_tests {
         let config_file = fake_home.join("config.toml");
         std::fs::write(&config_file, "[sandbox]\ninherit_evn = true\n").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "validate"])
             .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
@@ -1761,7 +1747,7 @@ mod e2e_tests {
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "show"])
             .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .output()
@@ -1794,7 +1780,7 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "show"])
             .env(
                 "CPLT_CONFIG",
@@ -1827,7 +1813,7 @@ mod e2e_tests {
 
         let config_file = fake_home.join(".config/cplt/config.toml");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "init"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -1856,7 +1842,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(config_dir.join("config.toml"), "# existing\n").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "init"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -1881,7 +1867,7 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .arg("--init-config")
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -1911,7 +1897,7 @@ mod e2e_tests {
 
     #[test]
     fn e2e_settings_requires_interactive_terminal() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .arg("settings")
             .env_remove("__CPLT_TRUST_LOCKED")
             .output()
@@ -1934,7 +1920,7 @@ mod e2e_tests {
         let config_path = fake_home.join(".config/cplt/config.toml");
         assert!(!config_path.exists());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "sandbox.quiet", "true"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -1961,7 +1947,7 @@ mod e2e_tests {
     fn e2e_config_get_returns_default() {
         let fake_home = make_config_home("get-default");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "get", "sandbox.quiet"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -1985,7 +1971,7 @@ mod e2e_tests {
         let fake_home = make_config_home("set-get");
 
         // Set a value
-        let set_out = Command::new(binary_path())
+        let set_out = cplt_cmd()
             .args(["config", "set", "proxy.port", "9090"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -1998,7 +1984,7 @@ mod e2e_tests {
         );
 
         // Get it back
-        let get_out = Command::new(binary_path())
+        let get_out = cplt_cmd()
             .args(["config", "get", "proxy.port"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2016,7 +2002,7 @@ mod e2e_tests {
         let fake_home = make_config_home("set-unset");
 
         // Set a value
-        Command::new(binary_path())
+        cplt_cmd()
             .args(["config", "set", "sandbox.quiet", "true"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2024,7 +2010,7 @@ mod e2e_tests {
             .expect("should run");
 
         // Unset it
-        let unset_out = Command::new(binary_path())
+        let unset_out = cplt_cmd()
             .args(["config", "set", "sandbox.quiet", "--unset"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2037,7 +2023,7 @@ mod e2e_tests {
         );
 
         // Get should return default
-        let get_out = Command::new(binary_path())
+        let get_out = cplt_cmd()
             .args(["config", "get", "sandbox.quiet"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2054,7 +2040,7 @@ mod e2e_tests {
         let fake_home = make_config_home("set-dangerous");
 
         // Without --force should fail
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "sandbox.inherit_env", "true"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2068,7 +2054,7 @@ mod e2e_tests {
         );
 
         // With --force should succeed
-        let output2 = Command::new(binary_path())
+        let output2 = cplt_cmd()
             .args(["config", "set", "sandbox.inherit_env", "true", "--force"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2087,7 +2073,7 @@ mod e2e_tests {
     fn e2e_config_set_dangerous_false_no_force_needed() {
         let fake_home = make_config_home("set-dangerous-false");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "sandbox.inherit_env", "false"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2111,7 +2097,7 @@ mod e2e_tests {
             let fake_home = make_config_home(&format!("set-preset-{preset}"));
 
             // Without --force should fail and name what it enables.
-            let output = Command::new(binary_path())
+            let output = cplt_cmd()
                 .args(["config", "set", "sandbox.preset", preset])
                 .env("HOME", fake_home.to_str().unwrap())
                 .env_remove("CPLT_CONFIG")
@@ -2128,7 +2114,7 @@ mod e2e_tests {
             );
 
             // With --force should succeed.
-            let output2 = Command::new(binary_path())
+            let output2 = cplt_cmd()
                 .args(["config", "set", "sandbox.preset", preset, "--force"])
                 .env("HOME", fake_home.to_str().unwrap())
                 .env_remove("CPLT_CONFIG")
@@ -2150,7 +2136,7 @@ mod e2e_tests {
         for preset in ["strict", "standard"] {
             let fake_home = make_config_home(&format!("set-safe-preset-{preset}"));
 
-            let output = Command::new(binary_path())
+            let output = cplt_cmd()
                 .args(["config", "set", "sandbox.preset", preset])
                 .env("HOME", fake_home.to_str().unwrap())
                 .env_remove("CPLT_CONFIG")
@@ -2170,7 +2156,7 @@ mod e2e_tests {
     fn e2e_config_set_invalid_key_fails() {
         let fake_home = make_config_home("set-badkey");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "sandbox.queit", "true"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2187,7 +2173,7 @@ mod e2e_tests {
     fn e2e_config_get_invalid_key_fails() {
         let fake_home = make_config_home("get-badkey");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "get", "nope"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2203,7 +2189,7 @@ mod e2e_tests {
         let fake_home = make_config_home("set-comments");
 
         // Create a config with comments via init
-        Command::new(binary_path())
+        cplt_cmd()
             .args(["config", "init"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2215,7 +2201,7 @@ mod e2e_tests {
         assert!(before.contains('#'), "init template should have comments");
 
         // Set a value
-        Command::new(binary_path())
+        cplt_cmd()
             .args(["config", "set", "sandbox.quiet", "true"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2240,7 +2226,7 @@ mod e2e_tests {
         let fake_home = make_config_home("set-append");
 
         // Set initial array
-        Command::new(binary_path())
+        cplt_cmd()
             .args(["config", "set", "allow.ports", "8080"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2248,7 +2234,7 @@ mod e2e_tests {
             .expect("should run");
 
         // Append another value
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "allow.ports", "--append", "9090"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2261,7 +2247,7 @@ mod e2e_tests {
         );
 
         // Get should show both
-        let get_out = Command::new(binary_path())
+        let get_out = cplt_cmd()
             .args(["config", "get", "allow.ports"])
             .env("HOME", fake_home.to_str().unwrap())
             .env_remove("CPLT_CONFIG")
@@ -2284,11 +2270,7 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Initialize git repo (required for repo detection)
-        std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
+        git_cmd(&dir).args(["init", "--quiet"]).output().unwrap();
         dir
     }
 
@@ -2303,11 +2285,7 @@ mod e2e_tests {
         let repo = make_repo_dir(label);
         std::fs::write(repo.join(".cplt.toml"), toml).unwrap();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .unwrap();
+            let out = git_cmd(&repo).args(args).output().unwrap();
             assert!(
                 out.status.success(),
                 "git {args:?} failed: {}",
@@ -2620,7 +2598,7 @@ paths = [
         let cplt_toml = repo.join(".cplt.toml");
         assert!(!cplt_toml.exists());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "config",
                 "set",
@@ -2656,7 +2634,7 @@ paths = [
     fn e2e_config_set_repo_deny_paths() {
         let repo = make_repo_dir("set-repo-deny");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "--repo", "deny.paths", "~/secrets"])
             .current_dir(&repo)
             .output()
@@ -2686,7 +2664,7 @@ paths = [
         let repo = make_repo_dir("set-repo-allow-arr");
 
         // Set first read path
-        Command::new(binary_path())
+        cplt_cmd()
             .args([
                 "config",
                 "set",
@@ -2699,7 +2677,7 @@ paths = [
             .expect("should run");
 
         // Append second
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "config",
                 "set",
@@ -2738,7 +2716,7 @@ paths = [
     fn e2e_config_set_repo_rejects_invalid_key() {
         let repo = make_repo_dir("set-repo-invalid");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "--repo", "sandbox.quiet", "true"])
             .current_dir(&repo)
             .output()
@@ -2762,7 +2740,7 @@ paths = [
     fn e2e_config_set_repo_rejects_false_proposal() {
         let repo = make_repo_dir("set-repo-false");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "config",
                 "set",
@@ -2789,7 +2767,7 @@ paths = [
         let repo = make_repo_dir("set-repo-danger");
 
         // Without --force
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "--repo", "sandbox.allow_docker", "true"])
             .current_dir(&repo)
             .output()
@@ -2803,7 +2781,7 @@ paths = [
         );
 
         // With --force
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "config",
                 "set",
@@ -2836,7 +2814,7 @@ paths = [
         let repo = make_repo_dir("set-repo-unset");
 
         // Set a value first
-        Command::new(binary_path())
+        cplt_cmd()
             .args([
                 "config",
                 "set",
@@ -2849,7 +2827,7 @@ paths = [
             .expect("should run");
 
         // Unset it
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "config",
                 "set",
@@ -2880,7 +2858,7 @@ paths = [
     fn e2e_config_set_repo_port_array() {
         let repo = make_repo_dir("set-repo-ports");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "--repo", "allow.ports", "8080"])
             .current_dir(&repo)
             .output()
@@ -2904,7 +2882,7 @@ paths = [
 
         // Set same value twice
         for _ in 0..2 {
-            Command::new(binary_path())
+            cplt_cmd()
                 .args(["config", "set", "--repo", "allow.read", "~/.gradle"])
                 .current_dir(&repo)
                 .output()
@@ -2922,7 +2900,7 @@ paths = [
     fn e2e_config_set_repo_proxy_private_domains() {
         let repo = make_repo_dir("set-repo-proxy");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "config",
                 "set",
@@ -2957,7 +2935,7 @@ paths = [
     fn e2e_config_set_repo_deny_env() {
         let repo = make_repo_dir("set-repo-deny-env");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "set", "--repo", "deny.env", "VAULT_TOKEN"])
             .current_dir(&repo)
             .output()
@@ -2981,7 +2959,7 @@ paths = [
 
     #[test]
     fn e2e_config_explain_all_lists_keys() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "explain"])
             .output()
             .expect("should run");
@@ -3001,7 +2979,7 @@ paths = [
 
     #[test]
     fn e2e_config_explain_single_key() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "explain", "sandbox.quiet"])
             .output()
             .expect("should run");
@@ -3018,7 +2996,7 @@ paths = [
 
     #[test]
     fn e2e_config_explain_invalid_key() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["config", "explain", "sandbox.queit"])
             .output()
             .expect("should run");
@@ -3032,7 +3010,7 @@ paths = [
 
     #[test]
     fn e2e_update_help() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["update", "--help"])
             .output()
             .expect("should run");
@@ -3048,7 +3026,7 @@ paths = [
     /// since --check is read-only and fast.
     #[test]
     fn e2e_update_check_runs() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["update", "--check"])
             .output()
             .expect("should run");
@@ -3107,7 +3085,7 @@ paths = [
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate"])
             .args(cplt_args)
             .current_dir(project_dir())
@@ -3228,29 +3206,19 @@ paths = [
         std::fs::create_dir_all(&repo).unwrap();
 
         // Init git repo and commit .cplt.toml
-        Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&repo)
-            .output()
-            .unwrap();
-        Command::new("git")
+        git_cmd(&repo).args(["init", "--quiet"]).output().unwrap();
+        git_cmd(&repo)
             .args(["config", "user.email", "test@test.com"])
-            .current_dir(&repo)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd(&repo)
             .args(["config", "user.name", "Test"])
-            .current_dir(&repo)
             .output()
             .unwrap();
 
         std::fs::write(repo.join(".cplt.toml"), cplt_toml_content).unwrap();
-        Command::new("git")
-            .args(["add", ".cplt.toml"])
-            .current_dir(&repo)
-            .output()
-            .unwrap();
-        Command::new("git")
+        git_cmd(&repo).args(["add", ".cplt.toml"]).output().unwrap();
+        git_cmd(&repo)
             .args([
                 "-c",
                 "commit.gpgSign=false",
@@ -3259,14 +3227,21 @@ paths = [
                 "init",
                 "--quiet",
             ])
-            .current_dir(&repo)
             .output()
             .unwrap();
 
         // Isolated config dir (no interference from user's real config).
         // Deliberately NOT inside the repo: cplt refuses a CPLT_CONFIG the
         // project controls (issue #261).
+        //
+        // Wiped first: the path is deterministic, and it holds the trust store
+        // (`<parent of CPLT_CONFIG>/trust/`) keyed on the equally deterministic
+        // repo path. A store left behind by an earlier run made this repo start
+        // out *approved*, so "before accept, should be pending" failed
+        // intermittently — intermittently because `id` depends on how many
+        // other tests ran first.
         let config_dir = std::env::temp_dir().join(format!(".cplt-e2e-trust-cfg-{label}-{id}"));
+        let _ = std::fs::remove_dir_all(&config_dir);
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_file = config_dir.join("config.toml");
         std::fs::write(&config_file, "").unwrap();
@@ -3277,7 +3252,7 @@ paths = [
     /// Build a Command for the cplt binary with trust-related env vars cleared.
     /// Trust tests must not inherit __CPLT_TRUST_LOCKED from a parent sandbox.
     fn trust_cmd(repo: &Path, config_file: &Path) -> Command {
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = cplt_cmd();
         cmd.current_dir(repo)
             .env("CPLT_CONFIG", config_file.to_str().unwrap())
             .env_remove("__CPLT_TRUST_LOCKED");
@@ -3453,12 +3428,8 @@ paths = [
             "[propose]\nallow_localhost_any = true\nallow_docker = true\n",
         )
         .unwrap();
-        Command::new("git")
-            .args(["add", ".cplt.toml"])
-            .current_dir(&repo)
-            .output()
-            .unwrap();
-        Command::new("git")
+        git_cmd(&repo).args(["add", ".cplt.toml"]).output().unwrap();
+        git_cmd(&repo)
             .args([
                 "-c",
                 "commit.gpgSign=false",
@@ -3467,7 +3438,6 @@ paths = [
                 "change proposals",
                 "--quiet",
             ])
-            .current_dir(&repo)
             .output()
             .unwrap();
 
@@ -3549,7 +3519,7 @@ paths = [
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate", "--", "--version"])
             .current_dir(&repo)
             .env("PATH", &new_path)
@@ -3590,7 +3560,7 @@ paths = [
         let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
         // Run with flag — should succeed
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -3687,7 +3657,7 @@ paths = [
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.path().display());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -3736,7 +3706,7 @@ paths = [
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init"])
             .current_dir(dir.path())
             .output()
@@ -3761,7 +3731,7 @@ paths = [
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
         std::fs::write(dir.path().join("Dockerfile"), "FROM rust:1.80").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init"])
             .current_dir(dir.path())
             .output()
@@ -3781,7 +3751,7 @@ paths = [
     fn e2e_init_empty_project_succeeds() {
         let dir = tempfile::tempdir().unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init"])
             .current_dir(dir.path())
             .output()
@@ -3803,7 +3773,7 @@ paths = [
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init", "--write"])
             .current_dir(dir.path())
             .output()
@@ -3825,7 +3795,7 @@ paths = [
         std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
         std::fs::write(dir.path().join(".cplt.toml"), "# existing").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init", "--write"])
             .current_dir(dir.path())
             .output()
@@ -3845,7 +3815,7 @@ paths = [
         std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
         std::fs::write(dir.path().join(".cplt.toml"), "# old content").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init", "--write", "--force"])
             .current_dir(dir.path())
             .output()
@@ -3864,7 +3834,7 @@ paths = [
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Dockerfile"), "FROM node:20").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init", "--quiet"])
             .current_dir(dir.path())
             .output()
@@ -3897,7 +3867,7 @@ paths = [
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init"])
             .current_dir(dir.path())
             .output()
@@ -3922,7 +3892,7 @@ paths = [
         std::fs::create_dir_all(home.path().join("Library/Caches/ms-playwright")).unwrap();
         std::fs::create_dir_all(home.path().join(".cache/ms-playwright")).unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init", "--global"])
             .env("HOME", home.path())
             .env("CPLT_CONFIG", home.path().join("config.toml"))
@@ -3949,7 +3919,7 @@ paths = [
         std::fs::create_dir_all(home.path().join(".cache/ms-playwright")).unwrap();
         let config_path = home.path().join("cplt/config.toml");
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init", "--global", "--write"])
             .env("HOME", home.path())
             .env("CPLT_CONFIG", &config_path)
@@ -3971,10 +3941,13 @@ paths = [
     #[test]
     fn e2e_init_global_empty_home() {
         let home = tempfile::tempdir().unwrap();
-
-        let output = Command::new(binary_path())
+        // `init --global` detects machine-level config from PATH as well as
+        // HOME: an agent binary the developer happens to have installed makes
+        // "nothing detected" false. Empty PATH means empty detection.
+        let output = cplt_cmd()
             .args(["init", "--global"])
             .env("HOME", home.path())
+            .env("PATH", "")
             .env("CPLT_CONFIG", home.path().join("config.toml"))
             .output()
             .expect("should run");
@@ -4011,7 +3984,7 @@ paths = [
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init"])
             .current_dir(dir.path())
             .output()
@@ -4050,7 +4023,7 @@ paths = [
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init"])
             .current_dir(dir.path())
             .output()
@@ -4093,7 +4066,7 @@ paths = [
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init"])
             .current_dir(dir.path())
             .output()
@@ -4128,7 +4101,7 @@ paths = [
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init"])
             .current_dir(dir.path())
             .output()
@@ -4158,7 +4131,7 @@ paths = [
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["init", "--quiet"])
             .current_dir(dir.path())
             .output()
@@ -4189,7 +4162,7 @@ paths = [
         )
         .unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["doctor"])
             .current_dir(dir.path())
             .output()
@@ -4647,7 +4620,7 @@ paths = [
             "playwright-deny-env",
             "[deny]\nenv = [\"PWTEST_SOCKETS_DIR\"]\n",
         );
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--no-validate",
                 "--allow-cache-exec",
@@ -5013,9 +4986,8 @@ paths = [
         let home = tempfile::tempdir().expect("home");
         let project = tempfile::tempdir().expect("project");
         std::fs::create_dir_all(home.path().join(".config/cplt")).unwrap();
-        let status = Command::new("git")
+        let status = git_cmd(project.path())
             .args(["init", "-q"])
-            .current_dir(project.path())
             .status()
             .unwrap_or_else(|e| panic!("git init for {tag}: {e}"));
         assert!(status.success(), "git init should succeed for {tag}");
@@ -5029,7 +5001,7 @@ paths = [
         let config = elsewhere.path().join("config.toml");
         std::fs::write(&config, "[sandbox]\n").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--quiet", "--print-profile", "--agent", "copilot"])
             .current_dir(project.path())
             .env("HOME", home.path())
@@ -5054,7 +5026,7 @@ paths = [
         let config = home.path().join(".config/cplt/config.toml");
         std::fs::write(&config, "[sandbox]\n").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--quiet", "--print-profile", "--agent", "copilot"])
             .current_dir(project.path())
             .env("HOME", home.path())
@@ -5077,7 +5049,7 @@ paths = [
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(&config, "[sandbox]\nallow_env_files = true\n").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--quiet", "--print-profile", "--agent", "copilot"])
             .current_dir(project.path())
             .env("HOME", home.path())
@@ -5107,7 +5079,7 @@ paths = [
         let link = elsewhere.path().join("innocent.toml");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--quiet", "--print-profile", "--agent", "copilot"])
             .current_dir(project.path())
             .env("HOME", home.path())

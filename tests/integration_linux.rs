@@ -9,8 +9,12 @@
 //! - Network port filtering (ABI v4+)
 //! - seccomp syscall blocking
 
+mod common;
+
 #[cfg(target_os = "linux")]
 mod linux_tests {
+    use crate::common::cplt_cmd;
+
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -82,13 +86,9 @@ mod linux_tests {
     }
 
     /// Path to the built binary.
-    fn binary_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_BIN_EXE_cplt"))
-    }
-
     /// Run a shell command inside the cplt sandbox and return (exit_code, stdout, stderr).
     fn run_sandboxed(project_dir: &Path, script: &str) -> (i32, String, String) {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -131,7 +131,7 @@ mod linux_tests {
         args.extend_from_slice(extra_flags);
         args.extend_from_slice(&["--", "-c", script]);
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(&args)
             .env("HOME", home_dir())
             .output()
@@ -148,7 +148,7 @@ mod linux_tests {
 
     /// Run a shell command inside the sandbox with a custom HOME directory.
     fn run_sandboxed_home(project_dir: &Path, home: &Path, script: &str) -> (i32, String, String) {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -192,7 +192,7 @@ mod linux_tests {
         args.extend_from_slice(extra_flags);
         args.extend_from_slice(&["--", "-c", script]);
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(&args)
             .env("HOME", home)
             .output()
@@ -265,7 +265,7 @@ mod linux_tests {
         fs::create_dir_all(&ssh_dir).unwrap();
         fs::write(ssh_dir.join("test_key"), "secret").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -427,7 +427,7 @@ mod linux_tests {
         fs::create_dir_all(&ssh_dir).unwrap();
         fs::write(ssh_dir.join("test_key"), "secret_key_data").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -462,7 +462,7 @@ mod linux_tests {
         fs::create_dir_all(&ssh_dir).unwrap();
         fs::write(ssh_dir.join("test_key"), "secret_key_data").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -1090,7 +1090,7 @@ print('CONNECTED')
 
     #[test]
     fn binary_shows_help() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .arg("--help")
             .output()
             .expect("Failed to run cplt --help");
@@ -1101,7 +1101,7 @@ print('CONNECTED')
 
     #[test]
     fn binary_shows_version() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .arg("--version")
             .output()
             .expect("Failed to run cplt --version");
@@ -1112,7 +1112,7 @@ print('CONNECTED')
     fn binary_print_profile_shows_landlock() {
         require_landlock!();
         let project = create_test_project();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--print-profile",
                 "--project-dir",
@@ -1156,7 +1156,7 @@ print('CONNECTED')
         require_landlock!();
         let project = create_test_project();
         // Set a dangerous env var and verify it's stripped
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -1205,7 +1205,7 @@ print('CONNECTED')
             exit $fail
         "#;
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -1422,7 +1422,7 @@ print('CONNECTED')
         let project = create_test_project();
 
         // Inject credential-like vars into the cplt parent process env
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",
@@ -1506,7 +1506,7 @@ print('CONNECTED')
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{}", bin_dir.display(), current_path);
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--yes",
                 "--no-validate",

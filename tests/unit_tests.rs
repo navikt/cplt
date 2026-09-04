@@ -9658,6 +9658,10 @@ fn repo_config_state_uncommitted_when_gitignored() {
     let status = std::process::Command::new("git")
         .args(["status", "--porcelain", "--", ".cplt.toml"])
         .current_dir(tmp.path())
+        // As in `git_in`: the developer's global config (core.excludesFile,
+        // status.showUntrackedFiles) must not decide what this precondition sees.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .unwrap();
     assert!(

@@ -3,8 +3,12 @@
 //! These tests invoke sandbox-exec and verify kernel-level enforcement.
 //! They ONLY run on macOS — skipped on Linux/CI via #[cfg(target_os = "macos")].
 
+mod common;
+
 #[cfg(target_os = "macos")]
 mod macos_tests {
+    use crate::common::{cplt_cmd, git_cmd};
+
     use std::ffi::OsString;
     use std::fs::{self, File};
     use std::io::{Read, Seek, SeekFrom};
@@ -64,10 +68,6 @@ mod macos_tests {
     }
 
     /// Path to the built binary.
-    fn binary_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_BIN_EXE_cplt"))
-    }
-
     fn home_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap();
         fs::canonicalize(&home).unwrap()
@@ -2536,7 +2536,7 @@ if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
 
     #[test]
     fn binary_shows_help() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .arg("--help")
             .output()
             .expect("binary should exist");
@@ -2549,7 +2549,7 @@ if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
 
     #[test]
     fn binary_shows_version() {
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .arg("--version")
             .output()
             .expect("binary should exist");
@@ -2561,7 +2561,14 @@ if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
 
     #[test]
     fn binary_rejects_root_project_dir() {
-        let output = Command::new(binary_path())
+        // Every absolute path is "inside" `/`, so the usual
+        // `CPLT_CONFIG=/dev/null/nonexistent` isolation trips the
+        // config-inside-the-project refusal before the check under test.
+        // Isolate through an empty HOME instead.
+        let home = tempfile::tempdir().unwrap();
+        let output = cplt_cmd()
+            .env_remove("CPLT_CONFIG")
+            .env("HOME", home.path())
             .args(["--project-dir", "/", "--no-validate", "--", "--version"])
             .output()
             .expect("binary should exist");
@@ -2577,7 +2584,7 @@ if not owned_ok or sibling_result != 'SIBLING_BLOCKED':
     #[test]
     fn binary_rejects_home_project_dir() {
         let home = std::env::var("HOME").unwrap();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--project-dir", &home, "--no-validate", "--", "--version"])
             .output()
             .expect("binary should exist");
@@ -2814,7 +2821,7 @@ except Exception as e:
         // No require_sandbox!(): `--print-profile` only generates and prints the
         // SBPL text; it never invokes sandbox-exec, so it runs even when nested.
         let project = fs::canonicalize(".").unwrap();
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--proxy-forced",
                 "--print-profile",
@@ -2839,14 +2846,13 @@ except Exception as e:
     fn binary_print_profile_does_not_write_agents_md() {
         let dir = tempfile::tempdir().unwrap();
         let project = fs::canonicalize(dir.path()).unwrap();
-        let git_ok = Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&project)
-            .status()
-            .is_ok_and(|s| s.success());
-        if !git_ok {
-            return; // no git on this machine — nothing to assert
-        }
+        assert!(
+            git_cmd(&project)
+                .args(["init", "--quiet"])
+                .status()
+                .is_ok_and(|s| s.success()),
+            "git init should succeed"
+        );
 
         // Outside the project: cplt refuses a CPLT_CONFIG the repo controls
         // (issue #261).
@@ -2854,7 +2860,7 @@ except Exception as e:
         let config = config_home.path().join("cplt-config.toml");
         fs::write(&config, "[sandbox]\nbrief = true\nagents_md = true\n").unwrap();
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args([
                 "--print-profile",
                 "--project-dir",
