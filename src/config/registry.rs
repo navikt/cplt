@@ -696,10 +696,15 @@ macro_rules! bool_keys {
 // the read-back accessor.
 //
 // `cli` projects the CLI layer onto a `FeatureToggle`. A key with a proper
-// `--x`/`--no-x` pair carries one directly; a one-way flag (no `--no-x`) is
-// written as `from_pair(flag, false)` so the missing OFF side is visible in the
-// table rather than implied by a differently-shaped `if` somewhere in `merge`;
-// a config-only key passes `UseDefault`.
+// `--x`/`--no-x` pair carries one directly. A ONE-WAY flag — one that can only
+// push the value in one direction, because the opposite flag does not exist —
+// is written with a literal `false` on the side it lacks, and its row says so
+// in a `one-way` doc comment. That is the point of the column: one-way-ness
+// used to be implied by the shape of an `if cli.x { true } else { .. }` in
+// `merge` and stated nowhere. The set of one-way keys is pinned by
+// `precedence::one_way_cli_flags_are_declared_as_such`, so growing or losing
+// one is a test failure, not a silent change. A config-only key passes
+// `UseDefault`.
 //
 // `baseline` is `|b| b.<field>` for the nine preset-controlled keys and a
 // literal for the rest. It is a required column: a key cannot be declared
@@ -724,6 +729,7 @@ bool_keys! {
         resolved = |r: &Resolved| r.default_allowlist;
 
     /// `sandbox.validate`, stored inverted on `Resolved` as `no_validate`.
+    /// One-way in the OFF direction: `--no-validate` only, no `--validate`.
     validate, "sandbox", "validate",
         cli = |c: &CliFlags| FeatureToggle::from_pair(false, c.no_validate),
         config = |c: &Config| c.sandbox.validate,
@@ -756,6 +762,7 @@ bool_keys! {
         baseline = |b: PresetBaseline| b.allow_localhost_any,
         resolved = |r: &Resolved| r.allow_localhost_any;
 
+    /// One-way: `--inherit-env` turns it on, there is no `--no-inherit-env`.
     inherit_env, "sandbox", "inherit_env",
         cli = |c: &CliFlags| FeatureToggle::from_pair(c.inherit_env, false),
         config = |c: &Config| c.sandbox.inherit_env,
@@ -768,6 +775,8 @@ bool_keys! {
         baseline = |b: PresetBaseline| b.allow_lifecycle_scripts,
         resolved = |r: &Resolved| r.allow_lifecycle_scripts;
 
+    /// One-way: `--allow-gpg-signing` only. A config `true` cannot be undone
+    /// for a single run.
     allow_gpg_signing, "sandbox", "allow_gpg_signing",
         cli = |c: &CliFlags| FeatureToggle::from_pair(c.allow_gpg_signing, false),
         config = |c: &Config| c.sandbox.allow_gpg_signing,
@@ -786,6 +795,7 @@ bool_keys! {
         baseline = |_: PresetBaseline| true,
         resolved = |r: &Resolved| r.scratch_dir;
 
+    /// One-way in the OFF direction: `--no-audit` only, no `--audit`.
     audit, "sandbox", "audit",
         cli = |c: &CliFlags| c.audit,
         config = |c: &Config| c.sandbox.audit,
@@ -804,12 +814,14 @@ bool_keys! {
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.yes;
 
+    /// One-way: `--allow-jvm-attach` only.
     allow_jvm_attach, "sandbox", "allow_jvm_attach",
         cli = |c: &CliFlags| FeatureToggle::from_pair(c.allow_jvm_attach, false),
         config = |c: &Config| c.sandbox.allow_jvm_attach,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.allow_jvm_attach;
 
+    /// One-way: `--allow-msbuild` only.
     allow_msbuild, "sandbox", "allow_msbuild",
         cli = |c: &CliFlags| FeatureToggle::from_pair(c.allow_msbuild, false),
         config = |c: &Config| c.sandbox.allow_msbuild,
@@ -830,12 +842,14 @@ bool_keys! {
         baseline = |b: PresetBaseline| b.allow_docker,
         resolved = |r: &Resolved| r.allow_docker;
 
+    /// One-way: `--allow-cache-exec-any` only.
     allow_cache_exec_any, "sandbox", "allow_cache_exec_any",
         cli = |c: &CliFlags| FeatureToggle::from_pair(c.allow_cache_exec_any, false),
         config = |c: &Config| c.sandbox.allow_cache_exec_any,
         baseline = |_: PresetBaseline| false,
         resolved = |r: &Resolved| r.allow_cache_exec_any;
 
+    /// One-way: `--allow-browser` only.
     allow_browser, "sandbox", "allow_browser",
         cli = |c: &CliFlags| FeatureToggle::from_pair(c.allow_browser, false),
         config = |c: &Config| c.sandbox.allow_browser,
