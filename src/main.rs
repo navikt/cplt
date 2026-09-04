@@ -1596,8 +1596,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             .join(", ");
         ui::warn(&format!(
             "proxy.forced is active, so allow.ports ({ports}) opens no direct socket. \
-             Proxy-aware tools still reach those ports through the proxy; raw TCP does \
-             not. See docs/proxy.md, \"Raw-TCP tradeoff\"."
+             Proxy-aware tools still reach those ports through the proxy; a direct \
+             socket does not. See docs/proxy.md, \"Raw-TCP tradeoff\"."
         ));
     }
 
