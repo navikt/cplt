@@ -24,7 +24,7 @@ use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, EXEC_IN_WRITABLE,
     GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
     ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
-    active_tool_dirs, app_dirs, escape_regex, nested_alternation, path_bin_dirs,
+    XCODE_SELECT_LINK, active_tool_dirs, app_dirs, escape_regex, nested_alternation, path_bin_dirs,
     playwright_runtime_intent, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
@@ -119,6 +119,7 @@ pub fn generate_profile_with_playwright_socket_dir(
         config.agent,
         config.allow_cache_exec,
         config.allow_cache_exec_any,
+        Path::new(XCODE_SELECT_LINK),
     );
     emit_copilot_install(&mut sb, config.copilot_install_dir);
     emit_gradle_toolchain_exec(&mut sb, &home);
@@ -908,6 +909,7 @@ fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
     sbpl!(sb);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_tool_dirs(
     sb: &mut String,
     home_dir: &std::path::Path,
@@ -916,12 +918,23 @@ fn emit_tool_dirs(
     agent: Agent,
     allow_cache_exec: &[String],
     allow_cache_exec_any: bool,
+    xcode_select_link: &Path,
 ) {
     let home = home_dir.to_string_lossy();
     sbpl!(sb, ";; Developer tools");
     for dir in TOOL_READ_DIRS {
         sbpl!(sb, "(allow file-read* (subpath \"{dir}\"))");
         sbpl!(sb, "(allow file-map-executable (subpath \"{dir}\"))");
+    }
+    // The developer directory xcode-select actually points at, when it is not
+    // already covered above. Without it the xcrun shims at /usr/bin/{git,clang,
+    // make,python3} cannot dlopen libxcrun.dylib and exit 1 (#342).
+    if let Some(dev) = super::policy::xcode_developer_dir_from(xcode_select_link, home_dir)
+        && !TOOL_READ_DIRS.iter().any(|d| dev.starts_with(d))
+    {
+        let p = dev.to_string_lossy();
+        sbpl!(sb, "(allow file-read* (subpath \"{p}\"))");
+        sbpl!(sb, "(allow file-map-executable (subpath \"{p}\"))");
     }
     // Home tool dirs: use discovered existing dirs if available, else include all
     let active_dirs = active_tool_dirs(home_dir, existing_home_tool_dirs);
@@ -2335,6 +2348,95 @@ mod tests {
             allow_browser: false,
             keychain_substitute: None,
             use_bubblewrap: None,
+        }
+    }
+
+    /// Emit just the developer-tools block with `xcode_select_link` pointed at a
+    /// symlink under test control, so every `xcode-select` configuration can be
+    /// exercised on a machine that only has one.
+    fn tool_dirs_block(xcode_select_link: &Path) -> String {
+        let mut sb = String::new();
+        emit_tool_dirs(
+            &mut sb,
+            std::path::Path::new("/Users/test"),
+            Some(&[]),
+            Some(&[]),
+            crate::agent::Agent::Copilot,
+            &[],
+            false,
+            xcode_select_link,
+        );
+        sb
+    }
+
+    fn link_to(dir: &tempfile::TempDir, target: &str) -> PathBuf {
+        let link = dir.path().join("xcode_select_link");
+        std::os::unix::fs::symlink(target, &link).expect("symlink");
+        link
+    }
+
+    /// #342: the selected developer directory is granted, not just the literal
+    /// default. `/usr/bin/git` and the other xcrun shims dlopen libxcrun.dylib
+    /// from here; on a versioned Xcode the literal grant covers nothing they use
+    /// and every one of them exits 1 inside the sandbox.
+    #[test]
+    fn versioned_xcode_developer_dir_is_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = "/Applications/Xcode_26.6.app/Contents/Developer";
+        let sb = tool_dirs_block(&link_to(&dir, selected));
+        assert!(
+            sb.contains(&format!("(allow file-read* (subpath \"{selected}\"))")),
+            "selected developer dir must be readable:\n{sb}"
+        );
+        assert!(
+            sb.contains(&format!(
+                "(allow file-map-executable (subpath \"{selected}\"))"
+            )),
+            "libxcrun.dylib must be mappable from the selected developer dir:\n{sb}"
+        );
+    }
+
+    /// No link (or an unreadable one) falls back to the literal default install,
+    /// which stays in `TOOL_READ_DIRS` for exactly this case.
+    #[test]
+    fn absent_xcode_select_link_falls_back_to_the_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = tool_dirs_block(&dir.path().join("does_not_exist"));
+        assert!(
+            sb.contains(
+                "(allow file-read* (subpath \"/Applications/Xcode.app/Contents/Developer\"))"
+            ),
+            "default install must remain granted when nothing is selected:\n{sb}"
+        );
+    }
+
+    /// Command Line Tools: `xcode_select` points at a directory `TOOL_READ_DIRS`
+    /// already grants, so no second rule is emitted for it.
+    #[test]
+    fn command_line_tools_selection_emits_no_duplicate_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let clt = "/Library/Developer/CommandLineTools";
+        let sb = tool_dirs_block(&link_to(&dir, clt));
+        assert_eq!(
+            sb.matches(&format!("(allow file-read* (subpath \"{clt}\"))"))
+                .count(),
+            1,
+            "CommandLineTools is already in TOOL_READ_DIRS:\n{sb}"
+        );
+    }
+
+    /// The link is root-owned, but a grant that follows a symlink still gets the
+    /// widening check every other resolved path gets. A link to `/` or to $HOME
+    /// would hand the sandbox the whole machine.
+    #[test]
+    fn xcode_select_link_to_an_unsafe_root_is_not_granted() {
+        for target in ["/", "/Users/test", "/Users", "/tmp"] {
+            let dir = tempfile::tempdir().unwrap();
+            let sb = tool_dirs_block(&link_to(&dir, target));
+            assert!(
+                !sb.contains(&format!("(allow file-read* (subpath \"{target}\"))")),
+                "xcode-select pointing at {target} must not widen the sandbox:\n{sb}"
+            );
         }
     }
 

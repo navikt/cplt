@@ -328,10 +328,51 @@ pub(super) const TOOL_READ_DIRS: &[&str] = &[
     "/Library/Developer/CommandLineTools",
     // Xcode.app developer tools — needed when xcode-select points to the full
     // Xcode install instead of standalone CommandLineTools. /usr/bin/git and
-    // other shims load libxcrun.dylib from this path.
+    // other shims load libxcrun.dylib from this path. Only the *default*
+    // install location; the directory actually selected is resolved at profile
+    // generation by [`xcode_developer_dir_from`], and this literal is the
+    // fallback for when that resolution finds nothing.
     "/Applications/Xcode.app/Contents/Developer",
     "/Library/Java/JavaVirtualMachines",
 ];
+
+/// Symlink macOS maintains pointing at the directory `xcode-select` selected.
+///
+/// It is a symlink, not a file containing a path, on every macOS version cplt
+/// supports — so `read_link` answers the question with no subprocess. Shelling
+/// out to `xcode-select -p` would put an unbounded child process on the profile
+/// generation path in the parent, which is what made `cplt doctor` hang (#298).
+pub const XCODE_SELECT_LINK: &str = "/var/db/xcode_select_link";
+
+/// The developer directory `xcode-select` currently points at, if it is safe
+/// to grant read access to.
+///
+/// `/usr/bin/git`, `/usr/bin/clang`, `/usr/bin/make` and `/usr/bin/python3` on
+/// macOS are xcrun shims: each one `dlopen`s `libxcrun.dylib` from under the
+/// selected developer directory and exits 1 if that open is denied. Granting
+/// only the default `/Applications/Xcode.app/Contents/Developer` breaks all of
+/// them on any machine with a versioned or relocated Xcode — a user whose only
+/// git is `/usr/bin/git` then has no git inside the sandbox at all (#342).
+///
+/// Returns `None` when the link is absent, when it is relative, when it names a
+/// path that would widen the sandbox ([`tool_override_path_is_safe`] — the link
+/// is root-owned, but a grant that follows a symlink still gets the same sanity
+/// check every other resolved path in this codebase gets), or when the target
+/// cannot be safely interpolated into SBPL.
+///
+/// The caller is responsible for skipping a target already covered by
+/// [`TOOL_READ_DIRS`] — the Command Line Tools case, where the selected
+/// directory is `/Library/Developer/CommandLineTools` and is already granted.
+pub fn xcode_developer_dir_from(link: &Path, home: &Path) -> Option<PathBuf> {
+    let target = std::fs::read_link(link).ok()?;
+    if !target.is_absolute()
+        || !tool_override_path_is_safe(&target, home)
+        || validate_sbpl_path(&target).is_err()
+    {
+        return None;
+    }
+    Some(target)
+}
 
 /// Suffixes of env var names that indicate secrets/credentials.
 /// Vars matching a prefix allowlist entry BUT also matching one of these
