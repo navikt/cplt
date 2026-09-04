@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [main]
+  # Deliberately unfiltered by base branch. `branches: [main]` filters on a
+  # PR's BASE, so a PR stacked on another feature branch got no CI at all — no
+  # ci-ok, no unit tests. The `stack branches` ruleset requires ci-ok on
+  # `stack/**` bases, which under a base filter is unsatisfiable by
+  # construction: the check can never report, so the PR sits blocked forever.
+  # Listing prefixes instead (`stack/**`) would only move the hole to ad-hoc
+  # stacks (#354 is based on `fix/...`), so every PR gets checked regardless of
+  # base. Cost is one run per stacked PR; the concurrency group below keys on
+  # `github.ref`, which for a PR is `refs/pull/<n>/merge` — unique per PR — so a
+  # stack rebasing at once runs in parallel and each PR only cancels its own
+  # older runs.
   pull_request:
-    branches: [main]
   # Run the required checks on the merge queue's temporary ref. The ruleset
   # requires unit-tests / integration-tests / linux-integration-tests before
   # merge; without this trigger those checks never report in the merge_group
