@@ -545,10 +545,48 @@ fn install_command_wrappers(
             .map(std::path::Path::to_path_buf)
             .or_else(|| which_binary("git"))
     {
+        // Pin each allow_push rule's remote name to the URL that name has in
+        // the launch repository, so the rule identifies a repository and not
+        // just a name — without it a rule for this repo's `origin` also
+        // authorizes a push to an unrelated repo's `origin` (#215). Baked into
+        // the wrapper, the same shape as the gh guard's repo scope.
+        //
+        // Pinning requires `trusted_git`, not the PATH git the wrapper itself
+        // uses: this call runs in the UNSANDBOXED parent, where a planted git
+        // would execute as the user. With no trusted git the rules stay
+        // unpinned and keep matching by name — the pre-#215 behavior — so the
+        // operator is warned rather than left assuming the stronger guarantee.
+        let mut git_guard = git_guard.clone();
+        if !git_guard.allow_push.is_empty() {
+            if let Some(trusted) = crate::git::trusted_git() {
+                git_guard.allow_push = crate::gh_proxy::resolve_push_rule_urls(
+                    trusted,
+                    project_dir,
+                    &git_guard.allow_push,
+                );
+                for rule in &git_guard.allow_push {
+                    if rule.url.is_none()
+                        && let Some(name) = rule.remote.as_deref()
+                    {
+                        ui::warn(&format!(
+                            "git guard: allow_push remote {name:?} does not exist in this \
+                             repository, so the rule matches by name and also applies to a \
+                             remote called {name:?} in another repository."
+                        ));
+                    }
+                }
+            } else {
+                ui::warn(
+                    "git guard could not find a trusted Git to pin allow_push remotes to \
+                     their URLs. Those rules will match by remote name, so they also apply \
+                     to a same-named remote in another repository.",
+                );
+            }
+        }
         let script = crate::gh_proxy::generate_git_wrapper_script(
             &real_git.to_string_lossy(),
             &cplt_str,
-            git_guard,
+            &git_guard,
         );
         let wrapper_path = bin_dir.join("git");
         if std::fs::write(&wrapper_path, script).is_ok() {

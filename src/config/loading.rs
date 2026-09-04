@@ -552,6 +552,7 @@ impl Config {
                     remote: r.remote.clone(),
                     branches: r.branches.clone(),
                     force: r.force.unwrap_or(false),
+                    url: None,
                 })
                 .collect(),
         };

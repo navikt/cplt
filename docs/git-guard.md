@@ -39,6 +39,38 @@ branches = ["renovate/*", "dependabot/*"]
 force = false
 ```
 
+`remote` names a remote of the repository cplt was launched in. The name alone
+is not a repository identity — every checkout on the machine has an `origin` —
+so at launch the guard resolves the name to that remote's URL and matches on
+the URL from then on. A rule for this repository's `origin` therefore does not
+authorize `git -C ../other-repo push origin main`, even though the other
+checkout also calls its remote `origin`.
+
+Pinning needs a *trusted* git binary (the same one the gh guard uses to capture
+its repo scope), because it runs unsandboxed in the parent at launch. On a
+machine where cplt cannot find one, it says so and the rules fall back to
+matching the bare name — which is where a rule does apply to another
+repository's same-named remote. Fix the git installation cplt is warning about
+rather than relying on the fallback.
+
+URLs are compared after normalization, so the spellings of one remote are one
+remote: `git@github.com:navikt/cplt.git`, `ssh://git@github.com/navikt/cplt`,
+`https://github.com/navikt/cplt.git` and `https://github.com/navikt/cplt` all
+match. The host is lowercased, a `.git` suffix and a trailing slash are
+dropped, and userinfo (`https://token@github.com/...`) is ignored. What is
+*not* normalized: the path case (`navikt/cplt` and `navikt/CPLT` are different
+remotes), host aliases (an `ssh_config` `Host` alias is a different host than
+the name it expands to), and local paths — those compare as the literal string
+git reports.
+
+Nothing changes in the config file format, and a rule written against a remote
+name keeps working. The one behavior change is the intended one: such a rule
+now only covers the repository that name pointed at when the session started.
+
+Two cases keep the old name matching, both of them announced rather than
+silent: the launch repository has no remote by that name, and cplt found no
+trusted git to resolve it with.
+
 <details>
 <summary>CLI flag (override for a single run)</summary>
 
@@ -67,7 +99,7 @@ target branch:
 | `git push origin master` | `master` | Blocked |
 | `git push origin HEAD:refs/heads/main` | `main` (from refspec) | Blocked |
 | `git push origin HEAD:main` | `main` (from refspec) | Blocked |
-| `git push` (bare) | resolved from the current branch via the real git | Allowed on a feature branch, blocked on `main`/`master`, blocked if the branch cannot be resolved |
+| `git push` (bare) | resolved from the current branch via the real git, in the repository the command targets | Allowed on a feature branch, blocked on `main`/`master`, blocked if the branch cannot be resolved |
 | `git push origin` | same, no branch in the arguments | Allowed on a feature branch, blocked on `main`/`master`, blocked if the branch cannot be resolved |
 | `git push --force origin feature/x` | `feature/x` | Blocked while `prevent_force_push` is on, which is the default |
 | `git push --force origin main` | `main` | Blocked |
@@ -80,6 +112,11 @@ does not slip through.
 A push with no branch in the arguments is not waved through. The guard shells
 out to the real git to resolve the current branch, and fails closed when it
 cannot: an unresolvable branch counts as protected and the push is blocked.
+
+That resolution follows the command. `-C`, `--git-dir` and `--work-tree` are
+forwarded to the guard's own git call, so `git -C ../other-repo push` is judged
+by *that* repository's branch, not by the branch of the repository the session
+was launched in.
 
 **Security note:** This mode is intentionally permissive about branches. The
 agent can push to any non-default branch, and the human review gate becomes the
