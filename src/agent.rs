@@ -86,16 +86,62 @@ const GOOGLE_AI_DOMAINS: &[&str] = &[
 /// BARE domain — see `COPILOT_INFRA_DOMAINS` for the no-glob convention.
 const ANTIGRAVITY_DOMAINS: &[&str] = &["antigravity.google"];
 
-/// Anthropic infrastructure for Claude Code: the API, the console/login site,
-/// and feature-flag telemetry.
+/// Anthropic infrastructure for Claude Code: the API, sign-in, and the MCP
+/// connector proxy.
 ///
 /// BARE domains, matched exact-or-subdomain — see `COPILOT_INFRA_DOMAINS`.
 ///
-/// Anthropic API + console/login + feature-flag telemetry. High confidence.
+/// Verified 2026-09-04 against Anthropic's published "Network access
+/// requirements" table (code.claude.com/docs/en/network-config) and the host
+/// strings in the shipped Claude Code 2.1.260 binary. What each entry buys:
+///
+/// - `api.anthropic.com` — model requests, WebFetch domain safety check,
+///   feature flags, telemetry event logging.
+/// - `claude.ai` — claude.ai account authentication. Its subdomain match also
+///   covers `downloads.claude.ai` (native installer, auto-updater and plugin
+///   executable downloads), which the docs list separately.
+/// - `claude.com` — sign-in opens a `claude.com` page that redirects to
+///   claude.ai. Its subdomain match also covers `platform.claude.com`, which
+///   the docs make a hard requirement for BOTH account types (Console
+///   authentication, and OAuth token exchange/refresh/revocation for claude.ai
+///   accounts), and `code.claude.com`, the documentation host the built-in
+///   claude-code-guide agent and pre-approved WebFetch lookups read. Missing
+///   `platform.claude.com` is what issue #218 reported: token refresh failed
+///   and surfaced as a generic API error, not as a domain block.
+/// - `mcp-proxy.anthropic.com` — MCP connectors from claude.ai route through
+///   this host, and they are on by default for claude.ai-authenticated users,
+///   so an allowlisted session without it loses connectors silently. This
+///   widens what a connector can reach (#62); turn the connectors off with
+///   `ENABLE_CLAUDEAI_MCP_SERVERS=false` or `disableClaudeAiConnectors` if
+///   that is not a trade you want.
+///
+/// Two inherited entries are kept but NOT corroborated by either source above,
+/// so neither should be read as verified. Both are kept because removing an
+/// entry from a fail-closed list can only break a session, and this change is
+/// meant to be additive; both are candidates for deletion once someone
+/// observes a run with `--observe-domains`:
+///
+/// - `console.anthropic.com` — the old Console hostname. Anthropic's current
+///   table attributes Console authentication to `platform.claude.com`, and the
+///   2.1.260 binary carries no `console.` host at all, so this looks like a
+///   legacy redirect target rather than a host the CLI still reaches.
+/// - `statsig.anthropic.com` — the docs attribute feature-flag fetches to
+///   `api.anthropic.com`, and the binary carries no statsig host either.
+///
+/// Deliberately left out, all documented but none on the path to a working
+/// terminal session: `storage.googleapis.com` (plugin metadata — far too broad
+/// a host to grant by default), `raw.githubusercontent.com` (`/release-notes`),
+/// `formulae.brew.sh` (Homebrew update check), the two Datadog intake hosts
+/// (optional telemetry, which is what `blocked-domains.txt` exists to strip)
+/// and `*.claudeusercontent.com` (Claude in Chrome and artifacts, neither of
+/// which is a CLI-under-cplt path). `registry.npmjs.org` is already in
+/// `PACKAGE_REGISTRY_DOMAINS`.
 const ANTHROPIC_DOMAINS: &[&str] = &[
     "api.anthropic.com",
     "console.anthropic.com",
     "claude.ai",
+    "claude.com",
+    "mcp-proxy.anthropic.com",
     "statsig.anthropic.com",
 ];
 
@@ -2936,6 +2982,48 @@ mod tests {
                 .session_args(None, false, None, false)
                 .is_empty()
         );
+    }
+
+    /// The hosts Claude Code needs must survive the matcher the proxy
+    /// actually uses, not merely appear in the const (#218).
+    #[test]
+    fn claude_allowlist_admits_the_hosts_claude_code_needs() {
+        let domains: Vec<String> = Agent::Claude
+            .default_allowed_domains()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for host in [
+            "api.anthropic.com",
+            "claude.ai",
+            "claude.com",
+            // Covered by the bare `claude.com` entry through the matcher's
+            // subdomain rule; this is the host OAuth token refresh needs.
+            "platform.claude.com",
+            "code.claude.com",
+            "downloads.claude.ai",
+            "mcp-proxy.anthropic.com",
+        ] {
+            assert!(
+                crate::proxy::is_domain_match(host, &domains),
+                "claude allowlist must admit {host}"
+            );
+        }
+        // Still fail-closed: the list is not a blanket grant of anthropic.com,
+        // and the hosts deliberately left out stay out.
+        for host in [
+            "evil.com",
+            "storage.googleapis.com",
+            "browser-intake-us5-datadoghq.com",
+        ] {
+            assert!(
+                !crate::proxy::is_domain_match(host, &domains),
+                "claude allowlist must not admit {host}"
+            );
+        }
+        // Bare domains only — the matcher does the subdomain work, a literal
+        // `*.` entry would never match.
+        assert!(domains.iter().all(|d| !d.contains('*')));
     }
 
     #[test]
