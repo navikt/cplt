@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 #[cfg(target_os = "macos")]
 use cplt::gradle_init;
 use cplt::{
-    agent, audit, check, config, discover, gh_proxy, proxy, repo_config, sandbox, scratch,
-    subscriptions, trust, update,
+    agent, audit, brief, check, config, discover, gh_proxy, git, proxy, repo_config, sandbox,
+    scratch, subscriptions, trust, update,
 };
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
@@ -493,6 +493,29 @@ grants exec to every binary cached by any application. Prefer
     /// that file and network restrictions are active.
     #[arg(long)]
     no_validate: bool,
+
+    /// EXPERIMENTAL. Write the agent-facing sandbox brief to the scratch dir
+    /// (`CPLT_BRIEF.md`). Off by default, unstable, and may be removed in a
+    /// future release. Also the gate for --agents-md.
+    #[arg(long, conflicts_with = "no_brief")]
+    brief: bool,
+
+    /// Disable the sandbox brief for this run, overriding `sandbox.brief` in
+    /// the config. Also suppresses the AGENTS.md block, which is gated on the
+    /// brief.
+    #[arg(long)]
+    no_brief: bool,
+
+    /// EXPERIMENTAL. With --brief, also write the managed cplt block into the
+    /// project's AGENTS.md. Off by default, unstable, and may be removed in a
+    /// future release. Has no effect without --brief (or `sandbox.brief`).
+    #[arg(long, conflicts_with = "no_agents_md")]
+    agents_md: bool,
+
+    /// Disable the AGENTS.md block for this run, overriding
+    /// `sandbox.agents_md` in the config. Leaves the scratch-dir brief alone.
+    #[arg(long)]
+    no_agents_md: bool,
 
     /// Print the generated sandbox profile (SBPL) and exit.
     /// Useful for debugging or auditing the sandbox rules.
@@ -1285,6 +1308,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             cli.no_allow_env_files,
         ),
         no_validate: cli.no_validate,
+        brief: config::FeatureToggle::from_pair(cli.brief, cli.no_brief),
+        agents_md: config::FeatureToggle::from_pair(cli.agents_md, cli.no_agents_md),
         pass_env: cli.pass_env.clone(),
         inherit_env: cli.inherit_env,
         allow_lifecycle_scripts: config::FeatureToggle::from_pair(
@@ -1780,6 +1805,105 @@ fn resolve_domain_allowlist_decision(
         use_default_allowlist: default_allowlist_enabled && !observe_allow_all,
         force_proxy_on: observe_domains,
     }
+}
+
+/// Session layer of the sandbox brief (issue #148; opt-in via `--brief` /
+/// `sandbox.brief = true`): a fresh scratch `CPLT_BRIEF.md` rendered from the
+/// resolved policy, never a static template.
+///
+/// Safe for every entry point — the scratch dir is created per run and torn
+/// down with it, so nothing outside the sandbox is touched.
+///
+/// Best-effort: any failure is warned about, never fatal — a missing brief
+/// shouldn't block the agent from launching.
+fn write_session_sandbox_brief(
+    resolved: &config::Resolved,
+    active_agent: agent::Agent,
+    scratch_path: Option<&Path>,
+    home_dir: &Path,
+) {
+    if !resolved.brief {
+        return;
+    }
+    let Some(scratch) = scratch_path else {
+        // The brief lives in the scratch dir and nowhere else, so no scratch
+        // dir means no brief — say so, because the AGENTS.md block still
+        // points agents at `$TMPDIR/CPLT_BRIEF.md`. Both ways of turning the
+        // scratch dir off land here, and naming only the flag sends anyone who
+        // disabled it in config looking for a flag they never passed.
+        ui::warn(
+            "The sandbox brief was requested but no scratch dir is in use \
+             (--no-scratch-dir, or sandbox.scratch_dir = false in the config): \
+             no CPLT_BRIEF.md will be written.",
+        );
+        return;
+    };
+    let content = brief::generate_session_brief(resolved, active_agent, home_dir);
+    if let Err(e) = brief::write_session_brief(scratch, &content) {
+        ui::warn(&format!("Could not write sandbox brief: {e}"));
+    }
+}
+
+/// Persistent layer of the sandbox brief: a managed `AGENTS.md` block in the
+/// project root, written BEFORE the agent process starts (this whole setup
+/// phase is unsandboxed) and left for the user to review and commit.
+///
+/// Opt-in via `--agents-md` / `sandbox.agents_md`, and gated on the brief being
+/// on at all — it writes into the user's repository, which
+/// is not something to do by default. Only the agent-launch path calls it, and
+/// only once the launch has been confirmed: `cplt check`, `cplt exec` and every
+/// early return (`--print-profile`, a declined prompt) must leave the project
+/// untouched.
+///
+/// Skipped outside a git work tree: a project checkout is the only place a
+/// committed AGENTS.md makes sense, and cplt should not leave a file behind in
+/// an arbitrary directory the user happened to point it at.
+///
+/// Best-effort: any failure is warned about, never fatal.
+fn apply_persistent_sandbox_brief(resolved: &config::Resolved, project_dir: &Path) {
+    if !resolved.agents_md {
+        return;
+    }
+    if !in_git_work_tree(project_dir) {
+        return;
+    }
+    let agents_md = project_dir.join("AGENTS.md");
+    match brief::upsert_managed_block(&agents_md) {
+        Ok(brief::BlockOutcome::SkippedAmbiguous) => {
+            ui::warn(&format!(
+                "{} contains more than one '{}' / '{}' marker pair — skipped. \
+                 Delete the extra pair (keep at most one) or set \
+                 sandbox.agents_md = false.",
+                agents_md.display(),
+                brief::BLOCK_BEGIN,
+                brief::BLOCK_END
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            ui::warn(&format!(
+                "Could not update AGENTS.md sandbox block ({}): {e}",
+                agents_md.display()
+            ));
+        }
+    }
+}
+
+/// Is `dir` inside a git work tree?
+///
+/// Bare repos and plain directories both answer no: `--is-inside-work-tree`
+/// prints `false` for a bare repo and fails outright outside a repository.
+///
+/// Goes through the hardened parent-side invoker (`git::command`, #210/#211):
+/// this runs in the parent, before the sandbox exists, in a directory the
+/// untrusted project controls, so it must not be a raw `Command::new("git")`.
+/// `rev-parse` is on `CONTENT_FREE_SUBCOMMANDS`, so the invoker never has to
+/// consult the repo config to decide, and returns `None` only for refused
+/// args — which a fixed arg list is not.
+fn in_git_work_tree(dir: &Path) -> bool {
+    git::command(dir, &["rev-parse", "--is-inside-work-tree"])
+        .and_then(|mut cmd| cmd.output().ok())
+        .is_some_and(|o| o.status.success() && o.stdout.starts_with(b"true"))
 }
 
 fn start_proxy_if_enabled(
@@ -2358,6 +2482,15 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     };
     let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
 
+    #[cfg(target_os = "macos")]
+    let playwright_socket_guard = create_playwright_socket_dir(&resolved)?;
+    #[cfg(target_os = "macos")]
+    let playwright_socket_path = playwright_socket_guard
+        .as_ref()
+        .map(cplt::scratch::PlaywrightSocketDir::path);
+    #[cfg(not(target_os = "macos"))]
+    let playwright_socket_path = None;
+
     // Resolve the agent binary early so its installation directory
     // can be included in the sandbox profile. Failure is deferred —
     // --print-profile doesn't need the binary.
@@ -2427,6 +2560,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // After pre-creation, so a dir we just made resolves too. See #171.
     agent::canonicalize_agent_dirs(&mut agent_dirs);
 
+    // Agent-facing sandbox brief (issue #148), session layer only. The
+    // AGENTS.md layer writes into the user's repo and must not run until the
+    // launch is confirmed — see the call after prompt_confirm below.
+    write_session_sandbox_brief(&resolved, active_agent, scratch_path, &home_dir);
+
     // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
     // init script so sandboxed builds keep the preferIPv4Stack workaround for
     // the daemon and Test/JavaExec forks (WorkerExecutor forks have no
@@ -2478,6 +2616,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         allow_env_files: resolved.allow_env_files,
         allow_localhost_any: resolved.allow_localhost_any,
         scratch_dir: scratch_path,
+        playwright_socket_dir: playwright_socket_path,
         allow_tmp_exec: resolved.allow_tmp_exec,
         copilot_install_dir: copilot_install_dir.as_deref(),
         java_home: java_home_dir.as_deref(),
@@ -2553,6 +2692,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
     }
+
+    // Persistent layer of the sandbox brief (issue #148). Deliberately the
+    // last setup step before launch: every early return above (--print-profile,
+    // the recursion guard, preflight failure, a declined prompt) must leave
+    // the user's repo untouched.
+    apply_persistent_sandbox_brief(&resolved, &project_dir);
 
     // Compute hardening categories for environment sanitization
     let disabled_categories = resolved.disabled_hardening_categories();
@@ -2890,16 +3035,62 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
 
 /// A fully-built Shell sandbox plus the live resources it depends on.
 ///
-/// `scratch_guard` and `proxy_handle` are RAII/handle values that must outlive
-/// any use of `prepared` (the scratch dir is cleaned up on drop; the proxy
-/// thread is shut down via the handle). `policy` is the structured Landlock
-/// model of the filesystem policy — the same rules the profile enforces —
-/// used by `cplt check` for the explain layer (`describe_policy`'s model).
+/// The directory guards and `proxy_handle` must outlive any use of `prepared`
+/// (session directories are cleaned up on drop; the proxy thread is shut down
+/// via the handle). `policy` is the structured Landlock model of the filesystem
+/// policy — the same rules the profile enforces — used by `cplt check` for the
+/// explain layer (`describe_policy`'s model).
 struct ShellSandbox {
     prepared: sandbox::PreparedSandbox,
     policy: sandbox::LandlockPolicy,
     proxy_handle: Option<proxy::ProxyHandle>,
     scratch_guard: Option<scratch::ScratchDir>,
+    #[cfg(target_os = "macos")]
+    playwright_socket_guard: Option<scratch::PlaywrightSocketDir>,
+}
+
+/// Create the automatic macOS Playwright socket capability only for exact
+/// runtime intent. An explicit pass-through remains caller-owned and receives
+/// neither a cplt directory nor an automatic SBPL grant.
+#[cfg(target_os = "macos")]
+fn create_playwright_socket_dir(
+    resolved: &config::Resolved,
+) -> anyhow::Result<Option<scratch::PlaywrightSocketDir>> {
+    let intent = sandbox::playwright_runtime_intent(
+        &resolved.allow_cache_exec,
+        resolved.allow_cache_exec_any,
+    );
+    let caller_owned = resolved
+        .pass_env
+        .iter()
+        .any(|name| name == "PWTEST_SOCKETS_DIR");
+
+    // Passing the key through is an override signal, so cplt creates no
+    // directory and grants no socket rules. With no value to inherit the child
+    // gets nothing at all, and Playwright falls back to a path under cplt's
+    // long TMPDIR that exceeds its 103-byte Unix-socket limit. Setting the
+    // variable is not a way out either: the pass-through also suppresses the
+    // SBPL rules, so a shorter path of the caller's own would then be denied at
+    // bind. Both failures surface deep inside Playwright, so name the cause.
+    let inherited_value = std::env::var_os("PWTEST_SOCKETS_DIR")
+        .filter(|value| !value.is_empty())
+        .is_some();
+    if intent && caller_owned && !inherited_value {
+        ui::warn(
+            "PWTEST_SOCKETS_DIR is passed through but has no value, so cplt creates no \
+             socket directory for this session. Playwright will fall back to a path \
+             under TMPDIR that is usually too long for a Unix socket. Drop the \
+             pass-through to let cplt manage the directory and authorize its sockets.",
+        );
+    }
+
+    if !intent || caller_owned {
+        return Ok(None);
+    }
+
+    scratch::PlaywrightSocketDir::create()
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("Cannot create Playwright socket dir: {error}"))
 }
 
 /// Build the resolved Shell sandbox: tool discovery, scratch dir, optional
@@ -2932,6 +3123,15 @@ fn prepare_shell_sandbox(
     };
     let scratch_path = scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path);
 
+    #[cfg(target_os = "macos")]
+    let playwright_socket_guard = create_playwright_socket_dir(resolved)?;
+    #[cfg(target_os = "macos")]
+    let playwright_socket_path = playwright_socket_guard
+        .as_ref()
+        .map(cplt::scratch::PlaywrightSocketDir::path);
+    #[cfg(not(target_os = "macos"))]
+    let playwright_socket_path = None;
+
     let git_hooks_path = discover::git_hooks_path(home_dir);
     let git_common_dir = discover::git_common_dir(home_dir, project_dir);
     let java_home_dir = std::env::var("JAVA_HOME")
@@ -2957,6 +3157,11 @@ fn prepare_shell_sandbox(
     }
     // See the agent-path call site: resolve symlinked agent dirs (#171).
     agent::canonicalize_agent_dirs(&mut agent_dirs);
+
+    // See the agent-path call site: agent-facing sandbox brief (issue #148).
+    // Session layer only — `cplt check` and `cplt exec` must not write
+    // AGENTS.md into the user's project. See `apply_persistent_sandbox_brief`.
+    write_session_sandbox_brief(resolved, active_agent, scratch_path, home_dir);
 
     // See the agent-path call site: guarded Gradle init script (opt-in via
     // sandbox.gradle_init) so sandboxed builds keep the preferIPv4Stack
@@ -2998,6 +3203,7 @@ fn prepare_shell_sandbox(
         allow_env_files: resolved.allow_env_files,
         allow_localhost_any: resolved.allow_localhost_any,
         scratch_dir: scratch_path,
+        playwright_socket_dir: playwright_socket_path,
         allow_tmp_exec: resolved.allow_tmp_exec,
         // shell/check have no agent install dir to grant special access to
         copilot_install_dir: None,
@@ -3031,6 +3237,8 @@ fn prepare_shell_sandbox(
         policy,
         proxy_handle,
         scratch_guard,
+        #[cfg(target_os = "macos")]
+        playwright_socket_guard,
     })
 }
 
@@ -3123,6 +3331,8 @@ fn run_exec_command(
         prepared,
         proxy_handle,
         scratch_guard: _scratch_guard,
+        #[cfg(target_os = "macos")]
+            playwright_socket_guard: _playwright_socket_guard,
         ..
     } = prepare_shell_sandbox(
         cli,
@@ -3514,6 +3724,8 @@ fn run_check_command(
         policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
+        #[cfg(target_os = "macos")]
+            playwright_socket_guard: _playwright_socket_guard,
     } = prepare_shell_sandbox(
         cli,
         &mut resolved,
@@ -6625,6 +6837,44 @@ mod tests {
             ..Default::default()
         };
         assert!(resolved_ip_block_item(&optin, "127.0.0.1", 443).is_none());
+    }
+
+    /// A plain directory is not a work tree, so the persistent brief must not
+    /// write there — an AGENTS.md only belongs in a project checkout.
+    #[test]
+    fn in_git_work_tree_rejects_plain_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!in_git_work_tree(dir.path()));
+    }
+
+    #[test]
+    fn in_git_work_tree_accepts_initialised_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return; // no git on this machine — nothing to assert
+        }
+        assert!(in_git_work_tree(dir.path()));
+    }
+
+    /// A bare repo has no work tree, so there is nothing to commit the managed
+    /// block into.
+    #[test]
+    fn in_git_work_tree_rejects_bare_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return;
+        }
+        assert!(!in_git_work_tree(dir.path()));
     }
 }
 

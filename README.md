@@ -429,6 +429,10 @@ What passes through:
 | `--allow-msbuild` | Allow MSBuild worker-node unix sockets in `/tmp`. Needed for `dotnet build`. Does not enable the persistent MSBuild Server. See [MSBuild worker-node IPC](docs/known-impacts.md#msbuild-worker-node-ipc) |
 | `--no-scratch-dir` | Disable the per-session scratch directory, which is on by default. TMPDIR will not be redirected |
 | `--scratch-dir` | Explicitly enable the per-session scratch directory. Already the default, so this is for overriding `scratch_dir = false` in config |
+| `--brief` | 🧪 Experimental. Write the agent-facing sandbox brief to the scratch dir (`CPLT_BRIEF.md`). Off by default. Also `sandbox.brief = true` in config. Unstable, so it may change or be removed in a future release |
+| `--no-brief` | Turn the sandbox brief off for this run, overriding `sandbox.brief = true` in config. Also suppresses the `AGENTS.md` block, which is gated on the brief |
+| `--agents-md` | 🧪 Experimental. With `--brief`, also write the managed cplt block into the project's `AGENTS.md`. Off by default. Also `sandbox.agents_md = true` in config. No effect without `--brief`. Unstable, so it may change or be removed in a future release |
+| `--no-agents-md` | Turn the `AGENTS.md` block off for this run, overriding `sandbox.agents_md = true` in config. Leaves the scratch-dir brief alone |
 | `--allow-tmp-exec` | ⚠️ Dangerous. Allow exec from system temp dirs (`/private/tmp`, `/private/var/folders`). Prefer the scratch dir |
 | `--allow-cache-exec <SUBDIR>` | Allow exec from one `~/Library/Caches/<SUBDIR>`. Repeatable. For tools that cache compiled binaries there, such as Playwright and pnpm dlx |
 | `--allow-cache-exec-any` | ⚠️ Dangerous. Allow exec from all of `~/Library/Caches`. Prefer `--allow-cache-exec <SUBDIR>` |
@@ -841,7 +845,9 @@ The sandbox blocks some workflows on purpose. The common ones and their fixes:
 | JVM MockK/Mockito fails | `cplt config set sandbox.allow_jvm_attach true` |
 | `dotnet build` MSBuild worker nodes blocked | `cplt config set sandbox.allow_msbuild true` |
 | Private registry creds blocked | `cplt config set allow.read "~/.m2/settings.xml"` |
-| Playwright browsers won't launch | `cplt config set sandbox.allow_cache_exec ms-playwright` |
+| Playwright Chromium won't launch | Allow cache exec, then disable Chromium's nested sandbox; see below |
+
+**Playwright Chromium needs `cplt config set sandbox.allow_cache_exec ms-playwright`,** and Chromium must run without its own nested sandbox. On macOS its helpers cannot initialize a second Seatbelt sandbox inside cplt (`forbidden-sandbox-reinit`); on Linux cplt's seccomp filter blocks the namespace syscalls that sandbox needs. Playwright as a library already launches with `--no-sandbox`, and that same opt-in sets `PLAYWRIGHT_MCP_SANDBOX=false` for Playwright MCP, which would otherwise turn it back on. Any other Chromium launcher needs `--no-sandbox` itself. cplt remains the enforcing kernel boundary, but a compromised renderer then receives the full cplt Playwright profile instead of Chromium's narrower child profile. See [Cache exec](docs/known-impacts.md#cache-exec-playwright-pnpm-dlx-etc) and [SECURITY.md](SECURITY.md#out-of-scope).
 
 **Git commit and push work out of the box** over HTTPS, no extra flags. Three prerequisites: use HTTPS remotes rather than SSH (`git remote set-url origin https://github.com/org/repo.git`, or rewrite globally with `git config --global url."https://github.com/".insteadOf "git@github.com:"`), run `gh auth login` once outside the sandbox, and run `gh auth setup-git` if the credential helper is not configured yet. SSH is blocked because the agent socket unlocks *every* loaded key and can authenticate to any host, while the `gh` credential helper is scoped to GitHub.
 

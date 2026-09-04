@@ -16,6 +16,10 @@
 //! Each session gets a UUID subdirectory for isolation.
 
 use crate::sandbox::validate_sbpl_path;
+#[cfg(target_os = "macos")]
+use crate::sandbox::{
+    PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_ROOT, validate_playwright_socket_dir,
+};
 use crate::ui;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -78,14 +82,14 @@ impl ScratchDir {
         }
 
         // Validate base dir: must be owned by us, 0700, not a symlink
-        validate_dir_safety(&canonical_base)?;
+        validate_dir_safety(&canonical_base, "Scratch base")?;
 
         // Generate a unique session directory name
-        let session_id = generate_session_id();
+        let session_id = generate_session_id()?;
         let session_dir = canonical_base.join(&session_id);
 
         // Create session directory with restricted permissions
-        create_secure_dir(&session_dir)?;
+        create_secure_dir(&session_dir, "scratch dir")?;
 
         // Validate for SBPL injection before we use it in profile generation
         if let Err(e) = validate_sbpl_path(&session_dir) {
@@ -154,6 +158,75 @@ impl ScratchDir {
     }
 }
 
+/// A short, random, per-session macOS directory for Playwright control sockets.
+///
+/// The directory is deliberately independent of [`ScratchDir`]: it remains
+/// available when scratch execution is disabled and receives socket-only SBPL
+/// rules. The guard must outlive every sandboxed child that uses its path.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct PlaywrightSocketDir {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl PlaywrightSocketDir {
+    /// Atomically create a cplt-owned Playwright socket base under `/private/tmp`.
+    pub fn create() -> Result<Self, String> {
+        let root = Path::new(PLAYWRIGHT_SOCKET_ROOT);
+        let canonical_root = std::fs::canonicalize(root)
+            .map_err(|e| format!("Cannot canonicalize Playwright socket root: {e}"))?;
+        let root_metadata = root
+            .symlink_metadata()
+            .map_err(|e| format!("Cannot stat Playwright socket root: {e}"))?;
+        if canonical_root != root
+            || root_metadata.file_type().is_symlink()
+            || !root_metadata.is_dir()
+        {
+            return Err("Playwright socket root is not the expected real directory".to_string());
+        }
+
+        let session_id = generate_session_id()?;
+        Self::create_for_session_id(&session_id)
+    }
+
+    fn create_for_session_id(session_id: &str) -> Result<Self, String> {
+        let path = Path::new(PLAYWRIGHT_SOCKET_ROOT)
+            .join(format!("{PLAYWRIGHT_SOCKET_DIR_PREFIX}{session_id}"));
+        validate_playwright_socket_dir(&path)?;
+        create_secure_dir(&path, "Playwright socket dir")?;
+
+        let identity = secure_dir_identity(&path, "Playwright socket dir");
+        let (device, inode) = match identity {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = std::fs::remove_dir(&path);
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            path,
+            device,
+            inode,
+        })
+    }
+
+    /// Exact validated directory authorized by the generated SBPL profile.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for PlaywrightSocketDir {
+    fn drop(&mut self) {
+        remove_owned_dir(&self.path, self.device, self.inode, "Playwright socket dir");
+    }
+}
+
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         if self.path.exists()
@@ -168,26 +241,15 @@ impl Drop for ScratchDir {
 }
 
 /// Generate a random session ID using /dev/urandom.
-fn generate_session_id() -> String {
+fn generate_session_id() -> Result<String, String> {
     let mut buf = [0u8; 16];
-    let got_random = std::fs::File::open("/dev/urandom")
+    std::fs::File::open("/dev/urandom")
         .and_then(|mut f| {
             use std::io::Read;
             f.read_exact(&mut buf)
         })
-        .is_ok();
-
-    if !got_random {
-        // Fallback: use PID + timestamp for uniqueness
-        let pid = std::process::id();
-        let ts = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        buf[0..4].copy_from_slice(&pid.to_le_bytes());
-        buf[4..].copy_from_slice(&ts.to_le_bytes()[..12]);
-    }
-    hex_encode(&buf)
+        .map_err(|_| "Cannot generate a cryptographically random session ID".to_string())?;
+    Ok(hex_encode(&buf))
 }
 
 /// Check if a string looks like one of our session IDs (32-char hex).
@@ -201,7 +263,7 @@ fn is_session_id(name: &str) -> bool {
 /// - Is a directory (not a symlink to one)
 /// - Owned by current user
 /// - Permissions are 0700 (set if not)
-fn validate_dir_safety(path: &Path) -> Result<(), String> {
+fn validate_dir_safety(path: &Path, label: &str) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = path
@@ -211,23 +273,20 @@ fn validate_dir_safety(path: &Path) -> Result<(), String> {
     // Must be a real directory, not a symlink
     if metadata.file_type().is_symlink() {
         return Err(format!(
-            "Scratch base {} is a symlink, cplt refuses to use it",
+            "{label} {} is a symlink, cplt refuses to use it",
             path.display()
         ));
     }
 
     if !metadata.is_dir() {
-        return Err(format!(
-            "Scratch base {} is not a directory",
-            path.display()
-        ));
+        return Err(format!("{label} {} is not a directory", path.display()));
     }
 
     // Must be owned by us
     let my_uid = unsafe { libc::getuid() };
     if metadata.uid() != my_uid {
         return Err(format!(
-            "Scratch base {} is owned by uid {}, expected {}. cplt refuses to use it",
+            "{label} {} is owned by uid {}, expected {}. cplt refuses to use it",
             path.display(),
             metadata.uid(),
             my_uid
@@ -246,12 +305,57 @@ fn validate_dir_safety(path: &Path) -> Result<(), String> {
 }
 
 /// Create a directory with 0700 permissions atomically.
-fn create_secure_dir(path: &Path) -> Result<(), String> {
+fn create_secure_dir(path: &Path, label: &str) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(path)
-        .map_err(|e| format!("Cannot create scratch dir {}: {e}", path.display()))
+        .map_err(|e| format!("Cannot create {label} {}: {e}", path.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn secure_dir_identity(path: &Path, label: &str) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    validate_dir_safety(path, label)?;
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|e| format!("Cannot stat {}: {e}", path.display()))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(target_os = "macos")]
+fn remove_owned_dir(path: &Path, expected_device: u64, expected_inode: u64, label: &str) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            ui::warn(&format!(
+                "Warning: cannot inspect {label} {} during cleanup: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.dev() != expected_device
+        || metadata.ino() != expected_inode
+    {
+        ui::warn(&format!(
+            "Warning: refusing to cleanup replaced {label} {}",
+            path.display()
+        ));
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(path) {
+        ui::warn(&format!(
+            "Warning: cannot cleanup {label} {}: {error}",
+            path.display()
+        ));
+    }
 }
 
 /// Encode bytes as lowercase hex string.
@@ -266,7 +370,7 @@ mod tests {
 
     #[test]
     fn session_id_is_32_hex_chars() {
-        let id = generate_session_id();
+        let id = generate_session_id().unwrap();
         assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -426,5 +530,98 @@ mod tests {
         assert!(file_path.exists(), "files should be preserved");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn playwright_socket_dir_has_secure_short_shape_and_cleans_up_exactly() {
+        use crate::sandbox::{PLAYWRIGHT_SOCKET_PATH_LIMIT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let guard = PlaywrightSocketDir::create().unwrap();
+        let path = guard.path().to_path_buf();
+        let sibling = tempfile::Builder::new()
+            .prefix("cplt-pw-test-sibling-")
+            .tempdir_in(PLAYWRIGHT_SOCKET_ROOT)
+            .unwrap();
+        std::fs::write(path.join("marker"), b"owned").unwrap();
+
+        assert_eq!(path.parent(), Some(Path::new(PLAYWRIGHT_SOCKET_ROOT)));
+        validate_playwright_socket_dir(&path).unwrap();
+        let suffix = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .strip_prefix(PLAYWRIGHT_SOCKET_DIR_PREFIX)
+            .unwrap();
+        assert_eq!(suffix.len(), 32);
+        assert!(
+            suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+
+        let metadata = path.symlink_metadata().unwrap();
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), unsafe { libc::getuid() });
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(
+            path.as_os_str().len() + PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX.len()
+                < PLAYWRIGHT_SOCKET_PATH_LIMIT
+        );
+
+        drop(guard);
+        assert!(!path.exists());
+        assert!(
+            sibling.path().exists(),
+            "cleanup must not touch sibling directories"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn playwright_socket_dir_collision_preserves_existing_directory() {
+        let guard = PlaywrightSocketDir::create().unwrap();
+        let path = guard.path().to_path_buf();
+        let session_id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(PLAYWRIGHT_SOCKET_DIR_PREFIX))
+            .unwrap();
+
+        let collision = PlaywrightSocketDir::create_for_session_id(session_id);
+        assert!(collision.is_err());
+        assert!(path.is_dir(), "collision handling must preserve the owner");
+
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn playwright_socket_dir_cleanup_refuses_replaced_path() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let guarded_path = tmp.path().join("guarded");
+        let original_path = tmp.path().join("original");
+        let unrelated = tmp.path().join("unrelated");
+        std::fs::create_dir(&guarded_path).unwrap();
+        let metadata = guarded_path.symlink_metadata().unwrap();
+        std::fs::rename(&guarded_path, &original_path).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        std::os::unix::fs::symlink(&unrelated, &guarded_path).unwrap();
+
+        let guard = PlaywrightSocketDir {
+            path: guarded_path.clone(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        drop(guard);
+
+        assert!(guarded_path.is_symlink());
+        assert!(original_path.is_dir());
+        assert!(unrelated.is_dir());
     }
 }
