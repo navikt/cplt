@@ -11,12 +11,16 @@
 //!
 //! Run: cargo test --test e2e_projects
 
+mod common;
+
 #[cfg(target_os = "macos")]
 mod project_tests {
     use std::fmt::Write as _;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    use crate::common::{cplt_cmd, git_cmd};
     use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
     static PROJECT_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -58,10 +62,6 @@ mod project_tests {
                 return;
             }
         };
-    }
-
-    fn binary_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_BIN_EXE_cplt"))
     }
 
     // ── TempProject ────────────────────────────────────────────────
@@ -112,9 +112,8 @@ mod project_tests {
         /// Initialize a git repo with an initial commit.
         fn git_init(&self) {
             let run = |args: &[&str]| {
-                Command::new("git")
+                git_cmd(self.dir.path())
                     .args(args)
-                    .current_dir(self.dir.path())
                     .env("GIT_AUTHOR_NAME", "Test")
                     .env("GIT_AUTHOR_EMAIL", "test@example.com")
                     .env("GIT_COMMITTER_NAME", "Test")
@@ -328,7 +327,7 @@ fun main() {
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_copilot_dir.display());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
             // Explicit so the test's intended fake "copilot" can't be silently
@@ -1011,9 +1010,8 @@ fi
         require_sandbox!();
         let project = TempProject::scaffold_node();
         let bare = TempProject::new("bare");
-        let status = Command::new("git")
+        let status = git_cmd(bare.path())
             .args(["init", "--bare", "--quiet"])
-            .current_dir(bare.path())
             .status()
             .expect("git init --bare");
         assert!(status.success(), "git init --bare should succeed");
@@ -1224,7 +1222,7 @@ allow_env_files = true
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.display());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
             .args(["--", "--version"])
@@ -1343,7 +1341,7 @@ if [ "${GIT_TERMINAL_PROMPT:-}" = "0" ]; then echo "RESULT:env_hardening_git:OK"
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.display());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
             .args(["--agent", "copilot"])
@@ -2555,7 +2553,7 @@ if [ -n "${CLASSPATH:-}" ]; then echo "RESULT:env_classpath:OK"; else echo "RESU
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.display());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
             .args(["--agent", "copilot"])
@@ -2772,7 +2770,7 @@ esac
         let current_path = std::env::var("PATH").unwrap_or_default();
         let new_path = format!("{}:{current_path}", fake_dir.display());
 
-        let output = Command::new(binary_path())
+        let output = cplt_cmd()
             .args(["--yes", "--no-validate"])
             .args(["--project-dir", &project.canonical_path().to_string_lossy()])
             .args(["--scratch-dir"])

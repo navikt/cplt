@@ -9,7 +9,10 @@
 //! Run: cargo test --test e2e_git_hardening
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+mod common;
+use common::git_cmd;
 
 /// A scratch repo plus the marker path its payload would create.
 struct Fixture {
@@ -20,17 +23,13 @@ struct Fixture {
 }
 
 fn git(repo: &Path, args: &[&str]) -> bool {
-    Command::new("git")
+    // `git_cmd` keeps the developer's (and CI's) own git config out of FIXTURE
+    // SETUP: a global `core.hooksPath` pre-commit hook or `commit.gpgsign`
+    // would otherwise make `git commit` fail here for reasons unrelated to the
+    // property under test. This affects only these setup commands — the cplt
+    // code paths under test spawn their own git and see the real environment.
+    git_cmd(repo)
         .args(args)
-        .current_dir(repo)
-        // Keep the developer's (and CI's) own git config out of FIXTURE SETUP:
-        // a global `core.hooksPath` pre-commit hook or `commit.gpgsign` would
-        // otherwise make `git commit` fail here for reasons unrelated to the
-        // property under test. This affects only these setup commands — the
-        // cplt code paths under test spawn their own git and see the real
-        // environment.
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
         .env("GIT_COMMITTER_NAME", "t")

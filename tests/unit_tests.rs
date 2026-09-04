@@ -3,6 +3,9 @@
 //! These tests verify core logic without invoking sandbox-exec,
 //! so they run on any platform (Linux CI, macOS, etc.).
 
+mod common;
+use common::git_cmd;
+
 use cplt::discover::copilot_pkg_dir;
 use cplt::is_unsafe_root;
 use cplt::proxy::{is_blocked_in_content, is_domain_match, is_private_hostname, is_private_ip};
@@ -9548,15 +9551,12 @@ use cplt::audit::{AuditReport, Baseline};
 /// Run a git command in `dir`, panicking on failure. Uses fixed identity and
 /// disables GPG signing so the test is hermetic.
 fn git_in(dir: &std::path::Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
+    let status = git_cmd(dir)
         .args(args)
-        .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@e.x")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@e.x")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .expect("git runs");
     assert!(status.status.success(), "git {args:?} failed");
@@ -9864,9 +9864,8 @@ fn repo_config_state_uncommitted_when_gitignored() {
     std::fs::write(tmp.path().join(".cplt.toml"), PROPOSE).unwrap();
 
     // Precondition: git status really does report nothing here.
-    let status = std::process::Command::new("git")
+    let status = git_cmd(tmp.path())
         .args(["status", "--porcelain", "--", ".cplt.toml"])
-        .current_dir(tmp.path())
         .output()
         .unwrap();
     assert!(
