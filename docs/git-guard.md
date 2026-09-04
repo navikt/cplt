@@ -98,6 +98,7 @@ target branch:
 | `git push origin main` | `main` | Blocked |
 | `git push origin master` | `master` | Blocked |
 | `git push origin develop`, in a repo whose default is `develop` | `develop` | Blocked |
+| `git push origin release/2026`, in a repo whose default is `release/2026` | `release/2026` | Blocked |
 | `git push origin feature/x`, in a repo with no recorded default branch | `feature/x` | Blocked — the default branch is unknown |
 | `git push origin HEAD:refs/heads/main` | `main` (from refspec) | Blocked |
 | `git push origin HEAD:main` | `main` (from refspec) | Blocked |
@@ -110,8 +111,11 @@ The default branch is the one the repository actually has. The guard reads it
 from the local `refs/remotes/<remote>/HEAD` symref that `git clone` and
 `git remote set-head` write, so a repository whose default is `develop`,
 `trunk` or `production` is protected under the setting that promises it — no
-network call is made. `main` and `master` stay protected as a floor alongside
-it, recognized with or without an `origin/` prefix. When several refspecs are
+network call is made. A default branch with a slash in it (`release/2026`) is
+compared whole, because that is how both sides arrive: the symref gives up only
+its `<remote>/` prefix, and the push argument is the branch name entire. `main`
+and `master` stay protected as a floor alongside it, recognized with or without
+an `origin/` prefix. When several refspecs are
 given, the guard checks all of them and blocks if any names a protected branch,
 so `git push origin feature main` does not slip through.
 
