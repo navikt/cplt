@@ -210,6 +210,13 @@ pub(crate) fn test_functionality(
 ///    and run it; an `allow.exec` grant only reaches what already existed at
 ///    launch, on a mount that stays EROFS.
 ///
+/// 4c. Any writable bind from step 4 that lives *beneath* a read-only bind from
+///    step 4b is re-emitted, so the narrower write grant is not covered by the
+///    broader read grant (mounts apply in argument order). Without this,
+///    `--project-dir /tmp/work/repo` together with `--allow-read /tmp/work`
+///    left the project dir EROFS while every diagnostic still reported it
+///    writable.
+///
 /// 5. Finally, for every path in `ro_protect` that exists, `--ro-bind <p> <p>`
 ///    is emitted *after* the writable binds so it shadows them read-only. This
 ///    is the Finding 1 persistence mitigation: the project's `.git/hooks` lives
@@ -314,6 +321,7 @@ pub(crate) fn build_bwrap_args(
     // `bound_writable` is the set that actually got a `--bind`, not every
     // writable rule: the `/tmp` rule itself is writable and is deliberately
     // never bound, so testing against the rules would skip every path under it.
+    let mut bound_readonly: Vec<&Path> = Vec::new();
     for rule in fs_rules.iter().filter(|r| !r.access.write) {
         let path = &rule.path;
         if !path.starts_with("/tmp") || path == Path::new("/tmp") {
@@ -329,6 +337,31 @@ pub(crate) fn build_bwrap_args(
         }
         let path_str = path.to_string_lossy().into_owned();
         args.extend(["--ro-bind".to_string(), path_str.clone(), path_str]);
+        bound_readonly.push(path.as_path());
+    }
+
+    // ── Re-emit writable binds shadowed by a read-only bind above ──
+    // The skip above handles a read path *inside* a writable bind. The reverse
+    // nesting — a writable bind beneath a broader read grant, e.g.
+    // `--project-dir /tmp/work/repo` with `--allow-read /tmp/work` — is not
+    // covered by it: bwrap applies mounts in argument order, so the later
+    // `--ro-bind /tmp/work` covers the earlier `--bind /tmp/work/repo` and the
+    // project dir comes up EROFS. That is the same mechanic the git-persistence
+    // overlays below use on purpose, and it is silent here: Landlock still
+    // grants the write, `--print-profile` still reports it writable, and
+    // nothing at startup says otherwise (AGENTS.md, "No silent grants").
+    //
+    // Re-emitting the narrower writable bind after the broader read-only one
+    // restores the intended precedence: the read grant still covers the rest of
+    // the tree, the write grant still wins where the user asked for it.
+    // `bound_writable` is shallowest-first, so parents stay bound before
+    // children here too. Still before `ro_protect` below, which must keep
+    // shadowing writable binds.
+    for w in &bound_writable {
+        if bound_readonly.iter().any(|ro| w.starts_with(ro)) {
+            let w_str = w.to_string_lossy().into_owned();
+            args.extend(["--bind".to_string(), w_str.clone(), w_str]);
+        }
     }
 
     // ── Read-only overlays for git-persistence paths (Finding 1) ──
@@ -1016,6 +1049,53 @@ mod tests {
         assert!(
             bind_idx > tmpfs_idx,
             "writable bind under /tmp must come after --tmpfs /tmp to shadow it"
+        );
+    }
+
+    #[test]
+    fn a_read_only_bind_does_not_shadow_a_writable_bind_beneath_it() {
+        // #305 regression: the ro-bind loop skipped a read path *inside* a
+        // writable bind, but not the reverse nesting — a writable bind beneath
+        // a broader read grant. bwrap applies mounts in argument order, so
+        // `--ro-bind /tmp/work` after `--bind /tmp/work/repo` covers the
+        // project dir and it comes up EROFS, silently: Landlock and
+        // --print-profile both still call it writable.
+        //
+        // `writable_paths_under_tmp_survive_the_tmp_shadow` does not catch this:
+        // it passes a single writable rule with no read rule above it, so no
+        // ro-bind is ever emitted and there is nothing to shadow the write.
+        let base = tempfile::TempDir::new_in("/tmp").expect("tempdir under /tmp");
+        let project = base.path().join("repo");
+        std::fs::create_dir(&project).expect("mkdir repo");
+
+        let base_str = base.path().to_string_lossy().into_owned();
+        let proj_str = project.to_string_lossy().into_owned();
+        let rules = vec![
+            writable_rule(&proj_str),
+            FsRule {
+                path: base.path().to_path_buf(),
+                access: FsAccess {
+                    read: true,
+                    write: false,
+                    execute: false,
+                    ioctl: false,
+                },
+            },
+        ];
+        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+
+        let last_ro = args
+            .windows(3)
+            .rposition(|w| w[0] == "--ro-bind" && w[1] == base_str && w[2] == base_str)
+            .expect("the read grant must still be bound back over the tmpfs (#299)");
+        let last_rw = args
+            .windows(3)
+            .rposition(|w| w[0] == "--bind" && w[1] == proj_str && w[2] == proj_str)
+            .expect("the writable path must be bound");
+        assert!(
+            last_rw > last_ro,
+            "a writable bind nested under a read-only bind must be re-emitted after it, \
+             or the write grant is silently downgraded to EROFS: {args:?}"
         );
     }
 

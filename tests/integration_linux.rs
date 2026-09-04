@@ -1892,6 +1892,45 @@ print('CONNECTED')
     }
 
     #[test]
+    fn bwrap_project_dir_under_tmp_stays_writable_with_a_read_grant_above_it() {
+        require_bwrap!();
+
+        // #305 regression: the read-only bind-backs that make non-writable
+        // rules under /tmp visible were emitted after the writable binds, so a
+        // read grant on an ANCESTOR of the project dir covered the project's
+        // own writable bind (bwrap applies mounts in argument order) and the
+        // project came up EROFS. Silently: Landlock still granted the write and
+        // --print-profile still reported it writable.
+        let base = tempfile::Builder::new()
+            .prefix("cplt-bwrap-ro-over-rw")
+            .tempdir_in("/tmp")
+            .expect("Failed to create base under /tmp");
+        let project = base.path().join("repo");
+        fs::create_dir(&project).expect("mkdir repo");
+        fs::write(project.join("test.txt"), "hello from nested project").unwrap();
+
+        let (exit, stdout, stderr) = run_sandboxed_with_flags(
+            &project,
+            &[
+                "--use-bubblewrap",
+                "--allow-read",
+                &base.path().to_string_lossy(),
+            ],
+            "cat test.txt && echo ok > written.txt && cat written.txt",
+        );
+        assert_eq!(
+            exit, 0,
+            "a read grant on an ancestor must not turn the project dir read-only: {stderr}"
+        );
+        assert!(stdout.contains("hello from nested project"), "{stdout}");
+        assert!(stdout.contains("ok"), "{stdout}");
+        assert!(
+            project.join("written.txt").exists(),
+            "the write must reach the host, not a shadowed mount"
+        );
+    }
+
+    #[test]
     fn bwrap_exec_from_tmp_still_denied() {
         require_bwrap!();
         let project = create_test_project();
