@@ -104,6 +104,14 @@ pub fn default_config_contents() -> String {
 # ]
 # write = []
 #
+# DANGEROUS: trees the agent may execute binaries from, e.g. a relocated
+# Homebrew prefix. Read + execute, never write. A grant that names /, $HOME,
+# or any tree overlapping a writable one is refused at startup: writable +
+# executable is a binary-drop path.
+# exec = [
+#     "~/.linuxbrew",
+# ]
+#
 # Additional outbound TCP ports beyond 443.
 # Use for external services.
 # ports = [8080]

@@ -131,6 +131,7 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
+| `allow.exec` | exec paths differ per machine, and a repo must not be able to make one of its own trees executable |
 | `sandbox.allow_cache_exec` | cache paths differ per machine |
 | `sandbox.allow_cache_exec_any` | too broad for repo policy |
 | `proxy.enabled` | local proxy preference |

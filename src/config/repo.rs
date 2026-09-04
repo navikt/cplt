@@ -75,6 +75,10 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
             "too dangerous for repo config, it would affect all team members"
         }
         ("sandbox", "pass_env") => "environment variables are machine-specific, not project policy",
+        ("allow", "exec") => {
+            "exec grants are machine-specific paths, and a repo must not be able to make \
+             one of its own trees executable"
+        }
         ("sandbox", "allow_cache_exec") => "cache paths are machine-specific, not project policy",
         ("sandbox", "allow_cache_exec_any") => {
             "too dangerous for repo config, it would affect all team members"

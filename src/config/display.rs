@@ -276,6 +276,15 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
             c.allow.write
         );
     }
+    if c.allow.exec.is_empty() {
+        println!("{blue}[cplt]{nc}    exec             = {dim}[]{nc}");
+    } else {
+        let red = ui::color(ui::RED);
+        println!(
+            "{blue}[cplt]{nc}    exec             = {red}{:?}{nc} \u{26a0} DANGEROUS",
+            c.allow.exec
+        );
+    }
     if c.allow.ports.is_empty() {
         println!("{blue}[cplt]{nc}    ports            = {dim}[]{nc}");
     } else {

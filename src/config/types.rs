@@ -540,6 +540,9 @@ pub struct AllowConfig {
     pub read: Vec<String>,
     /// Additional paths to allow writing.
     pub write: Vec<String>,
+    /// Additional trees to allow executing binaries from (read + exec, never
+    /// write). DANGEROUS: see `allow.exec` in the key registry.
+    pub exec: Vec<String>,
     /// Unix socket paths to allow access to.
     pub socket: Vec<String>,
     /// Additional outbound TCP ports beyond 443.
@@ -786,6 +789,9 @@ pub struct Resolved {
     pub repo_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
+    /// Trees the agent may execute binaries from (`allow.exec` / `--allow-exec`).
+    /// Read + execute, never write — see `sandbox::validate_exec_grants`.
+    pub allow_exec: Vec<PathBuf>,
     pub allow_socket: Vec<PathBuf>,
     pub deny_paths: Vec<PathBuf>,
     pub allow_ports: Vec<u16>,
@@ -859,6 +865,7 @@ pub struct CliFlags {
     pub allow_private_domains: Vec<String>,
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
+    pub allow_exec: Vec<PathBuf>,
     pub allow_socket: Vec<PathBuf>,
     pub deny_paths: Vec<PathBuf>,
     pub allow_ports: Vec<u16>,

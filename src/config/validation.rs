@@ -285,6 +285,20 @@ pub fn validate_config(toml_text: &str) -> Vec<ConfigDiagnostic> {
         }
     }
 
+    if let Some(exec) = table
+        .get("allow")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("exec"))
+        .and_then(toml::Value::as_array)
+        && !exec.is_empty()
+    {
+        diagnostics.push(ConfigDiagnostic {
+            level: DiagnosticLevel::Warning,
+            message: "allow.exec grants the agent execute rights outside the default tool dirs (DANGEROUS)"
+                .to_string(),
+        });
+    }
+
     diagnostics
 }
 

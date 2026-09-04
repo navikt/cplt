@@ -571,6 +571,27 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
         });
     }
 
+    // ── Extra exec paths from config (`allow.exec`) ──
+    // Read AND execute: `execve` on a dynamically linked binary also opens the
+    // ELF interpreter and the libraries beside it, so an execute-only grant
+    // returns EACCES for every real tool. Never write — `sandbox::prepare`
+    // refuses an exec grant that overlaps a writable tree precisely because
+    // Landlock unions the two and cannot subtract one from the other.
+    for p in config.extra_exec {
+        if policy::hard_denied_file(home, p).is_some() {
+            continue;
+        }
+        fs_rules.push(FsRule {
+            path: p.clone(),
+            access: FsAccess {
+                read: true,
+                write: false,
+                execute: true,
+                ioctl: false,
+            },
+        });
+    }
+
     // ── Extra socket paths from config ──
     for p in config.extra_socket {
         if policy::hard_denied_file(home, p).is_some() {
@@ -1845,6 +1866,7 @@ mod tests {
             home_dir,
             extra_read: &[],
             extra_write: &[],
+            extra_exec: &[],
             extra_socket: &[],
             extra_deny: &[],
             existing_home_tool_dirs: None,
@@ -1930,6 +1952,43 @@ mod tests {
         assert!(
             !rule.access.execute,
             "~/.docker must not carry execute (Landlock execute is process-exec, #243)"
+        );
+    }
+
+    /// `allow.exec` must grant read AND execute. Landlock's EXECUTE right
+    /// covers `execve`, but a dynamically linked binary is only half the story:
+    /// the kernel then opens `PT_INTERP` and the loader opens the libraries the
+    /// RPATH names, both of which live inside the same relocated prefix for a
+    /// source-built Homebrew (#202/#232). Without the read half every real tool
+    /// under the grant still fails with EACCES, which is the exact symptom the
+    /// grant exists to fix.
+    #[test]
+    fn exec_grant_carries_read_and_execute_but_not_write() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let granted = vec![home.join(".linuxbrew")];
+
+        let mut config = test_config(&project, &home);
+        config.extra_exec = &granted;
+        let policy = generate_policy(&config);
+
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == granted[0])
+            .expect("allow.exec path should be in the ruleset");
+        assert!(
+            rule.access.execute,
+            "allow.exec must grant execute — that is the whole point"
+        );
+        assert!(
+            rule.access.read,
+            "allow.exec must grant read: exec without read is EACCES for any \
+             dynamically linked binary (ELF interpreter + RPATH libraries)"
+        );
+        assert!(
+            !rule.access.write,
+            "allow.exec must never grant write — writable + executable is a binary-drop path"
         );
     }
 

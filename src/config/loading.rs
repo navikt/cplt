@@ -307,6 +307,21 @@ impl Config {
         }
         allow_write.extend(cli.allow_write);
 
+        // Allow-exec: merge config + CLI. Read + execute, never write; the
+        // overlap-with-a-writable-grant refusal lives in `sandbox::prepare`,
+        // the one choke point that also sees the project dir and the
+        // env-derived write grants (`merge_tool_path_env_overrides`).
+        let mut allow_exec: Vec<PathBuf> = Vec::new();
+        for s in &self.allow.exec {
+            match resolve_config_path(s, config_dir.as_ref()) {
+                Ok(p) => allow_exec.push(p),
+                Err(e) => {
+                    ui::warn(&format!("Warning: allow.exec path {s:?}: {e}"));
+                }
+            }
+        }
+        allow_exec.extend(cli.allow_exec);
+
         // Allow-socket: merge config + CLI
         let mut allow_socket: Vec<PathBuf> = Vec::new();
         for s in &self.allow.socket {
@@ -561,6 +576,7 @@ impl Config {
         for p in allow_read
             .iter()
             .chain(allow_write.iter())
+            .chain(allow_exec.iter())
             .chain(allow_socket.iter())
             .chain(deny_paths.iter())
         {
@@ -610,6 +626,7 @@ impl Config {
             allow_private_domains,
             allow_read,
             allow_write,
+            allow_exec,
             allow_socket,
             deny_paths,
             allow_ports,
@@ -911,6 +928,17 @@ impl Resolved {
         } else {
             eprintln!(
                 "{blue}[cplt]{nc}    SSH/GPG/cloud: blocked     {dim}~/.ssh, ~/.gnupg, ~/.aws, ...{nc}"
+            );
+        }
+        if !self.allow_exec.is_empty() {
+            let red = ui::color(ui::RED);
+            eprintln!(
+                "{blue}[cplt]{nc}    Exec grants:   {red}ALLOWED{nc}     {dim}\u{26a0} {} (--allow-exec){nc}",
+                self.allow_exec
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         if self.allow_docker {
