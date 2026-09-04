@@ -215,9 +215,17 @@ pub fn generate_session_brief(resolved: &Resolved, agent: Agent, home: &Path) ->
 /// `permissive` and `full-trust` presets both set it, so this is not a corner
 /// case. macOS is unaffected — SBPL denies `(remote tcp)` by default and can
 /// pin localhost, so its port list holds either way.
+///
+/// Under `proxy.forced` no port is open to a direct socket at all (#297):
+/// `allow.ports` no longer emits a kernel egress rule, and `ssh` does not
+/// speak `HTTP_PROXY`, so the CONNECT tunnel that keeps proxy-aware tools
+/// working does nothing for it. `reconcile_proxy_forced` has already forced
+/// `allow_localhost_any` off by the time this runs, so the Linux clause cannot
+/// reopen it either.
 fn ssh_port_open(resolved: &Resolved) -> bool {
-    resolved.allow_ports.contains(&22)
-        || (cfg!(target_os = "linux") && resolved.allow_localhost_any)
+    !resolved.proxy_forced
+        && (resolved.allow_ports.contains(&22)
+            || (cfg!(target_os = "linux") && resolved.allow_localhost_any))
 }
 
 /// Is a private key under `~/.ssh` actually readable?
@@ -698,6 +706,31 @@ mod tests {
         assert!(brief.contains("SSH may work this session"));
         // The blanket credentials claim needs the same treatment.
         assert!(brief.contains("`~/.ssh/id_ed25519`"), "{brief}");
+    }
+
+    /// #297: under `proxy.forced` `allow.ports` emits no kernel egress rule, and
+    /// `ssh` cannot use the CONNECT tunnel that keeps proxy-aware tools working.
+    /// The same `allow.ports = [22]` that opens the port in default mode must
+    /// not be reported as open here, or the brief promises the agent an SSH
+    /// path the kernel denies.
+    #[test]
+    fn brief_does_not_claim_port_22_is_open_under_proxy_forced() {
+        let mut resolved = base_resolved();
+        resolved.allow_ports = vec![22];
+        resolved.allow_read = vec![home().join(".ssh/id_ed25519")];
+
+        let default_mode = generate_session_brief(&resolved, Agent::Claude, home());
+        assert!(
+            default_mode.contains("SSH may work this session"),
+            "default mode still opens port 22:\n{default_mode}"
+        );
+
+        resolved.proxy_forced = true;
+        let forced = generate_session_brief(&resolved, Agent::Claude, home());
+        assert!(
+            forced.contains("SSH is blocked"),
+            "proxy.forced closes the direct path port 22 needs:\n{forced}"
+        );
     }
 
     /// Port open, nothing to authenticate with: the blocker is the keys, and

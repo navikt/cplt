@@ -1595,10 +1595,9 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             .collect::<Vec<_>>()
             .join(", ");
         ui::warn(&format!(
-            "proxy.forced is active, so allow.ports ({ports}) no longer opens a direct \
-             kernel egress path. Those ports are still reachable through the proxy, so \
-             proxy-aware tools keep working; raw TCP does not. Drop proxy.forced if a \
-             tool needs a direct socket."
+            "proxy.forced is active, so allow.ports ({ports}) opens no direct socket. \
+             Proxy-aware tools still reach those ports through the proxy; raw TCP does \
+             not. See docs/proxy.md, \"Raw-TCP tradeoff\"."
         ));
     }
 
