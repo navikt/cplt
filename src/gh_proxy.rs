@@ -1676,14 +1676,45 @@ fn arg_reveals_token(arg: &str) -> bool {
 
 /// Evaluate a full command and return a human-friendly verdict.
 ///
-/// This is the entry point used by the `gh-gate` subcommand.
-/// Returns the verified repository scope when allowed, or an error when blocked.
+/// Used by `cplt check` (`check.rs`), which explains what the guard would do.
+/// The `gh-gate` subcommand does not come through here: it has the startup
+/// scope captured before launch and calls `gate_with_repo_scope` instead.
+///
+/// Returns the repository scope when one could be resolved, or an error when
+/// the command is blocked. An allowed decision does not imply a scope — a
+/// command that needs none is allowed without resolving one.
 pub fn gate(
     args: &[&str],
     project_dir: &Path,
     policy: &GatePolicy,
 ) -> Result<GateApproval, String> {
-    gate_with_git(args, project_dir, policy, Path::new("git"))
+    // Trusted, not PATH (#250). The only caller is `cplt check`, which runs in
+    // the UNSANDBOXED parent, so a `git` planted in a write+exec directory on
+    // PATH would execute as the user. `gate_with_git` documents its parameter
+    // as a trusted binary; passing `Path::new("git")` kept that promise by
+    // convention rather than by the code.
+    //
+    // No trusted git means the scope cannot be verified, so the resolver errors
+    // and scope-checked commands are refused. That matches what the gh wrapper
+    // already tells the user in the same situation, and it fails closed: the
+    // alternative is answering a scope question with an unverified answer.
+    // Resolved once, and passed to BOTH consumers: the scope resolver below and
+    // `gate_with_scope_resolver`'s own `real_git`, which #230 uses to verify the
+    // invocation repo of an implicit target. Passing `None` there would silently
+    // skip that check.
+    let trusted = crate::git::trusted_git();
+    gate_with_scope_resolver(
+        args,
+        policy,
+        || {
+            let git = trusted.ok_or_else(|| {
+                "no git in a trusted directory, so the repository scope cannot be verified"
+                    .to_string()
+            })?;
+            detect_current_repo(git, project_dir)
+        },
+        trusted,
+    )
 }
 
 /// Evaluate a `gh` command using a pre-resolved Git binary for repository scope.
