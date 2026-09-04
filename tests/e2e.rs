@@ -5147,12 +5147,23 @@ paths = [
         let canary = fake_dir.path().join("canary");
         std::fs::write(&canary, "canary").expect("write canary");
         let script = fake_dir.path().join("copilot");
+        // Relative to the agent's cwd, which `configure_command` pins to the
+        // project dir. An absolute path would have to survive `sh` word
+        // splitting, and a checkout under "~/My Projects" would then fail the
+        // read for the wrong reason; the TempDir's own name never needs quoting.
+        let canary_rel = format!(
+            "{}/canary",
+            fake_dir
+                .path()
+                .file_name()
+                .expect("tempdir has a name")
+                .to_string_lossy()
+        );
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nif cat {} >/dev/null 2>&1; then echo READ_ALLOWED; \
-                 else echo READ_DENIED; fi\n",
-                canary.display()
+                "#!/bin/sh\nif cat {canary_rel} >/dev/null 2>&1; then echo READ_ALLOWED; \
+                 else echo READ_DENIED; fi\n"
             ),
         )
         .expect("write fake copilot");
@@ -5171,14 +5182,18 @@ paths = [
             let hits = std::sync::Arc::clone(&hits);
             std::thread::spawn(move || {
                 let temp = std::env::temp_dir();
-                while !stop.load(Ordering::Relaxed) {
+                // Bounded, not just flagged: a panic anywhere below skips the
+                // explicit stop, and a detached thread scanning the temp dir
+                // for the rest of the process would slow every test after it.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
+                while !stop.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
                     // A scan every millisecond, not a spin: `read_dir` over the
                     // whole system temp dir pinned a core for the length of the
                     // test and starved the other tests sharing the binary. The
                     // window a real attacker gets is the whole gap between our
                     // write and the kernel's read, so 1ms costs the attack
                     // nothing — it still lands 15/15 against the old code.
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    std::thread::sleep(std::time::Duration::from_micros(500));
                     let Ok(entries) = std::fs::read_dir(&temp) else {
                         continue;
                     };
@@ -5206,7 +5221,7 @@ paths = [
         let mut allowed = 0;
         let mut denied = 0;
         let mut transcript = String::new();
-        for attempt in 0..15 {
+        for attempt in 0..25 {
             let output = cplt_cmd()
                 .args(["--yes", "--deny-path"])
                 .arg(&canary)
@@ -5231,7 +5246,7 @@ paths = [
         assert_eq!(
             allowed,
             0,
-            "an attacker's SBPL profile replaced ours in {allowed}/15 launches \
+            "an attacker's SBPL profile replaced ours in {allowed}/25 launches \
              ({} temp-file overwrites landed) — the profile must not reach the \
              kernel as a pathname:\n{transcript}",
             hits.load(Ordering::Relaxed)
