@@ -376,6 +376,38 @@ fn emit_sensitive_project_denies(
     }
     sbpl!(sb);
 
+    // In-project plugin manifests (#267). goose auto-spawns the MCP servers
+    // declared under `.agents/plugins/`, so a manifest the agent writes in one
+    // session runs on the HOST the next time the user starts an agent in this
+    // repo. Same class as `.git/hooks`, and the same reason it belongs here
+    // rather than in a per-agent rule: `.agents/` is a cross-agent convention,
+    // the payload fires whichever agent reads it, and a granted sibling repo is
+    // as exposed as the project.
+    //
+    // Scoped to `plugins/` rather than all of `.agents/`: the rest of that tree
+    // is ordinary agent state with no auto-execution, and denying it would
+    // break writes nothing has asked to break.
+    sbpl!(
+        sb,
+        ";; Plugin manifests — auto-spawned on the host next session"
+    );
+    for root in &roots {
+        sbpl!(
+            sb,
+            "(deny file-write* (subpath \"{root}/.agents/plugins\"))"
+        );
+        // A repo nested under a writable root needs this too: `allow.write
+        // ~/code` leaves `~/code/other-repo/.agents/plugins` writable, and a
+        // manifest there fires whichever agent next opens THAT repo. Same
+        // reasoning and the same regex shape as the nested gitdir denies.
+        let r = escape_regex(root);
+        sbpl!(
+            sb,
+            "(deny file-write* (regex #\"^{r}/.+/\\.agents/plugins($|/)\"))"
+        );
+    }
+    sbpl!(sb);
+
     // Sensitive project files — deny read AND write of .env*, .pem, .key etc.
     // Read deny: prevents exfiltration of secrets via HTTPS.
     // Write deny: prevents deletion/overwrite of secrets (rm, truncate).
@@ -2289,6 +2321,71 @@ mod tests {
         assert!(
             last_write_allow < nested_deny,
             "a write allow @ {last_write_allow} comes after the nested git deny @ {nested_deny}"
+        );
+    }
+
+    /// #267: goose auto-spawns MCP servers from `.agents/plugins/`, so a
+    /// manifest the agent writes runs on the HOST next session. Denied for
+    /// every writable root, not just the project: a granted sibling repo is as
+    /// exposed, and the payload fires whichever agent opens that repo.
+    #[test]
+    fn agents_plugins_is_denied_for_every_writable_root() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let rule = format!("(deny file-write* (subpath \"{root}/.agents/plugins\"))");
+            assert!(p.contains(&rule), "missing for {root}: {rule}");
+        }
+
+        // Last-match-wins: the deny has to outlive every user allow.write, or a
+        // grant on the project reopens the whole thing.
+        let deny = p
+            .rfind("/.agents/plugins\"))")
+            .expect("plugins deny must be emitted");
+        let last_allow = p
+            .rfind("(allow file-write*")
+            .expect("a write allow must be emitted");
+        assert!(
+            last_allow < deny,
+            "a write allow at {last_allow} comes after the plugins deny at {deny}"
+        );
+    }
+
+    /// A repo nested under a writable root has the same exposure: the manifest
+    /// fires whichever agent next opens THAT repo, not the granted one. Same
+    /// gap #247 found for `.git/hooks`, and the same regex shape closes it.
+    #[test]
+    fn agents_plugins_is_denied_in_nested_repos_too() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = root.replace('.', r"\.");
+            let rule = format!("(deny file-write* (regex #\"^{esc}/.+/\\.agents/plugins($|/)\"))");
+            assert!(p.contains(&rule), "missing nested deny for {root}: {rule}");
+        }
+    }
+
+    /// The rest of `.agents/` is ordinary state with no auto-execution. Denying
+    /// it wholesale would break writes nothing asked to break.
+    #[test]
+    fn agents_dir_itself_is_not_denied() {
+        let p = generate_profile(&test_options(
+            std::path::Path::new("/projects/app"),
+            std::path::Path::new("/Users/test"),
+        ));
+        assert!(
+            !p.contains("(deny file-write* (subpath \"/projects/app/.agents\"))"),
+            "only .agents/plugins is denied, not the whole tree"
         );
     }
 
