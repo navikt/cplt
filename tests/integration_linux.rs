@@ -1604,7 +1604,11 @@ print('CONNECTED')
         // Negative: no --allow-localhost. The listener is up, so a pass here can
         // only come from enforcement (Landlock TCP deny, or the proxy refusing
         // to forward), never from "nothing was listening".
-        let (_, denied_stdout, denied_stderr) = run_sandboxed(project.path(), &script);
+        let (_, denied_stdout, denied_stderr) = run_sandboxed_with_flags(
+            project.path(),
+            &["--allow-localhost", &port.to_string()],
+            &script,
+        ); // MUTATION
         assert!(
             denied_stdout.contains("CURL_FAIL"),
             "without --allow-localhost, curl to a live 127.0.0.1:{port} must fail; \
@@ -1626,6 +1630,35 @@ print('CONNECTED')
             allowed_stdout.contains("CURL_OK"),
             "--allow-localhost {port}: curl to 127.0.0.1:{port} must succeed — without this \
              control the deny above proves nothing; stdout: {allowed_stdout} stderr: {allowed_stderr}"
+        );
+    }
+
+    /// MUTATION CONTROL: the pre-PR version of the test above, verbatim except
+    /// for the same mutation. It drops the listener, so it passes on
+    /// ECONNREFUSED even with enforcement fully disabled. Expected GREEN.
+    #[test]
+    fn mutation_control_old_localhost_test_is_vacuous() {
+        require_landlock!(4);
+        require_curl!();
+        let project = create_test_project();
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let script = format!(
+            "curl --max-time 3 -sf http://127.0.0.1:{port}/ 2>&1 && echo CURL_OK || echo CURL_FAIL"
+        );
+        let (_, stdout, _) = run_sandboxed_with_flags(
+            project.path(),
+            &["--allow-localhost", &port.to_string()],
+            &script,
+        ); // MUTATION
+
+        assert!(
+            stdout.contains("CURL_FAIL"),
+            "without --allow-localhost, curl to 127.0.0.1:{port} must fail; got: {stdout}"
         );
     }
 
@@ -1898,8 +1931,11 @@ print('CONNECTED')
         let host_init = host_init.trim();
         assert!(!host_init.is_empty(), "host /proc/1/comm was empty");
 
-        let (exit, stdout, _) =
-            run_sandboxed_bwrap(project.path(), "cat /proc/1/comm 2>&1 || echo 'blocked'");
+        let (exit, stdout, _) = run_sandboxed_with_flags(
+            project.path(),
+            &["--no-bubblewrap"],
+            "cat /proc/1/comm 2>&1 || echo 'blocked'",
+        ); // MUTATION
         assert_eq!(exit, 0);
         // PID 1 inside the namespace is bwrap/the helper, never the host init.
         assert!(
