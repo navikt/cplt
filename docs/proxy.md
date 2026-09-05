@@ -39,7 +39,7 @@ cplt config set proxy.log_file "~/.config/cplt/proxy.log"
 | `--proxy-forced` / `--no-proxy-forced` | Force **all** egress through the proxy (opt-in, default off): make the proxy mandatory and restrict kernel egress to the proxy port. Fails closed; conflicts with `--no-proxy`. See [Proxy-forced mode](#proxy-forced-mode). |
 | `--proxy-port <PORT>`       | Which port the proxy listens on (default: 0, OS-assigned ephemeral).                             |
 | `--blocked-domains <FILE>`  | Domains to block, one per line. Re-read every ~5s, so you can edit it live. |
-| `--allowed-domains <FILE>`  | Domains to allow. Only listed domains can connect. Validated at startup (fail-closed); re-read every ~5s. |
+| `--allowed-domains <FILE>`  | Domains to allow. Setting it turns the allowlist on, and only listed domains can connect — an empty file therefore blocks everything, and a missing file is a startup error. Re-read every ~5s. |
 | `--default-allowlist`       | Enable the agent's built-in default allowlist for this run (opt-in, default off): restrict egress to the agent's fail-closed domain set merged with `--allowed-domains`. See [Default allowlist](#default-allowlist-fail-closed-networking). |
 | `--allow-all-domains`       | Escape hatch: disable the default allowlist for this run and allow all domains (blocklist still applies). Also ignores any `--allowed-domains` file. |
 | `--proxy-log <FILE>`        | Append a line per connection to this file for post-session audit.                                |
@@ -147,7 +147,14 @@ proxy.business.githubcopilot.com
 telemetry.business.githubcopilot.com
 ```
 
-> **Note:** Both the allowlist and blocklist are re-read from disk every ~5 seconds (TTL-cached), so you can edit them live mid-session and changes take effect within seconds without restarting cplt. If a file becomes unreadable at runtime, the last-known-good list is kept (fail-safe). At startup, an unreadable allowlist makes cplt exit with an error (fail-closed).
+> **Setting `allowed_domains` is what turns the allowlist on, not the file's contents.** The two ways to say "no allowlist" are not the same thing:
+>
+> - **No `allowed_domains` key** (and no `--allowed-domains`, no `default_allowlist`): no allowlist, every domain is allowed. This is the default.
+> - **`allowed_domains` pointing at an empty or all-comment file**: an allowlist with nothing on it, so every domain is blocked.
+>
+> A configured `allowed_domains` file that does not exist is a startup error rather than a silent fallback to allow-all. Use `--allow-all-domains` to allow everything for a single run without editing config.
+
+> **Note:** Both the allowlist and blocklist are re-read from disk every ~5 seconds (TTL-cached), so you can edit them live mid-session and changes take effect within seconds without restarting cplt. If a file becomes unreadable or is deleted at runtime, the last-known-good list is kept (fail-safe); if it becomes *empty*, that is a real edit and the allowlist tightens to blocking everything. At startup, an unreadable or missing allowlist makes cplt exit with an error (fail-closed).
 >
 > The `allow_private_domains` list in `config.toml` is also re-read every ~5 seconds. Domains from other sources, meaning `--allow-private-domain` CLI flags and trust-approved `[propose.proxy] allow_private_domains` entries from a repo `.cplt.toml`, are preserved for the whole session regardless of config changes.
 
