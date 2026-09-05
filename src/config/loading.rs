@@ -839,11 +839,16 @@ impl Resolved {
     /// tool directory is actually shadowed. Warning on every writable tree
     /// would fire on the ordinary case and teach people to skip it.
     ///
-    /// Best-effort by design, and existence-checked so an uninstalled tool
-    /// never produces advice about a directory that is not there. Tool homes
-    /// relocated by `CARGO_HOME` and friends are not resolved here — those
-    /// become `ToolRoot`s rather than `allow.write` grants (#152), so they
-    /// cannot be the grant this warning is about.
+    /// Best-effort by design. Tool candidates are existence-checked so an
+    /// uninstalled tool never produces advice about a directory that is not
+    /// there; agent candidates are not, because `assemble_sandbox` creates
+    /// every one of them itself, after this runs. Existence-checking those
+    /// would silence the warning on the first run after the grant is written —
+    /// the one run where it is worth reading — and start it on some later
+    /// session for no reason the user can see. Tool homes relocated by
+    /// `CARGO_HOME` and friends are not resolved here — those become
+    /// `ToolRoot`s rather than `allow.write` grants (#152), so they cannot be
+    /// the grant this warning is about.
     ///
     /// `agent_dirs` is the agent's own directories, which lose execute the same
     /// way on macOS (#343): `~/.pi/agent/bin` and `~/.cache/opencode/bin` are
@@ -868,13 +873,13 @@ impl Resolved {
                     .iter()
                     .flat_map(|a| a.process_exec_paths(home)),
             )
+            .filter(|p| p.exists())
             .chain(
                 agent_dirs
                     .iter()
                     .filter(|d| d.process_exec)
                     .map(|d| d.path.clone()),
             )
-            .filter(|p| p.exists())
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         grants_overlapping(&self.allow_write, &dirs)
@@ -2303,6 +2308,51 @@ validate = false
         for w in [&one, &many] {
             assert!(!w.contains("director "), "\"director\" is not a word: {w}");
         }
+    }
+
+    /// #343 review: cplt creates the agent's directories itself, in
+    /// `assemble_sandbox`, *after* this warning runs. Existence-checking them
+    /// like a tool directory would keep the warning silent on the first run
+    /// after the grant is written and fire it on some later session instead, so
+    /// the filter covers tool candidates only. The bin dir is deliberately not
+    /// created here: that absence is the whole test.
+    #[test]
+    fn an_agent_exec_dir_is_reported_before_cplt_creates_it() {
+        let home = std::env::temp_dir().join(format!(
+            "cplt-agent-exec-absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join(".pi")).expect("temp home");
+
+        let bin = home.join(".pi/agent/bin");
+        assert!(!bin.exists(), "the fixture must leave the bin dir absent");
+        let agent_dirs = vec![crate::agent::AgentDir {
+            path: bin.clone(),
+            write: false,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+        }];
+
+        let mut r = Config::default()
+            .merge(CliFlags::default())
+            .expect("default config merges");
+        r.allow_write = vec![home.join(".pi")];
+        let found = r.write_grants_over_exec_tool_dirs(&home, &agent_dirs);
+
+        let bin = bin.to_string_lossy().into_owned();
+        assert!(
+            found
+                .iter()
+                .any(|(g, dirs)| *g == home.join(".pi") && dirs.contains(&bin)),
+            "an agent exec dir cplt has not created yet must still be reported: {found:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// #343 review: the Linux sentence was unconditional, and it is false for
