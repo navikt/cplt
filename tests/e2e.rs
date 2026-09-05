@@ -4203,6 +4203,54 @@ paths = [
         );
     }
 
+    /// #343 review: `exec` ignores the agent `resolve_context` detected and
+    /// always builds the Shell profile, so a warning about the detected agent's
+    /// directories describes a session that was never assembled. The tool-dir
+    /// half of the same warning must stay live on `exec`, or this test would
+    /// pass on a warning that had simply stopped working.
+    #[test]
+    fn e2e_exec_does_not_warn_about_an_agent_it_does_not_run() {
+        require_sandbox!();
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-exec-agent-warn-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(fake_home.join(".copilot")).unwrap();
+        std::fs::create_dir_all(fake_home.join(".rustup")).unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "--no-validate",
+                "--agent",
+                "copilot",
+                "--allow-write",
+                fake_home.join(".copilot").to_str().unwrap(),
+                "--allow-write",
+                fake_home.join(".rustup").to_str().unwrap(),
+                "exec",
+                "--",
+                "/usr/bin/true",
+            ])
+            .env("HOME", fake_home.to_str().unwrap())
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(".rustup"),
+            "exec must still warn about a shadowed tool directory: {stderr}"
+        );
+        assert!(
+            !stderr.contains(".copilot"),
+            "exec builds the Shell profile and never emits Copilot's rules, so it \
+             must not blame the grant for withdrawing exec there: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     #[test]
     fn e2e_exec_exit_code_pass_through() {
         require_sandbox!();
