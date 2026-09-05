@@ -778,11 +778,14 @@ fn profile_allows_tty_ioctl() {
 #[test]
 fn landlock_policy_device_files_have_ioctl() {
     // Regression test: Landlock ABI v5 (kernel ≥ 6.8) enforces IoctlDev for
-    // character devices. Without IoctlDev on /dev/tty, /dev/ptmx, and /dev/pts,
-    // tcsetattr() and forkpty(3) are denied — the terminal stays in cooked/echo
-    // mode, OSC colour-query responses are echoed as visible text, and Copilot's
-    // TUI hangs. /dev/ptmx is the PTY master multiplexer; ioctl is required for
-    // TIOCGPTN and TIOCSPTLCK (used by forkpty/grantpt/unlockpt).
+    // character devices. Without IoctlDev on /dev/tty and /dev/ptmx,
+    // tcsetattr() is denied — the terminal stays in cooked/echo mode, OSC
+    // colour-query responses are echoed as visible text, and Copilot's TUI
+    // hangs. /dev/ptmx is the PTY master multiplexer; ioctl is required for
+    // TIOCGPTN and TIOCSPTLCK (used by grantpt/unlockpt).
+    //
+    // /dev/pts is deliberately NOT in this list — see the read-only assertion
+    // below (GHSA-q3p2-6x2x-8w8w).
     let policy = generate_policy(&SandboxConfig {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/home/test"),
@@ -822,7 +825,23 @@ fn landlock_policy_device_files_have_ioctl() {
         keychain_substitute: None,
     });
 
-    let device_paths = ["/dev/tty", "/dev/ptmx", "/dev/pts"];
+    // GHSA-q3p2-6x2x-8w8w: /dev/pts is path-beneath, so ANY right there
+    // applies to every peer terminal's slave, not just the agent's own —
+    // read captures what the user types in another window, write forges
+    // output in it, and ioctl reaches TIOCSTI on a kernel that still exposes
+    // it (pre-6.2, or dev.tty.legacy_tiocsti=1), which is keystroke
+    // injection. No rule at all: the agent's terminal is an inherited fd and
+    // /dev/tty covers the rest.
+    assert!(
+        !policy
+            .fs_rules
+            .iter()
+            .any(|r| r.path.starts_with("/dev/pts")),
+        "/dev/pts must have no Landlock rule — any right there reaches every \
+         other terminal the user has open"
+    );
+
+    let device_paths = ["/dev/tty", "/dev/ptmx"];
     for dev in &device_paths {
         let rule = policy
             .fs_rules

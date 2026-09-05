@@ -54,7 +54,8 @@ pub struct FsAccess {
     /// Grant `LANDLOCK_ACCESS_FS_IOCTL_DEV` (Landlock ABI v5+, kernel ≥ 6.8).
     ///
     /// Required for character and block devices that need `ioctl()` — most
-    /// importantly `/dev/tty` and `/dev/pts/*` for `tcsetattr()` (raw mode).
+    /// importantly `/dev/tty` for `tcsetattr()` (raw mode). Not granted on
+    /// `/dev/pts`: that is a directory of *other* terminals' slaves.
     /// Without this flag on ABI v5+, the terminal stays in cooked/echo mode:
     /// OSC colour-query responses are echoed as visible text and the process
     /// hangs waiting for a response it already "missed".
@@ -248,17 +249,45 @@ const LINUX_HOME_CONFIG_FILES: &[&str] = &[
     ".node_repl_history",
 ];
 
-/// Device and pseudo-filesystem paths that Node.js and common tools need.
+/// Device and pseudo-filesystem paths that Node.js and common tools need,
+/// granted read + write + ioctl.
+///
+/// `/dev/pts` is deliberately absent — see the comment below this list.
 const DEVICE_FILES: &[&str] = &[
     "/dev/null",
     "/dev/urandom",
     "/dev/zero",
     "/dev/random",
     "/dev/tty",  // Terminal device (interactive tools)
-    "/dev/ptmx", // PTY master multiplexer — required by forkpty(3)
-    "/dev/pts",  // Pseudo-terminal slave devices
+    "/dev/ptmx", // PTY master multiplexer — hands out a fresh master only
     "/dev/shm",  // POSIX shared memory (Node.js, Chromium)
 ];
+
+// Why `/dev/pts` is not in either list (GHSA-q3p2-6x2x-8w8w, Linux half).
+//
+// It used to sit in [`DEVICE_FILES`] with `write: true, ioctl: true`.
+// Landlock is path-beneath, so that covered every `/dev/pts/N` — the PTY
+// slave of every other terminal the user has open, not just the agent's own:
+//
+// * **read** consumes that terminal's input queue, so the sandboxed process
+//   captures what the user types in another window (a passphrase, a pasted
+//   token) and those bytes never reach the program that was meant to get them;
+// * **write** forges output in that terminal and can drive an OSC 52
+//   clipboard write;
+// * **ioctl** reaches `TIOCSTI` on a kernel that still exposes it (pre-6.2,
+//   or `dev.tty.legacy_tiocsti=1`), which is keystroke *injection*, i.e.
+//   command execution rather than spoofing.
+//
+// There is no rule at all now. Nothing in a normal session opens a
+// `/dev/pts/N` by path: the agent's terminal arrives as inherited fds 0/1/2,
+// Landlock binds rights at `open()` rather than on each read or write, and
+// `ttyname()`/`stat()` are not governed by Landlock at all. `/dev/tty` keeps
+// read + write + ioctl and always resolves to the caller's own controlling
+// terminal, so raw mode still works.
+//
+// The cost is the same as on macOS: a sandboxed process cannot allocate its
+// own PTY (`openpty`/`forkpty`, `script`, `tmux`, `pexpect`), because the new
+// slave can only be reached by the same kind of name an attacker would use.
 
 // ── Policy generation (cross-platform, pure logic) ─────────────
 
@@ -551,8 +580,8 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
 
     // ── Device files: read + write + ioctl (no execute) ──
     // ioctl: true grants LANDLOCK_ACCESS_FS_IOCTL_DEV (ABI v5+, kernel ≥ 6.8).
-    // Without it, tcsetattr() on /dev/tty and /dev/pts/* is denied — the
-    // terminal stays in cooked/echo mode and Copilot's TUI hangs.
+    // Without it, tcsetattr() on /dev/tty is denied — the terminal stays in
+    // cooked/echo mode and Copilot's TUI hangs.
     for &dev in DEVICE_FILES {
         fs_rules.push(FsRule {
             path: PathBuf::from(dev),
@@ -1950,9 +1979,9 @@ fn create_path_beneath_rule<'fd>(
 
     if access.ioctl {
         // IoctlDev (v5, kernel ≥ 6.8) enforces ioctl() on character/block
-        // devices. Grant it for device paths so tcsetattr() on /dev/tty and
-        // /dev/pts/* succeeds — without it raw mode fails, the terminal stays
-        // in cooked/echo mode and Copilot's TUI hangs. Best-effort-stripped on
+        // devices. Grant it for device paths so tcsetattr() on /dev/tty
+        // succeeds — without it raw mode fails, the terminal stays in
+        // cooked/echo mode and Copilot's TUI hangs. Best-effort-stripped on
         // kernels < 6.8 where the right does not exist.
         access_flags |= AccessFs::IoctlDev;
     }

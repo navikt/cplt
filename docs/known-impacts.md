@@ -838,3 +838,47 @@ disabled_categories = ["telemetry_opt_out"]
 [proxy]
 blocked_domains = "none"   # disable the default blocklist entirely
 ```
+
+## Terminal devices and allocating a PTY
+
+The sandbox allows writing to a short list of device nodes: `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, and the `/dev/fd` subtree (which covers `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`). Reading under `/dev` stays open, with one exception: the numbered terminal devices, `/dev/ttysNNN` on macOS. On Linux the same rule removes every right on `/dev/pts`.
+
+Those numbered nodes each name one specific terminal, and on a normal desktop most of them belong to the user's *other* windows:
+
+- **Writing** one puts bytes straight into that window's display, so a sandboxed agent could forge output there or set the clipboard through an OSC 52 escape.
+- **Reading** one takes bytes out of that terminal's input queue. The agent captures what the user types in the other window, a passphrase or a pasted token included, and the program that was supposed to receive those keystrokes never sees them.
+
+`/dev/tty` stays readable and writable because it always resolves to the caller's own controlling terminal.
+
+Your own session is unaffected. cplt passes file descriptors 0, 1, and 2 straight through, and both Seatbelt and Landlock check the path when a device is opened, not on every read or write to a descriptor that is already open. Raw mode, colours, pagers, and window-size handling all keep working.
+
+Two things do change:
+
+| Operation                            | Impact             | Why                                                        |
+| ------------------------------------ | ------------------ | ---------------------------------------------------------- |
+| Your session's terminal, raw mode    | ✅ Works            | fds 0/1/2 are inherited; `/dev/tty` is the caller's own    |
+| `git log` pager, `less`, `node`, `stty`, `tput` | ✅ Works | they use the inherited terminal                            |
+| `script`, `script -q file cmd`       | ❌ Blocked          | calls `openpty()`, then opens the new slave by name        |
+| `pty.spawn()`, `pexpect`, `node-pty` | ❌ Blocked          | same call, same device                                     |
+| `tmux`, `screen`                     | ❌ Blocked          | one PTY per pane (`tmux` was already blocked by its socket in `$TMPDIR`) |
+| `stty -f "$(tty)"`, or anything that opens its own terminal by name | ❌ Blocked | the name is a numbered device; use the plain form, which works on fd 0 |
+
+### `expect` fails without failing
+
+`expect` deserves its own warning. It cannot allocate a PTY, but it does not exit non-zero when that happens. It prints
+
+```
+The system has no more ptys.  Ask your system administrator to create more.
+```
+
+on stderr and carries on to the next command, so `expect` returns 0 and a wrapper script around it looks like it passed. Nothing cplt can do changes that, it is `expect`'s own error handling. If a suite of yours drives `expect`, check its output rather than its exit code, or run it outside cplt.
+
+**Fix:** run the command that needs its own terminal outside cplt, or grant the device tree back for that one session:
+
+```bash
+cplt --allow-write /dev -- -p "run the pexpect suite"
+```
+
+One flag is enough: an `--allow-write` grant also emits the matching read allow, and `openpty()` needs both because it opens the new slave read-write.
+
+Be clear about what that flag buys: it restores read and write on every device node, including the terminals of your other windows. For the length of that session a compromised agent can print whatever it likes into them, set your clipboard, and read what you type in them. Prefer the first option, and keep the second for a single run rather than putting it in `config.toml`.
