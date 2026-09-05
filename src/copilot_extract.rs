@@ -132,15 +132,15 @@ pub fn ensure_copilot_extracted(
     for pass in 0..2 {
         // Snapshot existing extraction dirs so we can detect the new one.
         let dirs_before = extraction_dirs(&pkg_base);
-        let attempt =
-            run_extraction_attempt(copilot_bin, &pkg_base, &dirs_before).map_err(|e| {
+        let attempt = run_extraction_attempt(copilot_bin, &pkg_base, &project, &dirs_before)
+            .map_err(|e| {
                 format!(
                     "Failed to spawn copilot for extraction: {e}\n  \
                      Try running '{} --version' manually to trigger extraction",
                     copilot_bin.display(),
                 )
             })?;
-        let outcome = resolve_extraction(copilot_bin, &pkg_base, &dirs_before, &attempt);
+        let outcome = resolve_extraction(copilot_bin, &pkg_base, &project, &dirs_before, &attempt);
         if attempt.version.is_some() {
             reported_version = attempt.version;
         }
@@ -251,12 +251,64 @@ const EXTRACTION_ENV_ALLOWLIST: &[&str] = &[
 ///
 /// The binary itself is already guarded: `ensure_copilot_extracted` refuses to
 /// run a `copilot` that lives under the project directory.
+/// `PATH` with everything the untrusted project could have put there removed.
+///
+/// SECURITY: an npm-installed `copilot` is a `#!/usr/bin/env node` wrapper, so
+/// `PATH` decides which `node` actually executes — outside the sandbox, as the
+/// user. direnv, asdf and mise routinely prepend repo-local tool directories,
+/// and a `.envrc` is the project's to write, so passing `PATH` through verbatim
+/// would hand the project back the influence that clearing the environment and
+/// the working directory just took away. The binary guard above only checks
+/// where `copilot` itself lives, not what it goes on to run.
+///
+/// Dropped: entries under the project, relative entries (a bare `.`, or
+/// anything not absolute — both resolve against the cwd), and empty segments,
+/// which POSIX reads as the current directory.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sanitized_path(project: &Path) -> Option<std::ffi::OsString> {
+    sanitize_path_value(&std::env::var_os("PATH")?, project)
+}
+
+/// The filtering half of [`sanitized_path`], split out so it can be tested
+/// without mutating the process environment — `set_var` is global, and these
+/// tests share a binary with others that need a real `PATH`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sanitize_path_value(raw: &std::ffi::OsStr, project: &Path) -> Option<std::ffi::OsString> {
+    let kept: Vec<PathBuf> = std::env::split_paths(raw)
+        .filter(|entry| {
+            if entry.as_os_str().is_empty() || !entry.is_absolute() {
+                return false;
+            }
+            // Compare canonically where possible: a symlink into the project is
+            // still the project. An entry that cannot be resolved does not exist,
+            // so it cannot supply a binary either way; keep it rather than let a
+            // stat failure silently shorten PATH.
+            match entry.canonicalize() {
+                Ok(resolved) => !resolved.starts_with(project),
+                Err(_) => true,
+            }
+        })
+        .collect();
+    std::env::join_paths(kept).ok()
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::disallowed_methods)] // resolved agent binary path, and the only extraction spawn that sets cwd + env
-fn extraction_command(copilot_bin: &Path, args: &[&str], pkg_base: &Path) -> std::process::Command {
+fn extraction_command(
+    copilot_bin: &Path,
+    args: &[&str],
+    pkg_base: &Path,
+    project: &Path,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new(copilot_bin);
     cmd.args(args).env_clear().current_dir(pkg_base);
     for var in EXTRACTION_ENV_ALLOWLIST {
+        if *var == "PATH" {
+            if let Some(path) = sanitized_path(project) {
+                cmd.env("PATH", path);
+            }
+            continue;
+        }
         if let Some(value) = std::env::var_os(var) {
             cmd.env(var, value);
         }
@@ -280,13 +332,19 @@ fn extraction_command(copilot_bin: &Path, args: &[&str], pkg_base: &Path) -> std
 fn run_extraction_attempt(
     copilot_bin: &Path,
     pkg_base: &Path,
+    project: &Path,
     dirs_before: &std::collections::HashSet<String>,
 ) -> Result<ExtractionAttempt, std::io::Error> {
-    let mut child = extraction_command(copilot_bin, &["--no-auto-update", "--version"], pkg_base)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    let mut child = extraction_command(
+        copilot_bin,
+        &["--no-auto-update", "--version"],
+        pkg_base,
+        project,
+    )
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .spawn()?;
     let mut child_stdout = child.stdout.take();
 
     // Poll for extraction completion. We check for both:
@@ -320,7 +378,8 @@ fn run_extraction_attempt(
             }
             if extracted_dir_name.is_none() && !status.success() {
                 // Process failed — try fallback with `-p exit`
-                extracted_dir_name = try_extraction_fallback(copilot_bin, pkg_base, dirs_before);
+                extracted_dir_name =
+                    try_extraction_fallback(copilot_bin, pkg_base, project, dirs_before);
             }
             break;
         }
@@ -384,6 +443,7 @@ enum ExtractionOutcome {
 fn resolve_extraction(
     copilot_bin: &Path,
     pkg_base: &Path,
+    project: &Path,
     dirs_before: &std::collections::HashSet<String>,
     attempt: &ExtractionAttempt,
 ) -> ExtractionOutcome {
@@ -411,7 +471,7 @@ fn resolve_extraction(
 
     // Last resort: if no complete dir exists, try `-p exit` which forces full
     // startup (and thus extraction) in case --version uses a lazy code path.
-    if let Some(name) = try_extraction_fallback(copilot_bin, pkg_base, dirs_before) {
+    if let Some(name) = try_extraction_fallback(copilot_bin, pkg_base, project, dirs_before) {
         return ExtractionOutcome::Extracted(name);
     }
     match complete_dir_for(pkg_base, attempt.version.as_deref()) {
@@ -513,13 +573,19 @@ fn extraction_failure_message(
 fn try_extraction_fallback(
     copilot_bin: &Path,
     pkg_base: &Path,
+    project: &Path,
     dirs_before: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    let child = extraction_command(copilot_bin, &["--no-auto-update", "-p", "exit"], pkg_base)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let child = extraction_command(
+        copilot_bin,
+        &["--no-auto-update", "-p", "exit"],
+        pkg_base,
+        project,
+    )
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn();
 
     let Ok(mut child) = child else {
         return None;
@@ -1130,6 +1196,64 @@ mod copilot_extraction_tests {
             std::env::vars().any(|(name, _)| !allowed.contains(name.as_str())),
             "the test process environment is too clean to prove anything",
         );
+    }
+
+    /// PATH decides which `node` an npm-installed `copilot` shebang wrapper
+    /// runs, outside the sandbox. direnv and asdf routinely prepend repo-local
+    /// tool dirs, and `.envrc` belongs to the project, so passing PATH through
+    /// verbatim would hand back the influence that clearing cwd and env removed.
+    #[test]
+    fn sanitized_path_drops_everything_the_project_controls() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cplt-path-sanitize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let project = tmp.join("project");
+        let node_bin = project.join("node_modules/.bin");
+        let safe = tmp.join("usr-bin");
+        std::fs::create_dir_all(&node_bin).expect("node bin");
+        std::fs::create_dir_all(&safe).expect("safe bin");
+        let project = project.canonicalize().expect("canonical project");
+
+        // A project dir, a relative entry, an empty segment, and one safe entry.
+        let raw = std::env::join_paths([
+            node_bin.as_path(),
+            Path::new("."),
+            Path::new(""),
+            safe.as_path(),
+        ])
+        .expect("join");
+
+        // SAFETY: single-threaded assertion on a value read once, immediately.
+        let kept = sanitize_path_value(&raw, &project).expect("non-empty PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&kept).collect();
+
+        // Compare canonically. On macOS the temp dir is reached through the
+        // /var -> /private/var symlink, so a raw `starts_with` against the
+        // canonicalized project is false for a surviving project entry and the
+        // assertion would pass without testing anything (it did, until a
+        // mutation that removed the filter failed to turn this test red).
+        assert!(
+            !entries
+                .iter()
+                .filter_map(|e| e.canonicalize().ok())
+                .any(|e| e.starts_with(&project)),
+            "a PATH entry under the project survived sanitizing: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| !e.is_absolute()),
+            "a relative PATH entry survived sanitizing: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e == &safe),
+            "the safe entry must survive, or copilot cannot find node: {entries:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// The SEA loader resolves its extraction directory from these, in this
