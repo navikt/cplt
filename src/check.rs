@@ -34,6 +34,8 @@ use crate::proxy::{self, NetPolicy, NetVerdict};
 use crate::sandbox::{
     DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, FsAccess, LandlockPolicy,
 };
+#[cfg(target_os = "macos")]
+use crate::sandbox::{PathBinDir, path_bin_dirs};
 
 /// Ground-truth (or, for static-only queries, policy) decision for one probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -231,6 +233,93 @@ pub fn explain_path(
         reason,
         fix,
     }
+}
+
+/// The most specific tree the sandbox makes **writable** that contains `path`,
+/// if any.
+///
+/// Asked of the emitted `fs_rules` — the same model [`explain_path`] reports
+/// from and the one `assemble_sandbox` hands to `cplt check` — rather than a
+/// hand-kept list of writable locations, so the answer cannot drift from the
+/// grants those rules carry. Longest match wins, matching `explain_path`'s
+/// `matched_rule`: the innermost rule is the one a caller can act on.
+///
+/// **What this accounts for, exactly.** The `fs_rules` grants, minus one
+/// enforced subtraction: the macOS `path_bin_dirs` write-denies (see
+/// [`write_denied`]). It is *not* a reflection of every write-deny the SBPL
+/// profile emits — `~/.gradle/jdks`, the DOTNET subdirs, the write-then-exec
+/// cache denies and the `.git` denies all narrow the real policy further and
+/// are not subtracted here. Those omissions can only make this over-report (a
+/// path called writable that macOS in fact denies), never under-report, so a
+/// caller warning on `Some` warns spuriously at worst. Subtracting the rest
+/// would mean modelling the profile's regex denies, which is a larger change
+/// than this predicate's callers need.
+///
+/// Two platform asymmetries, both of them the module doc's "the probe is
+/// authoritative" caveat in miniature:
+///
+/// - macOS re-denies write across the PATH-resolved bin/shim directories
+///   (`emit_path_bin_denies`, last-match-wins), and Landlock cannot express
+///   that. Those are subtracted here from the same `path_bin_dirs` list the
+///   profile emits, so a mise- or bun-installed binary is correctly reported
+///   read-only on macOS and correctly reported writable on Linux, where it is.
+/// - On Linux the bubblewrap overlay re-binds mise's `shims/` and `installs/`
+///   read-only, which would make some of those safe again — not subtracted,
+///   because bwrap is absent on any host without user namespaces and degrades
+///   at spawn time, so the grant may well stand.
+#[must_use]
+pub fn writable_tree_over(policy: &LandlockPolicy, home: &Path, path: &Path) -> Option<PathBuf> {
+    if write_denied(home, path) {
+        return None;
+    }
+    policy
+        .fs_rules
+        .iter()
+        .filter(|r| r.access.write && within(path, &r.path))
+        .map(|r| r.path.clone())
+        .max_by_key(|p| p.as_os_str().len())
+}
+
+/// The usual install locations that *this* policy keeps non-writable, for a
+/// binary called `file_name`.
+///
+/// "Read-only" is a property of the resolved policy, not of the path: an
+/// `allow.write` grant can make `~/.local/bin` writable for a run, and a
+/// warning that then tells the user to install there would contradict the very
+/// predicate it fired on. Asked of [`writable_tree_over`], so it cannot.
+#[must_use]
+pub fn read_only_install_dirs(
+    policy: &LandlockPolicy,
+    home: &Path,
+    file_name: &std::ffi::OsStr,
+) -> Vec<PathBuf> {
+    [
+        home.join(".local/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+    ]
+    .into_iter()
+    .filter(|d| writable_tree_over(policy, home, &d.join(file_name)).is_none())
+    .collect()
+}
+
+/// Whether a write **deny** the platform actually enforces covers `path`.
+///
+/// macOS only: SBPL is last-match-wins, so `emit_path_bin_denies` genuinely
+/// takes write back across those trees. Landlock cannot subtract from an
+/// allowed tree, so on Linux there is nothing to subtract.
+#[cfg(target_os = "macos")]
+fn write_denied(home: &Path, path: &Path) -> bool {
+    path_bin_dirs(home).iter().any(|d| match d {
+        PathBinDir::Subtree(p) => within(path, p),
+        // Anchored to one component, like the regex the profile emits.
+        PathBinDir::TopLevel(p) => path.parent() == Some(p.as_path()),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_denied(_home: &Path, _path: &Path) -> bool {
+    false
 }
 
 // ── Layer 2: network explain ───────────────────────────────────
