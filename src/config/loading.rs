@@ -583,38 +583,104 @@ fn grants_over_trusted_paths(
 ///
 /// Built here rather than at the call site so the wording — including the one
 /// thing a format string gets wrong every time, pluralisation — is testable.
-pub fn exec_tool_dir_warning(granted: &Path, dirs: &[String]) -> String {
+pub fn exec_tool_dir_warning(
+    granted: &Path,
+    dirs: &[String],
+    home: &Path,
+    agent_dirs: &[crate::agent::AgentDir],
+) -> String {
     let list = dirs.join(", ");
-    // Two different overlaps, and the user can only act on the right one: a
-    // grant *inside* the tool dir and a grant that swallows it are the same
-    // shadowing seen from opposite ends.
-    let overlap = if dirs.iter().any(|d| granted.starts_with(d)) {
+    let noun = if dirs.len() == 1 {
+        "directory"
+    } else {
+        "directories"
+    };
+    // Three ways the grant and the directory can overlap, and the user can only
+    // act on the right one: the grant *is* the directory, sits inside it, or
+    // swallows it. The first is the common shape for an agent config dir, whose
+    // whole path is what someone puts in `allow.write`.
+    let overlap = if dirs.len() == 1 && Path::new(&dirs[0]) == granted {
+        format!("allow.write grants the executable {noun} {list} itself.")
+    } else if dirs.iter().any(|d| granted.starts_with(d)) {
         format!(
             "allow.write grants {} — inside the executable tool directory {list}.",
             granted.display()
         )
     } else {
-        let noun = if dirs.len() == 1 {
-            "directory"
-        } else {
-            "directories"
-        };
         format!(
             "allow.write grants {}, which contains the executable tool {noun} {list}.",
             granted.display()
         )
     };
+    // The Linux half is only true where the *grant* is what pairs write with
+    // execute. A directory already writable by default is write+execute on
+    // Linux with or without the grant, so telling its owner to narrow the grant
+    // to close a hole would send them after a hole the grant did not open.
+    let (unchanged, gap): (Vec<&String>, Vec<&String>) = dirs
+        .iter()
+        .partition(|d| default_writable(Path::new(d.as_str()), home, agent_dirs));
+    let join = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+    use std::fmt::Write as _;
+    let mut linux = String::new();
+    if !gap.is_empty() {
+        let stays = if gap.len() == 1 { "stays" } else { "stay" };
+        let _ = write!(
+            linux,
+            " On Linux, Landlock cannot subtract a grant, so {} {stays} writable AND \
+             executable instead — the hole this deny closes on macOS is left open there.",
+            join(&gap)
+        );
+    }
+    if !unchanged.is_empty() {
+        let is = if unchanged.len() == 1 { "is" } else { "are" };
+        let _ = write!(
+            linux,
+            " On Linux {} {is} writable by default, with or without this grant, so \
+             nothing changes there and only macOS is affected.",
+            join(&unchanged)
+        );
+    }
     format!(
         "{overlap}\n  \
          cplt denies execute across an allow.write tree, because a tree that is both \
          writable and executable lets an agent drop a binary and run it. On macOS that \
          deny is enforced, so binaries under the tool directory will not run in this \
-         session. On Linux, Landlock cannot subtract a grant, so the tree stays \
-         writable AND executable instead — the hole this deny closes on macOS is left \
-         open there.\n  \
+         session.{linux}\n  \
          Narrow the write grant so it does not cover the tool directory, or use \
          allow.exec on a tree that does not overlap it."
     )
+}
+
+/// Is `path` writable by default — before any `allow.write` grant — through its
+/// own rule or an ancestor's?
+///
+/// Landlock unions a path's ancestors rather than letting a later rule subtract
+/// from an earlier one (see the `EXEC_IN_WRITABLE` and cache carve-out comments
+/// in `sandbox_landlock.rs`), so a `process_exec` directory sitting under a
+/// writable tree is already writable AND executable on Linux. Every agent
+/// directory candidate #343 added has that shape: `~/.copilot` is `write: true`
+/// itself, and `~/.pi/agent/bin` and `~/.cache/opencode/bin` inherit write from
+/// `~/.pi/agent` and `~/.cache`.
+///
+/// Derived from the *write* side of the same three sources the exec candidates
+/// come from, so it cannot drift into a second hand-maintained list.
+fn default_writable(path: &Path, home: &Path, agent_dirs: &[crate::agent::AgentDir]) -> bool {
+    crate::sandbox::HOME_TOOL_DIRS
+        .iter()
+        .filter(|d| d.write)
+        .map(|d| home.join(d.path))
+        .chain(
+            crate::sandbox::app_dirs()
+                .iter()
+                .flat_map(|a| a.write_paths(home)),
+        )
+        .chain(
+            agent_dirs
+                .iter()
+                .filter(|d| d.write)
+                .map(|d| d.path.clone()),
+        )
+        .any(|w| path.starts_with(&w))
 }
 
 /// Which `allow.write` grants overlap one of `paths`, in either direction, as
@@ -779,12 +845,14 @@ impl Resolved {
     /// become `ToolRoot`s rather than `allow.write` grants (#152), so they
     /// cannot be the grant this warning is about.
     ///
-    /// `agent_dirs` is the active agent's own directories, which lose execute
-    /// the same way (#343): `~/.pi/agent/bin` and `~/.cache/opencode/bin` are
+    /// `agent_dirs` is the agent's own directories, which lose execute the same
+    /// way on macOS (#343): `~/.pi/agent/bin` and `~/.cache/opencode/bin` are
     /// `process_exec` with a writable parent, so `allow.write = ["~/.pi"]`
-    /// withdraws exec from the managed binaries the agent expects to run. They
-    /// are passed in rather than derived here because the set depends on the
-    /// resolved agent, which `Resolved` does not know.
+    /// withdraws exec from the managed binaries the agent expects to run. On
+    /// Linux those are already write+execute through the ancestor union and the
+    /// grant takes nothing away — [`exec_tool_dir_warning`] says which case each
+    /// directory is. They are passed in rather than derived here because the set
+    /// depends on which agent's profile is built, which `Resolved` does not know.
     #[must_use]
     pub fn write_grants_over_exec_tool_dirs(
         &self,
@@ -810,6 +878,23 @@ impl Resolved {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         grants_overlapping(&self.allow_write, &dirs)
+    }
+
+    /// Every rendered launch warning about an `allow.write` grant shadowing a
+    /// directory this run grants execute on.
+    ///
+    /// Takes the agent whose profile is actually built, not the one auto-detected
+    /// for the session. `cplt exec` and `cplt check` always build the Shell
+    /// profile, so naming Copilot's `~/.copilot` there would blame a grant for
+    /// an effect a session that never emits Copilot's rules cannot have (#343).
+    #[must_use]
+    pub fn exec_tool_dir_warnings(&self, home: &Path, agent: crate::agent::Agent) -> Vec<String> {
+        let mut agent_dirs = agent.config_dirs(home);
+        crate::agent::canonicalize_agent_dirs(&mut agent_dirs);
+        self.write_grants_over_exec_tool_dirs(home, &agent_dirs)
+            .into_iter()
+            .map(|(granted, dirs)| exec_tool_dir_warning(&granted, &dirs, home, &agent_dirs))
+            .collect()
     }
 
     /// Print comprehensive sandbox configuration summary to stderr.
@@ -2194,7 +2279,8 @@ validate = false
     #[test]
     fn exec_tool_dir_warning_pluralises_both_ways() {
         let granted = PathBuf::from("/home/u");
-        let one = exec_tool_dir_warning(&granted, &["/home/u/.rustup".to_string()]);
+        let home = PathBuf::from("/home/u");
+        let one = exec_tool_dir_warning(&granted, &["/home/u/.rustup".to_string()], &home, &[]);
         assert!(
             one.contains("contains the executable tool directory /home/u/.rustup."),
             "one shadowed dir must read \"directory\": {one}"
@@ -2203,6 +2289,8 @@ validate = false
         let many = exec_tool_dir_warning(
             &granted,
             &["/home/u/.rustup".to_string(), "/home/u/.nvm".to_string()],
+            &home,
+            &[],
         );
         assert!(
             many.contains(
@@ -2217,6 +2305,100 @@ validate = false
         }
     }
 
+    /// #343 review: the Linux sentence was unconditional, and it is false for
+    /// every agent directory the same change added. Landlock unions a path's
+    /// ancestors, so a `process_exec` dir under a writable tree is already
+    /// write+execute there and the grant takes nothing away — telling its owner
+    /// the grant opened a hole sends them to drop a grant that changes nothing.
+    /// Asserted per directory, including the mixed grant that covers both kinds.
+    #[test]
+    fn exec_tool_dir_warning_scopes_the_linux_sentence_to_where_it_is_true() {
+        let home = PathBuf::from("/home/u");
+        let copilot = crate::agent::AgentDir {
+            path: home.join(".copilot"),
+            write: true,
+            map_exec: true,
+            process_exec: true,
+            write_files: vec![],
+        };
+        let rustup = home.join(".rustup").to_string_lossy().into_owned();
+        let copilot_dir = copilot.path.to_string_lossy().into_owned();
+        // Inherits write from the `.cache` HOME_TOOL_DIRS entry, not from a
+        // rule of its own — the ancestor half of the same question.
+        let opencode = home
+            .join(".cache/opencode/bin")
+            .to_string_lossy()
+            .into_owned();
+
+        // Not writable by default: the grant really is what pairs write with
+        // execute, and Landlock really cannot take it back.
+        let w = exec_tool_dir_warning(
+            &home,
+            std::slice::from_ref(&rustup),
+            &home,
+            std::slice::from_ref(&copilot),
+        );
+        assert!(
+            w.contains(&format!("so {rustup} stays writable AND executable")),
+            "a dir that is read-only by default keeps the Linux hole sentence: {w}"
+        );
+        assert!(
+            !w.contains("writable by default"),
+            "nothing here is writable by default: {w}"
+        );
+
+        // Writable by default through its own rule, and through an ancestor's.
+        for (dir, dirs) in [
+            (&copilot_dir, vec![copilot_dir.clone()]),
+            (&opencode, vec![opencode.clone()]),
+        ] {
+            let w = exec_tool_dir_warning(&home, &dirs, &home, std::slice::from_ref(&copilot));
+            assert!(
+                !w.contains("left open there"),
+                "the grant opens no hole on Linux for {dir}: {w}"
+            );
+            assert!(
+                w.contains(&format!("On Linux {dir} is writable by default")),
+                "say what Linux actually does for {dir}: {w}"
+            );
+        }
+
+        // One grant over both kinds: each sentence names only its own dirs.
+        let both = exec_tool_dir_warning(
+            &home,
+            &[rustup.clone(), copilot_dir.clone()],
+            &home,
+            std::slice::from_ref(&copilot),
+        );
+        assert!(
+            both.contains(&format!("so {rustup} stays writable AND executable")),
+            "the hole sentence must name only the dir it is true for: {both}"
+        );
+        assert!(
+            both.contains(&format!("On Linux {copilot_dir} is writable by default")),
+            "the no-op sentence must name only the dir it is true for: {both}"
+        );
+    }
+
+    /// The nit the same review found: `granted.starts_with(dir)` is true when
+    /// they are equal, so `allow.write = ["~/.copilot"]` rendered "grants
+    /// /home/u/.copilot — inside the executable tool directory /home/u/.copilot".
+    /// Granting an agent's config dir by its own full path is the common shape.
+    #[test]
+    fn exec_tool_dir_warning_names_a_grant_on_the_directory_itself() {
+        let granted = PathBuf::from("/home/u/.copilot");
+        let w = exec_tool_dir_warning(
+            &granted,
+            &["/home/u/.copilot".to_string()],
+            &PathBuf::from("/home/u"),
+            &[],
+        );
+        assert!(
+            w.contains("grants the executable directory /home/u/.copilot itself."),
+            "a grant equal to the directory must not read as \"inside\" it: {w}"
+        );
+    }
+
     /// A grant *inside* a tool dir is the same shadowing from the other end,
     /// and gets the wording the user can act on — no pluralisation involved,
     /// since the grant sits in exactly one tree.
@@ -2225,6 +2407,8 @@ validate = false
         let w = exec_tool_dir_warning(
             &PathBuf::from("/home/u/.rustup/toolchains"),
             &["/home/u/.rustup".to_string()],
+            &PathBuf::from("/home/u"),
+            &[],
         );
         assert!(
             w.contains("inside the executable tool directory /home/u/.rustup."),

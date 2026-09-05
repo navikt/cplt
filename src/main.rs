@@ -1305,6 +1305,23 @@ struct ResolvedContext {
     unapproved_proposals: Vec<String>,
 }
 
+/// Warn about `allow.write` grants that shadow a directory this run grants
+/// execute on (#243, #343).
+///
+/// `agent` is the agent whose profile is actually built, not the one detected
+/// for the session: `cplt exec` and `cplt check` always build Shell, and a
+/// warning naming Copilot's `~/.copilot` there would describe an effect that
+/// session cannot have.
+fn warn_exec_tool_dir_shadowing(
+    resolved: &config::Resolved,
+    home_dir: &std::path::Path,
+    agent: agent::Agent,
+) {
+    for w in resolved.exec_tool_dir_warnings(home_dir, agent) {
+        ui::warn(&w);
+    }
+}
+
 /// Load config, merge CLI flags, resolve paths, detect agent, print info messages.
 fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContext> {
     // Canonicalize CLI paths for consistency with config path handling
@@ -1729,24 +1746,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
     if !resolved.quiet {
         ui::info(&format!("Agent:    {}", active_agent.display_name()));
-    }
-
-    // #243 closed the write-then-exec hole by denying process-exec across an
-    // allow.write tree. Nothing is dropped — the write grant is honoured in
-    // full — but a tool directory swallowed by that grant loses the execute
-    // right it had by default, and the tool then fails with nothing pointing
-    // back at the grant. Narrow: only fires where a process-exec tool dir is
-    // actually shadowed, so the ordinary `allow.write` on a work tree is silent.
-    // After agent resolution, not with the other grant warnings above, because
-    // the agent's own exec dirs are part of the candidate set (#343) and they
-    // depend on which agent is running. Canonicalized to match `allow.write`,
-    // which `resolve_config_path` already resolved.
-    {
-        let mut agent_dirs = active_agent.config_dirs(&home_dir);
-        agent::canonicalize_agent_dirs(&mut agent_dirs);
-        for (granted, dirs) in resolved.write_grants_over_exec_tool_dirs(&home_dir, &agent_dirs) {
-            ui::warn(&cplt::config::exec_tool_dir_warning(&granted, &dirs));
-        }
     }
 
     // Hint about API keys for agents that need them
@@ -2620,6 +2619,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(&cli, false)?;
+
+    warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
 
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -3623,6 +3624,11 @@ fn run_exec_command(
     // Always use the Shell sandbox policy
     let active_agent = agent::Agent::Shell;
 
+    // Shell, not the agent `resolve_context` detected: exec builds the Shell
+    // profile, so a warning about another agent's directories would name an
+    // effect this session cannot have (#343).
+    warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
+
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
     // with `cplt check`, which runs its probes under the identical policy.
     let AssembledSandbox {
@@ -4006,6 +4012,9 @@ fn run_check_command(
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(cli, true)?;
+
+    // Shell, not `active_agent`: `check` probes under the Shell profile.
+    warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
 
     // check prints its own report; never prompt.
     resolved.yes = true;
