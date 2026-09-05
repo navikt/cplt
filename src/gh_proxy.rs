@@ -1437,6 +1437,7 @@ fn extract_repo_from_api_path(endpoint: &str) -> Option<String> {
 /// session's planted `git` executing as the user. `git config` executes nothing, so
 /// the shared `-c` overrides would add no security here. If this ever grows a
 /// subcommand that reads working-tree content, move it onto the shared path.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 pub fn detect_current_repo(real_git: &Path, project_dir: &Path) -> Result<String, String> {
     let mut command = std::process::Command::new(real_git);
     for (key, _) in std::env::vars_os() {
@@ -2670,6 +2671,7 @@ fn repo_target_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Resolve the current git branch of the repository `repo_args` targets.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn resolve_current_branch(real_git: &Path, repo_args: &[&str]) -> Option<String> {
     let output = std::process::Command::new(real_git)
         .args(repo_args)
@@ -2693,6 +2695,7 @@ fn resolve_current_branch(real_git: &Path, repo_args: &[&str]) -> Option<String>
 /// `None` when the remote does not exist, git fails, or no git binary is
 /// available — every caller treats that as "cannot prove identity" and fails
 /// closed.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn resolve_remote_url(real_git: &Path, repo_args: &[&str], remote: &str) -> Option<String> {
     // `--` guards against a remote name that looks like a flag.
     let output = std::process::Command::new(real_git)
@@ -2719,6 +2722,7 @@ fn resolve_remote_url(real_git: &Path, repo_args: &[&str], remote: &str) -> Opti
 /// ../other-repo push` is judged against *that* repo's default branch (#215).
 ///
 /// `None` when the symref is missing, the remote does not exist, or git fails.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn resolve_default_branch(real_git: &Path, repo_args: &[&str], remote: &str) -> Option<String> {
     // The ref name is always `refs/…`-prefixed, so a remote called `-x` cannot
     // turn into a flag here.
@@ -2924,6 +2928,7 @@ exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
 

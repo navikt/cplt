@@ -659,6 +659,7 @@ pub fn run<F: FnOnce() -> u8>(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
     use std::process::Command;

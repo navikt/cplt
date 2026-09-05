@@ -202,6 +202,7 @@ struct ExtractionAttempt {
 /// version-less fallback would accept any stale directory as proof — then cache
 /// that false positive against the binary's identity.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::disallowed_methods)] // spawns the resolved agent binary path, not a bare name
 fn run_extraction_attempt(
     copilot_bin: &Path,
     pkg_base: &Path,
@@ -436,6 +437,7 @@ fn extraction_failure_message(
 
 /// Try a fallback extraction method using `-p exit` (works on older Copilot versions).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::disallowed_methods)] // spawns the resolved agent binary path, not a bare name
 fn try_extraction_fallback(
     copilot_bin: &Path,
     pkg_base: &Path,
@@ -638,6 +640,7 @@ fn find_complete_dir_for_version(pkg_base: &Path, version: &str) -> Option<Strin
 /// under test is `cfg(any(macos, linux))`, so there is nothing to skip on
 /// Windows, and both macOS and Linux CI run every case here.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod copilot_extraction_tests {
     use super::*;

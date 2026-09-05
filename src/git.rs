@@ -553,6 +553,7 @@ fn insert_diff_flags<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// Pass `Path::new(".")` for the call sites that intentionally query the
 /// process working directory rather than a specific project.
 #[must_use]
+#[allow(clippy::disallowed_methods)] // the sanctioned path itself: trusted_git() is what every other site routes through
 pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
     if leading_globals(args)
         .iter()
@@ -594,6 +595,7 @@ pub fn command(project_dir: &Path, args: &[&str]) -> Option<Command> {
 /// no repo config to fear in that case, and the caller's own git call will fail
 /// on its own terms.
 #[must_use]
+#[allow(clippy::disallowed_methods)] // git resolved by trusted_git() immediately above
 pub fn repo_defines_content_filter(project_dir: &Path) -> bool {
     let Some(git) = trusted_git() else {
         return false;
