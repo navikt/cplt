@@ -940,15 +940,38 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             // loudly, which is the right way round: a guard that has stopped
             // working says so, where a silently writable-and-executable cplt
             // binary does not.
-            Some(tree) => crate::ui::warn(&format!(
-                "the cplt binary at {} sits under {}, which the sandbox makes writable. \
-                 Granting it execute would let the agent overwrite cplt and run it, so the \
-                 grant is skipped and the gh and git guard wrappers cannot re-execute cplt \
-                 — every guarded command will fail with \"Permission denied\". Install cplt \
-                 outside that tree (~/.local/bin or /usr/local/bin) and rerun.",
-                cplt_bin.display(),
-                tree.path.display()
-            )),
+            Some(tree) => {
+                // Same rule set the finding came from, so the suggestion cannot
+                // name a location this run's `allow.write` has made writable.
+                let safe: Vec<String> = ["/usr/local/bin", "~/.local/bin"]
+                    .iter()
+                    .map(|d| {
+                        let expanded = d
+                            .strip_prefix("~/")
+                            .map_or_else(|| std::path::PathBuf::from(d), |rel| home.join(rel));
+                        (d, expanded.join("cplt"))
+                    })
+                    .filter(|(_, probe)| writable_non_exec_tree_over(&fs_rules, probe).is_none())
+                    .map(|(d, _)| (*d).to_string())
+                    .collect();
+                let advice = if safe.is_empty() {
+                    "Install cplt outside that tree, or drop the write grant covering it, and rerun."
+                        .to_string()
+                } else {
+                    format!(
+                        "Install cplt outside that tree ({}) and rerun.",
+                        safe.join(" or ")
+                    )
+                };
+                crate::ui::warn(&format!(
+                    "the cplt binary at {} sits under {}, which the sandbox makes writable. \
+                     Granting it execute would let the agent overwrite cplt and run it, so the \
+                     grant is skipped and the gh and git guard wrappers cannot re-execute cplt \
+                     — every guarded command will fail with \"Permission denied\". {advice}",
+                    cplt_bin.display(),
+                    tree.path.display()
+                ));
+            }
             None => fs_rules.push(FsRule {
                 path: cplt_bin,
                 access: FsAccess {

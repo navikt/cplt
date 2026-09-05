@@ -240,9 +240,20 @@ pub fn explain_path(
 ///
 /// Asked of the emitted `fs_rules` — the same model [`explain_path`] reports
 /// from and the one `assemble_sandbox` hands to `cplt check` — rather than a
-/// hand-kept list of writable locations, so the answer cannot drift from what
-/// the backends grant. Longest match wins, matching `explain_path`'s
+/// hand-kept list of writable locations, so the answer cannot drift from the
+/// grants those rules carry. Longest match wins, matching `explain_path`'s
 /// `matched_rule`: the innermost rule is the one a caller can act on.
+///
+/// **What this accounts for, exactly.** The `fs_rules` grants, minus one
+/// enforced subtraction: the macOS `path_bin_dirs` write-denies (see
+/// [`write_denied`]). It is *not* a reflection of every write-deny the SBPL
+/// profile emits — `~/.gradle/jdks`, the DOTNET subdirs, the write-then-exec
+/// cache denies and the `.git` denies all narrow the real policy further and
+/// are not subtracted here. Those omissions can only make this over-report (a
+/// path called writable that macOS in fact denies), never under-report, so a
+/// caller warning on `Some` warns spuriously at worst. Subtracting the rest
+/// would mean modelling the profile's regex denies, which is a larger change
+/// than this predicate's callers need.
 ///
 /// Two platform asymmetries, both of them the module doc's "the probe is
 /// authoritative" caveat in miniature:
@@ -267,6 +278,29 @@ pub fn writable_tree_over(policy: &LandlockPolicy, home: &Path, path: &Path) -> 
         .filter(|r| r.access.write && within(path, &r.path))
         .map(|r| r.path.clone())
         .max_by_key(|p| p.as_os_str().len())
+}
+
+/// The usual install locations that *this* policy keeps non-writable, for a
+/// binary called `file_name`.
+///
+/// "Read-only" is a property of the resolved policy, not of the path: an
+/// `allow.write` grant can make `~/.local/bin` writable for a run, and a
+/// warning that then tells the user to install there would contradict the very
+/// predicate it fired on. Asked of [`writable_tree_over`], so it cannot.
+#[must_use]
+pub fn read_only_install_dirs(
+    policy: &LandlockPolicy,
+    home: &Path,
+    file_name: &std::ffi::OsStr,
+) -> Vec<PathBuf> {
+    [
+        home.join(".local/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+    ]
+    .into_iter()
+    .filter(|d| writable_tree_over(policy, home, &d.join(file_name)).is_none())
+    .collect()
 }
 
 /// Whether a write **deny** the platform actually enforces covers `path`.

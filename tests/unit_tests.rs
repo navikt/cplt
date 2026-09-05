@@ -8410,3 +8410,34 @@ fn a_mise_installed_agent_is_a_finding_only_where_the_deny_cannot_hold() {
         );
     }
 }
+
+/// The warning tells the user where to move the binary, and that advice is a
+/// claim about the resolved policy — not about the path. An `allow.write` over
+/// `~/.local/bin` makes it writable for the run, and the suggestion must drop
+/// it rather than send the user somewhere the same predicate would flag.
+#[test]
+fn install_advice_drops_a_location_the_run_makes_writable() {
+    let home = std::path::Path::new("/Users/test");
+    let name = std::ffi::OsStr::new("copilot");
+
+    let plain = generate_policy(&base_profile_options());
+    assert!(
+        cplt::check::read_only_install_dirs(&plain, home, name).contains(&home.join(".local/bin")),
+        "~/.local/bin is read-only by default and must be offered"
+    );
+
+    let granted = home.join(".local/bin");
+    let mut opts = base_profile_options();
+    let writes = [granted.clone()];
+    opts.extra_write = &writes;
+    let policy = generate_policy(&opts);
+
+    assert!(
+        cplt::check::writable_tree_over(&policy, home, &granted.join("copilot")).is_some(),
+        "the grant makes it writable, so the warning would fire there"
+    );
+    assert!(
+        !cplt::check::read_only_install_dirs(&policy, home, name).contains(&granted),
+        "advice must not name a location this run makes writable"
+    );
+}

@@ -2704,12 +2704,30 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // grant write, and not gated on `quiet` — it is a sandbox-boundary warning,
     // not progress chatter.
     if let Some(tree) = cplt::check::writable_tree_over(&policy, &home_dir, &agent_bin) {
+        // The suggested destinations come from the same predicate that fired,
+        // so the advice cannot contradict the finding: with an `allow.write`
+        // over ~/.local/bin, ~/.local/bin is not offered.
+        let file_name = agent_bin
+            .file_name()
+            .unwrap_or_else(|| active_agent.binary_name().as_ref());
+        let safe = cplt::check::read_only_install_dirs(&policy, &home_dir, file_name);
+        let advice = if safe.is_empty() {
+            "Move it out of that tree, or drop the write grant that covers it, and rerun."
+                .to_string()
+        } else {
+            format!(
+                "Install it somewhere this run keeps read-only ({}) and rerun.",
+                safe.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         ui::warn(&format!(
             "the {active_agent} binary at {} sits under {}, which the sandbox makes writable. \
              cplt spawns the agent binary OUTSIDE the sandbox, as you, so an agent that \
              rewrites it there gets unsandboxed execution on your next cplt launch — no \
-             approval, no prompt. Install it somewhere the sandbox keeps read-only \
-             (~/.local/bin, /usr/local/bin, or a Homebrew prefix) and rerun.",
+             approval, no prompt. {advice}",
             agent_bin.display(),
             tree.display()
         ));
