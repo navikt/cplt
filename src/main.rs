@@ -1652,16 +1652,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         ));
     }
 
-    // #243 closed the write-then-exec hole by denying process-exec across an
-    // allow.write tree. Nothing is dropped — the write grant is honoured in
-    // full — but a tool directory swallowed by that grant loses the execute
-    // right it had by default, and the tool then fails with nothing pointing
-    // back at the grant. Narrow: only fires where a process-exec tool dir is
-    // actually shadowed, so the ordinary `allow.write` on a work tree is silent.
-    for (granted, dirs) in resolved.write_grants_over_exec_tool_dirs(&home_dir) {
-        ui::warn(&cplt::config::exec_tool_dir_warning(&granted, &dirs));
-    }
-
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
     if !unapproved_proposals.is_empty() && !resolved.quiet {
         ui::warn(&format!(
@@ -1739,6 +1729,24 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 
     if !resolved.quiet {
         ui::info(&format!("Agent:    {}", active_agent.display_name()));
+    }
+
+    // #243 closed the write-then-exec hole by denying process-exec across an
+    // allow.write tree. Nothing is dropped — the write grant is honoured in
+    // full — but a tool directory swallowed by that grant loses the execute
+    // right it had by default, and the tool then fails with nothing pointing
+    // back at the grant. Narrow: only fires where a process-exec tool dir is
+    // actually shadowed, so the ordinary `allow.write` on a work tree is silent.
+    // After agent resolution, not with the other grant warnings above, because
+    // the agent's own exec dirs are part of the candidate set (#343) and they
+    // depend on which agent is running. Canonicalized to match `allow.write`,
+    // which `resolve_config_path` already resolved.
+    {
+        let mut agent_dirs = active_agent.config_dirs(&home_dir);
+        agent::canonicalize_agent_dirs(&mut agent_dirs);
+        for (granted, dirs) in resolved.write_grants_over_exec_tool_dirs(&home_dir, &agent_dirs) {
+            ui::warn(&cplt::config::exec_tool_dir_warning(&granted, &dirs));
+        }
     }
 
     // Hint about API keys for agents that need them

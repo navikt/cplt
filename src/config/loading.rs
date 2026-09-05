@@ -778,8 +778,19 @@ impl Resolved {
     /// relocated by `CARGO_HOME` and friends are not resolved here — those
     /// become `ToolRoot`s rather than `allow.write` grants (#152), so they
     /// cannot be the grant this warning is about.
+    ///
+    /// `agent_dirs` is the active agent's own directories, which lose execute
+    /// the same way (#343): `~/.pi/agent/bin` and `~/.cache/opencode/bin` are
+    /// `process_exec` with a writable parent, so `allow.write = ["~/.pi"]`
+    /// withdraws exec from the managed binaries the agent expects to run. They
+    /// are passed in rather than derived here because the set depends on the
+    /// resolved agent, which `Resolved` does not know.
     #[must_use]
-    pub fn write_grants_over_exec_tool_dirs(&self, home: &Path) -> Vec<(PathBuf, Vec<String>)> {
+    pub fn write_grants_over_exec_tool_dirs(
+        &self,
+        home: &Path,
+        agent_dirs: &[crate::agent::AgentDir],
+    ) -> Vec<(PathBuf, Vec<String>)> {
         let dirs: Vec<String> = crate::sandbox::HOME_TOOL_DIRS
             .iter()
             .filter(|d| d.process_exec)
@@ -788,6 +799,12 @@ impl Resolved {
                 crate::sandbox::app_dirs()
                     .iter()
                     .flat_map(|a| a.process_exec_paths(home)),
+            )
+            .chain(
+                agent_dirs
+                    .iter()
+                    .filter(|d| d.process_exec)
+                    .map(|d| d.path.clone()),
             )
             .filter(|p| p.exists())
             .map(|p| p.to_string_lossy().into_owned())
@@ -2077,7 +2094,7 @@ validate = false
             home.join(".nvm"),   // process_exec but absent
             home.join("work"),   // ordinary grant
         ];
-        let found = r.write_grants_over_exec_tool_dirs(&home);
+        let found = r.write_grants_over_exec_tool_dirs(&home, &[]);
 
         let rustup = home.join(".rustup").to_string_lossy().into_owned();
         assert!(
@@ -2098,11 +2115,72 @@ validate = false
         // The other direction of the overlap: a grant INSIDE an exec tool dir
         // loses the same right.
         r.allow_write = vec![home.join(".rustup/toolchains")];
-        let found = r.write_grants_over_exec_tool_dirs(&home);
+        let found = r.write_grants_over_exec_tool_dirs(&home, &[]);
         assert_eq!(
             found.len(),
             1,
             "a grant inside an exec tool dir must be reported too: {found:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #343: the agent's own directories lose execute to an `allow.write`
+    /// grant exactly like a tool directory does — `~/.pi/agent/bin` and
+    /// `~/.cache/opencode/bin` are `process_exec` with a writable parent, so a
+    /// grant on the parent silently withdraws exec from the managed binaries.
+    /// Threaded in as a candidate list, so the warning has to be told about
+    /// them; this is the test that says it was.
+    #[test]
+    fn write_grant_shadowing_an_agent_exec_dir_is_reported() {
+        let home = std::env::temp_dir().join(format!(
+            "cplt-agent-exec-warn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join(".pi/agent/bin")).expect("temp home");
+        std::fs::create_dir_all(home.join(".pi/agent/sessions")).expect("temp home");
+
+        let agent_dirs = vec![
+            crate::agent::AgentDir {
+                path: home.join(".pi/agent"),
+                write: true,
+                map_exec: false,
+                process_exec: false,
+                write_files: vec![],
+            },
+            crate::agent::AgentDir {
+                path: home.join(".pi/agent/bin"),
+                write: false,
+                map_exec: false,
+                process_exec: true,
+                write_files: vec![],
+            },
+        ];
+
+        let mut r = Config::default()
+            .merge(CliFlags::default())
+            .expect("default config merges");
+        r.allow_write = vec![
+            home.join(".pi"),                // ancestor: swallows the exec bin dir
+            home.join(".pi/agent/sessions"), // sibling: nothing executable shadowed
+        ];
+        let found = r.write_grants_over_exec_tool_dirs(&home, &agent_dirs);
+
+        let bin = home.join(".pi/agent/bin").to_string_lossy().into_owned();
+        assert!(
+            found
+                .iter()
+                .any(|(g, dirs)| *g == home.join(".pi") && dirs.contains(&bin)),
+            "a grant containing an agent exec dir must be reported and name it: {found:?}"
+        );
+        assert_eq!(
+            found.len(),
+            1,
+            "a grant that shadows nothing executable must stay silent: {found:?}"
         );
 
         std::fs::remove_dir_all(&home).ok();
