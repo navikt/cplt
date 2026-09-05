@@ -583,9 +583,10 @@ impl Agent {
     /// - Claude: `statusline.sh` runs on every prompt render, `plugins/` loads
     ///   at startup, and `settings.json` carries `hooks` (`SessionStart`,
     ///   `UserPromptSubmit`, …) which fire automatically. `commands/`,
-    ///   `agents/` and `skills/` stay writable, and they are **not** user-invocable
-    ///   only: a `skills/*/SKILL.md` or `commands/*.md` is offered to the model
-    ///   through the Skill tool unless it sets `disable-model-invocation` (absent
+    ///   `agents/` and `skills/` stay writable, and the user is **not** the only
+    ///   one who can invoke them: a `skills/*/SKILL.md` and a `commands/*.md` are
+    ///   both offered to the model through the Skill tool unless they set
+    ///   `disable-model-invocation` (absent
     ///   by default), and both run `` !`cmd` `` shell preprocessing when invoked;
     ///   an `agents/*.md` can carry frontmatter `hooks`, whose `Stop` hook runs a
     ///   host command when the model spawns the agent. They stay writable because
