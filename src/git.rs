@@ -9,9 +9,12 @@
 //! ([`crate::discover`], [`crate::detect`]) all do it.
 //!
 //! `git` run inside a repository honours **that repository's** configuration,
-//! and several config keys name a program git then executes. `.git/config` is
-//! inside the project directory, so a sandboxed agent can write it; a
-//! prompt-injected agent that appends
+//! and several config keys name a program git then executes. `.git/config` sits
+//! inside the project directory, and on **Linux** it stays agent-writable by
+//! design — a read-only bind would break `git config user.email` and can strand
+//! a `.git/config.lock`. macOS denies the write (the `config` entry of
+//! `sandbox_policy::PROTECTED_IN_GITDIR`, emitted at the tail of the profile so
+//! no user allow reopens it). So on Linux a prompt-injected agent that appends
 //!
 //! ```text
 //! [core]
@@ -92,9 +95,10 @@
 //! # Accepted, not overlooked
 //!
 //! An agent inside the sandbox can force the audit to `Incomplete` at will by
-//! writing `filter.x.clean` into the writable `.git/config`. That is inherent
-//! to failing closed: the only way to answer the query instead is to execute
-//! the filter, which is the escape this module exists to prevent. `Incomplete`
+//! writing `filter.x.clean` into `.git/config`, wherever that file is writable
+//! to it — Linux, per the scope above. That is inherent to failing closed: the
+//! only way to answer the query instead is to execute the filter, which is the
+//! escape this module exists to prevent. `Incomplete`
 //! is a loud "could not verify", never a forged clean session, so denial of the
 //! *report* is the correct trade against execution of the *payload*.
 
@@ -325,9 +329,11 @@ pub const CONFIG_OVERRIDES: &[(&str, &str, &str)] = &[
     (
         "core.hooksPath",
         "/dev/null",
-        "Hooks are the canonical repo-controlled exec vector and .git/hooks is \
-         agent-writable. No subcommand cplt runs triggers a hook. Cost: none \
-         today; a future parent-side commit/gc would silently skip hooks.",
+        "Hooks are the canonical repo-controlled exec vector, and .git/hooks is \
+         agent-writable on the Landlock-only Linux path (macOS denies it, and so \
+         does the bubblewrap read-only bind). No subcommand cplt runs triggers \
+         a hook. Cost: none today; a future parent-side commit/gc would \
+         silently skip hooks.",
     ),
     (
         "core.pager",
