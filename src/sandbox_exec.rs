@@ -742,6 +742,18 @@ fn seal_inherited_fds(cmd: &mut Command, keep: Vec<std::os::unix::io::RawFd>) {
     // failure mode.
     let max = unsafe { libc::getdtablesize() };
 
+    // The audit's settle probe is the one descriptor that is *meant* to reach
+    // the session: cplt created the pipe, holds the only read end, and detects
+    // stragglers by waiting for every inherited copy of this write end to close
+    // (GHSA-c47q-c3c8-7wrf). Exempting it here rather than at the three call
+    // sites means a fourth spawn path cannot silently re-seal it — and the
+    // failure is silent, since a sealed probe reports every session settled.
+    let mut keep = keep;
+    let probe = crate::audit::SETTLE_PROBE_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if probe >= 3 {
+        keep.push(probe);
+    }
+
     // SAFETY: the closure runs between fork and exec. It makes only `fcntl`
     // calls — no allocation, no locks, async-signal-safe.
     unsafe {

@@ -114,7 +114,7 @@ fn fsmonitor_is_not_executed_by_the_audit_and_the_audit_stays_correct() {
 
     let baseline = cplt::audit::Baseline::capture(&f.repo);
     dirty(&f);
-    let report = baseline.finish(0);
+    let report = baseline.finish(0, true);
 
     assert!(
         !f.marker.exists(),
@@ -168,7 +168,7 @@ fn content_filter_is_not_executed_and_the_audit_degrades_to_incomplete() {
 
     let baseline = cplt::audit::Baseline::capture(&f.repo);
     dirty(&f);
-    let report = baseline.finish(0);
+    let report = baseline.finish(0, true);
 
     assert!(
         !f.marker.exists(),
@@ -190,7 +190,7 @@ fn filter_process_is_not_executed() {
     set_key(&f, "filter.evil.process");
     dirty(&f);
 
-    let _ = cplt::audit::Baseline::capture(&f.repo).finish(0);
+    let _ = cplt::audit::Baseline::capture(&f.repo).finish(0, true);
     let _ = cplt::repo_config::repo_config_state(&f.repo);
 
     assert!(
@@ -242,7 +242,7 @@ fn an_ordinary_repo_is_fully_audited() {
     };
     let baseline = cplt::audit::Baseline::capture(&f.repo);
     dirty(&f);
-    let report = baseline.finish(0);
+    let report = baseline.finish(0, true);
 
     assert!(!f.marker.exists());
     match report {
@@ -285,7 +285,7 @@ fn worktree_scope_content_filter_is_detected() {
         cplt::git::repo_defines_content_filter(&f.repo),
         "a worktree-scope filter must be treated as repository-controlled"
     );
-    let _ = cplt::audit::Baseline::capture(&f.repo).finish(0);
+    let _ = cplt::audit::Baseline::capture(&f.repo).finish(0, true);
     assert!(
         !f.marker.exists(),
         "worktree-scope filter.evil.clean executed in the parent process"

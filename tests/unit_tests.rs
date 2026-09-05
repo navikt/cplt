@@ -7763,7 +7763,7 @@ fn audit_reports_net_change_even_after_commit() {
         ],
     );
 
-    let report = baseline.finish(0);
+    let report = baseline.finish(0, true);
     match report {
         AuditReport::Available {
             changes,
@@ -7805,7 +7805,7 @@ fn audit_reports_new_untracked_file() {
     let baseline = Baseline::capture(dir);
     std::fs::write(dir.join("leftover.txt"), "scratch\n").unwrap();
 
-    match baseline.finish(0) {
+    match baseline.finish(0, true) {
         AuditReport::Available { changes, .. } => {
             let f = changes.iter().find(|c| c.path == "leftover.txt");
             assert!(f.is_some(), "untracked file must be reported");
@@ -7821,7 +7821,7 @@ fn audit_unavailable_for_non_git_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let baseline = Baseline::capture(tmp.path());
     assert!(matches!(
-        baseline.finish(0),
+        baseline.finish(0, true),
         AuditReport::Unavailable { .. }
     ));
 }
@@ -7849,7 +7849,7 @@ fn audit_reports_deletion_and_rename_as_delete_plus_add() {
     std::fs::remove_file(dir.join("gone.rs")).unwrap();
     git_in(dir, &["mv", "old name.rs", "new name.rs"]);
 
-    match baseline.finish(0) {
+    match baseline.finish(0, true) {
         AuditReport::Available { changes, .. } => {
             let by = |p: &str| changes.iter().find(|c| c.path == p).cloned();
 
@@ -7888,7 +7888,7 @@ fn audit_reports_untracked_in_empty_repo() {
     let baseline = Baseline::capture(dir);
     std::fs::write(dir.join("bootstrap.sh"), "#!/bin/sh\n").unwrap();
 
-    match baseline.finish(0) {
+    match baseline.finish(0, true) {
         AuditReport::Available {
             changes,
             tracked_audited,
@@ -7944,9 +7944,45 @@ fn audit_reports_incomplete_when_baseline_commit_pruned() {
     git_in(dir, &["reflog", "expire", "--expire=now", "--all"]);
     git_in(dir, &["gc", "--prune=now", "-q"]);
 
-    match baseline.finish(0) {
+    match baseline.finish(0, true) {
         AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
         other => panic!("expected Incomplete after prune, got {other:?}"),
+    }
+}
+
+/// GHSA-c47q-c3c8-7wrf: `exec` returns when the DIRECT child is reaped, which
+/// says nothing about the descendants it disowned. Sampling git at that moment
+/// and printing "no project file changes" is an affirmative clean bill of
+/// health for a session that may still be writing — the one thing this audit
+/// exists not to do. An unsettled process tree turns an empty sample into the
+/// honest `Incomplete`, never a clean `Available`.
+#[test]
+fn audit_never_reports_clean_when_the_process_tree_did_not_settle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("app.rs"), "fn main() {}\n").unwrap();
+    git_in(dir, &["add", "."]);
+    git_in(
+        dir,
+        &["-c", "commit.gpgSign=false", "commit", "-q", "-m", "init"],
+    );
+
+    // Premise: with the tree settled, an unchanged repo is genuinely clean —
+    // this is the report the attack turned into a lie.
+    match Baseline::capture(dir).finish(0, true) {
+        AuditReport::Available { changes, .. } => assert!(
+            changes.is_empty(),
+            "test premise: nothing changed, got {changes:?}"
+        ),
+        other => panic!("expected a clean Available report, got {other:?}"),
+    }
+
+    // Same repo, same emptiness — but nothing established that the session had
+    // stopped writing, so finding nothing is an absence of information.
+    match Baseline::capture(dir).finish(0, false) {
+        AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
+        other => panic!("an unsettled session must never read as clean, got {other:?}"),
     }
 }
 

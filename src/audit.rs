@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 /// Upper bound on any single git invocation. The audit runs on EVERY sandboxed
@@ -35,6 +36,16 @@ use std::time::{Duration, Instant};
 /// killed and the query degrades to a failure (`None`) → an honest "incomplete"
 /// report rather than a false "clean" one.
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`run`] waits, after the process cplt actually waited for has been
+/// reaped, for the rest of the session's process tree to exit.
+///
+/// Costs nothing in the normal case: a session that leaves nothing behind
+/// closes the last copy of the probe descriptor as it exits, so the wait
+/// returns at once. The bound only bites when something really is still alive,
+/// and then it is short — a legitimate background process the user wanted is
+/// left running and named in the report, not killed.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A matcher against a changed path, used to classify sensitive files.
 ///
@@ -143,6 +154,36 @@ pub fn classify_path(path: &str) -> Option<&'static str> {
         .map(|(_, reason)| *reason)
 }
 
+/// Render a git-supplied path safe for the terminal.
+///
+/// SECURITY (GHSA-c47q-c3c8-7wrf): with `-z`, git emits paths **verbatim** —
+/// every byte except `/` and NUL is whatever the sandboxed session named its
+/// file. The report is printed with `ui::info`/`ui::warn`, which are bare
+/// `eprintln!`, so those bytes reached the terminal unfiltered. A file named
+/// `\r\x1b[2K\x1b[1A\x1b[2K[cplt] no project file changes` did not just garble a
+/// line: CR + erase-line + cursor-up + erase-line rewrote the "Project changes:
+/// 1 file" line above it, so a session that wrote a file reported itself clean.
+/// The audit is what the user reads to decide whether to trust the session, and
+/// the session was writing it.
+///
+/// Escaping happens HERE, at the parse boundary, rather than at the print
+/// sites: this is where git's untrusted bytes enter the process, and it leaves
+/// nothing hostile inside the `pub` [`FileChange`]/[`NumStat`] structs for the
+/// classifier, the untracked set difference, this module's two print arms, or a
+/// future consumer to re-emit. Nothing downstream needs the raw path — the
+/// audit never opens these files, it only reports them.
+///
+/// `escape_debug`, not `escape_default`, for the reason pinned in
+/// `src/proxy.rs` (PR #221): `escape_default` mangles every non-ASCII name into
+/// `\u{...}` noise, and a Norwegian filename must stay readable. `escape_debug`
+/// leaves printable Unicode alone while covering C0, C1, DEL, bidi overrides
+/// and zero-width formatters — everything a terminal control sequence needs.
+/// It is also injective, so escaping both sides of the before/after untracked
+/// comparison cannot make two distinct paths collide.
+fn escape_path(path: &str) -> String {
+    path.escape_debug().to_string()
+}
+
 /// A single parsed `git diff --numstat` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NumStat {
@@ -156,7 +197,9 @@ pub struct NumStat {
 /// Parse the output of `git diff --numstat -z --no-renames <sha>`.
 ///
 /// With `-z`, records are NUL-terminated and paths are emitted **verbatim**
-/// (git never quotes/C-escapes them), so spaces and non-ASCII survive intact.
+/// (git never quotes/C-escapes them), so spaces and non-ASCII survive intact —
+/// and so do control bytes, which is why every path goes through
+/// [`escape_path`] before it is stored.
 /// Within a record the three fields are `<added>\t<deleted>\t<path>`; binary
 /// files use `-` for the counts. `--no-renames` guarantees every record is a
 /// plain path (no `old\0new` rename pair), so a rename surfaces honestly as a
@@ -177,7 +220,7 @@ pub fn parse_numstat(output: &str) -> Vec<NumStat> {
                 return None;
             }
             Some(NumStat {
-                path: path.to_string(),
+                path: escape_path(path),
                 added: added.parse::<u64>().ok(),
                 deleted: deleted.parse::<u64>().ok(),
             })
@@ -189,7 +232,8 @@ pub fn parse_numstat(output: &str) -> Vec<NumStat> {
 ///
 /// With `-z`, entries are NUL-separated and paths are emitted **verbatim** (no
 /// double-quoting/C-escaping), which hardens parsing for paths with spaces or
-/// non-ASCII characters. Rename entries emit the old path as a separate NUL
+/// non-ASCII characters — and passes control bytes through just as faithfully,
+/// so every path goes through [`escape_path`] before it is stored. Rename entries emit the old path as a separate NUL
 /// field, but those never carry the `?? ` prefix, so filtering on it naturally
 /// keeps only genuine untracked paths. Pure function — the before/after
 /// untracked sets feed [`new_untracked`].
@@ -197,7 +241,7 @@ pub fn parse_untracked(porcelain: &str) -> BTreeSet<String> {
     porcelain
         .split('\0')
         .filter_map(|entry| entry.strip_prefix("?? "))
-        .map(ToString::to_string)
+        .map(escape_path)
         .collect()
 }
 
@@ -308,7 +352,13 @@ impl Baseline {
     /// Generate the report after the agent exits. Diffs the current working tree
     /// against the pinned baseline SHA (capturing changes even if the agent
     /// committed or reset them) and computes net-new untracked files.
-    pub fn finish(self, exit_code: u8) -> AuditReport {
+    ///
+    /// `settled` states whether the session's process tree was known to have
+    /// exited before this sample was taken (see [`SettleProbe`]). It is a
+    /// required argument rather than an assumption because an unsettled session
+    /// may still be writing: the sample is then a snapshot, not a verdict, and
+    /// an empty one must never be rendered as a clean bill of health.
+    pub fn finish(self, exit_code: u8, settled: bool) -> AuditReport {
         let duration = self.start.elapsed();
 
         // The after-untracked query. `None` means the git command FAILED (git
@@ -432,6 +482,18 @@ impl Baseline {
         }
 
         changes.sort_by(|a, b| a.path.cmp(&b.path));
+
+        // GHSA-c47q-c3c8-7wrf: a session whose process tree never settled may
+        // still be writing to the project. Finding nothing is then an absence of
+        // information, not a clean session — the one thing this audit must never
+        // affirm without having measured it. Changes we DID find are still worth
+        // showing (with the caveat `run` prints); an empty sample is not.
+        if !settled && changes.is_empty() {
+            return AuditReport::Incomplete {
+                duration,
+                exit_code,
+            };
+        }
 
         AuditReport::Available {
             duration,
@@ -618,6 +680,164 @@ fn unaudited_roots<'a>(project_dir: &Path, allow_write: &'a [PathBuf]) -> Vec<&'
         .collect()
 }
 
+/// The warning line naming the writable roots the audit did not measure, or
+/// `None` when every grant sits inside the project.
+///
+/// SECURITY (GHSA-c47q-c3c8-7wrf): these paths do not come through
+/// [`parse_numstat`]/[`parse_untracked`], so the parse-boundary escaping never
+/// sees them — and they are no more cplt's own text than a git path is. An
+/// `allow.write` grant can be written by the repository's own `.cplt.toml`, and
+/// `project_dir` is a directory name the session may itself have created. Both
+/// go through [`escape_path`] before reaching the terminal.
+fn unaudited_warning(project_dir: &Path, unaudited: &[&Path]) -> Option<String> {
+    if unaudited.is_empty() {
+        return None;
+    }
+    let list = unaudited
+        .iter()
+        .map(|p| escape_path(&p.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "audit covers {} only — {} writable path{} outside it {} NOT audited: {list}",
+        escape_path(&project_dir.display().to_string()),
+        unaudited.len(),
+        if unaudited.len() == 1 { "" } else { "s" },
+        if unaudited.len() == 1 { "was" } else { "were" },
+    ))
+}
+
+/// Detects processes that outlive the one cplt waits for.
+///
+/// SECURITY (GHSA-c47q-c3c8-7wrf): the closure [`run`] wraps returns when the
+/// **direct** child is reaped, and a reaped direct child says nothing about the
+/// rest of the tree. `cplt --yes exec -- /bin/sh -c '(sleep 1; printf late >
+/// late.txt) &'` reaped the shell instantly; the audit sampled git and printed
+/// "no project file changes" a full second before `late.txt` appeared. The
+/// session got a clean bill of health for a write it had already scheduled.
+///
+/// The probe is a pipe. Its write end is deliberately left **without**
+/// close-on-exec, so the sandboxed process and every process it forks inherit a
+/// copy (and `seal_inherited_fds` re-clears the flag on it at exec time, so a
+/// later change there cannot quietly seal it shut — see [`SETTLE_PROBE_FD`]);
+/// cplt closes its own copy once the session has started. The read end
+/// therefore reaches EOF exactly when the last process holding a copy is gone —
+/// a wait for the whole tree that needs no process-group surgery.
+///
+/// Why not a process group: putting the session in its own group means it is no
+/// longer the terminal's foreground group, so an interactive agent is stopped
+/// by SIGTTIN the moment it reads stdin and by SIGTTOU when it sets raw mode
+/// (which the agents cplt runs do — see `ignore_terminal_stop_signals`).
+/// Getting that right needs `tcsetpgrp` handover in both parent and child, on
+/// every spawn path, and buys no extra containment: `setsid` walks straight out
+/// of a process group, and killing the group would also kill a background
+/// process the user deliberately started.
+///
+/// This is a detector, not a cage. A descendant that closes the descriptor and
+/// detaches is invisible from the parent — no parent-side mechanism can see it.
+/// That is exactly why a failed settle degrades the **report** rather than
+/// pretending to have contained anything: what cplt cannot establish, it says.
+struct SettleProbe {
+    read: libc::c_int,
+    write: libc::c_int,
+}
+
+/// The armed probe's write end, or `-1`.
+///
+/// `sandbox_exec::seal_inherited_fds` makes every descriptor above stderr
+/// close-on-exec so that whatever launched cplt cannot leak an open file past
+/// the path rules (#329). The probe's write end is the one descriptor that must
+/// survive `execve`, and it is the only one: it is a pipe cplt created, cplt
+/// holds the only read end, and handing it to the session is the entire
+/// mechanism. Published here rather than threaded through `exec` because the
+/// seal is the single choke point all three spawn paths share — a fourth path
+/// added later inherits the exemption instead of silently re-breaking the probe.
+///
+/// Missing this is silent and fails OPEN: a sealed write end is closed by
+/// `execve`, the read end sees EOF at once, and every session reports itself
+/// settled (GHSA-c47q-c3c8-7wrf).
+pub(crate) static SETTLE_PROBE_FD: AtomicI32 = AtomicI32::new(-1);
+
+impl SettleProbe {
+    /// Arm the probe. Must be called **before** the session starts so every
+    /// process it spawns inherits the write end. `None` when the pipe could not
+    /// be created, which [`run`] treats as "settling could not be established".
+    fn arm() -> Option<Self> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid 2-element array; `pipe` writes both slots.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // Only the WRITE end may reach the session: the read end is cplt's
+        // alone, so nothing in the sandbox can consume what it observes.
+        // SAFETY: `fds[0]` is a descriptor `pipe` just returned.
+        unsafe { libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) };
+        // Exempt the write end from the exec-time seal, or nothing in the
+        // session inherits it and the probe reports every session settled.
+        SETTLE_PROBE_FD.store(fds[1], Ordering::Relaxed);
+        Some(Self {
+            read: fds[0],
+            write: fds[1],
+        })
+    }
+
+    /// Close cplt's own copy of the write end and wait for every inherited copy
+    /// to close. `true` when the tree settled within [`SETTLE_TIMEOUT`].
+    ///
+    /// Consumes the probe: both descriptors are closed before returning.
+    fn settled(self) -> bool {
+        // Retract the exemption before the descriptor number is freed, so a
+        // later spawn cannot un-seal whatever gets that number next.
+        SETTLE_PROBE_FD.store(-1, Ordering::Relaxed);
+        // Ours goes first — while cplt holds a write end, EOF can never fire.
+        // SAFETY: `self.write` is owned by this probe and closed exactly once.
+        unsafe { libc::close(self.write) };
+
+        let deadline = Instant::now() + SETTLE_TIMEOUT;
+        let outcome = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut pfd = libc::pollfd {
+                fd: self.read,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid `pollfd`, matching count of 1.
+            let ready =
+                unsafe { libc::poll(&raw mut pfd, 1, remaining.as_millis() as libc::c_int) };
+            if ready == 0 {
+                break false; // deadline hit with the descriptor still held
+            }
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break false;
+            }
+            // Readable or hung up. Only a zero-length read proves EOF: a hostile
+            // descendant can WRITE to the descriptor it inherited, and taking
+            // readability for EOF would hand it back the false clean.
+            let mut buf = [0u8; 64];
+            // SAFETY: `buf` is a valid writable buffer of `buf.len()` bytes.
+            let n = unsafe { libc::read(self.read, buf.as_mut_ptr().cast(), buf.len()) };
+            if n == 0 {
+                break true; // every copy of the write end is closed
+            }
+            if n < 0
+                && !matches!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                )
+            {
+                break false;
+            }
+        };
+
+        // SAFETY: `self.read` is owned by this probe and closed exactly once.
+        unsafe { libc::close(self.read) };
+        outcome
+    }
+}
+
 /// Wrap a sandboxed exec with the audit lifecycle: capture the baseline just
 /// before the closure runs the agent, then generate and print the report after
 /// it exits. Both `main.rs` exec sites call this so the wiring cannot diverge.
@@ -638,22 +858,23 @@ pub fn run<F: FnOnce() -> u8>(
         return exec();
     }
     let baseline = Baseline::capture(project_dir);
+    // Armed AFTER the baseline, so only the session's own processes inherit the
+    // write end — the baseline's short-lived git children are already reaped.
+    let probe = SettleProbe::arm();
     let exit_code = exec();
-    baseline.finish(exit_code).print();
-    let unaudited = unaudited_roots(project_dir, allow_write);
-    if !unaudited.is_empty() {
-        let list = unaudited
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        ui::warn(&format!(
-            "audit covers {} only — {} writable path{} outside it {} NOT audited: {list}",
-            project_dir.display(),
-            unaudited.len(),
-            if unaudited.len() == 1 { "" } else { "s" },
-            if unaudited.len() == 1 { "was" } else { "were" },
-        ));
+    // `exec` returns when the DIRECT child is reaped; the sample must not be
+    // taken until the rest of the tree is gone too (GHSA-c47q-c3c8-7wrf).
+    let settled = probe.is_some_and(SettleProbe::settled);
+    baseline.finish(exit_code, settled).print();
+    if !settled {
+        // Emitted next to the report rather than inside `AuditReport`: it is
+        // true of every variant and none of them has a place to put it.
+        ui::warn(
+            "the session left processes running — anything they change from here on is NOT audited",
+        );
+    }
+    if let Some(line) = unaudited_warning(project_dir, &unaudited_roots(project_dir, allow_write)) {
+        ui::warn(&line);
     }
     exit_code
 }
@@ -666,6 +887,260 @@ mod tests {
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(ToString::to_string).collect()
+    }
+
+    /// The forgery from GHSA-c47q-c3c8-7wrf, at byte level.
+    ///
+    /// git's `-z` output hands the path over verbatim, and the report is
+    /// printed with bare `eprintln!`. A file NAMED with CR + erase-line +
+    /// cursor-up + erase-line rewrote the "Project changes: 1 file" line above
+    /// it with text of the session's choosing, so a session that wrote a file
+    /// reported itself clean. Every control byte a terminal acts on must be
+    /// gone from the parsed path: ESC, CSI, OSC, BEL, CR, LF, and the C1
+    /// controls, which are two innocuous-looking UTF-8 bytes rather than one.
+    #[test]
+    fn parse_numstat_escapes_every_terminal_control_byte() {
+        // CR, CSI erase-line, CSI cursor-up, OSC title change + BEL, raw C1
+        // CSI (U+009B), and a newline that would forge a whole extra line.
+        let hostile = "\r\u{1b}[2K\u{1b}[1A\u{1b}]0;pwned\u{7}\u{9b}2K\nfaked.txt";
+        let rows = parse_numstat(&format!("1\t0\t{hostile}\0"));
+        assert_eq!(rows.len(), 1, "one record: {rows:?}");
+        let path = &rows[0].path;
+
+        assert!(
+            path.bytes().all(|b| (0x20..0x7f).contains(&b) || b >= 0x80),
+            "a C0 control or DEL reached the report path: {path:?}"
+        );
+        assert!(
+            !path.chars().any(char::is_control),
+            "a control character reached the report path: {path:?}"
+        );
+        // Escaped, not stripped: the audit exists to show that something odd
+        // was attempted, and a stripped payload reads as a typo.
+        for evidence in ["\\r", "\\n", "\\u{1b}", "\\u{7}", "\\u{9b}"] {
+            assert!(
+                path.contains(evidence),
+                "the attempt must survive as evidence ({evidence}): {path:?}"
+            );
+        }
+    }
+
+    /// The same path into the report, via `git status`: a file the session
+    /// CREATES is the easier attack, since it needs no tracked file at all.
+    #[test]
+    fn parse_untracked_escapes_every_terminal_control_byte() {
+        let hostile = "\r\u{1b}[2K\u{1b}[1A\u{1b}]0;pwned\u{7}\u{9b}2K\nfaked.txt";
+        let paths = parse_untracked(&format!("?? {hostile}\0"));
+        assert_eq!(paths.len(), 1, "one entry: {paths:?}");
+        let path = paths.iter().next().unwrap();
+
+        assert!(
+            path.bytes().all(|b| (0x20..0x7f).contains(&b) || b >= 0x80),
+            "a C0 control or DEL reached the report path: {path:?}"
+        );
+        assert!(
+            !path.chars().any(char::is_control),
+            "a control character reached the report path: {path:?}"
+        );
+        assert!(
+            path.contains("\\u{1b}"),
+            "the attempt must survive as evidence: {path:?}"
+        );
+    }
+
+    /// The escaping is only acceptable because it is lossless for real names.
+    /// `escape_default` would neutralise the attack just as well and turn every
+    /// Norwegian, Japanese or accented filename into `\u{...}` noise in the one
+    /// report the user reads to decide whether to trust the session — so the
+    /// choice of `escape_debug` is pinned here, exactly as it is in the proxy.
+    #[test]
+    fn parsed_paths_keep_non_ascii_filenames_readable() {
+        let names = [
+            "src/høyre-kolonne.rs",
+            "docs/naïve-café.md",
+            "テスト/設定.toml",
+            "sub dir/plain.txt",
+        ];
+        for name in names {
+            let rows = parse_numstat(&format!("3\t1\t{name}\0"));
+            assert_eq!(rows[0].path, name, "numstat mangled a legitimate name");
+            let untracked = parse_untracked(&format!("?? {name}\0"));
+            assert!(
+                untracked.contains(name),
+                "status mangled a legitimate name: {untracked:?}"
+            );
+        }
+    }
+
+    /// Escaping at the parse boundary must not cost the sensitive-file
+    /// classification that runs on the same string: a hostile name still has to
+    /// be flagged for what it is.
+    ///
+    /// This is the reason the layer is safe. `escape_debug` only ever inserts a
+    /// `\\` in front of a character it escapes, and it escapes nothing that any
+    /// entry in [`SENSITIVE_PATTERNS`] is made of — the literals are printable
+    /// ASCII with no quotes, and `/` is neither escaped nor produced by an
+    /// escape — so every `Name`/`Prefix`/`Suffix`/`Dir` match that held on the
+    /// raw path still holds on the escaped one, and no escape sequence can
+    /// synthesise a new match (`\\u{...}` emits no `.` and no capital letter).
+    #[test]
+    fn escaped_paths_are_still_classified() {
+        let rows = parse_numstat("1\t0\t.github/workflows/\u{1b}[2Kci.yml\0");
+        assert_eq!(classify_path(&rows[0].path), Some("CI/CD workflow"));
+        let rows = parse_numstat("1\t0\tdeploy\u{7}.sh\0");
+        assert_eq!(classify_path(&rows[0].path), Some("shell script"));
+
+        // Quotes are the interesting case, because `escape_debug` escapes both
+        // of them: `it's.env` becomes `it\'s.env`. A backslash landing next to
+        // a matcher literal must not push the literal out of place, in any of
+        // the four matcher shapes.
+        for (path, reason) in [
+            ("scripts/deploy's.sh", "shell script"),             // Suffix
+            ("certs/it\"s.pem", "private key / credential"),     // Suffix, other quote
+            (".env\"backup", "env file"),                        // Prefix
+            ("it's/.github/workflows/ci.yml", "CI/CD workflow"), // Dir
+            ("it's/Dockerfile", "container image"),              // Name
+        ] {
+            let rows = parse_numstat(&format!("1\t0\t{path}\0"));
+            assert!(
+                rows[0].path.contains('\\'),
+                "test premise: the quote must actually have been escaped: {:?}",
+                rows[0].path
+            );
+            assert_eq!(
+                classify_path(&rows[0].path),
+                Some(reason),
+                "escaping a quote lost the classification of {path:?} ({:?})",
+                rows[0].path
+            );
+        }
+    }
+
+    /// Hand the probe's write end to ONE child and to no one else.
+    ///
+    /// `arm` deliberately leaves the descriptor inheritable, which is exactly
+    /// what makes it see the whole session tree in production, where `run` is
+    /// the only thing that forks between arming and settling. This test binary
+    /// runs hundreds of tests in parallel, so here the descriptor is hidden
+    /// from every other test's children and un-hidden in this child alone.
+    fn sh_holding_the_probe(probe: &SettleProbe, script: &str) -> Command {
+        use std::os::unix::process::CommandExt as _;
+        let fd = probe.write;
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        // SAFETY: `fcntl` is async-signal-safe and touches only this fd.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::fcntl(fd, libc::F_SETFD, 0);
+                Ok(())
+            });
+        }
+        cmd
+    }
+
+    /// GHSA-c47q-c3c8-7wrf: reaping the direct child says nothing about the
+    /// tree. `sh -c '(sleep 1; ...) &'` exits at once and the write lands a
+    /// second later — the audit used to sample git in between and print a clean
+    /// verdict for a write it had already been told about.
+    #[test]
+    fn settle_probe_waits_for_a_backgrounded_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let late = tmp.path().join("late.txt");
+        let probe = SettleProbe::arm().expect("pipe");
+
+        let status =
+            sh_holding_the_probe(&probe, &format!("(sleep 1; : > '{}') &", late.display()))
+                .status()
+                .expect("sh runs");
+        assert!(status.success());
+        assert!(
+            !late.exists(),
+            "test premise: the direct child exits before the descendant writes"
+        );
+
+        assert!(probe.settled(), "the descendant's exit must be waited for");
+        assert!(
+            late.exists(),
+            "settling returned before the write it exists to wait for"
+        );
+    }
+
+    /// What cplt cannot establish, it must not claim. A descendant still
+    /// running when the grace period expires is reported, not waited out
+    /// forever and not killed — a background process the user deliberately
+    /// started is theirs to keep.
+    ///
+    /// It also writes to the descriptor it inherited: taking mere READABILITY
+    /// for EOF would hand the false clean straight back, so only a zero-length
+    /// read counts as the tree having settled.
+    #[test]
+    fn settle_probe_reports_unsettled_while_a_descendant_lives() {
+        let probe = SettleProbe::arm().expect("pipe");
+        let fd = probe.write;
+        // The straggler's stdout goes to /dev/null, or `output()` would block
+        // on the pipe until it exits and there would be nothing left to detect.
+        let out = sh_holding_the_probe(
+            &probe,
+            &format!("sleep 5 >/dev/null 2>&1 & printf x >&{fd}; echo $!"),
+        )
+        .output()
+        .expect("sh runs");
+        let pid: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+
+        let started = Instant::now();
+        let settled = probe.settled();
+        let waited = started.elapsed();
+        // SAFETY: `pid` is the child this test just started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+
+        assert!(!settled, "a live descendant must never read as settled");
+        // Slack for the sub-millisecond truncation in the poll timeout: the
+        // point is that the grace was waited OUT, not returned from at once.
+        assert!(
+            waited >= SETTLE_TIMEOUT.saturating_sub(Duration::from_millis(50)),
+            "the grace period must actually be waited out, got {waited:?}"
+        );
+    }
+
+    /// The second terminal sink for text cplt does not control, and the one the
+    /// parse-boundary escaping cannot reach: `allow.write` grants and the
+    /// project directory name never pass through [`parse_numstat`] or
+    /// [`parse_untracked`]. A grant can be written by the repository's own
+    /// `.cplt.toml`, so the same forgery works here (GHSA-c47q-c3c8-7wrf).
+    ///
+    /// Asserted on BYTES: a `contains("\\u{1b}")` check alone passes just as
+    /// happily on a line that ALSO still carries the raw ESC.
+    #[test]
+    fn unaudited_warning_escapes_every_terminal_control_byte() {
+        let project = PathBuf::from("/w/app\u{1b}]0;pwned\u{7}");
+        let roots = [
+            PathBuf::from("/w/lib\r\u{1b}[2K\u{1b}[1A\u{1b}[2K[cplt] no project file changes"),
+            PathBuf::from("/w/\u{9b}2K\nfaked"),
+            PathBuf::from("/w/høyre-æøå"),
+        ];
+        let refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let line = unaudited_warning(&project, &refs).expect("roots outside the project");
+
+        let raw: Vec<u8> = line.bytes().filter(|b| *b < 0x20 || *b == 0x7f).collect();
+        assert!(raw.is_empty(), "control bytes {raw:?} reached: {line:?}");
+        // One warning in, one line out: the grant list cannot forge a second
+        // `[cplt]`-prefixed line under the report.
+        assert_eq!(line.lines().count(), 1, "line split: {line:?}");
+        // Escaped, not stripped — the attempt is the evidence.
+        for evidence in ["\\r", "\\n", "\\u{1b}", "\\u{7}", "\\u{9b}"] {
+            assert!(
+                line.contains(evidence),
+                "the attempt must survive as evidence ({evidence}): {line:?}"
+            );
+        }
+        // Lossless for legitimate names, the same reason `escape_debug` is the
+        // primitive at the parse boundary.
+        assert!(
+            line.contains("/w/høyre-æøå"),
+            "a legitimate non-ASCII grant was mangled: {line:?}"
+        );
+        assert!(unaudited_warning(&project, &[]).is_none());
     }
 
     #[test]
@@ -913,7 +1388,7 @@ mod tests {
             before_untracked: BTreeSet::new(),
             before_ok: true,
         };
-        match base.finish(0) {
+        match base.finish(0, true) {
             AuditReport::Unavailable { exit_code, .. } => assert_eq!(exit_code, 0),
             other => panic!("expected Unavailable, got {other:?}"),
         }
@@ -932,7 +1407,7 @@ mod tests {
             before_untracked: BTreeSet::new(),
             before_ok: true,
         };
-        match base.finish(0) {
+        match base.finish(0, true) {
             AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
             other => panic!("expected Incomplete, got {other:?}"),
         }
@@ -969,7 +1444,7 @@ mod tests {
             before_untracked: BTreeSet::new(),
             before_ok: false,
         };
-        match base.finish(0) {
+        match base.finish(0, true) {
             AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
             other => panic!("expected Incomplete (untrustworthy delta), got {other:?}"),
         }

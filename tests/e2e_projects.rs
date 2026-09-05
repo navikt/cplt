@@ -1860,6 +1860,127 @@ echo "RESULT:sent:OK"
     }
 
     // ============================================================
+    // Post-session audit integrity (GHSA-c47q-c3c8-7wrf)
+    // ============================================================
+
+    /// Flaw A, through the real binary: the session names a file with the
+    /// forgery payload — CR, erase-line, cursor-up, erase-line — and the audit
+    /// prints that name. Unescaped it rewrote the "Project changes: 1 file"
+    /// line above it with the session's own text, so the audit the user reads
+    /// to decide whether to trust the session said the session was clean.
+    ///
+    /// The property is byte-level: no ESC, no CR, nothing else a terminal acts
+    /// on may reach stderr, while the attempt itself stays visible as evidence.
+    #[test]
+    fn audit_neutralises_terminal_control_bytes_in_a_filename() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let dir = project.canonical_path().to_string_lossy().to_string();
+
+        // \033 is ESC in POSIX printf's octal escape. The name erases its own
+        // line, walks the cursor up, erases the line above and writes a forged
+        // verdict over it.
+        let script = format!(
+            "name=$(printf 'a\\r\\033[2K\\033[1A\\033[2K[cplt] no project file changes\\033[2K.txt')\n\
+             printf x > \"{dir}/$name\"\n\
+             echo 'RESULT:forge:OK'\n"
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "forge");
+        // The forged file really was created and really is in the report —
+        // without this the byte assertions below would pass vacuously.
+        assert!(
+            stderr.contains("Project changes: 1 file"),
+            "test premise: the audit must report the file.\nstderr: {stderr:?}"
+        );
+        for (name, byte) in [("ESC", '\u{1b}'), ("CR", '\r'), ("BEL", '\u{7}')] {
+            assert!(
+                !stderr.contains(byte),
+                "a raw {name} from a filename reached the terminal.\nstderr: {stderr:?}"
+            );
+        }
+        // Escaped, not stripped: a stripped payload reads as a typo, and the
+        // audit exists to show that something odd was attempted.
+        assert!(
+            stderr.contains("\\u{1b}"),
+            "the attempt must survive as evidence.\nstderr: {stderr:?}"
+        );
+    }
+
+    /// Flaw B, through the real binary: the session disowns a descendant that
+    /// writes a second after the direct child is reaped. The audit used to
+    /// sample git in between and print "no project file changes" for a write it
+    /// had already been told about.
+    #[test]
+    fn audit_waits_for_a_disowned_descendant_before_sampling() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let dir = project.canonical_path().to_string_lossy().to_string();
+
+        let script = format!(
+            "(sleep 1; printf late > '{dir}/late.txt') &\n\
+             echo 'RESULT:disown:OK'\n"
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "disown");
+        assert!(
+            !stderr.contains("no project file changes"),
+            "a session with a pending write must never be reported clean.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("late.txt"),
+            "the late write must be in the report.\nstderr: {stderr}"
+        );
+    }
+
+    /// The other half of flaw B: a descendant that is STILL running when the
+    /// grace period expires. cplt cannot establish that the session stopped
+    /// writing, so it must say so — not print a clean verdict it has no
+    /// standing to give, and not kill a background process the user may have
+    /// wanted.
+    #[test]
+    fn audit_refuses_a_clean_verdict_while_the_session_is_still_running() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+
+        let script = "sleep 4 >/dev/null 2>&1 &\necho 'RESULT:linger:OK'\n";
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "linger");
+        assert!(
+            !stderr.contains("no project file changes"),
+            "an unverifiable session must never be reported clean.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("audit incomplete"),
+            "the audit must name itself incomplete.\nstderr: {stderr}"
+        );
+        // Specifically the settle warning: #217's unaudited-roots line also
+        // ends in "NOT audited", and must not be able to satisfy this.
+        assert!(
+            stderr.contains("the session left processes running"),
+            "the user must be told what is no longer covered.\nstderr: {stderr}"
+        );
+    }
+
+    // ============================================================
     // Go toolchain sandbox tests
     // ============================================================
 
