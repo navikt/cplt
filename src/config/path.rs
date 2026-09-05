@@ -314,14 +314,6 @@ pub fn default_config_contents() -> String {
 # remote = "fork"
 # branches = ["agent/*"]
 # force = false
-
-# ── audit logging ───────────────────────────────────────────────────────────
-# Global audit log for all sandbox gate decisions.
-# [audit]
-# enabled = false
-# destination = "stderr"      # "stderr" or file path
-# level = "blocked"           # "blocked" | "decisions" | "all"
-# format = "text"             # "text" | "jsonl"
 "#
     .to_string()
 }

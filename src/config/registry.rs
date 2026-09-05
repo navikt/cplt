@@ -535,40 +535,31 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         default_display: "[]",
         description: "Structured push exceptions. Each entry specifies remote/branches/force conditions under which push is allowed.",
     },
-    // [audit]
-    ConfigKeyInfo {
-        section: "audit",
-        key: "enabled",
-        value_type: ConfigValueType::Bool,
-        dangerous: false,
-        default_display: "false",
-        description: "Enable audit logging for all sandbox gate decisions.",
-    },
-    ConfigKeyInfo {
-        section: "audit",
-        key: "destination",
-        value_type: ConfigValueType::Str,
-        dangerous: false,
-        default_display: "stderr",
-        description: "Where to write audit entries: \"stderr\" or a file path.",
-    },
-    ConfigKeyInfo {
-        section: "audit",
-        key: "level",
-        value_type: ConfigValueType::Str,
-        dangerous: false,
-        default_display: "blocked",
-        description: "What to log: \"blocked\" (only blocked), \"decisions\" (all gate decisions), or \"all\" (including passthrough).",
-    },
-    ConfigKeyInfo {
-        section: "audit",
-        key: "format",
-        value_type: ConfigValueType::Str,
-        dangerous: false,
-        default_display: "text",
-        description: "Output format: \"text\" (human-readable) or \"jsonl\" (machine-parseable).",
-    },
 ];
+
+/// Sections removed from the registry, with the message shown when one is
+/// still named — by `cplt config set/get` or by a config file left on disk.
+///
+/// A key with no consumer must not be quietly accepted (AGENTS.md, "No silent
+/// grants"), and once removed it must not degrade into a bare "unknown key"
+/// either: someone who set it believed it did something, and the message is
+/// the only place that can say otherwise.
+pub(super) const REMOVED_SECTIONS: &[(&str, &str)] = &[(
+    "audit",
+    "the [audit] section was removed: nothing ever read it, so setting it only \
+     looked like it turned auditing on (issue #309). Nothing replaces it yet. \
+     Two working keys are often what people wanted: 'sandbox.audit' (the \
+     post-session project-change report, on by default) and 'proxy.log_file' \
+     (one line per proxied CONNECT). Delete the [audit] section from your config",
+)];
+
+/// The removal message for a section, if it was removed.
+pub(super) fn removed_section(section: &str) -> Option<&'static str> {
+    REMOVED_SECTIONS
+        .iter()
+        .find(|(name, _)| *name == section)
+        .map(|(_, message)| *message)
+}
 
 /// Returns all registered config keys. Used by tests to ensure every key is
 /// covered by `config show` output and other config commands.
@@ -583,6 +574,10 @@ pub fn lookup_key(dotted: &str) -> Result<&'static ConfigKeyInfo, ConfigError> {
             "invalid key format '{dotted}': expected section.key (e.g., sandbox.quiet)"
         ))
     })?;
+
+    if let Some(message) = removed_section(section) {
+        return Err(ConfigError::Validation(message.to_string()));
+    }
 
     CONFIG_KEYS
         .iter()
@@ -960,12 +955,6 @@ pub(super) const BOOL_KEYS_EXEMPT: &[(&str, &str, &str)] = &[
         "use_bubblewrap",
         "resolves to Option<bool>, not bool: `None` means auto-detect, a third \
          state the bool ladder cannot express",
-    ),
-    (
-        "audit",
-        "enabled",
-        "the [audit] section is parsed and displayed but has no consumer yet — \
-         it resolves to nothing, so there is no precedence to describe",
     ),
 ];
 

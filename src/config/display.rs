@@ -512,18 +512,6 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         );
     }
 
-    // [audit] section
-    println!("{blue}[cplt]{nc}");
-    println!("{blue}[cplt]{nc}  [audit]");
-    println!(
-        "{blue}[cplt]{nc}    enabled               = {}{}",
-        c.audit.enabled.unwrap_or(false),
-        src(c.audit.enabled.is_some())
-    );
-    if let Some(ref dest) = c.audit.destination {
-        println!("{blue}[cplt]{nc}    destination           = {dest}");
-    }
-
     println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
 }
 
