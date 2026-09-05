@@ -583,8 +583,15 @@ impl Agent {
     /// - Claude: `statusline.sh` runs on every prompt render, `plugins/` loads
     ///   at startup, and `settings.json` carries `hooks` (`SessionStart`,
     ///   `UserPromptSubmit`, …) which fire automatically. `commands/`,
-    ///   `agents/` and `skills/` stay writable — those do require explicit user
-    ///   invocation.
+    ///   `agents/` and `skills/` stay writable, and they are **not** user-invocable
+    ///   only: a `skills/*/SKILL.md` or `commands/*.md` is offered to the model
+    ///   through the Skill tool unless it sets `disable-model-invocation` (absent
+    ///   by default), and both run `` !`cmd` `` shell preprocessing when invoked;
+    ///   an `agents/*.md` can carry frontmatter `hooks`, whose `Stop` hook runs a
+    ///   host command when the model spawns the agent. They stay writable because
+    ///   authoring them is the point of the directories and a path-granularity
+    ///   deny is all-or-nothing — a stated residual, not a safety property. See
+    ///   SECURITY.md and issue #366.
     /// - Antigravity: its own grants carry the same class. `config/hooks.json`
     ///   names host commands, `config/mcp_config.json` holds `mcpServers` that
     ///   auto-start, and `antigravity-cli/bin/` holds binaries (`agentapi`,
