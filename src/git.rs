@@ -98,9 +98,9 @@
 //! writing `filter.x.clean` into `.git/config`, wherever that file is writable
 //! to it — Linux, per the scope above. That is inherent to failing closed: the
 //! only way to answer the query instead is to execute the filter, which is the
-//! escape this module exists to prevent. `Incomplete`
-//! is a loud "could not verify", never a forged clean session, so denial of the
-//! *report* is the correct trade against execution of the *payload*.
+//! escape this module exists to prevent. `Incomplete` is a loud "could not
+//! verify", never a forged clean session, so denial of the *report* is the
+//! correct trade against execution of the *payload*.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
