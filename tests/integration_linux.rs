@@ -1010,6 +1010,19 @@ except OSError as e:
         }
     }
 
+    /// Removes a directory tree the test created, on unwind as well as on
+    /// success. `None` when the tree already existed and is not ours to
+    /// delete.
+    struct RemoveDirOnDrop(Option<PathBuf>);
+
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    }
+
     impl Drop for OutsideSocket {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
@@ -1085,19 +1098,40 @@ except OSError as e:
             eprintln!("SKIPPED: python3 not available");
             return;
         }
-        let dir = home_dir().join(".docker").join("desktop");
+        let docker_dir = home_dir().join(".docker");
+        let dir = docker_dir.join("desktop");
         let path = dir.join("docker.sock");
-        if path.exists() {
-            // A real Docker Desktop install. Binding over its socket would
-            // break the host's daemon; there is nothing worth proving here
-            // that is worth that.
-            eprintln!("SKIPPED: {} already exists on this host", path.display());
+        // Skip only for a *live* Docker Desktop: binding over a running
+        // daemon's socket would break the host. A leftover socket file from a
+        // run killed with SIGKILL answers ECONNREFUSED, and skipping on that
+        // would leave this test permanently green while proving nothing —
+        // `OutsideSocket::bind_at` unlinks it and rebinds instead.
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            eprintln!(
+                "SKIPPED: a live Docker Desktop is listening on {}",
+                path.display()
+            );
             return;
         }
+        // `create_dir_all` runs against the real $HOME (a fake home cannot
+        // work here: `build_deny_masks` skips everything under /tmp, so the
+        // masked half would pass vacuously). Remember whichever directory we
+        // create so a machine without Docker does not keep ~/.docker/desktop
+        // forever — `OutsideSocket`'s Drop removes only the socket.
+        let created = if dir.exists() {
+            None
+        } else if docker_dir.exists() {
+            Some(dir.clone())
+        } else {
+            Some(docker_dir)
+        };
         if fs::create_dir_all(&dir).is_err() {
             eprintln!("SKIPPED: cannot create {}", dir.display());
             return;
         }
+        // Declared before `sock` so it drops after it: the socket file goes
+        // first, then the directory tree we made.
+        let _cleanup = RemoveDirOnDrop(created);
         let sock = OutsideSocket::bind_at(path.clone());
         let path_str = sock.path.to_string_lossy().into_owned();
         let project = create_test_project();
