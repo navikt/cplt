@@ -8026,7 +8026,8 @@ fn repo_config_state_not_a_git_repo() {
 
 #[test]
 fn socket_masks_cover_the_escape_sockets() {
-    let masks = cplt::sandbox::socket_mask_paths(1000, None, false);
+    let masks =
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, false);
     for expected in [
         "/run/user/1000/bus",          // D-Bus session bus -> systemd-run --user
         "/run/user/1000/systemd",      // systemd's private socket
@@ -8036,6 +8037,9 @@ fn socket_masks_cover_the_escape_sockets() {
         "/run/user/1000/docker.sock", // rootless docker
         "/run/user/1000/podman",      // podman.sock lives beneath
         "/run/podman",
+        // Docker Desktop for Linux's daemon (#279). Not under /run at all, so
+        // a list keyed only on the runtime dirs left it connectable.
+        "/home/user/.docker/desktop/docker.sock",
     ] {
         assert!(
             masks.iter().any(|p| p == std::path::Path::new(expected)),
@@ -8044,10 +8048,34 @@ fn socket_masks_cover_the_escape_sockets() {
     }
 }
 
+/// Docker Desktop's socket is derived from `$HOME`, not from the runtime dir
+/// or a hardcoded `/run` path (#279), so the list has to follow whatever home
+/// the sandbox was configured with.
+#[test]
+fn docker_socket_list_follows_the_home_dir() {
+    let paths = cplt::sandbox::linux_docker_socket_paths(
+        std::path::Path::new("/var/home/someone-else"),
+        1000,
+        None,
+    );
+    assert!(
+        paths.iter().any(
+            |p| p == std::path::Path::new("/var/home/someone-else/.docker/desktop/docker.sock")
+        ),
+        "the Docker Desktop socket must be built from the configured home, got {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.starts_with("/home/user")),
+        "no home path may be hardcoded, got {paths:?}"
+    );
+}
+
 #[test]
 fn allow_docker_lifts_only_the_container_masks() {
-    let with_docker = cplt::sandbox::socket_mask_paths(1000, None, true);
-    let docker_paths = cplt::sandbox::linux_docker_socket_paths(1000, None);
+    let with_docker =
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, true);
+    let docker_paths =
+        cplt::sandbox::linux_docker_socket_paths(std::path::Path::new("/home/user"), 1000, None);
 
     for p in &docker_paths {
         assert!(
@@ -8072,7 +8100,8 @@ fn allow_docker_lifts_only_the_container_masks() {
     }
     assert_eq!(
         with_docker.len() + docker_paths.len(),
-        cplt::sandbox::socket_mask_paths(1000, None, false).len(),
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, false)
+            .len(),
         "allow_docker must differ from the default set by exactly the container sockets"
     );
 }
@@ -8087,7 +8116,12 @@ fn socket_masks_follow_a_relocated_xdg_runtime_dir() {
     // passes `XDG_RUNTIME_DIR` through — stays reachable, with the launch
     // banner still counting the escape sockets as masked.
     let xdg = std::path::Path::new("/run/somewhere-else/1000");
-    let masks = cplt::sandbox::socket_mask_paths(1000, Some(xdg), false);
+    let masks = cplt::sandbox::socket_mask_paths(
+        std::path::Path::new("/home/user"),
+        1000,
+        Some(xdg),
+        false,
+    );
     for expected in [
         "/run/somewhere-else/1000/bus",
         "/run/somewhere-else/1000/systemd",
@@ -8113,8 +8147,12 @@ fn socket_masks_follow_a_relocated_xdg_runtime_dir() {
 fn relative_xdg_runtime_dir_is_ignored() {
     // Same rule as `AppDirKind::resolve`: a relative value would produce a
     // relative mask path, which resolves against the process cwd.
-    let masks =
-        cplt::sandbox::socket_mask_paths(1000, Some(std::path::Path::new("relative/dir")), false);
+    let masks = cplt::sandbox::socket_mask_paths(
+        std::path::Path::new("/home/user"),
+        1000,
+        Some(std::path::Path::new("relative/dir")),
+        false,
+    );
     assert!(
         !masks
             .iter()
@@ -8123,7 +8161,8 @@ fn relative_xdg_runtime_dir_is_ignored() {
     );
     assert_eq!(
         masks.len(),
-        cplt::sandbox::socket_mask_paths(1000, None, false).len(),
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, false)
+            .len(),
         "a rejected value must leave the list exactly as it was"
     );
 }
@@ -8132,7 +8171,8 @@ fn relative_xdg_runtime_dir_is_ignored() {
 fn socket_masks_follow_the_uid() {
     // The runtime-dir entries are per-user; a hardcoded uid would mask nothing
     // on any host but the developer's.
-    let masks = cplt::sandbox::socket_mask_paths(4242, None, false);
+    let masks =
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 4242, None, false);
     assert!(
         masks
             .iter()

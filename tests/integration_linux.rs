@@ -996,7 +996,10 @@ except OSError as e:
 
     impl OutsideSocket {
         fn bind() -> Self {
-            let path = home_dir().join(format!(".cplt-test-{}.sock", std::process::id()));
+            Self::bind_at(home_dir().join(format!(".cplt-test-{}.sock", std::process::id())))
+        }
+
+        fn bind_at(path: PathBuf) -> Self {
             let _ = fs::remove_file(&path);
             let listener =
                 std::os::unix::net::UnixListener::bind(&path).expect("bind UNIX socket in $HOME");
@@ -1054,6 +1057,72 @@ except OSError as e:
                  and the docs are stale.\nstdout: {stdout}\nstderr: {stderr}"
             );
         }
+    }
+
+    /// Docker Desktop for Linux serves its daemon from
+    /// `~/.docker/desktop/docker.sock` — not under `/run`, and inside the
+    /// read-only `~/.docker` grant #155 added (#279). Both halves are checked
+    /// here, in one test, because each guards the other from passing
+    /// vacuously: if the socket were unreachable under bubblewrap for some
+    /// unrelated reason, the `--allow-docker` case would fail rather than the
+    /// masked case quietly "passing".
+    ///
+    /// The masked half is real evidence on any kernel. The granted half only
+    /// proves the Landlock rule from ABI v9 up; below that `connect(2)` to a
+    /// pathname socket is ungated and the assertion holds for free.
+    #[test]
+    fn docker_desktop_socket_is_masked_by_default_and_granted_by_allow_docker() {
+        require_landlock!();
+        if !bwrap_available() {
+            assert!(
+                !require_sandbox_enforced(),
+                "Bubblewrap required by CPLT_TEST_REQUIRE_SANDBOX but unavailable"
+            );
+            eprintln!("SKIPPED: bwrap not available");
+            return;
+        }
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let dir = home_dir().join(".docker").join("desktop");
+        let path = dir.join("docker.sock");
+        if path.exists() {
+            // A real Docker Desktop install. Binding over its socket would
+            // break the host's daemon; there is nothing worth proving here
+            // that is worth that.
+            eprintln!("SKIPPED: {} already exists on this host", path.display());
+            return;
+        }
+        if fs::create_dir_all(&dir).is_err() {
+            eprintln!("SKIPPED: cannot create {}", dir.display());
+            return;
+        }
+        let sock = OutsideSocket::bind_at(path.clone());
+        let path_str = sock.path.to_string_lossy().into_owned();
+        let project = create_test_project();
+
+        let (_, masked_out, masked_err) =
+            run_sandboxed_bwrap(project.path(), &unix_connect_probe(&path_str));
+        let (_, granted_out, granted_err) = run_sandboxed_with_flags(
+            project.path(),
+            &["--use-bubblewrap", "--allow-docker"],
+            &unix_connect_probe(&path_str),
+        );
+
+        assert!(
+            granted_out.contains("CONNECTED"),
+            "--allow-docker must leave {path_str} connectable: it is in \
+             linux_docker_socket_paths, so it is neither mount-masked nor \
+             (from ABI v9) missing its ResolveUnix grant.\n\
+             stdout: {granted_out}\nstderr: {granted_err}"
+        );
+        assert!(
+            !masked_out.contains("CONNECTED"),
+            "without --allow-docker, bubblewrap must mask {path_str} — Docker \
+             Desktop's socket is a container daemon like any other.\n\
+             stdout: {masked_out}\nstderr: {masked_err}"
+        );
     }
 
     #[test]

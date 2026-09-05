@@ -176,6 +176,7 @@ pub fn current_uid() -> u32 {
 /// [`linux_runtime_dirs`] returns, so a host whose `$XDG_RUNTIME_DIR` is not
 /// `/run/user/<uid>` gets its real bus masked rather than a path nobody uses.
 pub fn socket_mask_paths(
+    home: &Path,
     uid: u32,
     xdg_runtime_dir: Option<&Path>,
     allow_docker: bool,
@@ -186,7 +187,7 @@ pub fn socket_mask_paths(
         .collect();
     paths.push(PathBuf::from("/run/dbus/system_bus_socket"));
     if !allow_docker {
-        paths.extend(linux_docker_socket_paths(uid, xdg_runtime_dir));
+        paths.extend(linux_docker_socket_paths(home, uid, xdg_runtime_dir));
     }
     paths
 }
@@ -247,10 +248,29 @@ pub fn xdg_runtime_dir_env() -> Option<PathBuf> {
 /// Directory entries (`.../podman`) are intentional: Podman's socket sits at
 /// `<dir>/podman.sock`, and a `PathBeneath` rule covers the subtree.
 ///
-/// `~/.docker` is not a socket and not in this list; it is in
+/// `~/.docker/desktop/docker.sock` is Docker Desktop for Linux's daemon
+/// endpoint (the `desktop-linux` context), and it is why this function takes
+/// `$HOME` at all (#279). It needs the same read+write grant as the sockets
+/// under `/run`: `create_path_beneath_rule` adds `ResolveUnix` on the write
+/// branch only, so the read-only `~/.docker` grant that #155 introduced does
+/// not make it connectable — on ABI v9 a Docker Desktop user would get a
+/// readable `config.json` and a refused `connect(2)`. The path is derived from
+/// `$HOME` rather than `$DOCKER_CONFIG`: Desktop places the socket relative to
+/// the home directory, and the `~/.docker` grant next to it is keyed on `$HOME`
+/// too, so a relocated `DOCKER_CONFIG` is an existing unhandled case and not a
+/// new one.
+///
+/// `~/.docker` itself is not a socket and not in this list; it is in
 /// [`DENIED_DOTFILES`] and gets its own read-only Landlock rule under
 /// `--allow-docker` (see `sandbox_landlock.rs`), mirroring the macOS profile.
-pub fn linux_docker_socket_paths(uid: u32, xdg_runtime_dir: Option<&Path>) -> Vec<PathBuf> {
+/// The socket rule is more specific and additive — Landlock unions the rights
+/// of every rule covering a path — so read+write on the socket coexists with
+/// read-only on its parent.
+pub fn linux_docker_socket_paths(
+    home: &Path,
+    uid: u32,
+    xdg_runtime_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut paths = vec![
         PathBuf::from("/run/docker.sock"),
         PathBuf::from("/var/run/docker.sock"),
@@ -261,6 +281,7 @@ pub fn linux_docker_socket_paths(uid: u32, xdg_runtime_dir: Option<&Path>) -> Ve
             .flat_map(|d| [d.join("docker.sock"), d.join("podman")]),
     );
     paths.push(PathBuf::from("/run/podman"));
+    paths.push(home.join(".docker").join("desktop").join("docker.sock"));
     paths
 }
 
