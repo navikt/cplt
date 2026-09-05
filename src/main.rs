@@ -5577,6 +5577,83 @@ fn trust_accept(
         return ExitCode::FAILURE;
     }
 
+    let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+    let stored = trust::load_trust(project_dir);
+
+    // Finding 4, write side: the trust file is keyed on the git origin URL alone,
+    // which any repo can forge (`git remote set-url origin <victim>`). The launch
+    // path binds an approval to the local checkout path; this one must too, or
+    // accepting one innocuous key here would both retain the victim's approved
+    // keys (laundering a foreign approval into this checkout) and overwrite their
+    // entry. Refuse while their recorded path still resolves — trust is one entry
+    // per origin, so there is nowhere else to put ours. A path that cannot be
+    // resolved (moved, deleted, unmounted, unreadable ancestor) leaves the entry
+    // orphaned, and an empty one is a legacy entry, so both may be taken over.
+    //
+    // The escape hatch is not what makes this safe: `carried` below drops the
+    // stored keys whenever `approved_path_matches` fails, and that fails closed on
+    // any canonicalize error. So making the recorded path unresolvable — including
+    // by racing this check against the save — yields an entry holding only the keys
+    // the user approves right now. That is denial of service plus a forced
+    // re-approval for the owner, never an inherited grant.
+    //
+    // The recovery advice depends on `trust_revoke` having NO path check: revoking
+    // here deletes this origin's entry whatever checkout it was granted at. Adding
+    // a path check there would strand the user, so don't. Pathless revoke is safe
+    // in its own right — it only ever de-escalates, and the owner re-approves
+    // against their own current proposal.
+    if let Some(t) = &stored
+        && !trust::approved_path_matches(t, project_dir)
+        && std::fs::canonicalize(&t.repo.path).is_ok()
+    {
+        ui::error(&format!(
+            "This repository's origin is already trusted for a different checkout ({}).\n  \
+             Approvals are stored per origin, so approving here would overwrite that one.\n  \
+             To approve here instead, drop that approval first: run `cplt trust revoke --all`\n  \
+             here, or in that checkout if it is still the repository you approved.",
+            t.repo.path
+        ));
+        return ExitCode::FAILURE;
+    }
+
+    // Only carry existing approvals forward when they were granted at THIS checkout
+    // for THESE exact proposal values. Otherwise the accepted set becomes exactly
+    // the keys approved now: a partial accept must never silently renew a stale
+    // approval whose value changed underneath it (SECURITY.md, "reapproval").
+    // Split the two reasons an approval stops applying, because they are not the
+    // same event and the message must not claim the wrong one. A legacy entry
+    // (empty stored hash) predates value pinning, so nothing "changed" — it was
+    // never recorded. `approval_is_stale` treats both as stale, correctly.
+    let stored_hash_is_legacy = stored
+        .as_ref()
+        .is_some_and(|t| t.accepted.content_hash.is_empty());
+    let hash_mismatch = stored
+        .as_ref()
+        .is_some_and(|t| trust::approval_is_stale(&t.accepted.content_hash, &current_hash));
+    let carried = stored.filter(|t| {
+        trust::approved_path_matches(t, project_dir)
+            && !trust::approval_is_stale(&t.accepted.content_hash, &current_hash)
+    });
+
+    // Say so in every branch. Accepting explicit keys after a value change drops
+    // the other approvals, and a user told only "Approved 1 permission(s)" would
+    // otherwise discover that at the next launch.
+    if hash_mismatch {
+        let reason = if stored_hash_is_legacy {
+            "The previous approval predates value pinning, so it cannot be matched against \
+these proposal values"
+        } else {
+            "Proposal values have changed since the last approval, so the previous approvals \
+no longer apply"
+        };
+        println!(
+            "{}[cplt]{} {reason}. Only the keys approved now are kept.",
+            ui::stdout_color(ui::YELLOW),
+            ui::stdout_color(ui::RESET),
+        );
+        println!();
+    }
+
     // Determine which keys to accept
     let keys_to_accept: Vec<String> = if all {
         proposed
@@ -5584,44 +5661,22 @@ fn trust_accept(
             .map(std::string::ToString::to_string)
             .collect()
     } else if keys.is_empty() {
-        // Interactive mode: show pending permissions and prompt
-        let trust_entry = trust::load_trust(project_dir);
-
-        // If content hash changed, all keys need re-approval
-        let hash_mismatch = trust_entry.as_ref().is_some_and(|t| {
-            !t.accepted.content_hash.is_empty() && {
-                let current_hash = trust::proposal_content_hash(&loaded.config.propose);
-                t.accepted.content_hash != current_hash
-            }
-        });
-
-        let pending: Vec<&str> = if hash_mismatch {
-            // Values changed — all keys need re-approval
-            proposed.clone()
-        } else {
-            proposed
-                .iter()
-                .filter(|&&key| {
-                    !trust_entry
-                        .as_ref()
-                        .is_some_and(|t| trust::is_key_approved(t, key))
-                })
-                .copied()
-                .collect()
-        };
+        // Interactive mode: show pending permissions and prompt.
+        // Anything not carried forward is pending, so a stale or foreign entry
+        // puts every key back in front of the user.
+        let pending: Vec<&str> = proposed
+            .iter()
+            .filter(|&&key| {
+                !carried
+                    .as_ref()
+                    .is_some_and(|t| trust::is_key_approved(t, key))
+            })
+            .copied()
+            .collect();
 
         if pending.is_empty() {
             ui::info("All permissions are already approved.");
             return ExitCode::SUCCESS;
-        }
-
-        if hash_mismatch {
-            println!(
-                "{}[cplt]{} Proposal values have changed since the last approval. Re-approve to continue.",
-                ui::stdout_color(ui::YELLOW),
-                ui::stdout_color(ui::RESET),
-            );
-            println!();
         }
 
         let blue = ui::stdout_color(ui::BLUE);
@@ -5682,8 +5737,9 @@ fn trust_accept(
         keys.to_vec()
     };
 
-    // Load or create trust entry
-    let mut entry = trust::load_trust(project_dir).unwrap_or_default();
+    // Start from the carried-forward entry, or a fresh one when nothing could be
+    // carried — so the accepted set is then exactly `keys_to_accept`.
+    let mut entry = carried.unwrap_or_default();
 
     // Set identity
     entry.repo.path = project_dir.to_string_lossy().into_owned();
@@ -5705,7 +5761,7 @@ fn trust_accept(
     entry.accepted.keys.sort_unstable();
     entry.accepted.approved_at = trust::now_iso8601();
     // Pin content hash so changes to proposal values invalidate approval
-    entry.accepted.content_hash = trust::proposal_content_hash(&loaded.config.propose);
+    entry.accepted.content_hash = current_hash;
 
     // Save
     if let Err(e) = trust::save_trust(project_dir, &entry) {
