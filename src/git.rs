@@ -9,8 +9,10 @@
 //! ([`crate::discover`], [`crate::detect`]) all do it.
 //!
 //! `git` run inside a repository honours **that repository's** configuration,
-//! and several config keys name a program git then executes. `.git/config` sits
-//! inside the project directory, and on **Linux** it stays agent-writable by
+//! and several config keys name a program git then executes. That config is
+//! `<project>/.git/config` in an ordinary checkout, and the shared
+//! `<gitdir>/config` for a worktree or bare repo — a directory cplt grants the
+//! sandbox write access to either way. On **Linux** it stays agent-writable by
 //! design — a read-only bind would break `git config user.email` and can strand
 //! a `.git/config.lock`. macOS denies the write (the `config` entry of
 //! `sandbox_policy::PROTECTED_IN_GITDIR`, emitted at the tail of the profile so
