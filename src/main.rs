@@ -4036,6 +4036,19 @@ fn run_check_command(
     // Snapshot the effective net policy BEFORE prepare_shell_sandbox mutates
     // resolved (it only changes the proxy port and tool-path env, neither of
     // which affects domain/port classification, but snapshot early to be safe).
+    // Same fail-closed refusal the proxy makes at startup. Without it, `check net`
+    // would report BLOCKED-ALLOWLIST for every host when the configured file is
+    // missing or unreadable (parse_lines_file returns None for both, and
+    // build_net_policy would then see an active-but-empty allowlist) while the
+    // live run refuses to start at all. Check must not describe a state the proxy
+    // never reaches — that divergence is the defect this whole change fixes.
+    if !resolved.allow_all_domains
+        && let Some(ref path) = resolved.allowed_domains
+        && proxy::parse_lines_file(path).is_none()
+    {
+        ui::error(&proxy::missing_allowlist_error(path));
+        return Ok(ExitCode::FAILURE);
+    }
     let net_policy = build_net_policy(&resolved, active_agent);
 
     let AssembledSandbox {
