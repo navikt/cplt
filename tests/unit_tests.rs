@@ -5581,6 +5581,65 @@ fn config_parses_allow_tmp_exec() {
 // Config validation (unknown key detection)
 // ============================================================
 
+/// The [audit] section was settable, displayed, and read by nothing (#309).
+/// `cplt config set audit.enabled true` must now refuse at the point of
+/// writing rather than store a line no code will ever consult, and the refusal
+/// must not read as a typo — it names why the section is gone and what works.
+#[test]
+fn audit_section_keys_are_refused_by_config_set() {
+    use cplt::config::lookup_key;
+    for key in [
+        "audit.enabled",
+        "audit.destination",
+        "audit.level",
+        "audit.format",
+    ] {
+        let err = lookup_key(key)
+            .err()
+            .unwrap_or_else(|| panic!("{key} must not be settable: nothing consumes it"))
+            .to_string();
+        assert!(
+            err.contains("[audit] section was removed") && err.contains("#309"),
+            "refusal must explain the removal, got: {err}"
+        );
+        assert!(
+            err.contains("sandbox.audit"),
+            "refusal must name the live post-session report key: {err}"
+        );
+    }
+}
+
+/// `sandbox.audit` is a different, working key — the post-session
+/// project-change report. Removing the [audit] section must not touch it.
+#[test]
+fn sandbox_audit_stays_a_real_key() {
+    use cplt::config::lookup_key;
+    assert!(
+        lookup_key("sandbox.audit").is_ok(),
+        "sandbox.audit is consumed by audit::run and must remain settable"
+    );
+}
+
+/// An `[audit]` block already on disk must still LOAD (unknown keys are
+/// ignored at runtime), and `config validate` must explain the removal rather
+/// than emit a bare "unknown key".
+#[test]
+fn stale_audit_section_validates_with_the_removal_message() {
+    use cplt::config::{Config, DiagnosticLevel, validate_config};
+    let toml = "[audit]\nenabled = true\ndestination = \"stderr\"\n";
+    assert!(
+        Config::parse(toml).is_ok(),
+        "a config file with a stale [audit] section must still load"
+    );
+    let diagnostics = validate_config(toml);
+    assert!(
+        diagnostics.iter().any(|d| d.level == DiagnosticLevel::Error
+            && d.message.contains("[audit] section was removed")),
+        "validate must explain the removal: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn validate_catches_typo_in_sandbox_key() {
     use cplt::config::{DiagnosticLevel, validate_config};
@@ -7107,12 +7166,6 @@ mode = "warn"
 prevent_push = true
 prevent_force_push = true
 protect_default_branch_only = false
-
-[audit]
-enabled = false
-destination = "stderr"
-level = "blocked"
-format = "text"
 "#;
 
     // Parse the fixture so coverage is checked per-section, not by a bare

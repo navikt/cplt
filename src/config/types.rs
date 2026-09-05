@@ -75,7 +75,6 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub gh_guard: GhGuardConfig,
     pub git_guard: GitGuardConfig,
-    pub audit: AuditConfig,
 }
 
 /// Enforcement mode for security gates — controls rollout aggressiveness.
@@ -419,22 +418,6 @@ pub struct GitPushRule {
     pub branches: Vec<String>,
     /// Allow force push in this rule (default: false).
     pub force: Option<bool>,
-}
-
-/// `[audit]` — global audit logging for sandbox decisions.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct AuditConfig {
-    /// Enable audit logging (default: false).
-    pub enabled: Option<bool>,
-    /// Where to write audit entries: "stderr" or a file path (default: "stderr").
-    pub destination: Option<String>,
-    /// What to log: "blocked" (only blocked), "decisions" (all gate decisions),
-    /// "all" (includes allowed passthrough). Default: "blocked".
-    pub level: Option<String>,
-    /// Output format: "text" (human-readable) or "jsonl" (machine-parseable).
-    /// Default: "text".
-    pub format: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

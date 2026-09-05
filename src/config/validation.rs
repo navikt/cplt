@@ -69,6 +69,13 @@ fn top_level_keys() -> Vec<&'static str> {
 /// Candidate keys for the suggestion come from `CONFIG_KEYS`, so suggestions
 /// automatically cover any option present in the registry.
 pub(super) fn describe_unknown_key(path: &str) -> String {
+    // A section that was removed, rather than mistyped, gets the removal
+    // message: "unknown key" would leave someone who once set it none the
+    // wiser about why it stopped existing, or what actually works.
+    let section = path.split('.').next().unwrap_or(path);
+    if let Some(message) = super::registry::removed_section(section) {
+        return message.to_string();
+    }
     // Split off the LAST segment: everything before it is the enclosing table
     // path. Nested tables exist ([proxy.subscriptions], [[git_guard.allow_push]]),
     // and splitting on the FIRST dot would report `proxy.subscriptions.allow` as

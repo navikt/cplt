@@ -148,7 +148,6 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | all `[proxy.subscriptions]` keys | subscription sources are security-sensitive, and a repo must not be able to add one |
 | all `[gh_guard]` keys | guard policy is configured globally, not per-repo |
 | all `[git_guard]` keys | guard policy is configured globally, not per-repo |
-| all `[audit]` keys | audit destination and level are a local concern |
 
 ### Removing values
 
@@ -170,7 +169,7 @@ cplt config validate                      # check for syntax errors and unknown 
 
 ## Configuration file
 
-The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, `[git_guard]`, and `[audit]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
+The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
 
 ```bash
 cplt config init
