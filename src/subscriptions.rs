@@ -230,6 +230,7 @@ fn curl_args(url: &str, timeout_secs: u64) -> Vec<String> {
 /// exceeds the cap and kill `curl`, guaranteeing the parent never buffers a
 /// multi-GB size bomb (which would OOM-kill cplt and defeat a pinned-hash check
 /// that must see the whole body first).
+#[allow(clippy::disallowed_methods)] // /usr/bin/curl, an absolute system path
 fn curl_fetch_inner(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String> {
     let mut child = Command::new("/usr/bin/curl")
         .args(curl_args(url, timeout_secs))

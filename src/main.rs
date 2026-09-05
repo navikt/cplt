@@ -3034,6 +3034,7 @@ fn perform_gate_effect(
 
 /// Replace this process with the real binary. `repo_scope` pins `GH_REPO`, which
 /// only `gh` reads — the git guard always passes `None`.
+#[allow(clippy::disallowed_methods)] // runs INSIDE the sandbox as cplt gh-gate/git-gate; the wrapper resolves the real binary through PATH deliberately
 fn exec_real(
     real_binary: &Path,
     name: &str,
@@ -6044,6 +6045,7 @@ fn print_preflight_ok() {
 ///
 /// On macOS, spawns `log stream` filtering for Sandbox deny events.
 /// On Linux, prints a hint about `strace` since Landlock has no audit logs.
+#[allow(clippy::disallowed_methods)] // /usr/bin/log, an absolute system path
 fn start_denial_stream() -> Option<std::process::Child> {
     #[cfg(target_os = "macos")]
     {
@@ -6082,6 +6084,7 @@ fn start_denial_stream() -> Option<std::process::Child> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
     use clap::Parser;

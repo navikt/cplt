@@ -145,6 +145,7 @@ pub(crate) fn check_availability() -> Option<PathBuf> {
 /// [`build_bwrap_args`] (plus `/bin/true`) so the probe can never drift from
 /// the real invocation. Catches hardened hosts where `bwrap` exists but user
 /// namespaces are disabled.
+#[allow(clippy::disallowed_methods)] // bwrap_path comes from git::trusted_binary("bwrap")
 pub(crate) fn test_functionality(
     bwrap_path: &Path,
     fs_rules: &[FsRule],

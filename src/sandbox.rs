@@ -1016,6 +1016,7 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
 

@@ -20,6 +20,13 @@
 //! These tests do NOT require sandbox-exec or macOS — they test the gate
 //! subcommands directly and work on macOS and Linux.
 
+// This turns off the #239 *security* lint only: a test binary is not the
+// unsandboxed parent around an agent session, so the PATH-hijack hazard
+// `disallowed_methods` guards against does not apply here. It grants no
+// licence to spawn ad hoc: the #245 isolation rule stands unchanged, and every
+// `Command` a test spawns is still built through the `tests/common` helpers,
+// which no lint can enforce and review does.
+#![allow(clippy::disallowed_methods)]
 use std::process::Command;
 
 mod common;

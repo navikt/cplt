@@ -1731,6 +1731,7 @@ fn is_editor_shim(path: &Path) -> bool {
 /// node version than the one the tool was installed with, mise fails with
 /// "No version is set for command <name>". We resolve the real binary path
 /// to bypass mise's version resolution entirely.
+#[allow(clippy::disallowed_methods)] // mise/asdf already resolved by git::trusted_binary, never PATH
 fn resolve_mise_shim(candidate: &Path, binary_name: &str) -> Option<PathBuf> {
     let dir = candidate.parent()?;
     let dir_str = dir.to_str()?;

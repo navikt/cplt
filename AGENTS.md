@@ -45,6 +45,11 @@ mise run check:all-targets # cargo check every release target, to catch breakage
 - Rust 2024 edition, stable toolchain
 - Standard rustfmt formatting (no overrides)
 - Clippy must pass clean (warnings are errors in CI)
+- `std::process::Command::new` is a `disallowed_methods` lint (`clippy.toml`).
+  Parent-side code resolves through `git::trusted_git()` / `git::trusted_binary()`
+  or names an absolute path; where the program is already a resolved `&Path`, or
+  where PATH resolution is deliberate (the guard wrappers run inside the
+  sandbox), add `#[allow(clippy::disallowed_methods)]` with a one-line reason
 - Prefer `&str`/`&[T]` over owned types in function signatures
 - Security-critical code gets doc comments explaining the *why*
 - Only comment code that needs clarification
