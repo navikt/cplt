@@ -2185,11 +2185,15 @@ fn start_proxy_if_enabled(
                 }
                 Err(e) => bail!("Failed to load allowed domains: {e}"),
             }
-        } else if !resolved.quiet {
-            ui::info(&format!(
-                "Domain allowlist file: {} (not found)",
-                path.display()
-            ));
+        } else {
+            // Fail closed, loudly. A configured allowlist whose file is absent
+            // used to print an informational line (suppressed by -q) and then
+            // run with no allowlist at all — the user asked for restricted
+            // egress and silently got allow-all. `DomainPolicy::build` refuses
+            // this too; the check is repeated here so the refusal arrives
+            // before anything else starts and carries the full explanation
+            // rather than being wrapped in "Failed to start proxy".
+            bail!("{}", proxy::missing_allowlist_error(path));
         }
     }
 
@@ -3906,6 +3910,13 @@ fn build_net_policy(resolved: &config::Resolved, agent: agent::Agent) -> proxy::
     } else {
         Vec::new()
     };
+    // Same intent bit `start_proxy_if_enabled` computes and hands the live
+    // proxy (via `DomainPolicy::build`). Without it, `cplt check net` would
+    // report ALLOWED for every host under an enabled-but-empty allowlist that
+    // the proxy blocks — a self-consistent wrong answer to the one command a
+    // user runs to verify the setup.
+    let allowlist_active = !default_allowlist.is_empty()
+        || (!resolved.allow_all_domains && resolved.allowed_domains.is_some());
     let allowed_domains = if default_allowlist.is_empty() {
         file_domains
     } else {
@@ -3939,6 +3950,7 @@ fn build_net_policy(resolved: &config::Resolved, agent: agent::Agent) -> proxy::
     proxy::NetPolicy {
         allowed_ports: ports,
         allowed_domains,
+        allowlist_active,
         blocked_domains,
         allow_localhost_ports: resolved.allow_localhost.clone(),
         allow_localhost_any: resolved.allow_localhost_any,
@@ -6651,6 +6663,83 @@ mod tests {
     }
 
     // ── `cplt check net` must MATCH the live proxy's verdict ──────────────
+
+    /// F03: `cplt check net` is the command a user runs to verify their
+    /// allowlist. It shared the proxy's `!allowed_domains.is_empty()` reading,
+    /// so an enabled-but-empty allowlist gave a self-consistent WRONG answer:
+    /// check said ALLOWED, and so did the proxy. Both now consult the same
+    /// intent bit, so check reports the block the proxy enforces.
+    #[test]
+    fn check_net_matches_the_proxy_for_an_enabled_but_empty_allowlist() {
+        let dir = std::env::temp_dir().join(format!(
+            "cplt-check-net-empty-allowlist-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowed.txt");
+        std::fs::write(&path, "# every domain revoked\n").unwrap();
+
+        let toml = format!(
+            "[proxy]\nallowed_domains = \"{}\"\n",
+            path.display().to_string().replace('\\', "\\\\")
+        );
+        let resolved = toml::from_str::<config::Config>(&toml)
+            .expect("config parses")
+            .merge(config::CliFlags::default())
+            .expect("config merges");
+
+        let policy = build_net_policy(&resolved, agent::Agent::Copilot);
+        assert!(
+            policy.allowlist_active,
+            "a configured allowed_domains file is an active allowlist even with zero entries"
+        );
+        assert!(policy.allowed_domains.is_empty());
+
+        // The live proxy's own snapshot of the same configuration.
+        let live = proxy::DomainPolicy::build(
+            proxy::PolicySpec {
+                blocked_file: dir.join("no-blocklist.txt"),
+                allowed_domains_file: Some(path),
+                ..Default::default()
+            },
+            std::time::Instant::now(),
+        )
+        .expect("live policy builds")
+        .net_policy(std::time::Instant::now());
+
+        for host in ["github.com", "api.githubcopilot.com", "evil.example"] {
+            let checked = proxy::classify_connect(&policy, host, 443);
+            let enforced = proxy::classify_connect(&live, host, 443);
+            assert_eq!(
+                checked, enforced,
+                "check net and the live proxy must agree about {host}"
+            );
+            assert_eq!(
+                checked,
+                proxy::NetVerdict::BlockedAllowlist,
+                "an allowlist with nothing on it blocks {host}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_net_reports_allow_all_when_no_allowlist_is_configured() {
+        // The no-regression half: with no allowlist configured at all, check
+        // and the proxy both report allow-all.
+        let resolved = toml::from_str::<config::Config>("")
+            .expect("config parses")
+            .merge(config::CliFlags::default())
+            .expect("config merges");
+        let policy = build_net_policy(&resolved, agent::Agent::Copilot);
+        assert!(!policy.allowlist_active);
+        assert_eq!(
+            proxy::classify_connect(&policy, "anything.example", 443),
+            proxy::NetVerdict::Allowed
+        );
+    }
 
     #[test]
     fn check_net_non_canonical_allowlist_matches_live_blocked() {
