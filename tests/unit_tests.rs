@@ -8342,3 +8342,71 @@ fn env_pass_env_java_tool_options_still_suppresses_proxy_injection() {
     let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
     assert_eq!(jto.unwrap().1, "-Xmx1g");
 }
+
+// ── #248: the agent binary in a writable tree ──────────────────
+
+/// The agent binary is spawned by the unsandboxed parent from wherever it was
+/// discovered, so a discovered path the sandbox itself makes writable is an
+/// execution primitive for the next launch. `writable_tree_over` is what the
+/// launch warning asks, and it asks the emitted `fs_rules` rather than a list
+/// of locations kept by hand.
+#[test]
+fn an_agent_binary_under_a_writable_tool_dir_is_a_finding() {
+    let policy = generate_policy(&base_profile_options());
+    let home = std::path::Path::new("/Users/test");
+    // The npx cache: `npx copilot` resolves here, and ~/.npm is granted write
+    // so ordinary installs work.
+    let bin = home.join(".npm/_npx/0e9f/node_modules/.bin/copilot");
+
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &bin),
+        Some(home.join(".npm")),
+        "a binary under a writable tool dir must name the tree containing it"
+    );
+}
+
+/// The ordinary install locations are read+execute and never write, so the
+/// warning stays silent for them — a warning that fires on the common case is
+/// one everybody learns to skip.
+#[test]
+fn an_agent_binary_in_a_read_only_bin_dir_is_not_a_finding() {
+    let policy = generate_policy(&base_profile_options());
+    let home = std::path::Path::new("/Users/test");
+
+    for bin in [
+        home.join(".cargo/bin/copilot"),
+        home.join(".local/bin/copilot"),
+        std::path::PathBuf::from("/usr/local/bin/copilot"),
+    ] {
+        assert_eq!(
+            cplt::check::writable_tree_over(&policy, home, &bin),
+            None,
+            "{} is read-only and must not warn",
+            bin.display()
+        );
+    }
+}
+
+/// The platform answer for a version-manager install, which is the case #248
+/// was filed about. mise's `installs/` sits inside a data dir that has to stay
+/// writable, so #286 re-denied it — a deny SBPL enforces and Landlock cannot
+/// express. So the same path is safe on macOS and is the residual on Linux.
+#[test]
+fn a_mise_installed_agent_is_a_finding_only_where_the_deny_cannot_hold() {
+    let policy = generate_policy(&base_profile_options());
+    let home = std::path::Path::new("/Users/test");
+    let bin = home.join(".local/share/mise/installs/npm-copilot/1.2.3/bin/copilot");
+
+    let found = cplt::check::writable_tree_over(&policy, home, &bin);
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            found, None,
+            "emit_path_bin_denies takes write back on macOS"
+        );
+    } else {
+        assert!(
+            found.is_some(),
+            "Landlock cannot subtract the deny, so the tree stays writable"
+        );
+    }
+}

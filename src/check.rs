@@ -34,6 +34,8 @@ use crate::proxy::{self, NetPolicy, NetVerdict};
 use crate::sandbox::{
     DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, FsAccess, LandlockPolicy,
 };
+#[cfg(target_os = "macos")]
+use crate::sandbox::{PathBinDir, path_bin_dirs};
 
 /// Ground-truth (or, for static-only queries, policy) decision for one probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -231,6 +233,59 @@ pub fn explain_path(
         reason,
         fix,
     }
+}
+
+/// The most specific tree the sandbox makes **writable** that contains `path`,
+/// if any.
+///
+/// Asked of the emitted `fs_rules` — the same model [`explain_path`] reports
+/// from and the one `assemble_sandbox` hands to `cplt check` — rather than a
+/// hand-kept list of writable locations, so the answer cannot drift from what
+/// the backends grant. Longest match wins, matching `explain_path`'s
+/// `matched_rule`: the innermost rule is the one a caller can act on.
+///
+/// Two platform asymmetries, both of them the module doc's "the probe is
+/// authoritative" caveat in miniature:
+///
+/// - macOS re-denies write across the PATH-resolved bin/shim directories
+///   (`emit_path_bin_denies`, last-match-wins), and Landlock cannot express
+///   that. Those are subtracted here from the same `path_bin_dirs` list the
+///   profile emits, so a mise- or bun-installed binary is correctly reported
+///   read-only on macOS and correctly reported writable on Linux, where it is.
+/// - On Linux the bubblewrap overlay re-binds mise's `shims/` and `installs/`
+///   read-only, which would make some of those safe again — not subtracted,
+///   because bwrap is absent on any host without user namespaces and degrades
+///   at spawn time, so the grant may well stand.
+#[must_use]
+pub fn writable_tree_over(policy: &LandlockPolicy, home: &Path, path: &Path) -> Option<PathBuf> {
+    if write_denied(home, path) {
+        return None;
+    }
+    policy
+        .fs_rules
+        .iter()
+        .filter(|r| r.access.write && within(path, &r.path))
+        .map(|r| r.path.clone())
+        .max_by_key(|p| p.as_os_str().len())
+}
+
+/// Whether a write **deny** the platform actually enforces covers `path`.
+///
+/// macOS only: SBPL is last-match-wins, so `emit_path_bin_denies` genuinely
+/// takes write back across those trees. Landlock cannot subtract from an
+/// allowed tree, so on Linux there is nothing to subtract.
+#[cfg(target_os = "macos")]
+fn write_denied(home: &Path, path: &Path) -> bool {
+    path_bin_dirs(home).iter().any(|d| match d {
+        PathBinDir::Subtree(p) => within(path, p),
+        // Anchored to one component, like the regex the profile emits.
+        PathBinDir::TopLevel(p) => path.parent() == Some(p.as_path()),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_denied(_home: &Path, _path: &Path) -> bool {
+    false
 }
 
 // ── Layer 2: network explain ───────────────────────────────────

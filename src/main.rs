@@ -2649,6 +2649,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     let AssembledSandbox {
         prepared,
+        policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
         #[cfg(target_os = "macos")]
@@ -2688,6 +2689,31 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         Ok(path) => path,
         Err(msg) => bail!("{msg}"),
     };
+
+    // #248: the agent binary is spawned by the UNSANDBOXED parent, from wherever
+    // it was discovered. #236 moved cplt's own helpers onto trusted-directory
+    // resolution and #286 took write back across the PATH bin/shim dirs, but the
+    // agent's own binary legitimately lives where the user's version manager put
+    // it, so there is no trusted list to move it onto — only the discovered path
+    // to check.
+    //
+    // Warn and proceed. Refusing would break the ordinary mise/npm install for a
+    // large share of users, and a launch that stops working is not a trade this
+    // buys anything with: the same agent already ran once to get the write.
+    // Asked of the emitted rules, so it fires only where the policy really does
+    // grant write, and not gated on `quiet` — it is a sandbox-boundary warning,
+    // not progress chatter.
+    if let Some(tree) = cplt::check::writable_tree_over(&policy, &home_dir, &agent_bin) {
+        ui::warn(&format!(
+            "the {active_agent} binary at {} sits under {}, which the sandbox makes writable. \
+             cplt spawns the agent binary OUTSIDE the sandbox, as you, so an agent that \
+             rewrites it there gets unsandboxed execution on your next cplt launch — no \
+             approval, no prompt. Install it somewhere the sandbox keeps read-only \
+             (~/.local/bin, /usr/local/bin, or a Homebrew prefix) and rerun.",
+            agent_bin.display(),
+            tree.display()
+        ));
+    }
 
     // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
     // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
