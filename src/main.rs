@@ -5620,6 +5620,13 @@ fn trust_accept(
     // for THESE exact proposal values. Otherwise the accepted set becomes exactly
     // the keys approved now: a partial accept must never silently renew a stale
     // approval whose value changed underneath it (SECURITY.md, "reapproval").
+    // Split the two reasons an approval stops applying, because they are not the
+    // same event and the message must not claim the wrong one. A legacy entry
+    // (empty stored hash) predates value pinning, so nothing "changed" — it was
+    // never recorded. `approval_is_stale` treats both as stale, correctly.
+    let stored_hash_is_legacy = stored
+        .as_ref()
+        .is_some_and(|t| t.accepted.content_hash.is_empty());
     let hash_mismatch = stored
         .as_ref()
         .is_some_and(|t| trust::approval_is_stale(&t.accepted.content_hash, &current_hash));
@@ -5632,9 +5639,15 @@ fn trust_accept(
     // the other approvals, and a user told only "Approved 1 permission(s)" would
     // otherwise discover that at the next launch.
     if hash_mismatch {
+        let reason = if stored_hash_is_legacy {
+            "The previous approval predates value pinning, so it cannot be matched against \
+these proposal values"
+        } else {
+            "Proposal values have changed since the last approval, so the previous approvals \
+no longer apply"
+        };
         println!(
-            "{}[cplt]{} Proposal values have changed since the last approval, so the previous \
-approvals no longer apply. Only the keys approved now are kept.",
+            "{}[cplt]{} {reason}. Only the keys approved now are kept.",
             ui::stdout_color(ui::YELLOW),
             ui::stdout_color(ui::RESET),
         );

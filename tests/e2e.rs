@@ -3482,6 +3482,10 @@ paths = [
                 let content = std::fs::read_to_string(&path).ok()?;
                 Some((path, content))
             })
+            // Sorted: `read_dir` order is filesystem-defined, and these results
+            // are compared with `assert_eq!` to prove a file was untouched.
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
             .collect()
     }
 
@@ -3608,7 +3612,7 @@ paths = [
         assert!(
             !output.status.success(),
             "accept from a different checkout with the same origin must be refused: {}",
-            String::from_utf8_lossy(&output.stdout)
+            String::from_utf8_lossy(&output.stderr)
         );
 
         let after = trust_store_files(&config_file);
