@@ -3465,6 +3465,172 @@ paths = [
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// Read every entry file in the trust store belonging to `config_file`'s
+    /// config dir. The store is keyed on a repo fingerprint, so tests assert on
+    /// the file set rather than recomputing the hash.
+    fn trust_store_files(config_file: &Path) -> Vec<(PathBuf, String)> {
+        let dir = config_file.parent().unwrap().join("trust");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| {
+                let path = e.ok()?.path();
+                if path.extension()? != "toml" {
+                    return None;
+                }
+                let content = std::fs::read_to_string(&path).ok()?;
+                Some((path, content))
+            })
+            .collect()
+    }
+
+    /// Accepting one key must not renew approvals whose *values* changed since
+    /// they were granted. The maintainer widens `allow.read` from a cache dir to
+    /// `~/.ssh`; accepting only the newly added key must drop the stale
+    /// `allow.read` approval, not re-pin it at its new, broader value.
+    #[test]
+    fn e2e_trust_partial_accept_does_not_renew_stale_keys() {
+        let (repo, config_file) = make_trust_repo(
+            "partial-stale",
+            "[propose]\nallow_localhost_any = true\n\n[propose.allow]\nread = [\"~/.gradle/caches\"]\n",
+        );
+
+        let output = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("accept should run");
+        assert!(output.status.success());
+
+        let before = trust_store_files(&config_file);
+        assert_eq!(before.len(), 1, "one trust entry expected: {before:?}");
+        assert!(
+            before[0].1.contains("allow.read"),
+            "allow.read should start approved: {}",
+            before[0].1
+        );
+
+        // Widen allow.read and add a new key, then commit.
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\nallow_docker = true\n\n[propose.allow]\nread = [\"~/.ssh\", \"~/.aws\"]\n",
+        )
+        .unwrap();
+        git_cmd(&repo).args(["add", ".cplt.toml"]).output().unwrap();
+        git_cmd(&repo)
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-m",
+                "widen allow.read",
+                "--quiet",
+            ])
+            .output()
+            .unwrap();
+
+        // Accept only the new key.
+        let output = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "allow_docker"])
+            .output()
+            .expect("accept should run");
+        assert!(
+            output.status.success(),
+            "accept failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("changed"),
+            "dropping the other approvals must be announced, not silent: {stdout}"
+        );
+
+        let after = trust_store_files(&config_file);
+        assert_eq!(after.len(), 1, "one trust entry expected: {after:?}");
+        let content = &after[0].1;
+        assert!(
+            content.contains("allow_docker"),
+            "the accepted key should be approved: {content}"
+        );
+        assert!(
+            !content.contains("allow.read"),
+            "allow.read changed value and must NOT be renewed by a partial accept: {content}"
+        );
+        assert!(
+            !content.contains("allow_localhost_any"),
+            "approvals from the stale hash must not survive a partial accept: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The trust store is keyed on the git origin URL, which any repo can forge.
+    /// A second checkout presenting the same origin must not inherit the first
+    /// checkout's approved keys, nor overwrite its entry.
+    #[test]
+    fn e2e_trust_accept_refuses_foreign_origin_entry() {
+        let propose = "[propose]\nallow_localhost_any = true\nallow_docker = true\n";
+        let (victim, config_file) = make_trust_repo("origin-victim", propose);
+        let (attacker, _attacker_config) = make_trust_repo("origin-attacker", propose);
+        for repo in [&victim, &attacker] {
+            git_cmd(repo)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/victim/repo.git",
+                ])
+                .output()
+                .unwrap();
+        }
+
+        let output = trust_cmd(&victim, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("accept should run");
+        assert!(
+            output.status.success(),
+            "victim accept failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let before = trust_store_files(&config_file);
+        assert_eq!(
+            before.len(),
+            1,
+            "victim should own one trust entry: {before:?}"
+        );
+
+        // Same forged origin, different checkout, accepting one innocuous key.
+        let output = trust_cmd(&attacker, &config_file)
+            .args(["trust", "accept", "allow_docker"])
+            .output()
+            .expect("accept should run");
+        assert!(
+            !output.status.success(),
+            "accept from a different checkout with the same origin must be refused: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let after = trust_store_files(&config_file);
+        assert_eq!(
+            after, before,
+            "the other checkout's entry must be untouched"
+        );
+        assert!(
+            after[0].1.contains("origin-victim"),
+            "entry must stay bound to the original checkout: {}",
+            after[0].1
+        );
+        assert!(
+            !after[0].1.contains("origin-attacker"),
+            "entry must not be rebound to the other checkout: {}",
+            after[0].1
+        );
+
+        let _ = std::fs::remove_dir_all(&victim);
+        let _ = std::fs::remove_dir_all(&attacker);
+    }
+
     #[test]
     fn e2e_trust_isolation_between_repos() {
         let (repo_a, config_file) =
