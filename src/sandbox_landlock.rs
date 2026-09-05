@@ -725,6 +725,14 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // Sockets are *not* masked by bubblewrap in this mode either; both halves
     // read the same path list.
     //
+    // Docker Desktop for Linux serves the daemon from inside that tree, at
+    // `~/.docker/desktop/docker.sock`, so the socket list carries it too
+    // (#279). It has to be its own read+write rule: `ResolveUnix` — the right
+    // `connect(2)` needs from ABI v9 — is granted on the write branch of
+    // `create_path_beneath_rule` alone, so the read-only parent grant below
+    // leaves the socket unconnectable. Landlock unions the rights of every
+    // rule covering a path, so the two rules coexist.
+    //
     // `~/.docker` is read-only, matching the macOS profile (#155): the CLI
     // needs config.json for contexts and registry auth. No write, and no
     // execute — `execute` here is full process-exec (see #243), and a
@@ -733,6 +741,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // cannot deny a subpath of a granted directory.
     if config.allow_docker {
         for path in policy::linux_docker_socket_paths(
+            home,
             policy::current_uid(),
             policy::xdg_runtime_dir_env().as_deref(),
         ) {
@@ -2203,6 +2212,54 @@ mod tests {
         assert!(
             !rule.access.execute,
             "~/.docker must not carry execute (Landlock execute is process-exec, #243)"
+        );
+    }
+
+    /// Docker Desktop for Linux's socket sits at `~/.docker/desktop/docker.sock`,
+    /// inside the read-only `~/.docker` grant (#279). It needs its own
+    /// read+write rule: `create_path_beneath_rule` adds `ResolveUnix` — the
+    /// right `connect(2)` needs from ABI v9 — on the write branch alone, so a
+    /// Desktop user on kernel 7.1 would otherwise get a readable `config.json`
+    /// and a refused connection.
+    #[test]
+    fn allow_docker_grants_the_desktop_socket_read_write() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.allow_docker = true;
+        let policy = generate_policy(&config);
+
+        let socket = home.join(".docker").join("desktop").join("docker.sock");
+        let rule = policy
+            .fs_rules
+            .iter()
+            .find(|r| r.path == socket)
+            .expect("Docker Desktop's socket should be in the ruleset with --allow-docker");
+        assert!(
+            rule.access.read && rule.access.write,
+            "the Desktop socket needs write for ResolveUnix, got {:?}",
+            rule.access
+        );
+        assert!(
+            !rule.access.execute,
+            "a socket must not carry execute, got {:?}",
+            rule.access
+        );
+    }
+
+    /// Without `--allow-docker` the Desktop socket is granted nothing; the
+    /// bubblewrap mask list is what takes it away (see `socket_mask_paths`).
+    #[test]
+    fn docker_desktop_socket_absent_without_allow_docker() {
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let config = test_config(&project, &home);
+        let policy = generate_policy(&config);
+
+        let socket = home.join(".docker").join("desktop").join("docker.sock");
+        assert!(
+            !policy.fs_rules.iter().any(|r| r.path == socket),
+            "the Desktop socket must stay out of the ruleset without --allow-docker"
         );
     }
 

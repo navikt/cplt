@@ -781,6 +781,7 @@ fn prepare_impl(
     // they never show up in the "could not be mount-masked" warning; the masks
     // are only ever applied when bwrap actually wraps the run.
     let socket_masks: Vec<PathBuf> = policy::socket_mask_paths(
+        config.home_dir,
         policy::current_uid(),
         policy::xdg_runtime_dir_env().as_deref(),
         config.allow_docker,
