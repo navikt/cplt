@@ -23,7 +23,7 @@ cplt config set gh_guard.block_auth_token true      # deny "gh auth token" exfil
 cplt config set gh_guard.unknown_command block      # block unrecognized gh commands
 
 # git guard — on by default, in warn mode
-cplt config set git_guard.mode block                # block | warn | audit (default warn)
+cplt config set git_guard.mode warn                # block | warn | audit (default block)
 cplt config set git_guard.enabled false             # opt out entirely
 cplt config set git_guard.prevent_push true         # block git push/request-pull
 ```

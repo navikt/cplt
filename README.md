@@ -76,9 +76,9 @@ cplt init --write
 # 2. Developers approve on first run
 cplt trust accept --all
 
-# 3. Tune the command guards (both are on by default)
-cplt config set git_guard.mode block                       # escalate the git guard from warn
-cplt config set git_guard.protect_default_branch_only true # allow feature-branch pushes
+# 3. Tune the command guards (both block by default)
+cplt config set git_guard.protect_default_branch_only false # block every push, not just main
+cplt config set git_guard.mode warn                         # observe instead of blocking
 ```
 
 ## What it blocks
@@ -118,7 +118,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read `~/.netrc`, `~/.pypirc`, `~/.vault-token` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | Read `~/.gem/credentials` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | `gh` CLI destructive operations (merge, delete, release) | 🔒 Command-gated (on by default) | Opt out with `--no-gh-guard`. See [gh guard](docs/gh-guard.md) |
-| `git push` to remote | ⚠️ Command-gated, warn-only by default | On by default in `warn` mode: the push runs, with a warning. `git_guard.mode = "block"` enforces; `--no-git-guard` opts out |
+| `git push` to the default branch | 🔒 Command-gated (on by default) | Blocks pushes to `main`/`master`; feature-branch pushes still work. `protect_default_branch_only = false` blocks every push, `git_guard.mode = "warn"` only warns, `--no-git-guard` opts out |
 | Child process inheritance | ✅ All restrictions apply to subprocesses | |
 
 That table is a summary. The sandbox also allows access to system files (SSL certs, `/etc/hosts`), temp directories (read and write, no exec), and system tool paths (`/usr/bin`, `/opt/homebrew`). Run `cplt --print-profile` for the complete SBPL rules.
@@ -208,9 +208,10 @@ push access. Pushing a branch, merging a pull request and deleting a
 repository are all well-formed API calls from an authorised client, and a
 filesystem or network rule has no opinion about them. cplt wraps `git` and
 `gh` instead. The agent commits, branches and rebases freely. `gh pr merge`,
-`gh repo delete` and `gh release create` are blocked by default. `git push`
-warns by default; set `git_guard.mode = "block"` to stop it, and
-`protect_default_branch_only` to keep feature branches open.
+`gh repo delete` and `gh release create` are blocked by default. So is
+`git push` to `main`/`master`; feature-branch pushes still work, because
+`protect_default_branch_only` is on. Set it to `false` to block every push, or
+`git_guard.mode = "warn"` to only warn.
 
 Running both is reasonable. MXC confines the process. The guards decide what
 the agent may do with the credentials it holds.
@@ -698,7 +699,7 @@ cplt settings
 # Set global preferences
 cplt config set sandbox.quiet true
 cplt config set proxy.blocked_domains "~/.config/cplt/blocked-domains.txt"
-cplt config set git_guard.mode block
+cplt config set git_guard.mode warn      # observe pushes instead of blocking them
 cplt config set gh_guard.enabled false   # opt out of the gh guard entirely
 
 # Set per-repo policy (committed to .cplt.toml)

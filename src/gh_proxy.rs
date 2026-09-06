@@ -2434,6 +2434,23 @@ pub fn gate_git(
                 }
                 return Ok(());
             }
+
+            // The refusal that follows is about *one branch*, not about pushing.
+            // Without saying so the only route the message names is the escape
+            // hatch, which tells the reader to turn the guard off — the one
+            // answer a security control must not lead with. Naming the branch
+            // and the form that works keeps the actionable route in the message.
+            let remote = push_remote_name(push_args);
+            if default_branch.is_some() {
+                match target_branch {
+                    Some(branch) => block_hints.push(format!(
+                        "'{branch}' is the protected branch here. Only the default branch is                          protected (protect_default_branch_only), so pushing a feature branch                          works as it is: `git push {remote} <branch>` with any other name."
+                    )),
+                    None => block_hints.push(format!(
+                        "This push targets the checked-out branch, which is either the                          protected default branch or could not be resolved. Naming a feature                          branch explicitly works: `git push {remote} <branch>`."
+                    )),
+                }
+            }
         }
 
         // Check allow_push exception rules before blocking
@@ -3778,6 +3795,49 @@ mod tests {
         gate_git(&args, true, true, true, &[], Some(git))
     }
 
+    /// #386: the shipped defaults — no config, no flags, no `allow_push` rule —
+    /// refuse a push to the default branch and allow one to a feature branch.
+    /// Driven from the resolved config rather than from literals, so a default
+    /// that flips back fails here rather than only in the config tests.
+    #[test]
+    fn standard_defaults_block_the_default_branch_and_allow_feature_branches() {
+        use crate::config::{CliFlags, Config, EnforcementMode};
+
+        let r = Config::default().merge(CliFlags::default()).unwrap();
+        assert_eq!(r.git_guard.mode, EnforcementMode::Block);
+        assert!(r.git_guard.enabled);
+        assert!(
+            r.git_guard.allow_push.is_empty(),
+            "the default posture must need no push exception to stay usable"
+        );
+
+        let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/o/o.git") else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+        let gate = |push_args: &[&str]| {
+            let mut args = vec!["-C", dir.as_str()];
+            args.extend_from_slice(push_args);
+            gate_git(
+                &args,
+                r.git_guard.prevent_push,
+                r.git_guard.prevent_force_push,
+                r.git_guard.protect_default_branch_only,
+                &r.git_guard.allow_push,
+                Some(&git),
+            )
+        };
+        assert!(
+            gate(&["push", "origin", "main"]).is_err(),
+            "a push to the default branch must be refused by default"
+        );
+        assert!(
+            gate(&["push", "origin", "feature/x"]).is_ok(),
+            "a feature-branch push must still work by default"
+        );
+    }
+
     #[test]
     fn protect_default_allows_feature_branch() {
         let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/o/o.git") else {
@@ -3802,6 +3862,22 @@ mod tests {
         let dir = repo.to_string_lossy().into_owned();
         assert!(gate_push_in(&git, &dir, &["push", "origin", "main"]).is_err());
         assert!(gate_push_in(&git, &dir, &["push", "origin", "master"]).is_err());
+    }
+
+    /// A refusal must name the route that still works. Before this the message
+    /// said only that push prevention was enabled, and the one way forward it
+    /// named was the escape hatch — turning the guard off.
+    #[test]
+    fn a_default_branch_refusal_names_the_feature_branch_route() {
+        let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/o/o.git") else {
+            return;
+        };
+        let git = which_git().unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+        let msg = gate_push_in(&git, &dir, &["push", "origin", "main"])
+            .expect_err("a push to the default branch must be refused");
+        assert!(msg.contains("'main' is the protected branch"), "{msg}");
+        assert!(msg.contains("git push origin <branch>"), "{msg}");
     }
 
     #[test]

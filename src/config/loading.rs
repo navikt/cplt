@@ -3201,15 +3201,19 @@ validate = false
         assert!(resolved.git_guard.enabled, "git guard must default on");
     }
 
-    /// The git guard carries far more legitimate traffic than the gh guard, so
-    /// its default-on lands in `warn`: output changes for everyone, nothing is
-    /// blocked. Escalating to `block` is `strict`'s job, or the user's.
+    /// #386: both guards block out of the box. The two halves ship together —
+    /// `prevent_push` is on, so `block` without `protect_default_branch_only`
+    /// would deny every push until the user writes an `allow_push` rule.
     #[test]
-    fn git_guard_defaults_to_warn_not_block() {
+    fn git_guard_defaults_to_block_on_the_default_branch_only() {
         let resolved = Config::default().merge(CliFlags::default()).unwrap();
-        assert_eq!(resolved.git_guard.mode, EnforcementMode::Warn);
-        // The sub-policies stay fail-closed underneath the warn: flipping the
-        // mode to block must not also require re-enabling them.
+        assert_eq!(resolved.git_guard.mode, EnforcementMode::Block);
+        assert!(
+            resolved.git_guard.protect_default_branch_only,
+            "block mode is only shippable while feature-branch pushes still work"
+        );
+        // The sub-policies stay fail-closed underneath: the mode is what
+        // changed, not the plumbing.
         assert!(resolved.git_guard.prevent_push);
         assert!(resolved.git_guard.prevent_force_push);
     }
@@ -3256,8 +3260,10 @@ validate = false
         // Guards on (#122), forced proxy and fail-closed allowlist still off —
         // those are `strict`-only.
         assert_eq!(posture_snapshot(&resolved), (true, true, false, false));
-        // The git guard is on but only warns; escalating to block is strict's job.
-        assert_eq!(resolved.git_guard.mode, EnforcementMode::Warn);
+        // The git guard blocks (#386), but only pushes to the default branch;
+        // blocking every push is strict's job.
+        assert_eq!(resolved.git_guard.mode, EnforcementMode::Block);
+        assert!(resolved.git_guard.protect_default_branch_only);
     }
 
     #[test]
@@ -3683,8 +3689,10 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.git_guard.protect_default_branch_only,
-                default: false,
-                preset: None,
+                default: true,
+                // On by default since #386, so `strict` is what differs: it
+                // blocks every push, not only the default branch.
+                preset: Some((Preset::Strict, false)),
             },
             // `sandbox.agents_md` is exercised separately: its resolved value is
             // additionally gated on `brief`, so it does not follow the plain

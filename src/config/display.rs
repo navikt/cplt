@@ -502,7 +502,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     );
     println!(
         "{blue}[cplt]{nc}    protect_default_branch_only = {}{}",
-        c.git_guard.protect_default_branch_only.unwrap_or(false),
+        c.git_guard.protect_default_branch_only.unwrap_or(true),
         src(c.git_guard.protect_default_branch_only.is_some())
     );
     if !c.git_guard.allow_push.is_empty() {
