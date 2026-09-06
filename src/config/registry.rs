@@ -493,15 +493,15 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "true",
-        description: "Intercept git push, request-pull and send-pack. What happens to an intercepted command is `mode`: warn (default) prints and runs it, block refuses it.",
+        description: "Intercept git push, request-pull and send-pack. What happens to an intercepted command is `mode`: block (default) refuses it, warn prints and runs it.",
     },
     ConfigKeyInfo {
         section: "git_guard",
         key: "mode",
         value_type: ConfigValueType::Str,
         dangerous: false,
-        default_display: "warn",
-        description: "Enforcement mode: \"warn\" (default: print warning, allow), \"block\" (deny and exit; the default under --preset strict), or \"audit\" (silent log).",
+        default_display: "block",
+        description: "Enforcement mode: \"block\" (default: deny and exit), \"warn\" (print warning, allow), or \"audit\" (silent log).",
     },
     ConfigKeyInfo {
         section: "git_guard",
@@ -523,9 +523,12 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         section: "git_guard",
         key: "protect_default_branch_only",
         value_type: ConfigValueType::Bool,
-        dangerous: true,
-        default_display: "false",
-        description: "Only block pushes to default branch (main/master). Allows feature branch pushes.",
+        // Not dangerous since #386: it is the shipped default outside `strict`,
+        // and a key that is on by default cannot also be the key that demands
+        // --force to turn on. The value that tightens the guard here is `false`.
+        dangerous: false,
+        default_display: "true",
+        description: "Only block pushes to the default branch (main/master), the default outside --preset strict. Set false to block every push.",
     },
     ConfigKeyInfo {
         section: "git_guard",
@@ -931,7 +934,7 @@ bool_keys! {
     git_protect_default_branch_only, "git_guard", "protect_default_branch_only",
         cli = |_: &CliFlags| FeatureToggle::UseDefault,
         config = |c: &Config| c.git_guard.protect_default_branch_only,
-        baseline = |_: PresetBaseline| false,
+        baseline = |b: PresetBaseline| b.git_protect_default_branch_only,
         resolved = |r: &Resolved| r.git_guard.protect_default_branch_only;
 }
 

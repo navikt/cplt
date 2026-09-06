@@ -42,7 +42,7 @@ cplt config set sandbox.quiet true
 cplt config set proxy.port 9090
 cplt config set allow.read ~/Desktop
 cplt config set allow.ports 8080
-cplt config set git_guard.mode block     # the git guard is on but warns by default
+cplt config set git_guard.mode warn      # the git guard blocks by default
 cplt config set gh_guard.enabled false   # opt out of the gh guard
 ```
 
@@ -92,7 +92,7 @@ preset = "standard"
 
 ¹ `standard` leaves the per-session scratch directory on, which is the default and what most tools need. `allow_tmp_exec` (raw `/tmp` exec) stays off. `standard` is identical to cplt's hardcoded defaults, so omitting `--preset` behaves exactly like `--preset standard`.
 
-`gh_guard` and `git_guard` are on under `standard` (the default posture), with the git guard in `warn` mode. `strict` additionally escalates the git guard to `block` and turns on `proxy.forced` (mandatory proxy, kernel egress locked to it) and `proxy.default_allowlist` (fail-closed domain filtering, where only the agent's built-in allowlist plus any `allowed_domains` resolve and everything else is blocked). The last two are orthogonal and compose: the kernel pins egress to the proxy, then the proxy filters domains. `permissive` and `full-trust` turn both guards back off along with weakening the sandbox toggles.
+`gh_guard` and `git_guard` are on under `standard` (the default posture), both in `block` mode; the git guard blocks pushes to the default branch only (`protect_default_branch_only`), so feature-branch pushes still work. `strict` additionally drops that relaxation — every push is blocked — and turns on `proxy.forced` (mandatory proxy, kernel egress locked to it) and `proxy.default_allowlist` (fail-closed domain filtering, where only the agent's built-in allowlist plus any `allowed_domains` resolve and everything else is blocked). The last two are orthogonal and compose: the kernel pins egress to the proxy, then the proxy filters domains. `permissive` and `full-trust` turn both guards back off along with weakening the sandbox toggles.
 
 Because `strict` only enables safety features, `config set sandbox.preset strict` needs no `--force`, unlike `permissive` and `full-trust`, which weaken the sandbox. To take the strict baseline but keep the network open, add `--allow-all-domains` (or `proxy.default_allowlist = false`). That overrides just the allowlist, since an explicit off beats the baseline.
 
