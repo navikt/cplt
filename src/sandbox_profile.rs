@@ -272,8 +272,16 @@ fn emit_process_rules(sb: &mut String) {
     // master read buffer, the same path the program's own stdout takes, so the
     // receiving emulator renders it with nothing else in the loop: display
     // forgery and OSC 52 clipboard writes into a session the agent was never
-    // given. (Not keystroke injection on macOS — data written to a slave never
-    // enters that slave's input queue, and TIOCSTI is blocked by the kernel.)
+    // given. Writing is not by itself keystroke injection — data written to a
+    // slave never enters that slave's input queue — but do NOT restate that as
+    // "TIOCSTI is blocked by the macOS kernel", which is what this comment used
+    // to say and is wrong. XNU permits `TIOCSTI` on the caller's OWN
+    // controlling terminal; it refuses it (EPERM) on any other tty, which is
+    // why a peer `/dev/ttysNNN` is not an injection target even when the device
+    // tree is handed back with `--allow-write /dev`. Inside a cplt session the
+    // ioctl is denied by the profile's `(deny default)`, NOT by the
+    // unconditional `(allow file-ioctl)`, which does not reach it.
+    // See SECURITY.md, "Terminal injection".
     //
     // Writes are now an allowlist of nodes that cannot name another terminal:
     //   /dev/tty     always resolves to the caller's OWN controlling terminal
