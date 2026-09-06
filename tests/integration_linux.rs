@@ -739,6 +739,68 @@ else:
         assert_eq!(code, 0, "Normal read/write/fork/exec should work");
     }
 
+    // ── Terminal-injection ioctls (GHSA-q3p2-6x2x-8w8w, CVE-2017-5226) ──
+    //
+    // A sandboxed agent can `ioctl(fd0, TIOCSTI, &c)` on its inherited
+    // controlling terminal to push a command line into the terminal's input
+    // queue and exit; the parent shell then reads and runs it — a full escape.
+    // Landlock cannot mediate ioctls on an inherited fd, so seccomp is the
+    // layer that stops it. This is the *live* kernel test of that rule: it
+    // installs the real filter and issues the real syscall. seccomp fires on
+    // syscall entry by request number, before the tty layer sees the fd, so
+    // the deny is EPERM regardless of whether stdin is a real terminal.
+    //
+    // This test can only run where a kernel actually installs the filter,
+    // i.e. Linux CI; it cannot be exercised on macOS.
+    #[test]
+    fn seccomp_blocks_terminal_injection_ioctls() {
+        require_landlock!();
+        if !have_python3() {
+            eprintln!("SKIPPED: python3 not available");
+            return;
+        }
+        let project = create_test_project();
+
+        // Request numbers are asm-generic, identical on x86_64 and aarch64.
+        let script = r#"
+            python3 -c "
+import ctypes, errno, fcntl, sys
+TIOCSTI, TIOCLINUX, TIOCGWINSZ = 0x5412, 0x541C, 0x5413
+
+# Prove seccomp is actually installed before reading anything into an EPERM.
+# EPERM from TIOCSTI is otherwise ambiguous: the kernel returns it for a
+# controlling-terminal mismatch, so on a tty stdin this test would pass with
+# the seccomp rule removed. PR_GET_SECCOMP == 2 is SECCOMP_MODE_FILTER.
+PR_GET_SECCOMP = 21
+seccomp_mode = ctypes.CDLL(None, use_errno=True).prctl(PR_GET_SECCOMP, 0, 0, 0, 0)
+
+def probe(request):
+    try:
+        fcntl.ioctl(0, request, b'\x00' * 8)
+        return 'OK'
+    except PermissionError:
+        return 'EPERM'
+    except OSError as e:
+        return 'OTHER ' + errno.errorcode.get(e.errno, str(e.errno))
+
+sti, lin, win = probe(TIOCSTI), probe(TIOCLINUX), probe(TIOCGWINSZ)
+print(f'TIOCSTI={sti} TIOCLINUX={lin} TIOCGWINSZ={win}')
+# The injection ioctls must be denied by seccomp (EPERM). The benign
+# window-size ioctl must NOT be denied by seccomp: on a non-tty stdin the
+# kernel answers ENOTTY, on a tty it succeeds — either way, not EPERM.
+print(f'seccomp_mode={seccomp_mode}')
+ok = seccomp_mode == 2 and sti == 'EPERM' and lin == 'EPERM' and win != 'EPERM'
+sys.exit(0 if ok else 1)
+"
+        "#;
+        let (code, stdout, stderr) = run_sandboxed(project.path(), script);
+        assert_eq!(
+            code, 0,
+            "seccomp must EPERM TIOCSTI/TIOCLINUX and leave TIOCGWINSZ alone.\n\
+             stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
     // ── UDP egress under proxy-forced (Finding B) ─────────────────
     //
     // Landlock's network rights are TCP-only, so before this the sandbox let
