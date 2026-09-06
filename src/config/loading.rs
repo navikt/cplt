@@ -659,8 +659,9 @@ pub fn exec_tool_dir_warning(
 /// in `sandbox_landlock.rs`), so a `process_exec` directory sitting under a
 /// writable tree is already writable AND executable on Linux. Every agent
 /// directory candidate #343 added has that shape: `~/.copilot` is `write: true`
-/// itself, and `~/.pi/agent/bin` and `~/.cache/opencode/bin` inherit write from
-/// `~/.pi/agent` and `~/.cache`.
+/// itself, and `~/.cache/opencode/bin` inherits write from `~/.cache`.
+/// `~/.pi/agent/bin` no longer does: Pi's root grant is read-only precisely so
+/// that its managed binaries are not inside a writable tree.
 ///
 /// Derived from the *write* side of the same three sources the exec candidates
 /// come from, so it cannot drift into a second hand-maintained list.
@@ -852,9 +853,9 @@ impl Resolved {
     ///
     /// `agent_dirs` is the agent's own directories, which lose execute the same
     /// way on macOS (#343): `~/.pi/agent/bin` and `~/.cache/opencode/bin` are
-    /// `process_exec` with a writable parent, so `allow.write = ["~/.pi"]`
-    /// withdraws exec from the managed binaries the agent expects to run. On
-    /// Linux those are already write+execute through the ancestor union and the
+    /// `process_exec`, so `allow.write = ["~/.pi"]` withdraws exec from the
+    /// managed binaries the agent expects to run. On Linux `~/.cache/opencode/bin`
+    /// is already write+execute through the `~/.cache` ancestor union and the
     /// grant takes nothing away — [`exec_tool_dir_warning`] says which case each
     /// directory is. They are passed in rather than derived here because the set
     /// depends on which agent's profile is built, which `Resolved` does not know.

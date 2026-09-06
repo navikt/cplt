@@ -978,15 +978,86 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
                 },
                 &[],
             );
-            for dir in agent_dirs.iter().filter(|d| d.write) {
-                for sub in agent.host_persistence_denies() {
-                    let path = dir.path.join(sub).display().to_string();
-                    let line = format!("(deny file-write* (subpath \"{path}\"))");
-                    assert!(p.contains(&line), "{agent:?} profile missing: {line}");
-                }
+            // Asserted through `host_persistence_paths` rather than re-derived
+            // from the writable grants: that function decides which grants the
+            // denies are joined onto (the top-level ones, writable or not), and
+            // re-deriving it here made the test disagree with the code the
+            // moment an agent's root grant stopped being writable.
+            for path in agent.host_persistence_paths(&agent_dirs) {
+                let line = format!("(deny file-write* (subpath \"{}\"))", path.display());
+                assert!(p.contains(&line), "{agent:?} profile missing: {line}");
             }
         }
     });
+}
+
+/// H-12: Pi's project trust store must be write-denied.
+///
+/// `~/.pi/agent/trust.json` records trust as a bare per-directory decision with
+/// no fingerprint of what was trusted, and trust is the gate on the
+/// project-local auto-load paths (`.pi/extensions`, `.pi/settings.json`
+/// `packages`). An agent that writes it pre-trusts a directory, and the planted
+/// project config then loads on the next unsandboxed `pi` with no prompt.
+#[test]
+fn pi_profile_denies_the_project_trust_store() {
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = cplt::agent::Agent::Pi.config_dirs(home);
+    let p = generate_profile(
+        &SandboxConfig {
+            agent: cplt::agent::Agent::Pi,
+            agent_dirs: &agent_dirs,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        p.contains("(deny file-write* (subpath \"/Users/test/.pi/agent/trust.json\"))"),
+        "the trust store must be denied alongside settings.json:\n{p}"
+    );
+}
+
+/// H-13/H-05: an agent's managed-binary dir must not sit inside a writable
+/// Landlock grant.
+///
+/// Landlock unions a path with every ancestor rule and has no deny form, so a
+/// `write: true` grant on `~/.pi/agent` reached the exec-only `~/.pi/agent/bin`
+/// inside it: the managed `rg`/`fd` were writable AND executable, and a
+/// contained agent that overwrote one owned the user's next unsandboxed `pi`.
+/// macOS denies the write at the tail of the profile; on Linux the grant has to
+/// be narrowed instead, which is what this asserts — while the rest of the tree
+/// stays writable, or Pi cannot record a session.
+#[test]
+fn pi_managed_binaries_are_not_inside_a_writable_linux_grant() {
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = cplt::agent::Agent::Pi.config_dirs(home);
+    let policy = generate_policy(&SandboxConfig {
+        agent: cplt::agent::Agent::Pi,
+        agent_dirs: &agent_dirs,
+        // No tool dirs: this is about the agent grants, and ~/.cache would
+        // otherwise be the writable ancestor of nothing here anyway.
+        existing_home_tool_dirs: Some(&[]),
+        ..base_profile_options()
+    });
+
+    let bin = home.join(".pi/agent/bin");
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &bin),
+        None,
+        "no rule may make ~/.pi/agent/bin writable — it is granted EXECUTE, and \
+         Landlock cannot subtract a write grant from an ancestor"
+    );
+    assert!(
+        policy
+            .fs_rules
+            .iter()
+            .any(|r| r.path == bin && r.access.execute),
+        "the managed fd/rg must still be executable"
+    );
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &home.join(".pi/agent/sessions/x.jsonl")),
+        Some(home.join(".pi/agent/sessions")),
+        "narrowing must not cost Pi its session directory"
+    );
 }
 
 /// A user `allow.write` must NOT reopen the host-persistence denies.
