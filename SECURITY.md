@@ -422,9 +422,12 @@ attacker's target inode instead.
 The condition it needs is real but not small: control of a recognised derived
 path, and two launches. It is **not fixed** — there is no `O_NOFOLLOW` open and no
 post-open inode verification today. It is stated here rather than claimed away.
-The macOS side does not share it: Seatbelt matches on the kernel-resolved path at
-every access, so a swapped symlink is re-evaluated rather than captured once (see
-[Symlink attack protection](#symlink-attack-protection)).
+Whether macOS shares it has not been established. Seatbelt is known to resolve
+symlinks when enforcing *deny* rules — that is what [Symlink attack
+protection](#symlink-attack-protection) and its tests cover — but whether an
+*allow* rule is re-evaluated per access or captured when the profile is compiled
+is a different property, and nothing here tests it. Do not read the deny-side
+result as covering the allow side.
 
 **`~/.config/gh/hosts.yml` is readable.** With gh guard enabled (the default), Copilot gets its token through a one-time cached file that is deleted after the first read; with gh guard disabled, `gh auth token` works inside the sandbox. The file holds a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable, not the whole `.config/gh` directory. With outbound port 443 open, a compromised agent could exfiltrate this token, though the token grants access to GitHub, which Copilot is already connected to. To mitigate, use `--deny-path ~/.config/gh`; Copilot falls back to Keychain auth.
 
