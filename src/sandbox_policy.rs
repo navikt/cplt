@@ -2034,6 +2034,174 @@ pub const PROTECTED_IN_ROOT: &[Protected] = &[
         why: "Copilot hook load path — runs unsandboxed on the next session in this repo",
         linux: LinuxCoverage::Bwrap,
     },
+    // ── H-11: three more agents auto-execute from the project directory ──
+    //
+    // Same class as `.agents/plugins` (#267) and `.github/hooks` (#339): a file
+    // or dir the agent writes now that runs unsandboxed on the HOST the next
+    // time an agent opens this repo. Each path below was verified against the
+    // upstream loader/config source, not a doc summary; where a claim could not
+    // be confirmed the path was left out rather than protected on a guess.
+    //
+    // `nested`/Linux reminder (see the module header and `sandbox_landlock`):
+    // Landlock enforces NONE of `PROTECTED_IN_ROOT` — on Linux the whole set is
+    // carried by the bubblewrap read-only overlay alone, and only for `Bwrap`
+    // entries. The `nested` regex ("this path at any depth") is macOS-only, and
+    // bubblewrap binds only paths that EXIST at launch, so a not-yet-created one
+    // is unprotected on Linux until it exists. Both are pre-existing properties
+    // of this table, restated because two of these entries lean on `nested` to
+    // reach a sub-path (`.claude/skills/*/.claude-plugin`, `.opencode/opencode.json`).
+
+    // OpenCode. `config/plugin.ts` globs `{plugin,plugins}/*.{ts,js}` and
+    // imports each, and `tool/registry.ts` globs `{tool,tools}/*.{js,ts}` and
+    // `import()`s each at registry init (top-level module code runs), both under
+    // every `.opencode` scan root (`config/paths.ts::directories`). So four
+    // subdirs auto-execute at startup.
+    //
+    // SURGICAL, not a whole-`.opencode/` deny: `config.ts` writes into
+    // `.opencode/` every run — `ensureGitignore` creates `.opencode/.gitignore`
+    // and the background `npm install @opencode-ai/plugin` writes
+    // `.opencode/{node_modules,package.json,*.lock}`. Denying the tree would
+    // break OpenCode's own startup. The exec content lives only in these four
+    // subdirs; the generated state at `.opencode/` root stays writable.
+    Protected {
+        rel: ".opencode/plugins",
+        tree: true,
+        nested: true,
+        why: "OpenCode plugin dir (plural) — auto-loaded on the host next session",
+        linux: LinuxCoverage::Bwrap,
+    },
+    Protected {
+        rel: ".opencode/plugin",
+        tree: true,
+        nested: true,
+        why: "OpenCode plugin dir (singular) — same `{plugin,plugins}` glob",
+        linux: LinuxCoverage::Bwrap,
+    },
+    Protected {
+        rel: ".opencode/tools",
+        tree: true,
+        nested: true,
+        why: "OpenCode custom-tool dir (plural) — import()ed at registry init",
+        linux: LinuxCoverage::Bwrap,
+    },
+    Protected {
+        rel: ".opencode/tool",
+        tree: true,
+        nested: true,
+        why: "OpenCode custom-tool dir (singular) — same `{tool,tools}` glob",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // `ConfigPaths.files` walks up from cwd loading a project-root
+    // `opencode.json`/`opencode.jsonc`; both carry a `plugin` array (npm-installed
+    // at startup), an `mcp` entry whose local `command` is spawned, and remote
+    // `instructions` URLs — all with no trust prompt. Files, and the `nested`
+    // regex also reaches the copy inside `.opencode/` (loaded by `config.ts`).
+    Protected {
+        rel: "opencode.json",
+        tree: false,
+        nested: true,
+        why: "OpenCode root config — plugin array / mcp command / remote instructions",
+        linux: LinuxCoverage::Bwrap,
+    },
+    Protected {
+        rel: "opencode.jsonc",
+        tree: false,
+        nested: true,
+        why: "OpenCode root config (jsonc) — same startup-exec surface",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // Claude Code runs the hooks declared in `<project>/.claude/settings.json`,
+    // including `SessionStart`, which fires the moment a session opens in this
+    // repo (code.claude.com/docs/en/hooks). A hook the agent plants there runs
+    // unsandboxed on the next Claude session — same class as `.github/hooks`.
+    //
+    // A FILE, not a subtree: `.claude/` also holds session state Claude writes
+    // every run (projects/, history, todos), so denying the directory would
+    // break legitimate writes. Hooks live in `settings.json`, so that one file
+    // is what is denied — the same precise scoping the HOST-side `~/.claude`
+    // deny already uses (`Agent::host_persistence_denies`).
+    Protected {
+        rel: ".claude/settings.json",
+        tree: false,
+        nested: true,
+        why: "Claude hook carrier — SessionStart etc. run unsandboxed next session",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // The project-local settings file is the same schema layered over
+    // `settings.json` (code.claude.com/docs/en/settings: it is a full settings
+    // file at the "project local" precedence level, and the hooks live-reload
+    // covers "user, project, local, and managed settings"), so it carries the
+    // same `hooks` and the same auto-exec. Denied as its own file for the same
+    // reason `settings.json` is — `.claude/` stays writable for state.
+    Protected {
+        rel: ".claude/settings.local.json",
+        tree: false,
+        nested: true,
+        why: "Claude local hook carrier — same auto-exec as settings.json",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // A `.claude-plugin/plugin.json` dropped in a `.claude/skills/<name>/` folder
+    // promotes it to a plugin `<name>@skills-dir` that auto-loads next session
+    // with no install step (code.claude.com/docs/en/plugins-reference), bundling
+    // hooks/, .mcp.json, agents/, monitors/ and bin/ — all auto-run on load.
+    // The manifest dir is the promotion gate and holds ONLY `plugin.json` (docs:
+    // "Only plugin.json goes inside .claude-plugin/"), so denying it blocks the
+    // plant without touching SKILL.md or any skill component authoring. Denied
+    // wherever it appears, since it is a pure-manifest dir with no session state;
+    // the `.claude/skills/*/.claude-plugin` case is reached by the `nested`
+    // regex (macOS-only, per the reminder above). Project-scope skills-dir
+    // plugins also gate on the workspace-trust dialog, which a `-p`/SDK session
+    // does not show — the same headless-trust gap as `.mcp.json` below.
+    Protected {
+        rel: ".claude-plugin",
+        tree: true,
+        nested: true,
+        why: "Claude skills-dir plugin manifest — promotes a skill to an auto-loaded plugin",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // `<project>/.mcp.json` auto-connects its MCP servers — spawning each local
+    // `command` — with no prompt in `-p`/SDK/cloud sessions
+    // (code.claude.com/docs/en/mcp); interactive sessions prompt first. A file
+    // the agent plants that spawns a host process on the next headless run in
+    // this repo. Protected (not merely documented like the writable `~/.claude.json`
+    // residual): unlike that home file Claude rewrites constantly, project
+    // `.mcp.json` is static, user/team-authored config Claude does not touch
+    // mid-session — `claude mcp add --scope project` is the only writer, an
+    // explicit command to run outside cplt like the other denied config here.
+    Protected {
+        rel: ".mcp.json",
+        tree: false,
+        nested: true,
+        why: "Claude project MCP config — spawns server commands unprompted in headless sessions",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // Pi auto-discovers `<project>/.pi/extensions/` at startup and runs them
+    // with full user permissions (pi.dev/docs/latest/security). A SUBTREE, not a
+    // file: the loader takes `.ts` and `.js`, any `*/package.json` carrying a
+    // `pi` field, and followed symlinks, so no single file shape covers it. The
+    // rest of `.pi/` (skills, prompts, themes) is ordinary content and stays
+    // writable. Pi is closed-source; this mirrors the decision this repo already
+    // made HOST-side, where `~/.pi/agent` denies `extensions` and `settings.json`
+    // for exactly these reasons (`Agent::host_persistence_denies`).
+    Protected {
+        rel: ".pi/extensions",
+        tree: true,
+        nested: true,
+        why: "Pi extension dir — auto-discovered and run unsandboxed next session",
+        linux: LinuxCoverage::Bwrap,
+    },
+    // `.pi/settings.json` names `packages` (npm/git-installed at startup once the
+    // project is trusted) and `extensions` paths that can point anywhere, so the
+    // file itself steers auto-execution even when `.pi/extensions/` is empty. A
+    // file — the rest of `.pi/` stays writable. The HOST-side `~/.pi/agent/settings.json`
+    // is already denied for this same reason; the project-side file was not.
+    Protected {
+        rel: ".pi/settings.json",
+        tree: false,
+        nested: true,
+        why: "Pi project settings — packages install and extensions load on trust",
+        linux: LinuxCoverage::Bwrap,
+    },
 ];
 
 /// Protected paths relative to a git directory.
@@ -2375,7 +2543,23 @@ mod tests {
         };
         assert_eq!(
             bwrap(PROTECTED_IN_ROOT),
-            [".cplt.toml", ".agents/plugins", ".github/hooks"],
+            [
+                ".cplt.toml",
+                ".agents/plugins",
+                ".github/hooks",
+                ".opencode/plugins",
+                ".opencode/plugin",
+                ".opencode/tools",
+                ".opencode/tool",
+                "opencode.json",
+                "opencode.jsonc",
+                ".claude/settings.json",
+                ".claude/settings.local.json",
+                ".claude-plugin",
+                ".mcp.json",
+                ".pi/extensions",
+                ".pi/settings.json",
+            ],
             "bubblewrap re-binds these read-only under every writable root"
         );
         assert_eq!(
@@ -2406,7 +2590,7 @@ mod tests {
         );
         assert_eq!(
             nested_alternation(PROTECTED_IN_ROOT),
-            r"\.gitmodules|\.cplt\.toml|\.agents/plugins|\.github/hooks",
+            r"\.gitmodules|\.cplt\.toml|\.agents/plugins|\.github/hooks|\.opencode/plugins|\.opencode/plugin|\.opencode/tools|\.opencode/tool|opencode\.json|opencode\.jsonc|\.claude/settings\.json|\.claude/settings\.local\.json|\.claude-plugin|\.mcp\.json|\.pi/extensions|\.pi/settings\.json",
             "a `.` in a rel path must reach the regex escaped, not as `any char`"
         );
     }
