@@ -8665,3 +8665,103 @@ fn install_advice_drops_a_location_the_run_makes_writable() {
         "advice must not name a location this run makes writable"
     );
 }
+
+// ============================================================
+// #390: a shim in a granted bin dir whose target is ungranted
+// ============================================================
+
+/// volta and nodenv put the shim and the real binary in different directories,
+/// and Landlock checks the target. Both stores live under one home root, so one
+/// `HomeToolDir` each covers shim and target — the same shape as `.nvm`.
+#[test]
+fn volta_and_nodenv_version_stores_are_exec_granted() {
+    use cplt::sandbox::HOME_TOOL_DIRS;
+
+    for root in [".volta", ".nodenv"] {
+        let entry = HOME_TOOL_DIRS
+            .iter()
+            .find(|d| d.path == root)
+            .unwrap_or_else(|| panic!("HOME_TOOL_DIRS missing {root} (#390)"));
+        assert!(entry.process_exec, "{root} must grant process_exec");
+        assert!(
+            !entry.write,
+            "{root} must stay read-only: a writable version store lets an agent \
+             trojan a binary that runs on the next launch"
+        );
+    }
+
+    let policy = generate_policy(&base_profile_options());
+    let exec_granted = |p: &std::path::Path| {
+        policy
+            .fs_rules
+            .iter()
+            .any(|r| r.access.execute && p.starts_with(&r.path))
+    };
+    // The paths the shims actually resolve into, not just the roots.
+    for target in [
+        "/Users/test/.volta/tools/image/node/22.23.2/bin/node",
+        "/Users/test/.nodenv/versions/22.23.2/bin/node",
+    ] {
+        assert!(
+            exec_granted(std::path::Path::new(target)),
+            "{target} must be exec-granted, or the shim fails with a silent exit 126"
+        );
+    }
+}
+
+#[test]
+fn shim_pointing_outside_every_exec_grant_is_reported() {
+    use cplt::check::shim_target_without_exec;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let bin = root.join("granted/bin");
+    let store = root.join("elsewhere/node-v22/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("node"), "#!/bin/sh\n").unwrap();
+    std::fs::write(bin.join("plain"), "#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(store.join("node"), bin.join("node")).unwrap();
+
+    let policy_with = |exec: &[PathBuf]| {
+        generate_policy(&SandboxConfig {
+            project_dir: &root.join("project"),
+            home_dir: &root.join("home"),
+            extra_exec: exec,
+            ..base_profile_options()
+        })
+    };
+
+    // The reported case: shim granted, target not.
+    let policy = policy_with(&[root.join("granted")]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("node")),
+        Some(store.join("node")),
+        "a shim resolving outside every exec grant must be named, not left as exit 126"
+    );
+
+    // Granting the real store silences it — the advice the warning gives works.
+    let policy = policy_with(&[root.join("granted"), root.join("elsewhere")]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("node")),
+        None,
+        "--allow-exec on the resolved store must clear the warning"
+    );
+
+    // A real binary in the granted dir is not a shim.
+    let policy = policy_with(&[root.join("granted")]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("plain")),
+        None,
+        "a non-symlink must never be reported as a shim"
+    );
+
+    // Nothing granted at all: the exec fails for the ordinary reason, and
+    // blaming the symlink would misdiagnose it.
+    let policy = policy_with(&[]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("node")),
+        None,
+        "an ungranted shim is not a shim-target problem"
+    );
+}

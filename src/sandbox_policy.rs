@@ -1185,6 +1185,23 @@ pub const HOME_TOOL_DIRS: &[HomeToolDir] = &[
         map_exec: true,
         write: false,
     },
+    // volta and nodenv both put a shim in one directory and the real binary in
+    // another, and Landlock checks the *target* of the exec, not the shim (#390).
+    // Granting the whole root covers both halves: volta's `bin/` shims resolve
+    // into `tools/image/node/<version>/bin/`, nodenv's `shims/` into
+    // `versions/<version>/bin/`. Same shape, and same reason, as .nvm and .asdf.
+    HomeToolDir {
+        path: ".volta",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
+    HomeToolDir {
+        path: ".nodenv",
+        process_exec: true,
+        map_exec: true,
+        write: false,
+    },
     HomeToolDir {
         path: ".cargo/bin",
         process_exec: true,

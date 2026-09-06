@@ -280,6 +280,50 @@ pub fn writable_tree_over(policy: &LandlockPolicy, home: &Path, path: &Path) -> 
         .max_by_key(|p| p.as_os_str().len())
 }
 
+/// The resolved target of `path`, when the policy grants execute on `path` but
+/// not on what it actually resolves to (#390).
+///
+/// Landlock resolves a symlink and checks the **target**, so a shim in a granted
+/// bin directory whose real binary lives in an ungranted one cannot be executed.
+/// The kernel refuses the `execve` and the caller sees exit 126 with nothing
+/// printed — a failure that reads as "cplt is broken" rather than "your runtime
+/// is installed somewhere the policy does not grant", and whose obvious next
+/// step (copying the binary into the project) is a far worse posture than
+/// granting the real path.
+///
+/// cplt cannot observe the refusal itself: the kernel denies the exec inside the
+/// sandbox and the parent only sees an exit status it cannot attribute. So this
+/// is a preflight — asked of the same resolved policy the run is about to
+/// enforce, before the launch, and only about the one binary cplt resolved.
+///
+/// Only sees a symlink that is still one by the time cplt resolves it, which is
+/// the reported case: `resolve_exec_binary`'s PATH branch returns the shim as
+/// found, and an agent binary discovered on PATH the same way. An *explicit*
+/// path (`cplt exec -- /path/to/shim`) is canonicalized before it gets here, so
+/// what runs is the target and there is no shim left to name — the exec still
+/// fails, and the remedy is still `--allow-exec` on that directory, but this
+/// says nothing about it.
+///
+/// Returns `None` when `path` is not a symlink, when it cannot be resolved, or
+/// when the target is granted execute anyway (the ordinary case: nvm, fnm, asdf,
+/// mise, volta and nodenv all keep shim and target under one granted root).
+#[must_use]
+pub fn shim_target_without_exec(policy: &LandlockPolicy, path: &Path) -> Option<PathBuf> {
+    let target = std::fs::canonicalize(path).ok()?;
+    if target == path {
+        return None;
+    }
+    let granted = |p: &Path| {
+        policy
+            .fs_rules
+            .iter()
+            .any(|r| r.access.execute && within(p, &r.path))
+    };
+    // Only a *shim* problem: if the policy does not grant the shim either, the
+    // exec fails for the ordinary reason and this message would misdiagnose it.
+    (granted(path) && !granted(&target)).then_some(target)
+}
+
 /// The usual install locations that *this* policy keeps non-writable, for a
 /// binary called `file_name`.
 ///
