@@ -1305,6 +1305,28 @@ struct ResolvedContext {
     unapproved_proposals: Vec<String>,
 }
 
+/// Warn when the binary cplt is about to launch is a shim whose real target the
+/// sandbox does not grant execute on (#390).
+///
+/// Preflight, not post-mortem: the kernel refuses the `execve` inside the
+/// sandbox and the parent sees only exit 126, with nothing to attribute it to.
+/// Naming the resolved path before launch is the only place cplt can turn that
+/// into something actionable. Not gated on `quiet` — like the writable-agent-dir
+/// warning above it, this is about the sandbox boundary, not progress.
+fn warn_shim_target_without_exec(policy: &sandbox::LandlockPolicy, bin: &Path) {
+    if let Some(target) = cplt::check::shim_target_without_exec(policy, bin) {
+        let dir = target.parent().unwrap_or(&target);
+        ui::warn(&format!(
+            "{} is a shim resolving to {}, which this run does not grant execute on. \
+             The sandbox checks the target, not the shim, so it will fail with exit 126 \
+             and no message. Grant it with --allow-exec {} (or [sandbox] allow.exec) and rerun.",
+            bin.display(),
+            target.display(),
+            dir.display()
+        ));
+    }
+}
+
 /// Warn about `allow.write` grants that shadow a directory this run grants
 /// execute on (#243, #343).
 ///
@@ -2746,6 +2768,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         ));
     }
 
+    warn_shim_target_without_exec(&policy, &agent_bin);
+
     // Preflight: verify the sandbox mechanism works on this system
     if !resolved.no_validate {
         match sandbox::preflight(&prepared) {
@@ -3661,6 +3685,7 @@ fn run_exec_command(
     // with `cplt check`, which runs its probes under the identical policy.
     let AssembledSandbox {
         prepared,
+        policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
         #[cfg(target_os = "macos")]
@@ -3673,6 +3698,8 @@ fn run_exec_command(
         &home_dir,
         &project_dir,
     )?;
+
+    warn_shim_target_without_exec(&policy, &exec_bin);
 
     if cli.print_profile {
         println!("{}", sandbox::describe(&prepared));
