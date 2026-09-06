@@ -2017,8 +2017,10 @@ fn emit_socket_rules(sb: &mut String, allow_socket: &[PathBuf], extra_deny: &[Pa
 /// SBPL uses last-match-wins, so these targeted allows override the deny.
 /// Sensitive files under ~/.docker (trust/, TLS private keys) remain denied.
 ///
-/// If any `extra_deny` path overlaps with `~/.docker` or known socket paths,
-/// Docker rules are skipped entirely — explicit user denies always win.
+/// Explicit user denies always win, per re-allow rather than per grant: an
+/// `extra_deny` overlapping `~/.docker`, `~/.config/containers`, or one socket
+/// withholds only that re-allow and leaves the rest of Docker active. (GPG is
+/// whole-grant by contrast, because all of its re-allows live under `~/.gnupg`.)
 fn emit_docker_rules(sb: &mut String, home: &str, allow_docker: bool, extra_deny: &[PathBuf]) {
     if !allow_docker {
         return;
@@ -2065,7 +2067,7 @@ fn emit_docker_rules(sb: &mut String, home: &str, allow_docker: bool, extra_deny
             format!("{home}/{sock}")
         };
         if let Some(deny) = overlapping_deny(extra_deny, Path::new(&full)) {
-            withhold_reallow(sb, "Docker", sock, deny);
+            withhold_reallow(sb, "Docker", &full, deny);
             continue;
         }
         sbpl!(sb, "(allow file-read* (literal \"{full}\"))");
