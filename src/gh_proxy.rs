@@ -2147,7 +2147,7 @@ const SENSITIVE_CONFIG_PREFIXES: &[&str] = &[
 /// Scans both the space-separated form (`-c k=v`, `--config-env k=ENV`) and the
 /// `=`-attached long form (`--config-env=k=ENV`). `-c` has no `=`-attached form:
 /// git always takes its `name=value` as the following token.
-fn injected_sensitive_config_key(args: &[&str]) -> Option<String> {
+fn injected_sensitive_config_key(args: &[&str]) -> Option<(&'static str, String)> {
     let sensitive = |kv: &str| -> Option<String> {
         let key = kv.split('=').next().unwrap_or(kv);
         let lower = key.to_ascii_lowercase();
@@ -2162,7 +2162,11 @@ fn injected_sensitive_config_key(args: &[&str]) -> Option<String> {
         if arg == "-c" || arg == "--config-env" {
             if let Some(kv) = args.get(i + 1) {
                 if let Some(key) = sensitive(kv) {
-                    return Some(key);
+                    // Name the flag the user actually typed; the refusal
+                    // message quotes it back and the two are not
+                    // interchangeable to someone acting on it.
+                    let flag = if arg == "-c" { "-c" } else { "--config-env" };
+                    return Some((flag, key));
                 }
                 i += 2;
                 continue;
@@ -2170,7 +2174,7 @@ fn injected_sensitive_config_key(args: &[&str]) -> Option<String> {
         } else if let Some(kv) = arg.strip_prefix("--config-env=")
             && let Some(key) = sensitive(kv)
         {
-            return Some(key);
+            return Some(("--config-env", key));
         }
         i += 1;
     }
@@ -2379,9 +2383,9 @@ pub fn gate_git(
     // authorized against one config and then run under another (H-10). Rather
     // than mirror every such key into the probe, reject the whole class at the
     // gate — it is never needed for a legitimate push and always precedes one.
-    if prevent_push && let Some(key) = injected_sensitive_config_key(args) {
+    if prevent_push && let Some((flag, key)) = injected_sensitive_config_key(args) {
         return Err(format!(
-            "⚠️ BLOCKED by sandbox: 'git -c {key}=…' is not allowed while push prevention is active.\n\
+            "⚠️ BLOCKED by sandbox: 'git {flag} {key}=…' is not allowed while push prevention is active.\n\
              Command-line config that can redirect a push (remote.*, url.*, push.*, branch.*) or\n\
              redefine a subcommand (alias.*) is refused, because the guard would authorize against\n\
              different configuration than the push actually runs under.\n\
@@ -5090,6 +5094,24 @@ mod tests {
         );
         assert!(injected_sensitive_config_key(&["--config-env=push.default=X", "push"]).is_some());
         // Innocuous config and normal pushes are not caught.
+        // The refusal quotes the flag back, so detection must report which one
+        // was used rather than assuming `-c` (H-10 review).
+        assert_eq!(
+            injected_sensitive_config_key(&["-c", "push.default=current", "push"])
+                .map(|(flag, _)| flag),
+            Some("-c")
+        );
+        assert_eq!(
+            injected_sensitive_config_key(&["--config-env", "remote.origin.url=EVIL", "push"])
+                .map(|(flag, _)| flag),
+            Some("--config-env")
+        );
+        assert_eq!(
+            injected_sensitive_config_key(&["--config-env=push.default=X", "push"])
+                .map(|(flag, _)| flag),
+            Some("--config-env")
+        );
+
         assert!(injected_sensitive_config_key(&["-c", "core.pager=cat", "push"]).is_none());
         assert!(injected_sensitive_config_key(&["push", "origin", "main"]).is_none());
         assert!(injected_sensitive_config_key(&["-C", "/some/dir", "push"]).is_none());
