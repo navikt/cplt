@@ -279,8 +279,8 @@ fn emit_process_rules(sb: &mut String) {
     // controlling terminal; it refuses it (EPERM) on any other tty, which is
     // why a peer `/dev/ttysNNN` is not an injection target even when the device
     // tree is handed back with `--allow-write /dev`. Inside a cplt session the
-    // ioctl is denied by the profile's `(deny default)` above, NOT by
-    // `(allow file-ioctl)` below, which is unconditional and does not reach it.
+    // ioctl is denied by the profile's `(deny default)`, NOT by the
+    // unconditional `(allow file-ioctl)`, which does not reach it.
     // See SECURITY.md, "Terminal injection".
     //
     // Writes are now an allowlist of nodes that cannot name another terminal:

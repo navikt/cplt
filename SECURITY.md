@@ -357,7 +357,7 @@ A curated blocklist of these domains ships in [`blocked-domains.txt`](blocked-do
 
 **`--allow-private-domain` weakens DNS rebinding protection for named domains.** For a domain listed in `proxy.allow_private_domains` (or `--allow-private-domain`), the proxy skips the post-DNS private IP check. That is intentional for corporate intranet services such as `intern.nav.no` that legitimately resolve to RFC 1918 addresses. The accepted risk: if DNS for a listed domain is poisoned or hijacked, a compromised agent could reach arbitrary private hosts on your internal network, not just the intended service. All other proxy checks (port, allowlist, blocklist) still apply. Only list domains you control and whose DNS you trust.
 
-**`proxy.upstream` delegates private-address defence to the upstream proxy.** When
+**`proxy.upstream` delegates private-address defense to the upstream proxy.** When
 `proxy.upstream` is set, cplt classifies the address *it* resolves for the target
 name, then forwards the **name** — not that address — to the upstream in a nested
 `CONNECT host:port`. The upstream resolves it again, in its own network and with
