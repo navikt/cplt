@@ -180,6 +180,41 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 
 cplt is more secure out of the box: env filtering, credential protection, DNS rebinding checks, lifecycle script blocking. srt is more flexible: SOCKS5, TLS inspection, per-request callbacks, library embedding. The Linux backend choice matters. bwrap needs workarounds on Ubuntu 24.04+ because of AppArmor userns restrictions, while Landlock requires kernel 5.13 or newer but has zero external dependencies.
 
+### GitHub Copilot CLI's own sandbox
+
+Copilot CLI has shipped with a local sandbox since June 2026, included in the
+standard seat. It runs shell commands through Microsoft MXC with restricted
+filesystem, network and system access, on macOS, Linux and Windows.
+`/sandbox enable` turns it on.
+
+If that covers you, use it. It costs nothing extra, and it runs on Windows,
+which cplt does not.
+
+Two things it does not do.
+
+Policy lives with the administrator, not the repository. Enterprises set
+sandbox policy through Intune or another MDM. Nothing sits next to the code,
+so a rule that matters for one repository cannot follow it to a contributor,
+to CI, or to a laptop the MDM does not manage. In cplt the policy is
+`.cplt.toml` in the repository. Reviewers see changes to it in the pull
+request, and the file can tighten a developer's own configuration but never
+loosen it.
+
+It confines the process, not what the process does with credentials it
+holds. The `/sandbox` tabs cover the filesystem, the network and system
+capabilities, and inside a Git repository the agent is granted read and write
+on `.git` by default. A sandboxed agent still has your `gh` token and your
+push access. Pushing a branch, merging a pull request and deleting a
+repository are all well-formed API calls from an authorised client, and a
+filesystem or network rule has no opinion about them. cplt wraps `git` and
+`gh` instead. The agent commits, branches and rebases freely. `gh pr merge`,
+`gh repo delete` and `gh release create` are blocked by default. `git push`
+warns by default; set `git_guard.mode = "block"` to stop it, and
+`protect_default_branch_only` to keep feature branches open.
+
+Running both is reasonable. MXC confines the process. The guards decide what
+the agent may do with the credentials it holds.
+
 ### Honest gaps
 
 - macOS has the strongest file-level enforcement today. Linux coverage is improving but not identical.
