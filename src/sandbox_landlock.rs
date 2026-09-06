@@ -274,16 +274,28 @@ const DEVICE_FILES: &[&str] = &[
 //   token) and those bytes never reach the program that was meant to get them;
 // * **write** forges output in that terminal and can drive an OSC 52
 //   clipboard write;
-// * **ioctl** reaches `TIOCSTI` on a kernel that still exposes it (pre-6.2,
-//   or `dev.tty.legacy_tiocsti=1`), which is keystroke *injection*, i.e.
-//   command execution rather than spoofing.
+// * **ioctl** reaches `TIOCSTI` on a kernel that still exposes it, which is
+//   keystroke *injection*, i.e. command execution rather than spoofing.
+//   6.2 added `CONFIG_LEGACY_TIOCSTI` as the gate, but it is `default y`
+//   upstream: Fedora/Debian/Arch ship it off, yet self-built and many
+//   vendor/cloud kernels leave it on, and pre-6.2 kernels expose TIOCSTI
+//   unconditionally with no capability. Where the config is on, the
+//   `dev.tty.legacy_tiocsti` sysctl toggles it at runtime. So a real set of
+//   supported configurations still exposes it — do not assume ≥6.2 is safe.
 //
-// There is no rule at all now. Nothing in a normal session opens a
+// There is no `/dev/pts` rule at all now. Nothing in a normal session opens a
 // `/dev/pts/N` by path: the agent's terminal arrives as inherited fds 0/1/2,
 // Landlock binds rights at `open()` rather than on each read or write, and
 // `ttyname()`/`stat()` are not governed by Landlock at all. `/dev/tty` keeps
 // read + write + ioctl and always resolves to the caller's own controlling
 // terminal, so raw mode still works.
+//
+// Dropping the path rule does not close the inherited-fd case: `TIOCSTI` /
+// `TIOCLINUX` on fd 0 (the controlling terminal, never opened by path) stayed
+// reachable because Landlock does not mediate ioctls on an inherited fd. The
+// seccomp rule in `build_seccomp_filter` denies those two requests at the
+// syscall layer regardless of fd, which is what actually covers this path on a
+// kernel that still exposes them.
 //
 // The cost is the same as on macOS: a sandboxed process cannot allocate its
 // own PTY (`openpty`/`forkpty`, `script`, `tmux`, `pexpect`), because the new
@@ -1661,6 +1673,53 @@ fn build_seccomp_filter(proxy_forced: bool) -> Vec<BpfInstruction> {
         filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
     }
 
+    // Step 2b: deny the terminal-injection ioctls (GHSA-q3p2-6x2x-8w8w,
+    // CVE-2017-5226). Always applied, in every mode.
+    //
+    // `ioctl(fd, TIOCSTI, &c)` pushes a byte into the *input* queue of the
+    // caller's controlling terminal; a sandboxed agent can queue a command
+    // line onto the terminal it inherited as fd 0 and exit, and the parent
+    // shell then reads and runs it — a full sandbox escape. `TIOCLINUX` is the
+    // console sibling (selection paste / VT poke) with the same effect on a
+    // text console. Neither has any legitimate use inside the sandbox.
+    //
+    // Landlock cannot stop this — it binds fs rights at `open()` and does not
+    // mediate ioctls on an already-inherited fd (its own docs name TIOCSTI as
+    // the example) — and bubblewrap is launched without `--new-session`, so the
+    // child keeps that controlling terminal. seccomp is the layer that sees the
+    // request, because it is a plain integer argument, not a pointer. The
+    // kernel takes `cmd` as `unsigned int`, so it compares only the low 32 bits
+    // of arg1 (the request); the upper word is truncated away and cannot smuggle
+    // a matching value past this check. arg1 is the request, never the fd
+    // (arg0), so benign requests on any fd — `TIOCGWINSZ` (0x5413), the raw-mode
+    // `termios` calls (`TCGETS`/`TCSETS`, 0x5401/0x5402) — carry different
+    // request numbers, miss both compares, and fall through to the allow.
+    //
+    // bubblewrap's own man page recommends exactly this seccomp deny for the
+    // CVE-2017-5226 controlling-terminal case.
+    {
+        const TIOCSTI: u32 = libc::TIOCSTI as u32; // 0x5412, asm-generic (x86_64 + aarch64)
+        const TIOCLINUX: u32 = libc::TIOCLINUX as u32; // 0x541C, asm-generic (x86_64 + aarch64)
+
+        // A still holds the syscall number here (the blocklist loop only
+        // compares and jumps, never reloads). If this is not ioctl, jf skips
+        // the whole block (4 instructions) and leaves A untouched for whatever
+        // follows.
+        filter.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::SYS_ioctl as u32,
+            0,
+            4,
+        ));
+        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, ARG1_LO_OFFSET));
+        // TIOCSTI → jump over the TIOCLINUX compare onto the deny return.
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCSTI, 1, 0));
+        // TIOCLINUX → fall through to the deny; anything else → skip it (a
+        // benign ioctl falls out of the block to the allow below).
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCLINUX, 0, 1));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM_VAL));
+    }
+
     // Step 3 (proxy-forced only): allow only plain TCP for AF_INET/AF_INET6.
     // See the function doc for why this is gated and what it costs.
     //
@@ -1689,10 +1748,12 @@ fn build_seccomp_filter(proxy_forced: bool) -> Vec<BpfInstruction> {
         const SOCK_STREAM: u32 = libc::SOCK_STREAM as u32;
         const IPPROTO_TCP: u32 = libc::IPPROTO_TCP as u32;
 
-        // A (the accumulator) still holds the syscall number here: the
-        // blocklist loop above only compares and jumps, it never reloads.
-        // jf = 10 skips the whole block below and lands on the default-allow
-        // return appended after it.
+        // Reload the syscall number into A. The blocklist loop leaves it in A,
+        // but the ioctl block above reloads A with arg1 on its benign-ioctl
+        // fall-through, so reload here rather than depend on which path we came
+        // from. jf = 10 skips the whole block below and lands on the
+        // default-allow return appended after it.
+        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, NR_OFFSET));
         filter.push(jump(
             BPF_JMP | BPF_JEQ | BPF_K,
             libc::SYS_socket as u32,
@@ -3266,6 +3327,99 @@ mod tests {
                 "arch guard must reject the compat ABI (proxy_forced={proxy_forced})"
             );
         }
+    }
+
+    /// Filter-semantics test for the TIOCSTI/TIOCLINUX deny (GHSA-q3p2-6x2x-8w8w,
+    /// CVE-2017-5226). This runs the built BPF program through the userspace
+    /// `run_filter` interpreter, so it proves the *filter logic* returns EPERM —
+    /// it is not a real `ioctl(2)` syscall under a kernel-installed filter. The
+    /// live syscall test lives in `tests/integration_linux.rs`, which only runs
+    /// on Linux CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_denies_terminal_injection_ioctls() {
+        let ioctl = libc::SYS_ioctl as u32;
+        // ioctl args are [fd, request, arg, …]; the request is arg1.
+        let req = |fd: u64, request: u64| -> [u64; 6] { [fd, request, 0, 0, 0, 0] };
+        // Narrow to u32 (what the filter compares) then widen — `libc::Ioctl`
+        // is `c_ulong` on gnu, so a bare `as u64` would be a same-type cast.
+        let tiocsti = u64::from(libc::TIOCSTI as u32);
+        let tioclinux = u64::from(libc::TIOCLINUX as u32);
+
+        // Applied in both modes — the escape does not depend on proxy-forced.
+        for proxy_forced in [false, true] {
+            let filter = build_seccomp_filter(proxy_forced);
+
+            for request in [tiocsti, tioclinux] {
+                // Denied on the inherited controlling terminal (fd 0) and on
+                // any other fd — the rule matches arg1 (request), never arg0.
+                for fd in [0u64, 3, 7] {
+                    assert_eq!(
+                        run_filter(&filter, ioctl, ARCH, req(fd, request)),
+                        EPERM,
+                        "ioctl request {request:#x} must be denied on fd {fd} \
+                         (proxy_forced={proxy_forced})"
+                    );
+                }
+                // The kernel truncates `cmd` to unsigned int; a high-word trick
+                // must not produce a request the low-word compare fails to see.
+                assert_eq!(
+                    run_filter(&filter, ioctl, ARCH, req(0, request | 0x1_0000_0000)),
+                    EPERM,
+                    "high bits in the ioctl request must not bypass the deny \
+                     (proxy_forced={proxy_forced})"
+                );
+            }
+
+            // Benign terminal ioctls the sandbox needs must still be allowed:
+            // window size and the raw-mode termios calls carry different
+            // request numbers and must fall through to ALLOW.
+            for request in [
+                u64::from(libc::TIOCGWINSZ as u32),
+                u64::from(libc::TCGETS as u32),
+                u64::from(libc::TCSETS as u32),
+            ] {
+                assert_eq!(
+                    run_filter(&filter, ioctl, ARCH, req(0, request)),
+                    ALLOW,
+                    "benign ioctl request {request:#x} must stay allowed \
+                     (proxy_forced={proxy_forced})"
+                );
+            }
+
+            // A non-ioctl syscall whose arg1 happens to equal TIOCSTI must not
+            // be caught: the rule is gated on the ioctl syscall number.
+            assert_eq!(
+                run_filter(&filter, libc::SYS_write as u32, ARCH, req(0, tiocsti)),
+                ALLOW,
+                "the ioctl deny must only apply to ioctl(2) (proxy_forced={proxy_forced})"
+            );
+
+            // Mutation guard for the `LD NR_OFFSET` reload at the head of the
+            // socket arm: a benign ioctl whose request (arg1) coincidentally
+            // equals SYS_socket must still be allowed. fd (arg0) = 2 is the
+            // worst case — without the reload the socket arm keeps arg1 in the
+            // accumulator, matches SYS_socket, then reads arg0 as AF_INET (2)
+            // and reaches the SOCK_STREAM check, mis-denying the ioctl. Only
+            // meaningful under proxy-forced, where the socket arm exists.
+            if proxy_forced {
+                assert_eq!(
+                    run_filter(
+                        &filter,
+                        ioctl,
+                        ARCH,
+                        req(2, u64::from(libc::SYS_socket as u32))
+                    ),
+                    ALLOW,
+                    "a benign ioctl whose request number equals SYS_socket must \
+                     not be mis-denied by the socket arm (NR reload missing)"
+                );
+            }
+        }
+        // Mutation guard: the TIOCSTI/TIOCLINUX asserts above run the actual BPF
+        // program, so deleting the ioctl arm from `build_seccomp_filter` flips
+        // those results to ALLOW and fails this test. There is no weaker
+        // "instruction count" backstop — the semantics are the check.
     }
 
     #[test]
