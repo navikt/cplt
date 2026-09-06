@@ -1037,11 +1037,16 @@ mod tests {
     fn sh_holding_the_probe(probe: &SettleProbe, script: &str) -> Command {
         use std::os::unix::process::CommandExt as _;
         let fd = probe.write;
+        // Keep the probe out of every OTHER child this test binary spawns:
+        // tests run in parallel, and an unrelated process holding the write end
+        // keeps the pipe open, which is precisely the "unsettled" condition
+        // under test. Only the script below gets it, through the dup2 in
+        // `pre_exec`, which clears FD_CLOEXEC on the copy it makes.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(script);
-        // SAFETY: `dup2` and `fcntl` are async-signal-safe and touch only these
-        // two descriptors. `dup2` clears FD_CLOEXEC on the new one, so the
-        // script inherits SCRIPT_FD whatever the source fd's flags were.
+        // SAFETY: `dup2` is async-signal-safe and touches only these two
+        // descriptors.
         unsafe {
             cmd.pre_exec(move || {
                 if libc::dup2(fd, SCRIPT_FD) == -1 {
