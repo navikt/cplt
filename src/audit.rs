@@ -1023,16 +1023,35 @@ mod tests {
     /// the only thing that forks between arming and settling. This test binary
     /// runs hundreds of tests in parallel, so here the descriptor is hidden
     /// from every other test's children and un-hidden in this child alone.
+    /// The descriptor number a probe-holding script sees.
+    ///
+    /// Fixed, and deliberately one digit: `/bin/sh` is dash on Debian, and dash
+    /// parses only a single digit in `>&N` / `<&N`. The probe's own fd number
+    /// depends on how many descriptors happen to be open, so a script written
+    /// against it works while that number is below 10 and silently fails to
+    /// parse above it — the redirection errors, the script produces no output,
+    /// and the test fails somewhere unrelated. That is exactly what happened on
+    /// Linux CI, and because the number varies it passed elsewhere.
+    const SCRIPT_FD: i32 = 9;
+
     fn sh_holding_the_probe(probe: &SettleProbe, script: &str) -> Command {
         use std::os::unix::process::CommandExt as _;
         let fd = probe.write;
+        // Keep the probe out of every OTHER child this test binary spawns:
+        // tests run in parallel, and an unrelated process holding the write end
+        // keeps the pipe open, which is precisely the "unsettled" condition
+        // under test. Only the script below gets it, through the dup2 in
+        // `pre_exec`, which clears FD_CLOEXEC on the copy it makes.
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(script);
-        // SAFETY: `fcntl` is async-signal-safe and touches only this fd.
+        // SAFETY: `dup2` is async-signal-safe and touches only these two
+        // descriptors.
         unsafe {
             cmd.pre_exec(move || {
-                libc::fcntl(fd, libc::F_SETFD, 0);
+                if libc::dup2(fd, SCRIPT_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -1077,12 +1096,11 @@ mod tests {
     #[test]
     fn settle_probe_reports_unsettled_while_a_descendant_lives() {
         let probe = SettleProbe::arm().expect("pipe");
-        let fd = probe.write;
         // The straggler's stdout goes to /dev/null, or `output()` would block
         // on the pipe until it exits and there would be nothing left to detect.
         let out = sh_holding_the_probe(
             &probe,
-            &format!("sleep 5 >/dev/null 2>&1 & printf x >&{fd}; echo $!"),
+            &format!("sleep 5 >/dev/null 2>&1 & printf x >&{SCRIPT_FD}; echo $!"),
         )
         .output()
         .expect("sh runs");
