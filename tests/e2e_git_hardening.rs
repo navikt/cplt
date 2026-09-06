@@ -314,6 +314,28 @@ fn guard_repo(url: &str, branch: &str, default: Option<&str>) -> Option<tempfile
         dir,
         &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")]
     ));
+    // A real commit, so `branch` exists: the guard resolves a colon-less push
+    // token with `rev-parse`, which answers nothing in an unborn repository.
+    assert!(common::git_ok(
+        dir,
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ]
+    ));
+    // The branches these tests push to must exist the way a real clone's would.
+    for extra in ["main", "develop", "feature/x"] {
+        if extra != branch {
+            let _ = common::git_ok(dir, &["branch", extra]);
+        }
+    }
     assert!(common::git_ok(dir, &["remote", "add", "origin", url]));
     if let Some(default) = default {
         assert!(common::git_ok(
