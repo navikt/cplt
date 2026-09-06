@@ -1853,6 +1853,41 @@ fn emit_denied_dotfile_overrides(
     sbpl!(sb);
 }
 
+/// The first explicit `--deny-path` that overlaps `root` in any direction:
+/// `root` itself, a path *beneath* `root`, or an *ancestor* of `root`.
+///
+/// `Path::starts_with` compares whole path components, so `~/.dockerfoo` does
+/// not overlap `~/.docker`, while `--deny-path /` (an ancestor of everything)
+/// overlaps every root — both of which a string-prefix test would get wrong.
+///
+/// The opt-in grants (`--allow-gpg-signing`, `--allow-docker`) use this to
+/// withhold a re-allow the user denied. The ancestor direction is the H-06
+/// fix: `--allow-docker` re-allows `~/.config/containers` (which holds registry
+/// `auth.json`), and a `--deny-path ~/.config` is an ancestor of it, which SBPL
+/// last-match-wins would otherwise silently reopen for read.
+fn overlapping_deny<'a>(extra_deny: &'a [PathBuf], root: &Path) -> Option<&'a PathBuf> {
+    extra_deny.iter().find(|deny| {
+        let deny = deny.as_path();
+        deny.starts_with(root) || root.starts_with(deny)
+    })
+}
+
+/// Withhold one opt-in re-allow because an explicit `--deny-path` overlaps it.
+///
+/// Emits an SBPL breadcrumb and warns the user: `main.rs` reports the grant as
+/// active, so without this the user has no signal that their own `--deny-path`
+/// just narrowed it.
+fn withhold_reallow(sb: &mut String, grant: &str, reallow: &str, deny: &Path) {
+    let deny = deny.display();
+    crate::ui::warn(&format!(
+        "{grant}: --deny-path {deny} overlaps {reallow}; leaving it denied, not re-allowing it"
+    ));
+    sbpl!(
+        sb,
+        ";; {grant} re-allow withheld: --deny-path {deny} overlaps {reallow}"
+    );
+}
+
 /// Allow GPG commit signing when `--allow-gpg-signing` is set.
 ///
 /// Emitted AFTER `emit_deny_rules` (which denies all of `~/.gnupg`).
@@ -1872,18 +1907,13 @@ fn emit_gpg_signing_rules(
     if !allow_gpg_signing {
         return;
     }
-    // Explicit --deny-path wins: if the user denied anything under ~/.gnupg,
-    // skip all GPG allows so the deny is not overridden.
-    let gnupg_dir = format!("{home}/.gnupg");
-    for deny in extra_deny {
-        let d = deny.to_string_lossy();
-        if d == gnupg_dir || d.starts_with(&format!("{gnupg_dir}/")) {
-            sbpl!(
-                sb,
-                ";; GPG signing skipped: --deny-path overlaps with ~/.gnupg"
-            );
-            return;
-        }
+    // Explicit --deny-path wins: if the user denied ~/.gnupg, anything under
+    // it, or an ancestor of it, withhold all GPG allows (they all live under
+    // ~/.gnupg) so the deny is not overridden.
+    let gnupg_dir = PathBuf::from(format!("{home}/.gnupg"));
+    if let Some(deny) = overlapping_deny(extra_deny, &gnupg_dir) {
+        withhold_reallow(sb, "GPG signing", "~/.gnupg", deny);
+        return;
     }
     sbpl!(sb, ";; GPG signing (--allow-gpg-signing)");
     // Allow read-only access to public keyring and config
@@ -1994,54 +2024,37 @@ fn emit_docker_rules(sb: &mut String, home: &str, allow_docker: bool, extra_deny
         return;
     }
 
-    // Explicit --deny-path wins: if the user denied ~/.docker or any socket path, skip all.
-    let docker_dir = format!("{home}/.docker");
-    for deny in extra_deny {
-        let d = deny.to_string_lossy();
-        if d == docker_dir || d.starts_with(&format!("{docker_dir}/")) {
-            sbpl!(
-                sb,
-                ";; Docker access skipped: --deny-path overlaps with ~/.docker"
-            );
-            return;
-        }
-        // Check socket paths
-        for sock in DOCKER_SOCKET_PATHS {
-            let full = if sock.starts_with('/') {
-                sock.to_string()
-            } else {
-                format!("{home}/{sock}")
-            };
-            if *d == full {
-                sbpl!(
-                    sb,
-                    ";; Docker access skipped: --deny-path overlaps with socket {sock}"
-                );
-                return;
-            }
-        }
-    }
-
     sbpl!(sb, ";; Docker/Podman access (--allow-docker)");
 
-    // Read-only access to ~/.docker for Docker CLI config and TLS certs.
-    sbpl!(sb, "(allow file-read* (subpath \"{home}/.docker\"))");
-
-    // Re-deny sensitive subdirectories: trust delegation keys, signing keys.
-    sbpl!(
-        sb,
-        "(deny file-read* (subpath \"{home}/.docker/trust/private\"))"
-    );
-
-    // No write access to Docker config.
-    sbpl!(sb, "(deny file-write* (subpath \"{home}/.docker\"))");
+    // Each re-allow is independent, so withhold ONLY the one an explicit
+    // --deny-path overlaps (in any direction, incl. ancestor — H-06) and keep
+    // the rest. A deny on a single unused socket must not disable all of Docker.
+    let docker_dir = PathBuf::from(format!("{home}/.docker"));
+    if let Some(deny) = overlapping_deny(extra_deny, &docker_dir) {
+        withhold_reallow(sb, "Docker", "~/.docker", deny);
+    } else {
+        // Read-only access to ~/.docker for Docker CLI config and TLS certs.
+        sbpl!(sb, "(allow file-read* (subpath \"{home}/.docker\"))");
+        // Re-deny sensitive subdirectories: trust delegation keys, signing keys.
+        sbpl!(
+            sb,
+            "(deny file-read* (subpath \"{home}/.docker/trust/private\"))"
+        );
+        // No write access to Docker config.
+        sbpl!(sb, "(deny file-write* (subpath \"{home}/.docker\"))");
+    }
 
     // Read-only access to ~/.config/containers for Podman CLI config
     // (registries.conf, containers.conf, auth.json read by podman/buildah).
-    sbpl!(
-        sb,
-        "(allow file-read* (subpath \"{home}/.config/containers\"))"
-    );
+    let containers_dir = PathBuf::from(format!("{home}/.config/containers"));
+    if let Some(deny) = overlapping_deny(extra_deny, &containers_dir) {
+        withhold_reallow(sb, "Docker", "~/.config/containers", deny);
+    } else {
+        sbpl!(
+            sb,
+            "(allow file-read* (subpath \"{home}/.config/containers\"))"
+        );
+    }
 
     // Allow Docker/Podman daemon socket connections.
     // Each socket needs file-read* (inode lookup) + network-outbound (connect).
@@ -2051,6 +2064,10 @@ fn emit_docker_rules(sb: &mut String, home: &str, allow_docker: bool, extra_deny
         } else {
             format!("{home}/{sock}")
         };
+        if let Some(deny) = overlapping_deny(extra_deny, Path::new(&full)) {
+            withhold_reallow(sb, "Docker", sock, deny);
+            continue;
+        }
         sbpl!(sb, "(allow file-read* (literal \"{full}\"))");
         sbpl!(sb, "(allow network-outbound (literal \"{full}\"))");
     }
@@ -2357,6 +2374,94 @@ mod tests {
                 "a directory grant must produce no post-deny re-allow:\n{p}"
             );
         }
+    }
+
+    /// H-06: an explicit `--deny-path` on an *ancestor* of a path
+    /// `--allow-docker` re-allows (`~/.config` over `~/.config/containers`,
+    /// which holds registry `auth.json`) must not be silently reopened — only
+    /// that one re-allow is withheld, the rest of the grant stays active.
+    #[test]
+    fn profile_docker_withholds_reallow_when_deny_path_is_an_ancestor_of_containers() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let deny = [PathBuf::from("/Users/test/.config")];
+        let mut opts = test_options(project, home);
+        opts.allow_docker = true;
+        opts.extra_deny = &deny;
+        let p = generate_profile(&opts, &[]);
+
+        assert!(
+            !p.contains(r#"(allow file-read* (subpath "/Users/test/.config/containers"))"#),
+            "the ~/.config/containers re-allow must not survive an ancestor --deny-path:\n{p}"
+        );
+        assert!(
+            p.contains(r#"(deny file-read* (subpath "/Users/test/.config"))"#),
+            "the explicit --deny-path must still be emitted:\n{p}"
+        );
+        // The rest of Docker stays active — the deny does not touch ~/.docker.
+        assert!(
+            p.contains(r#"(allow file-read* (subpath "/Users/test/.docker"))"#),
+            "an unrelated re-allow must survive a deny on a sibling path:\n{p}"
+        );
+    }
+
+    /// A `--deny-path` overlapping ONE docker socket withholds only that
+    /// socket's re-allow; every other socket and re-allow stays intact. Proves
+    /// per-root withholding rather than a whole-grant skip.
+    #[test]
+    fn profile_docker_withholds_only_the_overlapping_socket() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        // Ancestor of the OrbStack socket only.
+        let deny = [PathBuf::from("/Users/test/.orbstack")];
+        let mut opts = test_options(project, home);
+        opts.allow_docker = true;
+        opts.extra_deny = &deny;
+        let p = generate_profile(&opts, &[]);
+
+        assert!(
+            !p.contains(
+                r#"(allow network-outbound (literal "/Users/test/.orbstack/run/docker.sock"))"#
+            ),
+            "the denied OrbStack socket must be withheld:\n{p}"
+        );
+        // Other sockets and re-allows survive.
+        assert!(
+            p.contains(
+                r#"(allow network-outbound (literal "/Users/test/.colima/default/docker.sock"))"#
+            ),
+            "an unrelated socket must survive:\n{p}"
+        );
+        assert!(
+            p.contains(r#"(allow file-read* (subpath "/Users/test/.config/containers"))"#),
+            "the containers re-allow must survive a socket-only deny:\n{p}"
+        );
+        assert!(
+            p.contains(r#"(allow file-read* (subpath "/Users/test/.docker"))"#),
+            "the ~/.docker re-allow must survive a socket-only deny:\n{p}"
+        );
+    }
+
+    /// H-06, gpg half: a `--deny-path` on an ancestor of `~/.gnupg` (here
+    /// `$HOME`) withholds the GPG re-allows instead of reopening them.
+    #[test]
+    fn profile_gpg_withheld_when_deny_path_is_an_ancestor_of_gnupg() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let deny = [PathBuf::from("/Users/test")];
+        let mut opts = test_options(project, home);
+        opts.allow_gpg_signing = true;
+        opts.extra_deny = &deny;
+        let p = generate_profile(&opts, &[]);
+
+        assert!(
+            !p.contains(";; GPG signing (--allow-gpg-signing)"),
+            "the GPG re-allow block must not survive an ancestor --deny-path:\n{p}"
+        );
+        assert!(
+            !p.contains(r#"(allow file-read* (literal "/Users/test/.gnupg/"#),
+            "no GPG re-allow may survive an ancestor --deny-path:\n{p}"
+        );
     }
 
     fn test_options<'a>(

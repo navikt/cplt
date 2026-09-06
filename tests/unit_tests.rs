@@ -4899,7 +4899,7 @@ fn profile_gpg_signing_deny_path_wins() {
         "explicit --deny-path ~/.gnupg should override --allow-gpg-signing"
     );
     assert!(
-        p.contains("--deny-path overlaps"),
+        p.contains("GPG signing re-allow withheld"),
         "profile should note that deny-path overrode GPG signing"
     );
 }
@@ -5884,7 +5884,7 @@ fn profile_docker_enabled_allows_config_and_sockets() {
 }
 
 #[test]
-fn profile_docker_skipped_when_deny_path_overlaps() {
+fn profile_docker_withholds_the_overlapping_reallow() {
     let p = generate_profile(
         &SandboxConfig {
             extra_deny: &[std::path::PathBuf::from("/Users/test/.docker")],
@@ -5893,14 +5893,19 @@ fn profile_docker_skipped_when_deny_path_overlaps() {
         },
         &[],
     );
-    // Docker allows should be skipped — deny-path wins
+    // The overlapping re-allow is withheld — deny-path wins for ~/.docker...
     assert!(
-        p.contains("Docker access skipped"),
-        "Profile must skip docker rules when --deny-path overlaps"
+        p.contains("Docker re-allow withheld"),
+        "Profile must withhold the overlapping docker re-allow"
     );
     assert!(
         !p.contains(r#"(allow file-read* (subpath "/Users/test/.docker"))"#),
         "Profile must not allow .docker when deny-path overlaps"
+    );
+    // ...but the rest of the grant (containers, sockets) stays active.
+    assert!(
+        p.contains(r#"(allow file-read* (subpath "/Users/test/.config/containers"))"#),
+        "Profile must keep unrelated docker re-allows when only ~/.docker is denied"
     );
 }
 
