@@ -1643,6 +1643,37 @@ pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
     }
 }
 
+/// The first agent config dir that resolves to a system root or `$HOME`, if any.
+///
+/// A config dir is externally influenced: `CLAUDE_CONFIG_DIR` (used raw, no
+/// subdirectory appended) and the `XDG_*` bases both come from the ambient
+/// environment. An attacker-set or fat-fingered `CLAUDE_CONFIG_DIR=/` or
+/// `=$HOME` turns into an `AgentDir { write: true }` over the whole tree. The
+/// sandbox backends are purely additive — Landlock has no deny, and macOS's
+/// late credential/persistence denies only re-cover their enumerated paths — so
+/// such a grant cannot be clawed back and everything under it degrades to
+/// writable (external audit C-02).
+///
+/// So the same veto the relocatable tool dirs already use
+/// ([`crate::sandbox::tool_override_path_is_safe`]) guards these too — it wraps
+/// `is_unsafe_root` (`/`, `$HOME`, system/temp roots) and additionally rejects
+/// any *ancestor* of `$HOME` (`/Users`, `/home`, or a deeper parent), which a
+/// bare `is_unsafe_root` misses: `CLAUDE_CONFIG_DIR=/Users` would otherwise
+/// become a writable grant over every user's home. A legitimate config dir
+/// lives at `~/.claude` or a dedicated subdirectory, which the predicate
+/// accepts. Callers must refuse to launch rather than emit the grant — a
+/// silently dropped grant would still hand the same dir to the child via the
+/// environment, which would then fail writing to a denied path with no hint why
+/// (the "No silent grants" rule in AGENTS.md).
+///
+/// Run on the *canonicalized* dirs so a symlink or `..` cannot smuggle an unsafe
+/// root past the textual comparison.
+#[must_use]
+pub fn first_unsafe_agent_dir<'a>(dirs: &'a [AgentDir], home: &Path) -> Option<&'a AgentDir> {
+    dirs.iter()
+        .find(|d| !crate::sandbox::tool_override_path_is_safe(&d.path, home))
+}
+
 /// Are we running inside WSL? Cached — it cannot change within a process.
 ///
 /// Two independent signals, both cheap reads of kernel-owned state:
@@ -2711,6 +2742,93 @@ mod tests {
             let dirs = Agent::Claude.config_dirs(home);
             assert_eq!(dirs.len(), 2, "empty override is ignored");
             assert_eq!(dirs[0].path, home.join(".claude"));
+        });
+    }
+
+    // Audit C-02: CLAUDE_CONFIG_DIR is turned into a writable AgentDir with no
+    // validation. `first_unsafe_agent_dir` is the veto that stops the grant from
+    // reaching Landlock/Seatbelt. These assert against the resolved AgentDir set
+    // config_dirs actually produces, not just the helper in isolation.
+
+    #[test]
+    fn claude_config_dir_at_filesystem_root_is_vetoed() {
+        temp_env::with_var("CLAUDE_CONFIG_DIR", Some("/"), || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Claude.config_dirs(home);
+            // The vulnerable grant: a writable AgentDir over "/".
+            assert_eq!(dirs.len(), 1);
+            assert_eq!(dirs[0].path, PathBuf::from("/"));
+            assert!(dirs[0].write, "the grant that C-02 is about is writable");
+            // The veto catches it before it becomes an FsRule / subpath rule.
+            let bad = first_unsafe_agent_dir(&dirs, home).expect("filesystem root must be vetoed");
+            assert_eq!(bad.path, PathBuf::from("/"));
+        });
+    }
+
+    #[test]
+    fn claude_config_dir_at_home_is_vetoed() {
+        temp_env::with_var("CLAUDE_CONFIG_DIR", Some("/Users/test"), || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Claude.config_dirs(home);
+            assert_eq!(dirs[0].path, PathBuf::from("/Users/test"));
+            assert!(
+                first_unsafe_agent_dir(&dirs, home).is_some(),
+                "$HOME itself must be vetoed"
+            );
+        });
+    }
+
+    #[test]
+    fn claude_config_dir_dedicated_subdir_is_allowed() {
+        temp_env::with_var(
+            "CLAUDE_CONFIG_DIR",
+            Some("/Users/test/.config/claude-work"),
+            || {
+                let home = Path::new("/Users/test");
+                let dirs = Agent::Claude.config_dirs(home);
+                assert_eq!(
+                    dirs[0].path,
+                    PathBuf::from("/Users/test/.config/claude-work")
+                );
+                assert!(dirs[0].write);
+                assert!(
+                    first_unsafe_agent_dir(&dirs, home).is_none(),
+                    "a dedicated subdirectory is a legitimate config dir"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_at_ancestor_of_home_is_vetoed() {
+        // A parent of $HOME that is NOT in is_unsafe_root's enumerated root
+        // list. Bare is_unsafe_root misses it; the ancestor check that
+        // tool_override_path_is_safe adds is what catches it. Granting write
+        // here would reach every sibling home under the ancestor.
+        let home = Path::new("/Users/alice/sandbox/home");
+        temp_env::with_var("CLAUDE_CONFIG_DIR", Some("/Users/alice/sandbox"), || {
+            let dirs = Agent::Claude.config_dirs(home);
+            assert_eq!(dirs[0].path, PathBuf::from("/Users/alice/sandbox"));
+            assert!(
+                !crate::is_unsafe_root(&dirs[0].path, home),
+                "precondition: bare is_unsafe_root does NOT catch this ancestor"
+            );
+            assert!(
+                first_unsafe_agent_dir(&dirs, home).is_some(),
+                "an ancestor of $HOME must be vetoed even when not an enumerated root"
+            );
+        });
+    }
+
+    #[test]
+    fn default_claude_config_dirs_pass_the_veto() {
+        temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Claude.config_dirs(home);
+            assert!(
+                first_unsafe_agent_dir(&dirs, home).is_none(),
+                "~/.claude and ~/.claude.json must never be vetoed"
+            );
         });
     }
 

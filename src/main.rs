@@ -3432,6 +3432,25 @@ fn assemble_sandbox(
     // After pre-creation, so a dir we just made resolves too. See #171.
     agent::canonicalize_agent_dirs(&mut agent_dirs);
 
+    // An agent config dir can be relocated by an env var the user (or a repo, or
+    // an attacker) controls — CLAUDE_CONFIG_DIR is used raw, the XDG_* bases feed
+    // the rest. Like the project root and the tool dirs, one that resolves to a
+    // system root or $HOME would hand the agent a writable grant over the whole
+    // tree that the additive Landlock/Seatbelt model cannot claw back (audit
+    // C-02). Refuse loudly rather than silently narrowing or dropping the grant:
+    // a dropped grant would still pass the same dir to the child via the env,
+    // which would then fail writing to a denied path with no hint why.
+    if let Some(bad) = agent::first_unsafe_agent_dir(&agent_dirs, home_dir) {
+        bail!(
+            "cplt refuses to grant the agent the config directory derived from the \
+             environment, '{}', it is too broad (a system root, your home directory, \
+             or an ancestor of it). Point the relevant variable (CLAUDE_CONFIG_DIR, \
+             or an XDG_* base) at a dedicated subdirectory such as '{}'.",
+            bad.path.display(),
+            home_dir.join(".claude").display(),
+        );
+    }
+
     // Agent-facing sandbox brief (issue #148), session layer only. The
     // AGENTS.md layer writes into the user's repo and must not run until the
     // launch is confirmed — see `apply_persistent_sandbox_brief`, which the

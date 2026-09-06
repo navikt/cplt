@@ -321,6 +321,64 @@ mod e2e_tests {
         );
     }
 
+    /// Audit C-02: an externally-set `CLAUDE_CONFIG_DIR` pointing at a system
+    /// root must not become a writable grant. The refusal fires in
+    /// `assemble_sandbox`, which `--print-profile --agent claude` reaches
+    /// without needing a real Claude binary, so this exercises the full
+    /// enforcement wiring (not just the veto helper) and runs in CI.
+    #[test]
+    fn e2e_claude_config_dir_at_root_is_refused() {
+        let output = cplt_cmd()
+            .args(["--print-profile", "--agent", "claude"])
+            .env("CLAUDE_CONFIG_DIR", "/")
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "CLAUDE_CONFIG_DIR=/ must abort the launch.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("config directory") && stderr.contains("too broad"),
+            "refusal should name the offending config directory.\nstderr: {stderr}"
+        );
+    }
+
+    /// The other half of C-02: a dedicated subdirectory is legitimate and must
+    /// still produce a writable grant, so the veto does not strand a user who
+    /// deliberately relocated their config dir.
+    #[test]
+    fn e2e_claude_config_dir_dedicated_subdir_is_granted() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let cfg = tmp.path().join("claude-config");
+        std::fs::create_dir_all(&cfg).expect("create config dir");
+        // Match assemble_sandbox, which grants the canonicalized path.
+        let canonical = std::fs::canonicalize(&cfg).expect("canonicalize");
+
+        let output = cplt_cmd()
+            .args(["--print-profile", "--agent", "claude"])
+            .env("CLAUDE_CONFIG_DIR", &cfg)
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "a dedicated config dir must be accepted.\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                canonical.display()
+            )),
+            "profile should grant write to the dedicated config dir.\nstdout: {stdout}"
+        );
+    }
+
     #[test]
     fn e2e_print_profile_allows_gh_config_readonly() {
         let output = cplt_cmd()
