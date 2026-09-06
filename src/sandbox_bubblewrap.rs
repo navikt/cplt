@@ -1490,11 +1490,11 @@ mod tests {
             ".pi/extensions",
             ".pi/settings.json",
         ] {
+            let path = proj.path().join(rel).to_string_lossy().into_owned();
             assert!(
-                args.windows(2)
-                    .any(|w| w[0] == "--ro-bind"
-                        && w[1] == proj.path().join(rel).to_string_lossy()),
-                "{rel} must be re-bound read-only"
+                args.windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == path && w[2] == path),
+                "{rel} must be re-bound read-only (source and dest both {path})"
             );
         }
         // .git/config and .gitmodules are NOT re-bound (stay writable), even
