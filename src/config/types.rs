@@ -409,8 +409,16 @@ pub struct GitGuardConfig {
 
 /// A structured rule that permits `git push` under specific conditions.
 /// All specified fields must match (AND logic).
+///
+/// `deny_unknown_fields` is deliberate here, against the config loader's
+/// otherwise-lenient collect-and-warn handling of unknown keys: a misspelled key
+/// (`remto`, `brnach`) would silently drop its field to the default, widening the
+/// rule — a mistyped `branches` becomes "all branches on that remote". For a
+/// security allow-rule the safe failure is to reject the key at parse. The
+/// forward-compat cost (an older binary refusing a config written for a newer
+/// one) fails *closed*, which is the correct direction for a grant.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GitPushRule {
     /// Remote name to allow pushing to (e.g. `"fork"`, `"origin"`).
     pub remote: Option<String>,

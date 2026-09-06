@@ -443,6 +443,25 @@ impl Config {
             allow_api_write: bools.gh_allow_api_write,
         };
 
+        // An `allow_push` rule that names neither a remote nor any branch
+        // constrains nothing: `matches_allow_push_rule` would return true for
+        // every non-force push, silently defeating `prevent_push`. That is
+        // never what the operator meant — most often it is a typo (`remto =`,
+        // `brnach =`) whose misspelled key was dropped as unknown, leaving the
+        // rule all-default. Refuse it at load time rather than let it grant
+        // everything. (H-10; see the "No silent grants" doctrine in AGENTS.md.)
+        for (i, r) in self.git_guard.allow_push.iter().enumerate() {
+            if r.remote.is_none() && r.branches.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "git_guard.allow_push rule #{} constrains nothing (no `remote`, no `branches`) \
+                     and would allow every non-force push, defeating prevent_push. \
+                     Give it a `remote` and/or `branches`, or remove it. \
+                     A dropped field is usually a misspelled key — check for typos.",
+                    i + 1
+                )));
+            }
+        }
+
         // git-guard. `git_guard.enabled` folds in the deprecated
         // `sandbox.git_push_prevention` spelling at the config layer.
         let git_guard = GitGuardPolicy {
@@ -1485,6 +1504,54 @@ validate = false
         assert_eq!(config.proxy.enabled, Some(true));
         assert!(config.proxy.port.is_none());
         assert!(config.allow.read.is_empty());
+    }
+
+    #[test]
+    fn empty_allow_push_rule_is_rejected() {
+        // A rule with neither remote nor branches constrains nothing: it would
+        // allow every non-force push and silently defeat prevent_push (H-10).
+        let config: Config = toml::from_str(
+            "[git_guard]\nprevent_push = true\n[[git_guard.allow_push]]\nforce = false\n",
+        )
+        .unwrap();
+        let err = config.merge(CliFlags::default()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(ref m) if m.contains("constrains nothing")),
+            "expected a validation error about an unconstrained rule, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mistyped_allow_push_key_is_rejected() {
+        // `deny_unknown_fields` on GitPushRule rejects a misspelled key at parse
+        // rather than dropping it to a default that widens the rule. An old
+        // binary refusing a newer key fails closed — safe for an allow-rule.
+        assert!(
+            toml::from_str::<Config>(
+                "[[git_guard.allow_push]]\nremto = \"fork\"\nbrnach = [\"agent/*\"]\n"
+            )
+            .is_err(),
+            "a misspelled allow_push key must be rejected at parse"
+        );
+        // A misspelled `branches` alone (remote correct) is the fail-open the
+        // empty-rule check would miss — deny_unknown_fields catches it too.
+        assert!(
+            toml::from_str::<Config>(
+                "[[git_guard.allow_push]]\nremote = \"origin\"\nbrnach = [\"agent/*\"]\n"
+            )
+            .is_err(),
+            "a partial typo that would widen the rule must be rejected at parse"
+        );
+    }
+
+    #[test]
+    fn valid_allow_push_rule_still_merges() {
+        let config: Config = toml::from_str(
+            "[[git_guard.allow_push]]\nremote = \"origin\"\nbranches = [\"agent/*\"]\n",
+        )
+        .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert_eq!(resolved.git_guard.allow_push.len(), 1);
     }
 
     #[test]
