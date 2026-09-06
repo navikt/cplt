@@ -3110,6 +3110,107 @@ mod tests {
         );
     }
 
+    /// The four `(rel, is_tree)` groups H-11 protects: OpenCode's plugin/tool
+    /// subdirs (subtrees) and root configs (files), Claude's hook carriers and
+    /// skills-dir plugin manifest, Pi's extension dir and settings file. Kept as
+    /// one list so a table addition shows up as a diff on this test too.
+    const H11_PATHS: &[(&str, bool)] = &[
+        (".opencode/plugins", true),
+        (".opencode/plugin", true),
+        (".opencode/tools", true),
+        (".opencode/tool", true),
+        ("opencode.json", false),
+        ("opencode.jsonc", false),
+        (".claude/settings.json", false),
+        (".claude/settings.local.json", false),
+        (".claude-plugin", true),
+        (".mcp.json", false),
+        (".pi/extensions", true),
+        (".pi/settings.json", false),
+    ];
+
+    /// H-11: every path a supported agent auto-executes from the project
+    /// directory is write-denied for every writable root, subtree or file as the
+    /// vector requires, with the last-match-wins ordering behind every allow.
+    #[test]
+    fn h11_agent_persistence_paths_denied_for_every_writable_root() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        let last_allow = p
+            .rfind("(allow file-write*")
+            .expect("a write allow must be emitted");
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            for &(rel, is_tree) in H11_PATHS {
+                let shape = if is_tree { "subpath" } else { "literal" };
+                let rule = format!("(deny file-write* ({shape} \"{root}/{rel}\"))");
+                assert!(p.contains(&rule), "missing for {root}: {rule}");
+                // Must outlive every user allow.write, or a grant reopens it.
+                let deny = p
+                    .rfind(&format!("{root}/{rel}\"))"))
+                    .unwrap_or_else(|| panic!("{rel} deny must be emitted for {root}"));
+                assert!(
+                    last_allow < deny,
+                    "a write allow at {last_allow} comes after the {root}/{rel} deny at {deny}"
+                );
+            }
+        }
+    }
+
+    /// A repo nested under a writable root exposes the same auto-exec paths to
+    /// whichever agent next opens THAT repo, so they join the nested-repo
+    /// alternation — the #247 shape, with the `.` in each rel escaped. This is
+    /// also what reaches `.claude/skills/*/.claude-plugin` and `.opencode/opencode.json`.
+    #[test]
+    fn h11_agent_persistence_paths_denied_in_nested_repos_too() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = root.replace('.', r"\.");
+            for &(rel, _) in H11_PATHS {
+                let esc_rel = rel.replace('.', r"\.");
+                let rule = format!("(deny file-write* (regex #\"^{esc}/.+/{esc_rel}($|/)\"))");
+                assert!(
+                    p.contains(&rule),
+                    "missing nested deny for {root} {rel}: {rule}"
+                );
+            }
+        }
+    }
+
+    /// Scoped precisely: `.opencode/`, `.claude/` and `.pi/` each hold session
+    /// or generated state their agent writes every run (OpenCode's
+    /// node_modules/.gitignore, Claude's projects/history, Pi's skills/prompts),
+    /// so only the executable-bearing paths inside are denied, never the dir.
+    #[test]
+    fn h11_agent_config_dirs_not_denied_wholesale() {
+        let p = generate_profile(
+            &test_options(
+                std::path::Path::new("/projects/app"),
+                std::path::Path::new("/Users/test"),
+            ),
+            &[],
+        );
+        for dir in [".opencode", ".claude", ".pi"] {
+            assert!(
+                !p.contains(&format!(
+                    "(deny file-write* (subpath \"/projects/app/{dir}\"))"
+                )),
+                "only the auto-exec path inside {dir} is denied, not the whole tree"
+            );
+        }
+    }
+
     /// #341: `.git/info/exclude` is a local, uncommitted gitignore. Writing it
     /// hides every path it names from `git status` — the review step people
     /// actually perform — so an agent can conceal what it plants. Emitted for

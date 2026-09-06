@@ -1394,14 +1394,39 @@ mod tests {
         // The protected set is deliberately narrow: exactly the
         // `LinuxCoverage::Bwrap` entries of `PROTECTED_IN_ROOT` and
         // `PROTECTED_IN_GITDIR` — .git/hooks, .git/info/exclude, .cplt.toml,
-        // .agents/plugins and .github/hooks.
+        // .agents/plugins, .github/hooks, and the H-11 agent auto-exec paths
+        // (.opencode/{plugin,plugins,tool,tools}, opencode.json(c), .claude/settings*.json,
+        // .claude-plugin, .mcp.json, .pi/extensions, .pi/settings.json).
         // .git/config / .gitmodules must stay writable so legit in-sandbox git
         // config/remote/submodule ops (and their lock files) are not broken —
-        // even when those files exist on disk.
+        // even when those files exist on disk. Only paths that EXIST at launch
+        // are bound (nested-repo depth is macOS-only), so each H-11 path is
+        // created below to prove it reaches the bind.
         let proj = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(proj.path().join(".git/hooks")).expect("create .git/hooks");
         std::fs::create_dir_all(proj.path().join(".agents/plugins")).expect("create plugins");
         std::fs::create_dir_all(proj.path().join(".github/hooks")).expect("create .github/hooks");
+        for d in [
+            ".opencode/plugins",
+            ".opencode/plugin",
+            ".opencode/tools",
+            ".opencode/tool",
+        ] {
+            std::fs::create_dir_all(proj.path().join(d)).expect("create opencode dir");
+        }
+        std::fs::create_dir_all(proj.path().join(".claude-plugin")).expect("create claude-plugin");
+        std::fs::create_dir_all(proj.path().join(".pi/extensions")).expect("create pi ext");
+        std::fs::create_dir_all(proj.path().join(".claude")).expect("create .claude");
+        for f in [
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".mcp.json",
+            "opencode.json",
+            "opencode.jsonc",
+            ".pi/settings.json",
+        ] {
+            std::fs::write(proj.path().join(f), "").expect("create H-11 file");
+        }
         std::fs::create_dir_all(proj.path().join(".git/info")).expect("create .git/info");
         std::fs::write(proj.path().join(".git/info/exclude"), "").expect("create info/exclude");
         std::fs::write(proj.path().join(".git/config"), "").expect("create .git/config");
@@ -1447,6 +1472,31 @@ mod tests {
                 && w[1] == proj.path().join(".git/info/exclude").to_string_lossy()),
             ".git/info/exclude must be re-bound read-only"
         );
+        // H-11: every agent auto-exec path is `LinuxCoverage::Bwrap`, so each
+        // must reach `build_bwrap_args` as a read-only bind — the end-to-end pin
+        // that the table additions are enforced on Linux too (bubblewrap only,
+        // never Landlock).
+        for rel in [
+            ".opencode/plugins",
+            ".opencode/plugin",
+            ".opencode/tools",
+            ".opencode/tool",
+            "opencode.json",
+            "opencode.jsonc",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".claude-plugin",
+            ".mcp.json",
+            ".pi/extensions",
+            ".pi/settings.json",
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--ro-bind"
+                        && w[1] == proj.path().join(rel).to_string_lossy()),
+                "{rel} must be re-bound read-only"
+            );
+        }
         // .git/config and .gitmodules are NOT re-bound (stay writable), even
         // though both exist on disk — the narrowing, not the exists-check, is
         // what leaves them out.
