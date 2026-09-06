@@ -357,6 +357,75 @@ A curated blocklist of these domains ships in [`blocked-domains.txt`](blocked-do
 
 **`--allow-private-domain` weakens DNS rebinding protection for named domains.** For a domain listed in `proxy.allow_private_domains` (or `--allow-private-domain`), the proxy skips the post-DNS private IP check. That is intentional for corporate intranet services such as `intern.nav.no` that legitimately resolve to RFC 1918 addresses. The accepted risk: if DNS for a listed domain is poisoned or hijacked, a compromised agent could reach arbitrary private hosts on your internal network, not just the intended service. All other proxy checks (port, allowlist, blocklist) still apply. Only list domains you control and whose DNS you trust.
 
+**`proxy.upstream` delegates private-address defence to the upstream proxy.** When
+`proxy.upstream` is set, cplt classifies the address *it* resolves for the target
+name, then forwards the **name** — not that address — to the upstream in a nested
+`CONNECT host:port`. The upstream resolves it again, in its own network and with
+its own resolver, and cplt cannot see or pin the address the tunnel actually
+lands on. Two consequences follow, and both are accepted:
+
+- A **split-horizon** name that resolves publicly for cplt and privately for the
+  upstream passes cplt's resolved-IP guard on the public answer and still reaches
+  the private host.
+- A name that **does not resolve locally at all** gets no resolved-IP
+  classification: `resolve_locally` returns `None`, and on the upstream path that
+  is read as "only the corporate proxy can resolve this", so the tunnel is
+  forwarded anyway (`classify_resolved`, `src/proxy.rs`).
+
+Everything that does not depend on the resolved address still applies to every
+upstream-forwarded target, before the forward happens: the port policy, the
+fail-closed allowlist, the blocklist, and the pre-DNS private-hostname gate that
+rejects IP literals in a private range and `localhost` / `*.localhost` /
+`*.local` names. What does not apply is any guarantee about the *final* IP.
+
+This is deliberate and will not be enforced. Pinning the checked IP — forwarding
+`CONNECT 93.184.216.34:443` instead of the name — would break split-DNS and
+internal-name resolution, which is the entire reason upstream mode exists. So the
+trust boundary in this mode is the upstream proxy and the network segment it
+sits on: cplt filters which *names* reach it, and the upstream decides where they
+go. Do not use `proxy.upstream` with an upstream you would not trust to enforce
+its own egress policy.
+
+**An upstream proxy credential crosses the network in cleartext.** Only the
+`http` scheme is accepted for `proxy.upstream`; an `https://` upstream is
+rejected rather than silently downgraded, and cplt implements no TLS-to-proxy
+path. Userinfo in the upstream URL (`http://user:pass@host:8080`) is base64-encoded
+once at startup and sent as a `Proxy-Authorization: Basic` header over a plain TCP
+connection to that proxy, on every CONNECT. Anyone who can read that segment reads
+the credential; `Basic` is encoding, not encryption. The credential is redacted in
+`cplt config show`, in startup output and in `Debug` — that protects the logs, not
+the wire.
+
+cplt does not refuse userinfo for a non-loopback upstream, because Basic auth to a
+corporate proxy over a trusted internal segment is ordinary and refusing it would
+break real deployments. The trust boundary is therefore the network between cplt
+and the upstream. Where that segment is not trusted, point `proxy.upstream` at a
+loopback forwarder that holds the credential itself, or use a credential-free
+upstream that authenticates by source address.
+
+**Derived Linux grants follow symlinks (Landlock).** Landlock rules are attached
+by opening each path with `O_PATH | O_CLOEXEC` and **no `O_NOFOLLOW`**
+(`src/sandbox_landlock.rs`), and the path derivation that feeds them uses
+`std::fs::canonicalize`, which resolves symlinks by definition. A rule therefore
+binds to whatever inode the path resolves to at launch, not to the directory that
+was inspected when the grant was derived.
+
+That matters for **derived** grants — the ones whose final path cplt composes or
+resolves rather than taking verbatim: an `allow_cache_exec` entry, which names a
+subdirectory *relative* to the cache root and is what `cplt init` proposes from
+what it found on disk; a canonicalized `core.hooksPath`, gitdir or common dir; a
+detected tool directory. An attacker who already has write access inside such a
+location can replace the named subdirectory with a symlink between one launch and
+the next, and the read, write or exec right meant for it attaches to the
+attacker's target inode instead.
+
+The condition it needs is real but not small: control of a recognised derived
+path, and two launches. It is **not fixed** — there is no `O_NOFOLLOW` open and no
+post-open inode verification today. It is stated here rather than claimed away.
+The macOS side does not share it: Seatbelt matches on the kernel-resolved path at
+every access, so a swapped symlink is re-evaluated rather than captured once (see
+[Symlink attack protection](#symlink-attack-protection)).
+
 **`~/.config/gh/hosts.yml` is readable.** With gh guard enabled (the default), Copilot gets its token through a one-time cached file that is deleted after the first read; with gh guard disabled, `gh auth token` works inside the sandbox. The file holds a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable, not the whole `.config/gh` directory. With outbound port 443 open, a compromised agent could exfiltrate this token, though the token grants access to GitHub, which Copilot is already connected to. To mitigate, use `--deny-path ~/.config/gh`; Copilot falls back to Keychain auth.
 
 **`block_auth_token` is best-effort, not a same-UID boundary.** With gh guard and `block_auth_token` enabled (both the default), cplt withholds `GH_TOKEN` from the environment, caches the token to `$SCRATCH/.gh-token` (mode `0600`), serves it once via the `gh` wrapper's `gh auth token` callback, and deletes the file after the first read. That keeps the token out of every child's `/proc/*/environ`, and the deletion narrows the exposure window. It does **not** make the token confidential against an adversarial agent. The scratch dir *is* the agent's `TMPDIR`, and the `gh` wrapper runs as the agent's own UID inside the sandbox, so anything the wrapper can read, the agent can read. A same-UID `deny` rule would be illusory and would break the legitimate wrapper read, so cplt does not add one. An agent that `cat`s `$TMPDIR/.gh-token` before the legitimate consumer still gets the token. Treat `block_auth_token` as reducing accidental and env-based leakage, not as a boundary against a hostile agent.
@@ -387,6 +456,37 @@ The guards raise the bar against accidental and prompt-injected-but-cooperative 
 **DNS tunneling is the one channel we cannot inspect.** DNS queries are unrestricted on both platforms. What limits the damage: bandwidth is ~15 KB/s at best given the encoding overhead in subdomain labels, it needs an attacker-controlled authoritative DNS server, the most valuable targets (credentials, tokens, keys) are kernel-blocked from being read, and DNS monitoring detects it by the high-entropy subdomain queries to unusual domains.
 
 *Possible mitigation:* route DNS through a local resolver that logs and rate-limits queries, or block DNS entirely and use a pre-configured resolver for known domains. Practical impact is low, since credentials are already inaccessible.
+
+**Terminal injection (`TIOCSTI`) is denied by policy, not by either kernel.**
+`TIOCSTI` pushes a byte into a terminal's *input* queue, so it is command
+execution in whatever shell reads that terminal next — including the shell
+outside the sandbox that cplt was launched from. Neither platform blocks it for
+free, and the wording here has been wrong in both directions before.
+
+- **macOS.** XNU permits `TIOCSTI` on the caller's **own controlling terminal**;
+  it was reproduced succeeding outside the sandbox. It refuses the ioctl with
+  `EPERM` on any *other* tty, which is why a peer `/dev/ttysNNN` is not an
+  injection target even under the `--allow-write /dev` break-glass — that flag
+  restores output forgery and input capture on peer terminals, not injection into
+  them. What denies the ioctl inside a cplt session is the profile's
+  `(deny default)`. It is **not** `(allow file-ioctl)`, which cplt emits
+  unconditionally and which does not lift the default deny here. Any statement
+  that "the macOS kernel blocks TIOCSTI" is wrong; the control is Seatbelt.
+- **Linux.** The kernel gate is `CONFIG_LEGACY_TIOCSTI`, which is `default y`
+  upstream. Fedora, Debian and Arch disable it; self-built kernels and many
+  vendor and cloud kernels do not, and kernels before 6.2 predate the gate and
+  permit `TIOCSTI` with no capability at all. So on Linux the availability of
+  the primitive is a property of the kernel the user happens to be running, and
+  cplt cannot assume it is absent. Landlock does not help: it has no rule that
+  reaches an ioctl on an inherited descriptor. Denying `TIOCSTI` and `TIOCLINUX`
+  in the seccomp filter is the fix, and **it is not on `main` as of this
+  writing** — the filter table below does not list either. Until it lands,
+  assume an agent on a `CONFIG_LEGACY_TIOCSTI=y` kernel can inject into the
+  terminal cplt inherited.
+
+The exposure is the same on both platforms and is not about peer terminals at
+all: `/dev/tty` and the inherited descriptors 0/1/2 name the agent's own
+controlling terminal, and that terminal is the user's shell.
 
 **Reconnaissance leaks basic host info.** Hostname, IP address, OS version, and the sanitized subset of env vars are readable by any code inside the sandbox. This is unavoidable, because Copilot itself needs the information.
 
