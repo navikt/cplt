@@ -764,8 +764,15 @@ else:
         // Request numbers are asm-generic, identical on x86_64 and aarch64.
         let script = r#"
             python3 -c "
-import errno, fcntl, sys
+import ctypes, errno, fcntl, sys
 TIOCSTI, TIOCLINUX, TIOCGWINSZ = 0x5412, 0x541C, 0x5413
+
+# Prove seccomp is actually installed before reading anything into an EPERM.
+# EPERM from TIOCSTI is otherwise ambiguous: the kernel returns it for a
+# controlling-terminal mismatch, so on a tty stdin this test would pass with
+# the seccomp rule removed. PR_GET_SECCOMP == 2 is SECCOMP_MODE_FILTER.
+PR_GET_SECCOMP = 21
+seccomp_mode = ctypes.CDLL(None, use_errno=True).prctl(PR_GET_SECCOMP, 0, 0, 0, 0)
 
 def probe(request):
     try:
@@ -781,7 +788,8 @@ print(f'TIOCSTI={sti} TIOCLINUX={lin} TIOCGWINSZ={win}')
 # The injection ioctls must be denied by seccomp (EPERM). The benign
 # window-size ioctl must NOT be denied by seccomp: on a non-tty stdin the
 # kernel answers ENOTTY, on a tty it succeeds — either way, not EPERM.
-ok = sti == 'EPERM' and lin == 'EPERM' and win != 'EPERM'
+print(f'seccomp_mode={seccomp_mode}')
+ok = seccomp_mode == 2 and sti == 'EPERM' and lin == 'EPERM' and win != 'EPERM'
 sys.exit(0 if ok else 1)
 "
         "#;
