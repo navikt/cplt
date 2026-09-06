@@ -2746,16 +2746,6 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         ));
     }
 
-    // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
-    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
-    // so extraction must happen here, outside. SEA extraction applies to both
-    // macOS (~/Library/Caches/copilot/pkg/) and Linux (~/.cache/copilot/pkg/).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if active_agent.needs_sea_extraction() {
-        copilot_extract::ensure_copilot_extracted(&agent_bin, &home_dir, &project_dir)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-
     // Preflight: verify the sandbox mechanism works on this system
     if !resolved.no_validate {
         match sandbox::preflight(&prepared) {
@@ -2774,6 +2764,21 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
+    }
+
+    // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
+    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
+    // so extraction must happen here, outside. SEA extraction applies to both
+    // macOS (~/Library/Caches/copilot/pkg/) and Linux (~/.cache/copilot/pkg/).
+    //
+    // Deliberately after the confirmation: extraction spawns copilot outside the
+    // sandbox, as the user, and its `-p exit` fallback is a full agent session.
+    // Nothing runs that agent before the user has agreed to launch it (F05). The
+    // spawns themselves are isolated in `copilot_extract::extraction_command`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if active_agent.needs_sea_extraction() {
+        copilot_extract::ensure_copilot_extracted(&agent_bin, &home_dir, &project_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // Persistent layer of the sandbox brief (issue #148). Deliberately the

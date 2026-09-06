@@ -110,8 +110,17 @@ pub fn ensure_copilot_extracted(
 
     ui::info("Extracting Copilot runtime (first run after update)...");
 
-    // Ensure pkg_base exists — Copilot needs it for extraction
-    let _ = std::fs::create_dir_all(&pkg_base);
+    // Ensure pkg_base exists — Copilot extracts into it, and both preflight
+    // spawns use it as their working directory. A failure here has to be
+    // reported: `current_dir` on a missing directory makes `spawn` fail, and
+    // the spawn-failure message tells the user to run `copilot --version`
+    // themselves, which would work and leave them chasing the wrong thing.
+    std::fs::create_dir_all(&pkg_base).map_err(|e| {
+        format!(
+            "Failed to create the Copilot extraction directory {}: {e}",
+            pkg_base.display(),
+        )
+    })?;
 
     // Clean up stale .extracting-* temp dirs from previous failed attempts.
     // These can confuse the SEA loader into thinking extraction is in progress.
@@ -123,15 +132,15 @@ pub fn ensure_copilot_extracted(
     for pass in 0..2 {
         // Snapshot existing extraction dirs so we can detect the new one.
         let dirs_before = extraction_dirs(&pkg_base);
-        let attempt =
-            run_extraction_attempt(copilot_bin, &pkg_base, &dirs_before).map_err(|e| {
+        let attempt = run_extraction_attempt(copilot_bin, &pkg_base, &project, &dirs_before)
+            .map_err(|e| {
                 format!(
                     "Failed to spawn copilot for extraction: {e}\n  \
                      Try running '{} --version' manually to trigger extraction",
                     copilot_bin.display(),
                 )
             })?;
-        let outcome = resolve_extraction(copilot_bin, &pkg_base, &dirs_before, &attempt);
+        let outcome = resolve_extraction(copilot_bin, &pkg_base, &project, &dirs_before, &attempt);
         if attempt.version.is_some() {
             reported_version = attempt.version;
         }
@@ -189,6 +198,124 @@ struct ExtractionAttempt {
     exit_ok: bool,
 }
 
+/// Environment variables the extraction preflight passes through to `copilot`.
+///
+/// Two things decide what belongs here.
+///
+/// The first is whether copilot can run at all: `HOME` for the SEA loader's
+/// platform default, `PATH` so a wrapper script finds its `node`, `TMPDIR` so
+/// Node's scratch space lands where the user's other tools put theirs.
+///
+/// The second is the rule that actually matters: **the preflight must resolve
+/// the same extraction directory the sandboxed session will.** The SEA loader
+/// picks its target as `$COPILOT_PKG_CACHE_HOME/pkg`, else
+/// `$COPILOT_CACHE_HOME/pkg`, else the platform default — which on Linux is
+/// `$XDG_CACHE_HOME/copilot`, falling back to `~/.cache/copilot` only when
+/// `XDG_CACHE_HOME` is unset. It searches that same set plus `$COPILOT_HOME/pkg`
+/// for an existing extraction. The sandbox passes every one of these to the
+/// session (`XDG_CACHE_HOME` in `ENV_ALLOWLIST`, the rest via the `COPILOT_`
+/// entry in `ENV_PREFIX_ALLOWLIST`), so withholding any of them here would have
+/// the preflight extract to one directory and report success while the session
+/// extracts to another — into a write-denied cache, which is the EPERM that
+/// #166 exists to prevent. They are path overrides, not secrets.
+///
+/// Everything else stays out: tokens (`GH_TOKEN`, `COPILOT_GITHUB_TOKEN`),
+/// cloud credentials and `NODE_OPTIONS` have no business in an agent process
+/// running outside the sandbox.
+///
+/// Note that cplt's own `copilot_cache_dirs` does not yet honour this
+/// precedence — it hardcodes `~/.cache`. Passing the variables through keeps
+/// copilot self-consistent; making cplt agree with copilot is #374.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const EXTRACTION_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "PATH",
+    "TMPDIR",
+    // Extraction-target overrides, in the loader's own precedence order.
+    "COPILOT_PKG_CACHE_HOME",
+    "COPILOT_CACHE_HOME",
+    "COPILOT_HOME",
+    "XDG_CACHE_HOME",
+];
+
+/// Build a `copilot` command for the extraction preflight.
+///
+/// Both preflight spawns run OUTSIDE the sandbox, as the user, before
+/// `sandbox::preflight` and before the launch confirmation. The `-p exit`
+/// fallback is not a probe but a full agent session: it loads user config, MCP
+/// servers, and any instruction file it finds under its working directory. An
+/// inherited cwd is the untrusted project, and an inherited environment carries
+/// every credential the sandbox exists to strip — so the command gets a cleared
+/// environment rebuilt from `EXTRACTION_ENV_ALLOWLIST` and a cwd inside the
+/// Copilot cache, which holds nothing but extracted runtimes.
+///
+/// The binary itself is already guarded: `ensure_copilot_extracted` refuses to
+/// run a `copilot` that lives under the project directory.
+/// `PATH` with everything the untrusted project could have put there removed.
+///
+/// SECURITY: an npm-installed `copilot` is a `#!/usr/bin/env node` wrapper, so
+/// `PATH` decides which `node` actually executes — outside the sandbox, as the
+/// user. direnv, asdf and mise routinely prepend repo-local tool directories,
+/// and a `.envrc` is the project's to write, so passing `PATH` through verbatim
+/// would hand the project back the influence that clearing the environment and
+/// the working directory just took away. The binary guard above only checks
+/// where `copilot` itself lives, not what it goes on to run.
+///
+/// Dropped: entries under the project, relative entries (a bare `.`, or
+/// anything not absolute — both resolve against the cwd), and empty segments,
+/// which POSIX reads as the current directory.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sanitized_path(project: &Path) -> Option<std::ffi::OsString> {
+    sanitize_path_value(&std::env::var_os("PATH")?, project)
+}
+
+/// The filtering half of [`sanitized_path`], split out so it can be tested
+/// without mutating the process environment — `set_var` is global, and these
+/// tests share a binary with others that need a real `PATH`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sanitize_path_value(raw: &std::ffi::OsStr, project: &Path) -> Option<std::ffi::OsString> {
+    let kept: Vec<PathBuf> = std::env::split_paths(raw)
+        .filter(|entry| {
+            if entry.as_os_str().is_empty() || !entry.is_absolute() {
+                return false;
+            }
+            // Compare canonically where possible: a symlink into the project is
+            // still the project. An entry that cannot be resolved does not exist,
+            // so it cannot supply a binary either way; keep it rather than let a
+            // stat failure silently shorten PATH.
+            match entry.canonicalize() {
+                Ok(resolved) => !resolved.starts_with(project),
+                Err(_) => true,
+            }
+        })
+        .collect();
+    std::env::join_paths(kept).ok()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::disallowed_methods)] // resolved agent binary path, and the only extraction spawn that sets cwd + env
+fn extraction_command(
+    copilot_bin: &Path,
+    args: &[&str],
+    pkg_base: &Path,
+    project: &Path,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(copilot_bin);
+    cmd.args(args).env_clear().current_dir(pkg_base);
+    for var in EXTRACTION_ENV_ALLOWLIST {
+        if *var == "PATH" {
+            if let Some(path) = sanitized_path(project) {
+                cmd.env("PATH", path);
+            }
+            continue;
+        }
+        if let Some(value) = std::env::var_os(var) {
+            cmd.env(var, value);
+        }
+    }
+    cmd
+}
+
 /// Run `copilot --version` outside the sandbox and wait for SEA extraction.
 ///
 /// The extraction happens during Node.js startup, before any CLI logic, so
@@ -202,18 +329,22 @@ struct ExtractionAttempt {
 /// version-less fallback would accept any stale directory as proof — then cache
 /// that false positive against the binary's identity.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[allow(clippy::disallowed_methods)] // spawns the resolved agent binary path, not a bare name
 fn run_extraction_attempt(
     copilot_bin: &Path,
     pkg_base: &Path,
+    project: &Path,
     dirs_before: &std::collections::HashSet<String>,
 ) -> Result<ExtractionAttempt, std::io::Error> {
-    let mut child = std::process::Command::new(copilot_bin)
-        .args(["--no-auto-update", "--version"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    let mut child = extraction_command(
+        copilot_bin,
+        &["--no-auto-update", "--version"],
+        pkg_base,
+        project,
+    )
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .spawn()?;
     let mut child_stdout = child.stdout.take();
 
     // Poll for extraction completion. We check for both:
@@ -247,7 +378,8 @@ fn run_extraction_attempt(
             }
             if extracted_dir_name.is_none() && !status.success() {
                 // Process failed — try fallback with `-p exit`
-                extracted_dir_name = try_extraction_fallback(copilot_bin, pkg_base, dirs_before);
+                extracted_dir_name =
+                    try_extraction_fallback(copilot_bin, pkg_base, project, dirs_before);
             }
             break;
         }
@@ -311,6 +443,7 @@ enum ExtractionOutcome {
 fn resolve_extraction(
     copilot_bin: &Path,
     pkg_base: &Path,
+    project: &Path,
     dirs_before: &std::collections::HashSet<String>,
     attempt: &ExtractionAttempt,
 ) -> ExtractionOutcome {
@@ -338,7 +471,7 @@ fn resolve_extraction(
 
     // Last resort: if no complete dir exists, try `-p exit` which forces full
     // startup (and thus extraction) in case --version uses a lazy code path.
-    if let Some(name) = try_extraction_fallback(copilot_bin, pkg_base, dirs_before) {
+    if let Some(name) = try_extraction_fallback(copilot_bin, pkg_base, project, dirs_before) {
         return ExtractionOutcome::Extracted(name);
     }
     match complete_dir_for(pkg_base, attempt.version.as_deref()) {
@@ -437,18 +570,22 @@ fn extraction_failure_message(
 
 /// Try a fallback extraction method using `-p exit` (works on older Copilot versions).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[allow(clippy::disallowed_methods)] // spawns the resolved agent binary path, not a bare name
 fn try_extraction_fallback(
     copilot_bin: &Path,
     pkg_base: &Path,
+    project: &Path,
     dirs_before: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    let child = std::process::Command::new(copilot_bin)
-        .args(["--no-auto-update", "-p", "exit"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let child = extraction_command(
+        copilot_bin,
+        &["--no-auto-update", "-p", "exit"],
+        pkg_base,
+        project,
+    )
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn();
 
     let Ok(mut child) = child else {
         return None;
@@ -997,5 +1134,161 @@ mod copilot_extraction_tests {
         // A shorter prefix must not spuriously match (1.0.3 != 1.0.32).
         assert_eq!(find_complete_dir_for_version(&tmp, "1.0.3"), None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Records the working directory and environment of each preflight spawn,
+    /// then fails the `--version` probe so the `-p exit` fallback runs too.
+    const DUMPS_CWD_AND_ENV: &str = concat!(
+        "D=\"$(dirname \"$COUNT\")\"\n",
+        "if [ \"$2\" = \"-p\" ]; then T=fallback; else T=probe; fi\n",
+        "pwd > \"$D/$T.cwd\"\n",
+        "env > \"$D/$T.env\"\n",
+        "if [ \"$T\" = probe ]; then exit 3; fi\n",
+        "exit 0"
+    );
+
+    /// Assert the spawn recorded under `tag` ran in the Copilot cache with an
+    /// environment rebuilt from `EXTRACTION_ENV_ALLOWLIST`, not the caller's
+    /// project directory and inherited credentials (F05).
+    fn assert_isolated(f: &Fixture, tag: &str) {
+        use std::collections::BTreeSet;
+
+        let cwd = std::fs::read_to_string(f.root.join(format!("{tag}.cwd")))
+            .unwrap_or_else(|e| panic!("{tag}: the spawn never happened: {e}"));
+        assert_eq!(
+            std::fs::canonicalize(cwd.trim()).unwrap(),
+            std::fs::canonicalize(&f.pkg).unwrap(),
+            "{tag}: spawn inherited the caller's working directory",
+        );
+
+        let dump = std::fs::read_to_string(f.root.join(format!("{tag}.env"))).unwrap();
+        let names: BTreeSet<&str> = dump
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(name, _)| name)
+            .collect();
+        // `sh` exports these itself in the child; everything else must be ours.
+        let allowed: BTreeSet<&str> = EXTRACTION_ENV_ALLOWLIST
+            .iter()
+            .copied()
+            .chain(["PWD", "SHLVL", "_"])
+            .collect();
+        let leaked: Vec<&&str> = names.difference(&allowed).collect();
+        assert!(
+            leaked.is_empty(),
+            "{tag}: the parent environment leaked into the spawn: {leaked:?}",
+        );
+        assert!(
+            names.contains("HOME") && names.contains("PATH"),
+            "{tag}: the allowlist did not reach the spawn, got {names:?}",
+        );
+        for var in EXTRACTION_ENV_ALLOWLIST {
+            if std::env::var_os(var).is_some() {
+                assert!(
+                    names.contains(var),
+                    "{tag}: allowlisted {var} is set here but did not reach the spawn",
+                );
+            }
+        }
+        // Guard against a false pass: the parent must hold something that the
+        // child would have inherited had the environment not been cleared.
+        assert!(
+            std::env::vars().any(|(name, _)| !allowed.contains(name.as_str())),
+            "the test process environment is too clean to prove anything",
+        );
+    }
+
+    /// PATH decides which `node` an npm-installed `copilot` shebang wrapper
+    /// runs, outside the sandbox. direnv and asdf routinely prepend repo-local
+    /// tool dirs, and `.envrc` belongs to the project, so passing PATH through
+    /// verbatim would hand back the influence that clearing cwd and env removed.
+    #[test]
+    fn sanitized_path_drops_everything_the_project_controls() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cplt-path-sanitize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let project = tmp.join("project");
+        let node_bin = project.join("node_modules/.bin");
+        let safe = tmp.join("usr-bin");
+        std::fs::create_dir_all(&node_bin).expect("node bin");
+        std::fs::create_dir_all(&safe).expect("safe bin");
+        let project = project.canonicalize().expect("canonical project");
+
+        // A project dir, a relative entry, an empty segment, and one safe entry.
+        let raw = std::env::join_paths([
+            node_bin.as_path(),
+            Path::new("."),
+            Path::new(""),
+            safe.as_path(),
+        ])
+        .expect("join");
+
+        // SAFETY: single-threaded assertion on a value read once, immediately.
+        let kept = sanitize_path_value(&raw, &project).expect("non-empty PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&kept).collect();
+
+        // Compare canonically. On macOS the temp dir is reached through the
+        // /var -> /private/var symlink, so a raw `starts_with` against the
+        // canonicalized project is false for a surviving project entry and the
+        // assertion would pass without testing anything (it did, until a
+        // mutation that removed the filter failed to turn this test red).
+        assert!(
+            !entries
+                .iter()
+                .filter_map(|e| e.canonicalize().ok())
+                .any(|e| e.starts_with(&project)),
+            "a PATH entry under the project survived sanitizing: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| !e.is_absolute()),
+            "a relative PATH entry survived sanitizing: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e == &safe),
+            "the safe entry must survive, or copilot cannot find node: {entries:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The SEA loader resolves its extraction directory from these, in this
+    /// order, and `ENV_ALLOWLIST`/`ENV_PREFIX_ALLOWLIST` hand every one of them
+    /// to the sandboxed session. Withhold one here and the preflight extracts
+    /// to a directory the session never looks at; the session then extracts
+    /// into the write-denied cache and hits the EPERM this whole module exists
+    /// to prevent (#166).
+    #[test]
+    fn the_allowlist_carries_every_cache_path_the_loader_consults() {
+        for var in [
+            "COPILOT_PKG_CACHE_HOME",
+            "COPILOT_CACHE_HOME",
+            "COPILOT_HOME",
+            "XDG_CACHE_HOME",
+            "HOME",
+        ] {
+            assert!(
+                EXTRACTION_ENV_ALLOWLIST.contains(&var),
+                "{var} decides where copilot extracts, so the preflight must see it",
+            );
+        }
+    }
+
+    #[test]
+    fn version_probe_spawn_is_isolated() {
+        let f = fixture("probe-isolation", DUMPS_CWD_AND_ENV);
+        let _ = f.run();
+        assert_isolated(&f, "probe");
+    }
+
+    #[test]
+    fn fallback_spawn_is_isolated() {
+        let f = fixture("fallback-isolation", DUMPS_CWD_AND_ENV);
+        let _ = f.run();
+        assert_isolated(&f, "fallback");
     }
 }
