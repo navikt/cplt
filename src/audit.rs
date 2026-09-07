@@ -758,6 +758,23 @@ struct SettleProbe {
 /// settled (GHSA-c47q-c3c8-7wrf).
 pub(crate) static SETTLE_PROBE_FD: AtomicI32 = AtomicI32::new(-1);
 
+/// Why [`SettleProbe::outcome`] stopped waiting.
+///
+/// Diagnostics only — production asks [`SettleProbe::settled`] the same
+/// question and gets the same answer as a bool. `wrote` counts the bytes a
+/// descendant put down the pipe before the verdict, which is how a descendant
+/// that held the descriptor and wrote to it is told apart from one that never
+/// inherited it at all (#371).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// A zero-length read: every inherited copy of the write end is closed.
+    Eof { wrote: usize },
+    /// [`SETTLE_TIMEOUT`] expired with the descriptor still held.
+    TimedOut { wrote: usize },
+    /// `poll` or `read` failed. Treated as unsettled, like a timeout.
+    Failed(std::io::ErrorKind),
+}
+
 impl SettleProbe {
     /// Arm the probe. Must be called **before** the session starts so every
     /// process it spawns inherits the write end. `None` when the pipe could not
@@ -786,6 +803,15 @@ impl SettleProbe {
     ///
     /// Consumes the probe: both descriptors are closed before returning.
     fn settled(self) -> bool {
+        matches!(self.outcome(), Settle::Eof { .. })
+    }
+
+    /// [`Self::settled`], but keeping the reason. Production reads the bool;
+    /// the reason exists so a failing test can say WHY the probe decided what
+    /// it decided instead of leaving a bare `false` to be guessed at (#371).
+    ///
+    /// Consumes the probe: both descriptors are closed before returning.
+    fn outcome(self) -> Settle {
         // Retract the exemption before the descriptor number is freed, so a
         // later spawn cannot un-seal whatever gets that number next.
         SETTLE_PROBE_FD.store(-1, Ordering::Relaxed);
@@ -794,6 +820,7 @@ impl SettleProbe {
         unsafe { libc::close(self.write) };
 
         let deadline = Instant::now() + SETTLE_TIMEOUT;
+        let mut wrote = 0usize;
         let outcome = loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let mut pfd = libc::pollfd {
@@ -805,13 +832,15 @@ impl SettleProbe {
             let ready =
                 unsafe { libc::poll(&raw mut pfd, 1, remaining.as_millis() as libc::c_int) };
             if ready == 0 {
-                break false; // deadline hit with the descriptor still held
+                // deadline hit with the descriptor still held
+                break Settle::TimedOut { wrote };
             }
             if ready < 0 {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                let kind = std::io::Error::last_os_error().kind();
+                if kind == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                break false;
+                break Settle::Failed(kind);
             }
             // Readable or hung up. Only a zero-length read proves EOF: a hostile
             // descendant can WRITE to the descriptor it inherited, and taking
@@ -820,15 +849,20 @@ impl SettleProbe {
             // SAFETY: `buf` is a valid writable buffer of `buf.len()` bytes.
             let n = unsafe { libc::read(self.read, buf.as_mut_ptr().cast(), buf.len()) };
             if n == 0 {
-                break true; // every copy of the write end is closed
+                // every copy of the write end is closed
+                break Settle::Eof { wrote };
             }
-            if n < 0
-                && !matches!(
-                    std::io::Error::last_os_error().kind(),
+            if n > 0 {
+                wrote += n as usize;
+            }
+            if n < 0 {
+                let kind = std::io::Error::last_os_error().kind();
+                if !matches!(
+                    kind,
                     std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                )
-            {
-                break false;
+                ) {
+                    break Settle::Failed(kind);
+                }
             }
         };
 
@@ -1034,28 +1068,126 @@ mod tests {
     /// Linux CI, and because the number varies it passed elsewhere.
     const SCRIPT_FD: i32 = 9;
 
+    /// Put `fd` on [`SCRIPT_FD`] and make sure it survives `execve`.
+    ///
+    /// Runs in the forked child, between `fork` and `execve`.
+    ///
+    /// The `F_SETFD` is NOT redundant with the `dup2`, and #371 is what that
+    /// cost. POSIX says `dup2(fd, fd)` with `fd` already open is a no-op that
+    /// returns `fd` and explicitly does NOT touch its `FD_CLOEXEC` — so when
+    /// the pipe happened to land on [`SCRIPT_FD`] already, the flag
+    /// `sh_holding_the_probe` sets survived, `execve` closed the descriptor,
+    /// the script got `Bad file descriptor`, and the probe read EOF and called
+    /// a tree with a live `sleep 5` in it settled. Which descriptor the pipe
+    /// gets depends on how many are open, so it only ever bit under parallel
+    /// load. Clearing the flag unconditionally, on the descriptor the child
+    /// will actually use, is correct in both cases and has nothing to get
+    /// wrong later: no branch, and no dependence on which number the pipe drew.
+    ///
+    /// Choosing a [`SCRIPT_FD`] the pipe cannot occupy was the alternative and
+    /// is worse: `/bin/sh` is dash, `>&N` parses one digit, so the whole space
+    /// is 0-9 and a pipe can land anywhere in it. Any "safe" number would have
+    /// to be defended by a reservation the probe knows nothing about.
+    ///
+    /// SAFETY: `dup2` and `fcntl` are async-signal-safe, allocate nothing, and
+    /// touch only these descriptors.
+    fn hand_fd_to_script(fd: libc::c_int) -> std::io::Result<()> {
+        if unsafe { libc::dup2(fd, SCRIPT_FD) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(SCRIPT_FD, libc::F_SETFD, 0) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn sh_holding_the_probe(probe: &SettleProbe, script: &str) -> Command {
         use std::os::unix::process::CommandExt as _;
         let fd = probe.write;
         // Keep the probe out of every OTHER child this test binary spawns:
         // tests run in parallel, and an unrelated process holding the write end
         // keeps the pipe open, which is precisely the "unsettled" condition
-        // under test. Only the script below gets it, through the dup2 in
-        // `pre_exec`, which clears FD_CLOEXEC on the copy it makes.
+        // under test. Only the script below gets it, through
+        // `hand_fd_to_script`, which un-hides it in this child alone.
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(script);
-        // SAFETY: `dup2` is async-signal-safe and touches only these two
-        // descriptors.
+        // SAFETY: see `hand_fd_to_script`.
         unsafe {
-            cmd.pre_exec(move || {
-                if libc::dup2(fd, SCRIPT_FD) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            cmd.pre_exec(move || hand_fd_to_script(fd));
         }
         cmd
+    }
+
+    /// Is `pid` running now, and still running a moment later?
+    ///
+    /// One sample cannot answer that: a descendant closes its descriptors as
+    /// it exits, so the probe's EOF and the process's disappearance are the
+    /// same instant, and the grandchild is reparented to init, which reaps it
+    /// whenever it gets round to it. A single `kill(pid, 0)` right after EOF
+    /// therefore reads ALIVE for a process that is merely on its way out. Two
+    /// samples tell that apart from a descendant that is genuinely still
+    /// working, which is the whole question in #371.
+    fn alive_twice(pid: i32) -> (bool, bool) {
+        // SAFETY: signal 0 performs the existence and permission checks only.
+        let now = unsafe { libc::kill(pid, 0) } == 0;
+        std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: as above.
+        let later = unsafe { libc::kill(pid, 0) } == 0;
+        (now, later)
+    }
+
+    /// Everything needed to read a settle-probe failure without re-running it
+    /// (#371). The two settle tests flake only under full-suite load, so the
+    /// panic has to carry the evidence that separates the explanations:
+    ///
+    /// * `outcome` is the probe's own verdict, and its `wrote` says whether
+    ///   any descendant ever had the descriptor to write to;
+    /// * `waited` against [`SETTLE_TIMEOUT`] says whether a deadline was lost
+    ///   or the probe returned early;
+    /// * the descendant's liveness is measured HERE, at assertion time, with
+    ///   [`alive_twice`] rather than inferred from the probe;
+    /// * `fd` names the collision that caused #371: when the write end already
+    ///   sits on [`SCRIPT_FD`], the `dup2` in [`hand_fd_to_script`] is a POSIX
+    ///   no-op that does not clear `FD_CLOEXEC`. The unconditional `F_SETFD`
+    ///   there handles it, so the note reports the collision as handled — if
+    ///   an `Eof` ever shows up alongside it again, that helper is where to
+    ///   look first.
+    ///
+    /// Called only from a failing assertion's message, so the 100 ms it spends
+    /// watching the descendant is never paid by a passing run.
+    fn settle_diagnosis(fd: i32, pid: i32, outcome: Settle, waited: Duration) -> String {
+        let liveness = match alive_twice(pid) {
+            (true, true) => "STILL ALIVE, and still alive 100ms later",
+            (true, false) => "alive, but gone 100ms later: it was on its way out",
+            (false, _) => "already gone",
+        };
+        let fd_note = if fd == SCRIPT_FD {
+            concat!(
+                ", EQUAL to SCRIPT_FD: the pre_exec dup2 was a no-op (#371), so the",
+                " unconditional F_SETFD in hand_fd_to_script is what cleared FD_CLOEXEC.",
+                " The collision was handled; if this run still failed, that is where to look."
+            )
+        } else {
+            ""
+        };
+        let lines = [
+            "--- settle probe diagnosis (#371) ---".to_string(),
+            format!("probe verdict: {outcome:?}"),
+            format!("probe waited: {waited:?} of a {SETTLE_TIMEOUT:?} budget"),
+            format!("descendant pid {pid}: {liveness}"),
+            format!("probe write fd: {fd} (SCRIPT_FD is {SCRIPT_FD}){fd_note}"),
+            concat!(
+                "reading it: Eof while the descendant is STILL ALIVE 100ms on, from a probe",
+                " fd that is not SCRIPT_FD, is the probe calling a tree settled while a holder",
+                " of the descriptor was running -- the real ordering hole",
+                " GHSA-c47q-c3c8-7wrf exists to prevent. Eof with the descendant on its way",
+                " out or already gone, or TimedOut at the far end of the budget, is this",
+                " machine losing a timing race under load and says nothing about the probe."
+            )
+            .to_string(),
+        ];
+        format!("\n  {}", lines.join("\n  "))
     }
 
     /// GHSA-c47q-c3c8-7wrf: reaping the direct child says nothing about the
@@ -1068,20 +1200,42 @@ mod tests {
         let late = tmp.path().join("late.txt");
         let probe = SettleProbe::arm().expect("pipe");
 
-        let status =
-            sh_holding_the_probe(&probe, &format!("(sleep 1; : > '{}') &", late.display()))
-                .status()
-                .expect("sh runs");
-        assert!(status.success());
+        let fd = probe.write;
+        // `echo $!` names the descendant so the assertions below can ask the
+        // kernel whether it is still alive instead of inferring it (#371). Its
+        // own output goes to /dev/null: inheriting the captured stdout would
+        // hold that pipe open for the whole second and `output()` would block
+        // until after the write, destroying the premise this test rests on.
+        let out = sh_holding_the_probe(
+            &probe,
+            &format!(
+                "(sleep 1; : > '{}') >/dev/null 2>&1 & echo $!",
+                late.display()
+            ),
+        )
+        .output()
+        .expect("sh runs");
+        assert!(out.status.success());
+        let pid: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
         assert!(
             !late.exists(),
             "test premise: the direct child exits before the descendant writes"
         );
 
-        assert!(probe.settled(), "the descendant's exit must be waited for");
+        let started = Instant::now();
+        let outcome = probe.outcome();
+        let waited = started.elapsed();
+        // The diagnosis is an assertion ARGUMENT, so it is built only when the
+        // assertion fails and a passing run pays nothing for it.
+        assert!(
+            matches!(outcome, Settle::Eof { .. }),
+            "the descendant's exit must be waited for{}",
+            settle_diagnosis(fd, pid, outcome, waited)
+        );
         assert!(
             late.exists(),
-            "settling returned before the write it exists to wait for"
+            "settling returned before the write it exists to wait for{}",
+            settle_diagnosis(fd, pid, outcome, waited)
         );
     }
 
@@ -1096,6 +1250,7 @@ mod tests {
     #[test]
     fn settle_probe_reports_unsettled_while_a_descendant_lives() {
         let probe = SettleProbe::arm().expect("pipe");
+        let fd = probe.write;
         // The straggler's stdout goes to /dev/null, or `output()` would block
         // on the pipe until it exits and there would be nothing left to detect.
         let out = sh_holding_the_probe(
@@ -1107,17 +1262,84 @@ mod tests {
         let pid: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
 
         let started = Instant::now();
-        let settled = probe.settled();
+        let outcome = probe.outcome();
         let waited = started.elapsed();
-        // SAFETY: `pid` is the child this test just started.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let settled = matches!(outcome, Settle::Eof { .. });
 
-        assert!(!settled, "a live descendant must never read as settled");
+        // The straggler is killed AFTER the assertions, so a failure's
+        // diagnosis still finds it where the probe left it. A skipped kill
+        // leaks nothing: `sleep 5` is gone within five seconds either way.
+        // `sh`'s stderr is the other half of the fd question: a failed
+        // `printf x >&9` is the shell saying it never had the descriptor.
+        assert!(
+            !settled,
+            "a live descendant must never read as settled{}\n  sh stderr: {:?}",
+            settle_diagnosis(fd, pid, outcome, waited),
+            String::from_utf8_lossy(&out.stderr)
+        );
         // Slack for the sub-millisecond truncation in the poll timeout: the
         // point is that the grace was waited OUT, not returned from at once.
         assert!(
             waited >= SETTLE_TIMEOUT.saturating_sub(Duration::from_millis(50)),
-            "the grace period must actually be waited out, got {waited:?}"
+            "the grace period must actually be waited out, got {waited:?}{}\n  sh stderr: {:?}",
+            settle_diagnosis(fd, pid, outcome, waited),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // SAFETY: `pid` is the child this test just started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    /// #371, on purpose rather than by luck: the write end IS [`SCRIPT_FD`].
+    ///
+    /// The two settle tests only met this when the pipe happened to draw
+    /// descriptor 9, which depends on how many the test binary has open and so
+    /// only ever happened under parallel load — roughly one run in eight. Here
+    /// the collision is manufactured in the forked child, where it is safe to
+    /// do: that child is single-threaded, owns its descriptor table, and is
+    /// about to `execve`, so moving descriptor 9 cannot disturb any other test.
+    ///
+    /// `dup2(fd, fd)` is a no-op that leaves `FD_CLOEXEC` set, so without the
+    /// unconditional `F_SETFD` in [`hand_fd_to_script`] the script's
+    /// `printf x >&9` fails with `Bad file descriptor` and nothing is ever
+    /// written down the pipe. `wrote` is therefore the whole assertion: it is
+    /// 1 only if the child really held the write end across `execve`.
+    #[test]
+    fn script_fd_collision_still_reaches_the_child() {
+        use std::os::unix::process::CommandExt as _;
+
+        let probe = SettleProbe::arm().expect("pipe");
+        let fd = probe.write;
+        // As in `sh_holding_the_probe`: hidden from every other test's children.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("printf x >&{SCRIPT_FD}"));
+        // SAFETY: `dup2`, `close` and `fcntl` are async-signal-safe and touch
+        // only this child's own descriptors.
+        unsafe {
+            cmd.pre_exec(move || {
+                if fd != SCRIPT_FD {
+                    if libc::dup2(fd, SCRIPT_FD) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    libc::close(fd);
+                }
+                // The state `sh_holding_the_probe` leaves behind, now on the
+                // colliding descriptor: open, and close-on-exec.
+                if libc::fcntl(SCRIPT_FD, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                hand_fd_to_script(SCRIPT_FD)
+            });
+        }
+        let out = cmd.output().expect("sh runs");
+
+        let outcome = probe.outcome();
+        assert_eq!(
+            outcome,
+            Settle::Eof { wrote: 1 },
+            "the child on a colliding SCRIPT_FD never got the write end\n  sh stderr: {:?}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
