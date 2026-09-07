@@ -86,6 +86,7 @@ fn configure_command(
     cmd: &mut Command,
     copilot_args: &[String],
     project_dir: &Path,
+    repo_dirs: &[PathBuf],
     home_dir: &Path,
     extra_pass_env: &[String],
     inherit_env: bool,
@@ -258,7 +259,15 @@ fn configure_command(
                 cache_gh_token_to_file(scratch, agent, deny_env);
             }
         }
-        install_command_wrappers(cmd, scratch, project_dir, gh_guard, git_guard, quiet);
+        install_command_wrappers(
+            cmd,
+            scratch,
+            project_dir,
+            repo_dirs,
+            gh_guard,
+            git_guard,
+            quiet,
+        );
     }
 }
 
@@ -456,6 +465,7 @@ fn install_command_wrappers(
     cmd: &mut Command,
     scratch_dir: &Path,
     project_dir: &Path,
+    repo_dirs: &[PathBuf],
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
     quiet: bool,
@@ -525,24 +535,51 @@ fn install_command_wrappers(
         } else {
             None
         };
-        let repo_scope = if gh_guard.scope_check {
-            if let Some(real_git) = real_git.as_deref() {
-                match crate::gh_proxy::detect_current_repo(real_git, project_dir) {
-                    Ok(repo) => Some(repo),
-                    Err(reason) => {
-                        ui::warn(&format!(
-                            "gh guard could not capture repository scope: {reason}. \
-                             Scope-checked commands will be blocked."
-                        ));
-                        None
+        // The gh scope is a SET: the launch repository plus every `--repo-dir`
+        // root whose origin is on GitHub. Each member's `owner/name` is captured
+        // here, parent-side with the trusted git, and baked into the wrapper —
+        // the gate never re-derives it from inside the sandbox.
+        let mut repo_scope: Vec<String> = Vec::new();
+        if gh_guard.scope_check
+            && let Some(real_git) = real_git.as_deref()
+        {
+            match crate::gh_proxy::detect_current_repo(real_git, project_dir) {
+                Ok(repo) => repo_scope.push(repo),
+                Err(reason) => {
+                    ui::warn(&format!(
+                        "gh guard could not capture repository scope: {reason}. \
+                         Scope-checked commands will be blocked."
+                    ));
+                }
+            }
+            for dir in repo_dirs {
+                let root = crate::gh_proxy::capture_named_root(real_git, dir);
+                match root.repo {
+                    // A named root can be a second checkout of a repository
+                    // already in the set; the set dedups. Case-insensitively:
+                    // `Navikt/LAUNCH.git` and `navikt/launch` are one repository,
+                    // and letting both in would turn a single-repository session
+                    // into an ambiguous multi-member one that pins nothing.
+                    Some(repo)
+                        if !repo_scope
+                            .iter()
+                            .any(|member| crate::gh_proxy::repos_match(member, &repo)) =>
+                    {
+                        repo_scope.push(repo);
+                    }
+                    Some(_) => {}
+                    None => {
+                        if !quiet {
+                            ui::warn(&format!(
+                                "--repo-dir {} has no GitHub origin, so it is not in the gh \
+                                 scope. gh commands targeting it are refused.",
+                                dir.display()
+                            ));
+                        }
                     }
                 }
-            } else {
-                None
             }
-        } else {
-            None
-        };
+        }
         // `real_git` above is the parent-side probe and stays trusted. What the
         // wrapper carries is the sandbox git: `gh-gate` re-runs it inside the
         // sandbox to resolve scope, so a git that cannot start there turns every
@@ -556,7 +593,7 @@ fn install_command_wrappers(
         };
         let script = crate::gh_proxy::generate_wrapper_script(
             &real_gh.to_string_lossy(),
-            repo_scope.as_deref(),
+            &repo_scope,
             real_git_str.as_deref(),
             &cplt_str,
             gh_guard,
@@ -923,6 +960,7 @@ pub fn exec(
     sandbox: &super::PreparedSandbox,
     copilot_bin: &Path,
     copilot_args: &[String],
+    repo_dirs: &[PathBuf],
     extra_pass_env: &[String],
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
@@ -938,6 +976,7 @@ pub fn exec(
         &mut cmd,
         copilot_args,
         &sandbox.project_dir,
+        repo_dirs,
         &sandbox.home_dir,
         extra_pass_env,
         inherit_env,
@@ -999,6 +1038,7 @@ pub fn exec(
     sandbox: &super::PreparedSandbox,
     copilot_bin: &Path,
     copilot_args: &[String],
+    repo_dirs: &[PathBuf],
     extra_pass_env: &[String],
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
@@ -1016,6 +1056,7 @@ pub fn exec(
             wrapper,
             copilot_bin,
             copilot_args,
+            repo_dirs,
             extra_pass_env,
             inherit_env,
             disabled_categories,
@@ -1060,6 +1101,7 @@ pub fn exec(
         &mut cmd,
         copilot_args,
         &sandbox.project_dir,
+        repo_dirs,
         &sandbox.home_dir,
         extra_pass_env,
         inherit_env,
@@ -1126,6 +1168,7 @@ fn exec_bwrap(
     wrapper: &super::bubblewrap::BubblewrapWrapper,
     copilot_bin: &Path,
     copilot_args: &[String],
+    repo_dirs: &[PathBuf],
     extra_pass_env: &[String],
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
@@ -1204,6 +1247,7 @@ fn exec_bwrap(
         &mut cmd,
         &[],
         &sandbox.project_dir,
+        repo_dirs,
         &sandbox.home_dir,
         extra_pass_env,
         inherit_env,

@@ -528,11 +528,14 @@ pub fn preflight(sandbox: &PreparedSandbox) -> Result<(), String> {
 /// Environment handling is controlled by `extra_pass_env`, `inherit_env`,
 /// and `disabled_categories` — see [`build_sandbox_env()`] for details.
 /// `deny_env` contains additional env vars to strip (from repo config [deny] section).
+/// `repo_dirs` are the validated `--repo-dir` roots — first-class repositories
+/// alongside the launch one, whose identity the gh guard's scope set is built from.
 #[allow(clippy::too_many_arguments)]
 pub fn exec_sandboxed(
     sandbox: &PreparedSandbox,
     copilot_bin: &Path,
     copilot_args: &[String],
+    repo_dirs: &[PathBuf],
     extra_pass_env: &[String],
     inherit_env: bool,
     disabled_categories: &[HardeningCategory],
@@ -545,6 +548,7 @@ pub fn exec_sandboxed(
         sandbox,
         copilot_bin,
         copilot_args,
+        repo_dirs,
         extra_pass_env,
         inherit_env,
         disabled_categories,
