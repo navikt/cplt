@@ -10,9 +10,9 @@ Its sibling, the git guard, blocks `git push`, `git request-pull`, and
 
 ## Configuration
 
-Both guards are **enabled by default**. The gh guard blocks; the git guard
-starts in `warn` mode, so a `git push` still goes through and only prints a
-warning until you escalate it.
+Both guards are **enabled by default**, and both block. The gh guard blocks
+across its whole policy table; the git guard blocks pushes to the default
+branch, and lets feature branches through.
 
 ```bash
 # gh guard — on by default, in block mode
@@ -23,14 +23,14 @@ cplt config set gh_guard.block_auth_token true      # deny "gh auth token" exfil
 cplt config set gh_guard.unknown_command block      # block unrecognized gh commands
 
 # git guard — on by default, in block mode, scoped to the default branch
-cplt config set git_guard.mode warn                # block | warn | audit (default block)
+cplt config set git_guard.mode block               # block | warn | audit (default block)
 cplt config set git_guard.enabled false             # opt out entirely
 cplt config set git_guard.prevent_push true         # block git push/request-pull
 ```
 
 `--preset strict` widens the git guard from the default branch to every push;
 `--preset permissive` and `--preset full-trust` turn both guards off. Every refusal prints the flag and
-the config key that undo it.
+the config key that undoes it.
 
 Both guards take a `mode`. `block` prints the message and exits non-zero.
 `warn` prints the same message behind `⚠️  WARNING (would block):` and runs the
