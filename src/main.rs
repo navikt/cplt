@@ -125,6 +125,16 @@ struct Cli {
     #[arg(long, short = 'd', value_name = "DIR")]
     project_dir: Option<PathBuf>,
 
+    /// Name another git repository the agent works in, as a first-class
+    /// repository alongside the launch one: `gh` commands may target it.
+    /// Must be a repository toplevel inside the project directory — a nested
+    /// clone already has the project directory's file access, so this declares
+    /// its identity, not new access. Siblings are not supported yet; for
+    /// edit-only access to one, use --allow-write.
+    /// Can be specified multiple times.
+    #[arg(long = "repo-dir", value_name = "DIR")]
+    repo_dirs: Vec<PathBuf>,
+
     /// Enable a local CONNECT proxy that logs and filters outbound connections.
     /// cplt routes all agent traffic through it with the HTTP_PROXY and
     /// HTTPS_PROXY env vars. Block known-bad domains with --blocked-domains.
@@ -851,8 +861,9 @@ NOTE:
         real_gh: PathBuf,
 
         /// Repository scope captured before the sandboxed agent started.
+        /// Repeatable: the launch repository plus each `--repo-dir` root.
         #[arg(long)]
-        repo_scope: Option<String>,
+        repo_scope: Vec<String>,
 
         /// Trusted Git binary used to verify implicit repository targets from cwd.
         #[arg(long)]
@@ -1138,6 +1149,134 @@ fn detect_project_root() -> Option<PathBuf> {
     }
 }
 
+/// The toplevel of the git repository containing `dir`, canonicalized.
+///
+/// `None` when `dir` is not in a repository (or there is no trusted git, in
+/// which case nothing can be verified and the caller must refuse).
+fn git_toplevel(dir: &Path) -> Option<PathBuf> {
+    let output = cplt::git::command(dir, &["rev-parse", "--show-toplevel"])?
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    std::fs::canonicalize(path.trim()).ok()
+}
+
+/// Validate the `--repo-dir` roots against the launch repository.
+///
+/// A named root is a first-class repository the agent works in, not a grant:
+/// stage 1 accepts only roots *nested* in the project directory, which already
+/// carries the filesystem access as one subtree, so naming one declares its
+/// identity and changes no file rule.
+///
+/// Every refusal here is a launch-time refusal on purpose. The set decides what
+/// `gh` may target and what `GH_REPO` is pinned to, so a root that is not the
+/// repository the user thinks it is would misdirect writes — the #213 shape.
+fn validate_repo_dirs(
+    cli_dirs: &[PathBuf],
+    project_dir: &Path,
+    home_dir: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if cli_dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if git_toplevel(project_dir).as_deref() != Some(project_dir) {
+        bail!(
+            "--repo-dir needs the launch directory to be a git repository, and\n  \
+             {}\n  \
+             is not one (or its toplevel is elsewhere). A plain directory holding \
+             repositories is `--project-dir <parent>`, which grants the whole tree \
+             without claiming any repository identity.",
+            project_dir.display()
+        );
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for raw in cli_dirs {
+        let dir = std::fs::canonicalize(raw)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve --repo-dir {}: {e}", raw.display()))?;
+
+        // No symlinked final component. The project dir is agent-writable, so a
+        // symlink planted there last session would silently redirect the
+        // identity this launch grants (#216's confused deputy, one level down).
+        let named = std::path::absolute(raw)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve --repo-dir {}: {e}", raw.display()))?;
+        let unresolved_leaf = match (named.parent(), named.file_name()) {
+            (Some(parent), Some(name)) => std::fs::canonicalize(parent).map(|p| p.join(name)).ok(),
+            // A filesystem root has no leaf to plant a symlink as; `is_unsafe_root`
+            // refuses it below anyway.
+            _ => Some(dir.clone()),
+        };
+        if unresolved_leaf.as_ref() != Some(&dir) {
+            bail!(
+                "--repo-dir {} resolves through a symlink, to\n  {}\n  \
+                 A symlink inside the project directory is agent-writable, so the \
+                 repository it names could be changed between sessions. Name the \
+                 real path.",
+                raw.display(),
+                dir.display()
+            );
+        }
+
+        if dir == project_dir {
+            bail!(
+                "--repo-dir {} is the launch repository itself, which is always in scope.",
+                raw.display()
+            );
+        }
+        if project_dir.starts_with(&dir) {
+            bail!(
+                "--repo-dir {} contains the launch repository; launch from it and name the \
+                 inner one.",
+                raw.display()
+            );
+        }
+        if is_unsafe_root(&dir, home_dir) {
+            bail!(
+                "cplt refuses to treat '{}' as a repository, it is too broad.",
+                dir.display()
+            );
+        }
+        match git_toplevel(&dir) {
+            Some(top) if top == dir => {}
+            // A plain directory inside the launch repository is not a
+            // repository of its own, and pointing at the launch repo's toplevel
+            // would only name something this flag refuses anyway.
+            Some(top) if top == project_dir => bail!(
+                "--repo-dir {} is a plain directory in the launch repository, not a \
+                 repository of its own; for a plain directory use `--allow-write`.",
+                raw.display()
+            ),
+            Some(top) => bail!(
+                "--repo-dir {} is inside a repository but is not its toplevel. Name the \
+                 toplevel instead:\n  --repo-dir {}",
+                raw.display(),
+                top.display()
+            ),
+            None => bail!(
+                "--repo-dir {} is not a git repository; for a plain directory use \
+                 `--allow-write`.",
+                raw.display()
+            ),
+        }
+        if !dir.starts_with(project_dir) {
+            bail!(
+                "--repo-dir {} is outside the project directory\n  {}\n  \
+                 sibling repositories are not yet supported; use `--allow-write` for \
+                 edit-only.",
+                raw.display(),
+                project_dir.display()
+            );
+        }
+        if roots.contains(&dir) {
+            bail!("--repo-dir {} was given twice.", raw.display());
+        }
+        roots.push(dir);
+    }
+    Ok(roots)
+}
+
 // Use library's is_unsafe_root
 use cplt::is_unsafe_root;
 use cplt::sandbox::ToolRoot;
@@ -1308,6 +1447,9 @@ struct ResolvedContext {
     config_path: Option<PathBuf>,
     home_dir: PathBuf,
     project_dir: PathBuf,
+    /// Validated `--repo-dir` roots: repositories the agent works in alongside
+    /// the launch one. Empty unless the flag was given.
+    repo_dirs: Vec<PathBuf>,
     active_agent: agent::Agent,
     unapproved_proposals: Vec<String>,
 }
@@ -1439,6 +1581,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             project_dir.display()
         );
     }
+
+    let repo_dirs = validate_repo_dirs(&cli.repo_dirs, &project_dir, &home_dir)?;
 
     let (cfg, config_path) = match config::Config::load_file() {
         Ok(Some(loaded)) => (loaded.config, Some(loaded.path)),
@@ -1859,6 +2003,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         config_path,
         home_dir,
         project_dir,
+        repo_dirs,
         active_agent,
         unapproved_proposals,
     })
@@ -2587,13 +2732,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     },
                     allow_api_write: allow_api_write && !no_allow_api_write,
                 };
-                run_gh_gate(
-                    &real_gh,
-                    repo_scope.as_deref(),
-                    real_git.as_deref(),
-                    &args,
-                    &policy,
-                )
+                run_gh_gate(&real_gh, &repo_scope, real_git.as_deref(), &args, &policy)
             }
             Command::GitGate {
                 real_git,
@@ -2656,6 +2795,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         config_path,
         home_dir,
         project_dir,
+        repo_dirs,
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(&cli, false)?;
@@ -2862,6 +3002,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &prepared,
             &agent_bin,
             &copilot_args,
+            &repo_dirs,
             &resolved.pass_env,
             resolved.inherit_env,
             &disabled_categories,
@@ -3020,7 +3161,7 @@ enum GateEffect {
 fn decide_gh_gate(
     args: &[String],
     policy: &gh_proxy::GatePolicy,
-    repo_scope: Option<&str>,
+    repo_scope: &[String],
     real_git: Option<&Path>,
 ) -> GateEffect {
     // Intercept `gh auth token` — serve from cached file instead of blocking.
@@ -3056,7 +3197,7 @@ fn decide_gh_gate(
 /// If blocked, prints an error message and exits with code 1.
 fn run_gh_gate(
     real_gh: &Path,
-    repo_scope: Option<&str>,
+    repo_scope: &[String],
     real_git: Option<&Path>,
     args: &[String],
     policy: &gh_proxy::GatePolicy,
@@ -3733,6 +3874,7 @@ fn run_exec_command(
         config_path,
         home_dir,
         project_dir,
+        repo_dirs,
         unapproved_proposals: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
@@ -3850,6 +3992,7 @@ fn run_exec_command(
             &prepared,
             &exec_bin,
             &exec_args,
+            &repo_dirs,
             &resolved.pass_env,
             resolved.inherit_env,
             &disabled_categories,
@@ -3913,6 +4056,7 @@ fn probe_shell(
         prepared,
         &shell,
         &args,
+        &[],
         &resolved.pass_env,
         resolved.inherit_env,
         disabled,
@@ -4190,9 +4334,13 @@ fn run_check_command(
         config_path,
         home_dir,
         project_dir,
+        repo_dirs,
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(cli, true)?;
+    // `cplt check` does not yet report per named root; the flag is still
+    // validated by resolve_context, so a bad one is refused here too.
+    let _ = &repo_dirs;
 
     // Shell, not `active_agent`: `check` probes under the Shell profile.
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
@@ -6792,7 +6940,7 @@ mod tests {
         let effect = decide_gh_gate(
             &gh_args(&["pr", "create", "--repo", "navikt/cplt"]),
             &gh_policy(config::EnforcementMode::Block),
-            Some("navikt/cplt"),
+            &["navikt/cplt".to_string()],
             None,
         );
         assert_eq!(
@@ -6807,7 +6955,7 @@ mod tests {
         let effect = decide_gh_gate(
             &gh_args(&["pr", "create", "--repo", "someone/else"]),
             &gh_policy(config::EnforcementMode::Block),
-            Some("navikt/cplt"),
+            &["navikt/cplt".to_string()],
             None,
         );
         let GateEffect::Refuse(msg) = effect else {
@@ -6840,7 +6988,7 @@ mod tests {
             let effect = decide_gh_gate(
                 &gh_args(&["pr", "create", "--repo", "someone/else"]),
                 &gh_policy(mode),
-                Some("navikt/cplt"),
+                &["navikt/cplt".to_string()],
                 None,
             );
             match effect {
@@ -6863,13 +7011,13 @@ mod tests {
         let warn = decide_gh_gate(
             &args,
             &gh_policy(config::EnforcementMode::Warn),
-            Some("navikt/cplt"),
+            &["navikt/cplt".to_string()],
             None,
         );
         let audit = decide_gh_gate(
             &args,
             &gh_policy(config::EnforcementMode::Audit),
-            Some("navikt/cplt"),
+            &["navikt/cplt".to_string()],
             None,
         );
         assert_ne!(
@@ -6892,7 +7040,7 @@ mod tests {
             config::EnforcementMode::Audit,
         ] {
             assert_eq!(
-                decide_gh_gate(&gh_args(&["auth", "token"]), &gh_policy(mode), None, None),
+                decide_gh_gate(&gh_args(&["auth", "token"]), &gh_policy(mode), &[], None),
                 GateEffect::ServeCachedToken,
                 "{mode} must not let `gh auth token` reach the real binary"
             );
@@ -6907,7 +7055,7 @@ mod tests {
         let effect = decide_gh_gate(
             &gh_args(&["auth", "git-credential", "get"]),
             &gh_policy(config::EnforcementMode::Block),
-            Some("navikt/cplt"),
+            &["navikt/cplt".to_string()],
             None,
         );
         assert_eq!(
@@ -6923,7 +7071,7 @@ mod tests {
             decide_gh_gate(
                 &gh_args(&["--version"]),
                 &gh_policy(config::EnforcementMode::Block),
-                Some("navikt/cplt"),
+                &["navikt/cplt".to_string()],
                 None,
             ),
             GateEffect::ExecPlain { notice: None }
@@ -7223,5 +7371,174 @@ mod tests {
             return;
         }
         assert!(!in_git_work_tree(dir.path()));
+    }
+
+    // ── --repo-dir validation (#344, stage 1) ────────────────────────────
+
+    /// `git init` in `dir`; `false` when this machine has no usable git, which
+    /// makes every `--repo-dir` case untestable and the caller returns early.
+    fn init_repo(dir: &Path) -> bool {
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir)
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// A canonical temp dir: on macOS `/var` is a symlink, and the validator
+    /// compares canonical paths.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn repo_dir_accepts_a_nested_repository() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        if !init_repo(&project) || !init_repo(&inner) {
+            return;
+        }
+        let roots = validate_repo_dirs(
+            std::slice::from_ref(&inner),
+            &project,
+            Path::new("/nonexistent-home"),
+        )
+        .unwrap();
+        assert_eq!(roots, vec![inner]);
+    }
+
+    #[test]
+    fn repo_dir_refuses_a_plain_directory() {
+        let (_guard, project) = canonical_tempdir();
+        let plain = project.join("notarepo");
+        std::fs::create_dir(&plain).unwrap();
+        if !init_repo(&project) {
+            return;
+        }
+        let err = validate_repo_dirs(&[plain], &project, Path::new("/nonexistent-home"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--allow-write"), "{err}");
+    }
+
+    #[test]
+    fn repo_dir_refuses_a_subdirectory_and_names_the_toplevel() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        let sub = inner.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        if !init_repo(&project) || !init_repo(&inner) {
+            return;
+        }
+        let err = validate_repo_dirs(&[sub], &project, Path::new("/nonexistent-home"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&inner.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn repo_dir_refuses_a_sibling_repository() {
+        let (_guard, root) = canonical_tempdir();
+        let project = root.join("project");
+        let sibling = root.join("sibling");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        if !init_repo(&project) || !init_repo(&sibling) {
+            return;
+        }
+        let err = validate_repo_dirs(&[sibling], &project, Path::new("/nonexistent-home"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sibling repositories are not yet supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn repo_dir_refuses_the_launch_repository_and_its_ancestor() {
+        let (_guard, root) = canonical_tempdir();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        if !init_repo(&root) || !init_repo(&project) {
+            return;
+        }
+        let err = validate_repo_dirs(
+            std::slice::from_ref(&project),
+            &project,
+            Path::new("/nonexistent-home"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is the launch repository itself"), "{err}");
+
+        let err = validate_repo_dirs(&[root], &project, Path::new("/nonexistent-home"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contains the launch repository"), "{err}");
+    }
+
+    #[test]
+    fn repo_dir_refuses_a_symlinked_path() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        if !init_repo(&project) || !init_repo(&inner) {
+            return;
+        }
+        let link = project.join("link");
+        std::os::unix::fs::symlink(&inner, &link).unwrap();
+        let err = validate_repo_dirs(&[link], &project, Path::new("/nonexistent-home"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("resolves through a symlink"), "{err}");
+    }
+
+    #[test]
+    fn repo_dir_refuses_a_duplicate() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        if !init_repo(&project) || !init_repo(&inner) {
+            return;
+        }
+        let err = validate_repo_dirs(
+            &[inner.clone(), inner],
+            &project,
+            Path::new("/nonexistent-home"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("was given twice"), "{err}");
+    }
+
+    #[test]
+    fn repo_dir_refuses_a_launch_directory_that_is_not_a_repository() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        if !init_repo(&inner) {
+            return;
+        }
+        let err = validate_repo_dirs(&[inner], &project, Path::new("/nonexistent-home"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("needs the launch directory to be a git repository"),
+            "{err}"
+        );
+    }
+
+    /// No flag, no validation and no git subprocess.
+    #[test]
+    fn repo_dir_is_inert_when_unused() {
+        assert!(
+            validate_repo_dirs(&[], Path::new("/does/not/exist"), Path::new("/home"))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

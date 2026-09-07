@@ -2643,3 +2643,132 @@ mod trust_accept_guard {
         assert!(out.contains("allow_docker"), "{out}");
     }
 }
+
+// ── multi-repo gh scope (#344, stage 1) ───────────────────────────────────
+
+/// A fake `gh` that reports the `GH_REPO` it was executed with.
+fn gh_repo_reporter(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let fake_gh = dir.join("gh");
+    std::fs::write(&fake_gh, "#!/bin/sh\nprintf '%s\\n' \"$GH_REPO\"\n").unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake_gh
+}
+
+/// The pin follows the cwd's repository, not the launch repository.
+///
+/// This is the negative test the design requires: with a scope *set*, an
+/// implicit target resolved from the cwd must never fall back to the launch
+/// repo — that is #213 with N repositories to guess wrong about.
+#[test]
+fn gh_gate_pins_the_cwd_member_and_never_the_launch_repo() {
+    let bin = tempfile::tempdir().unwrap();
+    let fake_gh = gh_repo_reporter(bin.path());
+    let named = temp_repo("navikt/unleasherator");
+
+    let output = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&fake_gh)
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/unleash")
+        .arg("--repo-scope")
+        .arg("navikt/unleasherator")
+        .arg("--")
+        .args(["pr", "comment", "42", "--body", "test"])
+        .current_dir(named.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "a member of the set is in scope");
+    assert_eq!(stdout.trim(), "github.com/navikt/unleasherator");
+    assert!(
+        !stdout.contains("navikt/unleash\n"),
+        "the pin must not fall back to the launch repository: {stdout}"
+    );
+}
+
+/// An explicit `-R` pins to the repository it names, not to the cwd's.
+#[test]
+fn gh_gate_pins_the_explicit_member_and_never_the_cwd() {
+    let bin = tempfile::tempdir().unwrap();
+    let fake_gh = gh_repo_reporter(bin.path());
+    let named = temp_repo("navikt/unleasherator");
+
+    let output = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&fake_gh)
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/unleash")
+        .arg("--repo-scope")
+        .arg("navikt/unleasherator")
+        .arg("--")
+        .args(["pr", "comment", "42", "-R", "navikt/unleash", "--body", "t"])
+        .current_dir(named.path())
+        .output()
+        .expect("cplt gh-gate should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "github.com/navikt/unleash",
+        "the pin must follow -R, not the invocation cwd"
+    );
+}
+
+/// A repository outside the set is still refused, and the refusal names the set.
+#[test]
+fn gh_gate_refuses_a_repo_outside_the_scope_set() {
+    let output = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg("/usr/bin/true")
+        .arg("--real-git")
+        .arg(binary_in_path("git"))
+        .arg("--repo-scope")
+        .arg("navikt/unleash")
+        .arg("--repo-scope")
+        .arg("navikt/unleasherator")
+        .arg("--")
+        .args(["pr", "close", "42", "-R", "navikt/bifrost"])
+        .output()
+        .expect("cplt gh-gate should run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "outside the set must be refused");
+    assert!(
+        stderr.contains("navikt/unleash, navikt/unleasherator"),
+        "the refusal should name the whole set: {stderr}"
+    );
+}
+
+/// With several members and nothing naming one, no member is pinned: guessing
+/// is exactly the failure mode `GH_REPO` pinning exists to prevent.
+#[test]
+fn gh_gate_pins_nothing_when_the_set_is_ambiguous() {
+    let bin = tempfile::tempdir().unwrap();
+    let fake_gh = gh_repo_reporter(bin.path());
+
+    let output = cplt_cmd()
+        .arg("gh-gate")
+        .arg("--real-gh")
+        .arg(&fake_gh)
+        .arg("--repo-scope")
+        .arg("navikt/unleash")
+        .arg("--repo-scope")
+        .arg("navikt/unleasherator")
+        .arg("--")
+        .args(["auth", "status"])
+        .env("GH_REPO", "")
+        .output()
+        .expect("cplt gh-gate should run");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "");
+}
