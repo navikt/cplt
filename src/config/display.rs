@@ -1,8 +1,8 @@
 //! Human-readable config display and `cplt config explain`.
 
 use super::path::config_path;
-use super::registry::{ConfigKeyInfo, type_label};
-use super::types::LoadedConfig;
+use super::registry::{ConfigKeyInfo, ResolvedBools, type_label};
+use super::types::{CliFlags, Config, EnforcementMode, LoadedConfig, Preset, UnknownCommandPolicy};
 use crate::ui;
 
 /// Print explanation of a single config key, showing type and current value inline.
@@ -438,97 +438,117 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         src(c.sandbox.git_push_prevention.is_some())
     );
 
-    // [gh_guard] section
-    println!("{blue}[cplt]{nc}");
-    println!("{blue}[cplt]{nc}  [gh_guard]");
-    println!(
-        "{blue}[cplt]{nc}    enabled               = {}{}",
-        c.gh_guard.enabled.unwrap_or(false),
-        src(c.gh_guard.enabled.is_some())
-    );
-    println!(
-        "{blue}[cplt]{nc}    mode                  = {}{}",
-        c.gh_guard.mode.unwrap_or_default(),
-        src(c.gh_guard.mode.is_some())
-    );
-    println!(
-        "{blue}[cplt]{nc}    scope_check           = {}{}",
-        c.gh_guard.scope_check.unwrap_or(true),
-        src(c.gh_guard.scope_check.is_some())
-    );
-    println!(
-        "{blue}[cplt]{nc}    block_auth_token      = {}{}",
-        c.gh_guard.block_auth_token.unwrap_or(true),
-        src(c.gh_guard.block_auth_token.is_some())
-    );
-    println!(
-        "{blue}[cplt]{nc}    inject_token          = {}{}",
-        c.gh_guard.inject_token.unwrap_or(false),
-        src(c.gh_guard.inject_token.is_some())
-    );
-    println!(
-        "{blue}[cplt]{nc}    unknown_command       = {}{}",
-        c.gh_guard.unknown_command.unwrap_or_default(),
-        src(c.gh_guard.unknown_command.is_some())
-    );
-    println!(
-        "{blue}[cplt]{nc}    allow_api_write       = {}{}",
-        c.gh_guard.allow_api_write.unwrap_or(false),
-        src(c.gh_guard.allow_api_write.is_some())
-    );
-
-    // [git_guard] section
-    println!("{blue}[cplt]{nc}");
-    println!("{blue}[cplt]{nc}  [git_guard]");
-    println!(
-        "{blue}[cplt]{nc}    enabled               = {}{}",
-        c.git_guard.enabled.unwrap_or(false),
-        src(c.git_guard.enabled.is_some())
-    );
-    println!(
-        "{blue}[cplt]{nc}    mode                  = {}{}",
-        c.git_guard.mode.unwrap_or_default(),
-        src(c.git_guard.mode.is_some())
-    );
-    println!(
-        "{blue}[cplt]{nc}    prevent_push          = {}{}",
-        c.git_guard.prevent_push.unwrap_or(true),
-        src(c.git_guard.prevent_push.is_some())
-    );
-    println!(
-        "{blue}[cplt]{nc}    prevent_force_push    = {}{}",
-        c.git_guard.prevent_force_push.unwrap_or(true),
-        src(c.git_guard.prevent_force_push.is_some())
-    );
-    // Preset-aware: this key's default differs per preset (standard protects the
-    // default branch, strict refuses every push), so a hard-coded fallback would
-    // report the wrong effective value under `--preset strict` — and this command
-    // exists to show what is actually in force.
-    println!(
-        "{blue}[cplt]{nc}    protect_default_branch_only = {}{}",
-        c.git_guard.protect_default_branch_only.unwrap_or_else(|| {
-            c.sandbox
-                .preset
-                .unwrap_or(crate::config::Preset::Standard)
-                .baseline()
-                .git_protect_default_branch_only
-        }),
-        src(c.git_guard.protect_default_branch_only.is_some())
-    );
-    if !c.git_guard.allow_push.is_empty() {
-        println!(
-            "{blue}[cplt]{nc}    allow_push            = [{} rules]",
-            c.git_guard.allow_push.len()
-        );
+    for line in guard_lines(&c) {
+        println!("{blue}[cplt]{nc}{line}");
     }
 
     println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
 }
 
+/// The `[gh_guard]` / `[git_guard]` block of `config show`, without the
+/// `[cplt]` prefix so a test can compare it against the resolver's own output.
+///
+/// Every effective value here comes from [`ResolvedBools`] with an empty
+/// [`CliFlags`] — the same table the resolver uses — rather than a hand-written
+/// `unwrap_or(<literal>)`. `config show` reports what is in force; a private
+/// fallback ladder here is free to drift from the real one, and did: both
+/// guards have defaulted ON since #335 while this screen kept printing
+/// `false`. Reusing the table makes that class of bug unrepresentable, and
+/// picks up the deprecated `sandbox.gh_proxy` / `sandbox.git_push_prevention`
+/// spellings for free, since the registry folds them in at the config layer.
+fn guard_lines(c: &Config) -> Vec<String> {
+    let src = |has_file_value: bool| if has_file_value { "" } else { " (default)" };
+    let baseline = c.sandbox.preset.unwrap_or(Preset::Standard).baseline();
+    let b = ResolvedBools::resolve(&CliFlags::default(), c, baseline);
+
+    vec![
+        String::new(),
+        "  [gh_guard]".to_string(),
+        format!(
+            "    enabled               = {}{}",
+            b.gh_guard_enabled,
+            // The deprecated spelling is a file value too: the registry reads
+            // `enabled.or(sandbox.gh_proxy)`, so "(default)" must follow it.
+            src(c.gh_guard.enabled.is_some() || c.sandbox.gh_proxy.is_some())
+        ),
+        format!(
+            // Literal, not a baseline: no preset varies the gh guard's mode, so
+            // the resolver hardcodes `Block` for it. The git guard's mode two
+            // sections below IS preset-controlled and reads the baseline. The
+            // asymmetry is real, not an oversight — mirror whatever the
+            // resolver does for each key.
+            "    mode                  = {}{}",
+            c.gh_guard.mode.unwrap_or(EnforcementMode::Block),
+            src(c.gh_guard.mode.is_some())
+        ),
+        format!(
+            "    scope_check           = {}{}",
+            b.gh_scope_check,
+            src(c.gh_guard.scope_check.is_some())
+        ),
+        format!(
+            "    block_auth_token      = {}{}",
+            b.gh_block_auth_token,
+            src(c.gh_guard.block_auth_token.is_some())
+        ),
+        format!(
+            "    inject_token          = {}{}",
+            b.gh_inject_token,
+            src(c.gh_guard.inject_token.is_some())
+        ),
+        format!(
+            "    unknown_command       = {}{}",
+            c.gh_guard
+                .unknown_command
+                .unwrap_or(UnknownCommandPolicy::Block),
+            src(c.gh_guard.unknown_command.is_some())
+        ),
+        format!(
+            "    allow_api_write       = {}{}",
+            b.gh_allow_api_write,
+            src(c.gh_guard.allow_api_write.is_some())
+        ),
+        String::new(),
+        "  [git_guard]".to_string(),
+        format!(
+            "    enabled               = {}{}",
+            b.git_guard_enabled,
+            src(c.git_guard.enabled.is_some() || c.sandbox.git_push_prevention.is_some())
+        ),
+        format!(
+            "    mode                  = {}{}",
+            c.git_guard.mode.unwrap_or(baseline.git_guard_mode),
+            src(c.git_guard.mode.is_some())
+        ),
+        format!(
+            "    prevent_push          = {}{}",
+            b.git_prevent_push,
+            src(c.git_guard.prevent_push.is_some())
+        ),
+        format!(
+            "    prevent_force_push    = {}{}",
+            b.git_prevent_force_push,
+            src(c.git_guard.prevent_force_push.is_some())
+        ),
+        format!(
+            "    protect_default_branch_only = {}{}",
+            b.git_protect_default_branch_only,
+            src(c.git_guard.protect_default_branch_only.is_some())
+        ),
+    ]
+    .into_iter()
+    .chain((!c.git_guard.allow_push.is_empty()).then(|| {
+        format!(
+            "    allow_push            = [{} rules]",
+            c.git_guard.allow_push.len()
+        )
+    }))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
 
     #[test]
     fn get_config_value_returns_default_when_no_file() {
@@ -581,5 +601,143 @@ mod tests {
         assert!(from_file);
         assert!(val.contains("internal.example.com"), "got: {val}");
         assert!(val.contains("corp.example"), "got: {val}");
+    }
+
+    /// `config show` is the screen an operator reads to check whether their
+    /// machine is enforcing, so a wrong answer here is the worst kind. #410:
+    /// both guards have defaulted ON since #335 while this screen printed
+    /// `false`, because it carried its own `unwrap_or(false)` instead of the
+    /// preset baseline the resolver uses. Pin every guard line against the
+    /// real resolver, under every preset, so the two cannot drift again.
+    #[test]
+    fn guard_lines_match_the_resolved_policy() {
+        for toml in [
+            "",
+            "[sandbox]\npreset = \"standard\"\n",
+            "[sandbox]\npreset = \"strict\"\n",
+            "[sandbox]\npreset = \"permissive\"\n",
+            "[sandbox]\npreset = \"full-trust\"\n",
+            // Deprecated spellings: the registry folds them into `enabled`.
+            "[sandbox]\ngh_proxy = true\ngit_push_prevention = true\n",
+            // Explicit values must still win over the baseline.
+            "[gh_guard]\nenabled = false\nmode = \"warn\"\n\n[git_guard]\nenabled = false\nmode = \"audit\"\n",
+        ] {
+            let c = Config::parse(toml).unwrap();
+            let r = c.merge(CliFlags::default()).unwrap();
+            let lines = guard_lines(&c);
+            let gh = section(&lines, "[gh_guard]");
+            let git = section(&lines, "[git_guard]");
+
+            for (key, shown, resolved) in [
+                (
+                    "gh_guard.enabled",
+                    &gh["enabled"],
+                    r.gh_guard.enabled.to_string(),
+                ),
+                ("gh_guard.mode", &gh["mode"], r.gh_guard.mode.to_string()),
+                (
+                    "gh_guard.scope_check",
+                    &gh["scope_check"],
+                    r.gh_guard.scope_check.to_string(),
+                ),
+                (
+                    "gh_guard.block_auth_token",
+                    &gh["block_auth_token"],
+                    r.gh_guard.block_auth_token.to_string(),
+                ),
+                (
+                    "gh_guard.inject_token",
+                    &gh["inject_token"],
+                    r.gh_guard.inject_token.to_string(),
+                ),
+                (
+                    "gh_guard.unknown_command",
+                    &gh["unknown_command"],
+                    r.gh_guard.unknown_command.to_string(),
+                ),
+                (
+                    "gh_guard.allow_api_write",
+                    &gh["allow_api_write"],
+                    r.gh_guard.allow_api_write.to_string(),
+                ),
+                (
+                    "git_guard.enabled",
+                    &git["enabled"],
+                    r.git_guard.enabled.to_string(),
+                ),
+                ("git_guard.mode", &git["mode"], r.git_guard.mode.to_string()),
+                (
+                    "git_guard.prevent_push",
+                    &git["prevent_push"],
+                    r.git_guard.prevent_push.to_string(),
+                ),
+                (
+                    "git_guard.prevent_force_push",
+                    &git["prevent_force_push"],
+                    r.git_guard.prevent_force_push.to_string(),
+                ),
+                (
+                    "git_guard.protect_default_branch_only",
+                    &git["protect_default_branch_only"],
+                    r.git_guard.protect_default_branch_only.to_string(),
+                ),
+            ] {
+                assert_eq!(
+                    *shown, resolved,
+                    "{key}: `config show` says {shown}, the resolver enforces {resolved} \
+                     (config: {toml:?})"
+                );
+            }
+        }
+    }
+
+    /// The literal the #410 report named: an empty user config enforces both
+    /// guards, so the screen must say `true`, marked as coming from the default.
+    #[test]
+    fn empty_config_shows_both_guards_enabled_by_default() {
+        let lines = guard_lines(&Config::default());
+        assert!(
+            lines.contains(&"    enabled               = true (default)".to_string()),
+            "expected an enabled=true (default) line in {lines:#?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.trim_start().starts_with("enabled "))
+                .count(),
+            2,
+            "both guard sections must render an `enabled` line"
+        );
+    }
+
+    /// A deprecated spelling is a value from the file, not a default: it turns
+    /// the guard on, so the line must not be annotated `(default)`.
+    #[test]
+    fn deprecated_spellings_are_not_labelled_default() {
+        let c = Config::parse("[sandbox]\ngh_proxy = true\ngit_push_prevention = true\n").unwrap();
+        let lines = guard_lines(&c);
+        for l in lines
+            .iter()
+            .filter(|l| l.trim_start().starts_with("enabled "))
+        {
+            assert_eq!(l.trim(), "enabled               = true", "line: {l:?}");
+        }
+    }
+
+    /// `key = value` pairs of one rendered guard section, `(default)` stripped.
+    fn section(lines: &[String], header: &str) -> std::collections::HashMap<String, String> {
+        lines
+            .iter()
+            .skip_while(|l| l.trim() != header)
+            .skip(1)
+            .take_while(|l| l.contains('='))
+            .map(|l| {
+                let (k, v) = l.split_once('=').unwrap();
+                (
+                    k.trim().to_string(),
+                    v.replace("(default)", "").trim().to_string(),
+                )
+            })
+            .collect()
     }
 }
