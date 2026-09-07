@@ -11,3 +11,5 @@
 
 # Local agent worktrees/metadata — never track
 .claude/
+tc/
+target-clean/
