@@ -778,11 +778,14 @@ fn profile_allows_tty_ioctl() {
 #[test]
 fn landlock_policy_device_files_have_ioctl() {
     // Regression test: Landlock ABI v5 (kernel ≥ 6.8) enforces IoctlDev for
-    // character devices. Without IoctlDev on /dev/tty, /dev/ptmx, and /dev/pts,
-    // tcsetattr() and forkpty(3) are denied — the terminal stays in cooked/echo
-    // mode, OSC colour-query responses are echoed as visible text, and Copilot's
-    // TUI hangs. /dev/ptmx is the PTY master multiplexer; ioctl is required for
-    // TIOCGPTN and TIOCSPTLCK (used by forkpty/grantpt/unlockpt).
+    // character devices. Without IoctlDev on /dev/tty and /dev/ptmx,
+    // tcsetattr() is denied — the terminal stays in cooked/echo mode, OSC
+    // colour-query responses are echoed as visible text, and Copilot's TUI
+    // hangs. /dev/ptmx is the PTY master multiplexer; ioctl is required for
+    // TIOCGPTN and TIOCSPTLCK (used by grantpt/unlockpt).
+    //
+    // /dev/pts is deliberately NOT in this list — see the read-only assertion
+    // below (GHSA-q3p2-6x2x-8w8w).
     let policy = generate_policy(&SandboxConfig {
         project_dir: std::path::Path::new("/projects/app"),
         home_dir: std::path::Path::new("/home/test"),
@@ -822,7 +825,23 @@ fn landlock_policy_device_files_have_ioctl() {
         keychain_substitute: None,
     });
 
-    let device_paths = ["/dev/tty", "/dev/ptmx", "/dev/pts"];
+    // GHSA-q3p2-6x2x-8w8w: /dev/pts is path-beneath, so ANY right there
+    // applies to every peer terminal's slave, not just the agent's own —
+    // read captures what the user types in another window, write forges
+    // output in it, and ioctl reaches TIOCSTI on a kernel that still exposes
+    // it (pre-6.2, or dev.tty.legacy_tiocsti=1), which is keystroke
+    // injection. No rule at all: the agent's terminal is an inherited fd and
+    // /dev/tty covers the rest.
+    assert!(
+        !policy
+            .fs_rules
+            .iter()
+            .any(|r| r.path.starts_with("/dev/pts")),
+        "/dev/pts must have no Landlock rule — any right there reaches every \
+         other terminal the user has open"
+    );
+
+    let device_paths = ["/dev/tty", "/dev/ptmx"];
     for dev in &device_paths {
         let rule = policy
             .fs_rules
@@ -959,15 +978,86 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
                 },
                 &[],
             );
-            for dir in agent_dirs.iter().filter(|d| d.write) {
-                for sub in agent.host_persistence_denies() {
-                    let path = dir.path.join(sub).display().to_string();
-                    let line = format!("(deny file-write* (subpath \"{path}\"))");
-                    assert!(p.contains(&line), "{agent:?} profile missing: {line}");
-                }
+            // Asserted through `host_persistence_paths` rather than re-derived
+            // from the writable grants: that function decides which grants the
+            // denies are joined onto (the top-level ones, writable or not), and
+            // re-deriving it here made the test disagree with the code the
+            // moment an agent's root grant stopped being writable.
+            for path in agent.host_persistence_paths(&agent_dirs) {
+                let line = format!("(deny file-write* (subpath \"{}\"))", path.display());
+                assert!(p.contains(&line), "{agent:?} profile missing: {line}");
             }
         }
     });
+}
+
+/// H-12: Pi's project trust store must be write-denied.
+///
+/// `~/.pi/agent/trust.json` records trust as a bare per-directory decision with
+/// no fingerprint of what was trusted, and trust is the gate on the
+/// project-local auto-load paths (`.pi/extensions`, `.pi/settings.json`
+/// `packages`). An agent that writes it pre-trusts a directory, and the planted
+/// project config then loads on the next unsandboxed `pi` with no prompt.
+#[test]
+fn pi_profile_denies_the_project_trust_store() {
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = cplt::agent::Agent::Pi.config_dirs(home);
+    let p = generate_profile(
+        &SandboxConfig {
+            agent: cplt::agent::Agent::Pi,
+            agent_dirs: &agent_dirs,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        p.contains("(deny file-write* (subpath \"/Users/test/.pi/agent/trust.json\"))"),
+        "the trust store must be denied alongside settings.json:\n{p}"
+    );
+}
+
+/// H-13/H-05: an agent's managed-binary dir must not sit inside a writable
+/// Landlock grant.
+///
+/// Landlock unions a path with every ancestor rule and has no deny form, so a
+/// `write: true` grant on `~/.pi/agent` reached the exec-only `~/.pi/agent/bin`
+/// inside it: the managed `rg`/`fd` were writable AND executable, and a
+/// contained agent that overwrote one owned the user's next unsandboxed `pi`.
+/// macOS denies the write at the tail of the profile; on Linux the grant has to
+/// be narrowed instead, which is what this asserts — while the rest of the tree
+/// stays writable, or Pi cannot record a session.
+#[test]
+fn pi_managed_binaries_are_not_inside_a_writable_linux_grant() {
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = cplt::agent::Agent::Pi.config_dirs(home);
+    let policy = generate_policy(&SandboxConfig {
+        agent: cplt::agent::Agent::Pi,
+        agent_dirs: &agent_dirs,
+        // No tool dirs: this is about the agent grants, and ~/.cache would
+        // otherwise be the writable ancestor of nothing here anyway.
+        existing_home_tool_dirs: Some(&[]),
+        ..base_profile_options()
+    });
+
+    let bin = home.join(".pi/agent/bin");
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &bin),
+        None,
+        "no rule may make ~/.pi/agent/bin writable — it is granted EXECUTE, and \
+         Landlock cannot subtract a write grant from an ancestor"
+    );
+    assert!(
+        policy
+            .fs_rules
+            .iter()
+            .any(|r| r.path == bin && r.access.execute),
+        "the managed fd/rg must still be executable"
+    );
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &home.join(".pi/agent/sessions/x.jsonl")),
+        Some(home.join(".pi/agent/sessions")),
+        "narrowing must not cost Pi its session directory"
+    );
 }
 
 /// A user `allow.write` must NOT reopen the host-persistence denies.
@@ -4809,7 +4899,7 @@ fn profile_gpg_signing_deny_path_wins() {
         "explicit --deny-path ~/.gnupg should override --allow-gpg-signing"
     );
     assert!(
-        p.contains("--deny-path overlaps"),
+        p.contains("GPG signing re-allow withheld"),
         "profile should note that deny-path overrode GPG signing"
     );
 }
@@ -5581,6 +5671,65 @@ fn config_parses_allow_tmp_exec() {
 // Config validation (unknown key detection)
 // ============================================================
 
+/// The [audit] section was settable, displayed, and read by nothing (#309).
+/// `cplt config set audit.enabled true` must now refuse at the point of
+/// writing rather than store a line no code will ever consult, and the refusal
+/// must not read as a typo — it names why the section is gone and what works.
+#[test]
+fn audit_section_keys_are_refused_by_config_set() {
+    use cplt::config::lookup_key;
+    for key in [
+        "audit.enabled",
+        "audit.destination",
+        "audit.level",
+        "audit.format",
+    ] {
+        let err = lookup_key(key)
+            .err()
+            .unwrap_or_else(|| panic!("{key} must not be settable: nothing consumes it"))
+            .to_string();
+        assert!(
+            err.contains("[audit] section was removed") && err.contains("#309"),
+            "refusal must explain the removal, got: {err}"
+        );
+        assert!(
+            err.contains("sandbox.audit"),
+            "refusal must name the live post-session report key: {err}"
+        );
+    }
+}
+
+/// `sandbox.audit` is a different, working key — the post-session
+/// project-change report. Removing the [audit] section must not touch it.
+#[test]
+fn sandbox_audit_stays_a_real_key() {
+    use cplt::config::lookup_key;
+    assert!(
+        lookup_key("sandbox.audit").is_ok(),
+        "sandbox.audit is consumed by audit::run and must remain settable"
+    );
+}
+
+/// An `[audit]` block already on disk must still LOAD (unknown keys are
+/// ignored at runtime), and `config validate` must explain the removal rather
+/// than emit a bare "unknown key".
+#[test]
+fn stale_audit_section_validates_with_the_removal_message() {
+    use cplt::config::{Config, DiagnosticLevel, validate_config};
+    let toml = "[audit]\nenabled = true\ndestination = \"stderr\"\n";
+    assert!(
+        Config::parse(toml).is_ok(),
+        "a config file with a stale [audit] section must still load"
+    );
+    let diagnostics = validate_config(toml);
+    assert!(
+        diagnostics.iter().any(|d| d.level == DiagnosticLevel::Error
+            && d.message.contains("[audit] section was removed")),
+        "validate must explain the removal: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn validate_catches_typo_in_sandbox_key() {
     use cplt::config::{DiagnosticLevel, validate_config};
@@ -5735,7 +5884,7 @@ fn profile_docker_enabled_allows_config_and_sockets() {
 }
 
 #[test]
-fn profile_docker_skipped_when_deny_path_overlaps() {
+fn profile_docker_withholds_the_overlapping_reallow() {
     let p = generate_profile(
         &SandboxConfig {
             extra_deny: &[std::path::PathBuf::from("/Users/test/.docker")],
@@ -5744,14 +5893,19 @@ fn profile_docker_skipped_when_deny_path_overlaps() {
         },
         &[],
     );
-    // Docker allows should be skipped — deny-path wins
+    // The overlapping re-allow is withheld — deny-path wins for ~/.docker...
     assert!(
-        p.contains("Docker access skipped"),
-        "Profile must skip docker rules when --deny-path overlaps"
+        p.contains("Docker re-allow withheld"),
+        "Profile must withhold the overlapping docker re-allow"
     );
     assert!(
         !p.contains(r#"(allow file-read* (subpath "/Users/test/.docker"))"#),
         "Profile must not allow .docker when deny-path overlaps"
+    );
+    // ...but the rest of the grant (containers, sockets) stays active.
+    assert!(
+        p.contains(r#"(allow file-read* (subpath "/Users/test/.config/containers"))"#),
+        "Profile must keep unrelated docker re-allows when only ~/.docker is denied"
     );
 }
 
@@ -7107,12 +7261,6 @@ mode = "warn"
 prevent_push = true
 prevent_force_push = true
 protect_default_branch_only = false
-
-[audit]
-enabled = false
-destination = "stderr"
-level = "blocked"
-format = "text"
 "#;
 
     // Parse the fixture so coverage is checked per-section, not by a bare
@@ -7691,7 +7839,7 @@ fn audit_reports_net_change_even_after_commit() {
         ],
     );
 
-    let report = baseline.finish(0);
+    let report = baseline.finish(0, true);
     match report {
         AuditReport::Available {
             changes,
@@ -7733,7 +7881,7 @@ fn audit_reports_new_untracked_file() {
     let baseline = Baseline::capture(dir);
     std::fs::write(dir.join("leftover.txt"), "scratch\n").unwrap();
 
-    match baseline.finish(0) {
+    match baseline.finish(0, true) {
         AuditReport::Available { changes, .. } => {
             let f = changes.iter().find(|c| c.path == "leftover.txt");
             assert!(f.is_some(), "untracked file must be reported");
@@ -7749,7 +7897,7 @@ fn audit_unavailable_for_non_git_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let baseline = Baseline::capture(tmp.path());
     assert!(matches!(
-        baseline.finish(0),
+        baseline.finish(0, true),
         AuditReport::Unavailable { .. }
     ));
 }
@@ -7777,7 +7925,7 @@ fn audit_reports_deletion_and_rename_as_delete_plus_add() {
     std::fs::remove_file(dir.join("gone.rs")).unwrap();
     git_in(dir, &["mv", "old name.rs", "new name.rs"]);
 
-    match baseline.finish(0) {
+    match baseline.finish(0, true) {
         AuditReport::Available { changes, .. } => {
             let by = |p: &str| changes.iter().find(|c| c.path == p).cloned();
 
@@ -7816,7 +7964,7 @@ fn audit_reports_untracked_in_empty_repo() {
     let baseline = Baseline::capture(dir);
     std::fs::write(dir.join("bootstrap.sh"), "#!/bin/sh\n").unwrap();
 
-    match baseline.finish(0) {
+    match baseline.finish(0, true) {
         AuditReport::Available {
             changes,
             tracked_audited,
@@ -7872,9 +8020,45 @@ fn audit_reports_incomplete_when_baseline_commit_pruned() {
     git_in(dir, &["reflog", "expire", "--expire=now", "--all"]);
     git_in(dir, &["gc", "--prune=now", "-q"]);
 
-    match baseline.finish(0) {
+    match baseline.finish(0, true) {
         AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
         other => panic!("expected Incomplete after prune, got {other:?}"),
+    }
+}
+
+/// GHSA-c47q-c3c8-7wrf: `exec` returns when the DIRECT child is reaped, which
+/// says nothing about the descendants it disowned. Sampling git at that moment
+/// and printing "no project file changes" is an affirmative clean bill of
+/// health for a session that may still be writing — the one thing this audit
+/// exists not to do. An unsettled process tree turns an empty sample into the
+/// honest `Incomplete`, never a clean `Available`.
+#[test]
+fn audit_never_reports_clean_when_the_process_tree_did_not_settle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("app.rs"), "fn main() {}\n").unwrap();
+    git_in(dir, &["add", "."]);
+    git_in(
+        dir,
+        &["-c", "commit.gpgSign=false", "commit", "-q", "-m", "init"],
+    );
+
+    // Premise: with the tree settled, an unchanged repo is genuinely clean —
+    // this is the report the attack turned into a lie.
+    match Baseline::capture(dir).finish(0, true) {
+        AuditReport::Available { changes, .. } => assert!(
+            changes.is_empty(),
+            "test premise: nothing changed, got {changes:?}"
+        ),
+        other => panic!("expected a clean Available report, got {other:?}"),
+    }
+
+    // Same repo, same emptiness — but nothing established that the session had
+    // stopped writing, so finding nothing is an absence of information.
+    match Baseline::capture(dir).finish(0, false) {
+        AuditReport::Incomplete { exit_code, .. } => assert_eq!(exit_code, 0),
+        other => panic!("an unsettled session must never read as clean, got {other:?}"),
     }
 }
 
@@ -8026,7 +8210,8 @@ fn repo_config_state_not_a_git_repo() {
 
 #[test]
 fn socket_masks_cover_the_escape_sockets() {
-    let masks = cplt::sandbox::socket_mask_paths(1000, None, false);
+    let masks =
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, false);
     for expected in [
         "/run/user/1000/bus",          // D-Bus session bus -> systemd-run --user
         "/run/user/1000/systemd",      // systemd's private socket
@@ -8036,6 +8221,9 @@ fn socket_masks_cover_the_escape_sockets() {
         "/run/user/1000/docker.sock", // rootless docker
         "/run/user/1000/podman",      // podman.sock lives beneath
         "/run/podman",
+        // Docker Desktop for Linux's daemon (#279). Not under /run at all, so
+        // a list keyed only on the runtime dirs left it connectable.
+        "/home/user/.docker/desktop/docker.sock",
     ] {
         assert!(
             masks.iter().any(|p| p == std::path::Path::new(expected)),
@@ -8044,10 +8232,34 @@ fn socket_masks_cover_the_escape_sockets() {
     }
 }
 
+/// Docker Desktop's socket is derived from `$HOME`, not from the runtime dir
+/// or a hardcoded `/run` path (#279), so the list has to follow whatever home
+/// the sandbox was configured with.
+#[test]
+fn docker_socket_list_follows_the_home_dir() {
+    let paths = cplt::sandbox::linux_docker_socket_paths(
+        std::path::Path::new("/var/home/someone-else"),
+        1000,
+        None,
+    );
+    assert!(
+        paths.iter().any(
+            |p| p == std::path::Path::new("/var/home/someone-else/.docker/desktop/docker.sock")
+        ),
+        "the Docker Desktop socket must be built from the configured home, got {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.starts_with("/home/user")),
+        "no home path may be hardcoded, got {paths:?}"
+    );
+}
+
 #[test]
 fn allow_docker_lifts_only_the_container_masks() {
-    let with_docker = cplt::sandbox::socket_mask_paths(1000, None, true);
-    let docker_paths = cplt::sandbox::linux_docker_socket_paths(1000, None);
+    let with_docker =
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, true);
+    let docker_paths =
+        cplt::sandbox::linux_docker_socket_paths(std::path::Path::new("/home/user"), 1000, None);
 
     for p in &docker_paths {
         assert!(
@@ -8072,7 +8284,8 @@ fn allow_docker_lifts_only_the_container_masks() {
     }
     assert_eq!(
         with_docker.len() + docker_paths.len(),
-        cplt::sandbox::socket_mask_paths(1000, None, false).len(),
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, false)
+            .len(),
         "allow_docker must differ from the default set by exactly the container sockets"
     );
 }
@@ -8087,7 +8300,12 @@ fn socket_masks_follow_a_relocated_xdg_runtime_dir() {
     // passes `XDG_RUNTIME_DIR` through — stays reachable, with the launch
     // banner still counting the escape sockets as masked.
     let xdg = std::path::Path::new("/run/somewhere-else/1000");
-    let masks = cplt::sandbox::socket_mask_paths(1000, Some(xdg), false);
+    let masks = cplt::sandbox::socket_mask_paths(
+        std::path::Path::new("/home/user"),
+        1000,
+        Some(xdg),
+        false,
+    );
     for expected in [
         "/run/somewhere-else/1000/bus",
         "/run/somewhere-else/1000/systemd",
@@ -8113,8 +8331,12 @@ fn socket_masks_follow_a_relocated_xdg_runtime_dir() {
 fn relative_xdg_runtime_dir_is_ignored() {
     // Same rule as `AppDirKind::resolve`: a relative value would produce a
     // relative mask path, which resolves against the process cwd.
-    let masks =
-        cplt::sandbox::socket_mask_paths(1000, Some(std::path::Path::new("relative/dir")), false);
+    let masks = cplt::sandbox::socket_mask_paths(
+        std::path::Path::new("/home/user"),
+        1000,
+        Some(std::path::Path::new("relative/dir")),
+        false,
+    );
     assert!(
         !masks
             .iter()
@@ -8123,7 +8345,8 @@ fn relative_xdg_runtime_dir_is_ignored() {
     );
     assert_eq!(
         masks.len(),
-        cplt::sandbox::socket_mask_paths(1000, None, false).len(),
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 1000, None, false)
+            .len(),
         "a rejected value must leave the list exactly as it was"
     );
 }
@@ -8132,7 +8355,8 @@ fn relative_xdg_runtime_dir_is_ignored() {
 fn socket_masks_follow_the_uid() {
     // The runtime-dir entries are per-user; a hardcoded uid would mask nothing
     // on any host but the developer's.
-    let masks = cplt::sandbox::socket_mask_paths(4242, None, false);
+    let masks =
+        cplt::sandbox::socket_mask_paths(std::path::Path::new("/home/user"), 4242, None, false);
     assert!(
         masks
             .iter()
@@ -8341,4 +8565,225 @@ fn env_pass_env_java_tool_options_still_suppresses_proxy_injection() {
     );
     let jto = env.vars.iter().find(|(k, _)| k == "JAVA_TOOL_OPTIONS");
     assert_eq!(jto.unwrap().1, "-Xmx1g");
+}
+
+// ── #248: the agent binary in a writable tree ──────────────────
+
+/// The agent binary is spawned by the unsandboxed parent from wherever it was
+/// discovered, so a discovered path the sandbox itself makes writable is an
+/// execution primitive for the next launch. `writable_tree_over` is what the
+/// launch warning asks, and it asks the emitted `fs_rules` rather than a list
+/// of locations kept by hand.
+#[test]
+fn an_agent_binary_under_a_writable_tool_dir_is_a_finding() {
+    let policy = generate_policy(&base_profile_options());
+    let home = std::path::Path::new("/Users/test");
+    // The npx cache: `npx copilot` resolves here, and ~/.npm is granted write
+    // so ordinary installs work.
+    let bin = home.join(".npm/_npx/0e9f/node_modules/.bin/copilot");
+
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &bin),
+        Some(home.join(".npm")),
+        "a binary under a writable tool dir must name the tree containing it"
+    );
+}
+
+/// The ordinary install locations are read+execute and never write, so the
+/// warning stays silent for them — a warning that fires on the common case is
+/// one everybody learns to skip.
+#[test]
+fn an_agent_binary_in_a_read_only_bin_dir_is_not_a_finding() {
+    let policy = generate_policy(&base_profile_options());
+    let home = std::path::Path::new("/Users/test");
+
+    for bin in [
+        home.join(".cargo/bin/copilot"),
+        home.join(".local/bin/copilot"),
+        std::path::PathBuf::from("/usr/local/bin/copilot"),
+    ] {
+        assert_eq!(
+            cplt::check::writable_tree_over(&policy, home, &bin),
+            None,
+            "{} is read-only and must not warn",
+            bin.display()
+        );
+    }
+}
+
+/// The platform answer for a version-manager install, which is the case #248
+/// was filed about. mise's `installs/` sits inside a data dir that has to stay
+/// writable, so #286 re-denied it — a deny SBPL enforces and Landlock cannot
+/// express. So the same path is safe on macOS and is the residual on Linux.
+#[test]
+fn a_mise_installed_agent_is_a_finding_only_where_the_deny_cannot_hold() {
+    let policy = generate_policy(&base_profile_options());
+    let home = std::path::Path::new("/Users/test");
+    let bin = home.join(".local/share/mise/installs/npm-copilot/1.2.3/bin/copilot");
+
+    let found = cplt::check::writable_tree_over(&policy, home, &bin);
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            found, None,
+            "emit_path_bin_denies takes write back on macOS"
+        );
+    } else {
+        assert!(
+            found.is_some(),
+            "Landlock cannot subtract the deny, so the tree stays writable"
+        );
+    }
+}
+
+/// The warning tells the user where to move the binary, and that advice is a
+/// claim about the resolved policy — not about the path. An `allow.write` over
+/// `~/.local/bin` makes it writable for the run, and the suggestion must drop
+/// it rather than send the user somewhere the same predicate would flag.
+#[test]
+fn install_advice_drops_a_location_the_run_makes_writable() {
+    let home = std::path::Path::new("/Users/test");
+    let name = std::ffi::OsStr::new("copilot");
+
+    let plain = generate_policy(&base_profile_options());
+    assert!(
+        cplt::check::read_only_install_dirs(&plain, home, name).contains(&home.join(".local/bin")),
+        "~/.local/bin is read-only by default and must be offered"
+    );
+
+    let granted = home.join(".local/bin");
+    let mut opts = base_profile_options();
+    let writes = [granted.clone()];
+    opts.extra_write = &writes;
+    let policy = generate_policy(&opts);
+
+    assert!(
+        cplt::check::writable_tree_over(&policy, home, &granted.join("copilot")).is_some(),
+        "the grant makes it writable, so the warning would fire there"
+    );
+    assert!(
+        !cplt::check::read_only_install_dirs(&policy, home, name).contains(&granted),
+        "advice must not name a location this run makes writable"
+    );
+}
+
+// ============================================================
+// #390: a shim in a granted bin dir whose target is ungranted
+// ============================================================
+
+/// volta and nodenv put the shim and the real binary in different directories,
+/// and Landlock checks the target. Both stores live under one home root, so one
+/// `HomeToolDir` each covers shim and target — the same shape as `.nvm`.
+#[test]
+fn volta_and_nodenv_version_stores_are_exec_granted() {
+    use cplt::sandbox::HOME_TOOL_DIRS;
+
+    for root in [".volta", ".nodenv"] {
+        let entry = HOME_TOOL_DIRS
+            .iter()
+            .find(|d| d.path == root)
+            .unwrap_or_else(|| panic!("HOME_TOOL_DIRS missing {root} (#390)"));
+        assert!(entry.process_exec, "{root} must grant process_exec");
+        assert!(
+            !entry.write,
+            "{root} must stay read-only: a writable version store lets an agent \
+             trojan a binary that runs on the next launch"
+        );
+    }
+
+    let policy = generate_policy(&base_profile_options());
+    let exec_granted = |p: &std::path::Path| {
+        policy
+            .fs_rules
+            .iter()
+            .any(|r| r.access.execute && p.starts_with(&r.path))
+    };
+    // The paths the shims actually resolve into, not just the roots.
+    for target in [
+        "/Users/test/.volta/tools/image/node/22.23.2/bin/node",
+        "/Users/test/.nodenv/versions/22.23.2/bin/node",
+    ] {
+        assert!(
+            exec_granted(std::path::Path::new(target)),
+            "{target} must be exec-granted, or the shim fails with a silent exit 126"
+        );
+    }
+}
+
+#[test]
+fn shim_pointing_outside_every_exec_grant_is_reported() {
+    use cplt::check::shim_target_without_exec;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let bin = root.join("granted/bin");
+    let store = root.join("elsewhere/node-v22/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("node"), "#!/bin/sh\n").unwrap();
+    std::fs::write(bin.join("plain"), "#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(store.join("node"), bin.join("node")).unwrap();
+
+    let policy_with = |exec: &[PathBuf]| {
+        generate_policy(&SandboxConfig {
+            project_dir: &root.join("project"),
+            home_dir: &root.join("home"),
+            extra_exec: exec,
+            ..base_profile_options()
+        })
+    };
+
+    // The reported case: shim granted, target not.
+    let policy = policy_with(&[root.join("granted")]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("node")),
+        Some(store.join("node")),
+        "a shim resolving outside every exec grant must be named, not left as exit 126"
+    );
+
+    // Granting the real store silences it — the advice the warning gives works.
+    let policy = policy_with(&[root.join("granted"), root.join("elsewhere")]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("node")),
+        None,
+        "--allow-exec on the resolved store must clear the warning"
+    );
+
+    // A real binary in the granted dir is not a shim.
+    let policy = policy_with(&[root.join("granted")]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("plain")),
+        None,
+        "a non-symlink must never be reported as a shim"
+    );
+
+    // A plain binary reached through a SYMLINKED PARENT, with the path itself
+    // inside the exec grant so the ordinary ungranted-shim branch cannot be what
+    // returns None. `canonicalize` resolves parent components too, so comparing
+    // it against the input reports this as a shim resolving into the ungranted
+    // store — a warning about a symlink the user does not have. Only the
+    // symlink_metadata check on the path itself rejects it.
+    let linked_parent = root.join("granted/link");
+    std::os::unix::fs::symlink(&store, &linked_parent).unwrap();
+    let policy = policy_with(&[root.join("granted")]);
+    assert!(
+        std::fs::symlink_metadata(linked_parent.join("node"))
+            .unwrap()
+            .file_type()
+            .is_file(),
+        "fixture: the binary itself must not be a symlink, or this tests nothing"
+    );
+    assert_eq!(
+        shim_target_without_exec(&policy, &linked_parent.join("node")),
+        None,
+        "a plain binary under a symlinked parent must not be reported as a shim"
+    );
+
+    // Nothing granted at all: the exec fails for the ordinary reason, and
+    // blaming the symlink would misdiagnose it.
+    let policy = policy_with(&[]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("node")),
+        None,
+        "an ungranted shim is not a shim-target problem"
+    );
 }

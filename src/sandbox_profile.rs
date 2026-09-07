@@ -28,6 +28,20 @@ use super::policy::{
     playwright_runtime_intent, validate_playwright_socket_dir, validate_sbpl_path,
 };
 
+/// Device nodes a sandboxed process may open for writing, by exact path.
+///
+/// None of these can name another process's terminal. Anything not listed here
+/// (most importantly `/dev/ttysNNN`, the PTY slaves of the user's other
+/// terminal windows) is left to `(deny default)`. See `emit_process_rules`.
+const DEV_WRITE_LITERALS: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+    "/dev/ptmx",
+];
+
 /// Generate a complete SBPL sandbox profile from the given options.
 ///
 /// Sections are emitted in a fixed order — SBPL uses last-match-wins semantics,
@@ -251,9 +265,62 @@ fn emit_process_rules(sb: &mut String) {
     sbpl!(sb);
 
     // Device access — Node.js needs /dev/tty, /dev/null, /dev/urandom etc.
+    //
+    // GHSA-q3p2-6x2x-8w8w: writes used to be `(subpath "/dev")`, which covered
+    // every `/dev/ttysNNN` — the PTY slave of every other terminal window the
+    // user has open. A write to a slave lands directly in that terminal's
+    // master read buffer, the same path the program's own stdout takes, so the
+    // receiving emulator renders it with nothing else in the loop: display
+    // forgery and OSC 52 clipboard writes into a session the agent was never
+    // given. Writing is not by itself keystroke injection — data written to a
+    // slave never enters that slave's input queue — but do NOT restate that as
+    // "TIOCSTI is blocked by the macOS kernel", which is what this comment used
+    // to say and is wrong. XNU permits `TIOCSTI` on the caller's OWN
+    // controlling terminal; it refuses it (EPERM) on any other tty, which is
+    // why a peer `/dev/ttysNNN` is not an injection target even when the device
+    // tree is handed back with `--allow-write /dev`. Inside a cplt session the
+    // ioctl is denied by the profile's `(deny default)`, NOT by the
+    // unconditional `(allow file-ioctl)`, which does not reach it.
+    // See SECURITY.md, "Terminal injection".
+    //
+    // Writes are now an allowlist of nodes that cannot name another terminal:
+    //   /dev/tty     always resolves to the caller's OWN controlling terminal
+    //   /dev/fd/N    only descriptors this process already holds; /dev/stdin,
+    //                /dev/stdout and /dev/stderr are symlinks into it and
+    //                Seatbelt matches on the resolved path, so they are covered
+    //   /dev/ptmx    always hands out a FRESH master, never an existing one
+    //   null/zero/random/urandom  not terminals
+    // Several of these are also granted by the imported system.sb; they are
+    // repeated here because that profile is Apple-private and may change.
+    //
+    // The agent's own terminal keeps working: cplt inherits fds 0/1/2 rather
+    // than allocating a PTY, and Seatbelt checks the path at open(), not on a
+    // write to an already-open descriptor. What this does break is a sandboxed
+    // process allocating its OWN pty (openpty/forkpty, `script`, tmux, pexpect)
+    // — the slave can only be reached by its `/dev/ttysNNN` name, which is
+    // exactly what an attacker uses. See docs/known-impacts.md for the
+    // `--allow-write /dev` break-glass and its residual risk.
     sbpl!(sb, ";; Device access (/dev/tty, /dev/null, /dev/urandom)");
     sbpl!(sb, "(allow file-read* (subpath \"/dev\"))");
-    sbpl!(sb, "(allow file-write* (subpath \"/dev\"))");
+    // Reads of a peer terminal are worse than writes: opening another window's
+    // slave and reading it consumes that terminal's input queue, so the agent
+    // captures whatever the user types there (a passphrase, a pasted token)
+    // and the bytes never reach the real reader. `/dev/tty` is a separate node
+    // that always resolves to the caller's own terminal, so it stays readable;
+    // only the numbered nodes, which name one specific terminal, are denied.
+    // Serial devices are `/dev/tty.usbserial…` and do not match this prefix.
+    //
+    // Emitted here rather than in the trailing deny block on purpose: a later
+    // `allow.read = ["/dev"]` must be able to override it, because openpty()
+    // opens the new slave O_RDWR and so needs read as well as write. Both
+    // halves of the PTY break-glass therefore work the same way. Nothing else
+    // cplt emits grants read on /dev, which `dev_ttys_read_deny_survives_user_allows`
+    // pins.
+    sbpl!(sb, "(deny file-read* (regex #\"^/dev/ttys\"))");
+    for dev in DEV_WRITE_LITERALS {
+        sbpl!(sb, "(allow file-write* (literal \"{dev}\"))");
+    }
+    sbpl!(sb, "(allow file-write* (subpath \"/dev/fd\"))");
     sbpl!(sb);
 }
 
@@ -1786,6 +1853,41 @@ fn emit_denied_dotfile_overrides(
     sbpl!(sb);
 }
 
+/// The first explicit `--deny-path` that overlaps `root` in any direction:
+/// `root` itself, a path *beneath* `root`, or an *ancestor* of `root`.
+///
+/// `Path::starts_with` compares whole path components, so `~/.dockerfoo` does
+/// not overlap `~/.docker`, while `--deny-path /` (an ancestor of everything)
+/// overlaps every root — both of which a string-prefix test would get wrong.
+///
+/// The opt-in grants (`--allow-gpg-signing`, `--allow-docker`) use this to
+/// withhold a re-allow the user denied. The ancestor direction is the H-06
+/// fix: `--allow-docker` re-allows `~/.config/containers` (which holds registry
+/// `auth.json`), and a `--deny-path ~/.config` is an ancestor of it, which SBPL
+/// last-match-wins would otherwise silently reopen for read.
+fn overlapping_deny<'a>(extra_deny: &'a [PathBuf], root: &Path) -> Option<&'a PathBuf> {
+    extra_deny.iter().find(|deny| {
+        let deny = deny.as_path();
+        deny.starts_with(root) || root.starts_with(deny)
+    })
+}
+
+/// Withhold one opt-in re-allow because an explicit `--deny-path` overlaps it.
+///
+/// Emits an SBPL breadcrumb and warns the user: `main.rs` reports the grant as
+/// active, so without this the user has no signal that their own `--deny-path`
+/// just narrowed it.
+fn withhold_reallow(sb: &mut String, grant: &str, reallow: &str, deny: &Path) {
+    let deny = deny.display();
+    crate::ui::warn(&format!(
+        "{grant}: --deny-path {deny} overlaps {reallow}; leaving it denied, not re-allowing it"
+    ));
+    sbpl!(
+        sb,
+        ";; {grant} re-allow withheld: --deny-path {deny} overlaps {reallow}"
+    );
+}
+
 /// Allow GPG commit signing when `--allow-gpg-signing` is set.
 ///
 /// Emitted AFTER `emit_deny_rules` (which denies all of `~/.gnupg`).
@@ -1805,18 +1907,13 @@ fn emit_gpg_signing_rules(
     if !allow_gpg_signing {
         return;
     }
-    // Explicit --deny-path wins: if the user denied anything under ~/.gnupg,
-    // skip all GPG allows so the deny is not overridden.
-    let gnupg_dir = format!("{home}/.gnupg");
-    for deny in extra_deny {
-        let d = deny.to_string_lossy();
-        if d == gnupg_dir || d.starts_with(&format!("{gnupg_dir}/")) {
-            sbpl!(
-                sb,
-                ";; GPG signing skipped: --deny-path overlaps with ~/.gnupg"
-            );
-            return;
-        }
+    // Explicit --deny-path wins: if the user denied ~/.gnupg, anything under
+    // it, or an ancestor of it, withhold all GPG allows (they all live under
+    // ~/.gnupg) so the deny is not overridden.
+    let gnupg_dir = PathBuf::from(format!("{home}/.gnupg"));
+    if let Some(deny) = overlapping_deny(extra_deny, &gnupg_dir) {
+        withhold_reallow(sb, "GPG signing", "~/.gnupg", deny);
+        return;
     }
     sbpl!(sb, ";; GPG signing (--allow-gpg-signing)");
     // Allow read-only access to public keyring and config
@@ -1920,61 +2017,46 @@ fn emit_socket_rules(sb: &mut String, allow_socket: &[PathBuf], extra_deny: &[Pa
 /// SBPL uses last-match-wins, so these targeted allows override the deny.
 /// Sensitive files under ~/.docker (trust/, TLS private keys) remain denied.
 ///
-/// If any `extra_deny` path overlaps with `~/.docker` or known socket paths,
-/// Docker rules are skipped entirely — explicit user denies always win.
+/// Explicit user denies always win, per re-allow rather than per grant: an
+/// `extra_deny` overlapping `~/.docker`, `~/.config/containers`, or one socket
+/// withholds only that re-allow and leaves the rest of Docker active. (GPG is
+/// whole-grant by contrast, because all of its re-allows live under `~/.gnupg`.)
 fn emit_docker_rules(sb: &mut String, home: &str, allow_docker: bool, extra_deny: &[PathBuf]) {
     if !allow_docker {
         return;
     }
 
-    // Explicit --deny-path wins: if the user denied ~/.docker or any socket path, skip all.
-    let docker_dir = format!("{home}/.docker");
-    for deny in extra_deny {
-        let d = deny.to_string_lossy();
-        if d == docker_dir || d.starts_with(&format!("{docker_dir}/")) {
-            sbpl!(
-                sb,
-                ";; Docker access skipped: --deny-path overlaps with ~/.docker"
-            );
-            return;
-        }
-        // Check socket paths
-        for sock in DOCKER_SOCKET_PATHS {
-            let full = if sock.starts_with('/') {
-                sock.to_string()
-            } else {
-                format!("{home}/{sock}")
-            };
-            if *d == full {
-                sbpl!(
-                    sb,
-                    ";; Docker access skipped: --deny-path overlaps with socket {sock}"
-                );
-                return;
-            }
-        }
-    }
-
     sbpl!(sb, ";; Docker/Podman access (--allow-docker)");
 
-    // Read-only access to ~/.docker for Docker CLI config and TLS certs.
-    sbpl!(sb, "(allow file-read* (subpath \"{home}/.docker\"))");
-
-    // Re-deny sensitive subdirectories: trust delegation keys, signing keys.
-    sbpl!(
-        sb,
-        "(deny file-read* (subpath \"{home}/.docker/trust/private\"))"
-    );
-
-    // No write access to Docker config.
-    sbpl!(sb, "(deny file-write* (subpath \"{home}/.docker\"))");
+    // Each re-allow is independent, so withhold ONLY the one an explicit
+    // --deny-path overlaps (in any direction, incl. ancestor — H-06) and keep
+    // the rest. A deny on a single unused socket must not disable all of Docker.
+    let docker_dir = PathBuf::from(format!("{home}/.docker"));
+    if let Some(deny) = overlapping_deny(extra_deny, &docker_dir) {
+        withhold_reallow(sb, "Docker", "~/.docker", deny);
+    } else {
+        // Read-only access to ~/.docker for Docker CLI config and TLS certs.
+        sbpl!(sb, "(allow file-read* (subpath \"{home}/.docker\"))");
+        // Re-deny sensitive subdirectories: trust delegation keys, signing keys.
+        sbpl!(
+            sb,
+            "(deny file-read* (subpath \"{home}/.docker/trust/private\"))"
+        );
+        // No write access to Docker config.
+        sbpl!(sb, "(deny file-write* (subpath \"{home}/.docker\"))");
+    }
 
     // Read-only access to ~/.config/containers for Podman CLI config
     // (registries.conf, containers.conf, auth.json read by podman/buildah).
-    sbpl!(
-        sb,
-        "(allow file-read* (subpath \"{home}/.config/containers\"))"
-    );
+    let containers_dir = PathBuf::from(format!("{home}/.config/containers"));
+    if let Some(deny) = overlapping_deny(extra_deny, &containers_dir) {
+        withhold_reallow(sb, "Docker", "~/.config/containers", deny);
+    } else {
+        sbpl!(
+            sb,
+            "(allow file-read* (subpath \"{home}/.config/containers\"))"
+        );
+    }
 
     // Allow Docker/Podman daemon socket connections.
     // Each socket needs file-read* (inode lookup) + network-outbound (connect).
@@ -1984,6 +2066,10 @@ fn emit_docker_rules(sb: &mut String, home: &str, allow_docker: bool, extra_deny
         } else {
             format!("{home}/{sock}")
         };
+        if let Some(deny) = overlapping_deny(extra_deny, Path::new(&full)) {
+            withhold_reallow(sb, "Docker", &full, deny);
+            continue;
+        }
         sbpl!(sb, "(allow file-read* (literal \"{full}\"))");
         sbpl!(sb, "(allow network-outbound (literal \"{full}\"))");
     }
@@ -2292,6 +2378,94 @@ mod tests {
         }
     }
 
+    /// H-06: an explicit `--deny-path` on an *ancestor* of a path
+    /// `--allow-docker` re-allows (`~/.config` over `~/.config/containers`,
+    /// which holds registry `auth.json`) must not be silently reopened — only
+    /// that one re-allow is withheld, the rest of the grant stays active.
+    #[test]
+    fn profile_docker_withholds_reallow_when_deny_path_is_an_ancestor_of_containers() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let deny = [PathBuf::from("/Users/test/.config")];
+        let mut opts = test_options(project, home);
+        opts.allow_docker = true;
+        opts.extra_deny = &deny;
+        let p = generate_profile(&opts, &[]);
+
+        assert!(
+            !p.contains(r#"(allow file-read* (subpath "/Users/test/.config/containers"))"#),
+            "the ~/.config/containers re-allow must not survive an ancestor --deny-path:\n{p}"
+        );
+        assert!(
+            p.contains(r#"(deny file-read* (subpath "/Users/test/.config"))"#),
+            "the explicit --deny-path must still be emitted:\n{p}"
+        );
+        // The rest of Docker stays active — the deny does not touch ~/.docker.
+        assert!(
+            p.contains(r#"(allow file-read* (subpath "/Users/test/.docker"))"#),
+            "an unrelated re-allow must survive a deny on a sibling path:\n{p}"
+        );
+    }
+
+    /// A `--deny-path` overlapping ONE docker socket withholds only that
+    /// socket's re-allow; every other socket and re-allow stays intact. Proves
+    /// per-root withholding rather than a whole-grant skip.
+    #[test]
+    fn profile_docker_withholds_only_the_overlapping_socket() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        // Ancestor of the OrbStack socket only.
+        let deny = [PathBuf::from("/Users/test/.orbstack")];
+        let mut opts = test_options(project, home);
+        opts.allow_docker = true;
+        opts.extra_deny = &deny;
+        let p = generate_profile(&opts, &[]);
+
+        assert!(
+            !p.contains(
+                r#"(allow network-outbound (literal "/Users/test/.orbstack/run/docker.sock"))"#
+            ),
+            "the denied OrbStack socket must be withheld:\n{p}"
+        );
+        // Other sockets and re-allows survive.
+        assert!(
+            p.contains(
+                r#"(allow network-outbound (literal "/Users/test/.colima/default/docker.sock"))"#
+            ),
+            "an unrelated socket must survive:\n{p}"
+        );
+        assert!(
+            p.contains(r#"(allow file-read* (subpath "/Users/test/.config/containers"))"#),
+            "the containers re-allow must survive a socket-only deny:\n{p}"
+        );
+        assert!(
+            p.contains(r#"(allow file-read* (subpath "/Users/test/.docker"))"#),
+            "the ~/.docker re-allow must survive a socket-only deny:\n{p}"
+        );
+    }
+
+    /// H-06, gpg half: a `--deny-path` on an ancestor of `~/.gnupg` (here
+    /// `$HOME`) withholds the GPG re-allows instead of reopening them.
+    #[test]
+    fn profile_gpg_withheld_when_deny_path_is_an_ancestor_of_gnupg() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let deny = [PathBuf::from("/Users/test")];
+        let mut opts = test_options(project, home);
+        opts.allow_gpg_signing = true;
+        opts.extra_deny = &deny;
+        let p = generate_profile(&opts, &[]);
+
+        assert!(
+            !p.contains(";; GPG signing (--allow-gpg-signing)"),
+            "the GPG re-allow block must not survive an ancestor --deny-path:\n{p}"
+        );
+        assert!(
+            !p.contains(r#"(allow file-read* (literal "/Users/test/.gnupg/"#),
+            "no GPG re-allow may survive an ancestor --deny-path:\n{p}"
+        );
+    }
+
     fn test_options<'a>(
         project_dir: &'a std::path::Path,
         home_dir: &'a std::path::Path,
@@ -2517,6 +2691,142 @@ mod tests {
         let p = generate_profile(&opts, &[]);
 
         assert!(p.contains("(allow network-outbound (remote ip \"*:443\"))"));
+    }
+
+    #[test]
+    fn dev_write_is_an_allowlist_not_the_whole_tree() {
+        // GHSA-q3p2-6x2x-8w8w: `(allow file-write* (subpath "/dev"))` covered
+        // /dev/ttysNNN — the PTY slave of every other terminal window the same
+        // user has open. Writing one lands bytes in that terminal's master read
+        // buffer, so the emulator renders them: display forgery and OSC 52
+        // clipboard writes. Reads stay broad; only the write side is narrowed.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home), &[]);
+
+        assert!(
+            !p.contains(r#"(allow file-write* (subpath "/dev"))"#),
+            "blanket /dev write is back — every peer terminal is writable again"
+        );
+        assert!(
+            p.contains(r#"(allow file-read* (subpath "/dev"))"#),
+            "device reads are still needed (/dev/urandom, terminfo probes)"
+        );
+        // Spelled out rather than looped over DEV_WRITE_LITERALS: iterating the
+        // production list would make this assertion vacuous the moment an entry
+        // is deleted, which is the failure it exists to catch.
+        for dev in [
+            "/dev/null",
+            "/dev/zero",
+            "/dev/random",
+            "/dev/urandom",
+            "/dev/tty",
+            "/dev/ptmx",
+        ] {
+            assert!(
+                p.contains(&format!(r#"(allow file-write* (literal "{dev}"))"#)),
+                "{dev} must stay writable — a session that cannot write it fails confusingly"
+            );
+        }
+        assert!(
+            p.contains(r#"(allow file-write* (subpath "/dev/fd"))"#),
+            "/dev/fd covers /dev/stdin, /dev/stdout and /dev/stderr (symlinks \
+             into it, and Seatbelt matches the resolved path)"
+        );
+        // No *allow* may name a specific terminal: that is the whole bug.
+        // (A deny may — see `dev_ttys_reads_are_denied`.)
+        for line in p.lines().filter(|l| l.contains("/dev/ttys")) {
+            assert!(
+                line.starts_with("(deny "),
+                "only a deny may name a /dev/ttysNNN node, got: {line}"
+            );
+        }
+        assert!(
+            !DEV_WRITE_LITERALS.contains(&"/dev/console"),
+            "/dev/console is the system console, not this process's terminal"
+        );
+    }
+
+    /// The read half of GHSA-q3p2-6x2x-8w8w, and the worse half. Opening a
+    /// peer terminal's slave for reading *consumes* its input queue: the agent
+    /// captures what the user types in that window and the real reader never
+    /// sees those bytes.
+    #[test]
+    fn dev_ttys_reads_are_denied() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let p = generate_profile(&test_options(project, home), &[]);
+
+        let allow = p
+            .find(r#"(allow file-read* (subpath "/dev"))"#)
+            .expect("device reads are still needed (/dev/urandom, terminfo)");
+        let deny = p
+            .find(r#"(deny file-read* (regex #"^/dev/ttys"))"#)
+            .expect("peer terminal reads must be denied — this is keystroke capture");
+        // SBPL is last-match-wins: before the allow, the deny would do nothing.
+        assert!(
+            deny > allow,
+            "the /dev/ttys read deny must come AFTER the blanket /dev read allow"
+        );
+        // /dev/tty is a different node and always resolves to the caller's own
+        // controlling terminal, so it must stay readable.
+        assert!(
+            !p.contains(r#"(deny file-read* (literal "/dev/tty"))"#),
+            "/dev/tty is the caller's own terminal — denying it breaks every TUI"
+        );
+    }
+
+    #[test]
+    fn dev_ttys_read_deny_survives_user_allows() {
+        // The deny sits in the device block rather than the trailing deny
+        // block, so ordering has to be checked against what comes after it.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let repos = vec![std::path::PathBuf::from("/Users/test/Repos")];
+
+        let mut opts = test_options(project, home);
+        opts.extra_read = &repos;
+        opts.extra_write = &repos;
+        let p = generate_profile(&opts, &[]);
+
+        let deny = p
+            .find(r#"(deny file-read* (regex #"^/dev/ttys"))"#)
+            .expect("deny must be emitted");
+        let after = &p[deny..];
+        assert!(
+            !after.contains(r#"(allow file-read* (subpath "/dev"))"#),
+            "a rule after the deny re-opens every peer terminal for reading"
+        );
+        assert!(
+            !after.contains(r#"(allow file-read* (subpath "/"))"#),
+            "a root-level read allow after the deny would re-open it too"
+        );
+    }
+
+    #[test]
+    fn granting_dev_reopens_the_terminal_devices_on_purpose() {
+        // Documented break-glass: `--allow-write /dev` (which emits a read
+        // allow as well) restores PTY allocation, because openpty() opens the
+        // new slave O_RDWR. That is why the deny is overridable at all. If
+        // this ever stops holding, docs/known-impacts.md is lying.
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let dev = vec![std::path::PathBuf::from("/dev")];
+
+        let mut opts = test_options(project, home);
+        opts.extra_write = &dev;
+        let p = generate_profile(&opts, &[]);
+
+        let deny = p
+            .find(r#"(deny file-read* (regex #"^/dev/ttys"))"#)
+            .expect("deny must be emitted");
+        let after = &p[deny..];
+        assert!(
+            after.contains(r#"(allow file-read* (subpath "/dev"))"#)
+                && after.contains(r#"(allow file-write* (subpath "/dev"))"#),
+            "--allow-write /dev must restore both halves, or the break-glass \
+             documented in known-impacts.md does not work"
+        );
     }
 
     #[test]
@@ -2913,6 +3223,107 @@ mod tests {
             !p.contains("(deny file-write* (subpath \"/projects/app/.github\"))"),
             "only .github/hooks is denied, not the whole tree"
         );
+    }
+
+    /// The four `(rel, is_tree)` groups H-11 protects: OpenCode's plugin/tool
+    /// subdirs (subtrees) and root configs (files), Claude's hook carriers and
+    /// skills-dir plugin manifest, Pi's extension dir and settings file. Kept as
+    /// one list so a table addition shows up as a diff on this test too.
+    const H11_PATHS: &[(&str, bool)] = &[
+        (".opencode/plugins", true),
+        (".opencode/plugin", true),
+        (".opencode/tools", true),
+        (".opencode/tool", true),
+        ("opencode.json", false),
+        ("opencode.jsonc", false),
+        (".claude/settings.json", false),
+        (".claude/settings.local.json", false),
+        (".claude-plugin", true),
+        (".mcp.json", false),
+        (".pi/extensions", true),
+        (".pi/settings.json", false),
+    ];
+
+    /// H-11: every path a supported agent auto-executes from the project
+    /// directory is write-denied for every writable root, subtree or file as the
+    /// vector requires, with the last-match-wins ordering behind every allow.
+    #[test]
+    fn h11_agent_persistence_paths_denied_for_every_writable_root() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        let last_allow = p
+            .rfind("(allow file-write*")
+            .expect("a write allow must be emitted");
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            for &(rel, is_tree) in H11_PATHS {
+                let shape = if is_tree { "subpath" } else { "literal" };
+                let rule = format!("(deny file-write* ({shape} \"{root}/{rel}\"))");
+                assert!(p.contains(&rule), "missing for {root}: {rule}");
+                // Must outlive every user allow.write, or a grant reopens it.
+                let deny = p
+                    .rfind(&format!("{root}/{rel}\"))"))
+                    .unwrap_or_else(|| panic!("{rel} deny must be emitted for {root}"));
+                assert!(
+                    last_allow < deny,
+                    "a write allow at {last_allow} comes after the {root}/{rel} deny at {deny}"
+                );
+            }
+        }
+    }
+
+    /// A repo nested under a writable root exposes the same auto-exec paths to
+    /// whichever agent next opens THAT repo, so they join the nested-repo
+    /// alternation — the #247 shape, with the `.` in each rel escaped. This is
+    /// also what reaches `.claude/skills/*/.claude-plugin` and `.opencode/opencode.json`.
+    #[test]
+    fn h11_agent_persistence_paths_denied_in_nested_repos_too() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = root.replace('.', r"\.");
+            for &(rel, _) in H11_PATHS {
+                let esc_rel = rel.replace('.', r"\.");
+                let rule = format!("(deny file-write* (regex #\"^{esc}/.+/{esc_rel}($|/)\"))");
+                assert!(
+                    p.contains(&rule),
+                    "missing nested deny for {root} {rel}: {rule}"
+                );
+            }
+        }
+    }
+
+    /// Scoped precisely: `.opencode/`, `.claude/` and `.pi/` each hold session
+    /// or generated state their agent writes every run (OpenCode's
+    /// node_modules/.gitignore, Claude's projects/history, Pi's skills/prompts),
+    /// so only the executable-bearing paths inside are denied, never the dir.
+    #[test]
+    fn h11_agent_config_dirs_not_denied_wholesale() {
+        let p = generate_profile(
+            &test_options(
+                std::path::Path::new("/projects/app"),
+                std::path::Path::new("/Users/test"),
+            ),
+            &[],
+        );
+        for dir in [".opencode", ".claude", ".pi"] {
+            assert!(
+                !p.contains(&format!(
+                    "(deny file-write* (subpath \"/projects/app/{dir}\"))"
+                )),
+                "only the auto-exec path inside {dir} is denied, not the whole tree"
+            );
+        }
     }
 
     /// #341: `.git/info/exclude` is a local, uncommitted gitignore. Writing it

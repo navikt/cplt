@@ -443,6 +443,25 @@ impl Config {
             allow_api_write: bools.gh_allow_api_write,
         };
 
+        // An `allow_push` rule that names neither a remote nor any branch
+        // constrains nothing: `matches_allow_push_rule` would return true for
+        // every non-force push, silently defeating `prevent_push`. That is
+        // never what the operator meant — most often it is a typo (`remto =`,
+        // `brnach =`) whose misspelled key was dropped as unknown, leaving the
+        // rule all-default. Refuse it at load time rather than let it grant
+        // everything. (H-10; see the "No silent grants" doctrine in AGENTS.md.)
+        for (i, r) in self.git_guard.allow_push.iter().enumerate() {
+            if r.remote.is_none() && r.branches.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "git_guard.allow_push rule #{} constrains nothing (no `remote`, no `branches`) \
+                     and would allow every non-force push, defeating prevent_push. \
+                     Give it a `remote` and/or `branches`, or remove it. \
+                     A dropped field is usually a misspelled key — check for typos.",
+                    i + 1
+                )));
+            }
+        }
+
         // git-guard. `git_guard.enabled` folds in the deprecated
         // `sandbox.git_push_prevention` spelling at the config layer.
         let git_guard = GitGuardPolicy {
@@ -583,38 +602,105 @@ fn grants_over_trusted_paths(
 ///
 /// Built here rather than at the call site so the wording — including the one
 /// thing a format string gets wrong every time, pluralisation — is testable.
-pub fn exec_tool_dir_warning(granted: &Path, dirs: &[String]) -> String {
+pub fn exec_tool_dir_warning(
+    granted: &Path,
+    dirs: &[String],
+    home: &Path,
+    agent_dirs: &[crate::agent::AgentDir],
+) -> String {
     let list = dirs.join(", ");
-    // Two different overlaps, and the user can only act on the right one: a
-    // grant *inside* the tool dir and a grant that swallows it are the same
-    // shadowing seen from opposite ends.
-    let overlap = if dirs.iter().any(|d| granted.starts_with(d)) {
+    let noun = if dirs.len() == 1 {
+        "directory"
+    } else {
+        "directories"
+    };
+    // Three ways the grant and the directory can overlap, and the user can only
+    // act on the right one: the grant *is* the directory, sits inside it, or
+    // swallows it. The first is the common shape for an agent config dir, whose
+    // whole path is what someone puts in `allow.write`.
+    let overlap = if dirs.len() == 1 && Path::new(&dirs[0]) == granted {
+        format!("allow.write grants the executable {noun} {list} itself.")
+    } else if dirs.iter().any(|d| granted.starts_with(d)) {
         format!(
             "allow.write grants {} — inside the executable tool directory {list}.",
             granted.display()
         )
     } else {
-        let noun = if dirs.len() == 1 {
-            "directory"
-        } else {
-            "directories"
-        };
         format!(
             "allow.write grants {}, which contains the executable tool {noun} {list}.",
             granted.display()
         )
     };
+    // The Linux half is only true where the *grant* is what pairs write with
+    // execute. A directory already writable by default is write+execute on
+    // Linux with or without the grant, so telling its owner to narrow the grant
+    // to close a hole would send them after a hole the grant did not open.
+    let (unchanged, gap): (Vec<&String>, Vec<&String>) = dirs
+        .iter()
+        .partition(|d| default_writable(Path::new(d.as_str()), home, agent_dirs));
+    let join = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+    use std::fmt::Write as _;
+    let mut linux = String::new();
+    if !gap.is_empty() {
+        let stays = if gap.len() == 1 { "stays" } else { "stay" };
+        let _ = write!(
+            linux,
+            " On Linux, Landlock cannot subtract a grant, so {} {stays} writable AND \
+             executable instead — the hole this deny closes on macOS is left open there.",
+            join(&gap)
+        );
+    }
+    if !unchanged.is_empty() {
+        let is = if unchanged.len() == 1 { "is" } else { "are" };
+        let _ = write!(
+            linux,
+            " On Linux {} {is} writable by default, with or without this grant, so \
+             nothing changes there and only macOS is affected.",
+            join(&unchanged)
+        );
+    }
     format!(
         "{overlap}\n  \
          cplt denies execute across an allow.write tree, because a tree that is both \
          writable and executable lets an agent drop a binary and run it. On macOS that \
          deny is enforced, so binaries under the tool directory will not run in this \
-         session. On Linux, Landlock cannot subtract a grant, so the tree stays \
-         writable AND executable instead — the hole this deny closes on macOS is left \
-         open there.\n  \
+         session.{linux}\n  \
          Narrow the write grant so it does not cover the tool directory, or use \
          allow.exec on a tree that does not overlap it."
     )
+}
+
+/// Is `path` writable by default — before any `allow.write` grant — through its
+/// own rule or an ancestor's?
+///
+/// Landlock unions a path's ancestors rather than letting a later rule subtract
+/// from an earlier one (see the `EXEC_IN_WRITABLE` and cache carve-out comments
+/// in `sandbox_landlock.rs`), so a `process_exec` directory sitting under a
+/// writable tree is already writable AND executable on Linux. Every agent
+/// directory candidate #343 added has that shape: `~/.copilot` is `write: true`
+/// itself, and `~/.cache/opencode/bin` inherits write from `~/.cache`.
+/// `~/.pi/agent/bin` no longer does: Pi's root grant is read-only precisely so
+/// that its managed binaries are not inside a writable tree.
+///
+/// Derived from the *write* side of the same three sources the exec candidates
+/// come from, so it cannot drift into a second hand-maintained list.
+fn default_writable(path: &Path, home: &Path, agent_dirs: &[crate::agent::AgentDir]) -> bool {
+    crate::sandbox::HOME_TOOL_DIRS
+        .iter()
+        .filter(|d| d.write)
+        .map(|d| home.join(d.path))
+        .chain(
+            crate::sandbox::app_dirs()
+                .iter()
+                .flat_map(|a| a.write_paths(home)),
+        )
+        .chain(
+            agent_dirs
+                .iter()
+                .filter(|d| d.write)
+                .map(|d| d.path.clone()),
+        )
+        .any(|w| path.starts_with(&w))
 }
 
 /// Which `allow.write` grants overlap one of `paths`, in either direction, as
@@ -773,13 +859,31 @@ impl Resolved {
     /// tool directory is actually shadowed. Warning on every writable tree
     /// would fire on the ordinary case and teach people to skip it.
     ///
-    /// Best-effort by design, and existence-checked so an uninstalled tool
-    /// never produces advice about a directory that is not there. Tool homes
-    /// relocated by `CARGO_HOME` and friends are not resolved here — those
-    /// become `ToolRoot`s rather than `allow.write` grants (#152), so they
-    /// cannot be the grant this warning is about.
+    /// Best-effort by design. Tool candidates are existence-checked so an
+    /// uninstalled tool never produces advice about a directory that is not
+    /// there; agent candidates are not, because `assemble_sandbox` creates
+    /// every one of them itself, after this runs. Existence-checking those
+    /// would silence the warning on the first run after the grant is written —
+    /// the one run where it is worth reading — and start it on some later
+    /// session for no reason the user can see. Tool homes relocated by
+    /// `CARGO_HOME` and friends are not resolved here — those become
+    /// `ToolRoot`s rather than `allow.write` grants (#152), so they cannot be
+    /// the grant this warning is about.
+    ///
+    /// `agent_dirs` is the agent's own directories, which lose execute the same
+    /// way on macOS (#343): `~/.pi/agent/bin` and `~/.cache/opencode/bin` are
+    /// `process_exec`, so `allow.write = ["~/.pi"]` withdraws exec from the
+    /// managed binaries the agent expects to run. On Linux `~/.cache/opencode/bin`
+    /// is already write+execute through the `~/.cache` ancestor union and the
+    /// grant takes nothing away — [`exec_tool_dir_warning`] says which case each
+    /// directory is. They are passed in rather than derived here because the set
+    /// depends on which agent's profile is built, which `Resolved` does not know.
     #[must_use]
-    pub fn write_grants_over_exec_tool_dirs(&self, home: &Path) -> Vec<(PathBuf, Vec<String>)> {
+    pub fn write_grants_over_exec_tool_dirs(
+        &self,
+        home: &Path,
+        agent_dirs: &[crate::agent::AgentDir],
+    ) -> Vec<(PathBuf, Vec<String>)> {
         let dirs: Vec<String> = crate::sandbox::HOME_TOOL_DIRS
             .iter()
             .filter(|d| d.process_exec)
@@ -790,9 +894,32 @@ impl Resolved {
                     .flat_map(|a| a.process_exec_paths(home)),
             )
             .filter(|p| p.exists())
+            .chain(
+                agent_dirs
+                    .iter()
+                    .filter(|d| d.process_exec)
+                    .map(|d| d.path.clone()),
+            )
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         grants_overlapping(&self.allow_write, &dirs)
+    }
+
+    /// Every rendered launch warning about an `allow.write` grant shadowing a
+    /// directory this run grants execute on.
+    ///
+    /// Takes the agent whose profile is actually built, not the one auto-detected
+    /// for the session. `cplt exec` and `cplt check` always build the Shell
+    /// profile, so naming Copilot's `~/.copilot` there would blame a grant for
+    /// an effect a session that never emits Copilot's rules cannot have (#343).
+    #[must_use]
+    pub fn exec_tool_dir_warnings(&self, home: &Path, agent: crate::agent::Agent) -> Vec<String> {
+        let mut agent_dirs = agent.config_dirs(home);
+        crate::agent::canonicalize_agent_dirs(&mut agent_dirs);
+        self.write_grants_over_exec_tool_dirs(home, &agent_dirs)
+            .into_iter()
+            .map(|(granted, dirs)| exec_tool_dir_warning(&granted, &dirs, home, &agent_dirs))
+            .collect()
     }
 
     /// Print comprehensive sandbox configuration summary to stderr.
@@ -1378,6 +1505,54 @@ validate = false
         assert_eq!(config.proxy.enabled, Some(true));
         assert!(config.proxy.port.is_none());
         assert!(config.allow.read.is_empty());
+    }
+
+    #[test]
+    fn empty_allow_push_rule_is_rejected() {
+        // A rule with neither remote nor branches constrains nothing: it would
+        // allow every non-force push and silently defeat prevent_push (H-10).
+        let config: Config = toml::from_str(
+            "[git_guard]\nprevent_push = true\n[[git_guard.allow_push]]\nforce = false\n",
+        )
+        .unwrap();
+        let err = config.merge(CliFlags::default()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(ref m) if m.contains("constrains nothing")),
+            "expected a validation error about an unconstrained rule, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mistyped_allow_push_key_is_rejected() {
+        // `deny_unknown_fields` on GitPushRule rejects a misspelled key at parse
+        // rather than dropping it to a default that widens the rule. An old
+        // binary refusing a newer key fails closed — safe for an allow-rule.
+        assert!(
+            toml::from_str::<Config>(
+                "[[git_guard.allow_push]]\nremto = \"fork\"\nbrnach = [\"agent/*\"]\n"
+            )
+            .is_err(),
+            "a misspelled allow_push key must be rejected at parse"
+        );
+        // A misspelled `branches` alone (remote correct) is the fail-open the
+        // empty-rule check would miss — deny_unknown_fields catches it too.
+        assert!(
+            toml::from_str::<Config>(
+                "[[git_guard.allow_push]]\nremote = \"origin\"\nbrnach = [\"agent/*\"]\n"
+            )
+            .is_err(),
+            "a partial typo that would widen the rule must be rejected at parse"
+        );
+    }
+
+    #[test]
+    fn valid_allow_push_rule_still_merges() {
+        let config: Config = toml::from_str(
+            "[[git_guard.allow_push]]\nremote = \"origin\"\nbranches = [\"agent/*\"]\n",
+        )
+        .unwrap();
+        let resolved = config.merge(CliFlags::default()).unwrap();
+        assert_eq!(resolved.git_guard.allow_push.len(), 1);
     }
 
     #[test]
@@ -2077,7 +2252,7 @@ validate = false
             home.join(".nvm"),   // process_exec but absent
             home.join("work"),   // ordinary grant
         ];
-        let found = r.write_grants_over_exec_tool_dirs(&home);
+        let found = r.write_grants_over_exec_tool_dirs(&home, &[]);
 
         let rustup = home.join(".rustup").to_string_lossy().into_owned();
         assert!(
@@ -2098,11 +2273,72 @@ validate = false
         // The other direction of the overlap: a grant INSIDE an exec tool dir
         // loses the same right.
         r.allow_write = vec![home.join(".rustup/toolchains")];
-        let found = r.write_grants_over_exec_tool_dirs(&home);
+        let found = r.write_grants_over_exec_tool_dirs(&home, &[]);
         assert_eq!(
             found.len(),
             1,
             "a grant inside an exec tool dir must be reported too: {found:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #343: the agent's own directories lose execute to an `allow.write`
+    /// grant exactly like a tool directory does — `~/.pi/agent/bin` and
+    /// `~/.cache/opencode/bin` are `process_exec` with a writable parent, so a
+    /// grant on the parent silently withdraws exec from the managed binaries.
+    /// Threaded in as a candidate list, so the warning has to be told about
+    /// them; this is the test that says it was.
+    #[test]
+    fn write_grant_shadowing_an_agent_exec_dir_is_reported() {
+        let home = std::env::temp_dir().join(format!(
+            "cplt-agent-exec-warn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join(".pi/agent/bin")).expect("temp home");
+        std::fs::create_dir_all(home.join(".pi/agent/sessions")).expect("temp home");
+
+        let agent_dirs = vec![
+            crate::agent::AgentDir {
+                path: home.join(".pi/agent"),
+                write: true,
+                map_exec: false,
+                process_exec: false,
+                write_files: vec![],
+            },
+            crate::agent::AgentDir {
+                path: home.join(".pi/agent/bin"),
+                write: false,
+                map_exec: false,
+                process_exec: true,
+                write_files: vec![],
+            },
+        ];
+
+        let mut r = Config::default()
+            .merge(CliFlags::default())
+            .expect("default config merges");
+        r.allow_write = vec![
+            home.join(".pi"),                // ancestor: swallows the exec bin dir
+            home.join(".pi/agent/sessions"), // sibling: nothing executable shadowed
+        ];
+        let found = r.write_grants_over_exec_tool_dirs(&home, &agent_dirs);
+
+        let bin = home.join(".pi/agent/bin").to_string_lossy().into_owned();
+        assert!(
+            found
+                .iter()
+                .any(|(g, dirs)| *g == home.join(".pi") && dirs.contains(&bin)),
+            "a grant containing an agent exec dir must be reported and name it: {found:?}"
+        );
+        assert_eq!(
+            found.len(),
+            1,
+            "a grant that shadows nothing executable must stay silent: {found:?}"
         );
 
         std::fs::remove_dir_all(&home).ok();
@@ -2116,7 +2352,8 @@ validate = false
     #[test]
     fn exec_tool_dir_warning_pluralises_both_ways() {
         let granted = PathBuf::from("/home/u");
-        let one = exec_tool_dir_warning(&granted, &["/home/u/.rustup".to_string()]);
+        let home = PathBuf::from("/home/u");
+        let one = exec_tool_dir_warning(&granted, &["/home/u/.rustup".to_string()], &home, &[]);
         assert!(
             one.contains("contains the executable tool directory /home/u/.rustup."),
             "one shadowed dir must read \"directory\": {one}"
@@ -2125,6 +2362,8 @@ validate = false
         let many = exec_tool_dir_warning(
             &granted,
             &["/home/u/.rustup".to_string(), "/home/u/.nvm".to_string()],
+            &home,
+            &[],
         );
         assert!(
             many.contains(
@@ -2139,6 +2378,145 @@ validate = false
         }
     }
 
+    /// #343 review: cplt creates the agent's directories itself, in
+    /// `assemble_sandbox`, *after* this warning runs. Existence-checking them
+    /// like a tool directory would keep the warning silent on the first run
+    /// after the grant is written and fire it on some later session instead, so
+    /// the filter covers tool candidates only. The bin dir is deliberately not
+    /// created here: that absence is the whole test.
+    #[test]
+    fn an_agent_exec_dir_is_reported_before_cplt_creates_it() {
+        let home = std::env::temp_dir().join(format!(
+            "cplt-agent-exec-absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join(".pi")).expect("temp home");
+
+        let bin = home.join(".pi/agent/bin");
+        assert!(!bin.exists(), "the fixture must leave the bin dir absent");
+        let agent_dirs = vec![crate::agent::AgentDir {
+            path: bin.clone(),
+            write: false,
+            map_exec: false,
+            process_exec: true,
+            write_files: vec![],
+        }];
+
+        let mut r = Config::default()
+            .merge(CliFlags::default())
+            .expect("default config merges");
+        r.allow_write = vec![home.join(".pi")];
+        let found = r.write_grants_over_exec_tool_dirs(&home, &agent_dirs);
+
+        let bin = bin.to_string_lossy().into_owned();
+        assert!(
+            found
+                .iter()
+                .any(|(g, dirs)| *g == home.join(".pi") && dirs.contains(&bin)),
+            "an agent exec dir cplt has not created yet must still be reported: {found:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #343 review: the Linux sentence was unconditional, and it is false for
+    /// every agent directory the same change added. Landlock unions a path's
+    /// ancestors, so a `process_exec` dir under a writable tree is already
+    /// write+execute there and the grant takes nothing away — telling its owner
+    /// the grant opened a hole sends them to drop a grant that changes nothing.
+    /// Asserted per directory, including the mixed grant that covers both kinds.
+    #[test]
+    fn exec_tool_dir_warning_scopes_the_linux_sentence_to_where_it_is_true() {
+        let home = PathBuf::from("/home/u");
+        let copilot = crate::agent::AgentDir {
+            path: home.join(".copilot"),
+            write: true,
+            map_exec: true,
+            process_exec: true,
+            write_files: vec![],
+        };
+        let rustup = home.join(".rustup").to_string_lossy().into_owned();
+        let copilot_dir = copilot.path.to_string_lossy().into_owned();
+        // Inherits write from the `.cache` HOME_TOOL_DIRS entry, not from a
+        // rule of its own — the ancestor half of the same question.
+        let opencode = home
+            .join(".cache/opencode/bin")
+            .to_string_lossy()
+            .into_owned();
+
+        // Not writable by default: the grant really is what pairs write with
+        // execute, and Landlock really cannot take it back.
+        let w = exec_tool_dir_warning(
+            &home,
+            std::slice::from_ref(&rustup),
+            &home,
+            std::slice::from_ref(&copilot),
+        );
+        assert!(
+            w.contains(&format!("so {rustup} stays writable AND executable")),
+            "a dir that is read-only by default keeps the Linux hole sentence: {w}"
+        );
+        assert!(
+            !w.contains("writable by default"),
+            "nothing here is writable by default: {w}"
+        );
+
+        // Writable by default through its own rule, and through an ancestor's.
+        for (dir, dirs) in [
+            (&copilot_dir, vec![copilot_dir.clone()]),
+            (&opencode, vec![opencode.clone()]),
+        ] {
+            let w = exec_tool_dir_warning(&home, &dirs, &home, std::slice::from_ref(&copilot));
+            assert!(
+                !w.contains("left open there"),
+                "the grant opens no hole on Linux for {dir}: {w}"
+            );
+            assert!(
+                w.contains(&format!("On Linux {dir} is writable by default")),
+                "say what Linux actually does for {dir}: {w}"
+            );
+        }
+
+        // One grant over both kinds: each sentence names only its own dirs.
+        let both = exec_tool_dir_warning(
+            &home,
+            &[rustup.clone(), copilot_dir.clone()],
+            &home,
+            std::slice::from_ref(&copilot),
+        );
+        assert!(
+            both.contains(&format!("so {rustup} stays writable AND executable")),
+            "the hole sentence must name only the dir it is true for: {both}"
+        );
+        assert!(
+            both.contains(&format!("On Linux {copilot_dir} is writable by default")),
+            "the no-op sentence must name only the dir it is true for: {both}"
+        );
+    }
+
+    /// The nit the same review found: `granted.starts_with(dir)` is true when
+    /// they are equal, so `allow.write = ["~/.copilot"]` rendered "grants
+    /// /home/u/.copilot — inside the executable tool directory /home/u/.copilot".
+    /// Granting an agent's config dir by its own full path is the common shape.
+    #[test]
+    fn exec_tool_dir_warning_names_a_grant_on_the_directory_itself() {
+        let granted = PathBuf::from("/home/u/.copilot");
+        let w = exec_tool_dir_warning(
+            &granted,
+            &["/home/u/.copilot".to_string()],
+            &PathBuf::from("/home/u"),
+            &[],
+        );
+        assert!(
+            w.contains("grants the executable directory /home/u/.copilot itself."),
+            "a grant equal to the directory must not read as \"inside\" it: {w}"
+        );
+    }
+
     /// A grant *inside* a tool dir is the same shadowing from the other end,
     /// and gets the wording the user can act on — no pluralisation involved,
     /// since the grant sits in exactly one tree.
@@ -2147,6 +2525,8 @@ validate = false
         let w = exec_tool_dir_warning(
             &PathBuf::from("/home/u/.rustup/toolchains"),
             &["/home/u/.rustup".to_string()],
+            &PathBuf::from("/home/u"),
+            &[],
         );
         assert!(
             w.contains("inside the executable tool directory /home/u/.rustup."),
@@ -2889,15 +3269,19 @@ validate = false
         assert!(resolved.git_guard.enabled, "git guard must default on");
     }
 
-    /// The git guard carries far more legitimate traffic than the gh guard, so
-    /// its default-on lands in `warn`: output changes for everyone, nothing is
-    /// blocked. Escalating to `block` is `strict`'s job, or the user's.
+    /// #386: both guards block out of the box. The two halves ship together —
+    /// `prevent_push` is on, so `block` without `protect_default_branch_only`
+    /// would deny every push until the user writes an `allow_push` rule.
     #[test]
-    fn git_guard_defaults_to_warn_not_block() {
+    fn git_guard_defaults_to_block_on_the_default_branch_only() {
         let resolved = Config::default().merge(CliFlags::default()).unwrap();
-        assert_eq!(resolved.git_guard.mode, EnforcementMode::Warn);
-        // The sub-policies stay fail-closed underneath the warn: flipping the
-        // mode to block must not also require re-enabling them.
+        assert_eq!(resolved.git_guard.mode, EnforcementMode::Block);
+        assert!(
+            resolved.git_guard.protect_default_branch_only,
+            "block mode is only shippable while feature-branch pushes still work"
+        );
+        // The sub-policies stay fail-closed underneath: the mode is what
+        // changed, not the plumbing.
         assert!(resolved.git_guard.prevent_push);
         assert!(resolved.git_guard.prevent_force_push);
     }
@@ -2944,8 +3328,10 @@ validate = false
         // Guards on (#122), forced proxy and fail-closed allowlist still off —
         // those are `strict`-only.
         assert_eq!(posture_snapshot(&resolved), (true, true, false, false));
-        // The git guard is on but only warns; escalating to block is strict's job.
-        assert_eq!(resolved.git_guard.mode, EnforcementMode::Warn);
+        // The git guard blocks (#386), but only pushes to the default branch;
+        // blocking every push is strict's job.
+        assert_eq!(resolved.git_guard.mode, EnforcementMode::Block);
+        assert!(resolved.git_guard.protect_default_branch_only);
     }
 
     #[test]
@@ -3371,8 +3757,10 @@ mod precedence {
                 cli_on: None,
                 cli_off: None,
                 get: |r| r.git_guard.protect_default_branch_only,
-                default: false,
-                preset: None,
+                default: true,
+                // On by default since #386, so `strict` is what differs: it
+                // blocks every push, not only the default branch.
+                preset: Some((Preset::Strict, false)),
             },
             // `sandbox.agents_md` is exercised separately: its resolved value is
             // additionally gated on `brief`, so it does not follow the plain

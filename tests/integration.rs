@@ -3,6 +3,13 @@
 //! These tests invoke sandbox-exec and verify kernel-level enforcement.
 //! They ONLY run on macOS — skipped on Linux/CI via #[cfg(target_os = "macos")].
 
+// This turns off the #239 *security* lint only: a test binary is not the
+// unsandboxed parent around an agent session, so the PATH-hijack hazard
+// `disallowed_methods` guards against does not apply here. It grants no
+// licence to spawn ad hoc: the #245 isolation rule stands unchanged, and every
+// `Command` a test spawns is still built through the `tests/common` helpers,
+// which no lint can enforce and review does.
+#![allow(clippy::disallowed_methods)]
 mod common;
 
 #[cfg(target_os = "macos")]
@@ -1429,6 +1436,87 @@ mod macos_tests {
         assert!(
             output.contains("Operation not permitted") || output.contains("EXIT:1"),
             "writing to .github/hooks should be blocked, got: {output}"
+        );
+    }
+
+    /// H-11: `.claude/settings.json` carries Claude Code hooks (`SessionStart`
+    /// et al.) that run unsandboxed on the next session in this repo. It is a
+    /// FILE deny (`literal`), not a subtree — `.claude/` stays writable for
+    /// session state — so this is the kernel proof that the file-literal shape
+    /// actually blocks the write while leaving the rest of `.claude/` open.
+    #[test]
+    fn real_profile_blocks_claude_settings_write() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".claude-settings-{}", std::process::id()));
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let settings = tmp.join(".claude/settings.json");
+        let denied = format!(
+            "echo '{{\"hooks\":{{}}}}' > '{}' 2>&1; echo EXIT:$?",
+            settings.display()
+        );
+        let (out_denied, _) = run_sandboxed(&profile, &denied);
+
+        // Sibling state under `.claude/` must stay writable, or we broke Claude.
+        let state = tmp.join(".claude/session-state.json");
+        let allowed = format!("echo x > '{}' 2>&1; echo EXIT:$?", state.display());
+        let (out_allowed, _) = run_sandboxed(&profile, &allowed);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            out_denied.contains("Operation not permitted") || out_denied.contains("EXIT:1"),
+            "writing .claude/settings.json should be blocked, got: {out_denied}"
+        );
+        assert!(
+            out_allowed.contains("EXIT:0"),
+            "other writes under .claude/ must stay allowed, got: {out_allowed}"
+        );
+    }
+
+    /// H-11: OpenCode auto-imports `.opencode/{plugin,plugins,tool,tools}/*` at
+    /// startup, but also writes `.opencode/{node_modules,.gitignore,*.lock}`
+    /// there every run. So the deny is surgical — the exec subdirs, not the
+    /// tree. Kernel proof that a plugin write is blocked while the generated
+    /// state OpenCode needs stays writable; get this wrong either way and we
+    /// leave the hole open or break OpenCode's own startup.
+    #[test]
+    fn real_profile_blocks_opencode_plugin_but_keeps_state_writable() {
+        require_sandbox!();
+        let project = fs::canonicalize(".").unwrap();
+        let tmp = project.join(format!(".opencode-surg-{}", std::process::id()));
+        fs::create_dir_all(tmp.join(".opencode/plugin")).unwrap();
+        fs::create_dir_all(tmp.join(".opencode/node_modules")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let home = home_dir();
+
+        let opts = default_opts(&tmp, &home);
+        let profile = write_real_profile(&opts);
+
+        let plugin = tmp.join(".opencode/plugin/evil.ts");
+        let denied = format!("echo x > '{}' 2>&1; echo EXIT:$?", plugin.display());
+        let (out_denied, _) = run_sandboxed(&profile, &denied);
+
+        // OpenCode's own startup writes here — must stay allowed.
+        let state = tmp.join(".opencode/node_modules/marker");
+        let allowed = format!("echo x > '{}' 2>&1; echo EXIT:$?", state.display());
+        let (out_allowed, _) = run_sandboxed(&profile, &allowed);
+
+        fs::remove_dir_all(&tmp).ok();
+        fs::remove_file(&profile).ok();
+        assert!(
+            out_denied.contains("Operation not permitted") || out_denied.contains("EXIT:1"),
+            "writing .opencode/plugin/ should be blocked, got: {out_denied}"
+        );
+        assert!(
+            out_allowed.contains("EXIT:0"),
+            "OpenCode state under .opencode/ must stay writable, got: {out_allowed}"
         );
     }
 

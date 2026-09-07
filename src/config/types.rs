@@ -75,7 +75,6 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub gh_guard: GhGuardConfig,
     pub git_guard: GitGuardConfig,
-    pub audit: AuditConfig,
 }
 
 /// Enforcement mode for security gates — controls rollout aggressiveness.
@@ -200,10 +199,17 @@ pub struct PresetBaseline {
     /// Safety feature: block dangerous `git` operations (push/force-push).
     pub git_guard_enabled: bool,
     /// Enforcement mode for the git guard when the config does not set one.
-    /// `Strict` blocks; every other preset warns, because the git guard is now
-    /// on by default and warn is the transition mode for the guard with the
-    /// most legitimate traffic (#122 Stage 2).
+    /// `Standard` and `Strict` both block (#386): two guards in one product
+    /// with opposite defaults was the inconsistency, and the weaker default sat
+    /// on the operation with the worse blast radius. The presets that turn the
+    /// guard off entirely keep a value here, but it is never read.
     pub git_guard_mode: EnforcementMode,
+    /// Refuse pushes to the remote's default branch only, leaving feature
+    /// branches alone, when the config does not set it. On under `Standard`
+    /// (#386): `prevent_push` is on, so blocking without this would deny every
+    /// push until the user writes an `allow_push` rule. Off under `Strict`,
+    /// which denies every push by design.
+    pub git_protect_default_branch_only: bool,
     /// Safety feature: mandatory proxy, kernel egress locked to the proxy port.
     pub proxy_forced: bool,
     /// Safety feature: fail-closed domain allowlist (#52). Restricts egress to
@@ -271,10 +277,12 @@ impl Preset {
     /// Map the preset to its baseline values (five sandbox toggles + four
     /// safety features).
     ///
-    /// `Strict` and `Standard` share the same five *toggle* values (all off) and
-    /// both enable gh_guard and git_guard; they differ in that only `Strict`
-    /// escalates the git guard to `block`, forces proxy egress, and turns on
-    /// the fail-closed default allowlist — a full network lockdown.
+    /// `Strict` and `Standard` share the same five *toggle* values (all off),
+    /// both enable gh_guard and git_guard, and both put the git guard in
+    /// `block` mode; they differ in that `Standard` blocks only pushes to the
+    /// default branch, while `Strict` blocks every push and additionally forces
+    /// proxy egress and turns on the fail-closed default allowlist — a full
+    /// network lockdown.
     /// `Standard` carries cplt's hardcoded defaults. The scratch dir is not a preset-controlled toggle
     /// and stays at its default (on) for every preset.
     pub fn baseline(self) -> PresetBaseline {
@@ -288,6 +296,7 @@ impl Preset {
                 gh_guard_enabled: true,
                 git_guard_enabled: true,
                 git_guard_mode: EnforcementMode::Block,
+                git_protect_default_branch_only: false,
                 proxy_forced: true,
                 default_allowlist: true,
             },
@@ -299,7 +308,8 @@ impl Preset {
                 allow_lifecycle_scripts: false,
                 gh_guard_enabled: true,
                 git_guard_enabled: true,
-                git_guard_mode: EnforcementMode::Warn,
+                git_guard_mode: EnforcementMode::Block,
+                git_protect_default_branch_only: true,
                 proxy_forced: false,
                 default_allowlist: false,
             },
@@ -312,6 +322,7 @@ impl Preset {
                 gh_guard_enabled: false,
                 git_guard_enabled: false,
                 git_guard_mode: EnforcementMode::Warn,
+                git_protect_default_branch_only: false,
                 proxy_forced: false,
                 default_allowlist: false,
             },
@@ -324,6 +335,7 @@ impl Preset {
                 gh_guard_enabled: false,
                 git_guard_enabled: false,
                 git_guard_mode: EnforcementMode::Warn,
+                git_protect_default_branch_only: false,
                 proxy_forced: false,
                 default_allowlist: false,
             },
@@ -410,8 +422,16 @@ pub struct GitGuardConfig {
 
 /// A structured rule that permits `git push` under specific conditions.
 /// All specified fields must match (AND logic).
+///
+/// `deny_unknown_fields` is deliberate here, against the config loader's
+/// otherwise-lenient collect-and-warn handling of unknown keys: a misspelled key
+/// (`remto`, `brnach`) would silently drop its field to the default, widening the
+/// rule — a mistyped `branches` becomes "all branches on that remote". For a
+/// security allow-rule the safe failure is to reject the key at parse. The
+/// forward-compat cost (an older binary refusing a config written for a newer
+/// one) fails *closed*, which is the correct direction for a grant.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GitPushRule {
     /// Remote name to allow pushing to (e.g. `"fork"`, `"origin"`).
     pub remote: Option<String>,
@@ -419,22 +439,6 @@ pub struct GitPushRule {
     pub branches: Vec<String>,
     /// Allow force push in this rule (default: false).
     pub force: Option<bool>,
-}
-
-/// `[audit]` — global audit logging for sandbox decisions.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct AuditConfig {
-    /// Enable audit logging (default: false).
-    pub enabled: Option<bool>,
-    /// Where to write audit entries: "stderr" or a file path (default: "stderr").
-    pub destination: Option<String>,
-    /// What to log: "blocked" (only blocked), "decisions" (all gate decisions),
-    /// "all" (includes allowed passthrough). Default: "blocked".
-    pub level: Option<String>,
-    /// Output format: "text" (human-readable) or "jsonl" (machine-parseable).
-    /// Default: "text".
-    pub format: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

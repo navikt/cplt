@@ -1,0 +1,19 @@
+# `Command::new("<bare name>")` resolves through `execvp` at spawn time using
+# the parent's PATH, and cplt's parent process runs unsandboxed, as the user.
+# The sandbox grants write+exec on several directories that are commonly on
+# PATH (mise shims, `$PNPM_HOME`, `~/.bun/bin`), so a bare-name spawn in the
+# parent is an execution primitive for an agent that has already run once.
+#
+# Three review rounds on #236 each found another one; the pattern was that
+# nothing prevented the next. This is the thing that prevents the next (#239).
+#
+# Parent-side code resolves through `git::trusted_git()` / `git::trusted_binary()`
+# instead — a fixed set of directories the sandbox grants read+exec and never
+# write — or names an absolute path. Where the program is already a resolved
+# `&Path`, or where PATH resolution is deliberate (the gh/git guard wrappers run
+# INSIDE the sandbox and must find the user's own `gh`), the sanctioned escape is
+# `#[allow(clippy::disallowed_methods)]` with a one-line reason. Test code is
+# allowed wholesale, per file or per `mod tests`.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "a bare program name spawns whatever the agent left on PATH — resolve through git::trusted_git()/trusted_binary(), or #[allow] with a one-line reason (#239)" },
+]

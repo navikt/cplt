@@ -583,8 +583,16 @@ impl Agent {
     /// - Claude: `statusline.sh` runs on every prompt render, `plugins/` loads
     ///   at startup, and `settings.json` carries `hooks` (`SessionStart`,
     ///   `UserPromptSubmit`, …) which fire automatically. `commands/`,
-    ///   `agents/` and `skills/` stay writable — those do require explicit user
-    ///   invocation.
+    ///   `agents/` and `skills/` stay writable, and the user is **not** the only
+    ///   one who can invoke them: a `skills/*/SKILL.md` and a `commands/*.md` are
+    ///   both offered to the model through the Skill tool unless they set
+    ///   `disable-model-invocation` (absent
+    ///   by default), and both run `` !`cmd` `` shell preprocessing when invoked;
+    ///   an `agents/*.md` can carry frontmatter `hooks`, whose `Stop` hook runs a
+    ///   host command when the model spawns the agent. They stay writable because
+    ///   authoring them is the point of the directories and a path-granularity
+    ///   deny is all-or-nothing — a stated residual, not a safety property. See
+    ///   SECURITY.md and issue #366.
     /// - Antigravity: its own grants carry the same class. `config/hooks.json`
     ///   names host commands, `config/mcp_config.json` holds `mcpServers` that
     ///   auto-start, and `antigravity-cli/bin/` holds binaries (`agentapi`,
@@ -609,6 +617,16 @@ impl Agent {
     ///   code of packages already installed by `pi install`: denying only
     ///   `settings.json` stops a *new* entry being added but leaves installed
     ///   package code editable in place, and it loads on the next host run.
+    ///   `trust.json` is the project trust store — Pi's `ProjectTrustStore`
+    ///   writes it as `join(agentDir, "trust.json")` and keys a bare decision
+    ///   on the normalized project path, with no fingerprint of what is being
+    ///   trusted (`dist/core/trust-manager.js`, @earendil-works/pi-coding-agent
+    ///   0.85.1; pi.dev/docs/latest/settings: "/trust … writes
+    ///   `~/.pi/agent/trust.json` only"). An agent that writes it pre-trusts a
+    ///   directory, and trust is what gates the project-local auto-load paths —
+    ///   `.pi/extensions`, `.pi/settings.json` `packages` — on the next host
+    ///   run. Same class as the rest of the list: nothing legitimate writes it
+    ///   mid-session, `/trust` is a deliberate act to perform outside cplt.
     ///
     /// Cost: for Pi this breaks package management and every in-session
     /// setting that persists to `settings.json` — `/model` Ctrl+S,
@@ -624,7 +642,7 @@ impl Agent {
     pub fn host_persistence_denies(&self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &["statusline.sh", "plugins", "settings.json"],
-            Agent::Pi => &["settings.json", "extensions", "npm", "git"],
+            Agent::Pi => &["settings.json", "trust.json", "extensions", "npm", "git"],
             // Antigravity's grants are ~/.gemini/config and
             // ~/.gemini/antigravity-cli, not ~/.gemini itself, so Gemini's own
             // entries would not match; these are its equivalents. Each name is
@@ -736,14 +754,31 @@ impl Agent {
     }
 
     /// The concrete paths [`Agent::host_persistence_denies`] resolves to for a
-    /// given set of grants: every entry joined onto every **writable** dir.
+    /// given set of grants: every entry joined onto every **top-level** dir,
+    /// meaning one that is not itself nested inside another of the agent's
+    /// grants.
     ///
     /// Both backends need exactly this list — Seatbelt turns it into
     /// `(deny file-write*)` rules, the Linux path re-binds it read-only under
     /// bubblewrap — so it lives here rather than being joined twice.
+    ///
+    /// Nesting, not writability, is the filter. It used to be `d.write`, which
+    /// was the same set back when every agent's root grant was writable, and
+    /// stopped being so when Pi's root became read-only to keep `bin/` out of a
+    /// writable tree. A deny under a read-only grant is not redundant: it is
+    /// what survives a user `allow.write` over the same tree, which SBPL emits
+    /// later and last-match-wins would otherwise let reopen — the property
+    /// `host_persistence_denies_survive_a_later_user_allow_write` pins. Nested
+    /// grants are skipped because the names are relative to the agent's root,
+    /// so joining them onto a subdirectory only produces paths that never
+    /// exist (`~/.pi/agent/sessions/npm`).
     pub fn host_persistence_paths(&self, dirs: &[AgentDir]) -> Vec<PathBuf> {
         dirs.iter()
-            .filter(|d| d.write)
+            .filter(|d| {
+                !dirs
+                    .iter()
+                    .any(|other| other.path != d.path && d.path.starts_with(&other.path))
+            })
             .flat_map(|d| {
                 self.host_persistence_denies()
                     .iter()
@@ -990,19 +1025,75 @@ impl Agent {
                 ]
             }
             Agent::Pi => {
-                // ~/.pi/agent/ stores all global data: settings.json, trust.json,
-                // sessions/, npm/ packages. Per https://pi.dev/docs/latest/settings
-                // ~/.pi/agent/bin contains managed tool binaries (fd, rg)
+                // ~/.pi/agent/ stores all of Pi's global state, and
+                // ~/.pi/agent/bin the managed tool binaries (fd, rg) Pi runs.
+                //
+                // The root is granted READ-ONLY on purpose. It used to be one
+                // `write: true` grant over the whole tree, which on Linux made
+                // `bin/` writable AND executable: Landlock unions a path with
+                // every ancestor rule and cannot subtract, so the parent's
+                // write reached the exec-only child (H-13/H-05). A contained
+                // agent could overwrite the managed `rg`/`fd`, and the user's
+                // next unsandboxed `pi` would execute it. macOS denies the
+                // write at the tail of the profile; Landlock has no such rule,
+                // so the grant is narrowed instead — the shape `HOME_TOOL_DIRS`
+                // already uses for `~/.cargo/bin` vs `~/.cargo/registry`, and
+                // the only form that holds without bubblewrap.
+                //
+                // The writable set is Pi's own `~/.pi/agent/*` surface, read
+                // off @earendil-works/pi-coding-agent 0.85.1: `dist/config.js`
+                // (`getSessionsDir`, `getPromptsDir`, `getCustomThemesDir`,
+                // `getToolsDir`, `getBinDir`), `dist/core/resource-loader.js`
+                // (`skills`) and the extension staging dir `tmp/extensions`.
+                // `npm/`, `git/` and `extensions/` are deliberately absent:
+                // they are `host_persistence_denies` entries, so read-only is
+                // what they are meant to be, and `bin/` is absent because it is
+                // the whole point of the narrowing.
+                //
+                // Cost: Pi can no longer create a NEW top-level entry under
+                // ~/.pi/agent mid-session. The files it rewrites in place are
+                // carved back open below; a first-ever `pi auth login` (which
+                // creates auth.json) and the managed-binary bootstrap (Pi
+                // downloads fd/rg into bin/ when they are not on PATH) have to
+                // happen outside cplt. See docs/known-impacts.md.
+                let agent = home.join(".pi/agent");
+                let writable = |path: PathBuf| AgentDir {
+                    path,
+                    write: true,
+                    map_exec: false,
+                    process_exec: false,
+                    write_files: vec![],
+                };
                 vec![
                     AgentDir {
-                        path: home.join(".pi/agent"),
-                        write: true,
+                        path: agent.clone(),
+                        write: false,
                         map_exec: false,
                         process_exec: false,
-                        write_files: vec![],
+                        // Top-level files Pi rewrites in place. `settings.json`
+                        // and `trust.json` are absent by design — they are
+                        // host-persistence denies. A file-level grant only
+                        // matches a file that already exists (Landlock resolves
+                        // the path when the rule is built), which is why
+                        // creating one of these for the first time needs a run
+                        // outside cplt.
+                        write_files: vec![
+                            "auth.json",
+                            "oauth.json",
+                            "models.json",
+                            "models-store.json",
+                            "keybindings.json",
+                            "pi-debug.log",
+                        ],
                     },
+                    writable(agent.join("sessions")),
+                    writable(agent.join("prompts")),
+                    writable(agent.join("themes")),
+                    writable(agent.join("skills")),
+                    writable(agent.join("tools")),
+                    writable(agent.join("tmp")),
                     AgentDir {
-                        path: home.join(".pi/agent/bin"),
+                        path: agent.join("bin"),
                         write: false,
                         map_exec: false,
                         // Pi installs managed binaries here (fd, rg)
@@ -1635,6 +1726,37 @@ pub fn canonicalize_agent_dirs(dirs: &mut [AgentDir]) {
     }
 }
 
+/// The first agent config dir that resolves to a system root or `$HOME`, if any.
+///
+/// A config dir is externally influenced: `CLAUDE_CONFIG_DIR` (used raw, no
+/// subdirectory appended) and the `XDG_*` bases both come from the ambient
+/// environment. An attacker-set or fat-fingered `CLAUDE_CONFIG_DIR=/` or
+/// `=$HOME` turns into an `AgentDir { write: true }` over the whole tree. The
+/// sandbox backends are purely additive — Landlock has no deny, and macOS's
+/// late credential/persistence denies only re-cover their enumerated paths — so
+/// such a grant cannot be clawed back and everything under it degrades to
+/// writable (external audit C-02).
+///
+/// So the same veto the relocatable tool dirs already use
+/// ([`crate::sandbox::tool_override_path_is_safe`]) guards these too — it wraps
+/// `is_unsafe_root` (`/`, `$HOME`, system/temp roots) and additionally rejects
+/// any *ancestor* of `$HOME` (`/Users`, `/home`, or a deeper parent), which a
+/// bare `is_unsafe_root` misses: `CLAUDE_CONFIG_DIR=/Users` would otherwise
+/// become a writable grant over every user's home. A legitimate config dir
+/// lives at `~/.claude` or a dedicated subdirectory, which the predicate
+/// accepts. Callers must refuse to launch rather than emit the grant — a
+/// silently dropped grant would still hand the same dir to the child via the
+/// environment, which would then fail writing to a denied path with no hint why
+/// (the "No silent grants" rule in AGENTS.md).
+///
+/// Run on the *canonicalized* dirs so a symlink or `..` cannot smuggle an unsafe
+/// root past the textual comparison.
+#[must_use]
+pub fn first_unsafe_agent_dir<'a>(dirs: &'a [AgentDir], home: &Path) -> Option<&'a AgentDir> {
+    dirs.iter()
+        .find(|d| !crate::sandbox::tool_override_path_is_safe(&d.path, home))
+}
+
 /// Are we running inside WSL? Cached — it cannot change within a process.
 ///
 /// Two independent signals, both cheap reads of kernel-owned state:
@@ -1731,6 +1853,7 @@ fn is_editor_shim(path: &Path) -> bool {
 /// node version than the one the tool was installed with, mise fails with
 /// "No version is set for command <name>". We resolve the real binary path
 /// to bypass mise's version resolution entirely.
+#[allow(clippy::disallowed_methods)] // mise/asdf already resolved by git::trusted_binary, never PATH
 fn resolve_mise_shim(candidate: &Path, binary_name: &str) -> Option<PathBuf> {
     let dir = candidate.parent()?;
     let dir_str = dir.to_str()?;
@@ -2205,7 +2328,10 @@ mod tests {
             Agent::Pi.host_persistence_denies(),
             // npm/ and git/ hold already-installed package code, editable in
             // place: denying settings.json alone only stops a NEW entry.
-            ["settings.json", "extensions", "npm", "git"]
+            // trust.json is the project trust store: a bare per-directory
+            // decision with no fingerprint, so writing it pre-trusts a project
+            // and unlocks its `.pi/` auto-load paths on the next host run.
+            ["settings.json", "trust.json", "extensions", "npm", "git"]
         );
         assert_eq!(
             Agent::Antigravity.host_persistence_denies(),
@@ -2261,7 +2387,7 @@ mod tests {
     /// it into deny rules, the Linux path re-binds it read-only — so pinning it
     /// here covers the bubblewrap assembly without needing a Linux host.
     #[test]
-    fn host_persistence_paths_join_only_writable_grants() {
+    fn host_persistence_paths_join_only_top_level_grants() {
         let home = Path::new("/Users/test");
 
         let dirs = Agent::Pi.config_dirs(home);
@@ -2269,12 +2395,14 @@ mod tests {
             Agent::Pi.host_persistence_paths(&dirs),
             vec![
                 home.join(".pi/agent/settings.json"),
+                home.join(".pi/agent/trust.json"),
                 home.join(".pi/agent/extensions"),
                 home.join(".pi/agent/npm"),
                 home.join(".pi/agent/git"),
             ],
-            "exec-only ~/.pi/agent/bin must contribute nothing — its write-deny \
-             comes from the exec-only rule instead"
+            "the denies belong to the ~/.pi/agent root — the nested grants \
+             (sessions/, bin/, …) must contribute nothing, and the read-only \
+             root must still contribute, or a user allow.write reopens them"
         );
 
         // Antigravity has two writable grants and its entries belong to one
@@ -2571,19 +2699,51 @@ mod tests {
         assert!(!Agent::Pi.needs_copilot_dir());
     }
 
+    /// Pi's managed-binary dir must not sit inside a writable grant.
+    ///
+    /// H-13/H-05: `~/.pi/agent` used to be one `write: true` grant containing
+    /// the exec-only `bin/`. Landlock unions a path with its ancestors and
+    /// cannot subtract, so `bin/` came out writable AND executable — a
+    /// contained agent overwrites the managed `rg`, and the user's next
+    /// unsandboxed `pi` runs it. The root is read-only now and the write grants
+    /// are the subdirectories Pi writes.
     #[test]
-    fn pi_config_dirs() {
+    fn pi_config_dirs_keep_bin_out_of_every_writable_grant() {
         let home = Path::new("/Users/test");
         let dirs = Agent::Pi.config_dirs(home);
-        assert_eq!(dirs.len(), 2, "should have ~/.pi/agent and ~/.pi/agent/bin");
-        // Main dir: ~/.pi/agent — all global data (settings, sessions, trust, npm)
-        assert_eq!(dirs[0].path, home.join(".pi/agent"));
-        assert!(dirs[0].write);
-        assert!(!dirs[0].process_exec);
-        // Bin dir has process_exec for managed binaries (fd, rg)
-        assert_eq!(dirs[1].path, home.join(".pi/agent/bin"));
-        assert!(!dirs[1].write);
-        assert!(dirs[1].process_exec);
+
+        let root = &dirs[0];
+        assert_eq!(root.path, home.join(".pi/agent"));
+        assert!(!root.write, "the root grant must not be writable");
+        assert!(!root.process_exec);
+        assert!(
+            root.write_files.contains(&"auth.json"),
+            "files Pi rewrites in place stay writable: {:?}",
+            root.write_files
+        );
+
+        let bin = dirs
+            .iter()
+            .find(|d| d.path == home.join(".pi/agent/bin"))
+            .expect("~/.pi/agent/bin must still be granted");
+        assert!(!bin.write);
+        assert!(bin.process_exec, "managed fd/rg must still execute");
+
+        // The property, not the list: nothing writable may contain bin/.
+        for dir in dirs.iter().filter(|d| d.write) {
+            assert!(
+                !bin.path.starts_with(&dir.path),
+                "{} is writable and contains the exec-only bin/ — Landlock \
+                 unions the two into write+execute",
+                dir.path.display()
+            );
+        }
+        // Sessions still writable, or Pi cannot record a conversation.
+        assert!(
+            dirs.iter()
+                .any(|d| d.write && d.path == home.join(".pi/agent/sessions")),
+            "{dirs:?}"
+        );
     }
 
     #[test]
@@ -2702,6 +2862,93 @@ mod tests {
             let dirs = Agent::Claude.config_dirs(home);
             assert_eq!(dirs.len(), 2, "empty override is ignored");
             assert_eq!(dirs[0].path, home.join(".claude"));
+        });
+    }
+
+    // Audit C-02: CLAUDE_CONFIG_DIR is turned into a writable AgentDir with no
+    // validation. `first_unsafe_agent_dir` is the veto that stops the grant from
+    // reaching Landlock/Seatbelt. These assert against the resolved AgentDir set
+    // config_dirs actually produces, not just the helper in isolation.
+
+    #[test]
+    fn claude_config_dir_at_filesystem_root_is_vetoed() {
+        temp_env::with_var("CLAUDE_CONFIG_DIR", Some("/"), || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Claude.config_dirs(home);
+            // The vulnerable grant: a writable AgentDir over "/".
+            assert_eq!(dirs.len(), 1);
+            assert_eq!(dirs[0].path, PathBuf::from("/"));
+            assert!(dirs[0].write, "the grant that C-02 is about is writable");
+            // The veto catches it before it becomes an FsRule / subpath rule.
+            let bad = first_unsafe_agent_dir(&dirs, home).expect("filesystem root must be vetoed");
+            assert_eq!(bad.path, PathBuf::from("/"));
+        });
+    }
+
+    #[test]
+    fn claude_config_dir_at_home_is_vetoed() {
+        temp_env::with_var("CLAUDE_CONFIG_DIR", Some("/Users/test"), || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Claude.config_dirs(home);
+            assert_eq!(dirs[0].path, PathBuf::from("/Users/test"));
+            assert!(
+                first_unsafe_agent_dir(&dirs, home).is_some(),
+                "$HOME itself must be vetoed"
+            );
+        });
+    }
+
+    #[test]
+    fn claude_config_dir_dedicated_subdir_is_allowed() {
+        temp_env::with_var(
+            "CLAUDE_CONFIG_DIR",
+            Some("/Users/test/.config/claude-work"),
+            || {
+                let home = Path::new("/Users/test");
+                let dirs = Agent::Claude.config_dirs(home);
+                assert_eq!(
+                    dirs[0].path,
+                    PathBuf::from("/Users/test/.config/claude-work")
+                );
+                assert!(dirs[0].write);
+                assert!(
+                    first_unsafe_agent_dir(&dirs, home).is_none(),
+                    "a dedicated subdirectory is a legitimate config dir"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_at_ancestor_of_home_is_vetoed() {
+        // A parent of $HOME that is NOT in is_unsafe_root's enumerated root
+        // list. Bare is_unsafe_root misses it; the ancestor check that
+        // tool_override_path_is_safe adds is what catches it. Granting write
+        // here would reach every sibling home under the ancestor.
+        let home = Path::new("/Users/alice/sandbox/home");
+        temp_env::with_var("CLAUDE_CONFIG_DIR", Some("/Users/alice/sandbox"), || {
+            let dirs = Agent::Claude.config_dirs(home);
+            assert_eq!(dirs[0].path, PathBuf::from("/Users/alice/sandbox"));
+            assert!(
+                !crate::is_unsafe_root(&dirs[0].path, home),
+                "precondition: bare is_unsafe_root does NOT catch this ancestor"
+            );
+            assert!(
+                first_unsafe_agent_dir(&dirs, home).is_some(),
+                "an ancestor of $HOME must be vetoed even when not an enumerated root"
+            );
+        });
+    }
+
+    #[test]
+    fn default_claude_config_dirs_pass_the_veto() {
+        temp_env::with_var_unset("CLAUDE_CONFIG_DIR", || {
+            let home = Path::new("/Users/test");
+            let dirs = Agent::Claude.config_dirs(home);
+            assert!(
+                first_unsafe_agent_dir(&dirs, home).is_none(),
+                "~/.claude and ~/.claude.json must never be vetoed"
+            );
         });
     }
 

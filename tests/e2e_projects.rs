@@ -11,6 +11,13 @@
 //!
 //! Run: cargo test --test e2e_projects
 
+// This turns off the #239 *security* lint only: a test binary is not the
+// unsandboxed parent around an agent session, so the PATH-hijack hazard
+// `disallowed_methods` guards against does not apply here. It grants no
+// licence to spawn ad hoc: the #245 isolation rule stands unchanged, and every
+// `Command` a test spawns is still built through the `tests/common` helpers,
+// which no lint can enforce and review does.
+#![allow(clippy::disallowed_methods)]
 mod common;
 
 #[cfg(target_os = "macos")]
@@ -1532,6 +1539,145 @@ rm -f push-err.txt
         );
     }
 
+    /// Allocate a PTY that belongs to *this test process* and return
+    /// `(master, slave, slave_path)`.
+    ///
+    /// The sandboxed script below writes to `slave_path`, so it must never be
+    /// a terminal anybody else owns. `openpty` here is the whole point: the
+    /// test creates its own victim and tears it down again, so a regression
+    /// cannot spray escape sequences into the developer's real session.
+    fn open_victim_pty() -> (libc::c_int, libc::c_int, String) {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: both out-params are valid ints; the three optional
+        // arguments are documented as nullable.
+        let rc = unsafe {
+            libc::openpty(
+                &raw mut master,
+                &raw mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: `slave` is a valid open pty fd.
+        let name = unsafe { libc::ttyname(slave) };
+        assert!(
+            !name.is_null(),
+            "ttyname: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: ttyname returned a non-null NUL-terminated string.
+        let path = unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: plain fcntl on fds we just opened. CLOEXEC keeps both ends
+        // out of the child; O_NONBLOCK lets the drain read below return
+        // immediately when (as expected) nothing was written.
+        unsafe {
+            libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        // Raw mode: without it the line discipline echoes the simulated
+        // keystroke straight back to the master, and the "nothing landed"
+        // check below could not tell an echo from a forged write.
+        // SAFETY: `slave` is a valid tty fd; `t` is fully initialised by
+        // tcgetattr before it is read.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            libc::tcgetattr(slave, &raw mut t);
+            libc::cfmakeraw(&raw mut t);
+            libc::tcsetattr(slave, libc::TCSANOW, &raw const t);
+        }
+        (master, slave, path)
+    }
+
+    /// Read whatever is queued on the pty master without blocking.
+    fn drain_pty(master: libc::c_int) -> Vec<u8> {
+        let mut buf = [0u8; 4096];
+        // SAFETY: `master` is a valid non-blocking fd; `buf` is live and sized.
+        let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            buf[..usize::try_from(n).expect("read length fits usize")].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// GHSA-q3p2-6x2x-8w8w, both halves. The profile used to grant
+    /// `(allow file-write* (subpath "/dev"))`, so a sandboxed agent could open
+    /// `/dev/ttysNNN` — the PTY slave of any *other* terminal window the same
+    /// user has open — and write to it. Those bytes land in that terminal's
+    /// master read buffer, the same path the program's own stdout takes, so
+    /// the receiving emulator renders them: display forgery, and OSC 52
+    /// clipboard writes into a session the agent was never given. Reading the
+    /// same device is worse: it drains that terminal's input queue, so the
+    /// agent captures what the user types there and the real reader never
+    /// sees it.
+    ///
+    /// The victim pty is allocated by this test and torn down at the end.
+    #[test]
+    fn peer_terminal_access_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let (master, slave, victim) = open_victim_pty();
+
+        // Simulate the victim typing in their own window. Reading their slave
+        // consumes this from the input queue, so the theft is also a denial of
+        // service against whatever was supposed to receive it.
+        // SAFETY: `master` is a valid fd owned by this test.
+        let typed = b"secret-passphrase\n";
+        let written = unsafe { libc::write(master, typed.as_ptr().cast(), typed.len()) };
+        assert_eq!(
+            usize::try_from(written).unwrap_or(0),
+            typed.len(),
+            "seeding the victim pty failed"
+        );
+
+        // Marker is base64 "PWNED" in the OSC 52 payload, plus plain text —
+        // either one landing on the master means the hole is open.
+        let script = format!(
+            r#"
+if printf '\033]52;c;UE9XTkVE\a CPLT-PEER-TTY-MARKER' > "{victim}" 2>/dev/null; then echo "RESULT:peer_tty_write:OK"; else echo "RESULT:peer_tty_write:FAIL"; fi
+if printf 'x' > /dev/null 2>/dev/null; then echo "RESULT:dev_null_write:OK"; else echo "RESULT:dev_null_write:FAIL"; fi
+if printf 'x' > /dev/fd/1 >/dev/null 2>/dev/null; then echo "RESULT:dev_fd_write:OK"; else echo "RESULT:dev_fd_write:FAIL"; fi
+if head -c 8 /dev/urandom >/dev/null 2>&1; then echo "RESULT:dev_urandom_read:OK"; else echo "RESULT:dev_urandom_read:FAIL"; fi
+if IFS= read -r -t 5 STOLEN < "{victim}" 2>/dev/null; then echo "RESULT:peer_tty_read:OK"; echo "STOLEN:$STOLEN"; else echo "RESULT:peer_tty_read:FAIL"; fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        let landed = drain_pty(master);
+        // SAFETY: both fds are ours and still open.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_fail(&stdout, "peer_tty_write");
+        assert_result_fail(&stdout, "peer_tty_read");
+        assert!(
+            !stdout.contains("secret-passphrase"),
+            "keystrokes were captured from a peer terminal.\nstdout:\n{stdout}"
+        );
+        assert!(
+            landed.is_empty(),
+            "bytes reached a peer terminal: {:?}",
+            String::from_utf8_lossy(&landed)
+        );
+        // The same profile must keep the device writes a normal session needs.
+        assert_result_ok(&stdout, &stderr, "dev_null_write");
+        assert_result_ok(&stdout, &stderr, "dev_fd_write");
+        assert_result_ok(&stdout, &stderr, "dev_urandom_read");
+    }
+
     #[test]
     fn project_proxy_env_vars_injected() {
         require_sandbox!();
@@ -1710,6 +1856,127 @@ echo "RESULT:sent:OK"
         assert!(
             log_contents.contains("BLOCKED-PORT"),
             "Port 80 should be blocked.\nlog:\n{log_contents}"
+        );
+    }
+
+    // ============================================================
+    // Post-session audit integrity (GHSA-c47q-c3c8-7wrf)
+    // ============================================================
+
+    /// Flaw A, through the real binary: the session names a file with the
+    /// forgery payload — CR, erase-line, cursor-up, erase-line — and the audit
+    /// prints that name. Unescaped it rewrote the "Project changes: 1 file"
+    /// line above it with the session's own text, so the audit the user reads
+    /// to decide whether to trust the session said the session was clean.
+    ///
+    /// The property is byte-level: no ESC, no CR, nothing else a terminal acts
+    /// on may reach stderr, while the attempt itself stays visible as evidence.
+    #[test]
+    fn audit_neutralises_terminal_control_bytes_in_a_filename() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let dir = project.canonical_path().to_string_lossy().to_string();
+
+        // \033 is ESC in POSIX printf's octal escape. The name erases its own
+        // line, walks the cursor up, erases the line above and writes a forged
+        // verdict over it.
+        let script = format!(
+            "name=$(printf 'a\\r\\033[2K\\033[1A\\033[2K[cplt] no project file changes\\033[2K.txt')\n\
+             printf x > \"{dir}/$name\"\n\
+             echo 'RESULT:forge:OK'\n"
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "forge");
+        // The forged file really was created and really is in the report —
+        // without this the byte assertions below would pass vacuously.
+        assert!(
+            stderr.contains("Project changes: 1 file"),
+            "test premise: the audit must report the file.\nstderr: {stderr:?}"
+        );
+        for (name, byte) in [("ESC", '\u{1b}'), ("CR", '\r'), ("BEL", '\u{7}')] {
+            assert!(
+                !stderr.contains(byte),
+                "a raw {name} from a filename reached the terminal.\nstderr: {stderr:?}"
+            );
+        }
+        // Escaped, not stripped: a stripped payload reads as a typo, and the
+        // audit exists to show that something odd was attempted.
+        assert!(
+            stderr.contains("\\u{1b}"),
+            "the attempt must survive as evidence.\nstderr: {stderr:?}"
+        );
+    }
+
+    /// Flaw B, through the real binary: the session disowns a descendant that
+    /// writes a second after the direct child is reaped. The audit used to
+    /// sample git in between and print "no project file changes" for a write it
+    /// had already been told about.
+    #[test]
+    fn audit_waits_for_a_disowned_descendant_before_sampling() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        let dir = project.canonical_path().to_string_lossy().to_string();
+
+        let script = format!(
+            "(sleep 1; printf late > '{dir}/late.txt') &\n\
+             echo 'RESULT:disown:OK'\n"
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "disown");
+        assert!(
+            !stderr.contains("no project file changes"),
+            "a session with a pending write must never be reported clean.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("late.txt"),
+            "the late write must be in the report.\nstderr: {stderr}"
+        );
+    }
+
+    /// The other half of flaw B: a descendant that is STILL running when the
+    /// grace period expires. cplt cannot establish that the session stopped
+    /// writing, so it must say so — not print a clean verdict it has no
+    /// standing to give, and not kill a background process the user may have
+    /// wanted.
+    #[test]
+    fn audit_refuses_a_clean_verdict_while_the_session_is_still_running() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+
+        let script = "sleep 4 >/dev/null 2>&1 &\necho 'RESULT:linger:OK'\n";
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "linger");
+        assert!(
+            !stderr.contains("no project file changes"),
+            "an unverifiable session must never be reported clean.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("audit incomplete"),
+            "the audit must name itself incomplete.\nstderr: {stderr}"
+        );
+        // Specifically the settle warning: #217's unaudited-roots line also
+        // ends in "NOT audited", and must not be able to satisfy this.
+        assert!(
+            stderr.contains("the session left processes running"),
+            "the user must be told what is no longer covered.\nstderr: {stderr}"
         );
     }
 

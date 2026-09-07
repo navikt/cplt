@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::proxy::normalize_hostname;
+use crate::proxy::{NetPolicy, normalize_hostname};
 
 /// How often file-backed domain lists are re-read from disk.
 /// Within the TTL window, cached values are returned without I/O.
@@ -135,10 +135,12 @@ pub struct PolicySpec {
     /// Domains from cached blocklist subscriptions (#144), frozen at startup.
     /// UNIONed with `blocked_file`. Tighten-only: can only ever ADD blocks.
     pub subscription_blocklist: Vec<String>,
-    /// User allowlist file. Re-read every [`RELOAD_TTL`].
+    /// User allowlist file. Re-read every [`RELOAD_TTL`]. Setting this makes
+    /// the allowlist *active*: the file must exist at startup, and an empty one
+    /// denies every domain rather than allowing all of them.
     pub allowed_domains_file: Option<PathBuf>,
-    /// Allowlist domains from CLI/config, used when the file does not exist yet
-    /// (or when there is no file at all).
+    /// Allowlist domains from CLI/config, used when there is no file at all.
+    /// A configured-but-missing file is a startup error, not a fallback.
     pub allowed_domains_initial: Vec<String>,
     /// The agent's built-in fail-closed allowlist (#52), frozen at startup.
     /// Empty = feature off (unchanged allow-all).
@@ -174,6 +176,14 @@ pub struct DomainPolicy {
     pub allow_localhost_ports: Vec<u16>,
     /// Whether every localhost port is open.
     pub allow_localhost_any: bool,
+    /// Whether a domain allowlist is configured for this session — the agent's
+    /// built-in default allowlist or an explicit `allowed_domains` file.
+    ///
+    /// This is the *intent* bit the CONNECT gate consults. It is deliberately
+    /// not derived from `allowed_domains()` being non-empty: a configured
+    /// allowlist that reloads to zero entries (someone empties the file
+    /// mid-session) must deny everything, not revert to allow-all.
+    pub allowlist_active: bool,
 }
 
 impl DomainPolicy {
@@ -183,16 +193,26 @@ impl DomainPolicy {
     /// - a blocklist file that exists but cannot be read is an error, so a
     ///   corrupt blocklist can never silently degrade to "block nothing";
     /// - an allowlist file that exists but cannot be read is an error, so a
-    ///   fail-closed allowlist can never silently degrade to "allow all".
+    ///   fail-closed allowlist can never silently degrade to "allow all";
+    /// - an allowlist file that does not exist is an error for the same reason:
+    ///   a run that was asked to restrict egress must not come up unrestricted
+    ///   because the file was never written or is absent on this machine.
     ///
-    /// A file that does not exist is not an error for either: the blocklist
-    /// starts empty and the allowlist falls back to `allowed_domains_initial`,
-    /// both of which are today's behaviour for a not-yet-written file.
+    /// A missing *blocklist* file is not an error — it starts empty, which is
+    /// today's behaviour for a not-yet-written file and does not weaken a
+    /// restriction the user asked for.
     pub fn build(spec: PolicySpec, now: Instant) -> Result<Self, String> {
         let mut ports: Vec<u16> = vec![443];
         ports.extend_from_slice(&spec.allowed_ports);
         ports.sort_unstable();
         ports.dedup();
+
+        // The intent bit: did anything ask for a domain allowlist this run?
+        // Captured from the *sources*, before any of them is read, so an
+        // allowlist that parses to zero domains still counts as active.
+        let allowlist_active = !spec.default_allowlist.is_empty()
+            || spec.allowed_domains_file.is_some()
+            || !spec.allowed_domains_initial.is_empty();
 
         let blocked_initial = if spec.blocked_file.exists() {
             parse_lines_file(&spec.blocked_file).ok_or_else(|| {
@@ -208,9 +228,8 @@ impl DomainPolicy {
         let allowlist_initial = match spec.allowed_domains_file.as_deref() {
             Some(path) if path.exists() => parse_lines_file(path)
                 .ok_or_else(|| format!("Cannot read allowed domains file {}", path.display()))?,
-            // File not written yet — seed from config, which the file will
-            // take over from at the first successful reload.
-            Some(_) | None => spec.allowed_domains_initial,
+            Some(path) => return Err(missing_allowlist_error(path)),
+            None => spec.allowed_domains_initial,
         };
 
         // Private domains whose source is read exactly once — CLI flags and
@@ -252,6 +271,7 @@ impl DomainPolicy {
             allowed_ports: ports,
             allow_localhost_ports: spec.allow_localhost_ports,
             allow_localhost_any: spec.allow_localhost_any,
+            allowlist_active,
         })
     }
 
@@ -263,11 +283,30 @@ impl DomainPolicy {
     }
 
     /// Effective allowlist: the reloadable user file merged with the agent's
-    /// built-in defaults. Empty = allow-all (the feature is off); non-empty
-    /// means the CONNECT gate fail-closes on anything unlisted.
+    /// built-in defaults. Whether it is *enforced* is [`Self::allowlist_active`],
+    /// not whether this is empty — an active allowlist with no entries denies
+    /// every domain.
     #[must_use]
     pub fn allowed_domains(&self, now: Instant) -> Vec<String> {
         self.allowed.current(now)
+    }
+
+    /// Snapshot the effective CONNECT policy at `now` for static classification.
+    ///
+    /// This is the one place a [`NetPolicy`] is built from live policy, so the
+    /// proxy's own gates and the `cplt check net` diagnostic read the same
+    /// fields — including `allowlist_active`, which decides enforcement.
+    #[must_use]
+    pub fn net_policy(&self, now: Instant) -> NetPolicy {
+        NetPolicy {
+            allowed_ports: self.allowed_ports.clone(),
+            allowed_domains: self.allowed_domains(now),
+            allowlist_active: self.allowlist_active,
+            blocked_domains: self.blocked_domains(now),
+            allow_localhost_ports: self.allow_localhost_ports.clone(),
+            allow_localhost_any: self.allow_localhost_any,
+            private_domains: self.private_domains(now),
+        }
     }
 
     /// Effective private-domain waiver list: sticky CLI/repo entries plus the
@@ -276,6 +315,31 @@ impl DomainPolicy {
     pub fn private_domains(&self, now: Instant) -> Vec<String> {
         self.private.current(now)
     }
+}
+
+/// The startup refusal for a configured `allowed_domains` file that is not on
+/// disk.
+///
+/// Shared by `cplt`'s pre-flight check and [`DomainPolicy::build`] so the two
+/// can never disagree about whether the run may proceed. The wording has to
+/// carry the whole decision, because the two ways to mean "no allowlist" now
+/// have opposite outcomes and neither is guessable from the file's absence.
+#[must_use]
+pub fn missing_allowlist_error(path: &Path) -> String {
+    format!(
+        "Domain allowlist file not found: {}\n  \
+         This run was configured to restrict egress to an allowlist, so cplt \
+         refuses to start rather than come up allowing every domain.\n  \
+         Fix it in one of these ways:\n    \
+         - create {} with the domains you want reachable, one per line;\n    \
+         - drop the `allowed_domains` key (or --allowed-domains) to run with no \
+         allowlist, which allows all domains;\n    \
+         - pass --allow-all-domains to allow every domain for this run only.\n  \
+         Note that an EMPTY allowlist file is not the same as no allowlist: it \
+         is an allowlist with nothing on it, and blocks every domain.",
+        path.display(),
+        path.display()
+    )
 }
 
 /// Parse a one-domain-per-line file (blocklist or allowlist format).
@@ -715,26 +779,231 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_falls_back_to_initial_until_the_file_exists() {
-        let dir = test_dir("allowlist-initial");
+    fn build_refuses_a_configured_allowlist_file_that_is_missing() {
+        // F03: this used to fall back to `allowed_domains_initial` (always
+        // empty in production) and start with NO allowlist — the user asked to
+        // restrict egress and silently got allow-all.
+        let dir = test_dir("allowlist-missing");
         let path = dir.join("not-written-yet.txt");
+
+        let err = DomainPolicy::build(
+            PolicySpec {
+                allowed_domains_file: Some(path.clone()),
+                allowed_domains_initial: vec!["github.com".to_string()],
+                ..PolicySpec::default()
+            },
+            Instant::now(),
+        )
+        .err()
+        .expect("a configured allowlist file that is absent must refuse startup");
+        assert!(err.contains(&path.display().to_string()), "names the file");
+        assert!(
+            err.contains("--allow-all-domains"),
+            "offers the intentional allow-all escape hatch: {err}"
+        );
+        assert!(
+            err.contains("EMPTY allowlist file is not the same as no allowlist"),
+            "distinguishes the two ways to mean 'no allowlist': {err}"
+        );
+
+        // Once written, the same spec builds and enforces the file.
+        std::fs::write(&path, "internal.example.com\n").unwrap();
+        let now = Instant::now();
+        let policy = policy(
+            PolicySpec {
+                allowed_domains_file: Some(path),
+                ..PolicySpec::default()
+            },
+            now,
+        );
+        assert_eq!(policy.allowed_domains(now), vec!["internal.example.com"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowlist_initial_still_seeds_a_fileless_allowlist() {
+        // No file at all: the config-supplied domains are the whole allowlist,
+        // and they make it active.
+        let now = Instant::now();
+        let policy = policy(
+            PolicySpec {
+                allowed_domains_initial: vec!["github.com".to_string()],
+                ..PolicySpec::default()
+            },
+            now,
+        );
+        assert!(policy.allowlist_active);
+        assert_eq!(policy.allowed_domains(now), vec!["github.com"]);
+    }
+
+    /// The four states F03 conflated. `allowlist_active` is what separates
+    /// "no allowlist" (allow-all) from "an allowlist with nothing on it"
+    /// (deny-all); the effective list alone cannot tell them apart.
+    #[test]
+    fn allowlist_active_tracks_configuration_not_contents() {
+        let dir = test_dir("allowlist-states");
+        let now = Instant::now();
+
+        // 1. Disabled: nothing configured => allow-all.
+        let off = policy(PolicySpec::default(), now);
+        assert!(
+            !off.allowlist_active,
+            "nothing configured is not an allowlist"
+        );
+        assert!(off.allowed_domains(now).is_empty());
+        assert_eq!(
+            crate::proxy::classify_connect(&off.net_policy(now), "anything.example", 443),
+            crate::proxy::NetVerdict::Allowed
+        );
+
+        // 2. Enabled but empty: a file with only comments and blank lines.
+        let empty = dir.join("empty.txt");
+        std::fs::write(&empty, "# nothing here yet\n\n").unwrap();
+        let enabled_empty = policy(
+            PolicySpec {
+                allowed_domains_file: Some(empty),
+                ..PolicySpec::default()
+            },
+            now,
+        );
+        assert!(enabled_empty.allowlist_active);
+        assert!(enabled_empty.allowed_domains(now).is_empty());
+        assert_eq!(
+            crate::proxy::classify_connect(&enabled_empty.net_policy(now), "github.com", 443),
+            crate::proxy::NetVerdict::BlockedAllowlist,
+            "an allowlist with nothing on it must deny every domain, not allow all"
+        );
+
+        // 3. Enabled and populated: only the listed domain gets through.
+        let populated = dir.join("allowed.txt");
+        std::fs::write(&populated, "github.com\n").unwrap();
+        let enabled_full = policy(
+            PolicySpec {
+                allowed_domains_file: Some(populated),
+                ..PolicySpec::default()
+            },
+            now,
+        );
+        assert!(enabled_full.allowlist_active);
+        let np = enabled_full.net_policy(now);
+        assert_eq!(
+            crate::proxy::classify_connect(&np, "github.com", 443),
+            crate::proxy::NetVerdict::Allowed
+        );
+        assert_eq!(
+            crate::proxy::classify_connect(&np, "evil.example", 443),
+            crate::proxy::NetVerdict::BlockedAllowlist
+        );
+
+        // 4. Configured but missing: refused at build, never reaching a policy.
+        assert!(
+            DomainPolicy::build(
+                PolicySpec {
+                    allowed_domains_file: Some(dir.join("gone.txt")),
+                    ..PolicySpec::default()
+                },
+                now,
+            )
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emptying_the_allowlist_file_denies_instead_of_allowing_all() {
+        // Hot reload: emptying the file is a real edit that REVOKES every
+        // domain. It must tighten to deny-all, not relax to allow-all.
+        let dir = test_dir("allowlist-emptied");
+        let path = dir.join("allowed.txt");
+        std::fs::write(&path, "github.com\n").unwrap();
+
+        let now = Instant::now();
+        let user_only = policy(
+            PolicySpec {
+                allowed_domains_file: Some(path.clone()),
+                ..PolicySpec::default()
+            },
+            now,
+        );
+        assert_eq!(
+            crate::proxy::classify_connect(&user_only.net_policy(now), "github.com", 443),
+            crate::proxy::NetVerdict::Allowed
+        );
+
+        std::fs::write(&path, "# all revoked\n").unwrap();
+        let later = stale(now);
+        assert!(user_only.allowed_domains(later).is_empty());
+        assert_eq!(
+            crate::proxy::classify_connect(&user_only.net_policy(later), "github.com", 443),
+            crate::proxy::NetVerdict::BlockedAllowlist,
+            "an emptied allowlist must revoke access, not restore allow-all"
+        );
+
+        // With `proxy.default_allowlist` on, the agent's built-in domains are
+        // sticky, so emptying the file revokes only the user's additions. That
+        // is why the exposure is an explicit `allowed_domains` file WITHOUT
+        // `--default-allowlist`.
+        std::fs::write(&path, "internal.example.com\n").unwrap();
+        let with_defaults = policy(
+            PolicySpec {
+                allowed_domains_file: Some(path.clone()),
+                default_allowlist: vec!["github.com".to_string()],
+                ..PolicySpec::default()
+            },
+            now,
+        );
+        std::fs::write(&path, "# all revoked\n").unwrap();
+        let np = with_defaults.net_policy(stale(now));
+        assert_eq!(
+            crate::proxy::classify_connect(&np, "github.com", 443),
+            crate::proxy::NetVerdict::Allowed,
+            "agent defaults survive an emptied file"
+        );
+        assert_eq!(
+            crate::proxy::classify_connect(&np, "internal.example.com", 443),
+            crate::proxy::NetVerdict::BlockedAllowlist,
+            "the user's own entry is revoked with the file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_or_unreadable_allowlist_file_keeps_last_good() {
+        // The documented fail-safe (docs/proxy.md): a file that cannot be READ
+        // is an error condition, not an edit, so the last-good list stands.
+        // This is the deliberate asymmetry with the emptied-file case above.
+        let dir = test_dir("allowlist-deleted");
+        let path = dir.join("allowed.txt");
+        std::fs::write(&path, "github.com\n").unwrap();
 
         let now = Instant::now();
         let policy = policy(
             PolicySpec {
                 allowed_domains_file: Some(path.clone()),
-                allowed_domains_initial: vec!["github.com".to_string()],
                 ..PolicySpec::default()
             },
             now,
         );
         assert_eq!(policy.allowed_domains(now), vec!["github.com"]);
 
-        // Once written, the file takes over at the next refresh.
-        std::fs::write(&path, "internal.example.com\n").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let later = stale(now);
         assert_eq!(
-            policy.allowed_domains(stale(now)),
-            vec!["internal.example.com"]
+            policy.allowed_domains(later),
+            vec!["github.com"],
+            "a deleted allowlist keeps the last-good list"
+        );
+
+        // Unreadable rather than absent: a directory where a file belongs.
+        std::fs::create_dir(&path).unwrap();
+        let later = stale(later);
+        assert_eq!(
+            policy.allowed_domains(later),
+            vec!["github.com"],
+            "an unreadable allowlist keeps the last-good list"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

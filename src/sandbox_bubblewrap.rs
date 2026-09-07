@@ -145,6 +145,7 @@ pub(crate) fn check_availability() -> Option<PathBuf> {
 /// [`build_bwrap_args`] (plus `/bin/true`) so the probe can never drift from
 /// the real invocation. Catches hardened hosts where `bwrap` exists but user
 /// namespaces are disabled.
+#[allow(clippy::disallowed_methods)] // bwrap_path comes from git::trusted_binary("bwrap")
 pub(crate) fn test_functionality(
     bwrap_path: &Path,
     fs_rules: &[FsRule],
@@ -274,28 +275,40 @@ pub(crate) fn build_bwrap_args(
 
     // ── Writable overlays, shallowest first so parents are bound before
     //    children (bwrap applies operations in order). ──
-    let mut writable: Vec<&FsRule> = fs_rules.iter().filter(|r| r.access.write).collect();
-    writable.sort_by_key(|r| r.path.components().count());
-    let mut bound_writable: Vec<&Path> = Vec::new();
-
-    for rule in writable {
-        let path = &rule.path;
+    //
+    //    Canonicalized, the way `build_deny_masks` already canonicalizes its
+    //    input, and for the same reason: two rules can name the same inode
+    //    through different paths. `--allow-docker` grants both
+    //    `/run/docker.sock` and `/var/run/docker.sock`, and on a host where
+    //    `/var/run` is a symlink to `/run` those are one file. bwrap aborts the
+    //    whole sandbox on the second bind, which with `--use-bubblewrap` is a
+    //    hard failure and in auto-detect mode is worse: `resolve` downgrades a
+    //    wrapper-build failure to one warning line and runs Landlock-only, so
+    //    the socket masks, the `.git/hooks` overlay and the host-persistence
+    //    overlays all silently disappear. Canonicalization also doubles as the
+    //    existence check Landlock performs (it drops rules for paths that do
+    //    not exist).
+    let mut writable: Vec<PathBuf> = fs_rules
+        .iter()
+        .filter(|r| r.access.write)
+        .filter_map(|r| r.path.canonicalize().ok())
         // Skip bwrap-managed subtrees and the /tmp mount point itself.
-        if path.starts_with("/proc")
-            || path.starts_with("/dev")
-            || path.starts_with("/sys")
-            || path == Path::new("/tmp")
-        {
-            continue;
-        }
-        // Landlock silently drops rules for non-existent paths; mirror that so
-        // we don't hand bwrap a bind source that does not exist.
-        if !path.exists() {
-            continue;
-        }
+        .filter(|p| {
+            !(p.starts_with("/proc")
+                || p.starts_with("/dev")
+                || p.starts_with("/sys")
+                || p == Path::new("/tmp"))
+        })
+        .collect();
+    writable.sort();
+    writable.dedup();
+    writable.sort_by_key(|p| p.components().count());
+
+    let mut bound_writable: Vec<PathBuf> = Vec::new();
+    for path in writable {
         let path_str = path.to_string_lossy().into_owned();
         args.extend(["--bind".to_string(), path_str.clone(), path_str]);
-        bound_writable.push(path.as_path());
+        bound_writable.push(path);
     }
 
     // ── Read-only overlays for non-writable rules under /tmp (#299) ──
@@ -1222,6 +1235,40 @@ mod tests {
     }
 
     #[test]
+    fn writable_rules_naming_the_same_file_are_bound_once() {
+        // Regression: `--allow-docker` grants both /run/docker.sock and
+        // /var/run/docker.sock, one file on any host where /var/run is a
+        // symlink to /run. Two --bind ops for one inode make bwrap abort the
+        // whole sandbox, and in auto-detect mode `resolve` turns that abort
+        // into a warning + Landlock-only — the bubblewrap layer vanishes
+        // silently. Any two rules that canonicalize to the same path must
+        // collapse into a single bind.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("create real dir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let canon = real.canonicalize().expect("canonicalize");
+        let canon_str = canon.to_string_lossy().into_owned();
+
+        let rules = vec![
+            writable_rule(&link.to_string_lossy()),
+            writable_rule(&real.to_string_lossy()),
+        ];
+        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+
+        let binds = args
+            .windows(3)
+            .filter(|w| w[0] == "--bind" && w[1] == canon_str && w[2] == canon_str)
+            .count();
+        assert_eq!(binds, 1, "aliased writable rules must produce one bind");
+        assert!(
+            !args.iter().any(|a| *a == link.to_string_lossy()),
+            "the symlinked alias must not get a bind of its own"
+        );
+    }
+
+    #[test]
     fn nonexistent_writable_paths_are_skipped() {
         let rules = vec![writable_rule("/definitely/not/a/real/path/xyzzy")];
         let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
@@ -1347,14 +1394,39 @@ mod tests {
         // The protected set is deliberately narrow: exactly the
         // `LinuxCoverage::Bwrap` entries of `PROTECTED_IN_ROOT` and
         // `PROTECTED_IN_GITDIR` — .git/hooks, .git/info/exclude, .cplt.toml,
-        // .agents/plugins and .github/hooks.
+        // .agents/plugins, .github/hooks, and the H-11 agent auto-exec paths
+        // (.opencode/{plugin,plugins,tool,tools}, opencode.json(c), .claude/settings*.json,
+        // .claude-plugin, .mcp.json, .pi/extensions, .pi/settings.json).
         // .git/config / .gitmodules must stay writable so legit in-sandbox git
         // config/remote/submodule ops (and their lock files) are not broken —
-        // even when those files exist on disk.
+        // even when those files exist on disk. Only paths that EXIST at launch
+        // are bound (nested-repo depth is macOS-only), so each H-11 path is
+        // created below to prove it reaches the bind.
         let proj = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(proj.path().join(".git/hooks")).expect("create .git/hooks");
         std::fs::create_dir_all(proj.path().join(".agents/plugins")).expect("create plugins");
         std::fs::create_dir_all(proj.path().join(".github/hooks")).expect("create .github/hooks");
+        for d in [
+            ".opencode/plugins",
+            ".opencode/plugin",
+            ".opencode/tools",
+            ".opencode/tool",
+        ] {
+            std::fs::create_dir_all(proj.path().join(d)).expect("create opencode dir");
+        }
+        std::fs::create_dir_all(proj.path().join(".claude-plugin")).expect("create claude-plugin");
+        std::fs::create_dir_all(proj.path().join(".pi/extensions")).expect("create pi ext");
+        std::fs::create_dir_all(proj.path().join(".claude")).expect("create .claude");
+        for f in [
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".mcp.json",
+            "opencode.json",
+            "opencode.jsonc",
+            ".pi/settings.json",
+        ] {
+            std::fs::write(proj.path().join(f), "").expect("create H-11 file");
+        }
         std::fs::create_dir_all(proj.path().join(".git/info")).expect("create .git/info");
         std::fs::write(proj.path().join(".git/info/exclude"), "").expect("create info/exclude");
         std::fs::write(proj.path().join(".git/config"), "").expect("create .git/config");
@@ -1400,6 +1472,31 @@ mod tests {
                 && w[1] == proj.path().join(".git/info/exclude").to_string_lossy()),
             ".git/info/exclude must be re-bound read-only"
         );
+        // H-11: every agent auto-exec path is `LinuxCoverage::Bwrap`, so each
+        // must reach `build_bwrap_args` as a read-only bind — the end-to-end pin
+        // that the table additions are enforced on Linux too (bubblewrap only,
+        // never Landlock).
+        for rel in [
+            ".opencode/plugins",
+            ".opencode/plugin",
+            ".opencode/tools",
+            ".opencode/tool",
+            "opencode.json",
+            "opencode.jsonc",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".claude-plugin",
+            ".mcp.json",
+            ".pi/extensions",
+            ".pi/settings.json",
+        ] {
+            let path = proj.path().join(rel).to_string_lossy().into_owned();
+            assert!(
+                args.windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == path && w[2] == path),
+                "{rel} must be re-bound read-only (source and dest both {path})"
+            );
+        }
         // .git/config and .gitmodules are NOT re-bound (stay writable), even
         // though both exist on disk — the narrowing, not the exists-check, is
         // what leaves them out.

@@ -127,12 +127,21 @@ pub fn discover_auth(home_dir: &Path) -> AuthDiscovery {
         .map(std::string::ToString::to_string)
         .collect();
 
-    let gh_cli_auth = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    // Trusted path, not PATH (#239): this runs in the unsandboxed parent, and
+    // `gh` is one of the binaries an agent can plant in a write+exec grant. It
+    // also answers the question that actually matters — `extract_gh_token`
+    // consults a trusted `gh` and nothing else, so a `gh` outside those
+    // directories genuinely does not supply the token, whatever it would say
+    // here.
+    let gh_cli_auth = crate::git::trusted_binary("gh").is_some_and(|gh| {
+        #[allow(clippy::disallowed_methods)] // resolved above, not a PATH lookup
+        std::process::Command::new(gh)
+            .args(["auth", "token"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    });
 
     let gh_config_exists = home_dir.join(".config/gh/hosts.yml").exists();
 
@@ -231,6 +240,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// after the probe itself exits, and an unbounded join there would reintroduce
 /// exactly the hang this function exists to remove. A detached reader blocked
 /// on a pipe costs one thread in a process that exits moments later.
+#[allow(clippy::disallowed_methods)] // runs an already-resolved discovered path; trusting it is #248, not resolution
 fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
     let Ok(mut child) = std::process::Command::new(path)
         .args(args)
@@ -988,10 +998,12 @@ fn print_sandbox_mechanism_status() -> bool {
             println!("      Check: cat /sys/kernel/security/lsm (should include 'landlock')");
             false
         };
-        if let Ok(uname) = std::process::Command::new("uname").arg("-r").output()
-            && uname.status.success()
-        {
-            let kernel = String::from_utf8_lossy(&uname.stdout);
+        // The kernel release, read rather than spawned. This branch is
+        // Linux-only, so `/proc/sys/kernel/osrelease` holds exactly what
+        // `uname -r` prints — and a spawn here was a bare-name PATH lookup in
+        // the unsandboxed parent, which is the class #239 closes. No spawn
+        // beats a trusted spawn.
+        if let Ok(kernel) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
             println!(
                 "  {}✓{} Kernel: {}",
                 ui::stdout_color(ui::GREEN),
@@ -1513,6 +1525,7 @@ fn find_native_modules(home_dir: &Path, module_name: &str) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
 

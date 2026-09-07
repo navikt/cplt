@@ -42,7 +42,7 @@ cplt config set sandbox.quiet true
 cplt config set proxy.port 9090
 cplt config set allow.read ~/Desktop
 cplt config set allow.ports 8080
-cplt config set git_guard.mode block     # the git guard is on but warns by default
+cplt config set git_guard.mode warn      # the git guard blocks by default
 cplt config set gh_guard.enabled false   # opt out of the gh guard
 ```
 
@@ -92,7 +92,7 @@ preset = "standard"
 
 ¹ `standard` leaves the per-session scratch directory on, which is the default and what most tools need. `allow_tmp_exec` (raw `/tmp` exec) stays off. `standard` is identical to cplt's hardcoded defaults, so omitting `--preset` behaves exactly like `--preset standard`.
 
-`gh_guard` and `git_guard` are on under `standard` (the default posture), with the git guard in `warn` mode. `strict` additionally escalates the git guard to `block` and turns on `proxy.forced` (mandatory proxy, kernel egress locked to it) and `proxy.default_allowlist` (fail-closed domain filtering, where only the agent's built-in allowlist plus any `allowed_domains` resolve and everything else is blocked). The last two are orthogonal and compose: the kernel pins egress to the proxy, then the proxy filters domains. `permissive` and `full-trust` turn both guards back off along with weakening the sandbox toggles.
+`gh_guard` and `git_guard` are on under `standard` (the default posture), both in `block` mode; the git guard blocks pushes to the default branch only (`protect_default_branch_only`), so feature-branch pushes still work. `strict` additionally drops that relaxation — every push is blocked — and turns on `proxy.forced` (mandatory proxy, kernel egress locked to it) and `proxy.default_allowlist` (fail-closed domain filtering, where only the agent's built-in allowlist plus any `allowed_domains` resolve and everything else is blocked). The last two are orthogonal and compose: the kernel pins egress to the proxy, then the proxy filters domains. `permissive` and `full-trust` turn both guards back off along with weakening the sandbox toggles.
 
 Because `strict` only enables safety features, `config set sandbox.preset strict` needs no `--force`, unlike `permissive` and `full-trust`, which weaken the sandbox. To take the strict baseline but keep the network open, add `--allow-all-domains` (or `proxy.default_allowlist = false`). That overrides just the allowlist, since an explicit off beats the baseline.
 
@@ -148,7 +148,6 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | all `[proxy.subscriptions]` keys | subscription sources are security-sensitive, and a repo must not be able to add one |
 | all `[gh_guard]` keys | guard policy is configured globally, not per-repo |
 | all `[git_guard]` keys | guard policy is configured globally, not per-repo |
-| all `[audit]` keys | audit destination and level are a local concern |
 
 ### Removing values
 
@@ -170,7 +169,7 @@ cplt config validate                      # check for syntax errors and unknown 
 
 ## Configuration file
 
-The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, `[git_guard]`, and `[audit]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
+The config file lives at `~/.config/cplt/config.toml`. `cplt config init` writes a commented starter template there. It covers `[proxy]`, `[proxy.subscriptions]`, `[allow]`, `[deny]`, `[sandbox]`, `[gh_guard]`, and `[git_guard]`, with every key commented out and documented inline, so a fresh file changes nothing until you uncomment something. Run it and read the result rather than copying a snippet from here, since the template is generated from `src/config/path.rs` and moves with the code:
 
 ```bash
 cplt config init

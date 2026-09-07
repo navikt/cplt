@@ -1305,6 +1305,45 @@ struct ResolvedContext {
     unapproved_proposals: Vec<String>,
 }
 
+/// Warn when the binary cplt is about to launch is a shim whose real target the
+/// sandbox does not grant execute on (#390).
+///
+/// Preflight, not post-mortem: the kernel refuses the `execve` inside the
+/// sandbox and the parent sees only exit 126, with nothing to attribute it to.
+/// Naming the resolved path before launch is the only place cplt can turn that
+/// into something actionable. Not gated on `quiet` — like the writable-agent-dir
+/// warning above it, this is about the sandbox boundary, not progress.
+fn warn_shim_target_without_exec(policy: &sandbox::LandlockPolicy, bin: &Path) {
+    if let Some(target) = cplt::check::shim_target_without_exec(policy, bin) {
+        let dir = target.parent().unwrap_or(&target);
+        ui::warn(&format!(
+            "{} is a shim resolving to {}, which this run does not grant execute on. \
+             The sandbox checks the target, not the shim, so it will fail with exit 126 \
+             and no message. Grant it with --allow-exec {} (or [sandbox] allow.exec) and rerun.",
+            bin.display(),
+            target.display(),
+            dir.display()
+        ));
+    }
+}
+
+/// Warn about `allow.write` grants that shadow a directory this run grants
+/// execute on (#243, #343).
+///
+/// `agent` is the agent whose profile is actually built, not the one detected
+/// for the session: `cplt exec` and `cplt check` always build Shell, and a
+/// warning naming Copilot's `~/.copilot` there would describe an effect that
+/// session cannot have.
+fn warn_exec_tool_dir_shadowing(
+    resolved: &config::Resolved,
+    home_dir: &std::path::Path,
+    agent: agent::Agent,
+) {
+    for w in resolved.exec_tool_dir_warnings(home_dir, agent) {
+        ui::warn(&w);
+    }
+}
+
 /// Load config, merge CLI flags, resolve paths, detect agent, print info messages.
 fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContext> {
     // Canonicalize CLI paths for consistency with config path handling
@@ -1650,16 +1689,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
              Grant a directory cplt never executes from, or drop this grant.",
             cplt::git::TRUSTED_BIN_DIRS.join(", ")
         ));
-    }
-
-    // #243 closed the write-then-exec hole by denying process-exec across an
-    // allow.write tree. Nothing is dropped — the write grant is honoured in
-    // full — but a tool directory swallowed by that grant loses the execute
-    // right it had by default, and the tool then fails with nothing pointing
-    // back at the grant. Narrow: only fires where a process-exec tool dir is
-    // actually shadowed, so the ordinary `allow.write` on a work tree is silent.
-    for (granted, dirs) in resolved.write_grants_over_exec_tool_dirs(&home_dir) {
-        ui::warn(&cplt::config::exec_tool_dir_warning(&granted, &dirs));
     }
 
     // Show unapproved permissions warning (non-fatal — deny-default keeps us safe)
@@ -2178,11 +2207,15 @@ fn start_proxy_if_enabled(
                 }
                 Err(e) => bail!("Failed to load allowed domains: {e}"),
             }
-        } else if !resolved.quiet {
-            ui::info(&format!(
-                "Domain allowlist file: {} (not found)",
-                path.display()
-            ));
+        } else {
+            // Fail closed, loudly. A configured allowlist whose file is absent
+            // used to print an informational line (suppressed by -q) and then
+            // run with no allowlist at all — the user asked for restricted
+            // egress and silently got allow-all. `DomainPolicy::build` refuses
+            // this too; the check is repeated here so the refusal arrives
+            // before anything else starts and carries the full explanation
+            // rather than being wrapped in "Failed to start proxy".
+            bail!("{}", proxy::missing_allowlist_error(path));
         }
     }
 
@@ -2613,6 +2646,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         unapproved_proposals: _,
     } = resolve_context(&cli, false)?;
 
+    warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
+
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
 
@@ -2649,6 +2684,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     let AssembledSandbox {
         prepared,
+        policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
         #[cfg(target_os = "macos")]
@@ -2689,15 +2725,50 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         Err(msg) => bail!("{msg}"),
     };
 
-    // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
-    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
-    // so extraction must happen here, outside. SEA extraction applies to both
-    // macOS (~/Library/Caches/copilot/pkg/) and Linux (~/.cache/copilot/pkg/).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if active_agent.needs_sea_extraction() {
-        copilot_extract::ensure_copilot_extracted(&agent_bin, &home_dir, &project_dir)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // #248: the agent binary is spawned by the UNSANDBOXED parent, from wherever
+    // it was discovered. #236 moved cplt's own helpers onto trusted-directory
+    // resolution and #286 took write back across the PATH bin/shim dirs, but the
+    // agent's own binary legitimately lives where the user's version manager put
+    // it, so there is no trusted list to move it onto — only the discovered path
+    // to check.
+    //
+    // Warn and proceed. Refusing would break the ordinary mise/npm install for a
+    // large share of users, and a launch that stops working is not a trade this
+    // buys anything with: the same agent already ran once to get the write.
+    // Asked of the emitted rules, so it fires only where the policy really does
+    // grant write, and not gated on `quiet` — it is a sandbox-boundary warning,
+    // not progress chatter.
+    if let Some(tree) = cplt::check::writable_tree_over(&policy, &home_dir, &agent_bin) {
+        // The suggested destinations come from the same predicate that fired,
+        // so the advice cannot contradict the finding: with an `allow.write`
+        // over ~/.local/bin, ~/.local/bin is not offered.
+        let file_name = agent_bin
+            .file_name()
+            .unwrap_or_else(|| active_agent.binary_name().as_ref());
+        let safe = cplt::check::read_only_install_dirs(&policy, &home_dir, file_name);
+        let advice = if safe.is_empty() {
+            "Move it out of that tree, or drop the write grant that covers it, and rerun."
+                .to_string()
+        } else {
+            format!(
+                "Install it somewhere this run keeps read-only ({}) and rerun.",
+                safe.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        ui::warn(&format!(
+            "the {active_agent} binary at {} sits under {}, which the sandbox makes writable. \
+             cplt spawns the agent binary OUTSIDE the sandbox, as you, so an agent that \
+             rewrites it there gets unsandboxed execution on your next cplt launch — no \
+             approval, no prompt. {advice}",
+            agent_bin.display(),
+            tree.display()
+        ));
     }
+
+    warn_shim_target_without_exec(&policy, &agent_bin);
 
     // Preflight: verify the sandbox mechanism works on this system
     if !resolved.no_validate {
@@ -2717,6 +2788,21 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
+    }
+
+    // Ensure Copilot's bundled runtime is extracted before entering the sandbox.
+    // Writes to copilot/pkg are denied inside the sandbox (write-then-exec defense),
+    // so extraction must happen here, outside. SEA extraction applies to both
+    // macOS (~/Library/Caches/copilot/pkg/) and Linux (~/.cache/copilot/pkg/).
+    //
+    // Deliberately after the confirmation: extraction spawns copilot outside the
+    // sandbox, as the user, and its `-p exit` fallback is a full agent session.
+    // Nothing runs that agent before the user has agreed to launch it (F05). The
+    // spawns themselves are isolated in `copilot_extract::extraction_command`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if active_agent.needs_sea_extraction() {
+        copilot_extract::ensure_copilot_extracted(&agent_bin, &home_dir, &project_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // Persistent layer of the sandbox brief (issue #148). Deliberately the
@@ -2990,6 +3076,7 @@ fn perform_gate_effect(
 
 /// Replace this process with the real binary. `repo_scope` pins `GH_REPO`, which
 /// only `gh` reads — the git guard always passes `None`.
+#[allow(clippy::disallowed_methods)] // runs INSIDE the sandbox as cplt gh-gate/git-gate; the wrapper resolves the real binary through PATH deliberately
 fn exec_real(
     real_binary: &Path,
     name: &str,
@@ -3369,6 +3456,25 @@ fn assemble_sandbox(
     // After pre-creation, so a dir we just made resolves too. See #171.
     agent::canonicalize_agent_dirs(&mut agent_dirs);
 
+    // An agent config dir can be relocated by an env var the user (or a repo, or
+    // an attacker) controls — CLAUDE_CONFIG_DIR is used raw, the XDG_* bases feed
+    // the rest. Like the project root and the tool dirs, one that resolves to a
+    // system root or $HOME would hand the agent a writable grant over the whole
+    // tree that the additive Landlock/Seatbelt model cannot claw back (audit
+    // C-02). Refuse loudly rather than silently narrowing or dropping the grant:
+    // a dropped grant would still pass the same dir to the child via the env,
+    // which would then fail writing to a denied path with no hint why.
+    if let Some(bad) = agent::first_unsafe_agent_dir(&agent_dirs, home_dir) {
+        bail!(
+            "cplt refuses to grant the agent the config directory derived from the \
+             environment, '{}', it is too broad (a system root, your home directory, \
+             or an ancestor of it). Point the relevant variable (CLAUDE_CONFIG_DIR, \
+             or an XDG_* base) at a dedicated subdirectory such as '{}'.",
+            bad.path.display(),
+            home_dir.join(".claude").display(),
+        );
+    }
+
     // Agent-facing sandbox brief (issue #148), session layer only. The
     // AGENTS.md layer writes into the user's repo and must not run until the
     // launch is confirmed — see `apply_persistent_sandbox_brief`, which the
@@ -3570,10 +3676,16 @@ fn run_exec_command(
     // Always use the Shell sandbox policy
     let active_agent = agent::Agent::Shell;
 
+    // Shell, not the agent `resolve_context` detected: exec builds the Shell
+    // profile, so a warning about another agent's directories would name an
+    // effect this session cannot have (#343).
+    warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
+
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
     // with `cplt check`, which runs its probes under the identical policy.
     let AssembledSandbox {
         prepared,
+        policy,
         proxy_handle,
         scratch_guard: _scratch_guard,
         #[cfg(target_os = "macos")]
@@ -3586,6 +3698,8 @@ fn run_exec_command(
         &home_dir,
         &project_dir,
     )?;
+
+    warn_shim_target_without_exec(&policy, &exec_bin);
 
     if cli.print_profile {
         println!("{}", sandbox::describe(&prepared));
@@ -3847,6 +3961,13 @@ fn build_net_policy(resolved: &config::Resolved, agent: agent::Agent) -> proxy::
     } else {
         Vec::new()
     };
+    // Same intent bit `start_proxy_if_enabled` computes and hands the live
+    // proxy (via `DomainPolicy::build`). Without it, `cplt check net` would
+    // report ALLOWED for every host under an enabled-but-empty allowlist that
+    // the proxy blocks — a self-consistent wrong answer to the one command a
+    // user runs to verify the setup.
+    let allowlist_active = !default_allowlist.is_empty()
+        || (!resolved.allow_all_domains && resolved.allowed_domains.is_some());
     let allowed_domains = if default_allowlist.is_empty() {
         file_domains
     } else {
@@ -3880,6 +4001,7 @@ fn build_net_policy(resolved: &config::Resolved, agent: agent::Agent) -> proxy::
     proxy::NetPolicy {
         allowed_ports: ports,
         allowed_domains,
+        allowlist_active,
         blocked_domains,
         allow_localhost_ports: resolved.allow_localhost.clone(),
         allow_localhost_any: resolved.allow_localhost_any,
@@ -3954,6 +4076,9 @@ fn run_check_command(
         unapproved_proposals: _,
     } = resolve_context(cli, true)?;
 
+    // Shell, not `active_agent`: `check` probes under the Shell profile.
+    warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
+
     // check prints its own report; never prompt.
     resolved.yes = true;
 
@@ -3962,6 +4087,19 @@ fn run_check_command(
     // Snapshot the effective net policy BEFORE prepare_shell_sandbox mutates
     // resolved (it only changes the proxy port and tool-path env, neither of
     // which affects domain/port classification, but snapshot early to be safe).
+    // Same fail-closed refusal the proxy makes at startup. Without it, `check net`
+    // would report BLOCKED-ALLOWLIST for every host when the configured file is
+    // missing or unreadable (parse_lines_file returns None for both, and
+    // build_net_policy would then see an active-but-empty allowlist) while the
+    // live run refuses to start at all. Check must not describe a state the proxy
+    // never reaches — that divergence is the defect this whole change fixes.
+    if !resolved.allow_all_domains
+        && let Some(ref path) = resolved.allowed_domains
+        && proxy::parse_lines_file(path).is_none()
+    {
+        ui::error(&proxy::missing_allowlist_error(path));
+        return Ok(ExitCode::FAILURE);
+    }
     let net_policy = build_net_policy(&resolved, active_agent);
 
     let AssembledSandbox {
@@ -5515,6 +5653,83 @@ fn trust_accept(
         return ExitCode::FAILURE;
     }
 
+    let current_hash = trust::proposal_content_hash(&loaded.config.propose);
+    let stored = trust::load_trust(project_dir);
+
+    // Finding 4, write side: the trust file is keyed on the git origin URL alone,
+    // which any repo can forge (`git remote set-url origin <victim>`). The launch
+    // path binds an approval to the local checkout path; this one must too, or
+    // accepting one innocuous key here would both retain the victim's approved
+    // keys (laundering a foreign approval into this checkout) and overwrite their
+    // entry. Refuse while their recorded path still resolves — trust is one entry
+    // per origin, so there is nowhere else to put ours. A path that cannot be
+    // resolved (moved, deleted, unmounted, unreadable ancestor) leaves the entry
+    // orphaned, and an empty one is a legacy entry, so both may be taken over.
+    //
+    // The escape hatch is not what makes this safe: `carried` below drops the
+    // stored keys whenever `approved_path_matches` fails, and that fails closed on
+    // any canonicalize error. So making the recorded path unresolvable — including
+    // by racing this check against the save — yields an entry holding only the keys
+    // the user approves right now. That is denial of service plus a forced
+    // re-approval for the owner, never an inherited grant.
+    //
+    // The recovery advice depends on `trust_revoke` having NO path check: revoking
+    // here deletes this origin's entry whatever checkout it was granted at. Adding
+    // a path check there would strand the user, so don't. Pathless revoke is safe
+    // in its own right — it only ever de-escalates, and the owner re-approves
+    // against their own current proposal.
+    if let Some(t) = &stored
+        && !trust::approved_path_matches(t, project_dir)
+        && std::fs::canonicalize(&t.repo.path).is_ok()
+    {
+        ui::error(&format!(
+            "This repository's origin is already trusted for a different checkout ({}).\n  \
+             Approvals are stored per origin, so approving here would overwrite that one.\n  \
+             To approve here instead, drop that approval first: run `cplt trust revoke --all`\n  \
+             here, or in that checkout if it is still the repository you approved.",
+            t.repo.path
+        ));
+        return ExitCode::FAILURE;
+    }
+
+    // Only carry existing approvals forward when they were granted at THIS checkout
+    // for THESE exact proposal values. Otherwise the accepted set becomes exactly
+    // the keys approved now: a partial accept must never silently renew a stale
+    // approval whose value changed underneath it (SECURITY.md, "reapproval").
+    // Split the two reasons an approval stops applying, because they are not the
+    // same event and the message must not claim the wrong one. A legacy entry
+    // (empty stored hash) predates value pinning, so nothing "changed" — it was
+    // never recorded. `approval_is_stale` treats both as stale, correctly.
+    let stored_hash_is_legacy = stored
+        .as_ref()
+        .is_some_and(|t| t.accepted.content_hash.is_empty());
+    let hash_mismatch = stored
+        .as_ref()
+        .is_some_and(|t| trust::approval_is_stale(&t.accepted.content_hash, &current_hash));
+    let carried = stored.filter(|t| {
+        trust::approved_path_matches(t, project_dir)
+            && !trust::approval_is_stale(&t.accepted.content_hash, &current_hash)
+    });
+
+    // Say so in every branch. Accepting explicit keys after a value change drops
+    // the other approvals, and a user told only "Approved 1 permission(s)" would
+    // otherwise discover that at the next launch.
+    if hash_mismatch {
+        let reason = if stored_hash_is_legacy {
+            "The previous approval predates value pinning, so it cannot be matched against \
+these proposal values"
+        } else {
+            "Proposal values have changed since the last approval, so the previous approvals \
+no longer apply"
+        };
+        println!(
+            "{}[cplt]{} {reason}. Only the keys approved now are kept.",
+            ui::stdout_color(ui::YELLOW),
+            ui::stdout_color(ui::RESET),
+        );
+        println!();
+    }
+
     // Determine which keys to accept
     let keys_to_accept: Vec<String> = if all {
         proposed
@@ -5522,44 +5737,22 @@ fn trust_accept(
             .map(std::string::ToString::to_string)
             .collect()
     } else if keys.is_empty() {
-        // Interactive mode: show pending permissions and prompt
-        let trust_entry = trust::load_trust(project_dir);
-
-        // If content hash changed, all keys need re-approval
-        let hash_mismatch = trust_entry.as_ref().is_some_and(|t| {
-            !t.accepted.content_hash.is_empty() && {
-                let current_hash = trust::proposal_content_hash(&loaded.config.propose);
-                t.accepted.content_hash != current_hash
-            }
-        });
-
-        let pending: Vec<&str> = if hash_mismatch {
-            // Values changed — all keys need re-approval
-            proposed.clone()
-        } else {
-            proposed
-                .iter()
-                .filter(|&&key| {
-                    !trust_entry
-                        .as_ref()
-                        .is_some_and(|t| trust::is_key_approved(t, key))
-                })
-                .copied()
-                .collect()
-        };
+        // Interactive mode: show pending permissions and prompt.
+        // Anything not carried forward is pending, so a stale or foreign entry
+        // puts every key back in front of the user.
+        let pending: Vec<&str> = proposed
+            .iter()
+            .filter(|&&key| {
+                !carried
+                    .as_ref()
+                    .is_some_and(|t| trust::is_key_approved(t, key))
+            })
+            .copied()
+            .collect();
 
         if pending.is_empty() {
             ui::info("All permissions are already approved.");
             return ExitCode::SUCCESS;
-        }
-
-        if hash_mismatch {
-            println!(
-                "{}[cplt]{} Proposal values have changed since the last approval. Re-approve to continue.",
-                ui::stdout_color(ui::YELLOW),
-                ui::stdout_color(ui::RESET),
-            );
-            println!();
         }
 
         let blue = ui::stdout_color(ui::BLUE);
@@ -5620,8 +5813,9 @@ fn trust_accept(
         keys.to_vec()
     };
 
-    // Load or create trust entry
-    let mut entry = trust::load_trust(project_dir).unwrap_or_default();
+    // Start from the carried-forward entry, or a fresh one when nothing could be
+    // carried — so the accepted set is then exactly `keys_to_accept`.
+    let mut entry = carried.unwrap_or_default();
 
     // Set identity
     entry.repo.path = project_dir.to_string_lossy().into_owned();
@@ -5643,7 +5837,7 @@ fn trust_accept(
     entry.accepted.keys.sort_unstable();
     entry.accepted.approved_at = trust::now_iso8601();
     // Pin content hash so changes to proposal values invalidate approval
-    entry.accepted.content_hash = trust::proposal_content_hash(&loaded.config.propose);
+    entry.accepted.content_hash = current_hash;
 
     // Save
     if let Err(e) = trust::save_trust(project_dir, &entry) {
@@ -6000,6 +6194,7 @@ fn print_preflight_ok() {
 ///
 /// On macOS, spawns `log stream` filtering for Sandbox deny events.
 /// On Linux, prints a hint about `strace` since Landlock has no audit logs.
+#[allow(clippy::disallowed_methods)] // /usr/bin/log, an absolute system path
 fn start_denial_stream() -> Option<std::process::Child> {
     #[cfg(target_os = "macos")]
     {
@@ -6038,6 +6233,7 @@ fn start_denial_stream() -> Option<std::process::Child> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
     use clap::Parser;
@@ -6587,6 +6783,83 @@ mod tests {
     }
 
     // ── `cplt check net` must MATCH the live proxy's verdict ──────────────
+
+    /// F03: `cplt check net` is the command a user runs to verify their
+    /// allowlist. It shared the proxy's `!allowed_domains.is_empty()` reading,
+    /// so an enabled-but-empty allowlist gave a self-consistent WRONG answer:
+    /// check said ALLOWED, and so did the proxy. Both now consult the same
+    /// intent bit, so check reports the block the proxy enforces.
+    #[test]
+    fn check_net_matches_the_proxy_for_an_enabled_but_empty_allowlist() {
+        let dir = std::env::temp_dir().join(format!(
+            "cplt-check-net-empty-allowlist-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowed.txt");
+        std::fs::write(&path, "# every domain revoked\n").unwrap();
+
+        let toml = format!(
+            "[proxy]\nallowed_domains = \"{}\"\n",
+            path.display().to_string().replace('\\', "\\\\")
+        );
+        let resolved = toml::from_str::<config::Config>(&toml)
+            .expect("config parses")
+            .merge(config::CliFlags::default())
+            .expect("config merges");
+
+        let policy = build_net_policy(&resolved, agent::Agent::Copilot);
+        assert!(
+            policy.allowlist_active,
+            "a configured allowed_domains file is an active allowlist even with zero entries"
+        );
+        assert!(policy.allowed_domains.is_empty());
+
+        // The live proxy's own snapshot of the same configuration.
+        let live = proxy::DomainPolicy::build(
+            proxy::PolicySpec {
+                blocked_file: dir.join("no-blocklist.txt"),
+                allowed_domains_file: Some(path),
+                ..Default::default()
+            },
+            std::time::Instant::now(),
+        )
+        .expect("live policy builds")
+        .net_policy(std::time::Instant::now());
+
+        for host in ["github.com", "api.githubcopilot.com", "evil.example"] {
+            let checked = proxy::classify_connect(&policy, host, 443);
+            let enforced = proxy::classify_connect(&live, host, 443);
+            assert_eq!(
+                checked, enforced,
+                "check net and the live proxy must agree about {host}"
+            );
+            assert_eq!(
+                checked,
+                proxy::NetVerdict::BlockedAllowlist,
+                "an allowlist with nothing on it blocks {host}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_net_reports_allow_all_when_no_allowlist_is_configured() {
+        // The no-regression half: with no allowlist configured at all, check
+        // and the proxy both report allow-all.
+        let resolved = toml::from_str::<config::Config>("")
+            .expect("config parses")
+            .merge(config::CliFlags::default())
+            .expect("config merges");
+        let policy = build_net_policy(&resolved, agent::Agent::Copilot);
+        assert!(!policy.allowlist_active);
+        assert_eq!(
+            proxy::classify_connect(&policy, "anything.example", 443),
+            proxy::NetVerdict::Allowed
+        );
+    }
 
     #[test]
     fn check_net_non_canonical_allowlist_matches_live_blocked() {

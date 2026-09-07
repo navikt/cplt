@@ -76,9 +76,9 @@ cplt init --write
 # 2. Developers approve on first run
 cplt trust accept --all
 
-# 3. Tune the command guards (both are on by default)
-cplt config set git_guard.mode block                       # escalate the git guard from warn
-cplt config set git_guard.protect_default_branch_only true # allow feature-branch pushes
+# 3. Tune the command guards (both block by default)
+cplt config set git_guard.protect_default_branch_only false # block every push, not just main
+cplt config set git_guard.mode warn                         # observe instead of blocking
 ```
 
 ## What it blocks
@@ -118,7 +118,7 @@ The sandbox blocks access to credentials and secrets in the kernel. Command guar
 | Read `~/.netrc`, `~/.pypirc`, `~/.vault-token` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | Read `~/.gem/credentials` | 🔒 Kernel-blocked | Un-overridable on both platforms. Naming one in `allow.read` is a startup error |
 | `gh` CLI destructive operations (merge, delete, release) | 🔒 Command-gated (on by default) | Opt out with `--no-gh-guard`. See [gh guard](docs/gh-guard.md) |
-| `git push` to remote | ⚠️ Command-gated, warn-only by default | On by default in `warn` mode: the push runs, with a warning. `git_guard.mode = "block"` enforces; `--no-git-guard` opts out |
+| `git push` to the default branch | 🔒 Command-gated (on by default) | Blocks pushes to `main`/`master`; feature-branch pushes still work. `protect_default_branch_only = false` blocks every push, `git_guard.mode = "warn"` only warns, `--no-git-guard` opts out |
 | Child process inheritance | ✅ All restrictions apply to subprocesses | |
 
 That table is a summary. The sandbox also allows access to system files (SSL certs, `/etc/hosts`), temp directories (read and write, no exec), and system tool paths (`/usr/bin`, `/opt/homebrew`). Run `cplt --print-profile` for the complete SBPL rules.
@@ -179,6 +179,42 @@ Tools such as VS Code agent mode rely mainly on UI permissions. cplt enforces it
 | Library API | ❌ Binary only | ✅ Embeddable TypeScript library |
 
 cplt is more secure out of the box: env filtering, credential protection, DNS rebinding checks, lifecycle script blocking. srt is more flexible: SOCKS5, TLS inspection, per-request callbacks, library embedding. The Linux backend choice matters. bwrap needs workarounds on Ubuntu 24.04+ because of AppArmor userns restrictions, while Landlock requires kernel 5.13 or newer but has zero external dependencies.
+
+### GitHub Copilot CLI's own sandbox
+
+Copilot CLI has shipped with a local sandbox since June 2026, included in the
+standard seat. It runs shell commands through Microsoft MXC with restricted
+filesystem, network and system access, on macOS, Linux and Windows.
+`/sandbox enable` turns it on.
+
+If that covers you, use it. It costs nothing extra, and it runs on Windows,
+which cplt does not.
+
+Two things it does not do.
+
+Policy lives with the administrator, not the repository. Enterprises set
+sandbox policy through Intune or another MDM. Nothing sits next to the code,
+so a rule that matters for one repository cannot follow it to a contributor,
+to CI, or to a laptop the MDM does not manage. In cplt the policy is
+`.cplt.toml` in the repository. Reviewers see changes to it in the pull
+request, and the file can tighten a developer's own configuration but never
+loosen it.
+
+It confines the process, not what the process does with credentials it
+holds. The `/sandbox` tabs cover the filesystem, the network and system
+capabilities, and inside a Git repository the agent is granted read and write
+on `.git` by default. A sandboxed agent still has your `gh` token and your
+push access. Pushing a branch, merging a pull request and deleting a
+repository are all well-formed API calls from an authorised client, and a
+filesystem or network rule has no opinion about them. cplt wraps `git` and
+`gh` instead. The agent commits, branches and rebases freely. `gh pr merge`,
+`gh repo delete` and `gh release create` are blocked by default. So is
+`git push` to `main`/`master`; feature-branch pushes still work, because
+`protect_default_branch_only` is on. Set it to `false` to block every push, or
+`git_guard.mode = "warn"` to only warn.
+
+Running both is reasonable. MXC confines the process. The guards decide what
+the agent may do with the credentials it holds.
 
 ### Honest gaps
 
@@ -663,7 +699,7 @@ cplt settings
 # Set global preferences
 cplt config set sandbox.quiet true
 cplt config set proxy.blocked_domains "~/.config/cplt/blocked-domains.txt"
-cplt config set git_guard.mode block
+cplt config set git_guard.mode warn      # observe pushes instead of blocking them
 cplt config set gh_guard.enabled false   # opt out of the gh guard entirely
 
 # Set per-repo policy (committed to .cplt.toml)
@@ -709,7 +745,7 @@ cplt init --global    # generate a personal ~/.config/cplt/config.toml
 
 It knows JVM (Gradle/Maven), Node.js, Docker, Python, Rust, Go, Playwright, Spring Boot, Ktor, TestContainers, Next.js, Vite, Flyway, Cypress, and environment secrets from `.env.example`. Dangerous permissions come out of the generator with a risk warning attached. `--global` looks at machine-level things instead: Playwright browsers, GPG signing, registry credentials, alternative agents.
 
-Some keys are global-only and rejected from `.cplt.toml` because they are machine-specific or a local preference: `sandbox.agent`, `sandbox.quiet`, `sandbox.yes`, `sandbox.validate`, `sandbox.scratch_dir`, `sandbox.pass_env`, `sandbox.inherit_env`, `sandbox.allow_cache_exec`, `sandbox.allow_cache_exec_any`, `proxy.enabled`, `proxy.port`, `proxy.log_file`, `proxy.log_level`, `proxy.blocked_domains`, `proxy.allowed_domains`, and every `[gh_guard]`, `[git_guard]`, and `[audit]` key.
+Some keys are global-only and rejected from `.cplt.toml` because they are machine-specific or a local preference: `sandbox.agent`, `sandbox.quiet`, `sandbox.yes`, `sandbox.validate`, `sandbox.scratch_dir`, `sandbox.pass_env`, `sandbox.inherit_env`, `sandbox.allow_cache_exec`, `sandbox.allow_cache_exec_any`, `proxy.enabled`, `proxy.port`, `proxy.log_file`, `proxy.log_level`, `proxy.blocked_domains`, `proxy.allowed_domains`, and every `[gh_guard]` and `[git_guard]` key.
 
 Full details, including the trust model, path expansion rules, and the complete config file reference: [docs/configuration.md](docs/configuration.md).
 
@@ -765,8 +801,8 @@ What cplt protects against:
 - Persistence via cache-dir binaries: kernel-blocked, since those dirs are denied exec
 - Persistence via git hooks in the project: `.git/hooks` is write-denied at the kernel on macOS. On Linux, with Landlock and no Bubblewrap, it stays writable, and cplt's own parent-side `git` then runs with `core.hooksPath=/dev/null` so it never executes a planted hook, though a `git` you run yourself still will
 - Persistence via package-manager tool dirs that are both writable and executable (mise shims, `PNPM_HOME`, `~/.deno/bin`, `~/.bun/bin`): write is granted there so `pnpm add -g` and friends work in-sandbox, so an agent can leave a binary behind that a *later* shell picks up off your `PATH`
-- A planted binary hijacking the **agent** cplt launches: at launch and audit, cplt resolves the helpers it runs itself (`git`, `bwrap`, `sandbox-exec`, `mise`, and the `gh` it reads a token from) from fixed system directories rather than `PATH`, but the agent binary itself runs from wherever it was discovered, which for an npm-global install is commonly under a writable mise or node tree
-- `cplt doctor`: its version probes (`gh`, `copilot`, `uname`, and each agent it finds) are plain `PATH` lookups run in the parent, so a planted binary executes there. The launch and audit paths do not use them
+- A planted binary hijacking the **agent** cplt launches: at launch and audit, cplt resolves the helpers it runs itself (`git`, `bwrap`, `sandbox-exec`, `mise`, and the `gh` it reads a token from) from fixed system directories rather than `PATH`, but the agent binary itself runs from wherever it was discovered, which for an npm-global install is commonly under a writable mise or node tree. cplt cannot resolve it from a fixed directory — it legitimately lives where your version manager put it — so it checks the resolved path against the write rules the sandbox is about to apply and **warns at launch**, naming the binary and the writable tree, then proceeds
+- `cplt doctor`: its `--version` probes run each agent binary it finds on your `PATH`, in the parent, so a planted one executes there — the same discovered-path exposure as the launch above, which is why doctor is a report and not a boundary. Its `gh` check is resolved from the trusted directories and its kernel-release read spawns nothing at all
 - Data exfiltration to unauthorized domains: proxy-blocked
 - Accidental pushes to main and PR merges without review: guard-blocked
 

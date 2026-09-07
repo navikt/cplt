@@ -9,6 +9,13 @@
 //! Run live tests that hit the Copilot API:
 //!   cargo test --test e2e -- --ignored
 
+// This turns off the #239 *security* lint only: a test binary is not the
+// unsandboxed parent around an agent session, so the PATH-hijack hazard
+// `disallowed_methods` guards against does not apply here. It grants no
+// licence to spawn ad hoc: the #245 isolation rule stands unchanged, and every
+// `Command` a test spawns is still built through the `tests/common` helpers,
+// which no lint can enforce and review does.
+#![allow(clippy::disallowed_methods)]
 mod common;
 
 #[cfg(target_os = "macos")]
@@ -311,6 +318,64 @@ mod e2e_tests {
         assert!(
             !stdout.contains("(allow network-outbound (remote unix-socket))"),
             "profile should NOT allow unix-socket (blocks SSH agent).\nstdout: {stdout}"
+        );
+    }
+
+    /// Audit C-02: an externally-set `CLAUDE_CONFIG_DIR` pointing at a system
+    /// root must not become a writable grant. The refusal fires in
+    /// `assemble_sandbox`, which `--print-profile --agent claude` reaches
+    /// without needing a real Claude binary, so this exercises the full
+    /// enforcement wiring (not just the veto helper) and runs in CI.
+    #[test]
+    fn e2e_claude_config_dir_at_root_is_refused() {
+        let output = cplt_cmd()
+            .args(["--print-profile", "--agent", "claude"])
+            .env("CLAUDE_CONFIG_DIR", "/")
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "CLAUDE_CONFIG_DIR=/ must abort the launch.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("config directory") && stderr.contains("too broad"),
+            "refusal should name the offending config directory.\nstderr: {stderr}"
+        );
+    }
+
+    /// The other half of C-02: a dedicated subdirectory is legitimate and must
+    /// still produce a writable grant, so the veto does not strand a user who
+    /// deliberately relocated their config dir.
+    #[test]
+    fn e2e_claude_config_dir_dedicated_subdir_is_granted() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let cfg = tmp.path().join("claude-config");
+        std::fs::create_dir_all(&cfg).expect("create config dir");
+        // Match assemble_sandbox, which grants the canonicalized path.
+        let canonical = std::fs::canonicalize(&cfg).expect("canonicalize");
+
+        let output = cplt_cmd()
+            .args(["--print-profile", "--agent", "claude"])
+            .env("CLAUDE_CONFIG_DIR", &cfg)
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "a dedicated config dir must be accepted.\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                canonical.display()
+            )),
+            "profile should grant write to the dedicated config dir.\nstdout: {stdout}"
         );
     }
 
@@ -3458,6 +3523,176 @@ paths = [
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// Read every entry file in the trust store belonging to `config_file`'s
+    /// config dir. The store is keyed on a repo fingerprint, so tests assert on
+    /// the file set rather than recomputing the hash.
+    fn trust_store_files(config_file: &Path) -> Vec<(PathBuf, String)> {
+        let dir = config_file.parent().unwrap().join("trust");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| {
+                let path = e.ok()?.path();
+                if path.extension()? != "toml" {
+                    return None;
+                }
+                let content = std::fs::read_to_string(&path).ok()?;
+                Some((path, content))
+            })
+            // Sorted: `read_dir` order is filesystem-defined, and these results
+            // are compared with `assert_eq!` to prove a file was untouched.
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Accepting one key must not renew approvals whose *values* changed since
+    /// they were granted. The maintainer widens `allow.read` from a cache dir to
+    /// `~/.ssh`; accepting only the newly added key must drop the stale
+    /// `allow.read` approval, not re-pin it at its new, broader value.
+    #[test]
+    fn e2e_trust_partial_accept_does_not_renew_stale_keys() {
+        let (repo, config_file) = make_trust_repo(
+            "partial-stale",
+            "[propose]\nallow_localhost_any = true\n\n[propose.allow]\nread = [\"~/.gradle/caches\"]\n",
+        );
+
+        let output = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("accept should run");
+        assert!(output.status.success());
+
+        let before = trust_store_files(&config_file);
+        assert_eq!(before.len(), 1, "one trust entry expected: {before:?}");
+        assert!(
+            before[0].1.contains("allow.read"),
+            "allow.read should start approved: {}",
+            before[0].1
+        );
+
+        // Widen allow.read and add a new key, then commit.
+        std::fs::write(
+            repo.join(".cplt.toml"),
+            "[propose]\nallow_localhost_any = true\nallow_docker = true\n\n[propose.allow]\nread = [\"~/.ssh\", \"~/.aws\"]\n",
+        )
+        .unwrap();
+        git_cmd(&repo).args(["add", ".cplt.toml"]).output().unwrap();
+        git_cmd(&repo)
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "-m",
+                "widen allow.read",
+                "--quiet",
+            ])
+            .output()
+            .unwrap();
+
+        // Accept only the new key.
+        let output = trust_cmd(&repo, &config_file)
+            .args(["trust", "accept", "allow_docker"])
+            .output()
+            .expect("accept should run");
+        assert!(
+            output.status.success(),
+            "accept failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("changed"),
+            "dropping the other approvals must be announced, not silent: {stdout}"
+        );
+
+        let after = trust_store_files(&config_file);
+        assert_eq!(after.len(), 1, "one trust entry expected: {after:?}");
+        let content = &after[0].1;
+        assert!(
+            content.contains("allow_docker"),
+            "the accepted key should be approved: {content}"
+        );
+        assert!(
+            !content.contains("allow.read"),
+            "allow.read changed value and must NOT be renewed by a partial accept: {content}"
+        );
+        assert!(
+            !content.contains("allow_localhost_any"),
+            "approvals from the stale hash must not survive a partial accept: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The trust store is keyed on the git origin URL, which any repo can forge.
+    /// A second checkout presenting the same origin must not inherit the first
+    /// checkout's approved keys, nor overwrite its entry.
+    #[test]
+    fn e2e_trust_accept_refuses_foreign_origin_entry() {
+        let propose = "[propose]\nallow_localhost_any = true\nallow_docker = true\n";
+        let (victim, config_file) = make_trust_repo("origin-victim", propose);
+        let (attacker, _attacker_config) = make_trust_repo("origin-attacker", propose);
+        for repo in [&victim, &attacker] {
+            git_cmd(repo)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/victim/repo.git",
+                ])
+                .output()
+                .unwrap();
+        }
+
+        let output = trust_cmd(&victim, &config_file)
+            .args(["trust", "accept", "--all"])
+            .output()
+            .expect("accept should run");
+        assert!(
+            output.status.success(),
+            "victim accept failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let before = trust_store_files(&config_file);
+        assert_eq!(
+            before.len(),
+            1,
+            "victim should own one trust entry: {before:?}"
+        );
+
+        // Same forged origin, different checkout, accepting one innocuous key.
+        let output = trust_cmd(&attacker, &config_file)
+            .args(["trust", "accept", "allow_docker"])
+            .output()
+            .expect("accept should run");
+        assert!(
+            !output.status.success(),
+            "accept from a different checkout with the same origin must be refused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let after = trust_store_files(&config_file);
+        assert_eq!(
+            after, before,
+            "the other checkout's entry must be untouched"
+        );
+        assert!(
+            after[0].1.contains("origin-victim"),
+            "entry must stay bound to the original checkout: {}",
+            after[0].1
+        );
+        assert!(
+            !after[0].1.contains("origin-attacker"),
+            "entry must not be rebound to the other checkout: {}",
+            after[0].1
+        );
+
+        let _ = std::fs::remove_dir_all(&victim);
+        let _ = std::fs::remove_dir_all(&attacker);
+    }
+
     #[test]
     fn e2e_trust_isolation_between_repos() {
         let (repo_a, config_file) =
@@ -4194,6 +4429,54 @@ paths = [
             "cplt exec -- /usr/bin/true should exit 0.\nstderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// #343 review: `exec` ignores the agent `resolve_context` detected and
+    /// always builds the Shell profile, so a warning about the detected agent's
+    /// directories describes a session that was never assembled. The tool-dir
+    /// half of the same warning must stay live on `exec`, or this test would
+    /// pass on a warning that had simply stopped working.
+    #[test]
+    fn e2e_exec_does_not_warn_about_an_agent_it_does_not_run() {
+        require_sandbox!();
+        let fake_home = std::env::temp_dir().join(format!(
+            ".cplt-e2e-exec-agent-warn-{}",
+            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(fake_home.join(".copilot")).unwrap();
+        std::fs::create_dir_all(fake_home.join(".rustup")).unwrap();
+
+        let output = cplt_cmd()
+            .args([
+                "--no-validate",
+                "--agent",
+                "copilot",
+                "--allow-write",
+                fake_home.join(".copilot").to_str().unwrap(),
+                "--allow-write",
+                fake_home.join(".rustup").to_str().unwrap(),
+                "exec",
+                "--",
+                "/usr/bin/true",
+            ])
+            .env("HOME", fake_home.to_str().unwrap())
+            .current_dir(project_dir())
+            .output()
+            .expect("cplt exec should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(".rustup"),
+            "exec must still warn about a shadowed tool directory: {stderr}"
+        );
+        assert!(
+            !stderr.contains(".copilot"),
+            "exec builds the Shell profile and never emits Copilot's rules, so it \
+             must not blame the grant for withdrawing exec there: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
     }
 
     #[test]

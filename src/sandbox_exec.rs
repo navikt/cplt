@@ -322,6 +322,7 @@ const GH_TOKEN_VARS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOK
 /// for the wrong host. The token vars are stripped from the subprocess so `gh`
 /// answers from its own credential store rather than echoing back an ambient
 /// value.
+#[allow(clippy::disallowed_methods)] // gh resolved by trusted_gh() above
 fn extract_gh_token() -> Option<String> {
     let gh = trusted_gh()?;
     let mut cmd = std::process::Command::new(&gh);
@@ -741,6 +742,18 @@ fn seal_inherited_fds(cmd: &mut Command, keep: Vec<std::os::unix::io::RawFd>) {
     // failure mode.
     let max = unsafe { libc::getdtablesize() };
 
+    // The audit's settle probe is the one descriptor that is *meant* to reach
+    // the session: cplt created the pipe, holds the only read end, and detects
+    // stragglers by waiting for every inherited copy of this write end to close
+    // (GHSA-c47q-c3c8-7wrf). Exempting it here rather than at the three call
+    // sites means a fourth spawn path cannot silently re-seal it — and the
+    // failure is silent, since a sealed probe reports every session settled.
+    let mut keep = keep;
+    let probe = crate::audit::SETTLE_PROBE_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if probe >= 3 {
+        keep.push(probe);
+    }
+
     // SAFETY: the closure runs between fork and exec. It makes only `fcntl`
     // calls — no allocation, no locks, async-signal-safe.
     unsafe {
@@ -821,6 +834,7 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// Verify the SBPL profile works by running `/usr/bin/true` inside sandbox-exec.
 #[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)] // SANDBOX_EXEC is the fixed /usr/bin/sandbox-exec
 pub fn preflight(sandbox: &super::PreparedSandbox) -> Result<(), String> {
     // Absolute: `sandbox-exec` only ever lives in /usr/bin (SIP-protected), and
     // resolving it by name would go through the parent's PATH, which contains
@@ -866,6 +880,7 @@ pub fn preflight(sandbox: &super::PreparedSandbox) -> Result<(), String> {
 /// (`preflight` explains it); the kernel never sees a truncated profile.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // SANDBOX_EXEC is the fixed /usr/bin/sandbox-exec
 pub fn exec(
     sandbox: &super::PreparedSandbox,
     copilot_bin: &Path,
@@ -939,6 +954,7 @@ pub fn preflight(_sandbox: &super::PreparedSandbox) -> Result<(), String> {
 /// the direct Landlock + seccomp path below.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // spawns the resolved agent binary path, not a bare name
 pub fn exec(
     sandbox: &super::PreparedSandbox,
     copilot_bin: &Path,
@@ -1061,6 +1077,7 @@ enum BwrapOutcome {
 /// with no risk of running the agent twice.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::disallowed_methods)] // bwrap_path comes from git::trusted_binary("bwrap")
 fn exec_bwrap(
     sandbox: &super::PreparedSandbox,
     wrapper: &super::bubblewrap::BubblewrapWrapper,
@@ -1401,6 +1418,7 @@ mod gh_token_extraction_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod keychain_substitute_tests {
     use super::*;
     use crate::agent::KeychainSubstitute;
@@ -1444,6 +1462,7 @@ mod keychain_substitute_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod spawn_error_tests {
     use super::*;
 
@@ -1475,6 +1494,7 @@ mod spawn_error_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod inherited_fd_tests {
     use super::*;
     use std::io::Write as _;

@@ -38,9 +38,9 @@ pub use repo::{
     set_repo_value_in_doc,
 };
 pub use types::{
-    AllowConfig, AuditConfig, BlocklistSource, CliFlags, Config, DenyConfig, EnforcementMode,
-    FeatureToggle, GhGuardConfig, GhGuardPolicy, GitGuardConfig, GitGuardPolicy, GitPushRule,
-    LoadedConfig, Preset, ProxyConfig, Resolved, ResolvedPushRule, SandboxConfig,
-    SubscriptionsConfig, UnknownCommandPolicy,
+    AllowConfig, BlocklistSource, CliFlags, Config, DenyConfig, EnforcementMode, FeatureToggle,
+    GhGuardConfig, GhGuardPolicy, GitGuardConfig, GitGuardPolicy, GitPushRule, LoadedConfig,
+    Preset, ProxyConfig, Resolved, ResolvedPushRule, SandboxConfig, SubscriptionsConfig,
+    UnknownCommandPolicy,
 };
 pub use validation::{ConfigDiagnostic, DiagnosticLevel, validate_config};

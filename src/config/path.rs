@@ -307,21 +307,15 @@ pub fn default_config_contents() -> String {
 # Intercepts `git` commands to prevent accidental pushes.
 # [git_guard]
 # enabled = true              # enable git command interception
-# mode = "warn"               # "block" | "warn" | "audit" (block under --preset strict)
+# mode = "block"              # "block" | "warn" | "audit"
 # prevent_push = true         # block push, request-pull, send-pack
 # prevent_force_push = true   # block force push (only when prevent_push = false)
+# protect_default_branch_only = true   # only refuse pushes to main/master
+#                                      # (false under --preset strict: every push)
 # [[git_guard.allow_push]]   # structured push exceptions
 # remote = "fork"
 # branches = ["agent/*"]
 # force = false
-
-# ── audit logging ───────────────────────────────────────────────────────────
-# Global audit log for all sandbox gate decisions.
-# [audit]
-# enabled = false
-# destination = "stderr"      # "stderr" or file path
-# level = "blocked"           # "blocked" | "decisions" | "all"
-# format = "text"             # "text" | "jsonl"
 "#
     .to_string()
 }

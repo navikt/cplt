@@ -408,6 +408,7 @@ pub fn parse_sha256sums(content: &str, asset_name: &str) -> Result<String, Updat
 // --- Internal helpers ---
 
 /// HTTP GET returning body as string (for JSON/text).
+#[allow(clippy::disallowed_methods)] // /usr/bin/curl, an absolute system path
 fn curl_get(url: &str, version: &str) -> Result<String, UpdateError> {
     let output = Command::new("/usr/bin/curl")
         .args([
@@ -438,6 +439,7 @@ fn curl_get(url: &str, version: &str) -> Result<String, UpdateError> {
 }
 
 /// HTTP GET expecting JSON, with Accept header.
+#[allow(clippy::disallowed_methods)] // /usr/bin/curl, an absolute system path
 fn curl_get_json(url: &str, version: &str) -> Result<String, UpdateError> {
     let output = Command::new("/usr/bin/curl")
         .args([
@@ -470,6 +472,7 @@ fn curl_get_json(url: &str, version: &str) -> Result<String, UpdateError> {
 }
 
 /// Download a file to disk.
+#[allow(clippy::disallowed_methods)] // /usr/bin/curl, an absolute system path
 fn curl_download(url: &str, dest: &Path, version: &str) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/curl")
         .args([
@@ -517,6 +520,7 @@ fn compute_sha256(path: &Path) -> Result<String, UpdateError> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)] // absolute system path
 fn sha256_command(path: &Path) -> Result<std::process::Output, UpdateError> {
     Command::new("/usr/bin/shasum")
         .args(["-a", "256", &path.to_string_lossy()])
@@ -525,6 +529,7 @@ fn sha256_command(path: &Path) -> Result<std::process::Output, UpdateError> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::disallowed_methods)] // absolute candidates, existence-checked before use
 fn sha256_command(path: &Path) -> Result<std::process::Output, UpdateError> {
     // Use absolute paths only — bare PATH lookup could run a malicious binary.
     let candidates = [
@@ -546,6 +551,7 @@ fn sha256_command(path: &Path) -> Result<std::process::Output, UpdateError> {
 /// Rejects archives with symlinks, directories, or unexpected entries.
 /// Uses verbose listing (`-tvf`) to detect file types — plain `-tzf`
 /// cannot distinguish symlinks from regular files.
+#[allow(clippy::disallowed_methods)] // /usr/bin/tar, an absolute system path
 fn validate_archive(path: &Path) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/tar")
         .args(["-tvzf", &path.to_string_lossy()])
@@ -587,6 +593,7 @@ fn validate_archive(path: &Path) -> Result<(), UpdateError> {
 }
 
 /// Extract archive to a directory.
+#[allow(clippy::disallowed_methods)] // /usr/bin/tar, an absolute system path
 fn extract_archive(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/tar")
         .args([
@@ -741,6 +748,7 @@ fn set_executable(path: &Path) -> Result<(), UpdateError> {
 /// string. This is a defense-in-depth check against release pipeline bugs where
 /// the tag version and the binary's embedded version diverge (which would cause
 /// an infinite update loop).
+#[allow(clippy::disallowed_methods)] // runs the freshly extracted binary by path
 fn verify_binary_version(
     binary: &Path,
     expected_version: &str,
@@ -785,6 +793,7 @@ fn postprocess_binary(path: &Path) {
 /// Remove macOS quarantine extended attributes.
 /// Remove quarantine attribute (macOS only — required for Gatekeeper).
 #[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)] // /usr/bin/xattr, an absolute system path
 fn run_xattr(path: &Path) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/xattr")
         .args(["-cr", &path.to_string_lossy()])
@@ -800,6 +809,7 @@ fn run_xattr(path: &Path) -> Result<(), UpdateError> {
 
 /// Ad-hoc code sign the binary (macOS only — required for Gatekeeper).
 #[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)] // /usr/bin/codesign, an absolute system path
 fn run_codesign(path: &Path) -> Result<(), UpdateError> {
     let output = Command::new("/usr/bin/codesign")
         .args(["--force", "--sign", "-", &path.to_string_lossy()])
@@ -830,6 +840,7 @@ fn is_writable(path: &Path) -> bool {
 /// Install binary using sudo for the final copy + permission step.
 /// Downloads and verification happen as the current user; only the
 /// file placement requires elevated privileges.
+#[allow(clippy::disallowed_methods)] // sudo resolved from absolute candidates by find_sudo()
 fn sudo_install(src: &Path, dest: &Path) -> Result<(), UpdateError> {
     let sudo = find_sudo()?;
 

@@ -500,9 +500,19 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         c.git_guard.prevent_force_push.unwrap_or(true),
         src(c.git_guard.prevent_force_push.is_some())
     );
+    // Preset-aware: this key's default differs per preset (standard protects the
+    // default branch, strict refuses every push), so a hard-coded fallback would
+    // report the wrong effective value under `--preset strict` — and this command
+    // exists to show what is actually in force.
     println!(
         "{blue}[cplt]{nc}    protect_default_branch_only = {}{}",
-        c.git_guard.protect_default_branch_only.unwrap_or(false),
+        c.git_guard.protect_default_branch_only.unwrap_or_else(|| {
+            c.sandbox
+                .preset
+                .unwrap_or(crate::config::Preset::Standard)
+                .baseline()
+                .git_protect_default_branch_only
+        }),
         src(c.git_guard.protect_default_branch_only.is_some())
     );
     if !c.git_guard.allow_push.is_empty() {
@@ -510,18 +520,6 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
             "{blue}[cplt]{nc}    allow_push            = [{} rules]",
             c.git_guard.allow_push.len()
         );
-    }
-
-    // [audit] section
-    println!("{blue}[cplt]{nc}");
-    println!("{blue}[cplt]{nc}  [audit]");
-    println!(
-        "{blue}[cplt]{nc}    enabled               = {}{}",
-        c.audit.enabled.unwrap_or(false),
-        src(c.audit.enabled.is_some())
-    );
-    if let Some(ref dest) = c.audit.destination {
-        println!("{blue}[cplt]{nc}    destination           = {dest}");
     }
 
     println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");

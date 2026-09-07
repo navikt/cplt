@@ -15,7 +15,7 @@ use crate::ui;
 #[path = "proxy_domains.rs"]
 pub mod domains;
 
-pub use domains::{DomainPolicy, PolicySpec, parse_lines_file};
+pub use domains::{DomainPolicy, PolicySpec, missing_allowlist_error, parse_lines_file};
 
 /// Controls how much the proxy logs to stderr.
 /// The audit log file (if configured) always records everything regardless of this level.
@@ -462,15 +462,7 @@ impl ProxyState {
     /// Reads the current (cache-refreshed) allowlist and blocklist so
     /// [`classify_connect`] sees exactly what the live gates would see.
     fn net_policy(&self) -> NetPolicy {
-        let now = Instant::now();
-        NetPolicy {
-            allowed_ports: self.policy.allowed_ports.clone(),
-            allowed_domains: self.policy.allowed_domains(now),
-            blocked_domains: self.policy.blocked_domains(now),
-            allow_localhost_ports: self.policy.allow_localhost_ports.clone(),
-            allow_localhost_any: self.policy.allow_localhost_any,
-            private_domains: self.policy.private_domains(now),
-        }
+        self.policy.net_policy(Instant::now())
     }
 }
 
@@ -824,12 +816,24 @@ impl NetVerdict {
 /// Built either from a live [`ProxyState`] (via [`ProxyState::net_policy`]) or
 /// directly from resolved config by the `cplt check` command. The field values
 /// mean exactly what they mean inside [`handle_connect`]: `allowed_ports`
-/// already includes 443, `allowed_domains` is the *effective* (merged) allowlist
-/// where empty means allow-all.
+/// already includes 443, and `allowed_domains` is the *effective* (merged)
+/// allowlist.
+///
+/// Whether the allowlist *enforces* is `allowlist_active`, NOT
+/// `!allowed_domains.is_empty()`. The two differ in the case that matters: an
+/// allowlist the user configured that resolves to zero domains (an empty or
+/// all-comment file). Reading emptiness as "no allowlist" made that case
+/// allow-all — a restriction accepted and silently dropped, which is the
+/// failure mode `AGENTS.md` calls out as the one that gets people hurt.
 #[derive(Debug, Clone, Default)]
 pub struct NetPolicy {
     pub allowed_ports: Vec<u16>,
     pub allowed_domains: Vec<String>,
+    /// Whether a domain allowlist is configured at all: the agent's built-in
+    /// default allowlist (`proxy.default_allowlist`) or an explicit
+    /// `allowed_domains` file. `false` is the unconfigured default, which is
+    /// allow-all. `true` with an empty `allowed_domains` denies every domain.
+    pub allowlist_active: bool,
     pub blocked_domains: Vec<String>,
     pub allow_localhost_ports: Vec<u16>,
     pub allow_localhost_any: bool,
@@ -866,8 +870,13 @@ pub fn classify_connect(policy: &NetPolicy, host: &str, port: u16) -> NetVerdict
     if !localhost_connect_allowed && !policy.allowed_ports.contains(&port) {
         return NetVerdict::BlockedPort;
     }
+    // The intent bit, not the list length, decides enforcement: an enabled
+    // allowlist with zero entries denies everything. `!allowed_domains
+    // .is_empty()` is ORed in purely as a fail-closed backstop, so a caller
+    // that forgets to set `allowlist_active` still enforces the list it built
+    // rather than silently allowing all.
     if !localhost_connect_allowed
-        && !policy.allowed_domains.is_empty()
+        && (policy.allowlist_active || !policy.allowed_domains.is_empty())
         && !is_domain_match(&host, &policy.allowed_domains)
     {
         return NetVerdict::BlockedAllowlist;

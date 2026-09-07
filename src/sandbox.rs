@@ -677,6 +677,28 @@ fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<P
     // SECURITY.md instead of half-done.
     ro_protect.extend(config.agent.host_persistence_paths(config.agent_dirs));
 
+    // H-13/H-05: an agent's exec-only grant that sits inside a writable tree.
+    // macOS denies the write for exactly these dirs in
+    // `emit_host_persistence_denies` (the `exec_only` chain at the tail of the
+    // profile); this is that rule's Linux half. The write comes from an
+    // ancestor Landlock cannot subtract, so the bwrap bind is the only
+    // mechanism — and, as everywhere in this list, WITHOUT bwrap it is absent.
+    //
+    // OpenCode's `~/.cache/opencode/bin` is the entry that needs it: the
+    // writable ancestor is `~/.cache` from HOME_TOOL_DIRS, granted to every
+    // agent, so narrowing OpenCode's own cache grant would take nothing away —
+    // the same shape as `~/.cache/copilot/pkg` below. Pi's
+    // `~/.pi/agent/bin` no longer has a writable ancestor at all (its root
+    // grant is read-only, see `Agent::config_dirs`), so for Pi this bind is
+    // belt-and-braces rather than the control.
+    ro_protect.extend(
+        config
+            .agent_dirs
+            .iter()
+            .filter(|d| !d.write && d.process_exec)
+            .map(|d| d.path.clone()),
+    );
+
     // #238: mise's `shims/` and `installs/` are PATH-resolved binary drop
     // points sitting inside the mise data dir, which stays writable for the
     // rest of mise's state. The other PATH-resolved dirs (~/.bun/bin,
@@ -781,6 +803,7 @@ fn prepare_impl(
     // they never show up in the "could not be mount-masked" warning; the masks
     // are only ever applied when bwrap actually wraps the run.
     let socket_masks: Vec<PathBuf> = policy::socket_mask_paths(
+        config.home_dir,
         policy::current_uid(),
         policy::xdg_runtime_dir_env().as_deref(),
         config.allow_docker,
@@ -1016,6 +1039,7 @@ fn validate_created_playwright_socket_dir(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
 
@@ -1165,6 +1189,29 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// H-13/H-05: an agent's exec-only grant must reach the overlay too.
+    ///
+    /// OpenCode's `~/.cache/opencode/bin` holds the managed `rg`/`fd` it runs,
+    /// and its writable ancestor is `~/.cache` from `HOME_TOOL_DIRS` — granted
+    /// to every agent, so narrowing OpenCode's own cache grant would take
+    /// nothing away. Landlock cannot subtract, macOS denies the write in
+    /// `emit_host_persistence_denies`, and this bind is the Linux half.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ro_protect_set_carries_the_exec_only_agent_dirs() {
+        let home = Path::new("/home/test");
+        let agent_dirs = Agent::OpenCode.config_dirs(home);
+        let mut config = test_config(home, &[]);
+        config.agent = Agent::OpenCode;
+        config.agent_dirs = &agent_dirs;
+
+        let paths = super::ro_protect_paths(&config, &[]);
+        assert!(
+            paths.contains(&home.join(".cache/opencode/bin")),
+            "the managed-binary dir must be re-bound read-only, got {paths:?}"
+        );
     }
 
     /// Same class, the file-level half: OpenCode's `auth.json` is a write grant
