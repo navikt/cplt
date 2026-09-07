@@ -2484,8 +2484,9 @@ pub fn gate_git(
             // branch, and a push whose destination refs cannot be enumerated
             // (whole-repo modes, config-driven destinations) is never provably
             // feature-only — both fall through to the normal block (fail closed).
+            let targets = push_target_branches(push_args, real_git, &repo_args);
             let is_feature_branch = default_branch.is_some()
-                && match push_target_branches(push_args, real_git, &repo_args) {
+                && match &targets {
                     PushTargets::Branches(branches) if !branches.is_empty() => branches
                         .iter()
                         .all(|b| !is_protected_branch(b, default_branch.as_deref())),
@@ -2506,6 +2507,37 @@ pub fn gate_git(
                     }
                 }
                 return Ok(());
+            }
+
+            // The refusal that follows is about *one branch*, not about pushing.
+            // Without saying so the only route the message names is the escape
+            // hatch, which tells the reader to turn the guard off — the one
+            // answer a security control must not lead with. Naming the branch
+            // and the form that works keeps the actionable route in the message.
+            let remote = push_remote_name(push_args);
+            // Name the branch only when the push resolves to exactly one. With
+            // several destinations, or none we could enumerate, there is no
+            // single branch to point at and the generic wording is the honest
+            // one.
+            let target_branch = match &targets {
+                PushTargets::Branches(branches) if branches.len() == 1 => branches.first(),
+                _ => None,
+            };
+            if default_branch.is_some() {
+                match target_branch {
+                    Some(branch) => block_hints.push(format!(
+                        "'{branch}' is the protected branch here. Only the default \
+                         branch is protected (protect_default_branch_only), so \
+                         pushing a feature branch works as it is: \
+                         `git push {remote} <branch>` with any other name."
+                    )),
+                    None => block_hints.push(format!(
+                        "This push targets the checked-out branch, which is either \
+                         the protected default branch or could not be resolved. \
+                         Naming a feature branch explicitly works: \
+                         `git push {remote} <branch>`."
+                    )),
+                }
             }
         }
 
@@ -4077,6 +4109,53 @@ mod tests {
         gate_git(&args, true, true, true, &[], Some(git))
     }
 
+    /// #386: the shipped defaults — no config, no flags, no `allow_push` rule —
+    /// refuse a push to the default branch and allow one to a feature branch.
+    /// Driven from the resolved config rather than from literals, so a default
+    /// that flips back fails here rather than only in the config tests.
+    #[test]
+    fn standard_defaults_block_the_default_branch_and_allow_feature_branches() {
+        use crate::config::{CliFlags, Config, EnforcementMode};
+
+        let r = Config::default().merge(CliFlags::default()).unwrap();
+        assert_eq!(r.git_guard.mode, EnforcementMode::Block);
+        assert!(r.git_guard.enabled);
+        assert!(
+            r.git_guard.allow_push.is_empty(),
+            "the default posture must need no push exception to stay usable"
+        );
+
+        let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/o/o.git") else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        // The branch has to exist: the guard resolves a colon-less push token
+        // with `rev-parse`, and an absent branch fails closed for a reason that
+        // has nothing to do with the default under test.
+        make_branches(&git, &repo, &["feature/x"]);
+        let dir = repo.to_string_lossy().into_owned();
+        let gate = |push_args: &[&str]| {
+            let mut args = vec!["-C", dir.as_str()];
+            args.extend_from_slice(push_args);
+            gate_git(
+                &args,
+                r.git_guard.prevent_push,
+                r.git_guard.prevent_force_push,
+                r.git_guard.protect_default_branch_only,
+                &r.git_guard.allow_push,
+                Some(&git),
+            )
+        };
+        assert!(
+            gate(&["push", "origin", "main"]).is_err(),
+            "a push to the default branch must be refused by default"
+        );
+        assert!(
+            gate(&["push", "origin", "feature/x"]).is_ok(),
+            "a feature-branch push must still work by default"
+        );
+    }
+
     #[test]
     fn protect_default_allows_feature_branch() {
         let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/o/o.git") else {
@@ -4102,6 +4181,29 @@ mod tests {
         let dir = repo.to_string_lossy().into_owned();
         assert!(gate_push_in(&git, &dir, &["push", "origin", "main"]).is_err());
         assert!(gate_push_in(&git, &dir, &["push", "origin", "master"]).is_err());
+    }
+
+    /// A refusal must name the route that still works. Before this the message
+    /// said only that push prevention was enabled, and the one way forward it
+    /// named was the escape hatch — turning the guard off.
+    #[test]
+    fn a_default_branch_refusal_names_the_feature_branch_route() {
+        let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/o/o.git") else {
+            return;
+        };
+        let git = which_git().unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+        let msg = gate_push_in(&git, &dir, &["push", "origin", "main"])
+            .expect_err("a push to the default branch must be refused");
+        assert!(msg.contains("'main' is the protected branch"), "{msg}");
+        assert!(msg.contains("git push origin <branch>"), "{msg}");
+        // The hint is wrapped in source with `\` continuations. Without them the
+        // literal carries the indentation, and the user reads a message with
+        // runs of spaces through the middle of it.
+        assert!(
+            !msg.contains("  "),
+            "the refusal must not carry source indentation as literal spaces: {msg}"
+        );
     }
 
     #[test]

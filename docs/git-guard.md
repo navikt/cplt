@@ -7,15 +7,16 @@ branch, merge, and rebase all it wants. A human still reviews and pushes.
 
 ## Configuration
 
-The git guard is **on by default**, in `warn` mode: a push prints a warning and
-then runs. Set `mode = "block"` (or use `--preset strict`) to actually stop it.
+The git guard is **on by default**, in `block` mode, scoped to the default
+branch: a push to `main`/`master` is refused and a feature-branch push runs.
+`--preset strict` drops the scoping and refuses every push.
 
 ```bash
-cplt config set git_guard.mode block                         # block | warn | audit (default warn)
+cplt config set git_guard.mode warn                          # block | warn | audit (default block)
 cplt config set git_guard.enabled false                      # opt out entirely
 cplt config set git_guard.prevent_push true                  # block git push/request-pull/send-pack (default true)
 cplt config set git_guard.prevent_force_push true            # block force push (default true)
-cplt config set git_guard.protect_default_branch_only false  # block all pushes (default)
+cplt config set git_guard.protect_default_branch_only false  # block every push, not just the default branch
 ```
 
 `mode` controls what happens on a block. `block` prints the message and exits
@@ -82,12 +83,13 @@ cplt --git-guard -- -p "fix the tests"
 
 ### protect_default_branch_only
 
-With this enabled, only pushes to the default branch are blocked and feature
-branch pushes go through:
+On by default outside `--preset strict`. With it enabled, only pushes to the
+default branch are blocked and feature branch pushes go through; it is what
+makes `mode = "block"` shippable as a default, since `prevent_push` would
+otherwise refuse every push until an `allow_push` rule exists:
 
 ```bash
-cplt config set git_guard.enabled true
-cplt config set git_guard.protect_default_branch_only true
+cplt config set git_guard.protect_default_branch_only false  # block every push
 ```
 
 The guard parses `git push [options...] [remote] [refspec...]` to find the
