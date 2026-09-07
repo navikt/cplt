@@ -309,6 +309,19 @@ pub fn writable_tree_over(policy: &LandlockPolicy, home: &Path, path: &Path) -> 
 /// mise, volta and nodenv all keep shim and target under one granted root).
 #[must_use]
 pub fn shim_target_without_exec(policy: &LandlockPolicy, path: &Path) -> Option<PathBuf> {
+    // Only a real symlink counts. `canonicalize` also normalizes `..` and
+    // resolves symlinks in PARENT components, so comparing it against the input
+    // reports a plain binary reached through `bin/../bin/node`, or through a
+    // symlinked parent directory, as a shim — a warning about a symlink the user
+    // does not have. A warning that fires on ordinary launches is how warnings
+    // get ignored.
+    if !std::fs::symlink_metadata(path)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
     let target = std::fs::canonicalize(path).ok()?;
     if target == path {
         return None;

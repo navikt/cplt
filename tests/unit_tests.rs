@@ -8756,6 +8756,28 @@ fn shim_pointing_outside_every_exec_grant_is_reported() {
         "a non-symlink must never be reported as a shim"
     );
 
+    // A plain binary reached through a SYMLINKED PARENT, with the path itself
+    // inside the exec grant so the ordinary ungranted-shim branch cannot be what
+    // returns None. `canonicalize` resolves parent components too, so comparing
+    // it against the input reports this as a shim resolving into the ungranted
+    // store — a warning about a symlink the user does not have. Only the
+    // symlink_metadata check on the path itself rejects it.
+    let linked_parent = root.join("granted/link");
+    std::os::unix::fs::symlink(&store, &linked_parent).unwrap();
+    let policy = policy_with(&[root.join("granted")]);
+    assert!(
+        std::fs::symlink_metadata(linked_parent.join("node"))
+            .unwrap()
+            .file_type()
+            .is_file(),
+        "fixture: the binary itself must not be a symlink, or this tests nothing"
+    );
+    assert_eq!(
+        shim_target_without_exec(&policy, &linked_parent.join("node")),
+        None,
+        "a plain binary under a symlinked parent must not be reported as a shim"
+    );
+
     // Nothing granted at all: the exec fails for the ordinary reason, and
     // blaming the symlink would misdiagnose it.
     let policy = policy_with(&[]);
