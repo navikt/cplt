@@ -23,9 +23,7 @@ mod e2e_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use crate::common::{
-        binary_in_path, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd,
-    };
+    use crate::common::{binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -5062,7 +5060,15 @@ paths = [
         // case-insensitive (APFS/HFS+ by default) — there the guard must run.
         // Where it is case-sensitive they are simply not on PATH, and cplt has
         // nothing to resolve, let alone redirect.
-        let case_insensitive_fs = binary_in_path("git").with_file_name("Git").is_file();
+        // Probe the very file `cplt exec` will resolve — the first `git` on
+        // PATH, the way `resolve_exec_binary` walks it — and not `/usr/bin/git`,
+        // which may sit on a mount with the opposite case behaviour.
+        let path_git =
+            std::env::split_paths(&std::env::var_os("PATH").expect("PATH should be set"))
+                .map(|dir| dir.join("git"))
+                .find(|candidate| candidate.is_file())
+                .expect("git should be available in PATH");
+        let case_insensitive_fs = path_git.with_file_name("Git").is_file();
         for name in ["Git", "GIT"] {
             let (ok, stderr) = push(&[
                 "--no-validate",

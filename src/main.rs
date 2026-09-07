@@ -6698,6 +6698,13 @@ mod tests {
         let case_insensitive_fs = bin.path().join("Git").is_file();
         for (name, guard) in [("Git", "git"), ("GIT", "git"), ("Gh", "gh"), ("GH", "gh")] {
             let real = bin.path().join(name);
+            if !case_insensitive_fs {
+                // Here the mixed-case name is a genuinely different binary, so
+                // write one: `resolve_exec_binary` only ever hands this function
+                // a path it found, and a missing file would prove nothing more
+                // than that unreadable metadata does not redirect.
+                std::fs::write(&real, "#!/bin/sh\n").unwrap();
+            }
             let expected = if case_insensitive_fs {
                 scratch.join("bin").join(guard)
             } else {
