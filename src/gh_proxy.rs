@@ -2764,7 +2764,7 @@ pub fn gate_git(
                                     " (this directory is not a git repository the guard can read)"
                                         .to_string()
                                 },
-                                |dir| format!(" (its git directory is {dir})"),
+                                |dir| format!(" (its shared git directory is {dir})"),
                             );
                         format!(
                             "protect_default_branch_only is set, but this push does not run in the \

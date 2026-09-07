@@ -2100,16 +2100,15 @@ fn git_gate_refuses_a_push_from_a_nested_repository() {
     // launch repo's baked `main` it passed as a feature branch and the push ran.
     let (_, stderr, ok) =
         git_gate_protect_default_with_facts(&nested, &facts, &["push", "origin", "trunk"]);
-    assert!(!ok, "a push from a nested repository must be refused");
-    assert!(
-        stderr.contains("does not run in the repository this session was launched in"),
-        "the refusal must say the repository is the wrong one.
-stderr: {stderr}"
+    assert_refused(
+        &stderr,
+        ok,
+        "does not run in the repository this session was launched in",
     );
     // The hint has to name the repository we actually landed in, or the operator
     // cannot tell this apart from an unresolvable default branch.
     assert!(
-        stderr.contains("its git directory is") && stderr.contains("nested"),
+        stderr.contains("its shared git directory is") && stderr.contains("nested"),
         "the hint must name the nested repository.
 stderr: {stderr}"
     );
@@ -2134,7 +2133,7 @@ fn git_gate_still_allows_a_feature_push_from_the_launch_repository() {
     // …and the protected branch is still protected there.
     let (_, stderr, ok) =
         git_gate_protect_default_with_facts(launch.path(), &facts, &["push", "origin", "main"]);
-    assert!(!ok, "the launch repo's default branch must stay protected");
+    assert_refused(&stderr, ok, "is the protected branch here");
     assert!(
         !stderr.contains("does not run in the repository this session was launched in"),
         "the launch repository must not be reported as the wrong one.
@@ -2160,14 +2159,10 @@ fn git_gate_refuses_a_push_redirected_by_git_dir_in_the_environment() {
         ],
         &["push", "origin", "trunk"],
     );
-    assert!(
-        !ok,
-        "GIT_DIR/GIT_WORK_TREE pointing at another repository must be refused"
-    );
-    assert!(
-        stderr.contains("does not run in the repository this session was launched in"),
-        "the refusal must say the repository is the wrong one.
-stderr: {stderr}"
+    assert_refused(
+        &stderr,
+        ok,
+        "does not run in the repository this session was launched in",
     );
 }
 
