@@ -2484,8 +2484,9 @@ pub fn gate_git(
             // branch, and a push whose destination refs cannot be enumerated
             // (whole-repo modes, config-driven destinations) is never provably
             // feature-only — both fall through to the normal block (fail closed).
+            let targets = push_target_branches(push_args, real_git, &repo_args);
             let is_feature_branch = default_branch.is_some()
-                && match push_target_branches(push_args, real_git, &repo_args) {
+                && match &targets {
                     PushTargets::Branches(branches) if !branches.is_empty() => branches
                         .iter()
                         .all(|b| !is_protected_branch(b, default_branch.as_deref())),
@@ -2514,6 +2515,14 @@ pub fn gate_git(
             // answer a security control must not lead with. Naming the branch
             // and the form that works keeps the actionable route in the message.
             let remote = push_remote_name(push_args);
+            // Name the branch only when the push resolves to exactly one. With
+            // several destinations, or none we could enumerate, there is no
+            // single branch to point at and the generic wording is the honest
+            // one.
+            let target_branch = match &targets {
+                PushTargets::Branches(branches) if branches.len() == 1 => branches.first(),
+                _ => None,
+            };
             if default_branch.is_some() {
                 match target_branch {
                     Some(branch) => block_hints.push(format!(
@@ -4120,6 +4129,10 @@ mod tests {
             return; // no git available
         };
         let git = which_git().unwrap();
+        // The branch has to exist: the guard resolves a colon-less push token
+        // with `rev-parse`, and an absent branch fails closed for a reason that
+        // has nothing to do with the default under test.
+        make_branches(&git, &repo, &["feature/x"]);
         let dir = repo.to_string_lossy().into_owned();
         let gate = |push_args: &[&str]| {
             let mut args = vec!["-C", dir.as_str()];
