@@ -2444,10 +2444,16 @@ pub fn gate_git(
             if default_branch.is_some() {
                 match target_branch {
                     Some(branch) => block_hints.push(format!(
-                        "'{branch}' is the protected branch here. Only the default branch is                          protected (protect_default_branch_only), so pushing a feature branch                          works as it is: `git push {remote} <branch>` with any other name."
+                        "'{branch}' is the protected branch here. Only the default \
+                         branch is protected (protect_default_branch_only), so \
+                         pushing a feature branch works as it is: \
+                         `git push {remote} <branch>` with any other name."
                     )),
                     None => block_hints.push(format!(
-                        "This push targets the checked-out branch, which is either the                          protected default branch or could not be resolved. Naming a feature                          branch explicitly works: `git push {remote} <branch>`."
+                        "This push targets the checked-out branch, which is either \
+                         the protected default branch or could not be resolved. \
+                         Naming a feature branch explicitly works: \
+                         `git push {remote} <branch>`."
                     )),
                 }
             }
@@ -3878,6 +3884,13 @@ mod tests {
             .expect_err("a push to the default branch must be refused");
         assert!(msg.contains("'main' is the protected branch"), "{msg}");
         assert!(msg.contains("git push origin <branch>"), "{msg}");
+        // The hint is wrapped in source with `\` continuations. Without them the
+        // literal carries the indentation, and the user reads a message with
+        // runs of spaces through the middle of it.
+        assert!(
+            !msg.contains("  "),
+            "the refusal must not carry source indentation as literal spaces: {msg}"
+        );
     }
 
     #[test]
