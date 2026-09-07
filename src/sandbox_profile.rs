@@ -24,8 +24,9 @@ use super::policy::{
     DENIED_CACHE_PREFIXES, DENIED_DOTFILES, DENIED_FILES, DENIED_HOME_SUBPATHS, EXEC_IN_WRITABLE,
     GPG_SIGNING_ALLOW_FILES, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, PathBinDir, Protected,
     ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS, SYSTEM_READ_FILES, TOOL_READ_DIRS,
-    XCODE_SELECT_LINK, active_tool_dirs, app_dirs, escape_regex, nested_alternation, path_bin_dirs,
-    playwright_runtime_intent, validate_playwright_socket_dir, validate_sbpl_path,
+    XCODE_SELECT_LINK, active_tool_dirs, ancestor_alternation, app_dirs, escape_regex,
+    nested_alternation, path_bin_dirs, playwright_runtime_intent, rel_is_glob, rel_regex,
+    validate_playwright_socket_dir, validate_sbpl_path,
 };
 
 /// Device nodes a sandboxed process may open for writing, by exact path.
@@ -393,9 +394,35 @@ fn emit_sensitive_project_denies(
             // manifest there fires whichever agent next opens THAT repo.
             if p.nested {
                 let r = escape_regex(root);
-                let rel = escape_regex(p.rel);
+                let rel = rel_regex(p.rel);
                 sbpl!(sb, "(deny file-write* (regex #\"^{r}/.+/{rel}($|/)\"))");
             }
+        }
+        sbpl!(sb);
+    }
+
+    // The ancestors of the paths above, for the same reason `emit_gitdir_denies`
+    // pins the gitdir's: a deny on `.github/hooks` only holds while `.github`
+    // keeps denoting that directory. GHSA-39xf-9j26-f82m — `mv .github .gh2 &&
+    // echo evil > .gh2/hooks/evil.json && mv .gh2 .github` planted a Copilot
+    // hook without ever writing a denied path. See [`policy::rel_ancestors`].
+    //
+    // `file-write-unlink` only: the directories themselves must stay writable
+    // (`.github/workflows`, `.claude/` session state, `.opencode/` generated
+    // files). The cost is that `mv .github`, `mv .agents`, `mv .claude`,
+    // `mv .opencode` and `mv .pi` are refused inside the sandbox — accepted,
+    // and recorded in docs/known-impacts.md.
+    let anc = ancestor_alternation(PROTECTED_IN_ROOT);
+    if !anc.is_empty() {
+        sbpl!(
+            sb,
+            ";; Ancestors of the protected project paths — no rename/unlink"
+        );
+        for root in &roots {
+            let r = escape_regex(root);
+            sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/({anc})$\"))");
+            // Same at any depth, mirroring the nested denies above.
+            sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/.+/({anc})$\"))");
         }
         sbpl!(sb);
     }
@@ -781,16 +808,30 @@ fn emit_gitdir_denies(sb: &mut String, gitdir: &str) {
     for p in PROTECTED_IN_GITDIR {
         emit_protected(sb, gitdir, p);
     }
+    // Same argument, one level down: a deny on `refs/remotes/*/HEAD` only holds
+    // while `refs/remotes` keeps denoting that directory. See
+    // [`policy::rel_ancestors`] for the three-command walk-around this closes.
+    // `file-write-unlink` only — the directories themselves must stay writable,
+    // git writes refs into them constantly.
+    let anc = ancestor_alternation(PROTECTED_IN_GITDIR);
+    let g = escape_regex(gitdir);
+    sbpl!(sb, "(deny file-write-unlink (regex #\"^{g}/({anc})$\"))");
     sbpl!(sb);
 }
 
 /// Emit one [`Protected`] entry as an SBPL write-deny under `base`.
 ///
 /// The only per-backend decision: a tree becomes a `subpath` rule, a file a
-/// `literal` one.
+/// `literal` one — and a `rel` with a `*` component (`refs/remotes/*/HEAD`) a
+/// regex, since neither `subpath` nor `literal` takes a wildcard.
 fn emit_protected(sb: &mut String, base: &str, p: &Protected) {
     let rel = p.rel;
-    if p.tree {
+    if rel_is_glob(rel) {
+        let b = escape_regex(base);
+        let r = rel_regex(rel);
+        let tail = if p.tree { "($|/)" } else { "$" };
+        sbpl!(sb, "(deny file-write* (regex #\"^{b}/{r}{tail}\"))");
+    } else if p.tree {
         sbpl!(sb, "(deny file-write* (subpath \"{base}/{rel}\"))");
     } else {
         sbpl!(sb, "(deny file-write* (literal \"{base}/{rel}\"))");
@@ -840,18 +881,43 @@ fn emit_protected(sb: &mut String, base: &str, p: &Protected) {
 /// Linux the bubblewrap read-only overlay carries this (see SECURITY.md).
 fn emit_host_persistence_denies(sb: &mut String, agent: Agent, agent_dirs: &[AgentDir]) {
     let paths = agent.host_persistence_paths(agent_dirs);
-    let exec_only = agent_dirs.iter().filter(|d| !d.write && d.process_exec);
+    let exec_only: Vec<&AgentDir> = agent_dirs
+        .iter()
+        .filter(|d| !d.write && d.process_exec)
+        .collect();
     let mut wrote_header = false;
     for path in paths
         .iter()
         .map(|p| p.display().to_string())
-        .chain(exec_only.map(|d| d.path.display().to_string()))
+        .chain(exec_only.iter().map(|d| d.path.display().to_string()))
     {
         if !wrote_header {
             sbpl!(sb, ";; Agent config-dir host-persistence denies");
             wrote_header = true;
         }
         sbpl!(sb, "(deny file-write* (subpath \"{path}\"))");
+    }
+    // GHSA-7mcc-xg5v-hv8v, the same shape as GHSA-8qmv-wxp3-526v: the deny
+    // above names a path, and a path rule only holds while the path keeps
+    // denoting the directory it protects. OpenCode's `~/.cache/opencode/bin`
+    // is exec-allowed and write-denied, but its parent `~/.cache/opencode` is
+    // a writable grant, so `mv ~/.cache/opencode ~/.cache/oc.bak` moved `bin`
+    // out from under the deny; the agent recreated it, wrote its own binaries
+    // there and moved the directory back, and the host executes them the next
+    // time OpenCode runs outside cplt.
+    //
+    // `file-write-unlink` on the parent closes it: Seatbelt checks that access
+    // on the *source* of a rename and on unlink/rmdir, not on writes inside
+    // the directory, so the cache keeps working — creating, extracting,
+    // chmod'ing and replacing managed binaries inside `bin` are untouched —
+    // and only the name is pinned. Derived from the exec-only grants rather
+    // than named, so an agent that gains one later is pinned with it.
+    //
+    // Cost: `mv`/`rm -rf` of that directory fails inside the sandbox, which
+    // for OpenCode means `opencode uninstall` (docs/known-impacts.md).
+    for parent in exec_only.iter().filter_map(|d| d.path.parent()) {
+        let p = parent.display();
+        sbpl!(sb, "(deny file-write-unlink (literal \"{p}\"))");
     }
     if wrote_header {
         sbpl!(sb);
@@ -958,6 +1024,14 @@ fn emit_nested_gitdir_denies(sb: &mut String, root: &str) {
     );
     sbpl!(sb, "(deny file-write-unlink (regex #\"^{r}/.+/\\.git$\"))");
     sbpl!(sb, "(deny file-write-data (regex #\"^{r}/.+/\\.git$\"))");
+    // The ancestors of the names above, for the same reason they are pinned in
+    // `emit_gitdir_denies`: renaming `refs/remotes` aside walks around the
+    // `refs/remotes/[^/]+/HEAD` deny without ever writing a denied path.
+    let anc = ancestor_alternation(PROTECTED_IN_GITDIR);
+    sbpl!(
+        sb,
+        "(deny file-write-unlink (regex #\"^{r}/.+/\\.git/({anc})$\"))"
+    );
     sbpl!(sb);
 }
 
@@ -1130,6 +1204,34 @@ fn emit_tool_dirs(
         sbpl!(
             sb,
             "(deny file-write* (subpath \"{home}/Library/Caches/copilot/pkg\"))"
+        );
+        // GHSA-8qmv-wxp3-526v. The deny above names a path, and a path-shaped
+        // rule only holds while the path keeps denoting the directory it
+        // protects. `~/Library/Caches` is writable (HOME_TOOL_DIRS), so
+        // `mv ~/Library/Caches/copilot ~/Library/Caches/copilot.bak` moved the
+        // whole `pkg` tree out from under the deny; the agent then recreated
+        // `copilot/pkg`, wrote its own code there and moved the directory back.
+        // `pkg` is what the host executes the next time Copilot runs outside
+        // cplt, so that is persistence plus host code execution.
+        //
+        // `file-write-unlink` on the parent closes it: Seatbelt checks that
+        // access on the *source* of a rename and on unlink/rmdir, not on writes
+        // inside the directory, so the cache keeps working and only the name is
+        // pinned. Same shape as the gitdir pin in `emit_gitdir_denies` and the
+        // `PROTECTED_IN_ROOT` ancestor pins; the invariant walk in
+        // `every_write_deny_has_a_pinned_parent_chain` is what keeps a fourth
+        // instance of this from shipping.
+        //
+        // Cost: `mv`/`rm -rf` of `~/Library/Caches/copilot` fails inside the
+        // sandbox (docs/known-impacts.md). OpenCode has the same shape one
+        // tree over — `~/.cache/opencode/bin` is exec-allowed and write-denied
+        // inside a writable cache grant — and is pinned by the derived rule in
+        // `emit_host_persistence_denies` rather than by a second special case
+        // here; this block stays hand-written because Copilot's package dir is
+        // not an `AgentDir` grant.
+        sbpl!(
+            sb,
+            "(deny file-write-unlink (literal \"{home}/Library/Caches/copilot\"))"
         );
         sbpl!(sb);
     }
@@ -3085,7 +3187,7 @@ mod tests {
             let esc = root.replace('.', r"\.");
             for rule in [
                 format!(
-                    "(deny file-write* (regex #\"^{esc}/.+/\\.git/(hooks|config|commondir|modules|info/exclude)($|/)\"))"
+                    "(deny file-write* (regex #\"^{esc}/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude)($|/)\"))"
                 ),
                 format!("(deny file-write-unlink (regex #\"^{esc}/.+/\\.git$\"))"),
                 format!("(deny file-write-data (regex #\"^{esc}/.+/\\.git$\"))"),
@@ -3096,7 +3198,9 @@ mod tests {
 
         // Last-match-wins: nothing may re-open write after these.
         let nested_deny = p
-            .rfind("/.+/\\.git/(hooks|config|commondir|modules|info/exclude)")
+            .rfind(
+                "/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude)",
+            )
             .expect("nested deny missing");
         let last_write_allow = p.rfind("(allow file-write*").expect("no write allows");
         assert!(
@@ -3356,6 +3460,85 @@ mod tests {
         );
     }
 
+    /// GHSA-cm6f-3wjh-x9qx: `refs/remotes/<remote>/HEAD` names the branch
+    /// `protect_default_branch_only` refuses pushes to, and every `cplt exec`
+    /// re-reads it before the sandbox exists — so a rewrite that survives one
+    /// launch retargets the guard on the next. The remote's name is not known
+    /// when the profile is generated, hence the wildcard component.
+    #[test]
+    fn remote_head_symref_is_denied_in_every_gitdir() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = escape_regex(root);
+            let rule =
+                format!("(deny file-write* (regex #\"^{esc}/\\.git/refs/remotes/[^/]+/HEAD$\"))");
+            assert!(p.contains(&rule), "missing for {root}: {rule}");
+        }
+        // Only HEAD — `git fetch` must keep writing the remote-tracking
+        // branches next to it, so `refs/remotes` is never denied as a tree.
+        assert!(
+            !p.contains("(deny file-write* (subpath \"/projects/app/.git/refs"),
+            "refs/remotes must not be denied as a subtree — it would break git fetch"
+        );
+        // A repo nested under a writable root is reached by the alternation.
+        assert!(
+            p.contains(
+                "(deny file-write* (regex #\"^/projects/app/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude)($|/)\"))"
+            ),
+            "the remote HEAD symref must reach the nested-repo alternation:\n{p}"
+        );
+    }
+
+    /// The leaf deny above is only worth what its path is worth. With
+    /// `refs/remotes` renameable, `mv .git/refs/remotes .git/x && >     /// .git/x/origin/HEAD && mv .git/x .git/refs/remotes` writes the symref
+    /// without ever touching a denied path (reproduced against the built binary
+    /// on macOS, git 2.55). Every ancestor of a protected name is pinned
+    /// against rename and unlink; the directories stay writable, because git
+    /// writes refs into them on every fetch.
+    #[test]
+    fn protected_path_ancestors_are_pinned_against_rename() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        let anc = "info|refs|refs/remotes|refs/remotes/[^/]+";
+        assert_eq!(
+            ancestor_alternation(PROTECTED_IN_GITDIR),
+            anc,
+            "derived from the table, so a new nested entry cannot skip its ancestors"
+        );
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = escape_regex(root);
+            let rule = format!("(deny file-write-unlink (regex #\"^{esc}/\\.git/({anc})$\"))");
+            assert!(p.contains(&rule), "missing for {root}: {rule}");
+        }
+        // Nested repos get the same pin — the walk-around does not care how
+        // deep the repository sits under the writable root.
+        assert!(
+            p.contains(&format!(
+                "(deny file-write-unlink (regex #\"^/projects/app/.+/\\.git/({anc})$\"))"
+            )),
+            "the ancestor pin must reach nested repos:\n{p}"
+        );
+        // Unlink only. `refs/remotes/origin/<branch>` is written on every
+        // fetch, so a `file-write*` deny here would break git outright.
+        assert!(
+            !p.contains(&format!(
+                "(deny file-write* (regex #\"^/projects/app/\\.git/({anc})$\"))"
+            )),
+            "the ancestors must stay writable"
+        );
+    }
+
     /// A file hidden in a nested repo is hidden from the same `git status`, so
     /// `info/exclude` joins the nested alternation rather than stopping at the
     /// gitdirs the profile can name.
@@ -3366,9 +3549,51 @@ mod tests {
         let p = generate_profile(&test_options(project, home), &[]);
         assert!(
             p.contains(
-                "(deny file-write* (regex #\"^/projects/app/.+/\\.git/(hooks|config|commondir|modules|info/exclude)($|/)\"))"
+                "(deny file-write* (regex #\"^/projects/app/.+/\\.git/(hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude)($|/)\"))"
             ),
             "info/exclude must reach the nested-repo alternation:\n{p}"
+        );
+    }
+
+    /// GHSA-39xf-9j26-f82m: the same ancestor hole as above, one tree over and
+    /// worse. `.github/hooks` and `.agents/plugins` were denied but `.github`
+    /// and `.agents` were renameable, so `mv .github .gh2 && echo evil >
+    /// .gh2/hooks/evil.json && mv .gh2 .github` planted a Copilot hook — which
+    /// runs on the HOST, unsandboxed, in a later session — without ever writing
+    /// a denied path (reproduced against the built binary on macOS).
+    #[test]
+    fn project_protected_path_ancestors_are_pinned_against_rename() {
+        let project = std::path::Path::new("/projects/app");
+        let home = std::path::Path::new("/Users/test");
+        let mut opts = test_options(project, home);
+        let extra_write = [std::path::PathBuf::from("/Users/test/code")];
+        opts.extra_write = &extra_write;
+        let p = generate_profile(&opts, &[]);
+
+        let anc = r"\.agents|\.claude|\.github|\.opencode|\.pi";
+        assert_eq!(
+            ancestor_alternation(PROTECTED_IN_ROOT),
+            anc,
+            "derived from the table, so a new entry cannot skip its ancestors"
+        );
+        for root in ["/projects/app", "/Users/test/code"] {
+            let esc = escape_regex(root);
+            let rule = format!("(deny file-write-unlink (regex #\"^{esc}/({anc})$\"))");
+            assert!(p.contains(&rule), "missing for {root}: {rule}");
+            // A repo nested under a writable root has the same walk-around.
+            let nested = format!("(deny file-write-unlink (regex #\"^{esc}/.+/({anc})$\"))");
+            assert!(
+                p.contains(&nested),
+                "missing nested pin for {root}: {nested}"
+            );
+        }
+        // Unlink only. `.github/workflows`, `.claude/` session state and
+        // `.opencode/`'s generated files are written in an ordinary session.
+        assert!(
+            !p.contains(&format!(
+                "(deny file-write* (regex #\"^/projects/app/({anc})$\"))"
+            )),
+            "the ancestors must stay writable"
         );
     }
 
@@ -3492,5 +3717,445 @@ mod tests {
             )),
             "re-allow naming the $HOME path missing from profile:\n{p}"
         );
+    }
+
+    /// The rename-pin invariant: no `deny file-write*` may sit under an
+    /// ancestor that the sandbox still lets the agent rename away.
+    ///
+    /// Three separate emitters have shipped the same bug — `PROTECTED_IN_ROOT`
+    /// (GHSA-39xf-9j26-f82m), `PROTECTED_IN_GITDIR`, and the Copilot cache
+    /// rules (GHSA-8qmv-wxp3-526v). Each time a `deny file-write*` named a path
+    /// whose *parent* was inside a broader write grant, so the agent renamed
+    /// the parent, rebuilt the tree under a name no rule mentioned, and moved
+    /// it back. Reviewing for a fourth is not a control; this is.
+    ///
+    /// # The rule the walk applies
+    ///
+    /// Seatbelt checks `file-write-unlink` on the *source path itself* for
+    /// `rename(2)`, `unlink(2)` and `rmdir(2)` — not on the containing
+    /// directory. A rename also needs the destination name created, and the
+    /// destination is a sibling, so it is checked against the ancestor's own
+    /// parent. An ancestor `P` of a denied path is therefore a hazard when
+    /// **both** hold:
+    ///
+    /// 1. some sibling of `P` is write-creatable (i.e. `P`'s parent is inside
+    ///    an effective `allow file-write*` grant), and
+    /// 2. `P` itself is not covered by an effective write-unlink deny.
+    ///
+    /// The walk climbs from the denied path's immediate parent and stops at the
+    /// first ancestor failing (1) — that is "up to the nearest enclosing
+    /// `allow file-write*` grant". Every ancestor that satisfies both is
+    /// reported.
+    ///
+    /// # Regexes
+    ///
+    /// Chosen approach: **normalise the small set of shapes the codebase
+    /// actually emits, and panic on anything else.** An unanalysable new shape
+    /// is a test failure, not a silent gap. The shapes are
+    /// `escape_regex`-quoted literals, `.+` (one or more components), `[^/]+`
+    /// (exactly one), top-level `(a|b|c)` alternations, the `($|/)` tail, and
+    /// an unanchored tail meaning "this component prefix and anything below".
+    ///
+    /// A component the rule itself wildcards is skipped rather than reported:
+    /// renaming `<root>/x` when the rule reads `^<root>/.+/\.github/hooks`
+    /// leaves the rule matching, so it is not an escape.
+    ///
+    /// A regex with no `^` anchor (`/\.env$`, `/config\.worktree$`) matches by
+    /// basename at any depth and so cannot be defeated by renaming an ancestor
+    /// at all — it is skipped **only** when it is basename-only (one leading
+    /// `/`, no others). Any other unanchored shape panics.
+    mod rename_pin_invariant {
+        use super::*;
+
+        /// One component of a parsed SBPL path matcher.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum Seg {
+            /// An exact component.
+            Lit(String),
+            /// Exactly one component, any content (`[^/]+`).
+            One,
+            /// One or more components (`.+`).
+            Many,
+            /// One component with this fixed prefix and any suffix — what a
+            /// regex that stops mid-component (`^…/Caches/com\.apple\.`) means.
+            Prefix(String),
+        }
+
+        /// How a matcher ends.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Tail {
+            /// The path itself only (`$`).
+            Exact,
+            /// The path and everything beneath it (`subpath`, `($|/)`, or a
+            /// regex with no end anchor).
+            OrDeeper,
+        }
+
+        #[derive(Debug, Clone)]
+        struct Pattern {
+            segs: Vec<Seg>,
+            tail: Tail,
+        }
+
+        #[derive(Debug, Clone)]
+        struct Rule {
+            allow: bool,
+            op: String,
+            pat: Pattern,
+            /// The profile line, for the failure message.
+            text: String,
+        }
+
+        /// Accesses that decide whether a path can be renamed away or removed.
+        const UNLINK: &[&str] = &["file-write*", "file-write-unlink"];
+        /// Accesses that decide whether a new name can be created.
+        const CREATE: &[&str] = &["file-write*", "file-write-create"];
+        /// Stand-in component for a name the attacker chooses.
+        const PROBE: &str = "cplt-rename-probe";
+        /// Placeholder for `[^/]+`, whose `/` is not a component boundary.
+        const ONE: &str = "\u{1}";
+
+        impl Pattern {
+            fn matches(&self, path: &[&str]) -> bool {
+                walk(&self.segs, path, self.tail)
+            }
+        }
+
+        fn walk(segs: &[Seg], path: &[&str], tail: Tail) -> bool {
+            let Some((seg, rest_segs)) = segs.split_first() else {
+                return tail == Tail::OrDeeper || path.is_empty();
+            };
+            if let Seg::Many = seg {
+                return (1..=path.len()).any(|n| walk(rest_segs, &path[n..], tail));
+            }
+            let Some((head, rest)) = path.split_first() else {
+                return false;
+            };
+            let ok = match seg {
+                Seg::Lit(s) => *head == s.as_str(),
+                Seg::One => true,
+                Seg::Prefix(p) => head.starts_with(p.as_str()),
+                Seg::Many => unreachable!("handled above"),
+            };
+            ok && walk(rest_segs, rest, tail)
+        }
+
+        /// Split an absolute path into components, dropping the leading empty
+        /// one. Panics on a relative path — the profile emits none.
+        fn split(path: &str) -> Vec<Seg> {
+            assert!(path.starts_with('/'), "not an absolute path: {path}");
+            path.split('/')
+                .skip(1)
+                .filter(|s| !s.is_empty())
+                .map(|s| Seg::Lit(s.to_string()))
+                .collect()
+        }
+
+        /// Undo `policy::escape_regex`, rejecting any metacharacter it would
+        /// never have produced.
+        fn unescape(raw: &str, rule: &str) -> String {
+            let mut out = String::new();
+            let mut it = raw.chars();
+            while let Some(c) = it.next() {
+                if c == '\\' {
+                    out.push(
+                        it.next()
+                            .unwrap_or_else(|| panic!("trailing backslash in `{raw}` of: {rule}")),
+                    );
+                } else {
+                    assert!(
+                        !r".*+?[]{}^$|".contains(c),
+                        "unanalysable regex component `{raw}` in: {rule}\n\
+                         Add it to the known shapes in `rename_pin_invariant` \
+                         (and work out what its parent chain means) rather than \
+                         loosening this check."
+                    );
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        /// Expand top-level `(a|b|c)` groups into one string per branch.
+        fn expand(s: &str) -> Vec<String> {
+            let Some(open) = s.find('(') else {
+                return vec![s.to_string()];
+            };
+            let close = open
+                + s[open..]
+                    .find(')')
+                    .unwrap_or_else(|| panic!("unbalanced group in regex: {s}"));
+            let (pre, mid, post) = (&s[..open], &s[open + 1..close], &s[close + 1..]);
+            mid.split('|')
+                .flat_map(|alt| expand(&format!("{pre}{alt}{post}")))
+                .collect()
+        }
+
+        /// Parse one SBPL regex into the patterns it stands for.
+        ///
+        /// Returns an empty vector for a basename-only rule, which no rename of
+        /// an ancestor can escape; panics on any shape it cannot account for.
+        fn patterns_from_regex(re: &str, rule: &str) -> Vec<Pattern> {
+            let Some(body) = re.strip_prefix('^') else {
+                assert!(
+                    re.starts_with('/') && !re[1..].contains('/'),
+                    "unanchored regex that is not basename-only, so its parent \
+                     chain cannot be determined: {rule}"
+                );
+                return Vec::new();
+            };
+            // `[^/]+` carries a `/` that is not a component boundary, so it
+            // is folded to a sentinel before anything splits on `/`.
+            let folded = body.replace("[^/]+", ONE);
+            let body = folded.as_str();
+            let (body, tail, open) = if let Some(b) = body.strip_suffix("($|/)") {
+                (b, Tail::OrDeeper, false)
+            } else if let Some(b) = body.strip_suffix('$') {
+                (b, Tail::Exact, false)
+            } else {
+                (body, Tail::OrDeeper, true)
+            };
+            expand(body)
+                .iter()
+                .map(|variant| {
+                    let raw: Vec<&str> = variant.split('/').skip(1).collect();
+                    let last = raw.len().saturating_sub(1);
+                    let segs = raw
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| match *s {
+                            ".+" => Seg::Many,
+                            _ if *s == ONE => Seg::One,
+                            _ if open && i == last => Seg::Prefix(unescape(s, rule)),
+                            _ => Seg::Lit(unescape(s, rule)),
+                        })
+                        .collect();
+                    Pattern { segs, tail }
+                })
+                .collect()
+        }
+
+        /// Every `(allow|deny) file-write…` rule in the profile, in order.
+        fn parse_rules(profile: &str) -> Vec<Rule> {
+            let mut rules = Vec::new();
+            for line in profile.lines().map(str::trim) {
+                let (allow, rest) = match line.strip_prefix("(allow ") {
+                    Some(r) => (true, r),
+                    None => match line.strip_prefix("(deny ") {
+                        Some(r) => (false, r),
+                        None => continue,
+                    },
+                };
+                let (op, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+                if !op.starts_with("file-write") {
+                    continue;
+                }
+                let body = rest
+                    .strip_suffix(')')
+                    .unwrap_or_else(|| panic!("write rule with no matcher: {line}"));
+                assert!(
+                    !body.contains(") ("),
+                    "multi-clause write rule, which this walk does not parse: {line}"
+                );
+                let inner = body
+                    .strip_prefix('(')
+                    .and_then(|b| b.strip_suffix(')'))
+                    .unwrap_or_else(|| panic!("unparsable matcher: {line}"));
+                let (kind, arg) = inner
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("unparsable matcher: {line}"));
+                let pats = match kind {
+                    "literal" | "subpath" => {
+                        let path = arg.trim_matches('"');
+                        vec![Pattern {
+                            segs: split(path),
+                            tail: if kind == "subpath" {
+                                Tail::OrDeeper
+                            } else {
+                                Tail::Exact
+                            },
+                        }]
+                    }
+                    "regex" => {
+                        let re = arg
+                            .strip_prefix("#\"")
+                            .and_then(|a| a.strip_suffix('"'))
+                            .unwrap_or_else(|| panic!("unparsable regex matcher: {line}"));
+                        patterns_from_regex(re, line)
+                    }
+                    other => panic!("unknown matcher kind `{other}`: {line}"),
+                };
+                rules.extend(pats.into_iter().map(|pat| Rule {
+                    allow,
+                    op: op.to_string(),
+                    pat,
+                    text: line.to_string(),
+                }));
+            }
+            rules
+        }
+
+        /// Last-match-wins over `ops`, default deny — Seatbelt's own rule.
+        fn allowed(rules: &[Rule], path: &[String], ops: &[&str]) -> bool {
+            let segs: Vec<&str> = path.iter().map(String::as_str).collect();
+            rules
+                .iter()
+                .rev()
+                .find(|r| ops.contains(&r.op.as_str()) && r.pat.matches(&segs))
+                .is_some_and(|r| r.allow)
+        }
+
+        /// A concrete path standing for the pattern, plus a flag per component
+        /// saying whether the rule wildcards that position.
+        fn concrete(pat: &Pattern) -> (Vec<String>, Vec<bool>) {
+            pat.segs
+                .iter()
+                .map(|s| match s {
+                    Seg::Lit(l) => (l.clone(), false),
+                    Seg::One | Seg::Many => (PROBE.to_string(), true),
+                    Seg::Prefix(p) => (format!("{p}{PROBE}"), true),
+                })
+                .unzip()
+        }
+
+        /// Every denied path in `profile` with a renameable ancestor, as
+        /// `(denied path, renameable ancestor, rule text)`.
+        fn violations(profile: &str) -> Vec<(String, String, String)> {
+            let rules = parse_rules(profile);
+            let mut out: Vec<(String, String, String)> = Vec::new();
+            for rule in rules.iter().filter(|r| !r.allow && r.op == "file-write*") {
+                let (segs, wild) = concrete(&rule.pat);
+                for depth in (1..segs.len()).rev() {
+                    // The rename needs a destination name next to the ancestor.
+                    // Nowhere to land means *this* ancestor cannot be moved —
+                    // but say nothing about the ones above it: create-ability is
+                    // not monotonic along the chain, a deny partway up can close
+                    // a deep parent while a shallower ancestor stays renameable.
+                    // So skip this depth and keep climbing, never stop early.
+                    let mut sibling = segs[..depth - 1].to_vec();
+                    sibling.push(PROBE.to_string());
+                    if !allowed(&rules, &sibling, CREATE) {
+                        continue;
+                    }
+                    // A position the rule already wildcards is no escape: the
+                    // renamed directory still matches there.
+                    if wild[depth - 1] {
+                        continue;
+                    }
+                    if allowed(&rules, &segs[..depth], UNLINK) {
+                        out.push((
+                            format!("/{}", segs.join("/")),
+                            format!("/{}", segs[..depth].join("/")),
+                            rule.text.clone(),
+                        ));
+                    }
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        }
+
+        /// A profile with enough shape to exercise every write-deny emitter:
+        /// a project, a second writable root, the agent's own config dirs, a
+        /// global git hooks path and a worktree common dir.
+        fn representative_profile(agent: crate::agent::Agent) -> String {
+            let project = Path::new("/projects/app");
+            let home = Path::new("/Users/test");
+            let extra_write = [PathBuf::from("/projects/sibling")];
+            let hooks = PathBuf::from("/Users/test/.config/git/hooks");
+            let common = PathBuf::from("/projects/app/.git");
+            let dirs = agent.config_dirs(home);
+            let mut opts = test_options(project, home);
+            opts.agent = agent;
+            opts.agent_dirs = &dirs;
+            opts.extra_write = &extra_write;
+            opts.git_hooks_path = Some(&hooks);
+            opts.git_common_dir = Some(&common);
+            generate_profile(&opts, &[])
+        }
+
+        /// Violations the walk finds that are **known and unfixed**, as
+        /// `(agent, denied path, renameable ancestor)`.
+        ///
+        /// The list exists so an open hole is recorded rather than silently
+        /// tolerated: an entry that no longer reproduces fails the test (delete
+        /// it with the fix), and a violation that is not listed fails the test
+        /// too. It is not a suppression mechanism — nothing goes in without a
+        /// note saying why it is still here.
+        ///
+        /// Empty, and meant to stay that way: its one entry,
+        /// `~/.cache/opencode/bin` under a renameable `~/.cache/opencode`
+        /// (GHSA-7mcc-xg5v-hv8v), is fixed by the exec-only parent pin in
+        /// `emit_host_persistence_denies`.
+        const KNOWN_UNFIXED: &[(&str, &str, &str)] = &[];
+
+        /// The invariant, over every agent: the write-deny set is
+        /// agent-conditional (the Copilot cache rules exist for Copilot only,
+        /// and each agent contributes its own host-persistence denies), so one
+        /// profile would leave most of the emitters unwalked.
+        #[test]
+        fn every_write_deny_has_a_pinned_parent_chain() {
+            let mut unexpected: Vec<String> = Vec::new();
+            let mut seen: Vec<(String, String, String)> = Vec::new();
+            for &agent in crate::agent::Agent::ALL {
+                let name = format!("{agent:?}");
+                let profile = representative_profile(agent);
+                for (denied, ancestor, rule) in violations(&profile) {
+                    let key = (name.clone(), denied.clone(), ancestor.clone());
+                    if KNOWN_UNFIXED
+                        .iter()
+                        .any(|k| (k.0, k.1, k.2) == (&*key.0, &*key.1, &*key.2))
+                    {
+                        seen.push(key);
+                        continue;
+                    }
+                    unexpected.push(format!(
+                        "  agent: {name}\n  denied: {denied}\n  renameable ancestor: {ancestor}\n  rule: {rule}"
+                    ));
+                }
+            }
+            assert!(
+                unexpected.is_empty(),
+                "{} write-deny rule(s) sit under an ancestor the sandbox still \
+                 lets the agent rename or remove. Renaming that ancestor moves \
+                 the protected tree out from under the deny \
+                 (GHSA-39xf-9j26-f82m, GHSA-8qmv-wxp3-526v). Pin it with a \
+                 `deny file-write-unlink` covering the ancestor — the directory \
+                 stays writable, only its name is fixed. If it is deliberate, \
+                 add it to KNOWN_UNFIXED with the reason.\n\n{}",
+                unexpected.len(),
+                unexpected.join("\n\n")
+            );
+            for k in KNOWN_UNFIXED {
+                assert!(
+                    seen.iter()
+                        .any(|s| (&*s.0, &*s.1, &*s.2) == (k.0, k.1, k.2)),
+                    "KNOWN_UNFIXED entry {k:?} no longer reproduces — delete it \
+                     rather than leaving a stale exception behind"
+                );
+            }
+        }
+
+        /// The walk must be able to see a violation at all — otherwise the test
+        /// above passes for the wrong reason the day a pin is deleted.
+        #[test]
+        fn the_walk_reports_an_unpinned_parent() {
+            let profile = "\
+(deny default)
+(allow file-write* (subpath \"/w\"))
+(deny file-write* (subpath \"/w/keep/pkg\"))
+";
+            let found = violations(profile);
+            assert_eq!(found.len(), 1, "expected exactly one violation: {found:?}");
+            assert_eq!(found[0].1, "/w/keep", "{found:?}");
+
+            let pinned = format!("{profile}(deny file-write-unlink (literal \"/w/keep\"))\n");
+            assert!(
+                violations(&pinned).is_empty(),
+                "the pin must clear it: {:?}",
+                violations(&pinned)
+            );
+        }
     }
 }

@@ -299,7 +299,38 @@ fn worktree_scope_content_filter_is_detected() {
 // refused, not extended on the strength of a name.
 
 use cplt::config::ResolvedPushRule;
-use cplt::gh_proxy::gate_git;
+use cplt::gh_proxy::{RepoFacts, capture_repo_facts, gate_git};
+
+/// [`gate_git`] with the launch-time [`RepoFacts`] of the repository the
+/// invocation targets, as `sandbox_exec` captures them before the sandbox
+/// starts. These tests drive the guard through `-C <scratch repo>`.
+fn gate_git_t(
+    args: &[&str],
+    prevent_push: bool,
+    prevent_force_push: bool,
+    protect_default_branch_only: bool,
+    allow_push_rules: &[ResolvedPushRule],
+    real_git: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let dir = args
+        .iter()
+        .position(|a| *a == "-C")
+        .and_then(|i| args.get(i + 1))
+        .copied()
+        .unwrap_or(".");
+    let facts = real_git.map_or_else(RepoFacts::default, |git| {
+        capture_repo_facts(git, std::path::Path::new(dir))
+    });
+    gate_git(
+        args,
+        prevent_push,
+        prevent_force_push,
+        protect_default_branch_only,
+        allow_push_rules,
+        real_git,
+        &facts,
+    )
+}
 
 /// A repo whose `origin` is `url`, checked out on `branch`, recording `default`
 /// as the remote's default branch (`None`: never recorded, as in a fetch-only
@@ -383,7 +414,7 @@ fn an_unpinned_allow_push_rule_authorizes_no_repository() {
 
     for repo in [launch.path(), other.path()] {
         let dir = repo.to_string_lossy().into_owned();
-        let err = gate_git(
+        let err = gate_git_t(
             &["-C", &dir, "push", "origin", "main"],
             true,
             true,
@@ -409,7 +440,7 @@ fn an_unpinned_allow_push_rule_authorizes_no_repository() {
     let launch_dir = launch.path().to_string_lossy().into_owned();
     let other_dir = other.path().to_string_lossy().into_owned();
     assert!(
-        gate_git(
+        gate_git_t(
             &["-C", &launch_dir, "push", "origin", "main"],
             true,
             true,
@@ -421,7 +452,7 @@ fn an_unpinned_allow_push_rule_authorizes_no_repository() {
         "a pinned rule must still authorize its own repository"
     );
     assert!(
-        gate_git(
+        gate_git_t(
             &["-C", &other_dir, "push", "origin", "main"],
             true,
             true,
@@ -444,7 +475,7 @@ fn protect_default_branch_only_protects_a_default_that_is_not_main() {
     let git = git_bin();
     let dir = repo.path().to_string_lossy().into_owned();
     let gate = |branch: &str| {
-        gate_git(
+        gate_git_t(
             &["-C", &dir, "push", "origin", branch],
             true,
             true,
@@ -470,12 +501,16 @@ fn protect_default_branch_only_protects_a_default_that_is_not_main() {
     // A bare `git push` on the default branch is blocked too — the branch is
     // resolved from HEAD, the default from the remote, both in this repo.
     assert!(
-        gate_git(&["-C", &dir, "push"], true, true, true, &[], Some(&git)).is_err(),
+        gate_git_t(&["-C", &dir, "push"], true, true, true, &[], Some(&git)).is_err(),
         "bare push while on the default branch must be blocked"
     );
 }
 
-/// Each repository is judged by its own default branch, including through `-C`.
+/// Each repository is judged by *its own* launch-time facts — which means a
+/// `-C` into a different repository is judged by nothing at all, and fails
+/// closed. Driven through `gate_git` rather than [`gate_git_t`] on purpose: the
+/// shim re-captures the facts for whatever `-C` names, which is precisely the
+/// gate-time re-derivation production no longer does.
 #[test]
 fn the_default_branch_is_resolved_in_the_repo_the_command_targets() {
     let Some(develop) = guard_repo("https://github.com/o/dev.git", "develop", Some("develop"))
@@ -486,6 +521,7 @@ fn the_default_branch_is_resolved_in_the_repo_the_command_targets() {
         return;
     };
     let git = git_bin();
+    let facts = capture_repo_facts(&git, develop.path());
     let gate = |repo: &Path| {
         let dir = repo.to_string_lossy().into_owned();
         gate_git(
@@ -495,16 +531,19 @@ fn the_default_branch_is_resolved_in_the_repo_the_command_targets() {
             true,
             &[],
             Some(&git),
+            &facts,
         )
     };
 
     assert!(
         gate(develop.path()).is_err(),
-        "develop is the default branch there"
+        "develop is the default branch of the repository these facts describe"
     );
+    let err = gate(mainline.path())
+        .expect_err("another repository has no launch-time default branch here");
     assert!(
-        gate(mainline.path()).is_ok(),
-        "develop is an ordinary feature branch there"
+        err.contains("redirects git elsewhere"),
+        "the refusal must say why the facts do not apply, got: {err}"
     );
 }
 
@@ -518,7 +557,7 @@ fn protect_default_branch_only_grants_nothing_when_the_default_is_unknown() {
     };
     let git = git_bin();
     let dir = repo.path().to_string_lossy().into_owned();
-    let err = gate_git(
+    let err = gate_git_t(
         &["-C", &dir, "push", "origin", "feature/x"],
         true,
         true,
@@ -531,4 +570,94 @@ fn protect_default_branch_only_grants_nothing_when_the_default_is_unknown() {
         err.contains("git remote set-head"),
         "the block must say how to record the default branch, got: {err}"
     );
+}
+
+/// The remote-HEAD symref is protected on BOTH ref backends.
+///
+/// On the `files` backend the profile's `.git/refs/remotes/*/HEAD` deny covers
+/// it. On a `reftable` repository (git 2.45+) that path does not exist — the ref
+/// lives in the binary tables under `.git/reftable/`, which must stay writable —
+/// so the path deny matches nothing and the gate is the only control left. The
+/// gate never looks at the disk, so it holds either way; this test pins that,
+/// and pins the read form staying allowed.
+#[test]
+fn writing_the_remote_head_symref_is_blocked_on_both_ref_backends() {
+    for format in ["files", "reftable"] {
+        let Ok(tmp) = tempfile::tempdir() else { return };
+        let dir = tmp.path();
+        if !common::git_ok(dir, &["init", "--quiet", &format!("--ref-format={format}")]) {
+            continue; // git too old for this backend
+        }
+        assert!(common::git_ok(
+            dir,
+            &["remote", "add", "origin", "https://github.com/o/o.git"]
+        ));
+        assert!(common::git_ok(
+            dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk"
+            ]
+        ));
+        let loose = dir.join(".git/refs/remotes/origin/HEAD").exists();
+        assert_eq!(
+            loose,
+            format == "files",
+            "{format}: a loose HEAD file is exactly what the path deny can and cannot see"
+        );
+        // The cross-launch mechanism the gate closes: the facts are re-derived
+        // from this symref at every launch, so a persisted rewrite retargets the
+        // next one.
+        let git = git_bin();
+        assert_eq!(
+            capture_repo_facts(&git, dir).default_branch("origin", &[]),
+            Some("trunk"),
+            "{format}: launch-time facts follow the symref"
+        );
+        let path = dir.to_string_lossy().into_owned();
+        for args in [
+            &[
+                "-C",
+                &path,
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/decoy",
+            ][..],
+            &[
+                "-C",
+                &path,
+                "symbolic-ref",
+                "-d",
+                "refs/remotes/origin/HEAD",
+            ][..],
+        ] {
+            let err = gate_git_t(args, true, true, true, &[], Some(&git))
+                .expect_err("writing the remote HEAD symref must be blocked on any backend");
+            assert!(
+                err.contains("refs/remotes/<remote>/HEAD"),
+                "{format}: got {err}"
+            );
+        }
+        // The read form is how the guard itself resolves the ref — it must stay
+        // allowed, or normal operation breaks.
+        assert!(
+            gate_git_t(
+                &[
+                    "-C",
+                    &path,
+                    "symbolic-ref",
+                    "--short",
+                    "refs/remotes/origin/HEAD"
+                ],
+                true,
+                true,
+                true,
+                &[],
+                Some(&git),
+            )
+            .is_ok(),
+            "{format}: the read form must stay allowed"
+        );
+    }
 }

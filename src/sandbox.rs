@@ -539,6 +539,7 @@ pub fn exec_sandboxed(
     deny_env: &[String],
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) -> u8 {
     exec::exec(
         sandbox,
@@ -550,6 +551,7 @@ pub fn exec_sandboxed(
         deny_env,
         gh_guard,
         git_guard,
+        quiet,
     )
 }
 
@@ -641,6 +643,59 @@ fn report_unix_socket_regime(bwrap_active: bool, socket_masks: usize) {
 /// one place. It was not, and it mattered: a mutation that deleted the Copilot
 /// entry from the caller passed Linux CI green, because each helper had a test
 /// and the wiring that consumes them had none.
+/// The writable roots and git directories both bubblewrap path sets are keyed
+/// on. Shared so `ro_protect_paths` and `pin_paths` cannot drift apart — a
+/// gitdir missing from the pin set silently re-opens the rename walk-around
+/// that the read-only binds depend on being closed.
+#[cfg(target_os = "linux")]
+fn git_roots<'a>(
+    config: &'a SandboxConfig,
+    extra_git_dirs: &'a [PathBuf],
+) -> (Vec<&'a Path>, Vec<&'a Path>) {
+    let mut write_roots: Vec<&Path> = vec![config.project_dir];
+    write_roots.extend(config.extra_write.iter().map(PathBuf::as_path));
+    let mut git_dirs: Vec<&Path> = config.git_common_dir.into_iter().collect();
+    git_dirs.extend(extra_git_dirs.iter().map(PathBuf::as_path));
+    (write_roots, git_dirs)
+}
+
+/// Paths bind-mounted read-write onto themselves so they become mountpoints and
+/// can no longer be renamed or removed. See `bubblewrap::rename_pin_paths`.
+#[cfg(target_os = "linux")]
+fn pin_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let (write_roots, git_dirs) = git_roots(config, extra_git_dirs);
+    let mut pins = bubblewrap::rename_pin_paths(&write_roots, &git_dirs);
+    // GHSA-8qmv-wxp3-526v, Linux half. A read-only bind pins a path's content,
+    // not its name: `~/.cache/copilot` sits inside the writable `~/.cache`
+    // grant, so moving it aside left `pkg` writable under a name no bind
+    // covered. Self-binding the parent makes it a mountpoint, and `rename`/
+    // `rmdir` of a mountpoint return `EBUSY`. Derived from the read-only set
+    // rather than spelled out, so a package dir added there cannot arrive
+    // unpinned. Empty for every agent but Copilot.
+    pins.extend(
+        copilot_ro_protect_paths(config.agent, config.home_dir)
+            .iter()
+            .filter_map(|p| p.parent().map(Path::to_path_buf)),
+    );
+    // GHSA-7mcc-xg5v-hv8v, Linux half — the same reasoning one class over, for
+    // the exec-only agent grants the read-only overlay covers above.
+    // OpenCode's `~/.cache/opencode/bin` is read-only bound, but its parent
+    // sits in the writable `~/.cache` grant, so moving `~/.cache/opencode`
+    // aside left `bin` writable under a name no bind covers. Derived from the
+    // same filter as that overlay entry, so a future exec-only grant is pinned
+    // with it. `~/.cache/opencode` itself stays writable.
+    pins.extend(
+        config
+            .agent_dirs
+            .iter()
+            .filter(|d| !d.write && d.process_exec)
+            .filter_map(|d| d.path.parent().map(Path::to_path_buf)),
+    );
+    pins.sort();
+    pins.dedup();
+    pins
+}
+
 #[cfg(target_os = "linux")]
 fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf> {
     // Finding 1: Landlock cannot deny subpaths inside the writable project tree,
@@ -652,10 +707,7 @@ fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<P
     //
     // #212: every writable granted path is a candidate too — a sibling repo's
     // .git/hooks was fully writable before, and hooks run unsandboxed.
-    let mut write_roots: Vec<&Path> = vec![config.project_dir];
-    write_roots.extend(config.extra_write.iter().map(PathBuf::as_path));
-    let mut git_dirs: Vec<&Path> = config.git_common_dir.into_iter().collect();
-    git_dirs.extend(extra_git_dirs.iter().map(PathBuf::as_path));
+    let (write_roots, git_dirs) = git_roots(config, extra_git_dirs);
     let mut ro_protect = bubblewrap::git_persistence_paths(&write_roots, &git_dirs);
 
     // #237: same class, different tree — the agent's own config dir is granted
@@ -790,6 +842,7 @@ fn prepare_impl(
     let profile_text = landlock_mod::describe_policy(&policy);
 
     let ro_protect = ro_protect_paths(config, extra_git_dirs);
+    let pins = pin_paths(config, extra_git_dirs);
 
     // Deny-path masks: Landlock cannot deny subpaths within allowed
     // directories, but Bubblewrap can shadow them at the mount level — denied
@@ -824,7 +877,10 @@ fn prepare_impl(
         &policy.net_rules,
         policy.restrict_net_connect,
         config.proxy_forced,
-        &ro_protect,
+        bubblewrap::Overlays {
+            read_only: &ro_protect,
+            pins: &pins,
+        },
         &deny_masks,
     )?;
 

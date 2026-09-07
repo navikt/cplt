@@ -130,6 +130,14 @@ protected one, so it allows no push at all and the block message says to run
 at. Falling back to `main`/`master` alone would leave a `develop` repository
 unprotected by a setting that says it is protected.
 
+cplt also warns about this at launch, so the refusal is not a surprise at the
+first push — but only where the advice applies and can be heard: the repository
+has remotes and none of them has a recorded default branch, and the session is
+not quiet. A repository with no remote has nowhere to push and no `origin` to
+run `set-head` against, and `cplt exec` is quiet by default because its stdout
+and stderr belong to the command it runs. The block message at push time still
+carries the reason in every case.
+
 A push with no branch in the arguments is not waved through. The guard shells
 out to the real git to resolve the current branch, and fails closed when it
 cannot: an unresolvable branch counts as protected and the push is blocked.
@@ -226,7 +234,7 @@ guard checks force flags on `push` and lets everything else through.
 | **SSH push (if creds available)** | Agent could use raw SSH if keys were accessible | Kernel sandbox blocks `~/.ssh/` access entirely |
 | **Agent modifies `.git/hooks`** | Post-push hooks or other persistence | Kernel sandbox blocks writes to `.git/hooks/` on both platforms, and to `.git/config` on macOS only. On Linux `.git/config` stays writable, so `core.hooksPath` can still redirect hooks. |
 | **Git credential helper** | Could theoretically extract tokens | `GIT_TERMINAL_PROMPT=0` disables interactive prompts; credential files blocked |
-| **Agent rewrites the recorded default branch** | `protect_default_branch_only` resolves the default branch from `.git/refs/remotes/<remote>/HEAD`. `symbolic-ref` and `remote set-head` are both allowed subcommands and `.git/refs` is not in `PROTECTED_IN_GITDIR`, so an agent can point that symref at a branch of its choosing and make its own branch look like the protected one, or the protected one look like a feature branch. | None inside cplt, by design. This is the same "policy on intent, not a boundary" position the guard holds everywhere: it stops a compliant agent from pushing by accident, and it is strictly better than the hardcoded `main`/`master` list it replaced, but a local symref lookup is not a boundary and should not be read as one. Server-side branch protection is the boundary. |
+| **Agent rewrites the recorded default branch** | `protect_default_branch_only` used to resolve the default branch inside the sandbox, from `.git/refs/remotes/<remote>/HEAD`, at the moment the push was judged. That ref is agent-writable, so the agent chose the guard's yardstick (GHSA-cm6f-3wjh-x9qx). | Closed. The default branch is captured at launch, in the parent, with the trusted git binary, and baked into the wrapper; the gate never re-reads it. The ref file is denied and its parent directories are pinned against rename, so it cannot be rewritten for the *next* launch either. Write-form `git symbolic-ref refs/remotes/<remote>/HEAD` and `git remote set-head` are refused by the gate, which is what covers repositories using the `reftable` backend, where the ref is not a file and no path deny can see it. Reads are unaffected. Residual: on a Landlock-only Linux host the filesystem half is unenforced, so only the launch-time capture and the gate blocks apply. Server-side branch protection remains the boundary that holds against an agent invoking git by absolute path. |
 
 ### Defense in depth
 

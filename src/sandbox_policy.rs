@@ -2291,6 +2291,46 @@ pub const PROTECTED_IN_GITDIR: &[Protected] = &[
              `<gitdir>/config` write that is itself only denied on macOS.",
         ),
     },
+    // GHSA-cm6f-3wjh-x9qx: `refs/remotes/<remote>/HEAD` is the symref that names
+    // the branch `protect_default_branch_only` refuses pushes to. The gate bakes
+    // that value in the parent at launch, so a rewrite cannot retarget the guard
+    // *within* a session — but `cplt exec` is one launch per command, so a
+    // rewrite that persists on disk retargets the guard on the NEXT launch, and
+    // the push to the real default branch then sails through. Making the file
+    // unwritable is what closes it across launches — but ONLY on the `files` ref
+    // backend. On a repository created with `--ref-format=reftable` (git 2.45+)
+    // this ref is not a file: it lives in the binary tables under
+    // `.git/reftable/`, which has to stay writable, so this deny matches nothing
+    // there. `gate_git` blocks the write form of `git symbolic-ref` on that ref
+    // for exactly that reason; the two controls together are what close it on
+    // both backends. (Note `packed-refs` is not a hole here: symbolic refs are
+    // never packed, so on the files backend the loose `HEAD` always exists.)
+    //
+    // `refs/remotes` as a tree is not an option: `git fetch` has to keep writing
+    // `refs/remotes/<remote>/<branch>`. Only the `HEAD` file inside each remote's
+    // directory is denied, and the remote name is not known when the profile is
+    // generated — hence the `*` component (see `rel_regex`).
+    //
+    // The deny on the leaf is not sufficient on its own: every ancestor of it
+    // has to be unrenameable too, or the file is written at a path no rule names
+    // and renamed back into place. See [`rel_ancestors`] for the exact sequence
+    // and the two mechanisms that close it.
+    //
+    // Nothing legitimate writes it from inside a session: `git clone` and
+    // `git remote set-head` write it, and neither runs against an existing
+    // sandboxed repo. `git fetch` since 2.46 sets it when it is *missing*: that
+    // write is denied, so the fetch prints `error: couldn't set
+    // 'refs/remotes/origin/HEAD'` and then succeeds anyway — every
+    // remote-tracking branch still updates, exit status still 0 (verified on git
+    // 2.55). A repo in that state already refuses every push, because the guard
+    // cannot tell the default branch from a feature one without that symref.
+    Protected {
+        rel: "refs/remotes/*/HEAD",
+        tree: false,
+        nested: true,
+        why: "remote HEAD symref — names the branch the push guard protects, re-read at every launch",
+        linux: LinuxCoverage::Bwrap,
+    },
     // #341: a local, uncommitted gitignore. Nothing here executes, so this is a
     // lower bracket than `hooks` — what it is, is a *concealment* vector. Every
     // path `info/exclude` names disappears from `git status`, for the user and
@@ -2353,7 +2393,74 @@ pub fn escape_regex(path: &str) -> String {
 pub fn nested_alternation(set: &[Protected]) -> String {
     set.iter()
         .filter(|p| p.nested)
-        .map(|p| escape_regex(p.rel))
+        .map(|p| rel_regex(p.rel))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// A [`Protected::rel`] as a regex fragment, with `*` meaning "one path
+/// component".
+///
+/// Every entry but one is a literal path, for which this is [`escape_regex`].
+/// `refs/remotes/*/HEAD` is the exception: the remote's name is not known when
+/// the profile is generated and cannot be, since `git remote add` can create one
+/// mid-session. A wildcard component is the only shape that covers all of them,
+/// and macOS is the only backend that can express it — bubblewrap binds the
+/// concrete paths that exist at launch instead (`git_persistence_paths`), and
+/// Landlock expresses nothing here at all.
+pub fn rel_regex(rel: &str) -> String {
+    rel.split('/')
+        .map(|c| {
+            if c == "*" {
+                "[^/]+".to_string()
+            } else {
+                escape_regex(c)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// True if `rel` needs [`rel_regex`] rather than a literal path rule.
+pub fn rel_is_glob(rel: &str) -> bool {
+    rel.split('/').any(|c| c == "*")
+}
+
+/// Every *proper ancestor* of a [`Protected::rel`], outermost first —
+/// `refs`, `refs/remotes`, `refs/remotes/*` for `refs/remotes/*/HEAD`.
+///
+/// A path-shaped deny only holds while the path keeps denoting the object it
+/// protects. `emit_gitdir_denies` already says that about the gitdir itself;
+/// the same argument runs one level down and was missed. With
+/// `refs/remotes/*/HEAD` denied but `refs/remotes` renameable, the deny is
+/// walked around without ever touching a denied path (verified on macOS,
+/// git 2.55):
+///
+/// ```text
+/// mv .git/refs/remotes .git/x                       # no rule names it
+/// > .git/x/origin/HEAD                              # not a denied path
+/// mv .git/x .git/refs/remotes                       # the file is now live
+/// ```
+///
+/// So every ancestor of a protected path is itself protected against rename
+/// and unlink — on macOS with `file-write-unlink`, on Linux by making it a
+/// bind mountpoint (`rename`/`rmdir` of a mountpoint is `EBUSY`).
+pub fn rel_ancestors(rel: &str) -> Vec<&str> {
+    rel.match_indices('/').map(|(i, _)| &rel[..i]).collect()
+}
+
+/// The proper ancestors of every entry in `set`, deduplicated, as a regex
+/// alternation — the companion to [`nested_alternation`] for the rename half.
+///
+/// Not filtered by [`Protected::nested`]: every entry that has an ancestor
+/// today is nested, and an extra alternative in the nested regex would only
+/// deny a rename we did not need to allow.
+pub fn ancestor_alternation(set: &[Protected]) -> String {
+    let mut anc: Vec<&str> = set.iter().flat_map(|p| rel_ancestors(p.rel)).collect();
+    anc.sort_unstable();
+    anc.dedup();
+    anc.iter()
+        .map(|a| rel_regex(a))
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -2581,7 +2688,7 @@ mod tests {
         );
         assert_eq!(
             bwrap(PROTECTED_IN_GITDIR),
-            ["hooks", "info/exclude"],
+            ["hooks", "refs/remotes/*/HEAD", "info/exclude"],
             "`config`, `commondir` and `modules` are macOS-only; each entry \
              carries the reason in its LinuxCoverage::Gap"
         );
@@ -2603,7 +2710,7 @@ mod tests {
     fn nested_alternation_covers_the_nested_entries() {
         assert_eq!(
             nested_alternation(PROTECTED_IN_GITDIR),
-            "hooks|config|commondir|modules|info/exclude"
+            "hooks|config|commondir|modules|refs/remotes/[^/]+/HEAD|info/exclude"
         );
         assert_eq!(
             nested_alternation(PROTECTED_IN_ROOT),

@@ -492,6 +492,151 @@ fi
         )
     }
 
+    /// Script that goes after `refs/remotes/<remote>/HEAD` — the symref that
+    /// names the branch the push guard protects (GHSA-cm6f-3wjh-x9qx).
+    ///
+    /// Three routes to the same file: git's own two writers, and a plain shell
+    /// redirect. The redirect is the one that proves the FILESYSTEM denies it —
+    /// the git commands could otherwise be failing on the gate wrapper instead,
+    /// which does not persist across a `cplt exec` launch the way this file does.
+    fn script_remote_head_rewrite(project_path: &str) -> String {
+        format!(
+            r#"
+cd "{project_path}"
+
+if echo 'ref: refs/remotes/origin/decoy' > "{project_path}/.git/refs/remotes/origin/HEAD" 2>/dev/null; then
+    echo "RESULT:remote_head_raw_write:OK"
+else
+    echo "RESULT:remote_head_raw_write:FAIL"
+fi
+
+if git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/decoy 2>/dev/null; then
+    echo "RESULT:remote_head_symbolic_ref:OK"
+else
+    echo "RESULT:remote_head_symbolic_ref:FAIL"
+fi
+
+if git update-ref refs/remotes/origin/HEAD HEAD 2>/dev/null; then
+    echo "RESULT:remote_head_update_ref:OK"
+else
+    echo "RESULT:remote_head_update_ref:FAIL"
+fi
+
+if git remote set-head origin decoy 2>/dev/null; then
+    echo "RESULT:remote_head_set_head:OK"
+else
+    echo "RESULT:remote_head_set_head:FAIL"
+fi
+
+# The remote-tracking branches next to it must stay writable, or `git fetch`
+# is broken. This is the line that says the deny is narrow enough.
+if echo '0000000000000000000000000000000000000000' > "{project_path}/.git/refs/remotes/origin/main" 2>/dev/null; then
+    echo "RESULT:remote_branch_write:OK"
+else
+    echo "RESULT:remote_branch_write:FAIL"
+fi
+
+# So must a NEW remote's tracking dir — `git remote add` + `git fetch`.
+if mkdir -p "{project_path}/.git/refs/remotes/upstream" 2>/dev/null \
+   && echo '0000000000000000000000000000000000000000' > "{project_path}/.git/refs/remotes/upstream/main" 2>/dev/null; then
+    echo "RESULT:new_remote_branch_write:OK"
+else
+    echo "RESULT:new_remote_branch_write:FAIL"
+fi
+
+# ...but not that remote's HEAD, which the wildcard component covers.
+if echo 'ref: refs/remotes/upstream/decoy' > "{project_path}/.git/refs/remotes/upstream/HEAD" 2>/dev/null; then
+    echo "RESULT:new_remote_head_write:OK"
+else
+    echo "RESULT:new_remote_head_write:FAIL"
+fi
+"#
+        )
+    }
+
+    /// Script that walks the `refs/remotes/*/HEAD` deny around by renaming an
+    /// ANCESTOR of it, rather than touching the denied path itself.
+    ///
+    /// The leaf deny is a path rule, and a path rule only holds while the path
+    /// keeps denoting the object it protects — the same argument the gitdir's
+    /// own `file-write-unlink` rule was written for, one level down. Each
+    /// ancestor is tried on its own, then the full three-step dance, because a
+    /// single un-pinned ancestor is enough to defeat the whole chain.
+    fn script_remote_head_ancestor_rename(project_path: &str) -> String {
+        format!(
+            r#"
+cd "{project_path}"
+
+if mv "{project_path}/.git/refs/remotes/origin" "{project_path}/.git/refs/remotes/moved" 2>/dev/null; then
+    echo "RESULT:mv_remote_dir:OK"
+else
+    echo "RESULT:mv_remote_dir:FAIL"
+fi
+
+if mv "{project_path}/.git/refs/remotes" "{project_path}/.git/refs/moved" 2>/dev/null; then
+    echo "RESULT:mv_remotes_dir:OK"
+else
+    echo "RESULT:mv_remotes_dir:FAIL"
+fi
+
+if mv "{project_path}/.git/refs" "{project_path}/.git/moved" 2>/dev/null; then
+    echo "RESULT:mv_refs_dir:OK"
+else
+    echo "RESULT:mv_refs_dir:FAIL"
+fi
+
+# Deleting an ancestor is the same primitive without the restore: the symref
+# would simply be gone, and a repo with no remote HEAD is one the guard cannot
+# read a default branch from.
+if rm -rf "{project_path}/.git/refs/remotes/origin" 2>/dev/null    && ! test -e "{project_path}/.git/refs/remotes/origin/HEAD"; then
+    echo "RESULT:rm_remote_dir:OK"
+else
+    echo "RESULT:rm_remote_dir:FAIL"
+fi
+
+# The dance itself, exactly as reported: move an ancestor aside, write the
+# symref at a path no rule names, move it back so the file is live again.
+if mv "{project_path}/.git/refs/remotes" "{project_path}/.git/x" 2>/dev/null \
+   && echo 'ref: refs/remotes/origin/decoy' > "{project_path}/.git/x/origin/HEAD" 2>/dev/null \
+   && mv "{project_path}/.git/x" "{project_path}/.git/refs/remotes" 2>/dev/null; then
+    echo "RESULT:remote_head_rename_dance:OK"
+else
+    echo "RESULT:remote_head_rename_dance:FAIL"
+fi
+
+# The directories must still be WRITABLE — only their names are pinned. A
+# `git fetch` writes remote-tracking branches into exactly these.
+if echo '0000000000000000000000000000000000000000' > "{project_path}/.git/refs/remotes/origin/next" 2>/dev/null; then
+    echo "RESULT:remote_branch_write_after:OK"
+else
+    echo "RESULT:remote_branch_write_after:FAIL"
+fi
+"#
+        )
+    }
+
+    /// Script for the SECOND launch: what the next `cplt exec` actually reads.
+    ///
+    /// The value on disk is only half the story — the guard resolves the symref
+    /// through git, in a fresh process, with the sandbox rebuilt from scratch.
+    fn script_remote_head_readback(project_path: &str) -> String {
+        format!(
+            r#"
+cd "{project_path}"
+
+printf 'RESULT:symref_after_relaunch:%s\n' \
+    "$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || echo unreadable)"
+
+# And the deny is still in force in the new launch, not a first-run artifact.
+if echo 'ref: refs/remotes/origin/decoy' > "{project_path}/.git/refs/remotes/origin/HEAD" 2>/dev/null; then
+    echo "RESULT:relaunch_raw_write:OK"
+else
+    echo "RESULT:relaunch_raw_write:FAIL"
+fi
+"#
+        )
+    }
+
     /// Script that walks the git-persistence denies around by renaming the
     /// gitdir. Every deny in the profile names a path *inside* `.git`, so if
     /// `.git` itself can be renamed the writes land under a name no rule
@@ -529,6 +674,65 @@ if rm -rf "{project_path}/.git" 2>/dev/null; then
     echo "RESULT:gitdir_remove:OK"
 else
     echo "RESULT:gitdir_remove:FAIL"
+fi
+"#
+        )
+    }
+
+    /// GHSA-39xf-9j26-f82m: the project-root twin of
+    /// `script_remote_head_ancestor_rename`. `PROTECTED_IN_ROOT` denies the
+    /// leaf (`.github/hooks`, `.agents/plugins`) but the parent was renameable,
+    /// so the deny was walked around without ever writing a denied path. What
+    /// lands there executes on the HOST, unsandboxed, in a later session.
+    ///
+    /// `key` names the results; each primitive is tried on its own — rename,
+    /// `rm -rf` — before the full move-write-move-back dance, because a single
+    /// unpinned ancestor defeats the whole chain. The last block is the control
+    /// that keeps the test honest: ordinary content beside the protected leaf
+    /// must stay writable, or a FAIL above would only prove the tree was
+    /// unreachable.
+    fn script_root_ancestor_rename(
+        project_path: &str,
+        dir: &str,
+        leaf: &str,
+        sibling: &str,
+        key: &str,
+    ) -> String {
+        format!(
+            r#"
+# The parent of the protected path, renamed aside on its own.
+if mv "{project_path}/{dir}" "{project_path}/{dir}-moved" 2>/dev/null; then
+    echo "RESULT:mv_{key}:OK"
+    mv "{project_path}/{dir}-moved" "{project_path}/{dir}" 2>/dev/null
+else
+    echo "RESULT:mv_{key}:FAIL"
+fi
+
+# Deleting it is the same primitive without the restore: the next session's
+# agent reads whatever a fresh, unprotected directory contains.
+if rm -rf "{project_path}/{dir}" 2>/dev/null && [ ! -d "{project_path}/{dir}" ]; then
+    echo "RESULT:rm_{key}:OK"
+else
+    echo "RESULT:rm_{key}:FAIL"
+fi
+
+# The dance itself, exactly as reported: move the parent aside, write the
+# protected path under a name no rule covers, move it back.
+if mv "{project_path}/{dir}" "{project_path}/{dir}-moved" 2>/dev/null \
+   && echo evil > "{project_path}/{dir}-moved/{leaf}/evil.json" 2>/dev/null \
+   && mv "{project_path}/{dir}-moved" "{project_path}/{dir}" 2>/dev/null; then
+    echo "RESULT:{key}_rename_dance:OK"
+else
+    echo "RESULT:{key}_rename_dance:FAIL"
+fi
+
+# Control: the pin is rename/unlink only, so ordinary content in the same
+# directory is still writable.
+if mkdir -p "{project_path}/{dir}/{sibling}" 2>/dev/null \
+   && echo ok > "{project_path}/{dir}/{sibling}/note.txt" 2>/dev/null; then
+    echo "RESULT:{key}_sibling_write:OK"
+else
+    echo "RESULT:{key}_sibling_write:FAIL"
 fi
 "#
         )
@@ -836,6 +1040,133 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
         assert_result_fail(&stdout, "gitmodules_write");
     }
 
+    /// GHSA-cm6f-3wjh-x9qx: `refs/remotes/<remote>/HEAD` decides which branch
+    /// `protect_default_branch_only` refuses pushes to, and every launch re-reads
+    /// it before the sandbox exists. Baking the value at launch closes the rewrite
+    /// within a session; `cplt exec` is one launch per command, so only making the
+    /// file unwritable closes it across sessions.
+    #[test]
+    fn project_remote_head_symref_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let remotes = project.path().join(".git/refs/remotes/origin");
+        fs::create_dir_all(&remotes).expect("create refs/remotes/origin");
+        fs::write(remotes.join("HEAD"), "ref: refs/remotes/origin/main\n").expect("write HEAD");
+        fs::write(
+            remotes.join("main"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .expect("write remote branch");
+
+        let project_path = project.canonical_path().to_string_lossy().to_string();
+        let script = script_remote_head_rewrite(&project_path);
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        for op in [
+            // The raw redirect is the proof that this is a filesystem deny and
+            // not a gate refusal.
+            "remote_head_raw_write",
+            "remote_head_symbolic_ref",
+            "remote_head_update_ref",
+            "remote_head_set_head",
+            "new_remote_head_write",
+        ] {
+            assert_result_fail(&stdout, op);
+        }
+        // Narrow enough that `git fetch` keeps working, for an existing remote
+        // and for one added mid-session.
+        assert_result_ok(&stdout, &stderr, "remote_branch_write");
+        assert_result_ok(&stdout, &stderr, "new_remote_branch_write");
+        // The file must still say what it said.
+        assert_eq!(
+            fs::read_to_string(remotes.join("HEAD")).expect("read HEAD"),
+            "ref: refs/remotes/origin/main\n",
+            "the remote HEAD symref must be unchanged after the run"
+        );
+    }
+
+    /// GHSA-cm6f-3wjh-x9qx, the half the leaf deny does not cover: the file is
+    /// denied, its ancestors were not, so `mv .git/refs/remotes .git/x && >
+    /// .git/x/origin/HEAD && mv .git/x .git/refs/remotes` rewrote the symref
+    /// without ever writing a denied path. Reproduced against the built binary
+    /// before the fix; the push then sailed through on the NEXT launch, because
+    /// that is when the guard re-reads the file.
+    ///
+    /// Two launches, because one launch cannot show this: the guard bakes the
+    /// default branch in the parent at launch, so a rewrite is inert until the
+    /// process it fools is a later one. `e2e_guards::
+    /// git_gate_protect_default_survives_a_rewritten_remote_head` owns the other
+    /// half — that a decoy value in this file flips the push verdict. What is
+    /// asserted here is that no decoy value can get onto disk to be read.
+    #[test]
+    fn project_remote_head_symref_survives_an_ancestor_rename_across_launches() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let remotes = project.path().join(".git/refs/remotes/origin");
+        fs::create_dir_all(&remotes).expect("create refs/remotes/origin");
+        fs::write(remotes.join("HEAD"), "ref: refs/remotes/origin/main\n").expect("write HEAD");
+        fs::write(
+            remotes.join("main"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .expect("write remote branch");
+
+        let project_path = project.canonical_path().to_string_lossy().to_string();
+
+        // ── Launch 1: the rename dance ──
+        let script = script_remote_head_ancestor_rename(&project_path);
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        for op in [
+            "mv_remote_dir",
+            "mv_remotes_dir",
+            "mv_refs_dir",
+            "rm_remote_dir",
+            "remote_head_rename_dance",
+        ] {
+            assert_result_fail(&stdout, op);
+        }
+        // Pinned against rename, not against writing: `git fetch` still has to
+        // be able to put a remote-tracking branch in there.
+        assert_result_ok(&stdout, &stderr, "remote_branch_write_after");
+        assert_eq!(
+            fs::read_to_string(remotes.join("HEAD")).expect("read HEAD"),
+            "ref: refs/remotes/origin/main\n",
+            "the symref must be untouched on disk after the dance"
+        );
+
+        // ── Launch 2: what the next `cplt exec` reads ──
+        let script = script_remote_head_readback(&project_path);
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("RESULT:symref_after_relaunch:refs/remotes/origin/main"),
+            "the second launch must still resolve the symref to the real default \
+             branch — a decoy here is the push guard retargeted.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_result_fail(&stdout, "relaunch_raw_write");
+        assert_eq!(
+            fs::read_to_string(remotes.join("HEAD")).expect("read HEAD"),
+            "ref: refs/remotes/origin/main\n",
+            "the symref must be untouched after both launches"
+        );
+    }
+
     /// The gitdir denies must not cost any git operation an agent actually needs.
     ///
     /// Denying `.git` as a subpath would stop the rename bypass just as well and
@@ -965,6 +1296,77 @@ if git reflog >/dev/null 2>&1; then echo "RESULT:git_reflog:OK"; else echo "RESU
             "core.hooksPath was injected into .git/config, redirecting hooks \
              outside the sandbox.\nconfig: {config}"
         );
+    }
+
+    /// GHSA-39xf-9j26-f82m: the same class as the gitdir rename above, in the
+    /// project root, and worse. `.github/hooks` and `.agents/plugins` are
+    /// denied, but their parents were renameable, so
+    /// `mv .github .gh2 && echo evil > .gh2/hooks/evil.json && mv .gh2 .github`
+    /// planted a file that runs on the HOST, unsandboxed, the next time an
+    /// agent opens this repo — persistence and host code execution, not a guard
+    /// bypass. Reproduced against the built binary before the ancestors were
+    /// pinned.
+    ///
+    /// The assertions are filesystem facts after the run, not the sandboxed
+    /// shell's own view: a bypass that reported FAIL while still landing the
+    /// file would fail this test.
+    #[test]
+    fn project_protected_path_ancestor_rename_bypass_blocked() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.write_file(".github/hooks/keep.json", "original\n");
+        project.write_file(".agents/plugins/keep.json", "original\n");
+        project.git_init();
+
+        let project_path = project.canonical_path().to_string_lossy().to_string();
+        let mut script =
+            script_root_ancestor_rename(&project_path, ".github", "hooks", "workflows", "github");
+        script.push_str(&script_root_ancestor_rename(
+            &project_path,
+            ".agents",
+            "plugins",
+            "rules",
+            "agents",
+        ));
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        for key in ["github", "agents"] {
+            // Each primitive is refused outright...
+            assert_result_fail(&stdout, &format!("mv_{key}"));
+            assert_result_fail(&stdout, &format!("rm_{key}"));
+            assert_result_fail(&stdout, &format!("{key}_rename_dance"));
+            // ...but the directory itself is still an ordinary writable one.
+            assert_result_ok(&stdout, &stderr, &format!("{key}_sibling_write"));
+        }
+
+        // Filesystem truth: nothing moved, nothing was planted, and the
+        // protected files are byte-for-byte what they were.
+        for (dir, leaf) in [(".github", "hooks"), (".agents", "plugins")] {
+            let path = project.path().join(dir);
+            assert!(
+                path.is_dir(),
+                "{dir} must still be a directory after the run"
+            );
+            assert!(
+                !project.path().join(format!("{dir}-moved")).exists(),
+                "{dir}-moved must not exist — {dir} was never renamed away"
+            );
+            assert!(
+                !path.join(leaf).join("evil.json").exists(),
+                "a payload was planted in {dir}/{leaf} — it runs unsandboxed on \
+                 the host the next time an agent opens this repo"
+            );
+            assert_eq!(
+                fs::read_to_string(path.join(leaf).join("keep.json")).unwrap_or_default(),
+                "original\n",
+                "{dir}/{leaf}/keep.json was rewritten"
+            );
+        }
     }
 
     /// #212: a repo granted via `--allow-write` is a second writable root, and

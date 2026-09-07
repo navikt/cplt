@@ -95,6 +95,38 @@ fn canonical_remote(project_dir: &Path) -> Option<String> {
     Some(normalize_remote_url(url.trim()))
 }
 
+/// Split `[user@]host[:port]/path` (a URL with its scheme already stripped)
+/// into a lowercased host plus the path, dropping a trailing `.git` or `/`.
+///
+/// The authority ends at the FIRST `/`, and `user@` is stripped from *that
+/// segment only*. Splitting the whole remainder on the first `@` — what both
+/// the `ssh://` and the HTTPS branch used to do — let an `@` anywhere in the
+/// path discard the real host: `https://evil.example/x@github.com/me/fork`
+/// normalized to `github.com/me/fork` while git connected to `evil.example`,
+/// which defeated `allow_push` URL pinning, the trust store and the gh
+/// repo-scope comparison alike (GHSA-xcvh-hxfg-f4cg).
+fn host_and_path(rest: &str) -> String {
+    // Trailing slash first: `repo.git/` does not end in `.git`, so trimming the
+    // suffix before the slash left it in place and an otherwise identical URL
+    // normalized differently.
+    let rest = rest
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (rest, None),
+    };
+    // `rsplit_once`: the host is what follows the LAST `@` of the authority,
+    // so a `user:pass@` containing an `@` cannot smuggle a host in either.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split(':').next().unwrap_or(host).to_lowercase();
+    match path {
+        Some(path) => format!("{host}/{path}"),
+        None => host,
+    }
+}
+
 /// Normalize a git remote URL to a canonical form.
 ///
 /// - `git@github.com:org/repo.git` → `github.com/org/repo`
@@ -105,19 +137,7 @@ pub fn normalize_remote_url(url: &str) -> String {
 
     // SSH scheme: ssh://[user@]host[:port]/org/repo.git
     if let Some(rest) = url.strip_prefix("ssh://") {
-        // Strip user@ prefix if present
-        let rest = if let Some((_user, after)) = rest.split_once('@') {
-            after
-        } else {
-            rest
-        };
-        // Strip optional :port before path
-        let rest = rest.trim_end_matches(".git").trim_end_matches('/');
-        if let Some((host_port, path)) = rest.split_once('/') {
-            let host = host_port.split(':').next().unwrap_or(host_port);
-            return format!("{}/{}", host.to_lowercase(), path);
-        }
-        return rest.to_lowercase();
+        return host_and_path(rest);
     }
 
     // SSH shorthand: git@host:org/repo.git (also handles user@host:path)
@@ -126,27 +146,19 @@ pub fn normalize_remote_url(url: &str) -> String {
         && user_host.contains('@')
     {
         let host = user_host.rsplit_once('@').map_or(user_host, |(_, h)| h);
-        let path = path.trim_end_matches(".git").trim_end_matches('/');
+        let path = path
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .trim_end_matches('/');
         return format!("{}/{}", host.to_lowercase(), path);
     }
 
-    // HTTPS/HTTP: https://host/org/repo.git
+    // HTTPS/HTTP: https://[user@]host[:port]/org/repo.git
     if let Some(rest) = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
     {
-        let rest = rest.trim_end_matches(".git").trim_end_matches('/');
-        // Strip optional user@ (e.g., https://token@github.com/org/repo)
-        let rest = if let Some((_cred, after)) = rest.split_once('@') {
-            after
-        } else {
-            rest
-        };
-        // Lowercase only the host portion
-        if let Some((host, path)) = rest.split_once('/') {
-            return format!("{}/{}", host.to_lowercase(), path);
-        }
-        return rest.to_lowercase();
+        return host_and_path(rest);
     }
 
     // Fallback: use as-is
@@ -498,6 +510,67 @@ mod tests {
         assert_eq!(
             normalize_remote_url("https://x-access-token:ghp_abc@github.com/navikt/spleis.git"),
             "github.com/navikt/spleis"
+        );
+    }
+
+    /// GHSA-xcvh-hxfg-f4cg: an `@` in the *path* must not be mistaken for the
+    /// userinfo delimiter, or a crafted remote normalizes to a host git never
+    /// contacts — and every URL comparison built on this (allow_push pinning,
+    /// the trust store, the gh repo scope) authorizes the wrong repository.
+    #[test]
+    fn normalize_ignores_a_trailing_slash_after_dot_git() {
+        // `repo.git/` does not end in `.git`, so trimming the suffix first left
+        // it in place and two spellings of one remote compared unequal.
+        for url in [
+            "https://github.com/org/repo.git/",
+            "https://github.com/org/repo.git",
+            "https://github.com/org/repo/",
+            "https://github.com/org/repo",
+            "ssh://git@github.com/org/repo.git/",
+            "git@github.com:org/repo.git/",
+        ] {
+            assert_eq!(
+                normalize_remote_url(url),
+                "github.com/org/repo",
+                "{url} should normalize to the same remote"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_the_host_when_the_path_contains_an_at_sign() {
+        for url in [
+            "https://evil.example/x@github.com/me/fork.git",
+            "http://evil.example/x@github.com/me/fork.git",
+            "ssh://git@evil.example/x@github.com/me/fork.git",
+            // Several `@`: the host is still the authority's last segment.
+            "https://a@b@evil.example/x@github.com/me/fork.git",
+        ] {
+            let normalized = normalize_remote_url(url);
+            assert!(
+                normalized.starts_with("evil.example/"),
+                "{url} normalized to {normalized}, which names a host it does not contact"
+            );
+        }
+    }
+
+    /// Degenerate `@` placements stay inside the authority/path split rather
+    /// than reshuffling the two.
+    #[test]
+    fn normalize_handles_degenerate_at_signs() {
+        // Empty userinfo, and userinfo with nothing after the `@`.
+        assert_eq!(
+            normalize_remote_url("https://@github.com/navikt/spleis.git"),
+            "github.com/navikt/spleis"
+        );
+        assert_eq!(
+            normalize_remote_url("https://user@/navikt/spleis.git"),
+            "/navikt/spleis"
+        );
+        // A path segment that merely *begins* with `@` is path, not userinfo.
+        assert_eq!(
+            normalize_remote_url("https://github.com/@navikt/spleis.git"),
+            "github.com/@navikt/spleis"
         );
     }
 

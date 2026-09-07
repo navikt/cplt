@@ -925,6 +925,12 @@ NOTE:
         #[arg(long, default_value = "")]
         allow_push_rules: String,
 
+        /// JSON-encoded repository facts captured at launch (default branch per
+        /// remote). Baked into the wrapper so the guard never re-derives them
+        /// from agent-writable state inside the sandbox.
+        #[arg(long, default_value = "")]
+        repo_facts: String,
+
         /// git arguments to evaluate and potentially pass through.
         #[arg(last = true)]
         args: Vec<String>,
@@ -2597,6 +2603,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 prevent_force_push,
                 protect_default_branch_only,
                 allow_push_rules,
+                repo_facts,
             } => {
                 let mode = match mode.as_str() {
                     "warn" => config::EnforcementMode::Warn,
@@ -2607,6 +2614,11 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                 let prevent_force_push = prevent_force_push != "false";
                 let protect_default_branch_only = protect_default_branch_only != "false";
                 let rules = parse_allow_push_rules(&allow_push_rules);
+                // Unparseable facts must not silently become "no protection":
+                // an empty RepoFacts fails closed under
+                // protect_default_branch_only, which is the safe default.
+                let facts: gh_proxy::RepoFacts =
+                    serde_json::from_str(&repo_facts).unwrap_or_default();
                 run_git_gate(
                     &real_git,
                     &args,
@@ -2615,6 +2627,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     prevent_force_push,
                     protect_default_branch_only,
                     &rules,
+                    &facts,
                 )
             }
             // Exec is handled before this match (see above) — unreachable
@@ -2855,6 +2868,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &resolved.deny_env,
             &resolved.gh_guard,
             &resolved.git_guard,
+            resolved.quiet,
         )
     });
 
@@ -3153,6 +3167,7 @@ fn parse_allow_push_rules(json: &str) -> Vec<config::ResolvedPushRule> {
 /// The git guard has no repository pin to apply, so an allowed command and a
 /// command let through by warn or audit take the same effect and differ only in
 /// whether a notice is printed first.
+#[allow(clippy::too_many_arguments)] // policy flags + the baked launch facts; a struct here would only rename them
 fn decide_git_gate(
     args: &[String],
     mode: config::EnforcementMode,
@@ -3161,6 +3176,7 @@ fn decide_git_gate(
     protect_default_branch_only: bool,
     allow_push_rules: &[config::ResolvedPushRule],
     real_git: &Path,
+    repo_facts: &gh_proxy::RepoFacts,
 ) -> GateEffect {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
@@ -3171,6 +3187,7 @@ fn decide_git_gate(
         protect_default_branch_only,
         allow_push_rules,
         Some(real_git),
+        repo_facts,
     ) {
         Ok(()) => GateEffect::ExecPlain { notice: None },
         Err(msg) => match mode {
@@ -3186,6 +3203,7 @@ fn decide_git_gate(
 }
 
 /// Handle `cplt git-gate` — evaluate a git command and exec the real binary if allowed.
+#[allow(clippy::too_many_arguments)] // policy flags + the baked launch facts; a struct here would only rename them
 fn run_git_gate(
     real_git: &Path,
     args: &[String],
@@ -3194,6 +3212,7 @@ fn run_git_gate(
     prevent_force_push: bool,
     protect_default_branch_only: bool,
     allow_push_rules: &[config::ResolvedPushRule],
+    repo_facts: &gh_proxy::RepoFacts,
 ) -> ExitCode {
     let effect = decide_git_gate(
         args,
@@ -3203,6 +3222,7 @@ fn run_git_gate(
         protect_default_branch_only,
         allow_push_rules,
         real_git,
+        repo_facts,
     );
     perform_gate_effect(real_git, "git", args, effect)
 }
@@ -3836,6 +3856,7 @@ fn run_exec_command(
             &resolved.deny_env,
             &resolved.gh_guard,
             &resolved.git_guard,
+            resolved.quiet,
         )
     });
 
@@ -3898,6 +3919,7 @@ fn probe_shell(
         &resolved.deny_env,
         &resolved.gh_guard,
         &resolved.git_guard,
+        resolved.quiet,
     )
 }
 
@@ -6919,6 +6941,7 @@ mod tests {
             false,
             &[],
             Path::new("/usr/bin/git"),
+            &gh_proxy::RepoFacts::default(),
         );
         assert!(
             matches!(blocked, GateEffect::Refuse(_)),
@@ -6933,6 +6956,7 @@ mod tests {
             false,
             &[],
             Path::new("/usr/bin/git"),
+            &gh_proxy::RepoFacts::default(),
         );
         assert!(
             matches!(warned, GateEffect::ExecPlain { notice: Some(_) }),

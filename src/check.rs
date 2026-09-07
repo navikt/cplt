@@ -570,6 +570,10 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             ctx.git_guard.protect_default_branch_only,
             &ctx.git_guard.allow_push,
             None,
+            // `cplt check exec` explains policy without a repository probe; with
+            // no baked facts the default-branch arm fails closed, matching what
+            // a launch that captured nothing would do.
+            &crate::gh_proxy::RepoFacts::default(),
         ) {
             Ok(()) => ExecExplain {
                 decision: Decision::Allowed,

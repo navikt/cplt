@@ -97,6 +97,9 @@ fn configure_command(
     agent: Agent,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    // Startup notices are suppressed under `--quiet`, which `cplt exec`
+    // defaults to: its stdout and stderr must stay clean for pipes.
+    quiet: bool,
     npmrc_allowed: bool,
     playwright_socket_dir: Option<&Path>,
     playwright_runtime: bool,
@@ -255,7 +258,7 @@ fn configure_command(
                 cache_gh_token_to_file(scratch, agent, deny_env);
             }
         }
-        install_command_wrappers(cmd, scratch, project_dir, gh_guard, git_guard);
+        install_command_wrappers(cmd, scratch, project_dir, gh_guard, git_guard, quiet);
     }
 }
 
@@ -455,6 +458,7 @@ fn install_command_wrappers(
     project_dir: &Path,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -581,6 +585,39 @@ fn install_command_wrappers(
         // unpinned, and an unpinned rule authorizes nothing, so the operator is
         // warned rather than left with a rule that silently does not apply.
         let mut git_guard = git_guard.clone();
+        // Capture the launch repository's facts — today the default branch of
+        // each remote — with the TRUSTED git, in the unsandboxed parent, and
+        // bake them into the wrapper. The guard used to ask
+        // `git symbolic-ref refs/remotes/<remote>/HEAD` at gate time inside the
+        // sandbox; that ref file is agent-writable, so the agent could rewrite
+        // the guard's yardstick and push to the real default branch
+        // (GHSA-cm6f-3wjh-x9qx). Same treatment as the gh guard's repo scope.
+        let repo_facts = crate::git::trusted_git()
+            .map(|git| crate::gh_proxy::capture_repo_facts(git, project_dir))
+            .unwrap_or_default();
+        // Two conditions narrow this to the case the operator can act on.
+        // `!quiet`, because `cplt exec` defaults to quiet and its stderr must
+        // stay clean for pipes (`e2e_exec_no_output_contamination`) — the same
+        // rule every other launch notice follows. And `has_remotes`, because a
+        // repo with no remote has nowhere to push: nothing is being refused
+        // that could have succeeded, and `git remote set-head origin -a` is
+        // advice for a remote that does not exist. What is left — remotes
+        // configured, no `refs/remotes/*/HEAD` recorded (a `git init` + `git
+        // remote add`, or a clone whose set-head never ran) — is exactly where
+        // every push really is refused.
+        if !quiet
+            && git_guard.protect_default_branch_only
+            && repo_facts.default_branches.is_empty()
+            && crate::git::trusted_git()
+                .is_some_and(|git| crate::gh_proxy::has_remotes(git, project_dir))
+        {
+            ui::warn(
+                "git guard: no remote's default branch could be captured at launch, so \
+                 protect_default_branch_only cannot tell a feature branch from the protected \
+                 one and every push is refused. Run `git remote set-head origin -a` in the \
+                 project repository and start a new session.",
+            );
+        }
         if !git_guard.allow_push.is_empty() {
             if let Some(trusted) = crate::git::trusted_git() {
                 git_guard.allow_push = crate::gh_proxy::resolve_push_rule_urls(
@@ -613,6 +650,7 @@ fn install_command_wrappers(
             &real_git.to_string_lossy(),
             &cplt_str,
             &git_guard,
+            &repo_facts,
         );
         let wrapper_path = bin_dir.join("git");
         if std::fs::write(&wrapper_path, script).is_ok() {
@@ -891,6 +929,7 @@ pub fn exec(
     deny_env: &[String],
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) -> u8 {
     let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-p").arg(&sandbox.profile_text).arg(copilot_bin);
@@ -910,6 +949,7 @@ pub fn exec(
         sandbox.agent,
         gh_guard,
         git_guard,
+        quiet,
         sandbox.npmrc_allowed,
         sandbox.playwright_socket_dir.as_deref(),
         sandbox.playwright_runtime,
@@ -965,6 +1005,7 @@ pub fn exec(
     deny_env: &[String],
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;
 
@@ -981,6 +1022,7 @@ pub fn exec(
             deny_env,
             gh_guard,
             git_guard,
+            quiet,
         ) {
             BwrapOutcome::Ran(code) => return code,
             BwrapOutcome::Fallback => {
@@ -1029,6 +1071,7 @@ pub fn exec(
         sandbox.agent,
         gh_guard,
         git_guard,
+        quiet,
         sandbox.npmrc_allowed,
         sandbox.playwright_socket_dir.as_deref(),
         sandbox.playwright_runtime,
@@ -1089,6 +1132,7 @@ fn exec_bwrap(
     deny_env: &[String],
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) -> BwrapOutcome {
     // The re-entry helper is this very binary; bwrap execs it by absolute path
     // (visible inside the namespace via `--ro-bind / /`).
@@ -1171,6 +1215,7 @@ fn exec_bwrap(
         sandbox.agent,
         gh_guard,
         git_guard,
+        quiet,
         sandbox.npmrc_allowed,
         sandbox.playwright_socket_dir.as_deref(),
         sandbox.playwright_runtime,
