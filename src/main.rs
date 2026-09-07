@@ -3249,6 +3249,44 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
     bail!("exec: '{name}' not found in PATH")
 }
 
+/// Point a bare guarded command name at its guard shim instead of the real
+/// binary `resolve_exec_binary` found on the parent PATH.
+///
+/// `install_command_wrappers` writes the `git`/`gh` shims into `{scratch}/bin`
+/// and prepends that directory to the *child's* PATH, which is why
+/// `cplt exec -c 'git push …'` meets the gate. `cplt exec -- git push …`
+/// never did: cplt resolves argv[0] itself, against the parent PATH, and hands
+/// the sandbox that absolute path — the shim directory never enters the
+/// lookup (GHSA-qcgr-j4mx-f92r). Redirecting here makes both spellings run the
+/// same gate.
+///
+/// A name containing a slash cannot match: `/usr/bin/git` and `./git` keep
+/// their current behaviour, the bypass SECURITY.md documents as accepted and
+/// out of scope. So does any name whose guard is disabled, and any command
+/// that is not `git` or `gh`.
+///
+/// `real` is the parent-PATH resolution, returned unchanged when no redirect
+/// applies. Taking it as an argument keeps the shim only where cplt actually
+/// found a binary to wrap: `gh` on a machine without gh still fails with
+/// "not found in PATH" rather than with a missing shim.
+fn redirect_to_guard_shim(
+    name: &str,
+    real: PathBuf,
+    scratch_dir: Option<&Path>,
+    gh_guard_enabled: bool,
+    git_guard_enabled: bool,
+) -> PathBuf {
+    let guarded = match name {
+        "git" => git_guard_enabled,
+        "gh" => gh_guard_enabled,
+        _ => false,
+    };
+    match (guarded, scratch_dir) {
+        (true, Some(scratch)) => scratch.join("bin").join(name),
+        _ => real,
+    }
+}
+
 /// Everything the sandbox assembly reads off the host machine.
 ///
 /// Pulled out as a seam: production calls [`HostProbe::probe`], while a test can
@@ -3615,26 +3653,16 @@ fn run_exec_command(
         );
     }
 
-    // Resolve the binary and args to pass to the sandbox
-    let (exec_bin, exec_args): (PathBuf, Vec<String>) = if let Some(ref shell_c) = shell_cmd {
-        // -c mode: use the same shell as --agent shell for consistent behaviour.
-        // Agent::Shell.resolve_binary() validates $SHELL exists and falls back to
-        // /bin/zsh (macOS) or /bin/bash (Linux) — same fallbacks as the interactive shell.
-        let shell = agent::Agent::Shell
-            .resolve_binary()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        (shell, vec!["-c".to_string(), shell_c.clone()])
-    } else {
-        if cmd.is_empty() {
-            bail!(
-                "cplt exec: no command given.\n\
-                 Usage: cplt exec -- <cmd> [args...]\n\
-                 Or:    cplt exec -c \"cmd && cmd\""
-            );
-        }
-        let bin = resolve_exec_binary(&cmd[0])?;
-        (bin, cmd[1..].to_vec())
-    };
+    // Usage error up front. The binary itself is resolved further down, after
+    // the sandbox is assembled — see there — but an empty command must not
+    // first cost a full config resolve and sandbox build.
+    if shell_cmd.is_none() && cmd.is_empty() {
+        bail!(
+            "cplt exec: no command given.\n\
+             Usage: cplt exec -- <cmd> [args...]\n\
+             Or:    cplt exec -c \"cmd && cmd\""
+        );
+    }
 
     // Resolve config, paths, project dir — same pipeline as the main agent launch
     let ResolvedContext {
@@ -3687,7 +3715,7 @@ fn run_exec_command(
         prepared,
         policy,
         proxy_handle,
-        scratch_guard: _scratch_guard,
+        scratch_guard,
         #[cfg(target_os = "macos")]
             playwright_socket_guard: _playwright_socket_guard,
         ..
@@ -3698,6 +3726,31 @@ fn run_exec_command(
         &home_dir,
         &project_dir,
     )?;
+
+    // Resolve the binary and args to pass to the sandbox.
+    //
+    // Deliberately after the sandbox is assembled: the guard shims live in the
+    // scratch bin dir this assembly creates, and a bare `git`/`gh` has to
+    // resolve to the shim rather than to the real binary on the parent PATH
+    // (see `redirect_to_guard_shim`).
+    let (exec_bin, exec_args): (PathBuf, Vec<String>) = if let Some(ref shell_c) = shell_cmd {
+        // -c mode: use the same shell as --agent shell for consistent behaviour.
+        // Agent::Shell.resolve_binary() validates $SHELL exists and falls back to
+        // /bin/zsh (macOS) or /bin/bash (Linux) — same fallbacks as the interactive shell.
+        let shell = agent::Agent::Shell
+            .resolve_binary()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        (shell, vec!["-c".to_string(), shell_c.clone()])
+    } else {
+        let bin = redirect_to_guard_shim(
+            &cmd[0],
+            resolve_exec_binary(&cmd[0])?,
+            scratch_guard.as_ref().map(cplt::scratch::ScratchDir::path),
+            resolved.gh_guard.enabled,
+            resolved.git_guard.enabled,
+        );
+        (bin, cmd[1..].to_vec())
+    };
 
     warn_shim_target_without_exec(&policy, &exec_bin);
 
@@ -6543,6 +6596,63 @@ mod tests {
         let cli = parse(&[]);
         let args = build_copilot_args(&cli, &agent::Agent::OpenCode);
         assert!(args.is_empty());
+    }
+
+    // ── `cplt exec` binary resolution (`redirect_to_guard_shim`) ──────────
+
+    /// GHSA-qcgr-j4mx-f92r: `cplt exec -- git push` executed the parent PATH's
+    /// real git, so the guard never ran, while `cplt exec -c 'git push'` was
+    /// refused. A bare guarded name must resolve to the shim.
+    #[test]
+    fn a_bare_guarded_name_resolves_to_the_guard_shim() {
+        let scratch = PathBuf::from("/scratch");
+        let real = PathBuf::from("/usr/bin/git");
+        assert_eq!(
+            redirect_to_guard_shim("git", real.clone(), Some(&scratch), true, true),
+            PathBuf::from("/scratch/bin/git")
+        );
+        assert_eq!(
+            redirect_to_guard_shim(
+                "gh",
+                PathBuf::from("/usr/bin/gh"),
+                Some(&scratch),
+                true,
+                true
+            ),
+            PathBuf::from("/scratch/bin/gh")
+        );
+
+        // Guard off → unchanged, for each guard independently.
+        assert_eq!(
+            redirect_to_guard_shim("git", real.clone(), Some(&scratch), true, false),
+            real
+        );
+        assert_eq!(
+            redirect_to_guard_shim(
+                "gh",
+                PathBuf::from("/usr/bin/gh"),
+                Some(&scratch),
+                false,
+                true
+            ),
+            PathBuf::from("/usr/bin/gh")
+        );
+
+        // No scratch dir → no shim was installed, so nothing to redirect to.
+        assert_eq!(
+            redirect_to_guard_shim("git", real.clone(), None, true, true),
+            real
+        );
+
+        // A path with a slash keeps the documented, out-of-scope behaviour
+        // (SECURITY.md), and every unguarded command is untouched.
+        for name in ["/usr/bin/git", "./git", "../gh", "ls", "gitk", "ghost"] {
+            assert_eq!(
+                redirect_to_guard_shim(name, real.clone(), Some(&scratch), true, true),
+                real,
+                "{name} must not be redirected"
+            );
+        }
     }
 
     // ── guard verdict → effect (`decide_gh_gate` / `decide_git_gate`) ──────

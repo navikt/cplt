@@ -2087,6 +2087,92 @@ const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
 const PUSH_FLAGS_WITH_VALUE: &[&str] =
     &["--repo", "--receive-pack", "--exec", "-o", "--push-option"];
 
+/// Every long option real `git push` accepts, transcribed from `git push -h`
+/// (git 2.50.1, Apple Git-155) — plus `--help`, which parse-options adds to
+/// every builtin. The usage's `--[no-]x` spelling means `--no-x` is accepted
+/// too, so the check strips a leading `no-` before looking a name up here.
+///
+/// Fail-closed by design. Git's parse-options also resolves *unique
+/// abbreviations* (`--rep` → `--repo`, `--forc` → `--force`, `--al` →
+/// `--all`), which every parser in this file — all of them exact-match — reads
+/// as something else entirely: an abbreviated `--repo` leaves the destination
+/// URL sitting in refspec position, where it is taken for a branch name that
+/// is not the protected one, and an abbreviated `--force`/`--mirror`/`--tags`
+/// is invisible to force and unconstrainable-mode detection. Rather than
+/// reimplement git's prefix matching (and inherit its ambiguity rules), any
+/// option not spelled out exactly is refused while a push guard is active.
+/// A future git option therefore gets refused rather than silently misparsed;
+/// when one appears, add it here.
+const PUSH_LONG_OPTIONS: &[&str] = &[
+    "all",
+    "atomic",
+    "branches",
+    "delete",
+    "dry-run",
+    "exec",
+    "follow-tags",
+    "force",
+    "force-if-includes",
+    "force-with-lease",
+    "help",
+    "ipv4",
+    "ipv6",
+    "mirror",
+    "porcelain",
+    "progress",
+    "prune",
+    "push-option",
+    "quiet",
+    "receive-pack",
+    "recurse-submodules",
+    "repo",
+    "set-upstream",
+    "signed",
+    "tags",
+    "thin",
+    "verbose",
+    "verify",
+];
+
+/// The first `git push` option token that cannot be bound to an exact option,
+/// if any: an unknown/abbreviated long option, or a bundled short cluster.
+///
+/// Bundling is refused rather than expanded for the same reason abbreviation
+/// is: `-vo`, `-qo`, `-fu` and friends all parse in git and in none of this
+/// file's parsers. The one single-dash token longer than two characters that
+/// is unambiguous is `-o<value>` (`git push -oci.skip`), so it stays allowed.
+///
+/// Walks arguments the same way [`push_positionals`] does, so a flag's *value*
+/// (`-o --whatever`) is never mistaken for an option, and everything after
+/// `--` is positional.
+fn unbindable_push_option<'a>(push_args: &[&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    while i < push_args.len() {
+        let arg = push_args[i];
+        if arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or(long);
+            if !PUSH_LONG_OPTIONS.contains(&name.strip_prefix("no-").unwrap_or(name)) {
+                return Some(arg);
+            }
+        } else if arg.starts_with('-') && arg.len() > 2 && !arg.starts_with("-o") {
+            return Some(arg);
+        }
+        if arg.starts_with('-') {
+            if !arg.contains('=') && PUSH_FLAGS_WITH_VALUE.contains(&arg) {
+                i += 2; // skip flag and its value
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// True if `arg` is a force-push *flag* (`--force`, `-f`, or a `--force-with-lease`/
 /// `--force-if-includes` variant, which may carry an `=`-attached value).
 fn is_force_push_flag(arg: &str) -> bool {
@@ -2198,12 +2284,50 @@ fn injected_sensitive_config_key(args: &[&str]) -> Option<(&'static str, String)
     None
 }
 
-/// Whether push args carry a `--repo`/`--repo=<url>` destination override, which
-/// redirects the push past remote-based authorization.
-fn push_has_repo_override(sub_args: &[&str]) -> bool {
-    sub_args
-        .iter()
-        .any(|a| *a == "--repo" || a.starts_with("--repo="))
+/// The push destination that escapes remote-based authorization, if any.
+///
+/// Two forms redirect a push away from the remote the guard authorizes against:
+/// `--repo`/`--repo=<url>`, and a first positional that is not a configured
+/// remote of this repository.
+///
+/// On the positional: git parses `git push [<repository> [<refspec>…]]`, and the
+/// FIRST positional is ALWAYS the repository — never a refspec. Verified against
+/// git 2.50: `git push main:main` tries to ssh to host `main`, `git push
+/// HEAD:refs/heads/x` to host `HEAD`, and `git push +main` fails with "'+main'
+/// does not appear to be a git repository". So the `main:main` (refspec) vs
+/// `host:path` (URL) ambiguity needs no syntactic tie-breaker: *position*
+/// decides, exactly as git decides it, and a refspec only ever appears from the
+/// second positional on.
+///
+/// What is left to establish is whether that repository argument is a name the
+/// guard's remote-based authorization can actually bind to, and git's own remote
+/// list is the only authority on that — no syntactic rule can do it, because a
+/// slash-less, colon-less relative path (`git push b2.git main`) is a valid
+/// destination too (GHSA-3m7m-m3rq-5cw8). With no git to ask, nothing can be
+/// proven a configured remote, so any positional is treated as an override
+/// (fail closed).
+fn push_destination_override<'a>(
+    sub_args: &[&'a str],
+    real_git: Option<&Path>,
+    repo_args: &[&str],
+) -> Option<&'a str> {
+    for (idx, arg) in sub_args.iter().enumerate() {
+        // Report the destination itself, not the flag token — the refusal says
+        // "'X' is not a configured remote", which is only true of the value.
+        if let Some(url) = arg.strip_prefix("--repo=") {
+            return Some(url);
+        }
+        if *arg == "--repo" {
+            // A trailing `--repo` with no value is git's error to give; still
+            // refuse, naming the only token there is.
+            return Some(sub_args.get(idx + 1).copied().unwrap_or(arg));
+        }
+    }
+    let dest = *push_positionals(sub_args).first()?;
+    match real_git {
+        Some(git) if resolve_remote_url(git, repo_args, dest).is_some() => None,
+        _ => Some(dest),
+    }
 }
 
 /// Resolve the destination branch a refspec targets.
@@ -2451,18 +2575,45 @@ pub fn gate_git(
         );
     }
 
-    // `git push --repo=<url>` overrides the destination entirely, so any
-    // remote/URL authorization the guard performs would be about a different
-    // target than the push writes to. Reject it while push prevention is active
-    // (H-10) — a legitimate push names a configured remote instead.
-    if prevent_push && sub == "push" && push_has_repo_override(&args[i + 1..]) {
-        return Err(
-            "⚠️ BLOCKED by sandbox: 'git push --repo=<url>' is not allowed while push prevention is active.\n\
-             It redirects the push to an arbitrary URL, bypassing remote-based authorization.\n\
-             Push to a configured remote by name instead.\n\
+    // Fail closed on any push option the guard cannot bind exactly. Git's
+    // parse-options accepts unique abbreviations and bundled short flags; the
+    // guard's parsers accept neither, and every disagreement between the two is
+    // a bypass — `--rep origin <url> feature` puts the destination in refspec
+    // position, `--forc`/`--al`/`--mir`/`--ta`/`-fu` hide a force or whole-repo
+    // push from detection. Refusing the unbindable spelling is the one check
+    // that closes both, and it sits ahead of every other push parser here so
+    // none of them ever sees a token it would misread.
+    if sub == "push"
+        && let Some(opt) = unbindable_push_option(sub_args)
+    {
+        return Err(format!(
+            "⚠️ BLOCKED by sandbox: 'git push {opt}' is not allowed in this environment.\n\
+             '{opt}' is not an exact 'git push' option. Git resolves abbreviations ('--rep' for '--repo')\n\
+             and bundled short flags ('-vo'), but the guard binds options by exact spelling, so an option\n\
+             it cannot bind is refused instead of misparsed — a misparse moves the push destination or\n\
+             hides '--force'.\n\
+             Spell the option out in full, one flag per token: `git push --repo=<url>`, `-o <option>`, `-v -o <option>`.\n\
              Please make a note of this for the human operator and continue with your remaining work."
-                .to_string(),
-        );
+        ));
+    }
+
+    // A destination that is not a configured remote — `--repo=<url>`, or the
+    // positional repository argument `git push <url|path> [refspec…]` — overrides
+    // where the push lands, so any remote/URL authorization the guard performs
+    // would be about a different target than the push writes to (H-10,
+    // GHSA-3m7m-m3rq-5cw8). Reject it while push prevention is active; a
+    // legitimate push names a configured remote instead.
+    if prevent_push
+        && sub == "push"
+        && let Some(dest) = push_destination_override(sub_args, real_git, &repo_args)
+    {
+        return Err(format!(
+            "⚠️ BLOCKED by sandbox: 'git push {dest}' is not allowed while push prevention is active.\n\
+             '{dest}' is not a configured remote of this repository, so it redirects the push past remote-based\n\
+             authorization — branch protection and allow_push rules bind to the remote, not to this argument.\n\
+             Push to a configured remote by name instead: `git push <remote> <branch>`.\n\
+             Please make a note of this for the human operator and continue with your remaining work."
+        ));
     }
 
     if prevent_push && GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
@@ -5257,9 +5408,24 @@ mod tests {
         assert!(injected_sensitive_config_key(&["push", "origin", "main"]).is_none());
         assert!(injected_sensitive_config_key(&["-C", "/some/dir", "push"]).is_none());
 
-        assert!(push_has_repo_override(&["--repo=https://x", "main"]));
-        assert!(push_has_repo_override(&["--repo", "https://x"]));
-        assert!(!push_has_repo_override(&["origin", "main"]));
+        // `--repo` is caught without consulting git at all, and reports the
+        // destination it names rather than the flag token.
+        assert_eq!(
+            push_destination_override(&["--repo=https://x", "main"], None, &[]),
+            Some("https://x")
+        );
+        assert_eq!(
+            push_destination_override(&["--repo", "https://x"], None, &[]),
+            Some("https://x")
+        );
+        // A positional destination cannot be proven a configured remote without
+        // git, so it fails closed.
+        assert_eq!(
+            push_destination_override(&["origin", "main"], None, &[]),
+            Some("origin")
+        );
+        // No positional at all is a bare `git push` — no destination override.
+        assert_eq!(push_destination_override(&["--force"], None, &[]), None);
     }
 
     #[test]
@@ -5306,6 +5472,128 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // GHSA-3m7m-m3rq-5cw8: the first positional of `git push` is git's
+    // *repository* argument, never a refspec. Parsing `git@host:path` as a
+    // refspec made the destination branch `attacker/x.git`, which matched no
+    // protection rule, so the push escaped to another repository entirely —
+    // while the default-branch yardstick was still read from `origin`.
+    #[test]
+    fn push_to_an_explicit_destination_is_blocked() {
+        use crate::config::ResolvedPushRule;
+
+        let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/me/fork.git") else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &repo, &["agent/fix-123"]);
+        let dir = repo.to_string_lossy().into_owned();
+        let rules = vec![ResolvedPushRule {
+            remote: Some("origin".to_string()),
+            branches: vec!["agent/*".to_string()],
+            force: false,
+            url: Some(crate::trust::normalize_remote_url(
+                "https://github.com/me/fork.git",
+            )),
+        }];
+        // The advisory's own configuration: block mode, push and force-push
+        // prevented, only the default branch protected.
+        let gate = |args: &[&str], rules: &[ResolvedPushRule]| {
+            let mut full = vec!["-C", dir.as_str()];
+            full.extend_from_slice(args);
+            gate_git(&full, true, true, true, rules, Some(&git))
+        };
+
+        for dest in [
+            "git@github.com:attacker/x.git", // scp-style
+            "ssh://git@github.com/attacker/x.git",
+            "https://github.com/attacker/x.git",
+            "file:///tmp/attacker-x.git",
+            "../attacker-x.git", // bare filesystem path
+            "attacker-x.git",    // …and its slash-less, colon-less form
+        ] {
+            // Alone, git pushes the current branch to that destination.
+            assert!(gate(&["push", dest], &[]).is_err(), "{dest} alone");
+            // Followed by a refspec it used to read as an ordinary
+            // remote-plus-feature-branch push.
+            assert!(
+                gate(&["push", dest, "agent/fix-123"], &[]).is_err(),
+                "{dest} with refspec"
+            );
+            // An allow_push rule pinned to origin authorizes origin, not this.
+            assert!(
+                gate(&["push", dest, "agent/fix-123"], &rules).is_err(),
+                "{dest} with an origin-pinned allow_push rule"
+            );
+        }
+
+        // Git resolves unique abbreviations and bundled short flags; the
+        // guard's exact-match parsers do not, and each disagreement moved the
+        // destination out of repository position into refspec position, where
+        // it read as an ordinary feature branch. Reproduced end to end against
+        // real git: `push --rep origin <url> feature` pushed to <url>.
+        for opt in ["--rep", "--push-opt", "-vo", "-qo", "-no"] {
+            assert!(
+                gate(
+                    &[
+                        "push",
+                        opt,
+                        "origin",
+                        "file:///tmp/attacker-x.git",
+                        "agent/fix-123"
+                    ],
+                    &[]
+                )
+                .is_err(),
+                "{opt} destination override"
+            );
+        }
+        // Same class on the force/whole-repo flags: these defeat
+        // `is_force_push_flag` / `is_unconstrainable_push_flag`.
+        for opt in ["--forc", "-fu", "--al", "--mir", "--ta"] {
+            assert!(
+                gate(&["push", opt, "origin", "agent/fix-123"], &[]).is_err(),
+                "{opt} force/mode flag"
+            );
+        }
+        // Exact spellings keep working.
+        for args in [
+            &["push", "-u", "origin", "agent/fix-123"][..],
+            &["push", "-q", "-v", "origin", "agent/fix-123"][..],
+            &["push", "-n", "origin", "agent/fix-123"][..],
+            &["push", "-o", "ci.skip", "origin", "agent/fix-123"][..],
+            &["push", "-oci.skip", "origin", "agent/fix-123"][..],
+            &["push", "--push-option=ci.skip", "origin", "agent/fix-123"][..],
+            &["push", "--set-upstream", "origin", "agent/fix-123"][..],
+            &["push", "--no-verify", "origin", "agent/fix-123"][..],
+            &["push", "--atomic", "--signed", "origin", "agent/fix-123"][..],
+            &[
+                "push",
+                "--receive-pack=/usr/bin/git-receive-pack",
+                "origin",
+                "agent/fix-123",
+            ][..],
+            &[
+                "push",
+                "--exec=/usr/bin/git-receive-pack",
+                "origin",
+                "agent/fix-123",
+            ][..],
+            &["push", "origin", "--", "agent/fix-123"][..],
+        ] {
+            assert!(gate(args, &[]).is_ok(), "{args:?} must stay allowed");
+        }
+
+        // Refspecs stay refspecs from the second positional on.
+        assert!(gate(&["push", "origin", "agent/fix-123"], &[]).is_ok());
+        assert!(gate(&["push", "origin", "HEAD:refs/heads/agent/fix-123"], &[]).is_ok());
+        assert!(gate(&["push", "origin", "agent/fix-123:agent/fix-123"], &[]).is_ok());
+        // The pinned allow_push rule still authorizes its own remote.
+        assert!(gate(&["push", "origin", "agent/fix-123"], &rules).is_ok());
+        // And the protected branch is still refused through that remote.
+        assert!(gate(&["push", "origin", "main"], &[]).is_err());
+        assert!(gate(&["push", "origin", "main"], &rules).is_err());
     }
 
     // ── Security fix tests ──────────────────────────────────────────

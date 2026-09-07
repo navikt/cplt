@@ -4978,6 +4978,104 @@ paths = [
         );
     }
 
+    /// GHSA-qcgr-j4mx-f92r: `cplt exec -- git push …` resolved argv[0] against
+    /// the parent PATH and executed the real git, so the git guard never ran —
+    /// while `cplt exec -c 'git push …'` was refused, because only the child's
+    /// PATH carries the shim directory. Both spellings must be refused.
+    ///
+    /// The remote is a bare repo on disk: if the guard ever fails open again,
+    /// the push lands there and never on a network remote.
+    #[test]
+    fn e2e_exec_bare_git_name_hits_the_git_guard() {
+        require_sandbox!();
+
+        // Inside the checkout, not /tmp: the sandbox denies process-exec under
+        // /private/tmp, so the git this pushes with must live in an
+        // exec-allowed location — same reasoning as the guard e2e fixtures.
+        let tmp = tempfile::Builder::new()
+            .prefix(".cplt-e2e-exec-git-guard-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("create temp dir");
+        let origin = tmp.path().join("origin.git");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).expect("create work dir");
+
+        let run_git = |dir: &Path, args: &[&str]| {
+            let out = git_cmd(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@test.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@test.com")
+                .output()
+                .expect("git should run");
+            assert!(
+                out.status.success(),
+                "git {args:?} should succeed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(
+            tmp.path(),
+            &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
+        );
+        run_git(&work, &["init", "-b", "main"]);
+        run_git(&work, &["commit", "--allow-empty", "-m", "init"]);
+        run_git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+
+        // The bare origin is outside the project dir, so grant write on it:
+        // without the grant a fail-open push would be stopped by the sandbox
+        // rather than by the guard, and the test would pass for the wrong
+        // reason.
+        let allow_origin = origin.to_string_lossy().into_owned();
+        let push = |args: &[&str]| {
+            let out = cplt_cmd()
+                .args(["--allow-write", &allow_origin])
+                .args(args)
+                .current_dir(&work)
+                .output()
+                .expect("cplt exec should run");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+
+        let (bare_ok, bare_stderr) = push(&[
+            "--no-validate",
+            "exec",
+            "--",
+            "git",
+            "push",
+            "origin",
+            "main",
+        ]);
+        let (shell_ok, shell_stderr) =
+            push(&["--no-validate", "exec", "-c", "git push origin main"]);
+
+        assert!(
+            !shell_ok && shell_stderr.contains("BLOCKED by sandbox"),
+            "control: exec -c 'git push' must be refused by the git guard.\n{shell_stderr}"
+        );
+        assert!(
+            !bare_ok && bare_stderr.contains("BLOCKED by sandbox"),
+            "exec -- git push must be refused by the same guard as the -c form.\n{bare_stderr}"
+        );
+
+        // And nothing reached the remote either way.
+        let pushed = git_cmd(&origin)
+            .args(["rev-parse", "--verify", "refs/heads/main"])
+            .output()
+            .expect("git should run");
+        assert!(
+            !pushed.status.success(),
+            "no push may have reached the origin"
+        );
+    }
+
     #[test]
     fn e2e_exec_no_quiet_shows_summary() {
         require_sandbox!();
