@@ -22,14 +22,14 @@ cplt config set gh_guard.scope_check true           # enforce repo-scoping on wr
 cplt config set gh_guard.block_auth_token true      # deny "gh auth token" exfiltration
 cplt config set gh_guard.unknown_command block      # block unrecognized gh commands
 
-# git guard — on by default, in warn mode
+# git guard — on by default, in block mode, scoped to the default branch
 cplt config set git_guard.mode warn                # block | warn | audit (default block)
 cplt config set git_guard.enabled false             # opt out entirely
 cplt config set git_guard.prevent_push true         # block git push/request-pull
 ```
 
-`--preset strict` puts the git guard in `block` mode; `--preset permissive` and
-`--preset full-trust` turn both guards off. Every refusal prints the flag and
+`--preset strict` widens the git guard from the default branch to every push;
+`--preset permissive` and `--preset full-trust` turn both guards off. Every refusal prints the flag and
 the config key that undo it.
 
 Both guards take a `mode`. `block` prints the message and exits non-zero.
@@ -75,7 +75,7 @@ allow_api_write = false     # allow gh api write (POST/PUT/PATCH) to current rep
 
 [git_guard]
 enabled = true              # intercept git push, request-pull, send-pack
-mode = "warn"               # block | warn | audit (default warn)
+mode = "block"              # block | warn | audit (default block)
 prevent_push = true         # treat push/request-pull as violations
 prevent_force_push = true   # block force push, even where a plain push is allowed
 ```
