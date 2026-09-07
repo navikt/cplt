@@ -289,7 +289,7 @@ This lifts TCC restrictions for all child processes, while the cplt sandbox keep
 
 ## Git workflow (commit & push)
 
-Git commit and push **work out of the box** over HTTPS, no extra flags needed.
+Git commit works for every agent. Whether `git push` works over HTTPS depends on which agent is running, because the credential channel differs per agent.
 
 **Prerequisites:**
 
@@ -303,20 +303,40 @@ Git commit and push **work out of the box** over HTTPS, no extra flags needed.
    git config --global url."https://github.com/".insteadOf "git@github.com:"
    ```
    Git then uses HTTPS transparently even when remotes are configured as SSH. The rewrite is read from `~/.gitconfig`, which is readable inside the sandbox.
-2. **Authenticate with `gh`.** cplt allows the agent to read `gh auth token`:
+2. **Authenticate with `gh`** outside the sandbox:
    ```bash
-   gh auth login   # one-time setup outside the sandbox
+   gh auth login   # one-time setup
    ```
-3. **Configure git credential helper** (if not already set by `gh auth setup-git`):
+3. **Configure the git credential helper** (if not already set by `gh auth setup-git`):
    ```bash
-   gh auth setup-git   # sets credential.helper to use gh
+   gh auth setup-git   # sets credential.helper to `!gh auth git-credential`
    ```
+   Every HTTPS `git push` then runs `gh auth git-credential`, which the gh guard allows.
 
-That's it. The agent can now `git add`, `git commit`, `git push`, create branches, and fetch, all inside the sandbox.
+**Credentials per agent (macOS).** The helper only produces a token if `gh` can reach one from inside the sandbox:
+
+| Agent                                       | HTTPS push  | Credential source                                                          |
+| ------------------------------------------- | ----------- | -------------------------------------------------------------------------- |
+| `copilot`, `antigravity`, `claude`, `goose` | ✅ Works     | Login Keychain is readable, which is where `gh auth login` stores the token |
+| `opencode`, `pi`, `cplt exec`               | ⚠️ Only via `hosts.yml` or `--pass-env` | Keychain is denied. With the token in the Keychain only, `gh api user` reports "Requires authentication" |
+
+Both rows depend on where `gh` keeps the token. An installation that stores it in `~/.config/gh/hosts.yml` rather than the Keychain works for every agent, since that file is readable in every profile, and `--pass-env GH_TOKEN` supplies one regardless of agent.
+
+The Keychain row has one caveat. With `sandbox.keychain_substitute = true` (off by default) the Keychain grant is dropped for an agent whose own credential already reaches it another way — `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s token with it, so HTTPS push fails for exactly those two agents in that configuration.
+
+**On Linux the table does not apply.** There is no Keychain grant to drop in the first place; `gh` reads its token from the Secret Service or from `hosts.yml`, and push works wherever that lookup succeeds.
+
+`~/.config/gh/hosts.yml` and `config.yml` are readable for every agent, so an installation that keeps the token in `hosts.yml` rather than the Keychain works everywhere — unless you take the `--deny-path ~/.config/gh` mitigation from [Honest gaps](../SECURITY.md#honest-gaps), which closes that path too.
+
+Exporting a token in your own shell is not enough on its own: `GH_TOKEN`, `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` are stripped from the environment of every agent except Copilot. Passing one explicitly does work, because `--pass-env` is applied after that suppression: `cplt --pass-env GH_TOKEN exec …` forwards it, and `gh auth status` then reports `Logged in to github.com account … (GH_TOKEN)`. Note that `--pass-env` is a global flag and goes before the subcommand, not after it. A repo `deny.env` naming the variable strips it again.
+
+`gh auth token` through the cplt `gh` shim is served from a one-shot cache that cplt writes for Copilot only, so with `block_auth_token = true` (the default) every other agent gets "No cached token available". Turn the setting off and the shim stops intercepting, leaving `gh` to answer from whatever source it can reach. Either way this is unrelated to whether push works.
+
+**Push before `gh pr create`.** With no TTY, which is how agents normally run, `gh pr create` refuses to push for you and fails with "aborted: you must first push the current branch to a remote, or use the --head flag". Push the branch first.
 
 **Optional, signed commits:** add `--allow-gpg-signing` (see [GPG signing](#gpg-commit-signing)).
 
-> **Why is SSH blocked?** The SSH agent socket gives access to *all* loaded keys, which could authenticate to any host. HTTPS with `gh auth token` is scoped to GitHub only. See [SSH agent blocking](#ssh-agent-blocking).
+> **Why is SSH blocked?** The SSH agent socket gives access to *all* loaded keys, which could authenticate to any host. HTTPS through the `gh` credential helper is scoped to GitHub only. See [SSH agent blocking](#ssh-agent-blocking).
 
 > **Tip:** protect your `main` branch with [branch protection rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-a-branch-protection-rule/about-branch-protection-rules) so the agent cannot push directly to main or force-push. Good practice regardless of cplt.
 
@@ -328,7 +348,7 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | ---------------------------------- | ----------- | ----------------------------------------------------------------- |
 | `git add/commit/status/diff/log`   | ✅ Works     | Local operations, no writes to protected paths                    |
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
-| `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth token` provides credentials            |
+| `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth git-credential` provides credentials, see [Git workflow](#git-workflow-commit--push) for the per-agent caveat |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked on macOS | SSH agent socket denied, use HTTPS. On Linux only `SSH_AUTH_SOCK` is withheld |
 | `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every `allow.write` grant, and to any repository nested under one. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |

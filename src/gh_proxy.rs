@@ -654,6 +654,23 @@ static POLICY: &[PolicyEntry] = &[
         decision: Decision::Allow,
         reason: "read-only (may be blocked by block_auth_token policy)",
     },
+    // `gh auth setup-git` points `credential.helper` at this verb, so every HTTPS
+    // push runs it; without an entry it hit default-deny and push died with
+    // "could not read Username" (#396). Ungated by `block_auth_token`: gating it
+    // would break push in the default config and would withhold nothing —
+    // claude/antigravity/goose can read the token out of the Keychain grant
+    // themselves, Copilot's cache sits in its own TMPDIR, and opencode/pi/exec
+    // reach whatever `hosts.yml` or `--pass-env` already handed them — in every
+    // case the helper reveals nothing the agent could not read directly.
+    // `block_auth_token` does not block `auth token` from the shim either:
+    // `decide_gh_gate` intercepts it first, so it means "serve the cache once,
+    // else report no cached token".
+    PolicyEntry {
+        command: "auth",
+        subcommand: "git-credential",
+        decision: Decision::Allow,
+        reason: "git credential helper required for HTTPS push",
+    },
     PolicyEntry {
         command: "auth",
         subcommand: "login",
@@ -3408,6 +3425,28 @@ mod tests {
         };
         let result = evaluate(&parsed);
         assert_eq!(result.decision, Decision::Unknown);
+    }
+
+    // Issue #396: the credential helper installed by `gh auth setup-git` must be
+    // allowed, or HTTPS `git push` fails with "could not read Username".
+    #[test]
+    fn auth_git_credential_allowed() {
+        let parsed = ParsedCommand {
+            command: "auth".to_string(),
+            subcommand: Some("git-credential".to_string()),
+            repo_flag: None,
+            method: None,
+            has_input_flags: false,
+            api_endpoint: None,
+        };
+        assert_eq!(evaluate(&parsed).decision, Decision::Allow);
+
+        // And through the full gate, including with block_auth_token on (the
+        // default): the helper stays allowed while `gh auth token` stays gated.
+        let dir = std::path::Path::new(".");
+        let policy = GatePolicy::default(); // block_auth_token = true
+        assert!(gate(&["auth", "git-credential", "get"], dir, &policy).is_ok());
+        assert!(gate(&["auth", "token"], dir, &policy).is_err());
     }
 
     #[test]
