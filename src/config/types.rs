@@ -403,8 +403,8 @@ pub struct GitGuardConfig {
     /// Enable git command interception (default: true; `--preset permissive`
     /// and `--preset full-trust` turn it back off).
     pub enabled: Option<bool>,
-    /// Enforcement mode: "warn" (default), "block" (the default under
-    /// `--preset strict`), or "audit".
+    /// Enforcement mode: "block" (default), "warn" (the default under
+    /// `--preset permissive` and `--preset full-trust`), or "audit".
     pub mode: Option<EnforcementMode>,
     /// Block git push, request-pull, and send-pack (default: true).
     pub prevent_push: Option<bool>,

@@ -17,7 +17,7 @@ branch, and lets feature branches through.
 ```bash
 # gh guard — on by default, in block mode
 cplt config set gh_guard.enabled false              # opt out entirely
-cplt config set gh_guard.mode warn                  # block | warn | audit (default block)
+cplt config set gh_guard.mode block                 # block | warn | audit (default block)
 cplt config set gh_guard.scope_check true           # enforce repo-scoping on write commands
 cplt config set gh_guard.block_auth_token true      # deny "gh auth token" exfiltration
 cplt config set gh_guard.unknown_command block      # block unrecognized gh commands
