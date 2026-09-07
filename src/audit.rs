@@ -1334,6 +1334,17 @@ mod tests {
         }
         let out = cmd.output().expect("sh runs");
 
+        // Check the shell's own verdict first. `printf x >&9` writing its byte
+        // and then failing for some unrelated reason would still satisfy the
+        // `wrote: 1` assertion below, so a non-zero status has to fail here
+        // rather than pass quietly with the reason discarded.
+        assert!(
+            out.status.success(),
+            "the shell holding the probe exited {}\n  sh stderr: {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+
         let outcome = probe.outcome();
         assert_eq!(
             outcome,
