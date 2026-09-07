@@ -125,7 +125,7 @@ cplt assumes the sandboxed agent is **untrusted**, because it executes arbitrary
 | **Git alias push bypass** | `git -c alias.p=push p origin main` | git guard blocks `-c alias.*` and denies unknown subcommands |
 | **Git subtree push bypass** | `git subtree push --prefix=lib origin main` | `subtree` in explicit block list, plus deny-unknown policy |
 | **Multi-refspec bypass** | `git push origin feature main` | git guard checks ALL refspecs, not just the first |
-| **Token exfiltration via CLI** | `gh auth token` prints raw token | gh guard serves the cached token once at startup and deletes the file, so subprocesses get nothing |
+| **Token exfiltration via CLI** | `gh auth token` prints raw token | gh guard serves the cached token once at startup and deletes the file, so subprocesses get nothing. Not a boundary: `gh auth git-credential get` stays allowed so HTTPS push works, and it prints `password=<token>` for any agent that still has a token source. See [`block_auth_token` is best-effort](#honest-gaps) |
 | **Cross-repo operations** | `gh pr close -R other-org/other-repo` | gh guard scope checking against current repo |
 | **Org/user data enumeration** | `gh api /orgs/.../audit-log` leaks PII | gh guard restricts API to `/repos/{current-repo}/...` endpoints only |
 | **DNS rebinding SSRF** | Domain resolves to `127.0.0.1` after check | Post-DNS-resolution IP validation; `--allow-private-domain` opt-in bypass for explicitly trusted internal domains |
