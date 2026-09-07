@@ -262,6 +262,12 @@ pub fn prepare(config: &SandboxConfig) -> Result<PreparedSandbox, String> {
 /// It also lands on both backends at once — silently ineffective on macOS,
 /// silently effective on Linux, which is how #207 stayed invisible.
 ///
+/// cplt's own state directory is refused as a whole *subtree*
+/// ([`policy::cplt_state_dir_grant`]), which is the one place the per-file
+/// override below does not apply: every file in it — config, trust store,
+/// blocklist cache, per-repo local files — decides what the next run is
+/// allowed to do, so a grant on any of them is self-perpetuating.
+///
 /// [`policy::DENIED_DOTFILES`] directories are refused for the same reason
 /// pointing the other way (#291): the grant was silently ineffective on macOS
 /// and silently *effective* on Linux, where it opened `~/.ssh` wholesale. The
@@ -277,6 +283,17 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
         ("allow.socket", config.extra_socket),
     ] {
         for p in paths {
+            if let Some(dir) = policy::cplt_state_dir_grant(config.home_dir, p) {
+                return Err(format!(
+                    "{key} names {} — inside cplt's own state directory ({}). Nothing in there \
+                     can be granted, not even a single file: it holds the config, the trust \
+                     store, the blocklist cache and the per-repo local files, so an agent that \
+                     can write there approves its own next launch. Remove it from your config \
+                     or command line.",
+                    p.display(),
+                    dir.display()
+                ));
+            }
             if let Some(file) = policy::hard_denied_file(config.home_dir, p) {
                 return Err(format!(
                     "{key} names {} (~/{file}), which is on the hard-deny list and cannot be granted explicitly. Remove it from your config or command line.",
@@ -1390,10 +1407,17 @@ mod tests {
             let error = prepare(&config).err().expect("allow.read must be refused");
             assert!(error.contains("allow.read"), "{error}");
             assert!(error.contains(dir), "{error}");
-            assert!(
-                error.contains("Name the specific path"),
-                "the error must point at the grant that does work: {error}"
-            );
+            // cplt's own state directory has no per-file grant to point at —
+            // it is refused as a whole subtree and says so instead.
+            if dir == policy::CPLT_STATE_DIR {
+                assert!(error.contains("state directory"), "{error}");
+                assert!(!error.contains("Name the specific path"), "{error}");
+            } else {
+                assert!(
+                    error.contains("Name the specific path"),
+                    "the error must point at the grant that does work: {error}"
+                );
+            }
 
             config.extra_read = &[];
             config.extra_write = &granted;
@@ -1431,6 +1455,75 @@ mod tests {
         config.extra_read = &[];
         config.extra_write = &granted;
         assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+    }
+
+    /// cplt's own state directory is the exception to the per-file override:
+    /// every file in it decides what the *next* run may do — the trust store
+    /// approves a repo's `.cplt.toml [propose]`, the config carries the grants,
+    /// the blocklist cache carries the egress policy — so a grant on any of
+    /// them is self-perpetuating. Refused as a subtree, on every grant key,
+    /// including a path that does not exist yet (naming a file before creating
+    /// it would otherwise walk straight through a canonicalize-only check).
+    #[test]
+    fn prepare_rejects_a_grant_inside_the_cplt_state_directory() {
+        let home = Path::new("/home/test");
+        let state = home.join(policy::CPLT_STATE_DIR);
+        for tail in ["", "trust", "local", "config.toml", "not/created/yet"] {
+            let granted = vec![if tail.is_empty() {
+                state.clone()
+            } else {
+                state.join(tail)
+            }];
+            let mut config = test_config(home, &granted);
+
+            for key in ["allow.read", "allow.write", "allow.exec", "allow.socket"] {
+                config.extra_read = &[];
+                config.extra_write = &[];
+                config.extra_exec = &[];
+                config.extra_socket = &[];
+                match key {
+                    "allow.read" => config.extra_read = &granted,
+                    "allow.write" => config.extra_write = &granted,
+                    "allow.exec" => config.extra_exec = &granted,
+                    _ => config.extra_socket = &granted,
+                }
+                let error = prepare(&config)
+                    .err()
+                    .unwrap_or_else(|| panic!("{key} on {tail:?} must be refused"));
+                assert!(error.contains(key), "{error}");
+                assert!(error.contains(".config/cplt"), "{error}");
+                assert!(
+                    error.contains("state directory"),
+                    "the error must name the reason: {error}"
+                );
+            }
+        }
+    }
+
+    /// The subtree rule is cplt's own directory, not `~/.config` at large.
+    #[test]
+    fn a_grant_on_another_config_subdirectory_is_untouched() {
+        let home = Path::new("/home/test");
+        let granted = vec![home.join(".config/foo"), home.join(".config/cpltish")];
+        let config = test_config(home, &granted);
+        assert_eq!(validate_hard_denied_grants(&config), Ok(()));
+    }
+
+    /// `CPLT_CONFIG` moves the real files, so the refusal has to move with
+    /// them — the state directory is wherever the config actually lives.
+    #[test]
+    fn a_grant_inside_a_relocated_state_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&dir).unwrap();
+        let granted = vec![dir.join("trust")];
+
+        temp_env::with_var("CPLT_CONFIG", Some(dir.join("config.toml")), || {
+            let config = test_config(Path::new("/home/test"), &granted);
+            let error = validate_hard_denied_grants(&config)
+                .expect_err("a grant in the relocated state dir must be refused");
+            assert!(error.contains("state directory"), "{error}");
+        });
     }
 
     /// `--allow-docker` grants `~/.docker` read-only, and `~/.docker` is a

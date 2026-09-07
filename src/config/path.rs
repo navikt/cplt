@@ -381,7 +381,7 @@ pub(crate) fn lexically_normalized(path: &Path) -> PathBuf {
 /// actually land. This also covers a canonicalize failure that is not ENOENT —
 /// a permission-denied ancestor, or ELOOP — where the unresolved fallback would
 /// likewise name a path the kernel never matches.
-fn canonicalize_deepest(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_deepest(path: &Path) -> PathBuf {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     let mut cur = path;
     loop {
