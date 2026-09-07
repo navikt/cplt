@@ -6671,6 +6671,24 @@ mod tests {
     }
 
     #[test]
+    fn git_credential_helper_reaches_the_real_binary() {
+        // The shim's entry point, not just `gate`: `gh auth setup-git` points
+        // `credential.helper` at this verb, so an HTTPS push must reach the real
+        // `gh` — not the `auth token` cache intercept, and not a refusal (#396).
+        let effect = decide_gh_gate(
+            &gh_args(&["auth", "git-credential", "get"]),
+            &gh_policy(config::EnforcementMode::Block),
+            Some("navikt/cplt"),
+            None,
+        );
+        assert_eq!(
+            effect,
+            GateEffect::ExecScoped("github.com/navikt/cplt".to_string()),
+            "the credential helper must exec with block_auth_token on"
+        );
+    }
+
+    #[test]
     fn informational_gh_commands_exec_unannounced() {
         assert_eq!(
             decide_gh_gate(
