@@ -1197,11 +1197,26 @@ fn validate_repo_dirs(
         let dir = std::fs::canonicalize(raw)
             .map_err(|e| anyhow::anyhow!("Cannot resolve --repo-dir {}: {e}", raw.display()))?;
 
-        // No symlinked final component. The project dir is agent-writable, so a
-        // symlink planted there last session would silently redirect the
-        // identity this launch grants (#216's confused deputy, one level down).
+        // The FINAL component must not be a symlink. The project dir is
+        // agent-writable, so a symlink planted there last session would silently
+        // redirect the identity this launch grants (#216's confused deputy, one
+        // level down). A symlinked *ancestor* is deliberately tolerated: it is
+        // part of the path the user typed to reach the tree, not the name of the
+        // repository this launch pins to.
         let named = std::path::absolute(raw)
             .map_err(|e| anyhow::anyhow!("Cannot resolve --repo-dir {}: {e}", raw.display()))?;
+        // `absolute` does not fold `..`, so a trailing one leaves no leaf to
+        // check and would walk straight past the refusal below.
+        if named
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            bail!(
+                "--repo-dir {} contains a '..' component, which hides which \
+                 directory is actually named. Name the directory itself.",
+                raw.display()
+            );
+        }
         let unresolved_leaf = match (named.parent(), named.file_name()) {
             (Some(parent), Some(name)) => std::fs::canonicalize(parent).map(|p| p.join(name)).ok(),
             // A filesystem root has no leaf to plant a symlink as; `is_unsafe_root`
@@ -1209,6 +1224,20 @@ fn validate_repo_dirs(
             _ => Some(dir.clone()),
         };
         if unresolved_leaf.as_ref() != Some(&dir) {
+            // On a case-insensitive filesystem `canonicalize` returns the on-disk
+            // spelling, so a case variant lands here too — say so rather than
+            // blaming a symlink that is not there.
+            if unresolved_leaf
+                .as_ref()
+                .is_some_and(|leaf| leaf.as_os_str().eq_ignore_ascii_case(dir.as_os_str()))
+            {
+                bail!(
+                    "--repo-dir {} differs in case from the directory on disk,\n  {}\n  \
+                     Name it with the on-disk spelling.",
+                    raw.display(),
+                    dir.display()
+                );
+            }
             bail!(
                 "--repo-dir {} resolves through a symlink, to\n  {}\n  \
                  A symlink inside the project directory is agent-writable, so the \
@@ -3232,6 +3261,14 @@ fn perform_gate_effect(
 
 /// Replace this process with the real binary. `repo_scope` pins `GH_REPO`, which
 /// only `gh` reads — the git guard always passes `None`.
+///
+/// `GH_HOST` and `GH_REPO` are scrubbed on EVERY approved exec, pin or no pin.
+/// They are inherited targeting: `GH_HOST` redirects a read at whatever GHES the
+/// user is logged into (`hosts.yml` is readable in the sandbox) and `GH_REPO`
+/// names a repository the scope set never approved. Scrubbing here rather than
+/// refusing in the gate is the one place every allowed command passes through,
+/// so a decision path that produces no pin — an ambiguous multi-repo scope, an
+/// audit/warn notice — cannot leak them by omission.
 #[allow(clippy::disallowed_methods)] // runs INSIDE the sandbox as cplt gh-gate/git-gate; the wrapper resolves the real binary through PATH deliberately
 fn exec_real(
     real_binary: &Path,
@@ -3243,8 +3280,9 @@ fn exec_real(
 
     let mut command = std::process::Command::new(real_binary);
     command.args(args);
+    command.env_remove("GH_HOST");
+    command.env_remove("GH_REPO");
     if let Some(repo) = repo_scope {
-        command.env_remove("GH_HOST");
         command.env("GH_REPO", repo);
     }
     let err = command.exec();
@@ -7495,6 +7533,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("resolves through a symlink"), "{err}");
+    }
+
+    /// A trailing `..` walks past the symlinked-leaf refusal: `absolute` leaves
+    /// it in place, `file_name()` is then `None`, and the leaf check has nothing
+    /// to compare.
+    #[test]
+    fn repo_dir_refuses_a_parent_component() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        if !init_repo(&project) || !init_repo(&inner) {
+            return;
+        }
+        let link = project.join("link");
+        std::os::unix::fs::symlink(&inner, &link).unwrap();
+        let err = validate_repo_dirs(
+            &[link.join("src").join("..")],
+            &project,
+            Path::new("/nonexistent-home"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("contains a '..' component"), "{err}");
     }
 
     #[test]

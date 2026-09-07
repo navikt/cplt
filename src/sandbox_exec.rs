@@ -556,8 +556,17 @@ fn install_command_wrappers(
                 let root = crate::gh_proxy::capture_named_root(real_git, dir);
                 match root.repo {
                     // A named root can be a second checkout of a repository
-                    // already in the set; the set dedups.
-                    Some(repo) if !repo_scope.contains(&repo) => repo_scope.push(repo),
+                    // already in the set; the set dedups. Case-insensitively:
+                    // `Navikt/LAUNCH.git` and `navikt/launch` are one repository,
+                    // and letting both in would turn a single-repository session
+                    // into an ambiguous multi-member one that pins nothing.
+                    Some(repo)
+                        if !repo_scope
+                            .iter()
+                            .any(|member| crate::gh_proxy::repos_match(member, &repo)) =>
+                    {
+                        repo_scope.push(repo);
+                    }
                     Some(_) => {}
                     None => {
                         if !quiet {

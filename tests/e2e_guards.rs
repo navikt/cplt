@@ -2650,7 +2650,13 @@ mod trust_accept_guard {
 fn gh_repo_reporter(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let fake_gh = dir.join("gh");
-    std::fs::write(&fake_gh, "#!/bin/sh\nprintf '%s\\n' \"$GH_REPO\"\n").unwrap();
+    // Both variables: `GH_HOST` is inherited targeting too, and must never
+    // reach the real gh (an authenticated read against any GHES otherwise).
+    std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\nprintf '%s\\n%s\\n' \"$GH_REPO\" \"$GH_HOST\"\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
     fake_gh
 }
@@ -2678,6 +2684,7 @@ fn gh_gate_pins_the_cwd_member_and_never_the_launch_repo() {
         .arg("navikt/unleasherator")
         .arg("--")
         .args(["pr", "comment", "42", "--body", "test"])
+        .env("GH_HOST", "ghes.example")
         .current_dir(named.path())
         .output()
         .expect("cplt gh-gate should run");
@@ -2765,10 +2772,17 @@ fn gh_gate_pins_nothing_when_the_set_is_ambiguous() {
         .arg("navikt/unleasherator")
         .arg("--")
         .args(["auth", "status"])
-        .env("GH_REPO", "")
+        // Inherited targeting: with no pin produced there is nothing to overwrite
+        // these, so the scrub has to be unconditional or they reach the real gh.
+        .env("GH_REPO", "evil/x")
+        .env("GH_HOST", "ghes.example")
         .output()
         .expect("cplt gh-gate should run");
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "",
+        "an ambiguous set must pin nothing AND leak neither GH_REPO nor GH_HOST"
+    );
 }

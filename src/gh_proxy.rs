@@ -1308,7 +1308,9 @@ fn scope_label(scope: &[String]) -> String {
     scope.join(", ")
 }
 
-fn repos_match(left: &str, right: &str) -> bool {
+/// Two `owner/name` spellings naming the same repository: GitHub is
+/// case-insensitive and an origin URL may carry a `.git` suffix.
+pub(crate) fn repos_match(left: &str, right: &str) -> bool {
     left.trim_end_matches(".git")
         .eq_ignore_ascii_case(right.trim_end_matches(".git"))
 }
