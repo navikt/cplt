@@ -2004,6 +2004,204 @@ fn git_gate_protect_default_allows_head_on_a_feature_branch() {
 }
 
 // ============================================================
+// git-gate: the baked facts must belong to the repository we are standing in
+// ============================================================
+//
+// `RepoFacts::describes` used to answer "yes" to any command carrying no
+// `-C` / `--git-dir` / `--work-tree`, on the assumption that an unredirected
+// push runs in the launch repository's work tree. The gate inherits the agent's
+// working directory, so that assumption was never checked, and a nested clone of
+// a *different* repository was judged against the launch repository's protected
+// branch (#416).
+
+/// Same as `git_gate_protect_default_with_facts`, with environment variables
+/// set on the gate process. `GIT_DIR` / `GIT_WORK_TREE` reach the same place a
+/// `--git-dir` flag does while carrying no flag for the guard to notice.
+fn git_gate_protect_default_with_env(
+    repo: &std::path::Path,
+    facts: &str,
+    env: &[(&str, &std::path::Path)],
+    args: &[&str],
+) -> (String, String, bool) {
+    let real_git = fake_push_git(repo);
+    let mut cmd = cplt_cmd();
+    cmd.arg("git-gate")
+        .arg("--real-git")
+        .arg(&real_git)
+        .arg(format!("--repo-facts={facts}"))
+        .arg("--mode=block")
+        .arg("--prevent-push=true")
+        .arg("--prevent-force-push=true")
+        .arg("--protect-default-branch-only=true")
+        .arg("--")
+        .args(args)
+        .current_dir(repo);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("cplt git-gate should run");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+/// A clone of a *different* repository, living under `parent`, whose own default
+/// branch is `trunk` — a name the launch repository does not protect. Pushing it
+/// is the bypass: judged against the launch repo's `main`, `trunk` looks like a
+/// feature branch.
+fn nested_repo(parent: &std::path::Path) -> std::path::PathBuf {
+    let nested = parent.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert!(git_ok(&nested, &["init", "--quiet"]));
+    assert!(git_ok(
+        &nested,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/other/other.git"
+        ],
+    ));
+    assert!(git_ok(
+        &nested,
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ],
+    ));
+    assert!(git_ok(&nested, &["branch", "-M", "trunk"]));
+    assert!(git_ok(
+        &nested,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
+    ));
+    nested
+}
+
+#[test]
+fn git_gate_refuses_a_push_from_a_nested_repository() {
+    let launch = temp_repo_live("navikt/cplt", "main", &[]);
+    let facts = launch_facts(launch.path());
+    let nested = nested_repo(launch.path());
+
+    // `trunk` is the nested repository's OWN default branch. Judged against the
+    // launch repo's baked `main` it passed as a feature branch and the push ran.
+    let (_, stderr, ok) =
+        git_gate_protect_default_with_facts(&nested, &facts, &["push", "origin", "trunk"]);
+    assert_refused(
+        &stderr,
+        ok,
+        "does not run in the repository this session was launched in",
+    );
+    // The hint has to name the repository we actually landed in, or the operator
+    // cannot tell this apart from an unresolvable default branch.
+    assert!(
+        stderr.contains("its shared git directory is") && stderr.contains("nested"),
+        "the hint must name the nested repository.
+stderr: {stderr}"
+    );
+}
+
+#[test]
+fn git_gate_still_allows_a_feature_push_from_the_launch_repository() {
+    // The fix must not cost the common case: no redirect, standing in the
+    // launch repository, pushing a feature branch.
+    let launch = temp_repo_live("navikt/cplt", "main", &["feature/x"]);
+    let facts = launch_facts(launch.path());
+    let (_, stderr, ok) = git_gate_protect_default_with_facts(
+        launch.path(),
+        &facts,
+        &["push", "origin", "feature/x"],
+    );
+    assert!(
+        ok,
+        "a feature push from the launch repository must stay allowed.
+{stderr}"
+    );
+    // …and the protected branch is still protected there.
+    let (_, stderr, ok) =
+        git_gate_protect_default_with_facts(launch.path(), &facts, &["push", "origin", "main"]);
+    assert_refused(&stderr, ok, "is the protected branch here");
+    assert!(
+        !stderr.contains("does not run in the repository this session was launched in"),
+        "the launch repository must not be reported as the wrong one.
+stderr: {stderr}"
+    );
+}
+
+#[test]
+fn git_gate_refuses_a_push_redirected_by_git_dir_in_the_environment() {
+    let launch = temp_repo_live("navikt/cplt", "main", &[]);
+    let facts = launch_facts(launch.path());
+    let nested = nested_repo(launch.path());
+    let nested_git_dir = nested.join(".git");
+
+    // cwd IS the launch repository; only the environment redirects git. No flag
+    // appears in argv, so `repo_target_args` sees nothing to fail closed on.
+    let (_, stderr, ok) = git_gate_protect_default_with_env(
+        launch.path(),
+        &facts,
+        &[
+            ("GIT_DIR", nested_git_dir.as_path()),
+            ("GIT_WORK_TREE", nested.as_path()),
+        ],
+        &["push", "origin", "trunk"],
+    );
+    assert_refused(
+        &stderr,
+        ok,
+        "does not run in the repository this session was launched in",
+    );
+}
+
+#[test]
+fn git_gate_allows_a_push_from_a_worktree_of_the_launch_repository() {
+    // A linked worktree has its own git dir (`.git/worktrees/<name>`) but shares
+    // the launch repository's COMMON dir — which is why the check compares
+    // common dirs. Comparing git dirs would refuse every `git worktree`, and
+    // that is a normal way to work, not a bypass.
+    let launch = temp_repo_live("navikt/cplt", "main", &[]);
+    let facts = launch_facts(launch.path());
+    let wt = launch.path().parent().unwrap().join("cplt-wt");
+    assert!(git_ok(
+        launch.path(),
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "wt/x"],
+    ));
+
+    let (_, stderr, ok) =
+        git_gate_protect_default_with_facts(&wt, &facts, &["push", "origin", "wt/x"]);
+    assert!(
+        ok,
+        "a feature push from a worktree of the launch repository must stay allowed.\n{stderr}"
+    );
+    // The launch repo's protected branch is still protected from the worktree.
+    let (_, stderr, ok) =
+        git_gate_protect_default_with_facts(&wt, &facts, &["push", "origin", "main"]);
+    assert!(
+        !ok,
+        "the protected branch must stay protected from a worktree"
+    );
+    assert!(
+        !stderr.contains("does not run in the repository this session was launched in"),
+        "a worktree of the launch repository is the launch repository.\nstderr: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&wt).ok();
+}
+
+// ============================================================
 // Full wrapper script integration (sandbox → wrapper → gate)
 // ============================================================
 
