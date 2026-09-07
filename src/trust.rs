@@ -106,7 +106,13 @@ fn canonical_remote(project_dir: &Path) -> Option<String> {
 /// which defeated `allow_push` URL pinning, the trust store and the gh
 /// repo-scope comparison alike (GHSA-xcvh-hxfg-f4cg).
 fn host_and_path(rest: &str) -> String {
-    let rest = rest.trim_end_matches(".git").trim_end_matches('/');
+    // Trailing slash first: `repo.git/` does not end in `.git`, so trimming the
+    // suffix before the slash left it in place and an otherwise identical URL
+    // normalized differently.
+    let rest = rest
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
     let (authority, path) = match rest.split_once('/') {
         Some((a, p)) => (a, Some(p)),
         None => (rest, None),
@@ -140,7 +146,10 @@ pub fn normalize_remote_url(url: &str) -> String {
         && user_host.contains('@')
     {
         let host = user_host.rsplit_once('@').map_or(user_host, |(_, h)| h);
-        let path = path.trim_end_matches(".git").trim_end_matches('/');
+        let path = path
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .trim_end_matches('/');
         return format!("{}/{}", host.to_lowercase(), path);
     }
 
@@ -508,6 +517,26 @@ mod tests {
     /// userinfo delimiter, or a crafted remote normalizes to a host git never
     /// contacts — and every URL comparison built on this (allow_push pinning,
     /// the trust store, the gh repo scope) authorizes the wrong repository.
+    #[test]
+    fn normalize_ignores_a_trailing_slash_after_dot_git() {
+        // `repo.git/` does not end in `.git`, so trimming the suffix first left
+        // it in place and two spellings of one remote compared unequal.
+        for url in [
+            "https://github.com/org/repo.git/",
+            "https://github.com/org/repo.git",
+            "https://github.com/org/repo/",
+            "https://github.com/org/repo",
+            "ssh://git@github.com/org/repo.git/",
+            "git@github.com:org/repo.git/",
+        ] {
+            assert_eq!(
+                normalize_remote_url(url),
+                "github.com/org/repo",
+                "{url} should normalize to the same remote"
+            );
+        }
+    }
+
     #[test]
     fn normalize_keeps_the_host_when_the_path_contains_an_at_sign() {
         for url in [
