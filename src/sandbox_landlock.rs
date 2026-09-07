@@ -950,11 +950,15 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
     // "exec: /path/to/cplt: Permission denied" and *every* git command fails —
     // `status`, `log`, `--version`, not only `push`.
     //
-    // It worked at all only by accident of layout: `/usr/local` is in
-    // LINUX_TOOL_DIRS, so an install there re-entered fine, while `install.sh`'s
-    // default of `~/.local/bin` did not. The guard's own design requires this
-    // grant; leaving it to depend on where the user installed cplt is what made
-    // it look like it worked.
+    // It worked at all only by accident of layout: the usual install locations
+    // are already granted read+execute by something else — `/usr/local`,
+    // `/snap` and `/home/linuxbrew/.linuxbrew` via LINUX_TOOL_DIRS,
+    // `~/.local/bin` (`install.sh`'s default) and `~/.cargo/bin` via
+    // HOME_TOOL_DIRS — so those installs re-entered fine. Nothing covers
+    // `~/bin`, which `install.sh` picks when that is the writable directory on
+    // PATH, or wherever `--dir` points, and there the wrapper died. The guard's
+    // own design requires this grant; leaving it to depend on where the user
+    // installed cplt is what made it look like it worked.
     //
     // The file, not its directory: `~/.local/bin` holds whatever else the user
     // put there, and none of it needs to become executable inside the sandbox.
@@ -3012,6 +3016,11 @@ mod tests {
         // every guarded git and gh command fails with "Permission denied".
         // The test binary is not under any writable-non-executable tree of a
         // fixture config, so the grant must survive the overlap check.
+        //
+        // Fails if the *test* binary itself lives under `/tmp` — say with
+        // `CARGO_TARGET_DIR=/tmp/...` — because `/tmp` is writable and not
+        // executable, so the overlap check correctly skips the grant. That is
+        // the check working, not the test breaking; build elsewhere.
         let project = PathBuf::from("/home/user/project");
         let home = PathBuf::from("/home/user");
         let policy = generate_policy(&test_config(&project, &home));
@@ -3020,8 +3029,50 @@ mod tests {
             policy
                 .fs_rules
                 .iter()
-                .any(|r| r.path == exe && r.access.execute && !r.access.write),
+                .any(|r| r.path == exe && r.access.read && r.access.execute && !r.access.write),
             "the cplt binary must be granted read+execute and not write"
+        );
+    }
+
+    #[test]
+    fn generate_policy_skips_the_cplt_exec_grant_under_a_writable_tree() {
+        // Pins the *wiring*: the four tests above pin the predicate, but
+        // nothing catches `generate_policy` dropping the call. Making the
+        // binary's own parent an `allow.write` tree (read+write, no execute)
+        // is the write-plus-execute pair the check exists to refuse, so no
+        // rule for the binary may be emitted at all.
+        let exe = std::env::current_exe().unwrap();
+        let writable = vec![exe.parent().unwrap().to_path_buf()];
+        let project = PathBuf::from("/home/user/project");
+        let home = PathBuf::from("/home/user");
+        let mut config = test_config(&project, &home);
+        config.extra_write = &writable;
+        let policy = generate_policy(&config);
+        assert!(
+            !policy.fs_rules.iter().any(|r| r.path == exe),
+            "no execute grant on the cplt binary when it sits under a writable tree"
+        );
+    }
+
+    #[test]
+    fn generate_policy_keeps_the_cplt_exec_grant_under_the_project_dir() {
+        // The other half of the wiring. The check deliberately runs against the
+        // rules actually emitted, not against `writable_trees`, because the
+        // project dir is writable *and* executable by design — skipping the
+        // grant there would break the guard to close a hole that is already
+        // open by construction. Nothing pinned that: rewiring the check to
+        // `writable_trees` passes every other test in the suite while silently
+        // disarming the guard for anyone running cplt from their own checkout.
+        let exe = std::env::current_exe().unwrap();
+        let project = exe.parent().unwrap().to_path_buf();
+        let home = PathBuf::from("/home/user");
+        let policy = generate_policy(&test_config(&project, &home));
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == exe && r.access.execute),
+            "the grant must survive a project dir that is writable and executable"
         );
     }
 
