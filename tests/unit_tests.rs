@@ -978,15 +978,86 @@ fn profile_denies_host_persistence_paths_for_every_agent() {
                 },
                 &[],
             );
-            for dir in agent_dirs.iter().filter(|d| d.write) {
-                for sub in agent.host_persistence_denies() {
-                    let path = dir.path.join(sub).display().to_string();
-                    let line = format!("(deny file-write* (subpath \"{path}\"))");
-                    assert!(p.contains(&line), "{agent:?} profile missing: {line}");
-                }
+            // Asserted through `host_persistence_paths` rather than re-derived
+            // from the writable grants: that function decides which grants the
+            // denies are joined onto (the top-level ones, writable or not), and
+            // re-deriving it here made the test disagree with the code the
+            // moment an agent's root grant stopped being writable.
+            for path in agent.host_persistence_paths(&agent_dirs) {
+                let line = format!("(deny file-write* (subpath \"{}\"))", path.display());
+                assert!(p.contains(&line), "{agent:?} profile missing: {line}");
             }
         }
     });
+}
+
+/// H-12: Pi's project trust store must be write-denied.
+///
+/// `~/.pi/agent/trust.json` records trust as a bare per-directory decision with
+/// no fingerprint of what was trusted, and trust is the gate on the
+/// project-local auto-load paths (`.pi/extensions`, `.pi/settings.json`
+/// `packages`). An agent that writes it pre-trusts a directory, and the planted
+/// project config then loads on the next unsandboxed `pi` with no prompt.
+#[test]
+fn pi_profile_denies_the_project_trust_store() {
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = cplt::agent::Agent::Pi.config_dirs(home);
+    let p = generate_profile(
+        &SandboxConfig {
+            agent: cplt::agent::Agent::Pi,
+            agent_dirs: &agent_dirs,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        p.contains("(deny file-write* (subpath \"/Users/test/.pi/agent/trust.json\"))"),
+        "the trust store must be denied alongside settings.json:\n{p}"
+    );
+}
+
+/// H-13/H-05: an agent's managed-binary dir must not sit inside a writable
+/// Landlock grant.
+///
+/// Landlock unions a path with every ancestor rule and has no deny form, so a
+/// `write: true` grant on `~/.pi/agent` reached the exec-only `~/.pi/agent/bin`
+/// inside it: the managed `rg`/`fd` were writable AND executable, and a
+/// contained agent that overwrote one owned the user's next unsandboxed `pi`.
+/// macOS denies the write at the tail of the profile; on Linux the grant has to
+/// be narrowed instead, which is what this asserts — while the rest of the tree
+/// stays writable, or Pi cannot record a session.
+#[test]
+fn pi_managed_binaries_are_not_inside_a_writable_linux_grant() {
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = cplt::agent::Agent::Pi.config_dirs(home);
+    let policy = generate_policy(&SandboxConfig {
+        agent: cplt::agent::Agent::Pi,
+        agent_dirs: &agent_dirs,
+        // No tool dirs: this is about the agent grants, and ~/.cache would
+        // otherwise be the writable ancestor of nothing here anyway.
+        existing_home_tool_dirs: Some(&[]),
+        ..base_profile_options()
+    });
+
+    let bin = home.join(".pi/agent/bin");
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &bin),
+        None,
+        "no rule may make ~/.pi/agent/bin writable — it is granted EXECUTE, and \
+         Landlock cannot subtract a write grant from an ancestor"
+    );
+    assert!(
+        policy
+            .fs_rules
+            .iter()
+            .any(|r| r.path == bin && r.access.execute),
+        "the managed fd/rg must still be executable"
+    );
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &home.join(".pi/agent/sessions/x.jsonl")),
+        Some(home.join(".pi/agent/sessions")),
+        "narrowing must not cost Pi its session directory"
+    );
 }
 
 /// A user `allow.write` must NOT reopen the host-persistence denies.
@@ -4828,7 +4899,7 @@ fn profile_gpg_signing_deny_path_wins() {
         "explicit --deny-path ~/.gnupg should override --allow-gpg-signing"
     );
     assert!(
-        p.contains("--deny-path overlaps"),
+        p.contains("GPG signing re-allow withheld"),
         "profile should note that deny-path overrode GPG signing"
     );
 }
@@ -5813,7 +5884,7 @@ fn profile_docker_enabled_allows_config_and_sockets() {
 }
 
 #[test]
-fn profile_docker_skipped_when_deny_path_overlaps() {
+fn profile_docker_withholds_the_overlapping_reallow() {
     let p = generate_profile(
         &SandboxConfig {
             extra_deny: &[std::path::PathBuf::from("/Users/test/.docker")],
@@ -5822,14 +5893,19 @@ fn profile_docker_skipped_when_deny_path_overlaps() {
         },
         &[],
     );
-    // Docker allows should be skipped — deny-path wins
+    // The overlapping re-allow is withheld — deny-path wins for ~/.docker...
     assert!(
-        p.contains("Docker access skipped"),
-        "Profile must skip docker rules when --deny-path overlaps"
+        p.contains("Docker re-allow withheld"),
+        "Profile must withhold the overlapping docker re-allow"
     );
     assert!(
         !p.contains(r#"(allow file-read* (subpath "/Users/test/.docker"))"#),
         "Profile must not allow .docker when deny-path overlaps"
+    );
+    // ...but the rest of the grant (containers, sockets) stays active.
+    assert!(
+        p.contains(r#"(allow file-read* (subpath "/Users/test/.config/containers"))"#),
+        "Profile must keep unrelated docker re-allows when only ~/.docker is denied"
     );
 }
 
@@ -8587,5 +8663,127 @@ fn install_advice_drops_a_location_the_run_makes_writable() {
     assert!(
         !cplt::check::read_only_install_dirs(&policy, home, name).contains(&granted),
         "advice must not name a location this run makes writable"
+    );
+}
+
+// ============================================================
+// #390: a shim in a granted bin dir whose target is ungranted
+// ============================================================
+
+/// volta and nodenv put the shim and the real binary in different directories,
+/// and Landlock checks the target. Both stores live under one home root, so one
+/// `HomeToolDir` each covers shim and target — the same shape as `.nvm`.
+#[test]
+fn volta_and_nodenv_version_stores_are_exec_granted() {
+    use cplt::sandbox::HOME_TOOL_DIRS;
+
+    for root in [".volta", ".nodenv"] {
+        let entry = HOME_TOOL_DIRS
+            .iter()
+            .find(|d| d.path == root)
+            .unwrap_or_else(|| panic!("HOME_TOOL_DIRS missing {root} (#390)"));
+        assert!(entry.process_exec, "{root} must grant process_exec");
+        assert!(
+            !entry.write,
+            "{root} must stay read-only: a writable version store lets an agent \
+             trojan a binary that runs on the next launch"
+        );
+    }
+
+    let policy = generate_policy(&base_profile_options());
+    let exec_granted = |p: &std::path::Path| {
+        policy
+            .fs_rules
+            .iter()
+            .any(|r| r.access.execute && p.starts_with(&r.path))
+    };
+    // The paths the shims actually resolve into, not just the roots.
+    for target in [
+        "/Users/test/.volta/tools/image/node/22.23.2/bin/node",
+        "/Users/test/.nodenv/versions/22.23.2/bin/node",
+    ] {
+        assert!(
+            exec_granted(std::path::Path::new(target)),
+            "{target} must be exec-granted, or the shim fails with a silent exit 126"
+        );
+    }
+}
+
+#[test]
+fn shim_pointing_outside_every_exec_grant_is_reported() {
+    use cplt::check::shim_target_without_exec;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let bin = root.join("granted/bin");
+    let store = root.join("elsewhere/node-v22/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("node"), "#!/bin/sh\n").unwrap();
+    std::fs::write(bin.join("plain"), "#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(store.join("node"), bin.join("node")).unwrap();
+
+    let policy_with = |exec: &[PathBuf]| {
+        generate_policy(&SandboxConfig {
+            project_dir: &root.join("project"),
+            home_dir: &root.join("home"),
+            extra_exec: exec,
+            ..base_profile_options()
+        })
+    };
+
+    // The reported case: shim granted, target not.
+    let policy = policy_with(&[root.join("granted")]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("node")),
+        Some(store.join("node")),
+        "a shim resolving outside every exec grant must be named, not left as exit 126"
+    );
+
+    // Granting the real store silences it — the advice the warning gives works.
+    let policy = policy_with(&[root.join("granted"), root.join("elsewhere")]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("node")),
+        None,
+        "--allow-exec on the resolved store must clear the warning"
+    );
+
+    // A real binary in the granted dir is not a shim.
+    let policy = policy_with(&[root.join("granted")]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("plain")),
+        None,
+        "a non-symlink must never be reported as a shim"
+    );
+
+    // A plain binary reached through a SYMLINKED PARENT, with the path itself
+    // inside the exec grant so the ordinary ungranted-shim branch cannot be what
+    // returns None. `canonicalize` resolves parent components too, so comparing
+    // it against the input reports this as a shim resolving into the ungranted
+    // store — a warning about a symlink the user does not have. Only the
+    // symlink_metadata check on the path itself rejects it.
+    let linked_parent = root.join("granted/link");
+    std::os::unix::fs::symlink(&store, &linked_parent).unwrap();
+    let policy = policy_with(&[root.join("granted")]);
+    assert!(
+        std::fs::symlink_metadata(linked_parent.join("node"))
+            .unwrap()
+            .file_type()
+            .is_file(),
+        "fixture: the binary itself must not be a symlink, or this tests nothing"
+    );
+    assert_eq!(
+        shim_target_without_exec(&policy, &linked_parent.join("node")),
+        None,
+        "a plain binary under a symlinked parent must not be reported as a shim"
+    );
+
+    // Nothing granted at all: the exec fails for the ordinary reason, and
+    // blaming the symlink would misdiagnose it.
+    let policy = policy_with(&[]);
+    assert_eq!(
+        shim_target_without_exec(&policy, &bin.join("node")),
+        None,
+        "an ungranted shim is not a shim-target problem"
     );
 }

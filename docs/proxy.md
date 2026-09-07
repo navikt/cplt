@@ -318,7 +318,10 @@ cplt config set sandbox.pass_env HTTPS_PROXY
 
 ### Chaining through an upstream (corporate) proxy
 
-Instead of disabling cplt's proxy, keep it and forward its approved CONNECT tunnels through your corporate proxy. cplt still enforces all of its own filtering (allowlist, blocklist, port policy, resolved-IP SSRF guard) before forwarding, so the upstream only ever receives targets cplt's policy already permits.
+Instead of disabling cplt's proxy, keep it and forward its approved CONNECT tunnels through your corporate proxy. Every hostname gate runs before the forward, so the upstream only ever receives a target whose *name* cplt's policy permits: the port policy, the fail-closed allowlist, the blocklist, and the pre-DNS private-hostname check that rejects private IP literals and `localhost` / `*.localhost` / `*.local`.
+
+> [!IMPORTANT]
+> **Upstream mode delegates private-address defense to the upstream.** cplt forwards the target *hostname*, not an address, and the upstream resolves it itself. cplt's resolved-IP SSRF guard classifies the answer cplt's own resolver gives, which need not be the address the tunnel lands on: a split-horizon name that is public locally and private upstream passes the guard and still reaches the private host, and a name that does not resolve locally at all is forwarded with no address classification (that is how split-DNS names are meant to work here). This is deliberate — pinning the checked IP would break split-DNS and internal-name resolution, which is the reason upstream mode exists. In this mode the private-network boundary is the upstream proxy and its network segment, not cplt.
 
 ```bash
 cplt config set proxy.upstream "http://corporate-proxy.example.com:8080"
@@ -327,6 +330,9 @@ cplt --proxy-upstream http://corporate-proxy.example.com:8080 -- -p "fix the tes
 ```
 
 Optional basic-auth userinfo is supported (`http://user:pass@host:8080`), and only the `http` scheme is supported. The credentials are redacted in `config show` and startup output.
+
+> [!WARNING]
+> **Upstream credentials travel in cleartext.** There is no TLS-to-proxy path: an `https://` upstream is rejected rather than downgraded, so the connection to the upstream is plain TCP and the userinfo is sent on every CONNECT as `Proxy-Authorization: Basic <base64>`. Base64 is encoding, not encryption — anyone who can read the segment between cplt and the upstream reads the credential. Redaction covers logs and `config show`, not the wire. cplt does not refuse userinfo for a non-loopback upstream, because Basic auth to a corporate proxy over a trusted internal segment is ordinary. Where that segment is not trusted, point `proxy.upstream` at a loopback forwarder that holds the credential, or use a credential-free upstream that authenticates by source address.
 
 #### Bypassing the upstream for some hosts (`NO_PROXY`)
 

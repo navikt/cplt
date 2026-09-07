@@ -10,7 +10,7 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
 |-----------------|-------------------------------------|---------------------------------------------------------------------|----------------------------------------------|---------------------------------------------|----------------------------------------------|
 | Auth mechanism  | GitHub token (Keychain, `GH_TOKEN`) | `/connect` device flow to `auth.json`, or API keys                  | Google OAuth (browser / keyring session)     | API keys (Anthropic, OpenAI, Gemini, etc.)  | OAuth token (Keychain / `~/.claude`) or API key |
 | Auth in sandbox | Token served via one-time file read (gh guard) or Keychain | Copilot auth stored in data dir; third-party keys need `--pass-env` | OAuth/session data stored in `~/.gemini/*` | Keys need `--pass-env`             | OAuth stored in `~/.claude`/Keychain; keys need `--pass-env` |
-| Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini/config` (read/write)              | `~/.pi` (read/write)                       | `~/.claude` + `~/.claude.json` (read/write)  |
+| Config dir      | `~/.copilot` (read/write)           | `~/.config/opencode` (read-only)                                    | `~/.gemini/config` (read/write)              | `~/.pi/agent` (read-only root; `sessions/`, `prompts/`, `themes/`, `skills/`, `tools/`, `tmp/` writable) | `~/.claude` + `~/.claude.json` (read/write)  |
 | Data dir        | `~/Library/Caches/copilot`          | `~/.local/share/opencode` (write, no exec)                          | `~/.gemini/antigravity-cli` (read/write)     | `~/.pi/agent/bin` (read + exec)             | N/A (in config dir)                          |
 | State data dir  | N/A                                 | `~/.local/state/opencode` (write, no exec)                          | N/A                                          | N/A                                          | N/A                                          |
 | Keychain access | Yes                                 | No                                                                  | Yes (OAuth/keyring flow)                     | No                                          | Yes (macOS OAuth token storage)              |
@@ -31,7 +31,7 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
   | Agent | Denied inside the agent's writable grants |
   | --- | --- |
   | Claude Code | `settings.json`, `statusline.sh`, `plugins/` |
-  | Pi | `settings.json`, `extensions/`, `npm/`, `git/` |
+  | Pi | `settings.json`, `trust.json`, `extensions/`, `npm/`, `git/` |
   | Antigravity | `config/hooks.json`, `config/mcp_config.json`, `antigravity-cli/bin/` |
   | Copilot | `settings.json`, `hooks/`, `mcp-config.json`, `lsp-config.json`, `extensions/`, `installed-plugins/`, `pkg/` |
   | Shell (fish) | `config.fish`, `conf.d/`, `functions/`, `completions/`, `vendor_conf.d/`, `vendor_functions.d/`, `vendor_completions.d/` |
@@ -46,7 +46,7 @@ cplt sandboxes AI coding agents. Currently that means **GitHub Copilot CLI**, **
 
 ### Agent notes beyond the table
 
-**OpenCode.** The data dir (`~/.local/share/opencode/`: sessions, auth, SQLite DB) and the state dir (`~/.local/state/opencode/`: locks, history, statistics) both carry `(deny process-exec)` and `(deny file-map-executable)` alongside their write permission, so neither can be used for write-then-exec persistence. The config dir (`~/.config/opencode/opencode.json` and friends) is read-only, so the agent cannot tamper with settings that apply to unsandboxed runs.
+**OpenCode.** The data dir (`~/.local/share/opencode/`: sessions, auth, SQLite DB) and the state dir (`~/.local/state/opencode/`: locks, history, statistics) both carry `(deny process-exec)` and `(deny file-map-executable)` alongside their write permission, so neither can be used for write-then-exec persistence. The config dir (`~/.config/opencode/opencode.json` and friends) is read-only, so the agent cannot tamper with settings that apply to unsandboxed runs. The cache dir's `~/.cache/opencode/bin/` — the managed `rg`/`fd` OpenCode downloads and runs — is granted process-exec and no write, and macOS write-denies it at the tail of the profile. On **Linux it is a residual**: its writable ancestor is `~/.cache`, which `HOME_TOOL_DIRS` grants to every agent, so narrowing OpenCode's own cache grant would take nothing away, and Landlock cannot subtract. The bubblewrap read-only overlay re-binds it (the same treatment `~/.cache/copilot/pkg` gets, and for the same reason), which means the control is absent on a Linux host without user namespaces.
 
 
 **Copilot.** `~/.copilot` is granted read/write plus map-executable, and is an ordinary `AgentDir` rather than a hand-written profile block, which is what lets the host-persistence guard reach into it. Seven paths inside it are write-denied. `settings.json` carries `hooks.<event>[]` entries whose `bash` / `command` / `exec`+`args` fire at lifecycle points, and `hooks/*.json` is the same schema in its own directory. `mcp-config.json` (`mcpServers.<name>.command`) and `lsp-config.json` (`lspServers.<name>.command`) both name host processes the CLI spawns — LSP servers start automatically once the working directory is trusted. `extensions/` runs Node modules; GitHub's own documentation says extensions "execute on your computer with your privileges", and while they are gated behind `--experimental` today, that is a flag the user flips, not a boundary. `pkg/` holds the native `.node` addons and carries the deny that used to be hardcoded next to the grant.
@@ -81,7 +81,13 @@ For a zsh session only `~/.local/share/zsh` is granted and none of the six entri
 
 **Antigravity.** Keeps the Keychain grant unless `~/.gemini/antigravity-cli/antigravity-oauth-token` already exists — that file is `agy`'s *keyring fallback*, not a mirror, so its presence is the only safe signal that the agent can authenticate without the grant (#242). See [Keychain access is all-or-nothing](#keychain-access-is-all-or-nothing). Its two grants carry their own auto-executing config, so the host-persistence guard applies: `~/.gemini/config/hooks.json` names host commands, `~/.gemini/config/mcp_config.json` holds `mcpServers` that auto-start, and `~/.gemini/antigravity-cli/bin/` holds binaries (`agentapi`, `webm_encoder`) Antigravity runs on the host. All three are write-denied. Note that Antigravity is granted `~/.gemini/config` and `~/.gemini/antigravity-cli`, not `~/.gemini` itself, so Gemini's own user-level `settings.json` is not writable through an Antigravity session.
 
-**Pi.** Not auto-detected: the `pi` binary name is generic and may collide with other tools, so select it explicitly with `--agent pi` or `sandbox.agent = "pi"`. `~/.pi/agent/` holds settings, auth, sessions, and themes. The managed binary dir `~/.pi/agent/bin/` (bundled `fd`, `rg`) has process-exec, and on **macOS only** an explicit `(deny file-write*)` is emitted for it at the tail of the profile — alongside the host-persistence denies, and for the same reason: emitted next to the parent allow it was reopenable by a later user `allow.write`. Linux has no equivalent: Landlock rules are additive, so the parent's read+write unions with the child's read+exec and `~/.pi/agent/bin/` ends up **writable and executable**. `~/.pi/agent/extensions/`, `settings.json`, `npm/` and `git/` are write-denied by the host-persistence guard (macOS Seatbelt; on Linux only via the bubblewrap overlay, and only for paths that already exist). Pi auto-discovers `~/.pi/agent/extensions/*.ts` and `*/index.ts` and loads them at startup without confirmation, since the project-trust gate covers only project-local `.pi/extensions`, and Pi's own documentation states that extensions run with the user's full system permissions and can execute arbitrary code. `settings.json` in the same directory is denied for the same reason: its `extensions` key loads code from arbitrary file paths and its `packages` key from npm or git, so denying the `extensions/` directory alone would not close the vector. `npm/` and `git/` are denied because that is where `pi install` puts the code: without them, denying `settings.json` would stop a *new* `packages` entry being added while leaving an already-installed package editable in place, and it loads on the next host run. A file written to any of these would execute unsandboxed the next time `pi` runs on the host. The cost is in-sandbox package management plus every setting that persists to `settings.json` — `/model` (Ctrl+S), `/thinking`, `/settings`. Do those outside cplt. Auth is unaffected: Pi has no interactive login and reads provider API keys from the environment.
+**Pi.** Not auto-detected: the `pi` binary name is generic and may collide with other tools, so select it explicitly with `--agent pi` or `sandbox.agent = "pi"`. `~/.pi/agent/` holds settings, auth, sessions, and themes.
+
+The **root is granted read-only**, and write is granted per subdirectory: `sessions/`, `prompts/`, `themes/`, `skills/`, `tools/` and `tmp/`, plus file-level write on the top-level files Pi rewrites in place (`auth.json`, `oauth.json`, `models.json`, `models-store.json`, `keybindings.json`, `pi-debug.log`). It used to be one write grant over the whole tree, and that is what made the managed binary dir `~/.pi/agent/bin/` (bundled `fd`, `rg`, which has process-exec) writable **and** executable on Linux: Landlock unions a path with every ancestor rule and has no deny form, so the parent's write reached the exec-only child, and an agent that overwrote `rg` there owned the user's next unsandboxed `pi`. macOS emitted — and still emits — an explicit `(deny file-write*)` for `bin/` at the tail of the profile; Landlock has no such rule, so the grant is narrowed instead, the shape `HOME_TOOL_DIRS` already uses for `~/.cargo/bin` against `~/.cargo/registry`, and the only form that holds on a host without bubblewrap. The writable set is Pi's own `~/.pi/agent/*` surface, read off `@earendil-works/pi-coding-agent` 0.85.1 (`dist/config.js`, `dist/core/resource-loader.js`).
+
+The cost of the narrowing is that Pi can no longer create a **new** top-level entry under `~/.pi/agent` from inside cplt: a first-ever `pi auth login` (which creates `auth.json`) and the managed-binary bootstrap (Pi downloads `fd`/`rg` into `bin/` when they are not on `PATH`) have to happen outside cplt. A file-level grant only matches a file that already exists, because both backends resolve the path when the rule is built.
+
+`~/.pi/agent/extensions/`, `settings.json`, `trust.json`, `npm/` and `git/` are write-denied by the host-persistence guard, and read-only by construction now that the root is. Pi auto-discovers `~/.pi/agent/extensions/*.ts` and `*/index.ts` and loads them at startup without confirmation, since the project-trust gate covers only project-local `.pi/extensions`, and Pi's own documentation states that extensions run with the user's full system permissions and can execute arbitrary code. `settings.json` in the same directory is denied for the same reason: its `extensions` key loads code from arbitrary file paths and its `packages` key from npm or git, so denying the `extensions/` directory alone would not close the vector. `trust.json` is the project trust store: `ProjectTrustStore` records a bare decision keyed on the normalized project path with **no fingerprint** of what is being trusted, so writing it pre-trusts a directory — and trust is the gate on the project-local auto-load paths, `.pi/extensions` and `.pi/settings.json`'s `packages`. `npm/` and `git/` are denied because that is where `pi install` puts the code: without them, denying `settings.json` would stop a *new* `packages` entry being added while leaving an already-installed package editable in place, and it loads on the next host run. A file written to any of these would execute unsandboxed the next time `pi` runs on the host. The cost is in-sandbox package management, `/trust`, plus every setting that persists to `settings.json` — `/model` (Ctrl+S), `/thinking`, `/settings`. Do those outside cplt. Auth is unaffected once `auth.json` exists: Pi has no interactive login by default and reads provider API keys from the environment.
 
 **Claude Code.** Not auto-detected either; select it with `--agent claude` (aliases `cc`, `claude-code`) or `sandbox.agent = "claude"`.
 
@@ -357,6 +363,78 @@ A curated blocklist of these domains ships in [`blocked-domains.txt`](blocked-do
 
 **`--allow-private-domain` weakens DNS rebinding protection for named domains.** For a domain listed in `proxy.allow_private_domains` (or `--allow-private-domain`), the proxy skips the post-DNS private IP check. That is intentional for corporate intranet services such as `intern.nav.no` that legitimately resolve to RFC 1918 addresses. The accepted risk: if DNS for a listed domain is poisoned or hijacked, a compromised agent could reach arbitrary private hosts on your internal network, not just the intended service. All other proxy checks (port, allowlist, blocklist) still apply. Only list domains you control and whose DNS you trust.
 
+**`proxy.upstream` delegates private-address defense to the upstream proxy.** When
+`proxy.upstream` is set, cplt classifies the address *it* resolves for the target
+name, then forwards the **name** — not that address — to the upstream in a nested
+`CONNECT host:port`. The upstream resolves it again, in its own network and with
+its own resolver, and cplt cannot see or pin the address the tunnel actually
+lands on. Two consequences follow, and both are accepted:
+
+- A **split-horizon** name that resolves publicly for cplt and privately for the
+  upstream passes cplt's resolved-IP guard on the public answer and still reaches
+  the private host.
+- A name that **does not resolve locally at all** gets no resolved-IP
+  classification: `resolve_locally` returns `None`, and on the upstream path that
+  is read as "only the corporate proxy can resolve this", so the tunnel is
+  forwarded anyway (`classify_resolved`, `src/proxy.rs`).
+
+Everything that does not depend on the resolved address still applies to every
+upstream-forwarded target, before the forward happens: the port policy, the
+fail-closed allowlist, the blocklist, and the pre-DNS private-hostname gate that
+rejects IP literals in a private range and `localhost` / `*.localhost` /
+`*.local` names. What does not apply is any guarantee about the *final* IP.
+
+This is deliberate and will not be enforced. Pinning the checked IP — forwarding
+`CONNECT 93.184.216.34:443` instead of the name — would break split-DNS and
+internal-name resolution, which is the entire reason upstream mode exists. So the
+trust boundary in this mode is the upstream proxy and the network segment it
+sits on: cplt filters which *names* reach it, and the upstream decides where they
+go. Do not use `proxy.upstream` with an upstream you would not trust to enforce
+its own egress policy.
+
+**An upstream proxy credential crosses the network in cleartext.** Only the
+`http` scheme is accepted for `proxy.upstream`; an `https://` upstream is
+rejected rather than silently downgraded, and cplt implements no TLS-to-proxy
+path. Userinfo in the upstream URL (`http://user:pass@host:8080`) is base64-encoded
+once at startup and sent as a `Proxy-Authorization: Basic` header over a plain TCP
+connection to that proxy, on every CONNECT. Anyone who can read that segment reads
+the credential; `Basic` is encoding, not encryption. The credential is redacted in
+`cplt config show`, in startup output and in `Debug` — that protects the logs, not
+the wire.
+
+cplt does not refuse userinfo for a non-loopback upstream, because Basic auth to a
+corporate proxy over a trusted internal segment is ordinary and refusing it would
+break real deployments. The trust boundary is therefore the network between cplt
+and the upstream. Where that segment is not trusted, point `proxy.upstream` at a
+loopback forwarder that holds the credential itself, or use a credential-free
+upstream that authenticates by source address.
+
+**Derived Linux grants follow symlinks (Landlock).** Landlock rules are attached
+by opening each path with `O_PATH | O_CLOEXEC` and **no `O_NOFOLLOW`**
+(`src/sandbox_landlock.rs`), and the path derivation that feeds them uses
+`std::fs::canonicalize`, which resolves symlinks by definition. A rule therefore
+binds to whatever inode the path resolves to at launch, not to the directory that
+was inspected when the grant was derived.
+
+That matters for **derived** grants — the ones whose final path cplt composes or
+resolves rather than taking verbatim: an `allow_cache_exec` entry, which names a
+subdirectory *relative* to the cache root and is what `cplt init` proposes from
+what it found on disk; a canonicalized `core.hooksPath`, gitdir or common dir; a
+detected tool directory. An attacker who already has write access inside such a
+location can replace the named subdirectory with a symlink between one launch and
+the next, and the read, write or exec right meant for it attaches to the
+attacker's target inode instead.
+
+The condition it needs is real but not small: control of a recognised derived
+path, and two launches. It is **not fixed** — there is no `O_NOFOLLOW` open and no
+post-open inode verification today. It is stated here rather than claimed away.
+Whether macOS shares it has not been established. Seatbelt is known to resolve
+symlinks when enforcing *deny* rules — that is what [Symlink attack
+protection](#symlink-attack-protection) and its tests cover — but whether an
+*allow* rule is re-evaluated per access or captured when the profile is compiled
+is a different property, and nothing here tests it. Do not read the deny-side
+result as covering the allow side.
+
 **`~/.config/gh/hosts.yml` is readable.** With gh guard enabled (the default), Copilot gets its token through a one-time cached file that is deleted after the first read; with gh guard disabled, `gh auth token` works inside the sandbox. The file holds a GitHub OAuth token. Only `hosts.yml` and `config.yml` are readable, not the whole `.config/gh` directory. With outbound port 443 open, a compromised agent could exfiltrate this token, though the token grants access to GitHub, which Copilot is already connected to. To mitigate, use `--deny-path ~/.config/gh`; Copilot falls back to Keychain auth.
 
 **`block_auth_token` is best-effort, not a same-UID boundary.** With gh guard and `block_auth_token` enabled (both the default), cplt withholds `GH_TOKEN` from the environment, caches the token to `$SCRATCH/.gh-token` (mode `0600`), serves it once via the `gh` wrapper's `gh auth token` callback, and deletes the file after the first read. That keeps the token out of every child's `/proc/*/environ`, and the deletion narrows the exposure window. It does **not** make the token confidential against an adversarial agent. The scratch dir *is* the agent's `TMPDIR`, and the `gh` wrapper runs as the agent's own UID inside the sandbox, so anything the wrapper can read, the agent can read. A same-UID `deny` rule would be illusory and would break the legitimate wrapper read, so cplt does not add one. An agent that `cat`s `$TMPDIR/.gh-token` before the legitimate consumer still gets the token. Treat `block_auth_token` as reducing accidental and env-based leakage, not as a boundary against a hostile agent.
@@ -387,6 +465,37 @@ The guards raise the bar against accidental and prompt-injected-but-cooperative 
 **DNS tunneling is the one channel we cannot inspect.** DNS queries are unrestricted on both platforms. What limits the damage: bandwidth is ~15 KB/s at best given the encoding overhead in subdomain labels, it needs an attacker-controlled authoritative DNS server, the most valuable targets (credentials, tokens, keys) are kernel-blocked from being read, and DNS monitoring detects it by the high-entropy subdomain queries to unusual domains.
 
 *Possible mitigation:* route DNS through a local resolver that logs and rate-limits queries, or block DNS entirely and use a pre-configured resolver for known domains. Practical impact is low, since credentials are already inaccessible.
+
+**Terminal injection (`TIOCSTI`) is denied by policy, not by either kernel.**
+`TIOCSTI` pushes a byte into a terminal's *input* queue, so it is command
+execution in whatever shell reads that terminal next — including the shell
+outside the sandbox that cplt was launched from. Neither platform blocks it for
+free, and the wording here has been wrong in both directions before.
+
+- **macOS.** XNU permits `TIOCSTI` on the caller's **own controlling terminal**;
+  it was reproduced succeeding outside the sandbox. It refuses the ioctl with
+  `EPERM` on any *other* tty, which is why a peer `/dev/ttysNNN` is not an
+  injection target even under the `--allow-write /dev` break-glass — that flag
+  restores output forgery and input capture on peer terminals, not injection into
+  them. What denies the ioctl inside a cplt session is the profile's
+  `(deny default)`. It is **not** `(allow file-ioctl)`, which cplt emits
+  unconditionally and which does not lift the default deny here. Any statement
+  that "the macOS kernel blocks TIOCSTI" is wrong; the control is Seatbelt.
+- **Linux.** The kernel gate is `CONFIG_LEGACY_TIOCSTI`, which is `default y`
+  upstream. Fedora, Debian and Arch disable it; self-built kernels and many
+  vendor and cloud kernels do not, and kernels before 6.2 predate the gate and
+  permit `TIOCSTI` with no capability at all. So on Linux the availability of
+  the primitive is a property of the kernel the user happens to be running, and
+  cplt cannot assume it is absent. Landlock does not help: it has no rule that
+  reaches an ioctl on an inherited descriptor. Denying `TIOCSTI` and `TIOCLINUX`
+  in the seccomp filter is the fix, and **it is not on `main` as of this
+  writing** — the filter table below does not list either. Until it lands,
+  assume an agent on a `CONFIG_LEGACY_TIOCSTI=y` kernel can inject into the
+  terminal cplt inherited.
+
+The exposure is the same on both platforms and is not about peer terminals at
+all: `/dev/tty` and the inherited descriptors 0/1/2 name the agent's own
+controlling terminal, and that terminal is the user's shell.
 
 **Reconnaissance leaks basic host info.** Hostname, IP address, OS version, and the sanitized subset of env vars are readable by any code inside the sandbox. This is unavoidable, because Copilot itself needs the information.
 

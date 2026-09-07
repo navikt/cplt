@@ -617,6 +617,16 @@ impl Agent {
     ///   code of packages already installed by `pi install`: denying only
     ///   `settings.json` stops a *new* entry being added but leaves installed
     ///   package code editable in place, and it loads on the next host run.
+    ///   `trust.json` is the project trust store — Pi's `ProjectTrustStore`
+    ///   writes it as `join(agentDir, "trust.json")` and keys a bare decision
+    ///   on the normalized project path, with no fingerprint of what is being
+    ///   trusted (`dist/core/trust-manager.js`, @earendil-works/pi-coding-agent
+    ///   0.85.1; pi.dev/docs/latest/settings: "/trust … writes
+    ///   `~/.pi/agent/trust.json` only"). An agent that writes it pre-trusts a
+    ///   directory, and trust is what gates the project-local auto-load paths —
+    ///   `.pi/extensions`, `.pi/settings.json` `packages` — on the next host
+    ///   run. Same class as the rest of the list: nothing legitimate writes it
+    ///   mid-session, `/trust` is a deliberate act to perform outside cplt.
     ///
     /// Cost: for Pi this breaks package management and every in-session
     /// setting that persists to `settings.json` — `/model` Ctrl+S,
@@ -632,7 +642,7 @@ impl Agent {
     pub fn host_persistence_denies(&self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &["statusline.sh", "plugins", "settings.json"],
-            Agent::Pi => &["settings.json", "extensions", "npm", "git"],
+            Agent::Pi => &["settings.json", "trust.json", "extensions", "npm", "git"],
             // Antigravity's grants are ~/.gemini/config and
             // ~/.gemini/antigravity-cli, not ~/.gemini itself, so Gemini's own
             // entries would not match; these are its equivalents. Each name is
@@ -744,14 +754,31 @@ impl Agent {
     }
 
     /// The concrete paths [`Agent::host_persistence_denies`] resolves to for a
-    /// given set of grants: every entry joined onto every **writable** dir.
+    /// given set of grants: every entry joined onto every **top-level** dir,
+    /// meaning one that is not itself nested inside another of the agent's
+    /// grants.
     ///
     /// Both backends need exactly this list — Seatbelt turns it into
     /// `(deny file-write*)` rules, the Linux path re-binds it read-only under
     /// bubblewrap — so it lives here rather than being joined twice.
+    ///
+    /// Nesting, not writability, is the filter. It used to be `d.write`, which
+    /// was the same set back when every agent's root grant was writable, and
+    /// stopped being so when Pi's root became read-only to keep `bin/` out of a
+    /// writable tree. A deny under a read-only grant is not redundant: it is
+    /// what survives a user `allow.write` over the same tree, which SBPL emits
+    /// later and last-match-wins would otherwise let reopen — the property
+    /// `host_persistence_denies_survive_a_later_user_allow_write` pins. Nested
+    /// grants are skipped because the names are relative to the agent's root,
+    /// so joining them onto a subdirectory only produces paths that never
+    /// exist (`~/.pi/agent/sessions/npm`).
     pub fn host_persistence_paths(&self, dirs: &[AgentDir]) -> Vec<PathBuf> {
         dirs.iter()
-            .filter(|d| d.write)
+            .filter(|d| {
+                !dirs
+                    .iter()
+                    .any(|other| other.path != d.path && d.path.starts_with(&other.path))
+            })
             .flat_map(|d| {
                 self.host_persistence_denies()
                     .iter()
@@ -998,19 +1025,75 @@ impl Agent {
                 ]
             }
             Agent::Pi => {
-                // ~/.pi/agent/ stores all global data: settings.json, trust.json,
-                // sessions/, npm/ packages. Per https://pi.dev/docs/latest/settings
-                // ~/.pi/agent/bin contains managed tool binaries (fd, rg)
+                // ~/.pi/agent/ stores all of Pi's global state, and
+                // ~/.pi/agent/bin the managed tool binaries (fd, rg) Pi runs.
+                //
+                // The root is granted READ-ONLY on purpose. It used to be one
+                // `write: true` grant over the whole tree, which on Linux made
+                // `bin/` writable AND executable: Landlock unions a path with
+                // every ancestor rule and cannot subtract, so the parent's
+                // write reached the exec-only child (H-13/H-05). A contained
+                // agent could overwrite the managed `rg`/`fd`, and the user's
+                // next unsandboxed `pi` would execute it. macOS denies the
+                // write at the tail of the profile; Landlock has no such rule,
+                // so the grant is narrowed instead — the shape `HOME_TOOL_DIRS`
+                // already uses for `~/.cargo/bin` vs `~/.cargo/registry`, and
+                // the only form that holds without bubblewrap.
+                //
+                // The writable set is Pi's own `~/.pi/agent/*` surface, read
+                // off @earendil-works/pi-coding-agent 0.85.1: `dist/config.js`
+                // (`getSessionsDir`, `getPromptsDir`, `getCustomThemesDir`,
+                // `getToolsDir`, `getBinDir`), `dist/core/resource-loader.js`
+                // (`skills`) and the extension staging dir `tmp/extensions`.
+                // `npm/`, `git/` and `extensions/` are deliberately absent:
+                // they are `host_persistence_denies` entries, so read-only is
+                // what they are meant to be, and `bin/` is absent because it is
+                // the whole point of the narrowing.
+                //
+                // Cost: Pi can no longer create a NEW top-level entry under
+                // ~/.pi/agent mid-session. The files it rewrites in place are
+                // carved back open below; a first-ever `pi auth login` (which
+                // creates auth.json) and the managed-binary bootstrap (Pi
+                // downloads fd/rg into bin/ when they are not on PATH) have to
+                // happen outside cplt. See docs/known-impacts.md.
+                let agent = home.join(".pi/agent");
+                let writable = |path: PathBuf| AgentDir {
+                    path,
+                    write: true,
+                    map_exec: false,
+                    process_exec: false,
+                    write_files: vec![],
+                };
                 vec![
                     AgentDir {
-                        path: home.join(".pi/agent"),
-                        write: true,
+                        path: agent.clone(),
+                        write: false,
                         map_exec: false,
                         process_exec: false,
-                        write_files: vec![],
+                        // Top-level files Pi rewrites in place. `settings.json`
+                        // and `trust.json` are absent by design — they are
+                        // host-persistence denies. A file-level grant only
+                        // matches a file that already exists (Landlock resolves
+                        // the path when the rule is built), which is why
+                        // creating one of these for the first time needs a run
+                        // outside cplt.
+                        write_files: vec![
+                            "auth.json",
+                            "oauth.json",
+                            "models.json",
+                            "models-store.json",
+                            "keybindings.json",
+                            "pi-debug.log",
+                        ],
                     },
+                    writable(agent.join("sessions")),
+                    writable(agent.join("prompts")),
+                    writable(agent.join("themes")),
+                    writable(agent.join("skills")),
+                    writable(agent.join("tools")),
+                    writable(agent.join("tmp")),
                     AgentDir {
-                        path: home.join(".pi/agent/bin"),
+                        path: agent.join("bin"),
                         write: false,
                         map_exec: false,
                         // Pi installs managed binaries here (fd, rg)
@@ -2245,7 +2328,10 @@ mod tests {
             Agent::Pi.host_persistence_denies(),
             // npm/ and git/ hold already-installed package code, editable in
             // place: denying settings.json alone only stops a NEW entry.
-            ["settings.json", "extensions", "npm", "git"]
+            // trust.json is the project trust store: a bare per-directory
+            // decision with no fingerprint, so writing it pre-trusts a project
+            // and unlocks its `.pi/` auto-load paths on the next host run.
+            ["settings.json", "trust.json", "extensions", "npm", "git"]
         );
         assert_eq!(
             Agent::Antigravity.host_persistence_denies(),
@@ -2301,7 +2387,7 @@ mod tests {
     /// it into deny rules, the Linux path re-binds it read-only — so pinning it
     /// here covers the bubblewrap assembly without needing a Linux host.
     #[test]
-    fn host_persistence_paths_join_only_writable_grants() {
+    fn host_persistence_paths_join_only_top_level_grants() {
         let home = Path::new("/Users/test");
 
         let dirs = Agent::Pi.config_dirs(home);
@@ -2309,12 +2395,14 @@ mod tests {
             Agent::Pi.host_persistence_paths(&dirs),
             vec![
                 home.join(".pi/agent/settings.json"),
+                home.join(".pi/agent/trust.json"),
                 home.join(".pi/agent/extensions"),
                 home.join(".pi/agent/npm"),
                 home.join(".pi/agent/git"),
             ],
-            "exec-only ~/.pi/agent/bin must contribute nothing — its write-deny \
-             comes from the exec-only rule instead"
+            "the denies belong to the ~/.pi/agent root — the nested grants \
+             (sessions/, bin/, …) must contribute nothing, and the read-only \
+             root must still contribute, or a user allow.write reopens them"
         );
 
         // Antigravity has two writable grants and its entries belong to one
@@ -2611,19 +2699,51 @@ mod tests {
         assert!(!Agent::Pi.needs_copilot_dir());
     }
 
+    /// Pi's managed-binary dir must not sit inside a writable grant.
+    ///
+    /// H-13/H-05: `~/.pi/agent` used to be one `write: true` grant containing
+    /// the exec-only `bin/`. Landlock unions a path with its ancestors and
+    /// cannot subtract, so `bin/` came out writable AND executable — a
+    /// contained agent overwrites the managed `rg`, and the user's next
+    /// unsandboxed `pi` runs it. The root is read-only now and the write grants
+    /// are the subdirectories Pi writes.
     #[test]
-    fn pi_config_dirs() {
+    fn pi_config_dirs_keep_bin_out_of_every_writable_grant() {
         let home = Path::new("/Users/test");
         let dirs = Agent::Pi.config_dirs(home);
-        assert_eq!(dirs.len(), 2, "should have ~/.pi/agent and ~/.pi/agent/bin");
-        // Main dir: ~/.pi/agent — all global data (settings, sessions, trust, npm)
-        assert_eq!(dirs[0].path, home.join(".pi/agent"));
-        assert!(dirs[0].write);
-        assert!(!dirs[0].process_exec);
-        // Bin dir has process_exec for managed binaries (fd, rg)
-        assert_eq!(dirs[1].path, home.join(".pi/agent/bin"));
-        assert!(!dirs[1].write);
-        assert!(dirs[1].process_exec);
+
+        let root = &dirs[0];
+        assert_eq!(root.path, home.join(".pi/agent"));
+        assert!(!root.write, "the root grant must not be writable");
+        assert!(!root.process_exec);
+        assert!(
+            root.write_files.contains(&"auth.json"),
+            "files Pi rewrites in place stay writable: {:?}",
+            root.write_files
+        );
+
+        let bin = dirs
+            .iter()
+            .find(|d| d.path == home.join(".pi/agent/bin"))
+            .expect("~/.pi/agent/bin must still be granted");
+        assert!(!bin.write);
+        assert!(bin.process_exec, "managed fd/rg must still execute");
+
+        // The property, not the list: nothing writable may contain bin/.
+        for dir in dirs.iter().filter(|d| d.write) {
+            assert!(
+                !bin.path.starts_with(&dir.path),
+                "{} is writable and contains the exec-only bin/ — Landlock \
+                 unions the two into write+execute",
+                dir.path.display()
+            );
+        }
+        // Sessions still writable, or Pi cannot record a conversation.
+        assert!(
+            dirs.iter()
+                .any(|d| d.write && d.path == home.join(".pi/agent/sessions")),
+            "{dirs:?}"
+        );
     }
 
     #[test]
