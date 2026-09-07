@@ -316,17 +316,27 @@ const DEVICE_FILES: &[&str] = &[
 ///
 /// `policy::PROTECTED_IN_ROOT` and `policy::PROTECTED_IN_GITDIR` name the paths
 /// that must stay unwritable inside a tree the sandbox makes writable —
-/// `.git/hooks`, `.cplt.toml`, `.agents/plugins`, `<gitdir>/config` and the
-/// rest. **This function emits no rule for any of them, and cannot.** Landlock
-/// is purely additive: a `FsRule` granting write on a directory cannot have a
+/// `.git/hooks`, `.cplt.toml`, `.agents/plugins`, `<gitdir>/config`,
+/// `<gitdir>/refs/remotes/*/HEAD` and the rest. **This function emits no rule
+/// for any of them, and cannot.** Landlock is purely additive: a `FsRule` granting write on a directory cannot have a
 /// sub-path subtracted from it, and there is no deny form to express one.
 ///
 /// So on Linux the whole set is carried by the bubblewrap read-only overlay
 /// (`bubblewrap::git_persistence_paths`) — for the subset those tables mark
 /// `LinuxCoverage::Bwrap` — and by nothing at all on a host without user
-/// namespaces, where bubblewrap is unavailable. That is a real gap, not an
-/// oversight, and it is stated here so the absence is visible from the backend
-/// that has it. #207 survived for months precisely because a control that was
+/// namespaces, where bubblewrap is unavailable. The same goes for the rename
+/// pins (`bubblewrap::rename_pin_paths`), which keep those paths *denoting* what
+/// they protect: they are mountpoints, and Landlock has no equivalent — it
+/// cannot make a directory unrenameable inside a tree it granted write on.
+/// Concretely, on a Landlock-only host the remote-HEAD rewrite of
+/// GHSA-cm6f-3wjh-x9qx is NOT blocked by the filesystem — the gate's
+/// launch-time baking is the only thing standing in front of it there, and
+/// that only holds within one launch — and neither is the project-root
+/// variant, GHSA-39xf-9j26-f82m, which has nothing in front of it at all:
+/// `mv .github` aside, write `hooks/evil.json`, move it back, and the hook
+/// runs unsandboxed on the host in the next session. That is a real
+/// gap, not an oversight, and it is stated here so the absence is visible from
+/// the backend that has it. #207 survived for months precisely because a control that was
 /// effective on macOS and ineffective on Linux looked identical in the code.
 /// True if `subdir` is a safe relative cache subdirectory: non-empty and every
 /// path component is a normal name (rejects `..`, `.`, an absolute root, or a

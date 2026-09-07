@@ -133,11 +133,36 @@ fn temp_repo_live(remote: &str, head: &str, extra: &[&str]) -> tempfile::TempDir
 
 /// Run `cplt git-gate` with protect-default-branch-only mode inside `repo`.
 fn git_gate_protect_default_in(repo: &std::path::Path, args: &[&str]) -> (String, String, bool) {
+    git_gate_protect_default_with_facts(repo, &launch_facts(repo), args)
+}
+
+/// The repository facts as the parent would capture them at launch. Tests that
+/// mutate the repository afterwards capture once and reuse the result — that is
+/// the whole point of baking them.
+fn launch_facts(repo: &std::path::Path) -> String {
+    serde_json::to_string(&cplt::gh_proxy::capture_repo_facts(
+        &binary_in_path("git"),
+        repo,
+    ))
+    .unwrap()
+}
+
+/// As above, with the launch-time facts supplied explicitly. The default branch
+/// is captured in the parent before the sandbox starts and baked into the
+/// wrapper — the guard never re-reads `refs/remotes/*/HEAD` from inside the
+/// sandbox (GHSA-cm6f-3wjh-x9qx). The wrapper generator emits this flag; here
+/// the harness stands in for it.
+fn git_gate_protect_default_with_facts(
+    repo: &std::path::Path,
+    facts: &str,
+    args: &[&str],
+) -> (String, String, bool) {
     let real_git = fake_push_git(repo);
     let mut cmd = cplt_cmd();
     cmd.arg("git-gate")
         .arg("--real-git")
         .arg(&real_git)
+        .arg(format!("--repo-facts={facts}"))
         .arg("--mode=block")
         .arg("--prevent-push=true")
         .arg("--prevent-force-push=true")
@@ -1338,6 +1363,70 @@ fn git_gate_blocks_abbreviated_and_bundled_push_options() {
 }
 
 // The fail-closed option check must not cost any legitimate spelling.
+/// GHSA-cm6f-3wjh-x9qx, end to end: a repository whose default branch is
+/// `trunk` refuses `git push origin trunk`, and still refuses it after the
+/// agent rewrites `refs/remotes/origin/HEAD` — an ordinary ref file that no
+/// protected-path rule covers, reached through the allowed `symbolic-ref`
+/// subcommand. The guard answers from the branch baked into the wrapper at
+/// launch, so the rewrite moves nothing.
+#[test]
+fn git_gate_protect_default_survives_a_rewritten_remote_head() {
+    let repo = temp_repo("navikt/cplt");
+    assert!(git_ok(
+        repo.path(),
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ],
+    ));
+    // A default branch that is neither `main` nor `master`: the names the
+    // unconditional floor protects would hide the bug.
+    assert!(git_ok(repo.path(), &["branch", "-M", "trunk"]));
+    assert!(git_ok(repo.path(), &["branch", "decoy"]));
+    assert!(git_ok(
+        repo.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
+    ));
+
+    // Captured once, at "launch", exactly as the wrapper generator does.
+    let facts = launch_facts(repo.path());
+
+    let (_, stderr, ok) =
+        git_gate_protect_default_with_facts(repo.path(), &facts, &["push", "origin", "trunk"]);
+    assert_refused(&stderr, ok, "'git push' is not allowed");
+
+    // The exploit: point the guard's old yardstick at a branch nobody protects.
+    assert!(git_ok(
+        repo.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/decoy",
+        ],
+    ));
+
+    let (_, stderr, ok) =
+        git_gate_protect_default_with_facts(repo.path(), &facts, &["push", "origin", "trunk"]);
+    assert_refused(&stderr, ok, "'git push' is not allowed");
+
+    // The other half: a real feature branch is still pushable, so the fix
+    // protects the default branch rather than everything.
+    let (_, _, ok) =
+        git_gate_protect_default_with_facts(repo.path(), &facts, &["push", "origin", "decoy"]);
+    assert!(ok, "a feature-branch push must still be allowed");
+}
+
 #[test]
 fn git_gate_allows_exactly_spelled_push_options() {
     for args in [

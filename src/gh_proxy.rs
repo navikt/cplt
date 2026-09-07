@@ -2409,14 +2409,21 @@ fn remote_verb_retargets_origin(verb: &str, verb_args: &[&str]) -> bool {
 /// (`git remote add upstream …`, `rename`, `remove`) and read-only inspection
 /// (`git remote -v`, `git remote get-url origin`, `git config --get …`) are
 /// unaffected — those cannot redirect the scope source.
+/// The verb of a `git remote <verb> …` invocation, and where it sits.
+///
+/// The first non-flag token. `None` is the bare listing form, which is
+/// read-only.
+fn remote_verb<'a>(sub_args: &[&'a str]) -> Option<(usize, &'a str)> {
+    let idx = sub_args.iter().position(|a| !a.starts_with('-'))?;
+    Some((idx, sub_args[idx]))
+}
+
 fn is_remote_scope_mutation(sub: &str, sub_args: &[&str]) -> bool {
     match sub {
         "remote" => {
-            // First non-flag token is the verb. No verb → list (read-only).
-            let Some(verb_idx) = sub_args.iter().position(|a| !a.starts_with('-')) else {
+            let Some((verb_idx, verb)) = remote_verb(sub_args) else {
                 return false;
             };
-            let verb = sub_args[verb_idx];
             if matches!(verb, "add" | "set-url" | "rename") {
                 remote_verb_retargets_origin(verb, &sub_args[verb_idx + 1..])
             } else {
@@ -2477,12 +2484,52 @@ fn is_subtree_push(sub_args: &[&str]) -> bool {
     sub_args.iter().find(|a| !a.starts_with('-')).copied() == Some("push")
 }
 
+/// True if these `git symbolic-ref` arguments *write* `refs/remotes/<remote>/HEAD`.
+///
+/// Fails closed on shape rather than enumerating the write forms. The only
+/// invocation provably a read is one whose every `-`-prefixed token is exactly
+/// `-q`, `--quiet` or `--short` and which has exactly one positional; that form
+/// stays allowed because git internals and the guard's own launch-time
+/// resolution use it. Anything else — a bundled short cluster (`-qm`, `-qd`),
+/// an abbreviated long (`--del`, `--d`), an unknown flag, or a second
+/// positional — is a write as far as this gate is concerned, and is blocked
+/// when any positional names a `refs/remotes/<remote>/HEAD` ref.
+///
+/// Enumerating instead is what let `-qm r <ref> <target>` through: `-qm` is not
+/// `-m`, so a skip-the-unknown parser dropped it, took its reason argument as
+/// the first positional and looked for the ref in the wrong slot. Git resolves
+/// abbreviations and bundles; this gate refuses to guess which token is which.
+///
+/// Names git itself rejects (`…/HEAD/`, `…//HEAD`, `./refs/…`, absolute paths —
+/// "refusing to update ref with bad name") need no handling here.
+fn symbolic_ref_writes_remote_head(sub_args: &[&str]) -> bool {
+    const READ_FLAGS: &[&str] = &["-q", "--quiet", "--short"];
+    let dashdash = sub_args.iter().position(|a| *a == "--");
+    let head = &sub_args[..dashdash.unwrap_or(sub_args.len())];
+    let tail = dashdash.map_or(&[][..], |i| &sub_args[i + 1..]);
+
+    let read_shape = head
+        .iter()
+        .all(|a| !a.starts_with('-') || READ_FLAGS.contains(a));
+    let positionals = || head.iter().filter(|a| !a.starts_with('-')).chain(tail);
+    if read_shape && positionals().count() == 1 {
+        return false; // read form
+    }
+    positionals().any(|name| {
+        name.strip_prefix("refs/remotes/")
+            .and_then(|r| r.strip_suffix("/HEAD"))
+            .is_some_and(|remote| !remote.is_empty())
+    })
+}
+
 /// Evaluate a git command. Returns Ok(()) if allowed, Err with message if blocked.
 ///
 /// Used by the `cplt git-gate` subcommand.
 /// `prevent_push` controls whether push/request-pull/send-pack are blocked.
 /// `prevent_force_push` blocks force push even when regular push is allowed.
 /// `protect_default_branch_only` allows pushes to non-default branches (not main/master).
+/// `repo_facts` carries the launch-time answers the guard must not re-derive from
+/// inside the sandbox — see [`RepoFacts`].
 pub fn gate_git(
     args: &[&str],
     prevent_push: bool,
@@ -2490,6 +2537,7 @@ pub fn gate_git(
     protect_default_branch_only: bool,
     allow_push_rules: &[crate::config::ResolvedPushRule],
     real_git: Option<&Path>,
+    repo_facts: &RepoFacts,
 ) -> Result<(), String> {
     // If push prevention is entirely disabled, allow everything
     if !prevent_push && !prevent_force_push {
@@ -2563,6 +2611,50 @@ pub fn gate_git(
         ));
     }
 
+    // `git remote set-head` writes `refs/remotes/<remote>/HEAD` — the very ref
+    // the push guard's default-branch yardstick used to be read from
+    // (GHSA-cm6f-3wjh-x9qx). The facts are baked at launch now, so this cannot
+    // move the yardstick within a session; refusing it stops the persisted
+    // rewrite that would retarget the NEXT launch. It is one of three controls
+    // on that ref: the profile's path deny (files backend only), this block,
+    // and the `symbolic-ref` write block below (backend-independent).
+    if prevent_push && sub == "remote" && remote_verb(sub_args).map(|(_, v)| v) == Some("set-head")
+    {
+        return Err(
+            "⚠️ BLOCKED by sandbox: 'git remote set-head' is not allowed in this environment.\n\
+             It rewrites refs/remotes/<remote>/HEAD, the record of which branch is the protected\n\
+             default one. The push guard reads that fact from before this session started, so\n\
+             rewriting it changes nothing it decides — but nothing legitimate needs it here either.\n\
+             Run it OUTSIDE the sandbox if the recorded default branch is wrong.\n\
+             Please make a note of this for the human operator and continue with your remaining work."
+                .to_string(),
+        );
+    }
+
+    // `git symbolic-ref refs/remotes/<remote>/HEAD <target>` writes the same ref
+    // `git remote set-head` does, and it is the one write the filesystem cannot
+    // stop: on a repository with the `reftable` ref backend (git 2.45+) that ref
+    // is not a file at all — it lives in the binary tables under `.git/reftable/`,
+    // which has to stay writable — so the profile's deny on
+    // `.git/refs/remotes/*/HEAD` matches nothing and the rewrite succeeds. The
+    // baked facts hold for the current session, but `cplt exec` re-bakes at every
+    // launch, so a persisted rewrite hands the next launch a forged default
+    // branch (GHSA-cm6f-3wjh-x9qx). A path deny cannot see a ref that is not a
+    // path, so this control has to live in the gate, where it is
+    // backend-independent. The read form stays allowed — git internals and the
+    // launch-time fact capture both use it.
+    if prevent_push && sub == "symbolic-ref" && symbolic_ref_writes_remote_head(sub_args) {
+        return Err(
+            "⚠️ BLOCKED by sandbox: writing refs/remotes/<remote>/HEAD is not allowed in this environment.\n\
+             That symref records which branch is the protected default one, and the push guard reads it\n\
+             when a session starts — so rewriting it here would retarget the guard at the next launch.\n\
+             Reading it (git symbolic-ref [--short] <ref>) is still allowed.\n\
+             Run the write OUTSIDE the sandbox if the recorded default branch is wrong.\n\
+             Please make a note of this for the human operator and continue with your remaining work."
+                .to_string(),
+        );
+    }
+
     // `git subtree push` is a remote write — block it like a bare push while
     // leaving the local subtree forms (add/pull/split/merge) allowed.
     if prevent_push && sub == "subtree" && is_subtree_push(sub_args) {
@@ -2627,24 +2719,43 @@ pub fn gate_git(
 
         // The repository's real default branch, resolved in the repo this
         // command targets. `None` means it could not be determined.
-        let default_branch = if sub == "push"
-            && (protect_default_branch_only || !allow_push_rules.is_empty())
-        {
-            let remote = push_remote_name(&args[i + 1..]);
-            let resolved = real_git.and_then(|git| resolve_default_branch(git, &repo_args, remote));
-            if resolved.is_none() && protect_default_branch_only {
-                block_hints.push(format!(
-                    "protect_default_branch_only is set, but the default branch of remote \
-                     '{remote}' could not be determined in this repository, so the guard \
-                     cannot tell a feature branch from the protected one. Run \
-                     `git remote set-head {remote} -a` (it records refs/remotes/{remote}/HEAD \
-                     locally, no push) and retry."
-                ));
-            }
-            resolved
-        } else {
-            None
-        };
+        let default_branch =
+            if sub == "push" && (protect_default_branch_only || !allow_push_rules.is_empty()) {
+                // The remote the push truly lands on, not an assumed `origin`:
+                // the *branch* yardstick has to come from the same remote the
+                // push writes to, or `remote.pushDefault` picks which remote's
+                // default branch the guard compares against.
+                let remote = push_dest_remote(&args[i + 1..], real_git, &repo_args);
+                // Baked at launch, never re-read here: `refs/remotes/<remote>/HEAD`
+                // is agent-writable, so asking the sandboxed repository at gate time
+                // let the agent choose the guard's yardstick (GHSA-cm6f-3wjh-x9qx).
+                let resolved = repo_facts
+                    .default_branch(&remote, &repo_args)
+                    .map(ToString::to_string);
+                if resolved.is_none() && protect_default_branch_only {
+                    block_hints.push(if repo_facts.describes(&repo_args) {
+                        format!(
+                            "protect_default_branch_only is set, but the default branch of remote \
+                         '{remote}' could not be determined when this session started, so the \
+                         guard cannot tell a feature branch from the protected one. Run \
+                         `git remote set-head {remote} -a` (it records refs/remotes/{remote}/HEAD \
+                         locally, no push) OUTSIDE the sandbox and start a new session."
+                        )
+                    } else {
+                        "protect_default_branch_only is set, but this push redirects git \
+                     elsewhere (-C / --git-dir / --work-tree). The protected branch is \
+                     captured once at launch, for the project directory exactly as it was \
+                     named, and it is not re-derived inside the sandbox — so any redirect, \
+                     including one into a subdirectory of this same repository, leaves the \
+                     guard without a default branch to judge against. Run the push without \
+                     the redirect, or from a session launched in that repository."
+                            .to_string()
+                    });
+                }
+                resolved
+            } else {
+                None
+            };
 
         if protect_default_branch_only && sub == "push" {
             let push_args = &args[i + 1..];
@@ -2682,7 +2793,7 @@ pub fn gate_git(
             // hatch, which tells the reader to turn the guard off — the one
             // answer a security control must not lead with. Naming the branch
             // and the form that works keeps the actionable route in the message.
-            let remote = push_remote_name(push_args);
+            let remote = push_dest_remote(push_args, real_git, &repo_args);
             // Name the branch only when the push resolves to exactly one. With
             // several destinations, or none we could enumerate, there is no
             // single branch to point at and the generic wording is the honest
@@ -2722,17 +2833,7 @@ pub fn gate_git(
             // checking only the first fails open (H-10). `matches_allow_push_rule`
             // treats an empty URL set as authorizing nothing for a remote-named
             // rule (fail closed).
-            let remote_positional = push_positionals(push_args)
-                .first()
-                .copied()
-                .filter(|r| !r.contains(':') && !r.starts_with('+'));
-            let dest_remote = match remote_positional {
-                Some(r) => r.to_string(),
-                None => real_git.map_or_else(
-                    || SCOPE_REMOTE.to_string(),
-                    |git| resolve_push_dest_remote(git, &repo_args),
-                ),
-            };
+            let dest_remote = push_dest_remote(push_args, real_git, &repo_args);
             let dest_url_strings = real_git
                 .map(|git| resolve_push_urls(git, &repo_args, &dest_remote))
                 .unwrap_or_default();
@@ -3211,8 +3312,12 @@ fn resolve_push_dest_remote(real_git: &Path, repo_args: &[&str]) -> String {
 ///
 /// Read from the local `refs/remotes/<remote>/HEAD` symref that `git clone` and
 /// `git remote set-head` write, so no network call is made and the answer is the
-/// one this repository holds — resolved through `repo_args`, so `git -C
-/// ../other-repo push` is judged against *that* repo's default branch (#215).
+/// one this repository holds.
+///
+/// Called ONLY from [`capture_repo_facts`], in the unsandboxed parent at launch.
+/// `refs/remotes/<remote>/HEAD` is an ordinary, agent-writable ref file, so
+/// asking this question at gate time inside the sandbox let the agent pick the
+/// guard's yardstick (GHSA-cm6f-3wjh-x9qx). Do not call it from `gate_git`.
 ///
 /// `None` when the symref is missing, the remote does not exist, or git fails.
 #[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
@@ -3241,17 +3346,156 @@ fn resolve_default_branch(real_git: &Path, repo_args: &[&str], remote: &str) -> 
     }
 }
 
-/// The remote a `git push` targets, defaulting to `origin`.
+/// Facts about the launch repository, captured in the unsandboxed parent with
+/// the trusted git binary and baked into the generated `git` wrapper.
 ///
-/// A single positional that is a refspec (`HEAD:main`, `+main`) is not a remote
-/// name, so the push goes to the branch's configured remote — `origin` in all
-/// but exotic setups, the same assumption the allow_push path makes.
-fn push_remote_name<'a>(push_args: &[&'a str]) -> &'a str {
-    push_positionals(push_args)
+/// The guard used to answer "what is this remote's default branch?" by running
+/// `git symbolic-ref refs/remotes/<remote>/HEAD` at gate time, inside the
+/// sandbox, against the repository the agent works in. `refs/remotes/*/HEAD` is
+/// an ordinary ref file under `.git/refs/` — not covered by
+/// `PROTECTED_IN_GITDIR` — and `symbolic-ref` is an allowed subcommand, so the
+/// agent could rewrite the guard's own yardstick and then push to the real
+/// default branch (GHSA-cm6f-3wjh-x9qx). Capturing the answer before the
+/// sandbox starts removes the dependency on agent-writable state entirely,
+/// exactly as the gh guard's `--repo-scope` pin already does.
+///
+/// Only facts that are *stable for the session* belong here. Anything that
+/// legitimately changes while the agent works — which branch HEAD points at,
+/// which URL a remote currently pushes to — must stay dynamic, or the guard
+/// would authorize against a snapshot while git acts on the present.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepoFacts {
+    /// Canonical path of the repository these facts describe, so a `-C` that
+    /// redirects the command elsewhere is not judged by them (#215).
+    #[serde(default)]
+    pub project_dir: String,
+    /// Remote name → its default branch, from `refs/remotes/<remote>/HEAD`.
+    #[serde(default)]
+    pub default_branches: std::collections::BTreeMap<String, String>,
+}
+
+impl RepoFacts {
+    /// Whether these facts describe the repository `repo_args` targets.
+    ///
+    /// No redirect at all is the common case: the agent's `git push` in its own
+    /// work tree. A `-C <dir>` naming the very repository the facts were
+    /// captured for is still described by them. Anything else — a `-C`
+    /// elsewhere, several `-C`, `--git-dir`, `--work-tree` — targets a
+    /// repository these facts say nothing about, and re-deriving the answer
+    /// from *that* repository is the hole this type exists to close, so it
+    /// yields no facts and the caller fails closed.
+    fn describes(&self, repo_args: &[&str]) -> bool {
+        if repo_args.is_empty() {
+            return true;
+        }
+        let mut dir: Option<&str> = None;
+        let mut it = repo_args.iter();
+        while let Some(arg) = it.next() {
+            if *arg != "-C" {
+                return false; // --git-dir / --work-tree: not a plain work-tree redirect
+            }
+            let Some(value) = it.next() else {
+                return false;
+            };
+            if dir.is_some() {
+                return false; // cumulative `-C`: not worth resolving, fail closed
+            }
+            dir = Some(value);
+        }
+        let (Some(dir), false) = (dir, self.project_dir.is_empty()) else {
+            return false;
+        };
+        match (
+            std::fs::canonicalize(dir),
+            std::fs::canonicalize(&self.project_dir),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// The baked default branch of `remote`, or `None` when there is no baked
+    /// answer — which every caller treats as "cannot tell a feature branch from
+    /// the protected one" and fails closed.
+    #[must_use]
+    pub fn default_branch(&self, remote: &str, repo_args: &[&str]) -> Option<&str> {
+        if !self.describes(repo_args) {
+            return None;
+        }
+        self.default_branches.get(remote).map(String::as_str)
+    }
+}
+
+/// Every configured remote of the repository `repo_args` targets.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
+fn list_remotes(real_git: &Path, repo_args: &[&str]) -> Vec<String> {
+    let Ok(output) = std::process::Command::new(real_git)
+        .args(repo_args)
+        .args(["remote"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Capture [`RepoFacts`] for `project_dir` at launch.
+///
+/// Runs once in the unsandboxed parent, so `real_git` must be a
+/// [`crate::git::trusted_git`] path — the same rule as
+/// [`resolve_push_rule_urls`]. A remote with no recorded
+/// `refs/remotes/<remote>/HEAD` is simply absent from the map, and the guard
+/// fails closed for it.
+#[must_use]
+pub fn capture_repo_facts(real_git: &Path, project_dir: &Path) -> RepoFacts {
+    let dir = project_dir.to_string_lossy().into_owned();
+    let repo_args = ["-C", dir.as_str()];
+    let mut facts = RepoFacts {
+        project_dir: std::fs::canonicalize(project_dir)
+            .unwrap_or_else(|_| project_dir.to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
+        ..RepoFacts::default()
+    };
+    for remote in list_remotes(real_git, &repo_args) {
+        if let Some(branch) = resolve_default_branch(real_git, &repo_args, &remote) {
+            facts.default_branches.insert(remote, branch);
+        }
+    }
+    facts
+}
+
+/// The remote a `git push` writes to.
+///
+/// An explicit positional remote wins. A single positional that is a refspec
+/// (`HEAD:main`, `+main`) is not a remote name, and neither is no positional at
+/// all: both follow git's own resolution via [`resolve_push_dest_remote`].
+/// Assuming `origin` there fails *open* — with `remote.pushDefault upstream`
+/// the push lands on `upstream` while the guard consults `origin`'s baked
+/// default branch, so a bare `git push` on `develop` slipped past
+/// `protect_default_branch_only` when `develop` was upstream's default. The
+/// agent cannot pick the guard's yardstick, but it could pick which remote's
+/// yardstick was read.
+fn push_dest_remote(push_args: &[&str], real_git: Option<&Path>, repo_args: &[&str]) -> String {
+    if let Some(remote) = push_positionals(push_args)
         .first()
         .copied()
         .filter(|r| !r.contains(':') && !r.starts_with('+'))
-        .unwrap_or(SCOPE_REMOTE)
+    {
+        return remote.to_string();
+    }
+    real_git.map_or_else(
+        || SCOPE_REMOTE.to_string(),
+        |git| resolve_push_dest_remote(git, repo_args),
+    )
 }
 
 /// Pin each rule's remote *name* to the URL that name has in the launch
@@ -3367,6 +3611,7 @@ pub fn generate_git_wrapper_script(
     real_git: &str,
     cplt_bin: &str,
     policy: &crate::config::GitGuardPolicy,
+    repo_facts: &RepoFacts,
 ) -> String {
     let cplt_escaped = shell_escape(cplt_bin);
     let git_escaped = shell_escape(real_git);
@@ -3390,6 +3635,14 @@ pub fn generate_git_wrapper_script(
     } else {
         "--protect-default-branch-only=false"
     };
+    // The launch-time repository facts, baked in exactly like the gh guard's
+    // `--repo-scope`. Absent when nothing could be captured, which fails closed.
+    let repo_facts_flag = if repo_facts.default_branches.is_empty() {
+        String::new()
+    } else {
+        let json = serde_json::to_string(repo_facts).unwrap_or_default();
+        format!(" --repo-facts='{}'", json.replace('\'', "'\\''"))
+    };
     let allow_push_flag = if policy.allow_push.is_empty() {
         String::new()
     } else {
@@ -3401,7 +3654,7 @@ pub fn generate_git_wrapper_script(
 # cplt git proxy — blocks git push in sandboxed agents.
 # This wrapper is auto-generated. Do not edit.
 
-exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_flag} {prevent_force_push_flag} {protect_default_flag}{allow_push_flag} -- "$@"
+exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_flag} {prevent_force_push_flag} {protect_default_flag}{allow_push_flag}{repo_facts_flag} -- "$@"
 "#
     )
 }
@@ -3410,6 +3663,39 @@ exec {cplt_escaped} git-gate --real-git {git_escaped} {mode_flag} {prevent_push_
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
+
+    /// Test shim for [`gate_git`] that supplies the launch-time [`RepoFacts`]
+    /// for the repository the invocation targets, the way `sandbox_exec`
+    /// captures them before the sandbox starts. Tests drive the guard through
+    /// `-C <scratch repo>`; in production the agent's own `git push` carries no
+    /// redirect and the facts are those of the launch repository.
+    fn gate_git_t(
+        args: &[&str],
+        prevent_push: bool,
+        prevent_force_push: bool,
+        protect_default_branch_only: bool,
+        allow_push_rules: &[crate::config::ResolvedPushRule],
+        real_git: Option<&Path>,
+    ) -> Result<(), String> {
+        let dir = args
+            .iter()
+            .position(|a| *a == "-C")
+            .and_then(|i| args.get(i + 1))
+            .copied()
+            .unwrap_or(".");
+        let facts = real_git.map_or_else(RepoFacts::default, |git| {
+            capture_repo_facts(git, Path::new(dir))
+        });
+        gate_git(
+            args,
+            prevent_push,
+            prevent_force_push,
+            protect_default_branch_only,
+            allow_push_rules,
+            real_git,
+            &facts,
+        )
+    }
 
     // ── parse_command tests ──
 
@@ -3923,6 +4209,18 @@ mod tests {
             ),
             None
         );
+        // The `@` need not start the path segment; the authority still ends at
+        // the first `/` (GHSA-xcvh-hxfg-f4cg, same class as `normalize_remote_url`).
+        assert_eq!(
+            parse_repo_from_url("https://evil.example/x@github.com/navikt/cplt.git"),
+            None
+        );
+        // …and a real `github.com` authority with an `@` later in the path is
+        // not GitHub's `owner/repo` either — three segments, so it fails closed.
+        assert_eq!(
+            parse_repo_from_url("https://github.com/navikt/x@evil.example/cplt.git"),
+            None
+        );
     }
 
     // ── wrapper script test ──
@@ -4103,16 +4401,60 @@ mod tests {
 
     #[test]
     fn git_push_is_blocked() {
-        assert!(gate_git(&["push"], true, true, false, &[], None).is_err());
-        assert!(gate_git(&["push", "origin", "main"], true, true, false, &[], None).is_err());
-        assert!(gate_git(&["push", "--force"], true, true, false, &[], None).is_err());
-        assert!(gate_git(&["-c", "user.name=x", "push"], true, true, false, &[], None).is_err());
+        assert!(
+            gate_git(
+                &["push"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &["push", "origin", "main"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &["push", "--force"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &["-c", "user.name=x", "push"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn git_request_pull_is_blocked() {
         assert!(
-            gate_git(
+            gate_git_t(
                 &["request-pull", "v1.0", "origin"],
                 true,
                 true,
@@ -4126,56 +4468,298 @@ mod tests {
 
     #[test]
     fn git_read_operations_allowed() {
-        assert!(gate_git(&["status"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["log", "--oneline"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["diff", "HEAD~1"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["fetch", "origin"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["pull"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["branch", "-a"], true, true, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["status"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["log", "--oneline"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["diff", "HEAD~1"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["fetch", "origin"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["pull"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["branch", "-a"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn git_local_writes_allowed() {
-        assert!(gate_git(&["commit", "-m", "fix"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["add", "."], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["checkout", "-b", "feature"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["merge", "main"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["rebase", "main"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["stash"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["tag", "v1.0"], true, true, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["commit", "-m", "fix"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["add", "."],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["checkout", "-b", "feature"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["merge", "main"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["rebase", "main"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["stash"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["tag", "v1.0"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn git_no_subcommand_allowed() {
-        assert!(gate_git(&["--version"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&[], true, true, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["--version"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(gate_git(&[], true, true, false, &[], None, &RepoFacts::default()).is_ok());
     }
 
     #[test]
     fn git_unknown_subcommand_blocked_when_push_prevention_active() {
         // Unknown git commands are blocked when push prevention is active
         // to prevent alias-based bypass (e.g., `git -c alias.p=push p`)
-        assert!(gate_git(&["some-custom-alias"], true, true, false, &[], None).is_err());
+        assert!(
+            gate_git(
+                &["some-custom-alias"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
         // But allowed when push prevention is disabled
-        assert!(gate_git(&["some-custom-alias"], false, false, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["some-custom-alias"],
+                false,
+                false,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
         // Also allowed when only force push prevention (no regular push block)
-        assert!(gate_git(&["some-custom-alias"], false, true, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["some-custom-alias"],
+                false,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn git_push_allowed_when_prevention_disabled() {
-        assert!(gate_git(&["push"], false, false, false, &[], None).is_ok());
-        assert!(gate_git(&["push", "--force"], false, false, false, &[], None).is_ok());
-        assert!(gate_git(&["send-pack", "origin"], false, false, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["push"],
+                false,
+                false,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["push", "--force"],
+                false,
+                false,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["send-pack", "origin"],
+                false,
+                false,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn git_force_push_blocked_when_only_force_prevention() {
         // Regular push allowed, force push blocked
-        assert!(gate_git(&["push", "origin", "main"], false, true, false, &[], None).is_ok());
-        assert!(gate_git(&["push", "--force"], false, true, false, &[], None).is_err());
         assert!(
             gate_git(
+                &["push", "origin", "main"],
+                false,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["push", "--force"],
+                false,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git_t(
                 &["push", "--force-with-lease"],
                 false,
                 true,
@@ -4190,7 +4774,12 @@ mod tests {
     #[test]
     fn git_wrapper_script_contains_paths() {
         let policy = crate::config::GitGuardPolicy::default();
-        let script = generate_git_wrapper_script("/usr/bin/git", "/usr/local/bin/cplt", &policy);
+        let script = generate_git_wrapper_script(
+            "/usr/bin/git",
+            "/usr/local/bin/cplt",
+            &policy,
+            &RepoFacts::default(),
+        );
         assert!(script.contains("/usr/bin/git"));
         assert!(script.contains("/usr/local/bin/cplt"));
         assert!(script.contains("git-gate"));
@@ -4266,6 +4855,7 @@ mod tests {
             false,
             &[],
             None,
+            &RepoFacts::default(),
         );
         assert!(result.is_err());
     }
@@ -4296,7 +4886,7 @@ mod tests {
     fn gate_push_in(git: &Path, repo: &str, push_args: &[&str]) -> Result<(), String> {
         let mut args = vec!["-C", repo];
         args.extend_from_slice(push_args);
-        gate_git(&args, true, true, true, &[], Some(git))
+        gate_git_t(&args, true, true, true, &[], Some(git))
     }
 
     /// #386: the shipped defaults — no config, no flags, no `allow_push` rule —
@@ -4327,7 +4917,7 @@ mod tests {
         let gate = |push_args: &[&str]| {
             let mut args = vec!["-C", dir.as_str()];
             args.extend_from_slice(push_args);
-            gate_git(
+            gate_git_t(
                 &args,
                 r.git_guard.prevent_push,
                 r.git_guard.prevent_force_push,
@@ -4421,10 +5011,32 @@ mod tests {
     fn protect_default_blocks_bare_push_without_git() {
         // When real_git is None nothing can be resolved — neither the current
         // branch nor the repository's default branch — so every push is blocked.
-        assert!(gate_git(&["push"], true, true, true, &[], None).is_err());
-        assert!(gate_git(&["push", "origin"], true, true, true, &[], None).is_err());
         assert!(
             gate_git(
+                &["push"],
+                true,
+                true,
+                true,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &["push", "origin"],
+                true,
+                true,
+                true,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git_t(
                 &["push", "origin", "feature/x"],
                 true,
                 true,
@@ -4759,9 +5371,6 @@ mod tests {
     /// `git` if it runs, probed directly rather than through `which` so the
     /// tests do not silently skip on a machine that has git but no `which`.
     /// `Command` resolves the bare name through PATH.
-    /// `git` if it runs, probed directly rather than through `which` so the
-    /// tests do not silently skip on a machine that has git but no `which`.
-    /// `Command` resolves the bare name through PATH.
     fn which_git() -> Option<PathBuf> {
         std::process::Command::new("git")
             .arg("--version")
@@ -4808,7 +5417,7 @@ mod tests {
 
         // `git -C <repo-on-main> push` must be blocked even though the repo the
         // test process runs in may sit on a feature branch.
-        let blocked = gate_git(&["-C", &dir, "push"], true, true, true, &[], Some(&git));
+        let blocked = gate_git_t(&["-C", &dir, "push"], true, true, true, &[], Some(&git));
         assert!(
             blocked.is_err(),
             "push to main of the -C target must be blocked, got {blocked:?}"
@@ -4823,7 +5432,7 @@ mod tests {
         };
         let feature_dir = feature.to_string_lossy().into_owned();
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &feature_dir, "push"],
                 true,
                 false,
@@ -4858,7 +5467,7 @@ mod tests {
         };
         let args = ["-C", dir.as_str(), "push", "origin", "main"];
         assert!(
-            gate_git(&args, true, true, false, &[rule], Some(&git)).is_err(),
+            gate_git_t(&args, true, true, false, &[rule], Some(&git)).is_err(),
             "a rule for another repository's origin must not authorize this push"
         );
 
@@ -4878,7 +5487,7 @@ mod tests {
         };
         let args = ["-C", same_dir.as_str(), "push", "origin", "main"];
         assert!(
-            gate_git(&args, true, true, false, &[rule], Some(&git)).is_ok(),
+            gate_git_t(&args, true, true, false, &[rule], Some(&git)).is_ok(),
             "the same repository under an equivalent URL form must still match"
         );
     }
@@ -5000,7 +5609,7 @@ mod tests {
         let rules = vec![origin_agent_rule()];
         // Baseline: a legitimate push to origin agent/x IS allowed.
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "origin", "agent/x"],
                 true,
                 true,
@@ -5013,7 +5622,7 @@ mod tests {
         );
         // Attack: `-c remote.origin.pushurl=<evil>` is refused at the gate.
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "-C",
                     &dir,
@@ -5042,7 +5651,7 @@ mod tests {
         let dir = repo.to_string_lossy().into_owned();
         let rules = vec![origin_agent_rule()];
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "-C",
                     &dir,
@@ -5074,7 +5683,7 @@ mod tests {
         // the rule allows for the current agent/x branch) and the push would be
         // authorized while `--repo` redirects it to <evil>. The block catches it.
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "--repo=https://github.com/evil/x.git",],
                 true,
                 true,
@@ -5121,7 +5730,7 @@ mod tests {
         let dir = repo.to_string_lossy().into_owned();
         let rules = vec![origin_agent_rule()];
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "origin", "agent/x"],
                 true,
                 true,
@@ -5145,7 +5754,7 @@ mod tests {
             .expect("git present: scratch repo must build");
         let control_dir = control.to_string_lossy().into_owned();
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &control_dir, "push"],
                 true,
                 true,
@@ -5170,7 +5779,7 @@ mod tests {
         git_setup(&git, &repo, &["config", "remote.pushDefault", "evil"]);
         let dir = repo.to_string_lossy().into_owned();
         assert!(
-            gate_git(&["-C", &dir, "push"], true, true, false, &rules, Some(&git)).is_err(),
+            gate_git_t(&["-C", &dir, "push"], true, true, false, &rules, Some(&git)).is_err(),
             "a bare push diverted by remote.pushDefault must be blocked"
         );
     }
@@ -5185,7 +5794,7 @@ mod tests {
         let dir = repo.to_string_lossy().into_owned();
         let rules = vec![origin_agent_rule()];
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "-C",
                     &dir,
@@ -5205,7 +5814,7 @@ mod tests {
             "-c include.path must be blocked"
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "-C",
                     &dir,
@@ -5247,7 +5856,7 @@ mod tests {
         let dir = repo.to_string_lossy().into_owned();
         let rules = vec![origin_agent_rule()];
         assert!(
-            gate_git(&["-C", &dir, "push"], true, true, false, &rules, Some(&git)).is_err(),
+            gate_git_t(&["-C", &dir, "push"], true, true, false, &rules, Some(&git)).is_err(),
             "a bare push diverted by branch.<b>.remote must be blocked"
         );
     }
@@ -5270,7 +5879,7 @@ mod tests {
             "--prune",
         ] {
             assert!(
-                gate_git(
+                gate_git_t(
                     &["-C", &dir, "push", mode, "origin"],
                     true,
                     true,
@@ -5294,7 +5903,7 @@ mod tests {
         let dir = repo.to_string_lossy().into_owned();
         let rules = vec![origin_agent_rule()];
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "origin", "agent/x", "main"],
                 true,
                 true,
@@ -5319,7 +5928,7 @@ mod tests {
         git_setup(&git, &r1, &["config", "push.default", "matching"]);
         let d1 = r1.to_string_lossy().into_owned();
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &d1, "push", "origin"],
                 true,
                 true,
@@ -5341,7 +5950,7 @@ mod tests {
         );
         let d2 = r2.to_string_lossy().into_owned();
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &d2, "push", "origin"],
                 true,
                 true,
@@ -5364,7 +5973,7 @@ mod tests {
         );
         let d3 = r3.to_string_lossy().into_owned();
         assert!(
-            gate_git(&["-C", &d3, "push"], true, true, false, &rules, Some(&git)).is_err(),
+            gate_git_t(&["-C", &d3, "push"], true, true, false, &rules, Some(&git)).is_err(),
             "push.default=upstream must block a bare push"
         );
     }
@@ -5449,7 +6058,7 @@ mod tests {
 
         // Push to the pinned repository's agent/* is allowed despite prevent_push
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "origin", "agent/fix-123"],
                 true,
                 true,
@@ -5462,7 +6071,7 @@ mod tests {
 
         // A branch outside the rule is still blocked
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "origin", "main"],
                 true,
                 true,
@@ -5502,7 +6111,7 @@ mod tests {
         let gate = |args: &[&str], rules: &[ResolvedPushRule]| {
             let mut full = vec!["-C", dir.as_str()];
             full.extend_from_slice(args);
-            gate_git(&full, true, true, true, rules, Some(&git))
+            gate_git_t(&full, true, true, true, rules, Some(&git))
         };
 
         for dest in [
@@ -5602,7 +6211,7 @@ mod tests {
     fn git_alias_bypass_blocked() {
         // `-c alias.p=push` should be blocked when push prevention is active
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-c", "alias.p=push", "p", "origin", "main"],
                 true,
                 true,
@@ -5613,7 +6222,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-c", "alias.x=send-pack", "x"],
                 true,
                 true,
@@ -5624,16 +6233,38 @@ mod tests {
             .is_err()
         );
         // Case insensitive check
-        assert!(gate_git(&["-c", "ALIAS.p=push", "p"], true, true, false, &[], None).is_err());
+        assert!(
+            gate_git(
+                &["-c", "ALIAS.p=push", "p"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
         // Not blocked when push prevention is disabled
-        assert!(gate_git(&["-c", "alias.p=push", "p"], false, false, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["-c", "alias.p=push", "p"],
+                false,
+                false,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn git_subtree_push_blocked() {
         // `git subtree push` is now explicitly blocked
         assert!(
-            gate_git(
+            gate_git_t(
                 &["subtree", "push", "--prefix=lib", "origin", "main"],
                 true,
                 true,
@@ -5650,7 +6281,7 @@ mod tests {
         // Even with protect_default_branch_only=true, force push to feature branch
         // should be blocked when prevent_force_push=true
         assert!(
-            gate_git(
+            gate_git_t(
                 &["push", "--force", "origin", "feature-branch"],
                 true,
                 true,
@@ -5661,7 +6292,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &["push", "-f", "origin", "my-feature"],
                 true,
                 true,
@@ -5672,7 +6303,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &["push", "--force-with-lease", "origin", "feature"],
                 true,
                 true,
@@ -5690,7 +6321,7 @@ mod tests {
         make_branches(&git, &repo, &["feature-branch", "my-feature", "feature"]);
         let dir = repo.to_string_lossy().into_owned();
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "origin", "feature-branch"],
                 true,
                 true,
@@ -5702,7 +6333,7 @@ mod tests {
         );
         // Force push to feature branch allowed when prevent_force_push=false
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "--force", "origin", "feature-branch"],
                 true,
                 false,
@@ -5718,7 +6349,7 @@ mod tests {
     fn git_multiple_refspecs_checked() {
         // `git push origin feature main` should be blocked because "main" is a default branch
         assert!(
-            gate_git(
+            gate_git_t(
                 &["push", "origin", "feature", "main"],
                 true,
                 true,
@@ -5736,7 +6367,7 @@ mod tests {
         make_branches(&git, &repo, &["feature", "develop"]);
         let dir = repo.to_string_lossy().into_owned();
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "origin", "feature", "develop"],
                 true,
                 true,
@@ -5748,7 +6379,7 @@ mod tests {
         );
         // `git push origin HEAD:refs/heads/feature HEAD:refs/heads/master` — master is default
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "push",
                     "origin",
@@ -5801,7 +6432,7 @@ mod tests {
     fn git_remote_url_mutation_blocked_scope_integrity() {
         // Mutating remote URLs / identity is blocked.
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "remote",
                     "set-url",
@@ -5817,7 +6448,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "remote",
                     "set-url",
@@ -5835,7 +6466,7 @@ mod tests {
         );
         // Re-creating `origin` pointing elsewhere is the same bypass.
         assert!(
-            gate_git(
+            gate_git_t(
                 &["remote", "add", "origin", "https://github.com/evil/repo"],
                 true,
                 true,
@@ -5847,7 +6478,7 @@ mod tests {
         );
         // Promoting another remote *to* `origin` retargets the scope source.
         assert!(
-            gate_git(
+            gate_git_t(
                 &["remote", "rename", "upstream", "origin"],
                 true,
                 true,
@@ -5859,7 +6490,7 @@ mod tests {
         );
         // `git config remote.origin.url <value>` is a write → blocked.
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "config",
                     "remote.origin.url",
@@ -5875,10 +6506,32 @@ mod tests {
         );
 
         // Read-only inspection stays allowed.
-        assert!(gate_git(&["remote", "-v"], true, true, false, &[], None).is_ok());
-        assert!(gate_git(&["remote"], true, true, false, &[], None).is_ok());
         assert!(
             gate_git(
+                &["remote", "-v"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git(
+                &["remote"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git_t(
                 &["remote", "get-url", "origin"],
                 true,
                 true,
@@ -5888,9 +6541,20 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(gate_git(&["remote", "show", "origin"], true, true, false, &[], None).is_ok());
         assert!(
             gate_git(
+                &["remote", "show", "origin"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            gate_git_t(
                 &["config", "--get", "remote.origin.url"],
                 true,
                 true,
@@ -5902,7 +6566,7 @@ mod tests {
         );
         // Bare read form `git config remote.origin.url` (prints the value).
         assert!(
-            gate_git(
+            gate_git_t(
                 &["config", "remote.origin.url"],
                 true,
                 true,
@@ -5913,7 +6577,18 @@ mod tests {
             .is_ok()
         );
         // Unrelated config writes are unaffected.
-        assert!(gate_git(&["config", "user.name", "x"], true, true, false, &[], None).is_ok());
+        assert!(
+            gate_git(
+                &["config", "user.name", "x"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
     }
 
     // Finding 2: git's URL-rewrite keys (`url.<base>.insteadOf` /
@@ -5923,7 +6598,7 @@ mod tests {
     fn git_config_insteadof_rewrite_blocked() {
         // Setting an insteadOf / pushInsteadOf rewrite is blocked.
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "config",
                     "url.https://evil/.insteadOf",
@@ -5938,7 +6613,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "config",
                     "url.https://evil/.pushInsteadOf",
@@ -5954,7 +6629,7 @@ mod tests {
         );
         // Reads of the same key stay allowed.
         assert!(
-            gate_git(
+            gate_git_t(
                 &["config", "--get", "url.https://evil/.insteadOf"],
                 true,
                 true,
@@ -5966,7 +6641,7 @@ mod tests {
         );
         // Bare read form (prints the value) stays allowed.
         assert!(
-            gate_git(
+            gate_git_t(
                 &["config", "url.https://evil/.insteadOf"],
                 true,
                 true,
@@ -5980,6 +6655,138 @@ mod tests {
 
     // Finding 3: managing NON-origin remotes doesn't touch the scope source and
     // must stay allowed; only mutations that create/retarget `origin` are blocked.
+    /// The write form of `git symbolic-ref` on `refs/remotes/<remote>/HEAD` is
+    /// the one route to that symref the filesystem cannot deny: on a `reftable`
+    /// repository the ref is not a file, so the path deny matches nothing.
+    /// Backend-independent by construction — the gate never looks at the disk.
+    #[test]
+    fn git_symbolic_ref_write_to_remote_head_is_blocked() {
+        for args in [
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/decoy",
+            ][..],
+            &[
+                "symbolic-ref",
+                "-m",
+                "why",
+                "refs/remotes/upstream/HEAD",
+                "refs/heads/x",
+            ][..],
+            &["symbolic-ref", "-d", "refs/remotes/origin/HEAD"][..],
+            &["symbolic-ref", "--delete", "-q", "refs/remotes/origin/HEAD"][..],
+            &[
+                "symbolic-ref",
+                "--",
+                "refs/remotes/origin/HEAD",
+                "refs/heads/x",
+            ][..],
+            // Bundled shorts and abbreviated longs: git resolves them, an
+            // enumerating parser did not. `-qm` is not `-m`, so its reason
+            // argument used to become the first positional and hide the ref.
+            &[
+                "symbolic-ref",
+                "-qm",
+                "r",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/decoy",
+            ][..],
+            &["symbolic-ref", "-qd", "refs/remotes/origin/HEAD"][..],
+            &["symbolic-ref", "-dm", "x", "refs/remotes/origin/HEAD"][..],
+            &["symbolic-ref", "--del", "refs/remotes/origin/HEAD"][..],
+            &["symbolic-ref", "--d", "refs/remotes/origin/HEAD"][..],
+            // An unrecognised flag is a write shape, wherever the ref sits.
+            &["symbolic-ref", "-z", "v", "refs/remotes/origin/HEAD"][..],
+        ] {
+            let err = gate_git(args, true, true, false, &[], None, &RepoFacts::default())
+                .expect_err("writing the remote HEAD symref retargets the guard next launch");
+            assert!(err.contains("refs/remotes/<remote>/HEAD"), "got: {err}");
+        }
+        // The read form must keep working: git internals and the launch-time
+        // fact capture both use it.
+        for args in [
+            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"][..],
+            &["symbolic-ref", "refs/remotes/origin/HEAD"][..],
+            &["symbolic-ref", "-q", "HEAD"][..],
+        ] {
+            assert!(
+                gate_git(args, true, true, false, &[], None, &RepoFacts::default()).is_ok(),
+                "read form must stay allowed: {args:?}"
+            );
+        }
+        // Writes to other refs are not this control's business.
+        assert!(
+            gate_git(
+                &["symbolic-ref", "HEAD", "refs/heads/trunk"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok()
+        );
+        // Only while a push guard is active.
+        assert!(
+            gate_git(
+                &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/heads/x"],
+                false,
+                false,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok(),
+            "with no push prevention there is no push verdict to protect"
+        );
+    }
+
+    /// `git remote set-head` writes `refs/remotes/<remote>/HEAD` — one of the
+    /// three controls on that symref, alongside the profile's path deny (files
+    /// backend only) and the `symbolic-ref` write block above.
+    #[test]
+    fn git_remote_set_head_is_blocked_while_push_is_prevented() {
+        for args in [
+            &["remote", "set-head", "origin", "-a"][..],
+            &["remote", "set-head", "upstream", "develop"][..],
+            &["remote", "-v", "set-head", "origin", "-d"][..],
+        ] {
+            let err = gate_git(args, true, true, false, &[], None, &RepoFacts::default())
+                .expect_err("set-head rewrites the recorded default branch");
+            assert!(err.contains("set-head"), "got: {err}");
+        }
+        // Only while a push guard is active, and only `set-head`.
+        assert!(
+            gate_git(
+                &["remote", "set-head", "origin", "-a"],
+                false,
+                false,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok(),
+            "with no push prevention there is no push verdict to protect"
+        );
+        assert!(
+            gate_git(
+                &["remote", "show", "origin"],
+                true,
+                true,
+                false,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_ok(),
+            "read-only remote inspection stays allowed"
+        );
+    }
+
     #[test]
     fn git_nonorigin_remote_management_allowed() {
         // Non-origin management: allowed (was previously over-blocked).
@@ -6006,7 +6813,7 @@ mod tests {
             ][..],
         ] {
             assert!(
-                gate_git(args, true, true, false, &[], None).is_ok(),
+                gate_git(args, true, true, false, &[], None, &RepoFacts::default()).is_ok(),
                 "expected allowed: git {}",
                 args.join(" ")
             );
@@ -6024,7 +6831,7 @@ mod tests {
             &["remote", "rename", "upstream", "origin"][..],
         ] {
             assert!(
-                gate_git(args, true, true, false, &[], None).is_err(),
+                gate_git(args, true, true, false, &[], None, &RepoFacts::default()).is_err(),
                 "expected blocked: git {}",
                 args.join(" ")
             );
@@ -6033,7 +6840,7 @@ mod tests {
         // The origin-retarget block also holds under force-push-only policy,
         // and still does not over-block non-origin management there.
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "remote",
                     "set-url",
@@ -6049,7 +6856,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &["remote", "add", "upstream", "https://github.com/other/repo"],
                 false,
                 true,
@@ -6066,10 +6873,32 @@ mod tests {
     #[test]
     fn git_plus_refspec_force_detected() {
         // `+main` targets the default branch under protect_default_branch_only.
-        assert!(gate_git(&["push", "origin", "+main"], true, true, true, &[], None).is_err());
-        assert!(gate_git(&["push", "origin", "+master"], true, true, true, &[], None).is_err());
         assert!(
             gate_git(
+                &["push", "origin", "+main"],
+                true,
+                true,
+                true,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git(
+                &["push", "origin", "+master"],
+                true,
+                true,
+                true,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
+        assert!(
+            gate_git_t(
                 &["push", "origin", "+HEAD:refs/heads/main"],
                 true,
                 true,
@@ -6081,7 +6910,7 @@ mod tests {
         );
         // `+feature:feature` is a force update under prevent_force_push (push allowed).
         assert!(
-            gate_git(
+            gate_git_t(
                 &["push", "origin", "+feature:feature"],
                 false,
                 true,
@@ -6093,7 +6922,7 @@ mod tests {
         );
         // Sanity: the non-force forms remain allowed.
         assert!(
-            gate_git(
+            gate_git_t(
                 &["push", "origin", "feature:feature"],
                 false,
                 true,
@@ -6105,7 +6934,18 @@ mod tests {
         );
         // `+feature` is a force to a feature branch: blocked when force-push is
         // prevented, but allowed when it is not (prevent_force_push=false).
-        assert!(gate_git(&["push", "origin", "+feature"], true, true, true, &[], None).is_err());
+        assert!(
+            gate_git(
+                &["push", "origin", "+feature"],
+                true,
+                true,
+                true,
+                &[],
+                None,
+                &RepoFacts::default()
+            )
+            .is_err()
+        );
         let Some((_tmp, repo)) = scratch_repo("main", "https://github.com/o/o.git") else {
             return; // no git available
         };
@@ -6113,7 +6953,7 @@ mod tests {
         make_branches(&git, &repo, &["feature"]);
         let dir = repo.to_string_lossy().into_owned();
         assert!(
-            gate_git(
+            gate_git_t(
                 &["-C", &dir, "push", "origin", "+feature"],
                 true,
                 false,
@@ -6148,7 +6988,7 @@ mod tests {
         let dir = repo.to_string_lossy().into_owned();
         // The remote/branch must parse correctly (not be eaten by --force-with-lease).
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "-C",
                     &dir,
@@ -6203,7 +7043,7 @@ mod tests {
     #[test]
     fn git_subtree_local_allowed_push_blocked() {
         assert!(
-            gate_git(
+            gate_git_t(
                 &[
                     "subtree",
                     "add",
@@ -6220,7 +7060,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &["subtree", "pull", "--prefix=lib", "origin", "main"],
                 true,
                 true,
@@ -6231,7 +7071,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &["subtree", "split", "--prefix=lib"],
                 true,
                 true,
@@ -6242,7 +7082,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            gate_git(
+            gate_git_t(
                 &["subtree", "push", "--prefix=lib", "origin", "main"],
                 true,
                 true,
@@ -6298,5 +7138,326 @@ mod tests {
         assert_eq!(cmd.repo_flag.as_deref(), Some("navikt/cplt"));
         assert_eq!(cmd.command, "pr");
         assert_eq!(cmd.subcommand.as_deref(), Some("list"));
+    }
+
+    // ── GHSA-cm6f-3wjh-x9qx: the default branch is a launch-time fact ──
+
+    /// Run git in `repo` with the hermetic env the other fixtures use.
+    fn run_in(git: &Path, repo: &Path, args: &[&str]) -> bool {
+        std::process::Command::new(git)
+            .args(["-C", repo.to_str().unwrap()])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git must run")
+            .status
+            .success()
+    }
+
+    /// The advisory, verbatim: default branch `trunk`, stock configuration.
+    /// `git push origin trunk` is refused; the agent rewrites
+    /// `refs/remotes/origin/HEAD` (an ordinary ref file, `symbolic-ref` is an
+    /// allowed subcommand) and the push must still be refused, because the
+    /// guard reads the branch it was handed at launch and never asks the
+    /// repository again.
+    #[test]
+    fn a_rewritten_remote_head_no_longer_changes_the_verdict() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/o.git", "trunk")
+        else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &repo, &["decoy"]);
+
+        // Captured in the parent, before the sandbox starts.
+        let facts = capture_repo_facts(&git, &repo);
+        assert_eq!(
+            facts.default_branches.get("origin").map(String::as_str),
+            Some("trunk"),
+            "the fixture must record refs/remotes/origin/HEAD -> origin/trunk"
+        );
+
+        let dir = repo.to_string_lossy().into_owned();
+        let push_trunk = |facts: &RepoFacts| {
+            gate_git(
+                &["-C", dir.as_str(), "push", "origin", "trunk"],
+                true,
+                true,
+                true,
+                &[],
+                Some(&git),
+                facts,
+            )
+        };
+        assert!(
+            push_trunk(&facts).is_err(),
+            "a push to the real default branch must be refused"
+        );
+
+        // The exploit step.
+        assert!(
+            run_in(
+                &git,
+                &repo,
+                &[
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/decoy",
+                ],
+            ),
+            "the fixture must be able to rewrite the symref"
+        );
+        assert_eq!(
+            resolve_default_branch(&git, &["-C", dir.as_str()], "origin").as_deref(),
+            Some("decoy"),
+            "the rewrite must have taken effect, or this test proves nothing"
+        );
+
+        assert!(
+            push_trunk(&facts).is_err(),
+            "the baked default branch must survive a refs/remotes/origin/HEAD rewrite"
+        );
+        // …and the decoy the agent planted gains no protection it should not
+        // have: a feature branch is still pushable.
+        assert!(
+            gate_git(
+                &["-C", dir.as_str(), "push", "origin", "decoy"],
+                true,
+                true,
+                true,
+                &[],
+                Some(&git),
+                &facts,
+            )
+            .is_ok(),
+            "a feature-branch push must still be allowed after the rewrite"
+        );
+    }
+
+    /// With no baked answer the guard cannot tell a feature branch from the
+    /// protected one, so every push is refused — and says why.
+    #[test]
+    fn a_default_branch_absent_at_launch_fails_closed() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/o.git", "trunk")
+        else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &repo, &["feature/x"]);
+        // A repository with no recorded `refs/remotes/origin/HEAD` — `git init`
+        // plus `git remote add`, the shape `git clone` does not produce.
+        assert!(run_in(
+            &git,
+            &repo,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        ));
+        let facts = capture_repo_facts(&git, &repo);
+        assert!(facts.default_branches.is_empty(), "nothing to bake");
+        let dir = repo.to_string_lossy().into_owned();
+        let err = gate_git(
+            &["-C", dir.as_str(), "push", "origin", "feature/x"],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+            &facts,
+        )
+        .expect_err("no baked default branch must refuse, not fall back to allowing");
+        assert!(
+            err.contains("could not be determined when this session started"),
+            "the refusal must name the missing launch-time fact, got: {err}"
+        );
+    }
+
+    /// `main`/`master` stay protected unconditionally — with baked facts, and
+    /// with none at all.
+    #[test]
+    fn main_and_master_stay_protected_whatever_the_baked_facts_say() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/o.git", "trunk")
+        else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &repo, &["main", "master"]);
+        let facts = capture_repo_facts(&git, &repo);
+        let dir = repo.to_string_lossy().into_owned();
+        for branch in ["main", "master"] {
+            let unknown = RepoFacts {
+                project_dir: facts.project_dir.clone(),
+                ..RepoFacts::default()
+            };
+            for facts in [&facts, &unknown] {
+                assert!(
+                    gate_git(
+                        &["-C", dir.as_str(), "push", "origin", branch],
+                        true,
+                        true,
+                        true,
+                        &[],
+                        Some(&git),
+                        facts,
+                    )
+                    .is_err(),
+                    "'{branch}' must stay protected even where the default branch is 'trunk'"
+                );
+            }
+        }
+    }
+
+    /// The baked facts describe the launch repository. A `-C` pointing
+    /// somewhere else is not covered by them, and re-deriving the answer from
+    /// that repository is the hole being closed — so it fails closed (#215).
+    #[test]
+    fn facts_do_not_travel_to_another_repository() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/o.git", "trunk")
+        else {
+            return; // no git available
+        };
+        let Some((_tmp2, other)) =
+            scratch_repo_with_default("trunk", "https://github.com/o/other.git", "trunk")
+        else {
+            return;
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &other, &["feature/x"]);
+        let facts = capture_repo_facts(&git, &repo);
+        let here = repo.to_string_lossy().into_owned();
+        let there = other.to_string_lossy().into_owned();
+
+        // `-C <the launch repo>` is still described by the facts.
+        make_branches(&git, &repo, &["feature/x"]);
+        assert!(
+            gate_git(
+                &["-C", here.as_str(), "push", "origin", "feature/x"],
+                true,
+                true,
+                true,
+                &[],
+                Some(&git),
+                &facts,
+            )
+            .is_ok(),
+            "a -C naming the launch repository must use its baked facts"
+        );
+
+        let err = gate_git(
+            &["-C", there.as_str(), "push", "origin", "feature/x"],
+            true,
+            true,
+            true,
+            &[],
+            Some(&git),
+            &facts,
+        )
+        .expect_err("another repository has no baked default branch");
+        assert!(
+            err.contains("redirects git elsewhere"),
+            "the refusal must say the facts do not cover that repository, got: {err}"
+        );
+    }
+
+    /// A bare `git push` follows git's own remote resolution, so the branch
+    /// yardstick must come from the remote the push actually lands on. Looking
+    /// up `origin`'s default branch while `remote.pushDefault` sends the push
+    /// to `upstream` let the agent choose *which remote's* yardstick the guard
+    /// consulted, and pushed straight to upstream's default branch.
+    #[test]
+    fn a_bare_push_is_judged_by_the_remote_it_actually_reaches() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("develop", "https://github.com/o/o.git", "trunk")
+        else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        let dir = repo.to_string_lossy().into_owned();
+        let repo_args = ["-C", dir.as_str()];
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new(&git)
+                .args(repo_args)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git must run")
+                .status
+                .success();
+            assert!(ok, "git {args:?} must succeed");
+        };
+        // Two remotes with different default branches: origin/trunk (already
+        // recorded by the fixture) and upstream/develop.
+        run(&["remote", "add", "upstream", "https://github.com/o/up.git"]);
+        run(&[
+            "symbolic-ref",
+            "refs/remotes/upstream/HEAD",
+            "refs/remotes/upstream/develop",
+        ]);
+        // Both remotes' facts are baked, so nothing here fails closed merely
+        // for want of an answer.
+        let facts = capture_repo_facts(&git, &repo);
+        assert_eq!(facts.default_branch("origin", &repo_args), Some("trunk"));
+        assert_eq!(
+            facts.default_branch("upstream", &repo_args),
+            Some("develop")
+        );
+
+        // Both settings are allowed by the gate; together they send a bare push
+        // on `develop` to `upstream`, where `develop` IS the default branch.
+        run(&["config", "remote.pushDefault", "upstream"]);
+        run(&["config", "push.default", "current"]);
+        let gate = |args: &[&str]| {
+            let mut full = vec!["-C", dir.as_str()];
+            full.extend_from_slice(args);
+            gate_git(&full, true, true, true, &[], Some(&git), &facts)
+        };
+
+        gate(&["push"]).expect_err(
+            "a bare push to upstream's default branch must be blocked, not judged by origin",
+        );
+        // The relaxation still works: a feature branch on the same remote goes
+        // through, so this is not a blanket refusal of bare pushes.
+        run(&["checkout", "-q", "-b", "feature/x"]);
+        gate(&["push"]).expect("a bare push to a feature branch is still allowed");
+        // And origin's own yardstick still applies when origin is named.
+        gate(&["push", "origin", "trunk"]).expect_err("origin/trunk is protected as before");
+        gate(&["push", "origin", "develop"])
+            .expect("develop is an ordinary branch on origin, whose default is trunk");
+    }
+
+    /// The baked facts reach the guard through the wrapper, spelled like the
+    /// flags beside them.
+    #[test]
+    fn the_wrapper_bakes_the_repository_facts() {
+        let policy = crate::config::GitGuardPolicy {
+            protect_default_branch_only: true,
+            ..Default::default()
+        };
+        let mut facts = RepoFacts::default();
+        facts
+            .default_branches
+            .insert("origin".to_string(), "trunk".to_string());
+        let script =
+            generate_git_wrapper_script("/usr/bin/git", "/usr/local/bin/cplt", &policy, &facts);
+        assert!(
+            script.contains("--repo-facts='"),
+            "the wrapper must carry the launch-time facts: {script}"
+        );
+        assert!(
+            script.contains("\"trunk\""),
+            "…including the branch: {script}"
+        );
+        // Nothing to bake → no flag, and the gate fails closed on its absence.
+        let empty = generate_git_wrapper_script(
+            "/usr/bin/git",
+            "/usr/local/bin/cplt",
+            &policy,
+            &RepoFacts::default(),
+        );
+        assert!(!empty.contains("--repo-facts"), "got: {empty}");
     }
 }

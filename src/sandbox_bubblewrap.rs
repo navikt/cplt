@@ -72,7 +72,9 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::sandbox::landlock_mod::{FsAccess, FsRule, NetRule};
-use crate::sandbox::policy::{LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected};
+use crate::sandbox::policy::{
+    LinuxCoverage, PROTECTED_IN_GITDIR, PROTECTED_IN_ROOT, Protected, rel_ancestors,
+};
 
 /// Environment variable carrying the read end of the policy pipe (a decimal fd
 /// number) from which the bwrap re-entry helper reads the serialized Landlock
@@ -139,6 +141,23 @@ pub(crate) fn check_availability() -> Option<PathBuf> {
     crate::git::trusted_binary("bwrap")
 }
 
+/// The two mount overlays the wrapper lays over the writable binds, in the
+/// order they are applied.
+///
+/// One struct rather than two adjacent `&[PathBuf]` parameters: they are the
+/// same type and swapping them would bind the protected paths writable and the
+/// pins read-only — a silent, total loss of the protection, and nothing in the
+/// type system would have said so.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Overlays<'a> {
+    /// Bound read-only, so the path's content cannot change
+    /// ([`git_persistence_paths`], plus the agent's own host-persistence dirs).
+    pub read_only: &'a [PathBuf],
+    /// Bound read-WRITE onto themselves, so the path becomes a mountpoint and
+    /// its *name* cannot be renamed or removed ([`rename_pin_paths`]).
+    pub pins: &'a [PathBuf],
+}
+
 /// Test that bubblewrap can actually create the namespaces we use.
 ///
 /// Runs `bwrap <production args> /bin/true`. The args come straight from
@@ -149,10 +168,10 @@ pub(crate) fn check_availability() -> Option<PathBuf> {
 pub(crate) fn test_functionality(
     bwrap_path: &Path,
     fs_rules: &[FsRule],
-    ro_protect: &[PathBuf],
+    overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
 ) -> Result<(), String> {
-    let mut args = build_bwrap_args(fs_rules, ro_protect, deny_masks);
+    let mut args = build_bwrap_args(fs_rules, overlays, deny_masks);
     args.push("--".to_string());
     args.push("/bin/true".to_string());
 
@@ -251,7 +270,7 @@ pub(crate) fn test_functionality(
 ///    through the scratch path. See [`build_deny_masks`].
 pub(crate) fn build_bwrap_args(
     fs_rules: &[FsRule],
-    ro_protect: &[PathBuf],
+    overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
 ) -> Vec<String> {
     let mut args = Vec::new();
@@ -377,9 +396,23 @@ pub(crate) fn build_bwrap_args(
         }
     }
 
+    // ── Rename pins for the protected paths' ancestors (see `rename_pin_paths`) ──
+    // Read-WRITE self-binds, purely to make each path a mountpoint: Linux
+    // refuses to rename or rmdir a mountpoint, which is what stops the
+    // read-only binds below being walked around by moving an ancestor aside.
+    // Emitted after the writable binds (so the source resolves to the real
+    // directory) and before the read-only ones (so those still shadow them).
+    for path in overlays.pins {
+        if !path.exists() {
+            continue;
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        args.extend(["--bind".to_string(), path_str.clone(), path_str]);
+    }
+
     // ── Read-only overlays for git-persistence paths (Finding 1) ──
     // Emitted last so they shadow the writable project bind above.
-    for path in ro_protect {
+    for path in overlays.read_only {
         // bwrap errors on a non-existent bind source; a read-only bind also
         // cannot protect a path that does not yet exist. Skip missing paths
         // (mirrors the writable-bind handling and keeps the probe from failing).
@@ -627,6 +660,55 @@ fn create_mask_placeholder(scratch: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Expand a [`Protected::rel`] under `base` into the concrete paths to bind.
+///
+/// A literal `rel` is one path. `refs/remotes/*/HEAD` is the one entry with a
+/// wildcard component, and bubblewrap binds paths, not patterns — so the `*` is
+/// resolved by listing the directory **at launch**.
+///
+/// That leaves one remote-HEAD gap Linux cannot close and macOS does (its rule
+/// is a regex, matched at syscall time): a remote created mid-session by
+/// `git remote add` + `git fetch` has no `HEAD` file to bind, so its symref
+/// stays writable for the rest of the run.
+///
+/// `packed-refs` is NOT such a gap: symbolic refs are never packed, so on the
+/// `files` backend the loose `HEAD` always exists when the symref does.
+///
+/// The `reftable` backend (git 2.45+) is a different matter, and it defeats the
+/// leaf deny on BOTH platforms: the ref is not a file there at all, it lives in
+/// the binary tables under `.git/reftable/`, so there is nothing to bind on
+/// Linux and nothing for the macOS regex to match. `gate_git` blocks the write
+/// form of `git symbolic-ref` on `refs/remotes/*/HEAD` for that reason — a path
+/// rule cannot see a ref that is not a path.
+fn expand_rel(base: &Path, rel: &str) -> Vec<PathBuf> {
+    // `refs/remotes/*/HEAD` has a suffix after the wildcard; `refs/remotes/*`
+    // (an ancestor of it, see `rename_pin_paths`) ends at the wildcard itself.
+    let (prefix, suffix) = match rel.split_once("/*/") {
+        Some((prefix, suffix)) => (prefix, suffix),
+        None => match rel.strip_suffix("/*") {
+            Some(prefix) => (prefix, ""),
+            None => return vec![base.join(rel)],
+        },
+    };
+    // `join("")` would append a trailing separator, so the no-suffix case keeps
+    // the entry path as-is.
+    let dir = base.join(prefix);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            if suffix.is_empty() {
+                e.path()
+            } else {
+                e.path().join(suffix)
+            }
+        })
+        .filter(|p| p.exists())
+        .collect()
+}
+
 /// Project-internal paths re-bound **read-only** when Bubblewrap is active, to
 /// restore the macOS write-deny parity that Landlock cannot express (they live
 /// inside the writable project tree, which Landlock cannot carve a sub-deny out
@@ -671,14 +753,88 @@ pub(crate) fn git_persistence_paths(write_roots: &[&Path], git_dirs: &[&Path]) -
             .filter(|p| p.linux == LinuxCoverage::Bwrap)
             .map(|p| p.rel)
     };
+    let under = |base: PathBuf, rel: &str| expand_rel(&base, rel);
     let mut paths: Vec<PathBuf> = Vec::new();
     for root in write_roots {
-        paths.extend(bwrap(PROTECTED_IN_ROOT).map(|rel| root.join(rel)));
-        paths.extend(bwrap(PROTECTED_IN_GITDIR).map(|rel| root.join(".git").join(rel)));
+        paths.extend(bwrap(PROTECTED_IN_ROOT).flat_map(|rel| under(root.to_path_buf(), rel)));
+        paths.extend(bwrap(PROTECTED_IN_GITDIR).flat_map(|rel| under(root.join(".git"), rel)));
     }
     for dir in git_dirs {
-        paths.extend(bwrap(PROTECTED_IN_GITDIR).map(|rel| dir.join(rel)));
+        paths.extend(bwrap(PROTECTED_IN_GITDIR).flat_map(|rel| under(dir.to_path_buf(), rel)));
     }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Git directories, and the ancestors of every protected path — inside a
+/// gitdir ([`PROTECTED_IN_GITDIR`]) and inside a writable root
+/// ([`PROTECTED_IN_ROOT`]) — bind-mounted **read-write onto themselves** so
+/// each becomes a mountpoint.
+///
+/// A read-only bind pins a path's *content*; it does not pin the path's
+/// *name*. `rename(2)` and `rmdir(2)` of a directory that merely contains a
+/// mount still succeed, so with only the `refs/remotes/*/HEAD` bind in place an
+/// agent could move `refs/remotes` aside, create a fresh
+/// `refs/remotes/origin/HEAD` — a path with no mount on it, hence writable —
+/// and be done. Linux refuses to rename or remove a *mountpoint* itself
+/// (`vfs_rename` / `vfs_rmdir` return `EBUSY` for `is_local_mountpoint`), so
+/// self-binding each ancestor is what makes the leaf bind mean what it says.
+/// This is the Linux half of the macOS `file-write-unlink` denies emitted by
+/// `profile::emit_gitdir_denies` and `profile::emit_sensitive_project_denies`.
+///
+/// The root table has the same hole and it was worse (GHSA-39xf-9j26-f82m):
+/// `.github/hooks` and `.agents/plugins` execute on the HOST in a later
+/// session, and `mv .github .gh2 && echo evil > .gh2/hooks/evil.json && mv
+/// .gh2 .github` planted a hook without writing a single bound path. So
+/// `.github`, `.agents`, `.claude`, `.opencode` and `.pi` are pinned too — the
+/// accepted cost is that renaming or removing them inside the sandbox fails
+/// (docs/known-impacts.md).
+///
+/// The bind is read-**write**: git writes refs into these directories on every
+/// fetch, and `.git` itself has to stay writable for the index and lock files.
+///
+/// The gitdir itself is in the set for the same reason its macOS counterpart
+/// is: without it, `mv .git g2 && mkdir .git` recreates an unprotected
+/// repository and every path rule below it is moot.
+///
+/// Costs, both accepted: `rmdir` of a pinned directory now fails with `EBUSY`,
+/// so git's `try_remove_empty_parents` (after `fetch --prune`, `pack-refs`, or
+/// a ref delete) leaves an empty `refs/remotes/<remote>` behind instead of
+/// removing it — it ignores the error and stops, so nothing fails; and `rm -rf`
+/// of a pinned directory fails inside the sandbox, which is what macOS already
+/// does for `.git`.
+///
+/// Only paths that exist at launch can be bound, so a remote created
+/// mid-session is not pinned — the same launch-time limitation already
+/// recorded on [`expand_rel`].
+pub(crate) fn rename_pin_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
+    let ancestors = |set: &'static [Protected]| {
+        set.iter()
+            .filter(|p| p.linux == LinuxCoverage::Bwrap)
+            .flat_map(|p| rel_ancestors(p.rel))
+    };
+    // The gitdir itself, plus the ancestors of the names protected inside it.
+    let gitdir_pins = |base: &Path| -> Vec<PathBuf> {
+        std::iter::once(base.to_path_buf())
+            .chain(ancestors(PROTECTED_IN_GITDIR).flat_map(|rel| expand_rel(base, rel)))
+            .collect()
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for root in write_roots {
+        paths.extend(gitdir_pins(&root.join(".git")));
+        // The writable root itself is not pinned — it is the tree the sandbox
+        // grants — but the ancestors of the paths protected inside it are, so
+        // `.github` cannot be moved aside and `.github/hooks` written under a
+        // name no bind covers (GHSA-39xf-9j26-f82m).
+        for rel in ancestors(PROTECTED_IN_ROOT) {
+            paths.extend(expand_rel(root, rel));
+        }
+    }
+    for dir in git_dirs {
+        paths.extend(gitdir_pins(dir));
+    }
+    // Shortest first, so an outer pin is mounted before the ones beneath it.
     paths.sort();
     paths.dedup();
     paths
@@ -700,7 +856,7 @@ pub(crate) fn resolve(
     net_rules: &[NetRule],
     restrict_net_connect: bool,
     proxy_forced: bool,
-    ro_protect: &[PathBuf],
+    overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
 ) -> Result<Option<BubblewrapWrapper>, String> {
     match use_bubblewrap {
@@ -710,7 +866,7 @@ pub(crate) fn resolve(
             net_rules,
             restrict_net_connect,
             proxy_forced,
-            ro_protect,
+            overlays,
             deny_masks,
             true,
         )
@@ -726,7 +882,7 @@ pub(crate) fn resolve(
             net_rules,
             restrict_net_connect,
             proxy_forced,
-            ro_protect,
+            overlays,
             deny_masks,
             false,
         ) {
@@ -746,7 +902,7 @@ fn build_wrapper(
     net_rules: &[NetRule],
     restrict_net_connect: bool,
     proxy_forced: bool,
-    ro_protect: &[PathBuf],
+    overlays: Overlays<'_>,
     deny_masks: &DenyMasks,
     strict: bool,
 ) -> Result<BubblewrapWrapper, String> {
@@ -756,8 +912,8 @@ fn build_wrapper(
             crate::git::TRUSTED_BIN_DIRS.join(", ")
         )
     })?;
-    test_functionality(&bwrap_path, fs_rules, ro_protect, deny_masks)?;
-    let bwrap_args = build_bwrap_args(fs_rules, ro_protect, deny_masks);
+    test_functionality(&bwrap_path, fs_rules, overlays, deny_masks)?;
+    let bwrap_args = build_bwrap_args(fs_rules, overlays, deny_masks);
     Ok(BubblewrapWrapper {
         bwrap_path,
         bwrap_args,
@@ -999,7 +1155,7 @@ mod tests {
 
     #[test]
     fn args_isolate_expected_namespaces() {
-        let args = build_bwrap_args(&[], &[], &DenyMasks::default());
+        let args = build_bwrap_args(&[], Overlays::default(), &DenyMasks::default());
         assert!(args.contains(&"--unshare-pid".to_string()));
         assert!(args.contains(&"--unshare-ipc".to_string()));
         assert!(args.contains(&"--unshare-uts".to_string()));
@@ -1012,7 +1168,7 @@ mod tests {
 
     #[test]
     fn args_set_up_base_mounts() {
-        let args = build_bwrap_args(&[], &[], &DenyMasks::default());
+        let args = build_bwrap_args(&[], Overlays::default(), &DenyMasks::default());
         assert!(args.windows(3).any(|w| w == ["--ro-bind", "/", "/"]));
         assert!(args.windows(2).any(|w| w == ["--proc", "/proc"]));
         assert!(args.windows(2).any(|w| w == ["--dev", "/dev"]));
@@ -1033,7 +1189,7 @@ mod tests {
                 ioctl: false,
             },
         }];
-        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
         let tmp_bind = args
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == "/tmp" && w[2] == "/tmp");
@@ -1052,7 +1208,7 @@ mod tests {
             "test premise: tempdir lives under the system temp dir"
         );
         let rules = vec![writable_rule(&dir_str)];
-        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
 
         let tmpfs_idx = args.iter().position(|a| a == "--tmpfs").expect("tmpfs");
         let bind_idx = args
@@ -1095,7 +1251,7 @@ mod tests {
                 },
             },
         ];
-        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
 
         let last_ro = args
             .windows(3)
@@ -1129,7 +1285,7 @@ mod tests {
                 ioctl: false,
             },
         }];
-        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
 
         let g = granted.to_string_lossy().into_owned();
         let bind_idx = args
@@ -1167,7 +1323,7 @@ mod tests {
                 ioctl: false,
             },
         }];
-        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
         let g = granted.to_string_lossy().into_owned();
         assert!(
             !args.windows(3).any(|w| w[1] == g && w[2] == g),
@@ -1203,7 +1359,7 @@ mod tests {
                 },
             },
         ];
-        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
         let n = nested.to_string_lossy().into_owned();
         assert!(
             !args
@@ -1223,7 +1379,7 @@ mod tests {
         // non-bwrap configuration kernel-denies by default.
         let dir = tempfile::tempdir().expect("tempdir");
         let scratch_like = writable_rule(&dir.path().to_string_lossy());
-        let args = build_bwrap_args(&[scratch_like], &[], &DenyMasks::default());
+        let args = build_bwrap_args(&[scratch_like], Overlays::default(), &DenyMasks::default());
 
         // No mount operation may target /tmp as its destination other than the
         // tmpfs itself.
@@ -1255,7 +1411,7 @@ mod tests {
             writable_rule(&link.to_string_lossy()),
             writable_rule(&real.to_string_lossy()),
         ];
-        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
 
         let binds = args
             .windows(3)
@@ -1271,7 +1427,7 @@ mod tests {
     #[test]
     fn nonexistent_writable_paths_are_skipped() {
         let rules = vec![writable_rule("/definitely/not/a/real/path/xyzzy")];
-        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
         assert!(!args.iter().any(|a| a.contains("xyzzy")));
     }
 
@@ -1282,7 +1438,7 @@ mod tests {
             writable_rule("/proc/self"),
             writable_rule("/sys/fs/cgroup"),
         ];
-        let args = build_bwrap_args(&rules, &[], &DenyMasks::default());
+        let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
         assert!(
             !args
                 .windows(3)
@@ -1309,7 +1465,7 @@ mod tests {
                 &[],
                 true,
                 false,
-                &[],
+                Overlays::default(),
                 &DenyMasks::default()
             )
             .unwrap()
@@ -1330,7 +1486,14 @@ mod tests {
 
         let rules = vec![writable_rule(&proj_str)];
         let ro = git_persistence_paths(&[proj.path()], &[]);
-        let args = build_bwrap_args(&rules, &ro, &DenyMasks::default());
+        let args = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &[],
+            },
+            &DenyMasks::default(),
+        );
 
         let proj_bind_idx = args
             .windows(3)
@@ -1364,7 +1527,14 @@ mod tests {
         ];
         let ro =
             crate::sandbox::copilot_ro_protect_paths(crate::agent::Agent::Copilot, home.path());
-        let args = build_bwrap_args(&rules, &ro, &DenyMasks::default());
+        let args = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &[],
+            },
+            &DenyMasks::default(),
+        );
 
         let idx = |flag: &str, p: &std::path::Path| {
             let s = p.to_string_lossy().into_owned();
@@ -1386,6 +1556,164 @@ mod tests {
         assert!(
             cache_pkg_ro > cache_bind,
             "the ~/.cache/copilot/pkg read-only bind must come AFTER the writable ~/.cache bind"
+        );
+    }
+
+    /// The read-only bind on `refs/remotes/<remote>/HEAD` pins that file's
+    /// content, not its path: an agent that renames `refs/remotes` aside can
+    /// create a fresh, unmounted `refs/remotes/origin/HEAD` and write it. The
+    /// gitdir and every ancestor of a protected name are therefore bound
+    /// read-WRITE onto themselves — Linux refuses to rename or rmdir a
+    /// mountpoint (EBUSY), and the directories have to stay writable because
+    /// git writes refs into them on every fetch.
+    #[test]
+    fn git_pins_make_the_gitdir_and_ref_ancestors_unrenameable() {
+        let proj = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(proj.path().join(".git/refs/remotes/origin"))
+            .expect("create refs/remotes/origin");
+        std::fs::create_dir_all(proj.path().join(".git/refs/remotes/upstream"))
+            .expect("create refs/remotes/upstream");
+        std::fs::create_dir_all(proj.path().join(".git/info")).expect("create .git/info");
+        std::fs::write(proj.path().join(".git/info/exclude"), "").expect("create exclude");
+        std::fs::write(proj.path().join(".git/refs/remotes/origin/HEAD"), "")
+            .expect("create remote HEAD");
+
+        let pins = rename_pin_paths(&[proj.path()], &[]);
+        let expected: Vec<PathBuf> = [
+            // `PROTECTED_IN_ROOT`'s ancestors are pinned for every root too
+            // (GHSA-39xf-9j26-f82m); a literal is listed whether or not it
+            // exists, and `build_bwrap_args` skips the missing ones.
+            ".agents",
+            ".claude",
+            ".git",
+            ".git/info",
+            ".git/refs",
+            ".git/refs/remotes",
+            ".git/refs/remotes/origin",
+            ".git/refs/remotes/upstream",
+            ".github",
+            ".opencode",
+            ".pi",
+        ]
+        .iter()
+        .map(|r| proj.path().join(r))
+        .collect();
+        assert_eq!(
+            pins, expected,
+            "every remote's directory is pinned, not only the one that has a HEAD — \
+             an unpinned one can be renamed aside and recreated with a decoy HEAD"
+        );
+
+        let rules = vec![writable_rule(&proj.path().to_string_lossy())];
+        let ro = git_persistence_paths(&[proj.path()], &[]);
+        let args = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &pins,
+            },
+            &DenyMasks::default(),
+        );
+        let idx = |flag: &str, p: &Path| {
+            let p = p.to_string_lossy().into_owned();
+            args.windows(3)
+                .position(|w| w[0] == flag && w[1] == p && w[2] == p)
+        };
+
+        let project_bind = idx("--bind", proj.path()).expect("the project is bound writable");
+        for pin in &pins {
+            let at = idx("--bind", pin)
+                .unwrap_or_else(|| panic!("{} must be bound read-write", pin.display()));
+            assert!(
+                at > project_bind,
+                "{} must be pinned AFTER the writable project bind, or the bind replaces it",
+                pin.display()
+            );
+        }
+        // Ordering is what makes both halves hold: the pins are plain writable
+        // binds, so a pin emitted after the HEAD read-only bind would re-expose
+        // the file it protects.
+        let head = idx(
+            "--ro-bind",
+            &proj.path().join(".git/refs/remotes/origin/HEAD"),
+        )
+        .expect("the remote HEAD is bound read-only");
+        let last_pin = pins
+            .iter()
+            .filter_map(|p| idx("--bind", p))
+            .max()
+            .expect("pins are emitted");
+        assert!(
+            last_pin < head,
+            "every pin must precede the read-only binds it protects"
+        );
+    }
+
+    /// GHSA-39xf-9j26-f82m: the read-only bind on `.github/hooks` pins that
+    /// directory's content, not its name. With `.github` unpinned an agent
+    /// could `mv .github .gh2`, write `.gh2/hooks/evil.json` — a path with no
+    /// mount on it — and `mv .gh2 .github` back; the hook then runs on the HOST
+    /// in the next session. Every ancestor in `PROTECTED_IN_ROOT` is therefore
+    /// a read-WRITE self-bind, i.e. a mountpoint, which Linux refuses to
+    /// rename or rmdir (EBUSY). The directories stay writable — `.github/
+    /// workflows` and `.claude/` session state are ordinary content.
+    #[test]
+    fn root_protected_ancestors_are_pinned_against_rename() {
+        let proj = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(proj.path().join(".github/hooks")).expect("create .github/hooks");
+        std::fs::create_dir_all(proj.path().join(".agents/plugins")).expect("create plugins");
+        std::fs::create_dir_all(proj.path().join(".claude")).expect("create .claude");
+        std::fs::write(proj.path().join(".claude/settings.json"), "").expect("create settings");
+
+        let pins = rename_pin_paths(&[proj.path()], &[]);
+        for rel in [".github", ".agents", ".claude", ".opencode", ".pi"] {
+            assert!(
+                pins.contains(&proj.path().join(rel)),
+                "{rel} must be pinned — derived from PROTECTED_IN_ROOT, so a new \
+                 entry cannot skip its ancestors"
+            );
+        }
+        assert!(
+            !pins.contains(&proj.path().join(".github/hooks")),
+            "only the ancestors are pinned; the protected leaf itself is bound \
+             read-only, and a read-write pin would re-expose it"
+        );
+
+        let rules = vec![writable_rule(&proj.path().to_string_lossy())];
+        let ro = git_persistence_paths(&[proj.path()], &[]);
+        let args = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &pins,
+            },
+            &DenyMasks::default(),
+        );
+        let idx = |flag: &str, p: &Path| {
+            let p = p.to_string_lossy().into_owned();
+            args.windows(3)
+                .position(|w| w[0] == flag && w[1] == p && w[2] == p)
+        };
+
+        let project_bind = idx("--bind", proj.path()).expect("the project is bound writable");
+        let github = idx("--bind", &proj.path().join(".github"))
+            .expect(".github must be bound read-write onto itself");
+        assert!(
+            github > project_bind,
+            "the pin must come AFTER the writable project bind, or the bind replaces it"
+        );
+        let hooks = idx("--ro-bind", &proj.path().join(".github/hooks"))
+            .expect(".github/hooks must be bound read-only");
+        assert!(
+            github < hooks,
+            "the pin must precede the read-only bind it protects, or the \
+             read-write self-bind re-exposes the hooks directory"
+        );
+        // Never bound at launch, so never pinned — the same launch-time
+        // limitation recorded on `expand_rel`.
+        assert!(
+            idx("--bind", &proj.path().join(".opencode")).is_none(),
+            "a pin whose source does not exist must be skipped, not passed to bwrap"
         );
     }
 
@@ -1427,6 +1755,12 @@ mod tests {
         ] {
             std::fs::write(proj.path().join(f), "").expect("create H-11 file");
         }
+        std::fs::create_dir_all(proj.path().join(".git/refs/remotes/origin"))
+            .expect("create refs/remotes/origin");
+        std::fs::write(proj.path().join(".git/refs/remotes/origin/HEAD"), "")
+            .expect("create remote HEAD");
+        std::fs::write(proj.path().join(".git/refs/remotes/origin/main"), "")
+            .expect("create remote branch");
         std::fs::create_dir_all(proj.path().join(".git/info")).expect("create .git/info");
         std::fs::write(proj.path().join(".git/info/exclude"), "").expect("create info/exclude");
         std::fs::write(proj.path().join(".git/config"), "").expect("create .git/config");
@@ -1436,7 +1770,14 @@ mod tests {
         let proj_str = proj.path().to_string_lossy().into_owned();
         let rules = vec![writable_rule(&proj_str)];
         let ro = git_persistence_paths(&[proj.path()], &[]);
-        let args = build_bwrap_args(&rules, &ro, &DenyMasks::default());
+        let args = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &[],
+            },
+            &DenyMasks::default(),
+        );
 
         // .git/hooks and .cplt.toml are re-bound read-only.
         assert!(
@@ -1497,6 +1838,26 @@ mod tests {
                 "{rel} must be re-bound read-only (source and dest both {path})"
             );
         }
+        // GHSA-cm6f-3wjh-x9qx: the remote HEAD symref names the branch the push
+        // guard protects, and it is re-read at every launch. The `*` component is
+        // resolved by listing `refs/remotes` at launch (see `expand_rel`).
+        assert!(
+            args.windows(2).any(|w| w[0] == "--ro-bind"
+                && w[1]
+                    == proj
+                        .path()
+                        .join(".git/refs/remotes/origin/HEAD")
+                        .to_string_lossy()),
+            "refs/remotes/origin/HEAD must be re-bound read-only"
+        );
+        // ...and only HEAD: `git fetch` has to keep writing the remote-tracking
+        // branches next to it.
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.ends_with("/refs/remotes/origin/main")),
+            "remote-tracking branches must stay writable (git fetch)"
+        );
         // .git/config and .gitmodules are NOT re-bound (stay writable), even
         // though both exist on disk — the narrowing, not the exists-check, is
         // what leaves them out.
@@ -1517,7 +1878,14 @@ mod tests {
         let proj = tempfile::tempdir().expect("tempdir");
         // No .git/hooks or .cplt.toml created.
         let ro = git_persistence_paths(&[proj.path()], &[]);
-        let args = build_bwrap_args(&[], &ro, &DenyMasks::default());
+        let args = build_bwrap_args(
+            &[],
+            Overlays {
+                read_only: &ro,
+                pins: &[],
+            },
+            &DenyMasks::default(),
+        );
         assert!(
             !args
                 .iter()
@@ -1546,7 +1914,14 @@ mod tests {
         );
 
         // And once bound they are re-bound read-only (they exist on disk).
-        let args = build_bwrap_args(&[], &ro, &DenyMasks::default());
+        let args = build_bwrap_args(
+            &[],
+            Overlays {
+                read_only: &ro,
+                pins: &[],
+            },
+            &DenyMasks::default(),
+        );
         let common_hooks_str = common_hooks.to_string_lossy().into_owned();
         assert!(
             args.windows(3).any(|w| w[0] == "--ro-bind"
@@ -1593,7 +1968,14 @@ mod tests {
             writable_rule(&proj.path().to_string_lossy()),
             writable_rule(&sibling.path().to_string_lossy()),
         ];
-        let args = build_bwrap_args(&rules, &ro, &DenyMasks::default());
+        let args = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &[],
+            },
+            &DenyMasks::default(),
+        );
         let hooks_str = sibling_hooks.to_string_lossy().into_owned();
         let sibling_bind_idx = args
             .windows(2)
@@ -1649,7 +2031,14 @@ mod tests {
 
         let rules = [writable_rule(&base.path().to_string_lossy())];
         let ro = git_persistence_paths(&[&hooks_proj], &[]);
-        let args = build_bwrap_args(&rules, &ro, &masks);
+        let args = build_bwrap_args(
+            &rules,
+            Overlays {
+                read_only: &ro,
+                pins: &[],
+            },
+            &masks,
+        );
 
         let canon = secret
             .canonicalize()
@@ -1693,7 +2082,7 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0, "placeholder must be mode 000");
 
-        let args = build_bwrap_args(&[], &[], &masks);
+        let args = build_bwrap_args(&[], Overlays::default(), &masks);
         let ph = placeholder.to_string_lossy().into_owned();
         let target = secret
             .canonicalize()
@@ -1838,7 +2227,7 @@ mod tests {
         std::fs::create_dir(&scratch).expect("scratch");
 
         let masks = build_deny_masks(&[dir.clone(), file], &[], Some(&scratch));
-        let args = build_bwrap_args(&[], &[], &masks);
+        let args = build_bwrap_args(&[], Overlays::default(), &masks);
         let file_pos = args.iter().position(|a| a.ends_with("f.txt")).unwrap();
         let dir_canon = dir.canonicalize().unwrap().to_string_lossy().into_owned();
         let dir_pos = args
@@ -1970,7 +2359,7 @@ mod tests {
         std::fs::create_dir(&systemd).expect("systemd");
 
         let masks = build_deny_masks(&[], &[bus.clone(), systemd.clone()], Some(&scratch));
-        let args = build_bwrap_args(&[], &[], &masks);
+        let args = build_bwrap_args(&[], Overlays::default(), &masks);
 
         let bus_str = bus.canonicalize().unwrap().to_string_lossy().into_owned();
         let systemd_str = systemd
@@ -1989,6 +2378,95 @@ mod tests {
             args.windows(2)
                 .any(|w| w[0] == "--tmpfs" && w[1] == systemd_str),
             "socket dir must be shadowed by a tmpfs: {args:?}"
+        );
+    }
+
+    /// Every strict ancestor of `path` below `root` that is missing from `pins`.
+    ///
+    /// A read-only bind pins content, not a name: with an ancestor left
+    /// unpinned the whole protected subtree can be renamed aside, rebuilt
+    /// under a name no bind covers, and moved back. Only the ancestors *below*
+    /// the writable root are candidates — the root's own parent is on the
+    /// `--ro-bind / /` base mount, so it cannot hold a new sibling name and the
+    /// rename has nowhere to land. That is the Linux spelling of the same stop
+    /// condition the macOS walk applies at the nearest enclosing write grant.
+    fn unpinned_ancestors(ro: &[PathBuf], pins: &[PathBuf], root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for path in ro {
+            let mut cur = path.parent();
+            while let Some(p) = cur {
+                if p == root {
+                    break;
+                }
+                if !pins.iter().any(|pin| pin == p) {
+                    out.push(format!(
+                        "{} is bound read-only, but its ancestor {} is not pinned",
+                        path.display(),
+                        p.display()
+                    ));
+                }
+                cur = p.parent();
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The Linux half of the rename-pin invariant enforced on macOS by
+    /// `profile::tests::rename_pin_invariant`: every path bubblewrap binds
+    /// read-only must have every ancestor between it and the writable root
+    /// bound read-write onto itself, so none of them can be renamed or removed.
+    ///
+    /// It covers the two path tables — `PROTECTED_IN_ROOT` and
+    /// `PROTECTED_IN_GITDIR` — because those are the read-only set built here,
+    /// out of plain paths. The rest of `sandbox::ro_protect_paths` (mise's
+    /// `shims`/`installs`, Copilot's two `pkg` dirs) is NOT walked: its
+    /// enclosing writable grant is a Landlock `FsRule` assembled elsewhere, not
+    /// a path in this list, so there is nothing here to compute a stop
+    /// condition from. Those entries are pinned by derivation instead — see
+    /// `sandbox::pin_paths`, which takes the parent of every Copilot package
+    /// dir — and their `~/.local/share` / `$HOME` parents are on the read-only
+    /// base mount, so the rename has nowhere to land.
+    #[test]
+    fn every_read_only_bind_has_its_ancestors_pinned() {
+        let proj = tempfile::tempdir().expect("tempdir");
+        for dir in [
+            ".git/refs/remotes/origin",
+            ".git/refs/remotes/upstream",
+            ".git/info",
+            ".github/hooks",
+            ".agents/plugins",
+            ".claude",
+            ".opencode/plugins",
+            ".pi/extensions",
+        ] {
+            std::fs::create_dir_all(proj.path().join(dir)).expect("create fixture dir");
+        }
+        std::fs::write(proj.path().join(".git/refs/remotes/origin/HEAD"), "").expect("HEAD");
+
+        let ro = git_persistence_paths(&[proj.path()], &[]);
+        let pins = rename_pin_paths(&[proj.path()], &[]);
+        assert!(!ro.is_empty() && !pins.is_empty(), "test premise");
+
+        let missing = unpinned_ancestors(&ro, &pins, proj.path());
+        assert!(
+            missing.is_empty(),
+            "{} read-only bind(s) have a renameable ancestor. Renaming it moves \
+             the protected tree out from under the bind (GHSA-39xf-9j26-f82m). \
+             Add the ancestor to `rename_pin_paths`.\n{}",
+            missing.len(),
+            missing.join("\n")
+        );
+
+        // Non-vacuity: drop one pin and the walk must say so. Without this the
+        // assertion above passes just as happily on an empty `ro`.
+        let gitdir = proj.path().join(".git");
+        let thinned: Vec<PathBuf> = pins.iter().filter(|p| **p != gitdir).cloned().collect();
+        let found = unpinned_ancestors(&ro, &thinned, proj.path());
+        assert!(
+            found.iter().any(|m| m.contains(".git is not pinned")),
+            "removing the gitdir pin must be reported: {found:?}"
         );
     }
 }

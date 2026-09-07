@@ -581,6 +581,24 @@ fn install_command_wrappers(
         // unpinned, and an unpinned rule authorizes nothing, so the operator is
         // warned rather than left with a rule that silently does not apply.
         let mut git_guard = git_guard.clone();
+        // Capture the launch repository's facts — today the default branch of
+        // each remote — with the TRUSTED git, in the unsandboxed parent, and
+        // bake them into the wrapper. The guard used to ask
+        // `git symbolic-ref refs/remotes/<remote>/HEAD` at gate time inside the
+        // sandbox; that ref file is agent-writable, so the agent could rewrite
+        // the guard's yardstick and push to the real default branch
+        // (GHSA-cm6f-3wjh-x9qx). Same treatment as the gh guard's repo scope.
+        let repo_facts = crate::git::trusted_git()
+            .map(|git| crate::gh_proxy::capture_repo_facts(git, project_dir))
+            .unwrap_or_default();
+        if git_guard.protect_default_branch_only && repo_facts.default_branches.is_empty() {
+            ui::warn(
+                "git guard: no remote's default branch could be captured at launch, so \
+                 protect_default_branch_only cannot tell a feature branch from the protected \
+                 one and every push is refused. Run `git remote set-head origin -a` in the \
+                 project repository and start a new session.",
+            );
+        }
         if !git_guard.allow_push.is_empty() {
             if let Some(trusted) = crate::git::trusted_git() {
                 git_guard.allow_push = crate::gh_proxy::resolve_push_rule_urls(
@@ -613,6 +631,7 @@ fn install_command_wrappers(
             &real_git.to_string_lossy(),
             &cplt_str,
             &git_guard,
+            &repo_facts,
         );
         let wrapper_path = bin_dir.join("git");
         if std::fs::write(&wrapper_path, script).is_ok() {
