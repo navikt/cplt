@@ -219,7 +219,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Str,
         dangerous: false,
         default_display: "standard",
-        description: "Security posture baseline: \"strict\" (all toggles off AND gh_guard + git_guard + proxy.forced ON, fully locked down), \"standard\" (default, no-op), \"permissive\", or \"full-trust\". Only strict enables the guards/forced proxy; the others leave them at default. Individual keys/flags override it.",
+        description: "Security posture baseline: \"standard\" (the default: both guards on in block mode, the git guard scoped to the default branch), \"strict\" (all toggles off, every push blocked, proxy.forced and proxy.default_allowlist on), \"permissive\" or \"full-trust\" (both guards off, sandbox toggles loosened). Individual keys/flags override it.",
     },
     ConfigKeyInfo {
         section: "sandbox",

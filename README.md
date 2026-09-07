@@ -24,7 +24,7 @@ cplt gives you kernel-level enforcement with team-configurable policy:
 - Deny by default for credentials, secrets, and sensitive files
 - Command-level git and gh interception that blocks pushes, merges, and releases
 - Outbound network filtering with an audit log
-- No Docker, no VMs. One static binary that runs on a locked-down laptop
+- No Docker, no VMs. One binary that runs on a locked-down laptop
 - Zero-config start for developers, with escape hatches when a build genuinely needs one
 
 ## Table of contents
@@ -786,7 +786,7 @@ Internals and module layout: [docs/architecture.md](docs/architecture.md). Threa
 
 ## Security
 
-One static binary, minimal dependencies, no runtime services, no telemetry. Three defense layers, with clear boundaries between them:
+One binary, minimal dependencies, no runtime services, no telemetry. Three defense layers, with clear boundaries between them:
 
 | Layer | Enforcement | Bypassable? | What it protects |
 |---|---|---|---|
@@ -814,7 +814,7 @@ What cplt does not protect against:
 - Network attacks on allowed domains. If github.com is allowed, the agent can read and write there
 - macOS Keychain access, for agents that store auth there. Contents are password-protected, and `sandbox.keychain_substitute` can trade the grant away where an agent has another credential
 
-Our priorities, in order: **correct** (every claim is tested, every edge case has a CVE or research reference), **transparent** ([SECURITY.md](SECURITY.md) hides nothing), **simple** (one static binary, zero config required, sane defaults), and **useful** (get out of the way and let the agent work, safely).
+Our priorities, in order: **correct** (every claim is tested, every edge case has a CVE or research reference), **transparent** ([SECURITY.md](SECURITY.md) hides nothing), **simple** (one binary, zero config required, sane defaults), and **useful** (get out of the way and let the agent work, safely).
 
 More: [docs/security.md](docs/security.md) · [SECURITY.md](SECURITY.md)
 

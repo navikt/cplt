@@ -6,7 +6,7 @@ One Rust binary, and a dependency list short enough to read in a sitting (see `C
 
 1. **Correct.** Every claim is tested, and every edge case has a CVE or research reference.
 2. **Transparent.** Read [SECURITY.md](../SECURITY.md). It hides nothing.
-3. **Simple.** One static binary, zero config required, sane defaults.
+3. **Simple.** One binary, zero config required, sane defaults.
 4. **Useful.** Get out of the way and let the agent do its job, safely.
 
 For the full security model, threat analysis, and test strategy, see **[SECURITY.md](../SECURITY.md)**.
