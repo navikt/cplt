@@ -3055,6 +3055,28 @@ mod tests {
     }
 
     #[test]
+    fn generate_policy_keeps_the_cplt_exec_grant_under_the_project_dir() {
+        // The other half of the wiring. The check deliberately runs against the
+        // rules actually emitted, not against `writable_trees`, because the
+        // project dir is writable *and* executable by design — skipping the
+        // grant there would break the guard to close a hole that is already
+        // open by construction. Nothing pinned that: rewiring the check to
+        // `writable_trees` passes every other test in the suite while silently
+        // disarming the guard for anyone running cplt from their own checkout.
+        let exe = std::env::current_exe().unwrap();
+        let project = exe.parent().unwrap().to_path_buf();
+        let home = PathBuf::from("/home/user");
+        let policy = generate_policy(&test_config(&project, &home));
+        assert!(
+            policy
+                .fs_rules
+                .iter()
+                .any(|r| r.path == exe && r.access.execute),
+            "the grant must survive a project dir that is writable and executable"
+        );
+    }
+
+    #[test]
     fn generate_policy_records_proxy_forced_flag() {
         // The proxy_forced flag must reach the policy so precompute() can
         // fail closed on kernels that can't enforce net restriction (#53).
