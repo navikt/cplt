@@ -23,7 +23,9 @@ mod e2e_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use crate::common::{binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd};
+    use crate::common::{
+        binary_in_path, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd,
+    };
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -5055,6 +5057,37 @@ paths = [
         ]);
         let (shell_ok, shell_stderr) =
             push(&["--no-validate", "exec", "-c", "git push origin main"]);
+
+        // `Git` and `GIT` reach the real git only where the filesystem is
+        // case-insensitive (APFS/HFS+ by default) — there the guard must run.
+        // Where it is case-sensitive they are simply not on PATH, and cplt has
+        // nothing to resolve, let alone redirect.
+        let case_insensitive_fs = binary_in_path("git").with_file_name("Git").is_file();
+        for name in ["Git", "GIT"] {
+            let (ok, stderr) = push(&[
+                "--no-validate",
+                "exec",
+                "--",
+                name,
+                "push",
+                "origin",
+                "main",
+            ]);
+            assert!(!ok, "exec -- {name} push must not succeed.\n{stderr}");
+            if case_insensitive_fs {
+                assert!(
+                    stderr.contains("BLOCKED by sandbox"),
+                    "exec -- {name} push resolves to the real git here, so it must meet the \
+                     same guard as the lowercase spelling.\n{stderr}"
+                );
+            } else {
+                assert!(
+                    stderr.contains("not found in PATH"),
+                    "exec -- {name} push has no binary to resolve on a case-sensitive \
+                     filesystem.\n{stderr}"
+                );
+            }
+        }
 
         assert!(
             !shell_ok && shell_stderr.contains("BLOCKED by sandbox"),

@@ -3269,6 +3269,27 @@ fn resolve_exec_binary(name: &str) -> anyhow::Result<PathBuf> {
 /// applies. Taking it as an argument keeps the shim only where cplt actually
 /// found a binary to wrap: `gh` on a machine without gh still fails with
 /// "not found in PATH" rather than with a missing shim.
+///
+/// Case is decided by the filesystem, not by the OS. `resolve_exec_binary`
+/// walks the parent PATH with `is_file()`, so on a case-insensitive volume
+/// (APFS/HFS+ by default, and ciopfs or vfat on Linux) `Git` resolves to the
+/// real git and the gate has to run; on a case-sensitive volume `Git` is a
+/// genuinely different command and redirecting it would silently run the wrong
+/// binary. Both hold on either OS — a case-sensitive APFS volume and a
+/// case-insensitive Linux mount both exist — so instead of `cfg(target_os)`,
+/// a name that differs from a guarded name only in case is redirected exactly
+/// when it resolves to the same inode as that guarded name does. That is the
+/// same question the kernel answers when it execs the path, so the two cannot
+/// disagree. Names that merely look similar (`gitk`, `ghost`, `github`) never
+/// reach the check.
+///
+/// Not taken: the general fix of resolving argv[0] against the CHILD PATH
+/// (scratch bin dir first), which would need no name list at all. The shims do
+/// not exist yet at this point — `install_command_wrappers` writes them while
+/// the sandboxed `Command` is being built, well after argv[0] is resolved — so
+/// that fix means splitting wrapper installation out of the spawn path first.
+/// With exactly two shims, both named here already, that refactor buys nothing
+/// this check does not; it becomes worth doing when a third guard appears.
 fn redirect_to_guard_shim(
     name: &str,
     real: PathBuf,
@@ -3276,15 +3297,36 @@ fn redirect_to_guard_shim(
     gh_guard_enabled: bool,
     git_guard_enabled: bool,
 ) -> PathBuf {
-    let guarded = match name {
-        "git" => git_guard_enabled,
-        "gh" => gh_guard_enabled,
+    let guarded = ["git", "gh"].into_iter().find(|guard| {
+        name.eq_ignore_ascii_case(guard) && (name == *guard || is_same_file(&real, guard))
+    });
+    let enabled = match guarded {
+        Some("git") => git_guard_enabled,
+        Some("gh") => gh_guard_enabled,
         _ => false,
     };
-    match (guarded, scratch_dir) {
-        (true, Some(scratch)) => scratch.join("bin").join(name),
+    match (guarded, enabled, scratch_dir) {
+        // The shim is written as `bin/git` / `bin/gh`, so name the shim by its
+        // real name and not by the case the caller happened to type.
+        (Some(guard), true, Some(scratch)) => scratch.join("bin").join(guard),
         _ => real,
     }
+}
+
+/// True when `real` and `<real's directory>/<name>` are the same file on disk.
+///
+/// Compares device and inode rather than the path text: that is the same
+/// question the kernel answers when it execs `real`, so it is right on a
+/// case-insensitive volume and on a case-sensitive one, with no per-OS guess.
+fn is_same_file(real: &Path, name: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(dir) = real.parent() else {
+        return false;
+    };
+    let (Ok(a), Ok(b)) = (std::fs::metadata(real), std::fs::metadata(dir.join(name))) else {
+        return false;
+    };
+    a.dev() == b.dev() && a.ino() == b.ino()
 }
 
 /// Everything the sandbox assembly reads off the host machine.
@@ -6644,9 +6686,56 @@ mod tests {
             real
         );
 
+        // A name differing only in case is redirected exactly when it resolves
+        // to the same file the guarded name does. Whether it does is a property
+        // of the filesystem (case-insensitive on APFS/HFS+, case-sensitive on
+        // most Linux ones), so the expectation is probed rather than assumed
+        // per-OS: a case-sensitive macOS volume and a case-insensitive Linux
+        // mount both exist.
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join("git"), "#!/bin/sh\n").unwrap();
+        std::fs::write(bin.path().join("gh"), "#!/bin/sh\n").unwrap();
+        let case_insensitive_fs = bin.path().join("Git").is_file();
+        for (name, guard) in [("Git", "git"), ("GIT", "git"), ("Gh", "gh"), ("GH", "gh")] {
+            let real = bin.path().join(name);
+            let expected = if case_insensitive_fs {
+                scratch.join("bin").join(guard)
+            } else {
+                real.clone()
+            };
+            assert_eq!(
+                redirect_to_guard_shim(name, real, Some(&scratch), true, true),
+                expected,
+                "{name} on a {} filesystem",
+                if case_insensitive_fs {
+                    "case-insensitive"
+                } else {
+                    "case-sensitive"
+                }
+            );
+        }
+
+        // Guard off → unchanged, whatever the case.
+        let real_git = bin.path().join("GIT");
+        assert_eq!(
+            redirect_to_guard_shim("GIT", real_git.clone(), Some(&scratch), true, false),
+            real_git
+        );
+
         // A path with a slash keeps the documented, out-of-scope behaviour
-        // (SECURITY.md), and every unguarded command is untouched.
-        for name in ["/usr/bin/git", "./git", "../gh", "ls", "gitk", "ghost"] {
+        // (SECURITY.md), and every unguarded command is untouched — including
+        // one that only looks like a guarded name in some other case.
+        for name in [
+            "/usr/bin/git",
+            "./git",
+            "../gh",
+            "./Git",
+            "ls",
+            "gitk",
+            "ghost",
+            "Gitk",
+            "GitHub",
+        ] {
             assert_eq!(
                 redirect_to_guard_shim(name, real.clone(), Some(&scratch), true, true),
                 real,
