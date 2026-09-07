@@ -186,13 +186,44 @@ fn git_gate_with_mode(
     prevent_force_push: bool,
     mode: &str,
 ) -> (String, String, bool) {
+    git_gate_inner(args, prevent_push, prevent_force_push, mode, false)
+}
+
+/// `git-gate` in block mode with a git the guard can query — for push tests,
+/// where the verdict depends on resolving the named remote.
+fn git_gate_push(
+    args: &[&str],
+    prevent_push: bool,
+    prevent_force_push: bool,
+) -> (String, String, bool) {
+    git_gate_inner(args, prevent_push, prevent_force_push, "block", true)
+}
+
+fn git_gate_inner(
+    args: &[&str],
+    prevent_push: bool,
+    prevent_force_push: bool,
+    mode: &str,
+    resolvable_git: bool,
+) -> (String, String, bool) {
     // The gate resolves the target repo from the cwd; a temp repo keeps that
     // independent of whatever origin the checkout running the tests has.
     let repo = temp_repo("navikt/cplt");
+    // `resolvable_git` supplies a git the guard can actually query (`remote
+    // get-url`, `symbolic-ref`, `rev-parse`) while keeping the push itself a
+    // no-op. Without it the guard cannot tell a configured remote from an
+    // arbitrary URL destination, so a push is refused for that reason instead
+    // of the one under test. Commands other than push run for real, which is
+    // why it is not the default: `git log`/`pull` in a bare fixture fail.
+    let real_git = if resolvable_git {
+        fake_push_git(repo.path())
+    } else {
+        std::path::PathBuf::from("/usr/bin/true")
+    };
     let mut cmd = cplt_cmd();
     cmd.arg("git-gate")
         .arg("--real-git")
-        .arg("/usr/bin/true")
+        .arg(&real_git)
         .arg(format!("--mode={mode}"))
         .arg(format!("--prevent-push={prevent_push}"))
         .arg(format!("--prevent-force-push={prevent_force_push}"))
@@ -1260,13 +1291,87 @@ fn git_gate_blocks_push() {
 
 #[test]
 fn git_gate_blocks_push_with_remote() {
-    let (_, stderr, ok) = git_gate(&["push", "origin", "main"], true, true);
+    let (_, stderr, ok) = git_gate_push(&["push", "origin", "main"], true, true);
     assert_refused(&stderr, ok, "Push prevention is enabled");
+}
+
+// GHSA-3m7m-m3rq-5cw8: an explicit destination is git's repository argument,
+// not a refspec, and it escapes remote-based authorization entirely.
+#[test]
+fn git_gate_blocks_push_to_an_explicit_destination() {
+    for dest in [
+        "git@github.com:attacker/x.git",
+        "ssh://git@github.com/attacker/x.git",
+        "https://github.com/attacker/x.git",
+        "file:///tmp/attacker-x.git",
+        "../attacker-x.git",
+    ] {
+        let (_, stderr, ok) = git_gate_push(&["push", dest], true, true);
+        assert_refused(&stderr, ok, "not a configured remote");
+        let (_, stderr, ok) = git_gate_push(&["push", dest, "main"], true, true);
+        assert_refused(&stderr, ok, "not a configured remote");
+    }
+}
+
+// Same advisory, second half: git resolves unique long-option abbreviations
+// (`--rep` = `--repo`) and bundled short flags (`-vo`), the guard's parsers do
+// not, and the disagreement moved the destination URL into refspec position —
+// where it read as a feature branch and passed under
+// protect_default_branch_only. Verified end to end against real git 2.50.
+#[test]
+fn git_gate_blocks_abbreviated_and_bundled_push_options() {
+    for opt in ["--rep", "--push-opt", "-vo", "-qo", "-no"] {
+        let (_, stderr, ok) = git_gate_protect_default(&[
+            "push",
+            opt,
+            "origin",
+            "file:///tmp/attacker-x.git",
+            "feature/my-work",
+        ]);
+        assert_refused(&stderr, ok, "is not an exact 'git push' option");
+    }
+    // The same class hides a force or whole-repo push from flag detection.
+    for opt in ["--forc", "-fu", "--al", "--mir", "--ta"] {
+        let (_, stderr, ok) = git_gate_protect_default(&["push", opt, "origin", "feature/my-work"]);
+        assert_refused(&stderr, ok, "is not an exact 'git push' option");
+    }
+}
+
+// The fail-closed option check must not cost any legitimate spelling.
+#[test]
+fn git_gate_allows_exactly_spelled_push_options() {
+    for args in [
+        &["push", "-u", "origin", "feature/my-work"][..],
+        &["push", "-q", "-v", "origin", "feature/my-work"][..],
+        &["push", "-n", "origin", "feature/my-work"][..],
+        &["push", "-o", "ci.skip", "origin", "feature/my-work"][..],
+        &["push", "-oci.skip", "origin", "feature/my-work"][..],
+        &["push", "--push-option=ci.skip", "origin", "feature/my-work"][..],
+        &["push", "--set-upstream", "origin", "feature/my-work"][..],
+        &["push", "--no-verify", "origin", "feature/my-work"][..],
+        &["push", "--atomic", "--signed", "origin", "feature/my-work"][..],
+        &[
+            "push",
+            "--exec=/usr/bin/git-receive-pack",
+            "origin",
+            "feature/my-work",
+        ][..],
+        &[
+            "push",
+            "--receive-pack=/usr/bin/git-receive-pack",
+            "origin",
+            "feature/my-work",
+        ][..],
+        &["push", "origin", "--", "feature/my-work"][..],
+    ] {
+        let (_, stderr, ok) = git_gate_protect_default(args);
+        assert!(ok, "{args:?} must stay allowed.\n{stderr}");
+    }
 }
 
 #[test]
 fn git_gate_blocks_push_force() {
-    let (_, stderr, ok) = git_gate(&["push", "--force", "origin", "main"], true, true);
+    let (_, stderr, ok) = git_gate_push(&["push", "--force", "origin", "main"], true, true);
     assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
@@ -1351,19 +1456,20 @@ fn git_gate_audit_mode_allows_push() {
 
 #[test]
 fn git_gate_blocks_push_with_refspec() {
-    let (_, stderr, ok) = git_gate(&["push", "origin", "HEAD:refs/heads/main"], true, true);
+    let (_, stderr, ok) = git_gate_push(&["push", "origin", "HEAD:refs/heads/main"], true, true);
     assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_blocks_push_with_set_upstream() {
-    let (_, stderr, ok) = git_gate(&["push", "--set-upstream", "origin", "feature"], true, true);
+    let (_, stderr, ok) =
+        git_gate_push(&["push", "--set-upstream", "origin", "feature"], true, true);
     assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
 #[test]
 fn git_gate_blocks_push_u_shorthand() {
-    let (_, stderr, ok) = git_gate(&["push", "-u", "origin", "feature"], true, true);
+    let (_, stderr, ok) = git_gate_push(&["push", "-u", "origin", "feature"], true, true);
     assert_refused(&stderr, ok, "Push prevention is enabled");
 }
 
