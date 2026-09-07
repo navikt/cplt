@@ -2572,7 +2572,17 @@ pub fn gate_git(
     // authorized against one config and then run under another (H-10). Rather
     // than mirror every such key into the probe, reject the whole class at the
     // gate — it is never needed for a legitimate push and always precedes one.
-    if prevent_push && let Some((flag, key)) = injected_sensitive_config_key(args) {
+    //
+    // Gated on EITHER setting, not on `prevent_push` alone: with
+    // `prevent_push = false, prevent_force_push = true` — a supported
+    // combination — `git -c 'alias.p=push --force' p origin feature` expanded
+    // inside the real git binary after the guard had approved a subcommand it
+    // did not recognize as a push, and the force push landed (#408). Every
+    // reason this check exists applies whenever the guard has any push verdict
+    // to protect.
+    if (prevent_push || prevent_force_push)
+        && let Some((flag, key)) = injected_sensitive_config_key(args)
+    {
         return Err(format!(
             "⚠️ BLOCKED by sandbox: 'git {flag} {key}=…' is not allowed while push prevention is active.\n\
              Command-line config that can redirect a push (remote.*, url.*, push.*, branch.*) or\n\
@@ -2730,16 +2740,40 @@ pub fn gate_git(
                 // is agent-writable, so asking the sandboxed repository at gate time
                 // let the agent choose the guard's yardstick (GHSA-cm6f-3wjh-x9qx).
                 let resolved = repo_facts
-                    .default_branch(&remote, &repo_args)
+                    .default_branch(&remote, &repo_args, real_git)
                     .map(ToString::to_string);
                 if resolved.is_none() && protect_default_branch_only {
-                    block_hints.push(if repo_facts.describes(&repo_args) {
+                    block_hints.push(if repo_facts.describes(&repo_args, real_git) {
                         format!(
                             "protect_default_branch_only is set, but the default branch of remote \
                          '{remote}' could not be determined when this session started, so the \
                          guard cannot tell a feature branch from the protected one. Run \
                          `git remote set-head {remote} -a` (it records refs/remotes/{remote}/HEAD \
                          locally, no push) OUTSIDE the sandbox and start a new session."
+                        )
+                    } else if repo_args.is_empty() {
+                        // No redirect flag, and still not the launch repository:
+                        // the working directory is somewhere else — a nested
+                        // clone, or GIT_DIR/GIT_WORK_TREE in the environment.
+                        // Naming the repository we actually landed in is the
+                        // only way the operator can tell those apart (#416).
+                        let here = real_git
+                            .and_then(|git| git_common_dir(git, &[]))
+                            .map_or_else(
+                                || {
+                                    " (this directory is not a git repository the guard can read)"
+                                        .to_string()
+                                },
+                                |dir| format!(" (its shared git directory is {dir})"),
+                            );
+                        format!(
+                            "protect_default_branch_only is set, but this push does not run in the \
+                         repository this session was launched in{here}. The protected branch is \
+                         captured once at launch, for the launch repository, and it is not \
+                         re-derived inside the sandbox — a nested clone, or GIT_DIR / \
+                         GIT_WORK_TREE pointing elsewhere, has its own default branch that these \
+                         facts say nothing about. Push from the launch repository, or start a \
+                         session in this one."
                         )
                     } else {
                         "protect_default_branch_only is set, but this push redirects git \
@@ -2907,15 +2941,26 @@ pub fn gate_git(
         return Ok(());
     }
 
-    // Unknown git subcommand — block when push prevention is active.
+    // Unknown git subcommand — block when any push verdict is being enforced.
     // An agent can define aliases (via `git config` or `-c alias.x=push`) that resolve
     // to blocked subcommands. Since alias expansion happens inside the real git binary
     // (after the guard has already approved), unknown subcommands must be blocked
     // to prevent bypass via `git -c alias.p=push p origin main` or similar.
-    if prevent_push {
+    //
+    // `prevent_force_push` counts here too. Gating on `prevent_push` alone left
+    // the force-push-only configuration approving `p` as an unrecognized
+    // subcommand, after which git expanded the alias into the very `push
+    // --force` the guard refuses when spelled out (#408).
+    // `GIT_BLOCKED_SUBCOMMANDS` are recognized, not unknown. Under
+    // `prevent_push` they returned above; under force-push-only they are
+    // allowed to reach git (a plain `git push` is legal there), so they must not
+    // be swept up here as unrecognized.
+    if (prevent_push || prevent_force_push) && !GIT_BLOCKED_SUBCOMMANDS.contains(&sub) {
         return Err(format!(
             "⚠️ BLOCKED by sandbox: 'git {sub}' is not a recognized subcommand.\n\
              Push prevention is active — only known git subcommands are allowed.\n\
+             An unrecognized subcommand may be an alias that expands to a push inside git,\n\
+             after this guard has already decided, so it is refused rather than guessed at.\n\
              If this is a legitimate command, please ask the human operator to allow it."
         ));
     }
@@ -3369,6 +3414,18 @@ pub struct RepoFacts {
     /// redirects the command elsewhere is not judged by them (#215).
     #[serde(default)]
     pub project_dir: String,
+    /// Canonical `git rev-parse --git-common-dir` of the launch repository.
+    ///
+    /// `project_dir` alone cannot answer "is this the launch repository?" for a
+    /// command that carries no redirect: the gate inherits the agent's working
+    /// directory, so `cd nested && git push` — a clone of a *different* repo
+    /// under the project tree — reached the baked facts and was judged against
+    /// the launch repo's protected branch (#416). The *common* dir, not the git
+    /// dir, so a linked `git worktree` of the launch repository (whose git dir
+    /// is `.git/worktrees/<name>` but whose common dir is the launch repo's)
+    /// still resolves to the same repository.
+    #[serde(default)]
+    pub git_common_dir: String,
     /// Remote name → its default branch, from `refs/remotes/<remote>/HEAD`.
     #[serde(default)]
     pub default_branches: std::collections::BTreeMap<String, String>,
@@ -3377,16 +3434,31 @@ pub struct RepoFacts {
 impl RepoFacts {
     /// Whether these facts describe the repository `repo_args` targets.
     ///
-    /// No redirect at all is the common case: the agent's `git push` in its own
-    /// work tree. A `-C <dir>` naming the very repository the facts were
-    /// captured for is still described by them. Anything else — a `-C`
-    /// elsewhere, several `-C`, `--git-dir`, `--work-tree` — targets a
-    /// repository these facts say nothing about, and re-deriving the answer
-    /// from *that* repository is the hole this type exists to close, so it
-    /// yields no facts and the caller fails closed.
-    fn describes(&self, repo_args: &[&str]) -> bool {
+    /// A `-C <dir>` naming the very repository the facts were captured for is
+    /// described by them. Anything else — a `-C` elsewhere, several `-C`,
+    /// `--git-dir`, `--work-tree` — targets a repository these facts say
+    /// nothing about, and re-deriving the answer from *that* repository is the
+    /// hole this type exists to close, so it yields no facts and the caller
+    /// fails closed.
+    ///
+    /// No redirect at all used to be assumed to mean the launch repository. It
+    /// does not: the gate runs with the agent's working directory, so `cd
+    /// nested && git push origin <its default branch>` — and `GIT_DIR` /
+    /// `GIT_WORK_TREE` in the environment, which carry no flag to notice — were
+    /// judged against the launch repository's baked facts (#416). Which
+    /// repository you are standing in is a different question from what its
+    /// default branch is: the second must come from launch (it is
+    /// agent-writable, GHSA-cm6f-3wjh-x9qx), the first can only be asked now.
+    /// So ask it, and compare against the launch repo's common dir baked at the
+    /// same time. An unknown common dir on either side means "cannot tell", and
+    /// that fails closed rather than treating every repository as the launch
+    /// one.
+    fn describes(&self, repo_args: &[&str], real_git: Option<&Path>) -> bool {
         if repo_args.is_empty() {
-            return true;
+            let (Some(git), false) = (real_git, self.git_common_dir.is_empty()) else {
+                return false;
+            };
+            return git_common_dir(git, &[]).is_some_and(|d| d == self.git_common_dir);
         }
         let mut dir: Option<&str> = None;
         let mut it = repo_args.iter();
@@ -3418,12 +3490,48 @@ impl RepoFacts {
     /// answer — which every caller treats as "cannot tell a feature branch from
     /// the protected one" and fails closed.
     #[must_use]
-    pub fn default_branch(&self, remote: &str, repo_args: &[&str]) -> Option<&str> {
-        if !self.describes(repo_args) {
+    pub fn default_branch(
+        &self,
+        remote: &str,
+        repo_args: &[&str],
+        real_git: Option<&Path>,
+    ) -> Option<&str> {
+        if !self.describes(repo_args, real_git) {
             return None;
         }
         self.default_branches.get(remote).map(String::as_str)
     }
+}
+
+/// Canonical `git rev-parse --git-common-dir` of the repository `repo_args`
+/// targets, or `None` when git cannot say (not a repository, git absent, a path
+/// that does not resolve). Every caller treats `None` as "cannot tell" and fails
+/// closed.
+///
+/// `--path-format=absolute` because the bare form is relative to the working
+/// directory git resolved it in, which is not the one this process is comparing
+/// against; canonicalized on top so a symlinked path (`/tmp` → `/private/tmp`)
+/// compares equal to the baked one.
+#[allow(clippy::disallowed_methods)] // `real_git` is a git::trusted_git() path supplied by the caller
+fn git_common_dir(real_git: &Path, repo_args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(real_git)
+        .args(repo_args)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    Some(
+        std::fs::canonicalize(path)
+            .ok()?
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Every configured remote of the repository `repo_args` targets.
@@ -3463,6 +3571,7 @@ pub fn capture_repo_facts(real_git: &Path, project_dir: &Path) -> RepoFacts {
             .unwrap_or_else(|_| project_dir.to_path_buf())
             .to_string_lossy()
             .into_owned(),
+        git_common_dir: git_common_dir(real_git, &repo_args).unwrap_or_default(),
         ..RepoFacts::default()
     };
     for remote in list_remotes(real_git, &repo_args) {
@@ -4659,6 +4768,79 @@ mod tests {
         assert!(gate_git(&[], true, true, false, &[], None, &RepoFacts::default()).is_ok());
     }
 
+    /// The force-push-only configuration (`prevent_push = false`,
+    /// `prevent_force_push = true`) is supported, and every gate that exists to
+    /// keep an alias from expanding into a push inside the real git binary has
+    /// to run under it too. Gating them on `prevent_push` alone let
+    /// `git -c 'alias.p=push --force' p origin feature` through while
+    /// `git push --force origin feature` was refused (#408).
+    #[test]
+    fn force_push_only_refuses_alias_and_injected_config() {
+        let force_only =
+            |args: &[&str]| gate_git(args, false, true, false, &[], None, &RepoFacts::default());
+
+        // The reported bypass, both spellings of the injection.
+        let err = force_only(&["-c", "alias.p=push --force", "p", "origin", "feature"])
+            .expect_err("-c alias.* must be refused under force-push-only");
+        assert!(
+            err.contains("is not allowed while push prevention is active"),
+            "{err}"
+        );
+        assert!(
+            force_only(&["--config-env", "alias.p=EVIL", "p", "origin", "feature"]).is_err(),
+            "--config-env alias.* must be refused under force-push-only"
+        );
+        assert!(
+            force_only(&["--config-env=alias.p=EVIL", "p", "origin", "feature"]).is_err(),
+            "--config-env=alias.* must be refused under force-push-only"
+        );
+        // A destination-redirecting key, not only `alias.*`.
+        assert!(
+            force_only(&[
+                "-c",
+                "remote.origin.pushurl=https://evil/x.git",
+                "push",
+                "origin",
+                "x"
+            ])
+            .is_err(),
+            "-c remote.*.pushurl must be refused under force-push-only"
+        );
+
+        // The alias's landing pad: an unrecognized subcommand is what git would
+        // expand, so it is refused rather than approved on the way past.
+        let err = force_only(&["p", "origin", "feature"])
+            .expect_err("an unknown subcommand must be refused under force-push-only");
+        assert!(err.contains("is not a recognized subcommand"), "{err}");
+
+        // Abbreviated and bundled force spellings. `unbindable_push_option` is
+        // gated on `sub == "push"` rather than on `prevent_push`, so these were
+        // already correct — pinned here so the gating stays that way.
+        for args in [
+            ["push", "--forc", "origin", "feature"],
+            ["push", "-fu", "origin", "feature"],
+            ["push", "--force", "origin", "feature"],
+        ] {
+            assert!(
+                force_only(&args).is_err(),
+                "force-push-only must refuse {args:?}"
+            );
+        }
+
+        // …without turning the force-push-only configuration into a push block:
+        // a plain push is exactly what it is supposed to allow. `push` is a
+        // recognized subcommand, so the unknown-subcommand refusal must not
+        // sweep it up now that it runs under this configuration.
+        assert!(
+            force_only(&["push", "origin", "feature"]).is_ok(),
+            "force-push-only must still allow a plain push"
+        );
+        assert!(
+            force_only(&["status"]).is_ok(),
+            "force-push-only must still allow ordinary read commands"
+        );
+    }
+
     #[test]
     fn git_unknown_subcommand_blocked_when_push_prevention_active() {
         // Unknown git commands are blocked when push prevention is active
@@ -4688,7 +4870,10 @@ mod tests {
             )
             .is_ok()
         );
-        // Also allowed when only force push prevention (no regular push block)
+        // Refused under force-push-only too (#408). Allowing it here was the
+        // bypass: `git -c 'alias.p=push --force' p origin feature` reached git,
+        // which expanded the alias into the force push the guard refuses when
+        // it is spelled out.
         assert!(
             gate_git(
                 &["some-custom-alias"],
@@ -4699,7 +4884,7 @@ mod tests {
                 None,
                 &RepoFacts::default()
             )
-            .is_ok()
+            .is_err()
         );
     }
 
@@ -7412,9 +7597,12 @@ mod tests {
         // Both remotes' facts are baked, so nothing here fails closed merely
         // for want of an answer.
         let facts = capture_repo_facts(&git, &repo);
-        assert_eq!(facts.default_branch("origin", &repo_args), Some("trunk"));
         assert_eq!(
-            facts.default_branch("upstream", &repo_args),
+            facts.default_branch("origin", &repo_args, Some(&git)),
+            Some("trunk")
+        );
+        assert_eq!(
+            facts.default_branch("upstream", &repo_args, Some(&git)),
             Some("develop")
         );
 

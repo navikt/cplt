@@ -610,12 +610,12 @@ fn writing_the_remote_head_symref_is_blocked_on_both_ref_backends() {
         // from this symref at every launch, so a persisted rewrite retargets the
         // next one.
         let git = git_bin();
+        let path = dir.to_string_lossy().into_owned();
         assert_eq!(
-            capture_repo_facts(&git, dir).default_branch("origin", &[]),
+            capture_repo_facts(&git, dir).default_branch("origin", &["-C", &path], Some(&git)),
             Some("trunk"),
             "{format}: launch-time facts follow the symref"
         );
-        let path = dir.to_string_lossy().into_owned();
         for args in [
             &[
                 "-C",
