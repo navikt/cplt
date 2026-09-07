@@ -97,6 +97,9 @@ fn configure_command(
     agent: Agent,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    // Startup notices are suppressed under `--quiet`, which `cplt exec`
+    // defaults to: its stdout and stderr must stay clean for pipes.
+    quiet: bool,
     npmrc_allowed: bool,
     playwright_socket_dir: Option<&Path>,
     playwright_runtime: bool,
@@ -255,7 +258,7 @@ fn configure_command(
                 cache_gh_token_to_file(scratch, agent, deny_env);
             }
         }
-        install_command_wrappers(cmd, scratch, project_dir, gh_guard, git_guard);
+        install_command_wrappers(cmd, scratch, project_dir, gh_guard, git_guard, quiet);
     }
 }
 
@@ -455,6 +458,7 @@ fn install_command_wrappers(
     project_dir: &Path,
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -591,7 +595,22 @@ fn install_command_wrappers(
         let repo_facts = crate::git::trusted_git()
             .map(|git| crate::gh_proxy::capture_repo_facts(git, project_dir))
             .unwrap_or_default();
-        if git_guard.protect_default_branch_only && repo_facts.default_branches.is_empty() {
+        // Two conditions narrow this to the case the operator can act on.
+        // `!quiet`, because `cplt exec` defaults to quiet and its stderr must
+        // stay clean for pipes (`e2e_exec_no_output_contamination`) — the same
+        // rule every other launch notice follows. And `has_remotes`, because a
+        // repo with no remote has nowhere to push: nothing is being refused
+        // that could have succeeded, and `git remote set-head origin -a` is
+        // advice for a remote that does not exist. What is left — remotes
+        // configured, no `refs/remotes/*/HEAD` recorded (a `git init` + `git
+        // remote add`, or a clone whose set-head never ran) — is exactly where
+        // every push really is refused.
+        if !quiet
+            && git_guard.protect_default_branch_only
+            && repo_facts.default_branches.is_empty()
+            && crate::git::trusted_git()
+                .is_some_and(|git| crate::gh_proxy::has_remotes(git, project_dir))
+        {
             ui::warn(
                 "git guard: no remote's default branch could be captured at launch, so \
                  protect_default_branch_only cannot tell a feature branch from the protected \
@@ -910,6 +929,7 @@ pub fn exec(
     deny_env: &[String],
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) -> u8 {
     let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-p").arg(&sandbox.profile_text).arg(copilot_bin);
@@ -929,6 +949,7 @@ pub fn exec(
         sandbox.agent,
         gh_guard,
         git_guard,
+        quiet,
         sandbox.npmrc_allowed,
         sandbox.playwright_socket_dir.as_deref(),
         sandbox.playwright_runtime,
@@ -984,6 +1005,7 @@ pub fn exec(
     deny_env: &[String],
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) -> u8 {
     use std::os::unix::process::CommandExt as _;
 
@@ -1000,6 +1022,7 @@ pub fn exec(
             deny_env,
             gh_guard,
             git_guard,
+            quiet,
         ) {
             BwrapOutcome::Ran(code) => return code,
             BwrapOutcome::Fallback => {
@@ -1048,6 +1071,7 @@ pub fn exec(
         sandbox.agent,
         gh_guard,
         git_guard,
+        quiet,
         sandbox.npmrc_allowed,
         sandbox.playwright_socket_dir.as_deref(),
         sandbox.playwright_runtime,
@@ -1108,6 +1132,7 @@ fn exec_bwrap(
     deny_env: &[String],
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) -> BwrapOutcome {
     // The re-entry helper is this very binary; bwrap execs it by absolute path
     // (visible inside the namespace via `--ro-bind / /`).
@@ -1190,6 +1215,7 @@ fn exec_bwrap(
         sandbox.agent,
         gh_guard,
         git_guard,
+        quiet,
         sandbox.npmrc_allowed,
         sandbox.playwright_socket_dir.as_deref(),
         sandbox.playwright_runtime,

@@ -805,9 +805,13 @@ pub(crate) fn git_persistence_paths(write_roots: &[&Path], git_dirs: &[&Path]) -
 /// of a pinned directory fails inside the sandbox, which is what macOS already
 /// does for `.git`.
 ///
-/// Only paths that exist at launch can be bound, so a remote created
-/// mid-session is not pinned — the same launch-time limitation already
-/// recorded on [`expand_rel`].
+/// Every name is listed whether or not it exists on disk, so the set is
+/// derived from the tables and an entry added later cannot skip its ancestors.
+/// Only the ones that exist at launch are actually bound — `bwrap` errors on a
+/// missing bind source, and a mountpoint cannot be made on a path that is not
+/// there (issue #417). So a `.github` the repo does not have yet, or a remote
+/// created mid-session by `git remote add`, is unpinned for the rest of the
+/// run: the same launch-time limitation already recorded on [`expand_rel`].
 pub(crate) fn rename_pin_paths(write_roots: &[&Path], git_dirs: &[&Path]) -> Vec<PathBuf> {
     let ancestors = |set: &'static [Protected]| {
         set.iter()
@@ -1621,7 +1625,12 @@ mod tests {
         };
 
         let project_bind = idx("--bind", proj.path()).expect("the project is bound writable");
-        for pin in &pins {
+        // Only the pins that EXIST are bound: bwrap errors on a missing bind
+        // source, so `build_bwrap_args` skips those (issue #417 — a path absent
+        // at launch is unpinned, and unprotected, until it exists). This
+        // fixture creates none of the `PROTECTED_IN_ROOT` directories, so they
+        // are listed in `pins` and correctly absent from the args.
+        for pin in pins.iter().filter(|p| p.exists()) {
             let at = idx("--bind", pin)
                 .unwrap_or_else(|| panic!("{} must be bound read-write", pin.display()));
             assert!(

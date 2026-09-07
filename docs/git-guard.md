@@ -130,6 +130,14 @@ protected one, so it allows no push at all and the block message says to run
 at. Falling back to `main`/`master` alone would leave a `develop` repository
 unprotected by a setting that says it is protected.
 
+cplt also warns about this at launch, so the refusal is not a surprise at the
+first push — but only where the advice applies and can be heard: the repository
+has remotes and none of them has a recorded default branch, and the session is
+not quiet. A repository with no remote has nowhere to push and no `origin` to
+run `set-head` against, and `cplt exec` is quiet by default because its stdout
+and stderr belong to the command it runs. The block message at push time still
+carries the reason in every case.
+
 A push with no branch in the arguments is not waved through. The guard shells
 out to the real git to resolve the current branch, and fails closed when it
 cannot: an unresolvable branch counts as protected and the push is blocked.

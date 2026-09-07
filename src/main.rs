@@ -2868,6 +2868,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &resolved.deny_env,
             &resolved.gh_guard,
             &resolved.git_guard,
+            resolved.quiet,
         )
     });
 
@@ -3855,6 +3856,7 @@ fn run_exec_command(
             &resolved.deny_env,
             &resolved.gh_guard,
             &resolved.git_guard,
+            resolved.quiet,
         )
     });
 
@@ -3917,6 +3919,7 @@ fn probe_shell(
         &resolved.deny_env,
         &resolved.gh_guard,
         &resolved.git_guard,
+        resolved.quiet,
     )
 }
 

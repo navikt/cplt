@@ -3473,6 +3473,18 @@ pub fn capture_repo_facts(real_git: &Path, project_dir: &Path) -> RepoFacts {
     facts
 }
 
+/// Whether `project_dir` has any remote configured at all.
+///
+/// Separates "no default branch could be captured" into its two cases: a repo
+/// with remotes whose `refs/remotes/*/HEAD` was never recorded (pushes really
+/// will be refused, and `git remote set-head` really is the fix), and a repo
+/// with nowhere to push, where neither is true.
+#[must_use]
+pub fn has_remotes(real_git: &Path, project_dir: &Path) -> bool {
+    let dir = project_dir.to_string_lossy().into_owned();
+    !list_remotes(real_git, &["-C", dir.as_str()]).is_empty()
+}
+
 /// The remote a `git push` writes to.
 ///
 /// An explicit positional remote wins. A single positional that is a refspec

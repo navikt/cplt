@@ -4543,6 +4543,63 @@ paths = [
         );
     }
 
+    /// The `protect_default_branch_only` launch warning must fire only where
+    /// the operator can act on it, and never through `exec`'s clean stderr.
+    ///
+    /// Three repositories, one message: remotes but no recorded
+    /// `refs/remotes/origin/HEAD` is the case where every push really is
+    /// refused, so `--no-quiet` must say so; the same repo under exec's default
+    /// quiet must not (`e2e_exec_no_output_contamination`); and a repo with no
+    /// remote at all has nowhere to push, so the warning — whose advice is `git
+    /// remote set-head origin -a` — would be nonsense there.
+    #[test]
+    fn e2e_exec_default_branch_warning_only_when_actionable() {
+        require_sandbox!();
+        const MSG: &str = "no remote's default branch could be captured";
+
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(
+                git_cmd(dir).args(args).status().is_ok_and(|s| s.success()),
+                "git {args:?} should succeed"
+            );
+        };
+        let no_head = tempfile::tempdir().expect("tempdir");
+        git(no_head.path(), &["init", "--quiet"]);
+        git(
+            no_head.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+
+        let no_remote = tempfile::tempdir().expect("tempdir");
+        git(no_remote.path(), &["init", "--quiet"]);
+
+        let run = |dir: &Path, extra: &[&str]| -> String {
+            let mut cmd = cplt_cmd();
+            cmd.arg("--no-validate")
+                .args(extra)
+                .args(["exec", "--", "/usr/bin/true"])
+                .current_dir(dir);
+            let out = cmd.output().expect("cplt exec should run");
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+
+        let loud = run(no_head.path(), &["--no-quiet"]);
+        assert!(
+            loud.contains(MSG),
+            "a repo with remotes but no origin/HEAD must still be warned about.\nstderr: {loud}"
+        );
+        let quiet = run(no_head.path(), &[]);
+        assert!(
+            !quiet.contains(MSG),
+            "exec defaults to quiet, so no launch notice may reach stderr.\nstderr: {quiet}"
+        );
+        let remoteless = run(no_remote.path(), &["--no-quiet"]);
+        assert!(
+            !remoteless.contains(MSG),
+            "a repo with no remote has nothing to push and no origin to set-head.\nstderr: {remoteless}"
+        );
+    }
+
     #[test]
     fn e2e_exec_env_credentials_filtered() {
         require_sandbox!();

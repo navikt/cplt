@@ -539,6 +539,7 @@ pub fn exec_sandboxed(
     deny_env: &[String],
     gh_guard: &crate::config::GhGuardPolicy,
     git_guard: &crate::config::GitGuardPolicy,
+    quiet: bool,
 ) -> u8 {
     exec::exec(
         sandbox,
@@ -550,6 +551,7 @@ pub fn exec_sandboxed(
         deny_env,
         gh_guard,
         git_guard,
+        quiet,
     )
 }
 
