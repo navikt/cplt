@@ -291,6 +291,8 @@ This lifts TCC restrictions for all child processes, while the cplt sandbox keep
 
 Git commit works for every agent. Whether `git push` works over HTTPS depends on which agent is running, because the credential channel differs per agent.
 
+**The git guard refuses a push to the default branch by default.** A feature-branch push goes through; `git push origin main` is blocked, and so is any force push. That is `git_guard.protect_default_branch_only`, on out of the box. `--preset strict` widens it to every push; `git_guard.mode = "warn"` goes back to observing.
+
 **Prerequisites:**
 
 1. **Use HTTPS remotes** (not SSH). Check with `git remote -v`:
@@ -338,7 +340,7 @@ Exporting a token in your own shell is not enough on its own: `GH_TOKEN`, `GITHU
 
 > **Why is SSH blocked?** The SSH agent socket gives access to *all* loaded keys, which could authenticate to any host. HTTPS through the `gh` credential helper is scoped to GitHub only. See [SSH agent blocking](#ssh-agent-blocking).
 
-> **Tip:** protect your `main` branch with [branch protection rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-a-branch-protection-rule/about-branch-protection-rules) so the agent cannot push directly to main or force-push. Good practice regardless of cplt.
+> **Tip:** the git guard already refuses default-branch and force pushes, but it is a command filter an agent can step around (see [SECURITY.md](../SECURITY.md)). Add [branch protection rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-a-branch-protection-rule/about-branch-protection-rules) so the server refuses them too. Good practice regardless of cplt.
 
 ## Git restrictions
 
@@ -348,7 +350,7 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 | ---------------------------------- | ----------- | ----------------------------------------------------------------- |
 | `git add/commit/status/diff/log`   | ✅ Works     | Local operations, no writes to protected paths                    |
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
-| `git fetch/pull/push` (HTTPS)      | ✅ Works     | Port 443 allowed, `gh auth git-credential` provides credentials, see [Git workflow](#git-workflow-commit--push) for the per-agent caveat |
+| `git fetch/pull/push` (HTTPS)      | ✅ Works, except a default-branch push | Port 443 allowed, `gh auth git-credential` provides credentials. The git guard refuses pushes to `main`/`master` and every force push, see [Git workflow](#git-workflow-commit--push) |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked on macOS | SSH agent socket denied, use HTTPS. On Linux only `SSH_AUTH_SOCK` is withheld |
 | `git config` (local)               | ❌ Blocked on macOS | `.git/config` is write-protected on macOS, which prevents `url.*.insteadOf` hijacking. Applies to the project, to every `allow.write` grant, and to any repository nested under one. Landlock cannot deny a file inside a writable root, so it stays writable on Linux |
 | `git config --global`              | ❌ Blocked   | Git config and `~/.gitignore_global` are read-only                 |
