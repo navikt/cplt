@@ -818,12 +818,13 @@ NOTE:
     /// child process exit code. No startup banner and no confirmation prompt,
     /// so it pipes and aliases cleanly.
     ///
-    /// All top-level cplt flags work: --project-dir, --allow-read, --with-proxy, etc.
+    /// All top-level cplt flags work, written BEFORE `exec`:
+    /// --project-dir, --allow-read, --with-proxy, etc.
     ///
     /// EXAMPLES:
     ///   cplt exec -- npm install
-    ///   cplt exec --allow-lifecycle-scripts -- npm install
-    ///   cplt exec --project-dir /path/to/repo -- make build
+    ///   cplt --allow-lifecycle-scripts exec -- npm install
+    ///   cplt --project-dir /path/to/repo exec -- make build
     ///   cplt exec -c "npm install && npm test"
     ///   alias npm="cplt exec -- npm"
     Exec {
