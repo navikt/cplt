@@ -318,7 +318,9 @@ Git commit works for every agent. Whether `git push` works over HTTPS depends on
 | Agent                                       | HTTPS push  | Credential source                                                          |
 | ------------------------------------------- | ----------- | -------------------------------------------------------------------------- |
 | `copilot`, `antigravity`, `claude`, `goose` | ✅ Works     | Login Keychain is readable, which is where `gh auth login` stores the token |
-| `opencode`, `pi`, `cplt exec`               | ❌ No credential | Keychain is denied, so `gh api user` reports "Requires authentication" |
+| `opencode`, `pi`, `cplt exec`               | ⚠️ Only via `hosts.yml` or `--pass-env` | Keychain is denied. With the token in the Keychain only, `gh api user` reports "Requires authentication" |
+
+Both rows depend on where `gh` keeps the token. An installation that stores it in `~/.config/gh/hosts.yml` rather than the Keychain works for every agent, since that file is readable in every profile, and `--pass-env GH_TOKEN` supplies one regardless of agent.
 
 The Keychain row has one caveat. With `sandbox.keychain_substitute = true` (off by default) the Keychain grant is dropped for an agent whose own credential already reaches it another way — `claude` with `CLAUDE_CODE_OAUTH_TOKEN` exported, `antigravity` with its `~/.gemini/antigravity-cli/antigravity-oauth-token` fallback file present. The drop takes `gh`'s token with it, so HTTPS push fails for exactly those two agents in that configuration.
 

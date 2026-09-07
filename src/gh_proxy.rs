@@ -660,7 +660,8 @@ static POLICY: &[PolicyEntry] = &[
     // would break push in the default config and would withhold nothing —
     // claude/antigravity/goose can read the token out of the Keychain grant
     // themselves, Copilot's cache sits in its own TMPDIR, and opencode/pi/exec
-    // have no token source, so `git-credential get` prints nothing there.
+    // reach whatever `hosts.yml` or `--pass-env` already handed them — in every
+    // case the helper reveals nothing the agent could not read directly.
     // `block_auth_token` does not block `auth token` from the shim either:
     // `decide_gh_gate` intercepts it first, so it means "serve the cache once,
     // else report no cached token".
