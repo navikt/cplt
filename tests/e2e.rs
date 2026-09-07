@@ -5056,6 +5056,45 @@ paths = [
         let (shell_ok, shell_stderr) =
             push(&["--no-validate", "exec", "-c", "git push origin main"]);
 
+        // `Git` and `GIT` reach the real git only where the filesystem is
+        // case-insensitive (APFS/HFS+ by default) — there the guard must run.
+        // Where it is case-sensitive they are simply not on PATH, and cplt has
+        // nothing to resolve, let alone redirect.
+        // Probe the very file `cplt exec` will resolve — the first `git` on
+        // PATH, the way `resolve_exec_binary` walks it — and not `/usr/bin/git`,
+        // which may sit on a mount with the opposite case behaviour.
+        let path_git =
+            std::env::split_paths(&std::env::var_os("PATH").expect("PATH should be set"))
+                .map(|dir| dir.join("git"))
+                .find(|candidate| candidate.is_file())
+                .expect("git should be available in PATH");
+        let case_insensitive_fs = path_git.with_file_name("Git").is_file();
+        for name in ["Git", "GIT"] {
+            let (ok, stderr) = push(&[
+                "--no-validate",
+                "exec",
+                "--",
+                name,
+                "push",
+                "origin",
+                "main",
+            ]);
+            assert!(!ok, "exec -- {name} push must not succeed.\n{stderr}");
+            if case_insensitive_fs {
+                assert!(
+                    stderr.contains("BLOCKED by sandbox"),
+                    "exec -- {name} push resolves to the real git here, so it must meet the \
+                     same guard as the lowercase spelling.\n{stderr}"
+                );
+            } else {
+                assert!(
+                    stderr.contains("not found in PATH"),
+                    "exec -- {name} push has no binary to resolve on a case-sensitive \
+                     filesystem.\n{stderr}"
+                );
+            }
+        }
+
         assert!(
             !shell_ok && shell_stderr.contains("BLOCKED by sandbox"),
             "control: exec -c 'git push' must be refused by the git guard.\n{shell_stderr}"
