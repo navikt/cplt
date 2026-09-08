@@ -271,6 +271,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "repo_dirs",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[]",
+        description: "Additional repositories this project spans (local config only: cplt config set --local). Absolute or ~/ paths, re-validated on every launch.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "inherit_env",
         value_type: ConfigValueType::Bool,
         dangerous: true,

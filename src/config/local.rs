@@ -57,13 +57,14 @@ struct LocalHeader {
 /// Deliberately not "every string in the file": `sandbox.allow_cache_exec`
 /// entries are directory *names* under `~/Library/Caches` and `proxy.upstream`
 /// is a URL, so a blanket "must start with `/` or `~`" rule would reject both.
-fn path_valued(config: &Config) -> [(&'static str, &[String]); 5] {
+fn path_valued(config: &Config) -> [(&'static str, &[String]); 6] {
     [
         ("allow.read", &config.allow.read),
         ("allow.write", &config.allow.write),
         ("allow.exec", &config.allow.exec),
         ("allow.socket", &config.allow.socket),
         ("deny.paths", &config.deny.paths),
+        ("sandbox.repo_dirs", &config.sandbox.repo_dirs),
     ]
 }
 
@@ -388,6 +389,7 @@ impl Config {
                     allow_env_files: _,
                     allow_localhost_any: _,
                     pass_env: _,
+                    repo_dirs: _,
                     inherit_env: _,
                     allow_lifecycle_scripts: _,
                     allow_gpg_signing: _,
@@ -495,7 +497,17 @@ impl Config {
             gh_proxy,
             git_push_prevention,
         );
-        union_lists!(out.sandbox, local.sandbox, pass_env, allow_cache_exec);
+        // `repo_dirs` unions like every other list, but only local ever holds
+        // one: `Config::load_file` clears a global list with a warning, so the
+        // union is always `[] ∪ local`. It is spelled as a union anyway so a
+        // future layer does not silently drop entries.
+        union_lists!(
+            out.sandbox,
+            local.sandbox,
+            pass_env,
+            allow_cache_exec,
+            repo_dirs
+        );
         take_set!(
             out.gh_guard,
             local.gh_guard,
@@ -702,6 +714,29 @@ mod tests {
             .unwrap();
         let err = validate_local_document(&doc).unwrap_err();
         assert!(err.to_string().contains("relative"), "{err}");
+    }
+
+    /// `sandbox.repo_dirs` is a path list, so the local layer's absolute-or-`~`
+    /// rule must reach it: a relative entry has no anchor a repository root
+    /// could live at (`~/.config/cplt/../inner` is not a checkout).
+    #[test]
+    fn repo_dirs_entries_are_path_checked() {
+        let err = parse("[sandbox]\nrepo_dirs = [\"../sibling\"]\n").unwrap_err();
+        assert!(err.to_string().contains("relative"), "{err}");
+
+        let cfg = parse("[sandbox]\nrepo_dirs = [\"/repo/inner\", \"~/code/other\"]\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.sandbox.repo_dirs.len(), 2);
+    }
+
+    /// The overlay must carry the list, or the launch would validate an empty
+    /// set and the persisted repositories would silently drop out of scope.
+    #[test]
+    fn overlay_carries_repo_dirs() {
+        let global = Config::default();
+        let local: Config = toml::from_str("[sandbox]\nrepo_dirs = [\"/repo/inner\"]\n").unwrap();
+        assert_eq!(global.overlay(&local).sandbox.repo_dirs, ["/repo/inner"]);
     }
 
     #[test]

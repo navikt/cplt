@@ -45,7 +45,7 @@ pub use repo::{
 pub use types::{
     AllowConfig, BlocklistSource, CliFlags, Config, DenyConfig, EnforcementMode, FeatureToggle,
     GhGuardConfig, GhGuardPolicy, GitGuardConfig, GitGuardPolicy, GitPushRule, LoadedConfig,
-    Preset, ProxyConfig, Resolved, ResolvedPushRule, SandboxConfig, SubscriptionsConfig,
-    UnknownCommandPolicy,
+    Preset, ProxyConfig, RepoSummaryRow, Resolved, ResolvedPushRule, SandboxConfig,
+    SubscriptionsConfig, UnknownCommandPolicy,
 };
 pub use validation::{ConfigDiagnostic, DiagnosticLevel, validate_config};

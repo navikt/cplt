@@ -23,7 +23,9 @@ mod e2e_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use crate::common::{binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd, temp_repo};
+    use crate::common::{
+        binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd, git_ok, temp_repo,
+    };
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -2503,6 +2505,135 @@ mod e2e_tests {
         );
         let content = std::fs::read_to_string(local_file(&fake_home).unwrap()).unwrap();
         assert!(content.contains("allow_tmp_exec = true"), "{content}");
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// `sandbox.repo_dirs` is the one key that must never come from the global
+    /// file: a machine-wide repository list would attach to every session.
+    #[test]
+    fn e2e_repo_dirs_needs_local() {
+        let fake_home = make_config_home("repo-dirs-global");
+        let repo = temp_repo("navikt/unleash");
+
+        let output = cplt_local(&fake_home, repo.path())
+            .args(["config", "set", "sandbox.repo_dirs", "/tmp/x"])
+            .output()
+            .expect("should run");
+        assert!(!output.status.success(), "global set must be refused");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--local"), "must name --local: {stderr}");
+        assert!(
+            !fake_home.join(".config/cplt/config.toml").exists()
+                || !std::fs::read_to_string(fake_home.join(".config/cplt/config.toml"))
+                    .unwrap()
+                    .contains("repo_dirs"),
+            "a refused set must not write"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// A hand-written global `sandbox.repo_dirs` parses (it is the same serde
+    /// struct), so it must be warned about and dropped rather than silently
+    /// ignored — a dropped repository list is a silent scope discrepancy.
+    #[test]
+    fn e2e_repo_dirs_in_global_config_warns_and_is_ignored() {
+        let fake_home = make_config_home("repo-dirs-global-file");
+        let repo = temp_repo("navikt/unleash");
+        std::fs::create_dir_all(fake_home.join(".config/cplt")).unwrap();
+        std::fs::write(
+            fake_home.join(".config/cplt/config.toml"),
+            "[sandbox]\nrepo_dirs = [\"/tmp/somewhere\"]\n",
+        )
+        .unwrap();
+
+        let output = cplt_local(&fake_home, repo.path())
+            .args(["config", "get", "sandbox.quiet"])
+            .output()
+            .expect("should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("sandbox.repo_dirs") && stderr.contains("ignored"),
+            "the global list must be named and dropped: {stderr}"
+        );
+        assert!(
+            stderr.contains("--local"),
+            "the warning must say where it does belong: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// The acceptance journey for the whole multi-repo line of work: a human
+    /// writes the set once, and a later session with **no flag from anyone**
+    /// picks it up. nav-pilot dispatches agents on the user's behalf, so a flag
+    /// is not a place this can live.
+    #[test]
+    fn e2e_local_repo_dirs_put_a_nested_repo_in_scope_with_no_flag() {
+        require_sandbox!();
+        let fake_home = make_config_home("repo-dirs-launch");
+        let launch = temp_repo("navikt/unleash");
+        let inner = launch.path().join("bifrost");
+        std::fs::create_dir(&inner).unwrap();
+        assert!(git_ok(&inner, &["init", "--quiet"]));
+        assert!(git_ok(
+            &inner,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/navikt/bifrost.git",
+            ]
+        ));
+        let inner = std::fs::canonicalize(&inner).unwrap();
+
+        assert!(
+            cplt_local(&fake_home, launch.path())
+                .args([
+                    "config",
+                    "set",
+                    "--local",
+                    "sandbox.repo_dirs",
+                    inner.to_str().unwrap(),
+                ])
+                .output()
+                .expect("should run")
+                .status
+                .success(),
+            "writing the set must succeed"
+        );
+
+        // No --repo-dir anywhere on this command line.
+        let output = cplt_local(&fake_home, launch.path())
+            .args([
+                "--no-validate",
+                "--no-quiet",
+                "--yes",
+                "exec",
+                "--",
+                "/usr/bin/true",
+            ])
+            .output()
+            .expect("cplt exec should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "launch should succeed: {stderr}");
+        assert!(
+            stderr.contains("Repositories:"),
+            "the summary must carry the block: {stderr}"
+        );
+        assert!(
+            stderr.contains("navikt/bifrost"),
+            "the persisted root must be in scope: {stderr}"
+        );
+        assert!(
+            stderr.contains("local config"),
+            "and must say where it came from: {stderr}"
+        );
+        assert!(
+            stderr.contains("launch repository"),
+            "the launch repo must be named too: {stderr}"
+        );
 
         let _ = std::fs::remove_dir_all(&fake_home);
     }

@@ -40,11 +40,25 @@ impl Config {
         // version, or typos) are collected and warned about but do NOT fail the
         // load. Validity is derived from the struct definitions via serde_ignored,
         // so there is no key list to keep in sync with the config schema.
-        let (config, unknown_keys) = super::validation::deserialize_collecting_unknowns(&raw)
+        let (mut config, unknown_keys) = super::validation::deserialize_collecting_unknowns(&raw)
             .map_err(|e| ConfigError::TomlParse {
-                path: path.display().to_string(),
-                source: e,
-            })?;
+            path: path.display().to_string(),
+            source: e,
+        })?;
+
+        // `sandbox.repo_dirs` is local-layer only. The global file is a serde
+        // struct, so it parses the key happily and would otherwise be dropped
+        // downstream without a word — a silent scope discrepancy between what
+        // the file says and what the session spans. Say so and drop it.
+        if !config.sandbox.repo_dirs.is_empty() {
+            ui::warn(&format!(
+                "sandbox.repo_dirs in {} is ignored: a machine-wide repository list \
+                 would attach to every session. Set it per project instead:\n  \
+                 cplt config set --local sandbox.repo_dirs <DIR>",
+                path.display()
+            ));
+            config.sandbox.repo_dirs.clear();
+        }
 
         for key_path in &unknown_keys {
             // describe_unknown_key already includes "in [section]"; append the
@@ -1009,6 +1023,7 @@ impl Resolved {
         project_dir: &std::path::Path,
         home_dir: &std::path::Path,
         agent: crate::agent::Agent,
+        repos: &[super::types::RepoSummaryRow],
     ) {
         let blue = ui::color(ui::BLUE);
         let dim = ui::color(ui::DIM);
@@ -1024,6 +1039,25 @@ impl Resolved {
             eprintln!(
                 "{blue}[cplt]{nc}  {dim}Preset:{nc}        {green}{preset}{nc}         {dim}baseline, individual flags still override{nc}"
             );
+            eprintln!();
+        }
+
+        // Repositories. Only when the session spans more than the launch repo:
+        // with one repository the `Project:` line below already says it, and a
+        // block restating it would be noise. With more than one, the source
+        // column is the point — a root persisted in the local config is the one
+        // nobody on this command line asked for.
+        if !repos.is_empty() {
+            let width = repos.iter().map(|r| r.name.len()).max().unwrap_or(0);
+            eprintln!("{blue}[cplt]{nc}  {dim}Repositories:{nc}");
+            for row in repos {
+                eprintln!(
+                    "{blue}[cplt]{nc}    {:width$}  {}   {dim}{}{nc}",
+                    row.name,
+                    row.path.display(),
+                    row.source
+                );
+            }
             eprintln!();
         }
 

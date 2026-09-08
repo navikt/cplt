@@ -603,6 +603,14 @@ pub struct SandboxConfig {
     pub allow_localhost_any: Option<bool>,
     /// Extra env vars to pass through to the sandbox (beyond the safe allowlist).
     pub pass_env: Vec<String>,
+    /// Additional repositories this project spans, as `--repo-dir` would name
+    /// them. LOCAL-LAYER ONLY: a machine-wide list in `~/.config/cplt/config.toml`
+    /// would attach to every session, and a `.cplt.toml` naming other trees as
+    /// project-grade roots would be a repo granting paths. `Config::load_file`
+    /// warns and clears it for the global file; the repo schema cannot express
+    /// it at all. Entries are absolute or `~/`-prefixed and are validated by
+    /// `validate_repo_dirs` at launch, on every launch, exactly like the flag.
+    pub repo_dirs: Vec<String>,
     /// Inherit ALL env vars instead of using the safe allowlist (default: false).
     /// DANGEROUS: exposes cloud credentials, npm tokens, database URLs, etc.
     pub inherit_env: Option<bool>,
@@ -771,6 +779,24 @@ pub struct ResolvedPushRule {
     /// would match every repository's remote of that name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// One row of the startup summary's `Repositories:` block.
+///
+/// Built by the launcher, which is where the trusted git and the validated
+/// named roots both live; the summary only formats it. A persisted root — the
+/// one the user has forgotten about — is exactly what this block exists to
+/// make visible, so every row carries where it was named.
+#[derive(Debug, Clone)]
+pub struct RepoSummaryRow {
+    /// `owner/name`, or a fallback when the origin is not a GitHub URL.
+    pub name: String,
+    /// The checkout on disk. Always shown: two checkouts of one repository are
+    /// legal, so the name alone does not identify a row.
+    pub path: std::path::PathBuf,
+    /// Where the root was named: `launch repository`, `--repo-dir`, or
+    /// `local config`.
+    pub source: &'static str,
 }
 
 /// Resolved configuration after merging config file + CLI flags.

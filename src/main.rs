@@ -1197,22 +1197,95 @@ fn git_toplevel(dir: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(path.trim()).ok()
 }
 
-/// Validate the `--repo-dir` roots against the launch repository.
+/// Where a named repository root came from.
+///
+/// Carried through validation and into the startup summary: a root a human
+/// typed and a root a file has been carrying for weeks fail and appear
+/// differently, and the second is the one the user has forgotten about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepoDirSource {
+    /// A `--repo-dir` flag on this command line.
+    Flag,
+    /// `sandbox.repo_dirs` in the per-repo local config at this path (#340).
+    Local(PathBuf),
+}
+
+impl RepoDirSource {
+    /// How a refusal names the entry. Every message in `validate_repo_dirs`
+    /// starts with this, so a persisted root says where it is written down
+    /// instead of blaming a flag nobody passed.
+    fn describe(&self, raw: &Path) -> String {
+        match self {
+            Self::Flag => format!("--repo-dir {}", raw.display()),
+            Self::Local(file) => format!(
+                "sandbox.repo_dirs entry {} in {}",
+                raw.display(),
+                file.display()
+            ),
+        }
+    }
+
+    /// The one-word label the startup summary shows in the source column.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Flag => "--repo-dir",
+            Self::Local(_) => "local config",
+        }
+    }
+}
+
+/// A validated named repository root, with where it was named.
+#[derive(Debug, Clone)]
+struct RepoRoot {
+    dir: PathBuf,
+    source: RepoDirSource,
+}
+
+/// Validate the named repository roots against the launch repository.
+///
+/// The roots are the union of `--repo-dir` flags and `sandbox.repo_dirs` from
+/// the per-repo local config (#340), deduped, flags first, order preserved. A
+/// flag *adds to* the persisted set; it never replaces it.
 ///
 /// A named root is a first-class repository the agent works in, not a grant:
 /// stage 1 accepts only roots *nested* in the project directory, which already
 /// carries the filesystem access as one subtree, so naming one declares its
 /// identity and changes no file rule.
 ///
+/// Every rule below reapplies to the persisted entries on every launch, not
+/// only when they are written. The file may be weeks old and the tree it names
+/// is agent-writable, so a root that was a real repository when it was written
+/// may since have become a symlink, moved, or stopped being one. Validating at
+/// write time only would be a grant that outlives its own evidence.
+///
 /// Every refusal here is a launch-time refusal on purpose. The set decides what
 /// `gh` may target and what `GH_REPO` is pinned to, so a root that is not the
 /// repository the user thinks it is would misdirect writes — the #213 shape.
 fn validate_repo_dirs(
     cli_dirs: &[PathBuf],
+    local_dirs: &[String],
+    local_file: Option<&Path>,
     project_dir: &Path,
     home_dir: &Path,
-) -> anyhow::Result<Vec<PathBuf>> {
-    if cli_dirs.is_empty() {
+) -> anyhow::Result<Vec<RepoRoot>> {
+    // Flags first, then the persisted set: the union is order-preserving and
+    // the flag is what the user typed just now.
+    let mut named: Vec<(PathBuf, RepoDirSource)> = cli_dirs
+        .iter()
+        .map(|d| (d.clone(), RepoDirSource::Flag))
+        .collect();
+    if let Some(file) = local_file {
+        // Absolute or `~/` only, enforced by the local layer at both write and
+        // load; anchoring a relative entry to `~/.config/cplt` — the only
+        // anchor the global file has — would name nothing a repository lives at.
+        for entry in local_dirs {
+            named.push((
+                config::expand_tilde(entry),
+                RepoDirSource::Local(file.to_path_buf()),
+            ));
+        }
+    }
+    if named.is_empty() {
         return Ok(Vec::new());
     }
     if git_toplevel(project_dir).as_deref() != Some(project_dir) {
@@ -1225,10 +1298,12 @@ fn validate_repo_dirs(
             project_dir.display()
         );
     }
-    let mut roots: Vec<PathBuf> = Vec::new();
-    for raw in cli_dirs {
+    let mut roots: Vec<RepoRoot> = Vec::new();
+    for (raw, source) in &named {
+        let raw = raw.as_path();
+        let named_as = source.describe(raw);
         let dir = std::fs::canonicalize(raw)
-            .map_err(|e| anyhow::anyhow!("Cannot resolve --repo-dir {}: {e}", raw.display()))?;
+            .map_err(|e| anyhow::anyhow!("Cannot resolve {named_as}: {e}"))?;
 
         // The FINAL component must not be a symlink. The project dir is
         // agent-writable, so a symlink planted there last session would silently
@@ -1236,21 +1311,20 @@ fn validate_repo_dirs(
         // level down). A symlinked *ancestor* is deliberately tolerated: it is
         // part of the path the user typed to reach the tree, not the name of the
         // repository this launch pins to.
-        let named = std::path::absolute(raw)
-            .map_err(|e| anyhow::anyhow!("Cannot resolve --repo-dir {}: {e}", raw.display()))?;
+        let absolute = std::path::absolute(raw)
+            .map_err(|e| anyhow::anyhow!("Cannot resolve {named_as}: {e}"))?;
         // `absolute` does not fold `..`, so a trailing one leaves no leaf to
         // check and would walk straight past the refusal below.
-        if named
+        if absolute
             .components()
             .any(|c| c == std::path::Component::ParentDir)
         {
             bail!(
-                "--repo-dir {} contains a '..' component, which hides which \
-                 directory is actually named. Name the directory itself.",
-                raw.display()
+                "{named_as} contains a '..' component, which hides which \
+                 directory is actually named. Name the directory itself."
             );
         }
-        let unresolved_leaf = match (named.parent(), named.file_name()) {
+        let unresolved_leaf = match (absolute.parent(), absolute.file_name()) {
             (Some(parent), Some(name)) => std::fs::canonicalize(parent).map(|p| p.join(name)).ok(),
             // A filesystem root has no leaf to plant a symlink as; `is_unsafe_root`
             // refuses it below anyway.
@@ -1265,33 +1339,27 @@ fn validate_repo_dirs(
                 .is_some_and(|leaf| leaf.as_os_str().eq_ignore_ascii_case(dir.as_os_str()))
             {
                 bail!(
-                    "--repo-dir {} differs in case from the directory on disk,\n  {}\n  \
+                    "{named_as} differs in case from the directory on disk,\n  {}\n  \
                      Name it with the on-disk spelling.",
-                    raw.display(),
                     dir.display()
                 );
             }
             bail!(
-                "--repo-dir {} resolves through a symlink, to\n  {}\n  \
+                "{named_as} resolves through a symlink, to\n  {}\n  \
                  A symlink inside the project directory is agent-writable, so the \
                  repository it names could be changed between sessions. Name the \
                  real path.",
-                raw.display(),
                 dir.display()
             );
         }
 
         if dir == project_dir {
-            bail!(
-                "--repo-dir {} is the launch repository itself, which is always in scope.",
-                raw.display()
-            );
+            bail!("{named_as} is the launch repository itself, which is always in scope.");
         }
         if project_dir.starts_with(&dir) {
             bail!(
-                "--repo-dir {} contains the launch repository; launch from it and name the \
-                 inner one.",
-                raw.display()
+                "{named_as} contains the launch repository; launch from it and name the \
+                 inner one."
             );
         }
         if is_unsafe_root(&dir, home_dir) {
@@ -1306,35 +1374,41 @@ fn validate_repo_dirs(
             // repository of its own, and pointing at the launch repo's toplevel
             // would only name something this flag refuses anyway.
             Some(top) if top == project_dir => bail!(
-                "--repo-dir {} is a plain directory in the launch repository, not a \
-                 repository of its own; for a plain directory use `--allow-write`.",
-                raw.display()
+                "{named_as} is a plain directory in the launch repository, not a \
+                 repository of its own; for a plain directory use `--allow-write`."
             ),
             Some(top) => bail!(
-                "--repo-dir {} is inside a repository but is not its toplevel. Name the \
-                 toplevel instead:\n  --repo-dir {}",
-                raw.display(),
+                "{named_as} is inside a repository but is not its toplevel. Name the \
+                 toplevel instead:\n  {}",
                 top.display()
             ),
             None => bail!(
-                "--repo-dir {} is not a git repository; for a plain directory use \
-                 `--allow-write`.",
-                raw.display()
+                "{named_as} is not a git repository; for a plain directory use \
+                 `--allow-write`."
             ),
         }
         if !dir.starts_with(project_dir) {
             bail!(
-                "--repo-dir {} is outside the project directory\n  {}\n  \
+                "{named_as} is outside the project directory\n  {}\n  \
                  sibling repositories are not yet supported; use `--allow-write` for \
                  edit-only.",
-                raw.display(),
                 project_dir.display()
             );
         }
-        if roots.contains(&dir) {
-            bail!("--repo-dir {} was given twice.", raw.display());
+        // Dedup rather than refuse across sources: naming with `--repo-dir` a
+        // root the local file already carries is how a user re-states the set,
+        // not an error. Two spellings of the same root within one source are
+        // still a mistake worth naming.
+        if let Some(seen) = roots.iter().find(|r| r.dir == dir) {
+            if seen.source == *source {
+                bail!("{named_as} was given twice.");
+            }
+            continue;
         }
-        roots.push(dir);
+        roots.push(RepoRoot {
+            dir,
+            source: source.clone(),
+        });
     }
     Ok(roots)
 }
@@ -1502,6 +1576,44 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -
     roots
 }
 
+/// The `Repositories:` rows for the startup summary.
+///
+/// Empty when nothing but the launch repository is in scope: the summary's
+/// `Project:` line already says that, and a one-row block restating it is noise.
+///
+/// `owner/name` comes from the trusted git in the unsandboxed parent, the same
+/// source and the same moment the gh scope set is captured from. A root whose
+/// origin is not a GitHub URL has no `owner/name`; it is still in the set for
+/// files, `[deny]` and the audit, so it is shown by its directory name with the
+/// gh consequence spelled out rather than dropped from the block.
+fn repo_summary_rows(project_dir: &Path, roots: &[RepoRoot]) -> Vec<config::RepoSummaryRow> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let real_git = cplt::git::trusted_git();
+    let name_of = |dir: &Path| {
+        real_git
+            .and_then(|git| gh_proxy::detect_current_repo(git, dir).ok())
+            .unwrap_or_else(|| {
+                format!(
+                    "{} (no GitHub origin)",
+                    dir.file_name().unwrap_or_default().to_string_lossy()
+                )
+            })
+    };
+    let mut rows = vec![config::RepoSummaryRow {
+        name: name_of(project_dir),
+        path: project_dir.to_path_buf(),
+        source: "launch repository",
+    }];
+    rows.extend(roots.iter().map(|root| config::RepoSummaryRow {
+        name: name_of(&root.dir),
+        path: root.dir.clone(),
+        source: root.source.label(),
+    }));
+    rows
+}
+
 /// Resolved configuration, paths, and agent info needed by the sandbox.
 #[allow(dead_code)] // unapproved_proposals is consumed by the warning block in resolve_context
 struct ResolvedContext {
@@ -1509,9 +1621,10 @@ struct ResolvedContext {
     config_path: Option<PathBuf>,
     home_dir: PathBuf,
     project_dir: PathBuf,
-    /// Validated `--repo-dir` roots: repositories the agent works in alongside
-    /// the launch one. Empty unless the flag was given.
-    repo_dirs: Vec<PathBuf>,
+    /// Validated named roots: repositories the agent works in alongside the
+    /// launch one, from `--repo-dir` and `sandbox.repo_dirs` in the per-repo
+    /// local config. Empty unless one of the two named something.
+    repo_roots: Vec<RepoRoot>,
     active_agent: agent::Agent,
     unapproved_proposals: Vec<String>,
 }
@@ -1662,8 +1775,6 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         );
     }
 
-    let repo_dirs = validate_repo_dirs(&cli.repo_dirs, &project_dir, &home_dir)?;
-
     let (cfg, config_path) = match config::Config::load_file() {
         Ok(Some(loaded)) => (loaded.config, Some(loaded.path)),
         Ok(None) => (config::Config::default(), None),
@@ -1676,6 +1787,20 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(local) => local,
         Err(e) => bail!("{e}"),
     };
+
+    // After the local layer, not before it: the set is the union of the flags
+    // and `sandbox.repo_dirs`, and every rule reapplies to the union on every
+    // launch. Before #340 this ran above `load_file`, where there was nothing
+    // persisted to merge.
+    let repo_roots = validate_repo_dirs(
+        &cli.repo_dirs,
+        local_cfg
+            .as_ref()
+            .map_or(&[][..], |l| &l.config.sandbox.repo_dirs),
+        local_cfg.as_ref().map(|l| l.path.as_path()),
+        &project_dir,
+        &home_dir,
+    )?;
     let cli_flags = config::CliFlags {
         preset: cli.preset,
         proxy: config::FeatureToggle::from_pair(cli.with_proxy, cli.no_proxy),
@@ -2100,7 +2225,7 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         config_path,
         home_dir,
         project_dir,
-        repo_dirs,
+        repo_roots,
         active_agent,
         unapproved_proposals,
     })
@@ -2892,10 +3017,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         config_path,
         home_dir,
         project_dir,
-        repo_dirs,
+        repo_roots,
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(&cli, false)?;
+
+    let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
 
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
 
@@ -3035,7 +3162,12 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Print comprehensive summary and confirm before launching Copilot
     if !resolved.quiet {
-        resolved.print_summary(&project_dir, &home_dir, active_agent);
+        resolved.print_summary(
+            &project_dir,
+            &home_dir,
+            active_agent,
+            &repo_summary_rows(&project_dir, &repo_roots),
+        );
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -3099,7 +3231,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             &prepared,
             &agent_bin,
             &copilot_args,
-            &repo_dirs,
+            &repo_paths,
             &resolved.pass_env,
             resolved.inherit_env,
             &disabled_categories,
@@ -3980,11 +4112,13 @@ fn run_exec_command(
         config_path,
         home_dir,
         project_dir,
-        repo_dirs,
+        repo_roots,
         unapproved_proposals: _,
         // active_agent from resolve_context is ignored — exec always uses Shell
         active_agent: _,
     } = resolve_context(cli, false)?;
+
+    let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
 
     // exec defaults to quiet+yes (scripting UX). User can override with --no-quiet / --no-yes.
     if !cli.no_quiet {
@@ -4081,7 +4215,12 @@ fn run_exec_command(
 
     // Summary (only shown with --no-quiet)
     if !resolved.quiet {
-        resolved.print_summary(&project_dir, &home_dir, active_agent);
+        resolved.print_summary(
+            &project_dir,
+            &home_dir,
+            active_agent,
+            &repo_summary_rows(&project_dir, &repo_roots),
+        );
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -4098,7 +4237,7 @@ fn run_exec_command(
             &prepared,
             &exec_bin,
             &exec_args,
-            &repo_dirs,
+            &repo_paths,
             &resolved.pass_env,
             resolved.inherit_env,
             &disabled_categories,
@@ -4440,13 +4579,13 @@ fn run_check_command(
         config_path,
         home_dir,
         project_dir,
-        repo_dirs,
+        repo_roots,
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(cli, true)?;
-    // `cplt check` does not yet report per named root; the flag is still
-    // validated by resolve_context, so a bad one is refused here too.
-    let _ = &repo_dirs;
+    // `cplt check` does not yet report per named root; the set is still
+    // validated by resolve_context, so a bad entry is refused here too.
+    let _ = &repo_roots;
 
     // Shell, not `active_agent`: `check` probes under the Shell profile.
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
@@ -5426,6 +5565,20 @@ fn run_config_set(
         return run_config_set_repo(key, key_info, value, unset, force);
     }
 
+    // `sandbox.repo_dirs` is local-layer only. Writing it globally would produce
+    // a file the next launch warns about and ignores; refuse here instead, and
+    // name the flag that makes it work.
+    if !local && key_info.section == "sandbox" && key_info.key == "repo_dirs" {
+        ui::error(&format!(
+            "sandbox.repo_dirs is per-project, not machine-wide: a repository list in \
+             your global config would attach to every session.\n  \
+             Use --local, from inside the launch repository:\n  \
+             cplt config set --local {key} {}",
+            value.unwrap_or("<DIR>")
+        ));
+        return ExitCode::FAILURE;
+    }
+
     // ── Global mode (default) ───────────────────────────────────────
 
     // deny.env is repo-local only (not in global config file schema)
@@ -5572,10 +5725,18 @@ fn run_config_set_repo(
     // Check if key is valid in repo config
     let Some(target) = config::repo_key_target(key_info) else {
         let reason = config::repo_key_rejection_reason(key_info);
+        // The fallback suggestion is the global file, which is where every
+        // rejected key but one belongs. `sandbox.repo_dirs` is refused there
+        // too, so pointing at it would send the user round a second refusal.
+        let scope = if key_info.section == "sandbox" && key_info.key == "repo_dirs" {
+            "--local "
+        } else {
+            ""
+        };
         ui::error(&format!(
             "{key} is not valid in repo config.\n  \
              Reason: {reason}.\n  \
-             Use: cplt config set {key} {}",
+             Use: cplt config set {scope}{key} {}",
             value.unwrap_or("<VALUE>")
         ));
         return ExitCode::FAILURE;
@@ -7615,6 +7776,17 @@ mod tests {
         (dir, path)
     }
 
+    /// Flags only, the shape every pre-#340 case had. The local layer is
+    /// exercised by the `local_repo_dirs_*` tests below.
+    fn validate_flags(dirs: &[PathBuf], project: &Path) -> anyhow::Result<Vec<RepoRoot>> {
+        validate_repo_dirs(dirs, &[], None, project, Path::new("/nonexistent-home"))
+    }
+
+    /// The validated roots as plain paths, for assertions.
+    fn dirs_of(roots: &[RepoRoot]) -> Vec<PathBuf> {
+        roots.iter().map(|r| r.dir.clone()).collect()
+    }
+
     #[test]
     fn repo_dir_accepts_a_nested_repository() {
         let (_guard, project) = canonical_tempdir();
@@ -7623,13 +7795,8 @@ mod tests {
         if !init_repo(&project) || !init_repo(&inner) {
             return;
         }
-        let roots = validate_repo_dirs(
-            std::slice::from_ref(&inner),
-            &project,
-            Path::new("/nonexistent-home"),
-        )
-        .unwrap();
-        assert_eq!(roots, vec![inner]);
+        let roots = validate_flags(std::slice::from_ref(&inner), &project).unwrap();
+        assert_eq!(dirs_of(&roots), vec![inner]);
     }
 
     #[test]
@@ -7640,9 +7807,7 @@ mod tests {
         if !init_repo(&project) {
             return;
         }
-        let err = validate_repo_dirs(&[plain], &project, Path::new("/nonexistent-home"))
-            .unwrap_err()
-            .to_string();
+        let err = validate_flags(&[plain], &project).unwrap_err().to_string();
         assert!(err.contains("--allow-write"), "{err}");
     }
 
@@ -7655,9 +7820,7 @@ mod tests {
         if !init_repo(&project) || !init_repo(&inner) {
             return;
         }
-        let err = validate_repo_dirs(&[sub], &project, Path::new("/nonexistent-home"))
-            .unwrap_err()
-            .to_string();
+        let err = validate_flags(&[sub], &project).unwrap_err().to_string();
         assert!(err.contains(&inner.display().to_string()), "{err}");
     }
 
@@ -7671,7 +7834,7 @@ mod tests {
         if !init_repo(&project) || !init_repo(&sibling) {
             return;
         }
-        let err = validate_repo_dirs(&[sibling], &project, Path::new("/nonexistent-home"))
+        let err = validate_flags(&[sibling], &project)
             .unwrap_err()
             .to_string();
         assert!(
@@ -7688,18 +7851,12 @@ mod tests {
         if !init_repo(&root) || !init_repo(&project) {
             return;
         }
-        let err = validate_repo_dirs(
-            std::slice::from_ref(&project),
-            &project,
-            Path::new("/nonexistent-home"),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("is the launch repository itself"), "{err}");
-
-        let err = validate_repo_dirs(&[root], &project, Path::new("/nonexistent-home"))
+        let err = validate_flags(std::slice::from_ref(&project), &project)
             .unwrap_err()
             .to_string();
+        assert!(err.contains("is the launch repository itself"), "{err}");
+
+        let err = validate_flags(&[root], &project).unwrap_err().to_string();
         assert!(err.contains("contains the launch repository"), "{err}");
     }
 
@@ -7713,9 +7870,7 @@ mod tests {
         }
         let link = project.join("link");
         std::os::unix::fs::symlink(&inner, &link).unwrap();
-        let err = validate_repo_dirs(&[link], &project, Path::new("/nonexistent-home"))
-            .unwrap_err()
-            .to_string();
+        let err = validate_flags(&[link], &project).unwrap_err().to_string();
         assert!(err.contains("resolves through a symlink"), "{err}");
     }
 
@@ -7732,13 +7887,9 @@ mod tests {
         }
         let link = project.join("link");
         std::os::unix::fs::symlink(&inner, &link).unwrap();
-        let err = validate_repo_dirs(
-            &[link.join("src").join("..")],
-            &project,
-            Path::new("/nonexistent-home"),
-        )
-        .unwrap_err()
-        .to_string();
+        let err = validate_flags(&[link.join("src").join("..")], &project)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("contains a '..' component"), "{err}");
     }
 
@@ -7750,13 +7901,9 @@ mod tests {
         if !init_repo(&project) || !init_repo(&inner) {
             return;
         }
-        let err = validate_repo_dirs(
-            &[inner.clone(), inner],
-            &project,
-            Path::new("/nonexistent-home"),
-        )
-        .unwrap_err()
-        .to_string();
+        let err = validate_flags(&[inner.clone(), inner], &project)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("was given twice"), "{err}");
     }
 
@@ -7768,22 +7915,156 @@ mod tests {
         if !init_repo(&inner) {
             return;
         }
-        let err = validate_repo_dirs(&[inner], &project, Path::new("/nonexistent-home"))
-            .unwrap_err()
-            .to_string();
+        let err = validate_flags(&[inner], &project).unwrap_err().to_string();
         assert!(
             err.contains("needs the launch directory to be a git repository"),
             "{err}"
         );
     }
 
+    /// A local file is a source like the flag, so it takes the same path
+    /// through validation — and the messages must say so, or the user has no
+    /// way to find where a root they never typed came from.
+    fn validate_local(entries: &[&str], project: &Path) -> anyhow::Result<Vec<RepoRoot>> {
+        let owned: Vec<String> = entries.iter().map(|e| (*e).to_string()).collect();
+        validate_repo_dirs(
+            &[],
+            &owned,
+            Some(Path::new("/config/local/abc.toml")),
+            project,
+            Path::new("/nonexistent-home"),
+        )
+    }
+
+    /// The acceptance shape, at the validator: a persisted entry alone puts a
+    /// repository in the set, with no flag on the command line.
+    #[test]
+    fn local_repo_dirs_are_a_source_on_their_own() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        if !init_repo(&project) || !init_repo(&inner) {
+            return;
+        }
+        let roots = validate_local(&[&inner.display().to_string()], &project).unwrap();
+        assert_eq!(dirs_of(&roots), vec![inner]);
+        assert_eq!(roots[0].source.label(), "local config");
+    }
+
+    /// The flag ADDS to the persisted set. Union, deduped, flags first.
+    #[test]
+    fn local_repo_dirs_union_with_the_flag() {
+        let (_guard, project) = canonical_tempdir();
+        let a = project.join("a");
+        let b = project.join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        if !init_repo(&project) || !init_repo(&a) || !init_repo(&b) {
+            return;
+        }
+        let roots = validate_repo_dirs(
+            std::slice::from_ref(&b),
+            &[a.display().to_string(), b.display().to_string()],
+            Some(Path::new("/config/local/abc.toml")),
+            &project,
+            Path::new("/nonexistent-home"),
+        )
+        .unwrap();
+        // `b` appears in both sources and lands once, at its flag position.
+        assert_eq!(dirs_of(&roots), vec![b, a]);
+        assert_eq!(roots[0].source.label(), "--repo-dir");
+        assert_eq!(roots[1].source.label(), "local config");
+    }
+
+    /// The file may be weeks old: a root that has stopped being a repository
+    /// must fail the launch, naming the file rather than a flag nobody passed.
+    #[test]
+    fn a_stale_local_root_fails_the_launch_and_names_the_file() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        if !init_repo(&project) {
+            return;
+        }
+        let err = validate_local(&[&inner.display().to_string()], &project)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sandbox.repo_dirs entry"), "{err}");
+        assert!(err.contains("/config/local/abc.toml"), "{err}");
+        assert!(err.contains("not a repository of its own"), "{err}");
+    }
+
+    /// Same file, same weeks: the leaf became a symlink between sessions.
+    #[test]
+    fn a_local_root_that_became_a_symlink_is_refused() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        if !init_repo(&project) || !init_repo(&inner) {
+            return;
+        }
+        let link = project.join("link");
+        std::os::unix::fs::symlink(&inner, &link).unwrap();
+        let err = validate_local(&[&link.display().to_string()], &project)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("resolves through a symlink"), "{err}");
+        assert!(err.contains("/config/local/abc.toml"), "{err}");
+    }
+
+    /// Stage 1 is nested-only for a persisted root exactly as for a flag.
+    #[test]
+    fn a_local_root_outside_the_project_gets_the_sibling_message() {
+        let (_guard, root) = canonical_tempdir();
+        let project = root.join("project");
+        let sibling = root.join("sibling");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        if !init_repo(&project) || !init_repo(&sibling) {
+            return;
+        }
+        let err = validate_local(&[&sibling.display().to_string()], &project)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sibling repositories are not yet supported"),
+            "{err}"
+        );
+        assert!(err.contains("sandbox.repo_dirs entry"), "{err}");
+    }
+
+    /// `~` is the one non-absolute spelling the local layer accepts, so the
+    /// validator has to expand it rather than treat it as a relative path.
+    #[test]
+    fn a_tilde_local_entry_is_expanded() {
+        let (_guard, project) = canonical_tempdir();
+        let inner = project.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        if !init_repo(&project) || !init_repo(&inner) {
+            return;
+        }
+        // No HOME to expand against here, so assert on the expansion rule
+        // itself: an unexpanded `~/x` would reach canonicalize verbatim.
+        let err = validate_local(&["~/definitely-not-here"], &project)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("~/definitely-not-here"), "{err}");
+        assert!(err.contains("Cannot resolve"), "{err}");
+    }
+
     /// No flag, no validation and no git subprocess.
     #[test]
     fn repo_dir_is_inert_when_unused() {
         assert!(
-            validate_repo_dirs(&[], Path::new("/does/not/exist"), Path::new("/home"))
-                .unwrap()
-                .is_empty()
+            validate_repo_dirs(
+                &[],
+                &[],
+                None,
+                Path::new("/does/not/exist"),
+                Path::new("/home")
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 }
