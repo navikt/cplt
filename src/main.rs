@@ -4601,12 +4601,11 @@ fn run_check_command(
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(cli, true)?;
-    // The gh scope set the launch would capture: the launch repository plus
-    // every named root with a GitHub origin, built the same way
-    // `sandbox_exec` builds it. `check exec gh …` reported a named repository
-    // as outside the startup scope while the launch allowed it, because this
-    // was discarded (#447).
-    let repo_scope = check_repo_scope(&project_dir, &repo_roots);
+    // The named roots, which `ExecContext::for_launch` turns into the gh scope
+    // set. `check exec gh …` reported a named repository as outside the startup
+    // scope while the launch allowed it, because these were discarded here with
+    // `let _ = &repo_roots` (#447).
+    let named_roots: Vec<&Path> = repo_roots.iter().map(|r| r.dir.as_path()).collect();
 
     // Shell, not `active_agent`: `check` probes under the Shell profile.
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
@@ -4695,7 +4694,7 @@ fn run_check_command(
         Some(CheckTarget::Exec { cmd }) => build_exec_check(
             &resolved,
             &project_dir,
-            &repo_scope,
+            &named_roots,
             &cmd,
             agent_name,
             preset_name,
@@ -5068,57 +5067,18 @@ fn build_net_check(
     check::Report::new(agent_name, preset_name, false, vec![item])
 }
 
-/// The gh scope set for `cplt check`, built the way a launch builds it.
-///
-/// `owner/name` comes from the trusted git in the unsandboxed parent, and a
-/// root whose origin is not a GitHub URL contributes nothing — it is still in
-/// scope for files, but there is no repository name for `gh` to be scoped to.
-fn check_repo_scope(project_dir: &Path, roots: &[RepoRoot]) -> Vec<String> {
-    let Some(real_git) = cplt::git::trusted_git() else {
-        return Vec::new();
-    };
-    let mut scope: Vec<String> = Vec::new();
-    for dir in std::iter::once(project_dir).chain(roots.iter().map(|r| r.dir.as_path())) {
-        // `repos_match`, not `contains`: the launch dedups case-insensitively
-        // and ignoring a `.git` suffix, so `navikt/Foo` and `navikt/foo` are
-        // one member there. Exact equality here would let this surface hold a
-        // scope set the launch never has — the very class of bug the rest of
-        // this change closes.
-        if let Ok(repo) = gh_proxy::detect_current_repo(real_git, dir)
-            && !scope
-                .iter()
-                .any(|member| gh_proxy::repos_match(member, &repo))
-        {
-            scope.push(repo);
-        }
-    }
-    scope
-}
-
 fn build_exec_check(
     resolved: &config::Resolved,
     project_dir: &Path,
-    repo_scope: &[String],
+    named_roots: &[&Path],
     cmd: &[String],
     agent_name: String,
     preset_name: Option<String>,
 ) -> check::Report {
-    // The same capture the launch does, from the same trusted git (see
-    // `sandbox_exec.rs`, "baked at launch"): without it every push reads as
-    // blocked, feature branches included.
-    let repo_facts = crate::git::trusted_git()
-        .map(|git| gh_proxy::capture_repo_facts(git, project_dir))
-        .unwrap_or_default();
-    let ctx = check::ExecContext {
-        allow_docker: resolved.allow_docker,
-        allow_tmp_exec: resolved.allow_tmp_exec,
-        gh_guard: &resolved.gh_guard,
-        git_guard: &resolved.git_guard,
-        project_dir,
-        repo_facts: &repo_facts,
-        repo_scope,
-        scratch_dir: resolved.scratch_dir,
-    };
+    // One constructor, deriving everything from the same values the launch
+    // resolves from. See `ExecContext::for_launch` for why this is not
+    // assembled field by field any more (#447).
+    let ctx = check::ExecContext::for_launch(resolved, project_dir, named_roots);
     let expl = check::explain_exec(cmd, &ctx);
     let item = check::CheckItem {
         name: "exec".to_string(),

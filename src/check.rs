@@ -485,33 +485,77 @@ pub fn explain_domain(
 
 /// The exec-relevant slice of the resolved policy, for [`explain_exec`].
 pub struct ExecContext<'a> {
-    pub allow_docker: bool,
-    pub allow_tmp_exec: bool,
-    pub gh_guard: &'a crate::config::GhGuardPolicy,
-    pub git_guard: &'a crate::config::GitGuardPolicy,
-    pub project_dir: &'a Path,
+    allow_docker: bool,
+    allow_tmp_exec: bool,
+    gh_guard: &'a crate::config::GhGuardPolicy,
+    git_guard: &'a crate::config::GitGuardPolicy,
+    project_dir: &'a Path,
     /// The repository facts the launch bakes in, captured the same way and from
     /// the same trusted git.
-    ///
-    /// Without them `protect_default_branch_only` has no default branch to
-    /// compare against, so `gate_git` fails closed and every push reads as
-    /// blocked — including a feature-branch push the launch allows. That is
-    /// the most common push there is, so the surface built to answer "what
-    /// will happen" was wrong about the ordinary case.
-    pub repo_facts: &'a crate::gh_proxy::RepoFacts,
+    repo_facts: crate::gh_proxy::RepoFacts,
     /// The gh scope set a launch captures: the launch repository plus every
     /// named root whose origin is on GitHub.
-    ///
-    /// Empty means "no named roots" — `explain_exec` then falls back to
-    /// resolving the project directory, which is what a launch with no
-    /// `repo_dirs` does. Without this, `check exec` reported a repository the
-    /// launch allows as outside the startup scope, because it only ever knew
-    /// about the project directory (#447).
-    pub repo_scope: &'a [String],
+    repo_scope: Vec<String>,
     /// Both guards install themselves through a PATH shim in the scratch dir.
     /// Without one there is no shim, so the guards do not run whatever the
     /// config says — which is what the launch summary reports as `inactive`.
-    pub scratch_dir: bool,
+    scratch_dir: bool,
+}
+
+impl<'a> ExecContext<'a> {
+    /// Build the context from the same values a launch resolves from.
+    ///
+    /// The fields above are private and this is the only constructor, which is
+    /// the point. `check exec` answers "what will happen if I run this", and it
+    /// got that wrong five times in two days — reporting a block under
+    /// `mode = "warn"` while the launch ran the command and moved the remote;
+    /// reporting a block with no scratch dir, where no guard runs at all;
+    /// reporting a feature-branch push blocked on the default config; reporting
+    /// a named repository outside the gh scope; and still reporting
+    /// `gh auth token` blocked while the launch serves it from cache (#440).
+    ///
+    /// Every one had the same cause. The context was assembled by hand from
+    /// whatever the author remembered, so each input the launch gained had to
+    /// be added in two places, and the second was missed. Deriving it here from
+    /// `Resolved` plus the two things a launch knows that config does not — the
+    /// project directory and the named roots — means a new input reaches this
+    /// surface or it reaches neither (#447).
+    #[must_use]
+    pub fn for_launch(
+        resolved: &'a crate::config::Resolved,
+        project_dir: &'a Path,
+        named_roots: &[&Path],
+    ) -> Self {
+        let real_git = crate::git::trusted_git();
+        let repo_facts = real_git
+            .map(|git| crate::gh_proxy::capture_repo_facts(git, project_dir))
+            .unwrap_or_default();
+        // `repos_match`, not `contains`: the launch dedups case-insensitively
+        // and ignoring a `.git` suffix, so holding an exact-match set here
+        // would be a scope set the launch never has.
+        let mut repo_scope: Vec<String> = Vec::new();
+        if let Some(git) = real_git {
+            for dir in std::iter::once(project_dir).chain(named_roots.iter().copied()) {
+                if let Ok(repo) = crate::gh_proxy::detect_current_repo(git, dir)
+                    && !repo_scope
+                        .iter()
+                        .any(|member| crate::gh_proxy::repos_match(member, &repo))
+                {
+                    repo_scope.push(repo);
+                }
+            }
+        }
+        Self {
+            allow_docker: resolved.allow_docker,
+            allow_tmp_exec: resolved.allow_tmp_exec,
+            gh_guard: &resolved.gh_guard,
+            git_guard: &resolved.git_guard,
+            project_dir,
+            repo_facts,
+            repo_scope,
+            scratch_dir: resolved.scratch_dir,
+        }
+    }
 }
 
 /// Static explanation of whether a command would run under the resolved policy.
@@ -661,7 +705,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             // branches a push actually targets; without one no push is ever
             // provably feature-only and the default-branch arm fails closed.
             crate::git::trusted_git(),
-            ctx.repo_facts,
+            &ctx.repo_facts,
         ) {
             Ok(()) => ExecExplain {
                 decision: Decision::Allowed,
@@ -720,7 +764,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             crate::gh_proxy::gate_with_repo_scope(
                 &rest,
                 &policy,
-                ctx.repo_scope,
+                &ctx.repo_scope,
                 crate::git::trusted_git(),
             )
         };
@@ -1135,28 +1179,22 @@ mod tests {
 
     // ── explain_exec ──
 
-    /// Facts for the unit tests: a scratch dir, and no captured repository.
-    ///
-    /// Empty facts is the honest default here — these tests assert on policy
-    /// shape, not on a checkout — and it is also the case the guard fails
-    /// closed on, so `git push` reads as blocked exactly as it did before
-    /// `ExecContext` grew these fields.
-    static NO_FACTS: std::sync::LazyLock<crate::gh_proxy::RepoFacts> =
-        std::sync::LazyLock::new(crate::gh_proxy::RepoFacts::default);
-
     fn exec_ctx<'a>(
         gh: &'a GhGuardPolicy,
         git: &'a GitGuardPolicy,
         allow_docker: bool,
     ) -> ExecContext<'a> {
+        // The tests construct directly because they assert on policy shape
+        // rather than on a checkout — but they are inside this module, which is
+        // what keeps `for_launch` the only way in from anywhere else.
         ExecContext {
             allow_docker,
             allow_tmp_exec: false,
             gh_guard: gh,
             git_guard: git,
             project_dir: Path::new("/home/u/proj"),
-            repo_facts: &NO_FACTS,
-            repo_scope: &[],
+            repo_facts: crate::gh_proxy::RepoFacts::default(),
+            repo_scope: Vec::new(),
             scratch_dir: true,
         }
     }
