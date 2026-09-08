@@ -1390,8 +1390,10 @@ fn validate_repo_dirs(
         if !dir.starts_with(project_dir) {
             bail!(
                 "{named_as} is outside the project directory\n  {}\n  \
-                 sibling repositories are not yet supported; use `--allow-write` for \
-                 edit-only.",
+                 Only repositories checked out inside the project directory can be \
+                 named. For one that lives elsewhere, `--allow-write <DIR>` grants \
+                 the files — the agent can build and edit there, but `gh` will not \
+                 target it.",
                 project_dir.display()
             );
         }
@@ -4599,9 +4601,12 @@ fn run_check_command(
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(cli, true)?;
-    // `cplt check` does not yet report per named root; the set is still
-    // validated by resolve_context, so a bad entry is refused here too.
-    let _ = &repo_roots;
+    // The gh scope set the launch would capture: the launch repository plus
+    // every named root with a GitHub origin, built the same way
+    // `sandbox_exec` builds it. `check exec gh …` reported a named repository
+    // as outside the startup scope while the launch allowed it, because this
+    // was discarded (#447).
+    let repo_scope = check_repo_scope(&project_dir, &repo_roots);
 
     // Shell, not `active_agent`: `check` probes under the Shell profile.
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
@@ -4687,9 +4692,14 @@ fn run_check_command(
             agent_name,
             preset_name,
         ),
-        Some(CheckTarget::Exec { cmd }) => {
-            build_exec_check(&resolved, &project_dir, &cmd, agent_name, preset_name)
-        }
+        Some(CheckTarget::Exec { cmd }) => build_exec_check(
+            &resolved,
+            &project_dir,
+            &repo_scope,
+            &cmd,
+            agent_name,
+            preset_name,
+        ),
     };
 
     if let Some(handle) = proxy_handle {
@@ -5058,9 +5068,30 @@ fn build_net_check(
     check::Report::new(agent_name, preset_name, false, vec![item])
 }
 
+/// The gh scope set for `cplt check`, built the way a launch builds it.
+///
+/// `owner/name` comes from the trusted git in the unsandboxed parent, and a
+/// root whose origin is not a GitHub URL contributes nothing — it is still in
+/// scope for files, but there is no repository name for `gh` to be scoped to.
+fn check_repo_scope(project_dir: &Path, roots: &[RepoRoot]) -> Vec<String> {
+    let Some(real_git) = cplt::git::trusted_git() else {
+        return Vec::new();
+    };
+    let mut scope = Vec::new();
+    for dir in std::iter::once(project_dir).chain(roots.iter().map(|r| r.dir.as_path())) {
+        if let Ok(repo) = gh_proxy::detect_current_repo(real_git, dir)
+            && !scope.contains(&repo)
+        {
+            scope.push(repo);
+        }
+    }
+    scope
+}
+
 fn build_exec_check(
     resolved: &config::Resolved,
     project_dir: &Path,
+    repo_scope: &[String],
     cmd: &[String],
     agent_name: String,
     preset_name: Option<String>,
@@ -5078,6 +5109,7 @@ fn build_exec_check(
         git_guard: &resolved.git_guard,
         project_dir,
         repo_facts: &repo_facts,
+        repo_scope,
         scratch_dir: resolved.scratch_dir,
     };
     let expl = check::explain_exec(cmd, &ctx);
@@ -7910,7 +7942,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("sibling repositories are not yet supported"),
+            err.contains("Only repositories checked out inside the project directory"),
             "{err}"
         );
     }
@@ -8099,7 +8131,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("sibling repositories are not yet supported"),
+            err.contains("Only repositories checked out inside the project directory"),
             "{err}"
         );
         assert!(err.contains("sandbox.repo_dirs entry"), "{err}");

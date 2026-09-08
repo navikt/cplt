@@ -499,6 +499,15 @@ pub struct ExecContext<'a> {
     /// the most common push there is, so the surface built to answer "what
     /// will happen" was wrong about the ordinary case.
     pub repo_facts: &'a crate::gh_proxy::RepoFacts,
+    /// The gh scope set a launch captures: the launch repository plus every
+    /// named root whose origin is on GitHub.
+    ///
+    /// Empty means "no named roots" — `explain_exec` then falls back to
+    /// resolving the project directory, which is what a launch with no
+    /// `repo_dirs` does. Without this, `check exec` reported a repository the
+    /// launch allows as outside the startup scope, because it only ever knew
+    /// about the project directory (#447).
+    pub repo_scope: &'a [String],
     /// Both guards install themselves through a PATH shim in the scratch dir.
     /// Without one there is no shim, so the guards do not run whatever the
     /// config says — which is what the launch summary reports as `inactive`.
@@ -702,7 +711,20 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             },
             allow_api_write: ctx.gh_guard.allow_api_write,
         };
-        return match crate::gh_proxy::gate(&rest, ctx.project_dir, &policy) {
+        // The scope-aware gate when the launch would have a scope set, the
+        // project-dir one otherwise — the same two shapes `sandbox_exec` picks
+        // between, rather than a third answer only this surface gives.
+        let verdict = if ctx.repo_scope.is_empty() {
+            crate::gh_proxy::gate(&rest, ctx.project_dir, &policy)
+        } else {
+            crate::gh_proxy::gate_with_repo_scope(
+                &rest,
+                &policy,
+                ctx.repo_scope,
+                crate::git::trusted_git(),
+            )
+        };
+        return match verdict {
             Ok(_) => ExecExplain {
                 decision: Decision::Allowed,
                 reason: "allowed by the gh guard.".to_string(),
@@ -1134,6 +1156,7 @@ mod tests {
             git_guard: git,
             project_dir: Path::new("/home/u/proj"),
             repo_facts: &NO_FACTS,
+            repo_scope: &[],
             scratch_dir: true,
         }
     }
