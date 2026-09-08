@@ -22,7 +22,7 @@ cplt gives you kernel-level enforcement with team-configurable policy:
 
 - Per-repo policy in `.cplt.toml`, committed to version control, so it is tamper-proof and auditable
 - Deny by default for credentials, secrets, and sensitive files
-- Command-level git and gh interception that blocks pushes, merges, and releases
+- Command-level git and gh interception: pushes to the default branch, force pushes, merges, and releases are blocked, feature branches stay open
 - Outbound network filtering with an audit log
 - No Docker, no VMs. One binary that runs on a locked-down laptop
 - Zero-config start for developers, with escape hatches when a build genuinely needs one
