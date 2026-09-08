@@ -660,24 +660,42 @@ fn git_output(project_dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Writable roots the audit does NOT measure: every `allow.write` grant that
-/// falls outside `project_dir`.
+/// Writable roots the audit does NOT measure: every `--repo-dir` root, plus
+/// every `allow.write` grant that falls outside `project_dir`.
 ///
 /// The audit runs git in `project_dir` alone, so a session that only touched a
 /// granted repository is reported as "no project file changes" — an absence of
 /// information rendered as a clean bill of health (#214). Naming the roots
 /// removes the false assurance; auditing them properly needs a per-root report
-/// format and belongs with the multi-repo work in #165.
+/// format and belongs with the multi-repo work in #344.
 ///
-/// Paths *inside* `project_dir` are omitted: the project's own `git status`
+/// A named root is listed even though it sits *inside* `project_dir`: it keeps
+/// its own git history, so the project's `git status` renders it as a single
+/// `?? <dir>/` line, or as nothing at all when it is gitignored. That is the
+/// same absence of information one level down, and it is the case `--repo-dir`
+/// exists to create.
+///
+/// Other paths inside `project_dir` are omitted: the project's own `git status`
 /// already covers them. (A grant pointing at a git-ignored subdirectory is a
 /// residual — git does not report those either, and this function cannot tell.)
-fn unaudited_roots<'a>(project_dir: &Path, allow_write: &'a [PathBuf]) -> Vec<&'a Path> {
-    allow_write
+fn unaudited_roots<'a>(
+    project_dir: &Path,
+    allow_write: &'a [PathBuf],
+    named_roots: &'a [PathBuf],
+) -> Vec<&'a Path> {
+    let mut roots: Vec<&Path> = named_roots.iter().map(PathBuf::as_path).collect();
+    for grant in allow_write
         .iter()
         .map(PathBuf::as_path)
         .filter(|p| !p.starts_with(project_dir))
-        .collect()
+    {
+        // A grant may name a root that `--repo-dir` already named; one line per
+        // path, or the count contradicts the list.
+        if !roots.contains(&grant) {
+            roots.push(grant);
+        }
+    }
+    roots
 }
 
 /// The warning line naming the writable roots the audit did not measure, or
@@ -698,8 +716,17 @@ fn unaudited_warning(project_dir: &Path, unaudited: &[&Path]) -> Option<String> 
         .map(|p| escape_path(&p.display().to_string()))
         .collect::<Vec<_>>()
         .join(", ");
+    // Said only when a listed root is nested, because that is the line that
+    // otherwise reads as a contradiction: "audit covers /w/app only" followed
+    // by "/w/app/lib was NOT audited".
+    let nested = if unaudited.iter().any(|p| p.starts_with(project_dir)) {
+        " A repository checked out inside the project keeps its own git history, so its \
+         changes never appear in the project's git status."
+    } else {
+        ""
+    };
     Some(format!(
-        "audit covers {} only — {} writable path{} outside it {} NOT audited: {list}",
+        "audit covers {} only — {} writable path{} {} NOT audited: {list}.{nested}",
         escape_path(&project_dir.display().to_string()),
         unaudited.len(),
         if unaudited.len() == 1 { "" } else { "s" },
@@ -885,6 +912,7 @@ impl SettleProbe {
 pub fn run<F: FnOnce() -> u8>(
     project_dir: &Path,
     allow_write: &[PathBuf],
+    named_roots: &[PathBuf],
     enabled: bool,
     exec: F,
 ) -> u8 {
@@ -907,7 +935,10 @@ pub fn run<F: FnOnce() -> u8>(
             "the session left processes running — anything they change from here on is NOT audited",
         );
     }
-    if let Some(line) = unaudited_warning(project_dir, &unaudited_roots(project_dir, allow_write)) {
+    if let Some(line) = unaudited_warning(
+        project_dir,
+        &unaudited_roots(project_dir, allow_write, named_roots),
+    ) {
         ui::warn(&line);
     }
     exit_code
@@ -1401,7 +1432,8 @@ mod tests {
         assert!(
             unaudited_roots(
                 &project,
-                &[PathBuf::from("/w/app/vendor"), PathBuf::from("/w/app")]
+                &[PathBuf::from("/w/app/vendor"), PathBuf::from("/w/app")],
+                &[]
             )
             .is_empty()
         );
@@ -1413,11 +1445,54 @@ mod tests {
                     PathBuf::from("/w/app/vendor"),
                     PathBuf::from("/w/lib"),
                     PathBuf::from("/w/app-tools"),
-                ]
+                ],
+                &[]
             ),
             vec![Path::new("/w/lib"), Path::new("/w/app-tools")]
         );
-        assert!(unaudited_roots(&project, &[]).is_empty());
+        assert!(unaudited_roots(&project, &[], &[]).is_empty());
+    }
+
+    /// A `--repo-dir` root is nested inside the project by construction today,
+    /// so the "inside the project is already covered" rule would drop exactly
+    /// the roots this exists to name.
+    #[test]
+    fn unaudited_roots_names_a_nested_named_repository() {
+        let project = PathBuf::from("/w/app");
+        assert_eq!(
+            unaudited_roots(&project, &[], &[PathBuf::from("/w/app/lib")]),
+            vec![Path::new("/w/app/lib")],
+        );
+        // A grant that names a root `--repo-dir` already named is one path, not
+        // two: the count in the warning has to match the list.
+        assert_eq!(
+            unaudited_roots(
+                &project,
+                &[PathBuf::from("/w/lib")],
+                &[PathBuf::from("/w/lib")]
+            ),
+            vec![Path::new("/w/lib")],
+        );
+    }
+
+    /// "audit covers /w/app only" next to "/w/app/lib was NOT audited" reads as
+    /// a contradiction unless the reason is stated, and the reason is the whole
+    /// point: a nested checkout has its own history.
+    #[test]
+    fn unaudited_warning_explains_a_nested_root_and_not_an_outside_one() {
+        let project = PathBuf::from("/w/app");
+        let nested = unaudited_warning(&project, &[Path::new("/w/app/lib")])
+            .expect("a named root is never covered");
+        assert!(
+            nested.contains("its own git history"),
+            "a nested root needs its reason: {nested:?}"
+        );
+        let outside =
+            unaudited_warning(&project, &[Path::new("/w/lib")]).expect("a grant outside it");
+        assert!(
+            !outside.contains("its own git history"),
+            "nothing is nested here, so the clause is noise: {outside:?}"
+        );
     }
 
     #[test]
