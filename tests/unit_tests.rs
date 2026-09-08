@@ -6448,8 +6448,11 @@ fn repo_key_target_rejects_machine_specific_keys() {
         "sandbox.quiet",
         "sandbox.validate",
         "sandbox.scratch_dir",
+        // `inherit_env` stays rejected: it passes the whole environment, so a
+        // repo could not enumerate what it is asking for and a reviewer could
+        // not see it. `pass_env` names variables one at a time, which is why it
+        // moved to `[propose]` (#443) and is asserted below instead.
         "sandbox.inherit_env",
-        "sandbox.pass_env",
         "proxy.enabled",
         "proxy.port",
         "proxy.log_file",
@@ -6466,6 +6469,21 @@ fn repo_key_target_rejects_machine_specific_keys() {
             "{key_str} should be rejected in repo config"
         );
     }
+
+    // The deliberate exception (#443). The old refusal said environment
+    // variables are machine-specific and not project policy; plenty are the
+    // application's — NODE_ENV, TZ, SPRING_PROFILES_ACTIVE — and none of those
+    // is sensitive. The real hazard is that the name is resolved against the
+    // *parent's* environment, which is what `[propose]` plus a per-machine
+    // acceptance is for.
+    let pass_env = lookup_key("sandbox.pass_env").unwrap();
+    assert!(
+        matches!(
+            repo_key_target(pass_env),
+            Some(cplt::config::RepoKeyTarget::ProposeStrArray("pass_env"))
+        ),
+        "sandbox.pass_env is proposable, and nothing else changed about it"
+    );
 }
 
 #[test]

@@ -1550,6 +1550,23 @@ impl Resolved {
             }
         }
 
+        // `pass_env` proposals (#443). The variable is read from the parent's
+        // environment at launch, so what a repo can express here is a *name*,
+        // never a value — and it does nothing until this machine's human has
+        // accepted it.
+        if is_approved("sandbox.pass_env") {
+            for name in &repo_config.propose.pass_env {
+                if !self.pass_env.contains(name) {
+                    self.pass_env.push(name.clone());
+                }
+            }
+            // The list is sorted and deduped when config and CLI are merged;
+            // appending here would leave it neither, and every other proposal
+            // that extends a list restores the invariant.
+            self.pass_env.sort();
+            self.pass_env.dedup();
+        }
+
         // Port proposals
         if is_approved("allow.ports") {
             for &port in &repo_config.propose.allow.ports {

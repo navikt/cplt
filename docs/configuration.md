@@ -268,6 +268,8 @@ Each toggle resolves in this order: explicit CLI flag, then explicit config valu
 
 Project-specific sandbox permissions belong in `.cplt.toml`, approved with `cplt trust`. That covers `sandbox.allow_jvm_attach`, `sandbox.allow_msbuild`, `sandbox.allow_docker`, `sandbox.allow_localhost_any`, and `allow.ports`. Machine-specific paths such as `allow.read ~/.gitconfig` go in `~/.config/cplt/config.toml`.
 
+`sandbox.pass_env` is the exception among the environment settings: a project can propose the variables its build needs (`NODE_ENV`, `TZ`, `SPRING_PROFILES_ACTIVE`), because it names them one at a time and a reviewer sees the list in the diff. The value still comes from whoever launches the agent, never from the file, and each developer approves once with `cplt trust`. `sandbox.inherit_env` stays refused — it passes the whole environment, so there is nothing for a reviewer to review.
+
 The settings below are machine-specific or local CLI preferences, so `.cplt.toml` does not support them at all. `cplt config set --repo <key>` rejects each one with an explanation. Set them globally instead.
 
 | Key | Why |
@@ -281,7 +283,6 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.brief` | local agent-context preference |
 | `sandbox.agents_md` | a repo must not be able to make cplt write into its own `AGENTS.md` |
 | `sandbox.use_bubblewrap` | depends on bwrap being installed on the machine |
-| `sandbox.pass_env` | machine-specific env passthrough |
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |

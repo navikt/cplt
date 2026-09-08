@@ -6354,7 +6354,8 @@ fn run_config_set_repo(
         let section_name = match target {
             config::RepoKeyTarget::ProposeBool
             | config::RepoKeyTarget::ProposeAllow(_)
-            | config::RepoKeyTarget::ProposeProxy(_) => "propose",
+            | config::RepoKeyTarget::ProposeProxy(_)
+            | config::RepoKeyTarget::ProposeStrArray(_) => "propose",
             config::RepoKeyTarget::Deny(_) => "deny",
             _ => "unknown",
         };
@@ -6368,11 +6369,14 @@ fn run_config_set_repo(
     );
 
     // Remind about trust approval for propose keys
+    // Every `[propose]` shape, including the top-level arrays: a proposal the
+    // author is not told to approve is one that silently does nothing.
     if matches!(
         target,
         config::RepoKeyTarget::ProposeBool
             | config::RepoKeyTarget::ProposeAllow(_)
             | config::RepoKeyTarget::ProposeProxy(_)
+            | config::RepoKeyTarget::ProposeStrArray(_)
     ) && !unset
     {
         eprintln!(
