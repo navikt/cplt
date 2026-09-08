@@ -1954,8 +1954,9 @@ fn gate_with_scope_resolver(
                     "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the startup repo '{}'.\n\
                      Reason: {}\n\
                      Ways forward: read-only commands take an explicit repository — \
-                     `gh pr view -R <owner>/<repo>`, `gh pr diff -R …`, `gh issue view -R …` — \
-                     and are allowed against any repository. Raw `gh api` is not. If the agent \
+                     `gh pr view -R <owner>/<repo> <number>`, `gh pr diff -R <owner>/<repo> \
+                     <number>`, `gh issue view -R <owner>/<repo> <number>` — and are allowed \
+                     against any repository. Raw `gh api` is not. If the agent \
                      works in that repository too and it is checked out inside this one, name it \
                      with `cplt config set --local sandbox.repo_dirs <DIR>` and it joins the \
                      scope set. Otherwise relaunch cplt against that repository.\n\
