@@ -596,7 +596,13 @@ fn refusal_decision(
         EnforcementMode::Block => ExecExplain {
             decision: Decision::Blocked,
             reason: first_line(msg),
-            fix: Some(blocked_fix.to_string()),
+            // The guard's own guidance when it carries some, the generic line
+            // otherwise. The guards write remedies specific to the command that
+            // was refused — which repository to name, which spelling is allowed
+            // — and `first_line` was dropping all of it, so `check exec` told
+            // the reader less than the launch would have. It is the surface
+            // someone consults deliberately; it should not be the poorer one.
+            fix: Some(guidance(msg).unwrap_or_else(|| blocked_fix.to_string())),
         },
         // The command runs. Saying "allowed" alone would hide that the policy
         // objected, so the reason carries the objection and the fix says how to
@@ -731,6 +737,19 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 fix: None,
             };
         }
+        // The launch serves this from the cached token file rather than
+        // running the real `gh`, so reporting the policy's block would be
+        // wrong (#440).
+        if ctx.gh_guard.block_auth_token && crate::gh_proxy::is_auth_token_request(&rest) {
+            return ExecExplain {
+                decision: Decision::Allowed,
+                reason: "gh auth token is served from the token file cplt wrote at startup, \
+                         not by running gh — so the agent can authenticate without the token \
+                         being an environment variable every child process can read."
+                    .to_string(),
+                fix: None,
+            };
+        }
         if !ctx.scratch_dir {
             return ExecExplain {
                 decision: Decision::Allowed,
@@ -809,6 +828,28 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
 
 fn looks_like_tmp_path(cmd: &str) -> bool {
     cmd.starts_with("/tmp/") || cmd.starts_with("/private/tmp/") || cmd.starts_with("/var/tmp/")
+}
+
+/// The guard's own "way forward" lines, if its message carries any.
+///
+/// Both guards put the headline on the first line and the remedy below it. The
+/// tail also holds boilerplate addressed to the agent ("make a note of this for
+/// the human operator") and the escape hatch, neither of which belongs in a
+/// `Fix:` line an operator reads — so this takes the guidance and leaves those.
+fn guidance(msg: &str) -> Option<String> {
+    const NOISE: &[&str] = &[
+        "This operation is restricted",
+        "Please make a note",
+        "Reason:",
+    ];
+    let lines: Vec<&str> = msg
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| !NOISE.iter().any(|n| l.starts_with(n)))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join(" "))
 }
 
 fn first_line(s: &str) -> String {
