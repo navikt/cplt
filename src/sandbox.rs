@@ -779,10 +779,20 @@ fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<P
     // OpenCode's `~/.cache/opencode/bin` is the entry that needs it: the
     // writable ancestor is `~/.cache` from HOME_TOOL_DIRS, granted to every
     // agent, so narrowing OpenCode's own cache grant would take nothing away —
-    // the same shape as `~/.cache/copilot/pkg` below. Pi's
-    // `~/.pi/agent/bin` no longer has a writable ancestor at all (its root
-    // grant is read-only, see `Agent::config_dirs`), so for Pi this bind is
-    // belt-and-braces rather than the control.
+    // the same shape as `~/.cache/copilot/pkg` below.
+    //
+    // For Pi this bind IS the control, not belt-and-braces — the comment here
+    // said the opposite until #449. Pi's root carries a create-only grant so it
+    // can take its trust lock, and `MakeDir | RemoveDir` on a parent is
+    // sufficient for a *same-directory* rename (Landlock does not require
+    // `Refer` for one). So `mv bin bin.old; mv tmp bin` is permitted by the
+    // ruleset alone; what stops it is that this bind makes `bin/` a mountpoint,
+    // and rename of a mountpoint is `EBUSY`. Measured, not argued: removing
+    // this extend makes `pi_trust_lock_works_under_bwrap_and_bin_cannot_be_renamed`
+    // fail with the rename succeeding.
+    //
+    // Which is also why the create-only grant is withheld on Linux when
+    // bubblewrap is unavailable: without this bind there is nothing left.
     ro_protect.extend(
         config
             .agent_dirs
