@@ -1132,6 +1132,24 @@ fn collect_nav_private(content: &str, out: &mut BTreeSet<String>) {
 /// sandbox — at three different moments. None of the three defaults is wrong,
 /// so this detector does not weaken them: it exists so the developer is told
 /// about all three at once, before collecting them one refusal at a time.
+/// The one rule for "which root file drives the nais CLI": the first, in sorted
+/// order, that mentions one of the CLI markers.
+///
+/// Two readers, one rule. The detector uses it to decide which file to raise a
+/// signal for; `nais_bootstrap_driver` uses it to answer the launch summary.
+/// The alternative — recovering the answer by matching the human-facing
+/// `reason` text — makes an editor rewording a message drop a hint silently,
+/// which is the drift #431 is about.
+fn nais_driver_file(ctx: &DetectContext, names: &[String]) -> Option<String> {
+    names
+        .iter()
+        .find(|name| {
+            ctx.read_text(name)
+                .is_some_and(|content| NAIS_CLI_MARKERS.iter().any(|m| content.contains(m)))
+        })
+        .cloned()
+}
+
 fn detect_nais_bootstrap(ctx: &DetectContext) -> DetectorOutput {
     let mut names: Vec<String> = ctx
         .root_file_names()
@@ -1142,7 +1160,7 @@ fn detect_nais_bootstrap(ctx: &DetectContext) -> DetectorOutput {
 
     let mut signals = Vec::new();
     let mut private_domains: BTreeSet<String> = BTreeSet::new();
-    let mut driver: Option<String> = None;
+    let driver = nais_driver_file(ctx, &names);
     let mut env_evidence = false;
 
     for name in &names {
@@ -1153,8 +1171,7 @@ fn detect_nais_bootstrap(ctx: &DetectContext) -> DetectorOutput {
             continue;
         }
         collect_nav_private(&content, &mut private_domains);
-        if driver.is_none() {
-            driver = Some(name.clone());
+        if driver.as_deref() == Some(name.as_str()) {
             signals.push(Signal::FileContains {
                 path: name.clone(),
                 reason: "drives the nais CLI (device status / app env / secret get)",
@@ -1283,16 +1300,18 @@ fn detect_nais_bootstrap(ctx: &DetectContext) -> DetectorOutput {
 /// summary.
 #[must_use]
 pub fn nais_bootstrap_driver(dir: &Path) -> Option<String> {
-    let detection = detect_nais_bootstrap(&DetectContext::new(dir)).detection?;
-    detection
-        .signals
+    let ctx = DetectContext::new(dir);
+    // The detector has to fire first: a repository with a script that mentions
+    // the nais CLI but none of the rest of the flow is not the project this
+    // hint is for.
+    detect_nais_bootstrap(&ctx).detection?;
+    let mut names: Vec<String> = ctx
+        .root_file_names()
         .into_iter()
-        .find_map(|signal| match signal {
-            Signal::FileContains { path, reason } if reason.starts_with("drives the nais CLI") => {
-                Some(path)
-            }
-            _ => None,
-        })
+        .filter(|n| n.ends_with(".sh") || n.eq_ignore_ascii_case("README.md"))
+        .collect();
+    names.sort();
+    nais_driver_file(&ctx, &names)
 }
 
 /// Extract a port number from package.json scripts (best-effort).
@@ -2211,6 +2230,13 @@ fn detect_global_gradle_credentials(home: &Path) -> Option<GlobalDetection> {
         "gpr.token",
     ];
     let has_registry = content.lines().any(|line| {
+        // A commented-out entry is not a credential this session needs — and a
+        // proposal raised for one asks the operator to widen the sandbox for
+        // nothing, which is how proposals stop being read.
+        let line = line.trim_start();
+        if line.starts_with('#') || line.starts_with('!') {
+            return false;
+        }
         let lower = line.to_lowercase();
         CREDENTIAL_MARKERS.iter().any(|m| lower.contains(m))
     });
@@ -3352,6 +3378,30 @@ services:
                 .iter()
                 .any(|d| d.name == "Gradle registry credentials"),
             "githubUser/githubPassword is a registry credential: {:?}",
+            report.detections.iter().map(|d| d.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A commented-out entry is a credential the developer turned off. Raising
+    /// a proposal for it asks the operator to widen the sandbox for nothing.
+    #[test]
+    fn global_detect_gradle_ignores_commented_out_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let props = home.path().join(".gradle/gradle.properties");
+        std::fs::create_dir_all(props.parent().unwrap()).unwrap();
+        std::fs::write(
+            &props,
+            "# githubUser=x-access-token\n! githubPassword=ghp_secret\norg.gradle.jvmargs=-Xmx2g\n",
+        )
+        .unwrap();
+
+        let report = detect_global(home.path());
+        assert!(
+            !report
+                .detections
+                .iter()
+                .any(|d| d.name == "Gradle registry credentials"),
+            "commented-out entries are not credentials in force: {:?}",
             report.detections.iter().map(|d| d.name).collect::<Vec<_>>()
         );
     }
