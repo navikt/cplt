@@ -2134,7 +2134,11 @@ fn access_to_flags(access: &FsAccess) -> landlock::BitFlags<landlock::AccessFs> 
     }
 
     if access.create_dirs {
-        // Create-only: mkdir/rmdir of new subdirectories, nothing more. No
+        // Create-only: `mkdir` of any new subdirectory name, and `rmdir` of
+        // any *empty* subdirectory — removal is not limited to entries created
+        // this session, which is worth saying because "new" reads as if it
+        // were. A non-empty directory cannot be removed, and nothing here can
+        // empty one, so `bin/` with the managed binaries in it is safe. No
         // WriteFile/Truncate (existing files stay unwritable), no MakeReg/
         // MakeSym (no regular file or symlink to point exec at content the
         // agent controls), no Refer (no rename/hardlink to reconstitute a

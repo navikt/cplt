@@ -1748,12 +1748,21 @@ pub struct AgentDir {
     /// new directory in a config dir that must otherwise stay read-only so an
     /// exec-only `bin/` child never lands in a writable tree (H-13/H-05).
     ///
-    /// It grants `mkdir`/`rmdir` of new names ONLY — no file writes, no regular
-    /// files, no symlinks, no rename. See `FsAccess::create_dirs` for the exact
-    /// bound and why it is deliberately weaker than `write`. Landlock cannot
-    /// scope it to one name, so any new subdirectory name is allowed; the
-    /// exec-only child is kept safe by being pre-created (its name is taken)
-    /// and by the absence of any right that could put bytes in the tree.
+    /// It grants `mkdir` and `rmdir` — no file writes, no regular files, no
+    /// symlinks, no rename. See `FsAccess::create_dirs` for the exact bound and
+    /// why it is deliberately weaker than `write`.
+    ///
+    /// Two limits, stated because a doc comment on a security boundary that
+    /// overstates is worse than none:
+    ///
+    /// - **Any name, not one name.** Landlock cannot scope creation to a single
+    ///   entry, so any new subdirectory name is allowed. The exec-only child is
+    ///   kept safe by being pre-created — its name is taken — and by the
+    ///   absence of any right that could put bytes in the tree.
+    /// - **`rmdir` is not limited to entries created this session.** Any
+    ///   *empty* subdirectory under the path can be removed. A non-empty one
+    ///   cannot, so `bin/` with its managed binaries in it is not removable,
+    ///   and nothing here can empty it.
     pub create_dirs: bool,
 }
 
