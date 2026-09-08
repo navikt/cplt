@@ -1392,8 +1392,8 @@ fn validate_repo_dirs(
                 "{named_as} is outside the project directory\n  {}\n  \
                  Only repositories checked out inside the project directory can be \
                  named. For one that lives elsewhere, `--allow-write <DIR>` grants \
-                 the files — the agent can build and edit there, but `gh` will not \
-                 target it.",
+                 read and write on its files — but not execute, so a build script \
+                 inside that tree will not run, and `gh` will not target it.",
                 project_dir.display()
             );
         }
@@ -5077,10 +5077,17 @@ fn check_repo_scope(project_dir: &Path, roots: &[RepoRoot]) -> Vec<String> {
     let Some(real_git) = cplt::git::trusted_git() else {
         return Vec::new();
     };
-    let mut scope = Vec::new();
+    let mut scope: Vec<String> = Vec::new();
     for dir in std::iter::once(project_dir).chain(roots.iter().map(|r| r.dir.as_path())) {
+        // `repos_match`, not `contains`: the launch dedups case-insensitively
+        // and ignoring a `.git` suffix, so `navikt/Foo` and `navikt/foo` are
+        // one member there. Exact equality here would let this surface hold a
+        // scope set the launch never has — the very class of bug the rest of
+        // this change closes.
         if let Ok(repo) = gh_proxy::detect_current_repo(real_git, dir)
-            && !scope.contains(&repo)
+            && !scope
+                .iter()
+                .any(|member| gh_proxy::repos_match(member, &repo))
         {
             scope.push(repo);
         }
