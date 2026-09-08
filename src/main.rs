@@ -3339,12 +3339,6 @@ fn build_copilot_args(cli: &Cli, agent: &agent::Agent) -> Vec<String> {
     args
 }
 
-/// Restate a block-mode policy message for warn mode.
-///
-/// Policy errors are written for block mode and lead with `⚠️ BLOCKED by
-/// sandbox:`. In warn mode the command is allowed to run, so that prefix is
-/// swapped for the warning label instead of being stacked behind it — otherwise
-/// the user reads "WARNING … BLOCKED" for a command that just ran.
 /// The opt-out a refused command should name, for whichever guard refused it.
 ///
 /// #122/#147 make the guards default-on, and both issues call naming the exact
@@ -3358,13 +3352,6 @@ fn escape_hatch(name: &str) -> String {
          `{name}_guard.mode = \"warn\"` (or `{name}_guard.enabled = false`) in \
          your cplt config."
     )
-}
-
-fn warn_mode_message(msg: &str) -> String {
-    match msg.strip_prefix("⚠️ BLOCKED by sandbox:") {
-        Some(rest) => format!("⚠️  WARNING (would block):{rest}"),
-        None => format!("⚠️  WARNING (would block): {msg}"),
-    }
 }
 
 /// What a guard verdict means for this process, decided before anything runs.
@@ -3385,8 +3372,8 @@ enum GateEffect {
     ExecPlain { notice: Option<String> },
     /// Serve the cached token from the scratch dir instead of running `gh`.
     ServeCachedToken,
-    /// Refuse, printing this message.
-    Refuse(String),
+    /// Refuse, printing this refusal and the guard's escape hatch.
+    Refuse(gh_proxy::Refusal),
 }
 
 /// Decide what `cplt gh-gate` should do. Pure: no process is spawned here.
@@ -3429,13 +3416,13 @@ fn decide_gh_gate(
             Some(repo) => GateEffect::ExecScoped(repo),
             None => GateEffect::ExecPlain { notice: None },
         },
-        Err(msg) => match policy.mode {
-            config::EnforcementMode::Block => GateEffect::Refuse(msg),
+        Err(refusal) => match policy.mode {
+            config::EnforcementMode::Block => GateEffect::Refuse(refusal),
             config::EnforcementMode::Warn => GateEffect::ExecPlain {
-                notice: Some(warn_mode_message(&msg)),
+                notice: Some(refusal.warning()),
             },
             config::EnforcementMode::Audit => GateEffect::ExecPlain {
-                notice: Some(format!("[audit] gh-gate: would block: {msg}")),
+                notice: Some(format!("[audit] gh-gate: would block: {refusal}")),
             },
         },
     }
@@ -3467,8 +3454,8 @@ fn perform_gate_effect(
 ) -> ExitCode {
     match effect {
         GateEffect::ServeCachedToken => serve_cached_gh_token(),
-        GateEffect::Refuse(msg) => {
-            eprintln!("{msg}\n{}", escape_hatch(name));
+        GateEffect::Refuse(refusal) => {
+            eprintln!("{refusal}\n{}", escape_hatch(name));
             ExitCode::FAILURE
         }
         GateEffect::ExecScoped(repo) => exec_real(real_binary, name, args, Some(&repo)),
@@ -3590,13 +3577,13 @@ fn decide_git_gate(
         repo_facts,
     ) {
         Ok(()) => GateEffect::ExecPlain { notice: None },
-        Err(msg) => match mode {
-            config::EnforcementMode::Block => GateEffect::Refuse(msg),
+        Err(refusal) => match mode {
+            config::EnforcementMode::Block => GateEffect::Refuse(refusal),
             config::EnforcementMode::Warn => GateEffect::ExecPlain {
-                notice: Some(warn_mode_message(&msg)),
+                notice: Some(refusal.warning()),
             },
             config::EnforcementMode::Audit => GateEffect::ExecPlain {
-                notice: Some(format!("[audit] git-gate: would block: {msg}")),
+                notice: Some(format!("[audit] git-gate: would block: {refusal}")),
             },
         },
     }
@@ -7484,26 +7471,6 @@ mod tests {
     }
 
     #[test]
-    fn warn_mode_message_replaces_the_block_prefix() {
-        let blocked = "\u{26a0}\u{fe0f} BLOCKED by sandbox: 'gh pr merge' is not allowed.\nReason: needs a human.";
-        let warned = warn_mode_message(blocked);
-        assert!(
-            !warned.contains("BLOCKED"),
-            "warn mode must not tell the user the command was blocked: {warned}"
-        );
-        assert!(warned.starts_with("\u{26a0}\u{fe0f}  WARNING (would block): 'gh pr merge'"));
-        assert!(
-            warned.ends_with("Reason: needs a human."),
-            "the body must survive: {warned}"
-        );
-        // A message without the block prefix still gets labelled.
-        assert_eq!(
-            warn_mode_message("nope"),
-            "\u{26a0}\u{fe0f}  WARNING (would block): nope"
-        );
-    }
-
-    #[test]
     fn observe_domains_flags_parse() {
         let cli = parse(&["--observe-domains", "--observe-domains-out", "/tmp/obs.txt"]);
         assert!(cli.observe_domains);
@@ -7927,12 +7894,12 @@ mod tests {
             &["navikt/cplt".to_string()],
             None,
         );
-        let GateEffect::Refuse(msg) = effect else {
+        let GateEffect::Refuse(refusal) = effect else {
             panic!("block mode must refuse an out-of-scope write, got {effect:?}");
         };
         assert!(
-            msg.contains("someone/else"),
-            "message names the target: {msg}"
+            refusal.headline.contains("someone/else"),
+            "message names the target: {refusal}"
         );
     }
 

@@ -601,7 +601,7 @@ fn command_basename(cmd: &str) -> String {
 /// defect (#431).
 fn refusal_decision(
     mode: crate::config::EnforcementMode,
-    msg: &str,
+    refusal: &crate::gh_proxy::Refusal,
     blocked_fix: &str,
     guard: &str,
 ) -> ExecExplain {
@@ -609,31 +609,35 @@ fn refusal_decision(
     match mode {
         EnforcementMode::Block => ExecExplain {
             decision: Decision::Blocked,
-            reason: first_line(msg),
+            reason: refusal.banner_line(),
             // The guard's own guidance when it carries some, the generic line
             // otherwise. The guards write remedies specific to the command that
             // was refused — which repository to name, which spelling is allowed
-            // — and `first_line` was dropping all of it, so `check exec` told
+            // — and this surface used to show only the first line, so it told
             // the reader less than the launch would have. It is the surface
             // someone consults deliberately; it should not be the poorer one.
-            fix: Some(guidance(msg).unwrap_or_else(|| blocked_fix.to_string())),
+            // Flattened to one line for the `Fix:` column; the lines addressed
+            // to the agent are not in this field to begin with.
+            fix: Some(if refusal.guidance.is_empty() {
+                blocked_fix.to_string()
+            } else {
+                refusal
+                    .guidance
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
             objection: None,
         },
         // The command runs. Saying "allowed" alone would hide that the policy
         // objected, so the reason carries the objection and the fix says how to
-        // make it bite.
+        // make it bite. The headline, not the banner: "BLOCKED by sandbox"
+        // inside a line that says ALLOWED is the contradiction this exists to
+        // remove.
         EnforcementMode::Warn | EnforcementMode::Audit => {
-            // The policy message is written for block mode and leads with
-            // "BLOCKED by sandbox"; stacking that inside a line that says
-            // ALLOWED is the contradiction this fix exists to remove. The
-            // launch strips the same prefix for the same reason. Bound once:
-            // `first_line` allocates, and calling it inside the format to
-            // strip a prefix off its own temporary reads as a puzzle.
-            let line = first_line(msg);
-            let objection = line
-                .strip_prefix("⚠️ BLOCKED by sandbox:")
-                .unwrap_or(&line)
-                .trim();
+            let objection = refusal.headline.as_str();
             let mode_name = match mode {
                 EnforcementMode::Warn => "warn",
                 _ => "audit",
@@ -860,36 +864,6 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
 
 fn looks_like_tmp_path(cmd: &str) -> bool {
     cmd.starts_with("/tmp/") || cmd.starts_with("/private/tmp/") || cmd.starts_with("/var/tmp/")
-}
-
-/// The guard's own "way forward" lines, if its message carries any.
-///
-/// Both guards put the headline on the first line and the remedy below it. The
-/// tail also holds boilerplate addressed to the agent ("make a note of this for
-/// the human operator") and the escape hatch, neither of which belongs in a
-/// `Fix:` line an operator reads — so this takes the guidance and leaves those.
-fn guidance(msg: &str) -> Option<String> {
-    // `Reason:` stays. It looked like boilerplate, but some guards put the
-    // remedy there and nowhere else — the token-exfiltration refusal's "Use the
-    // GH_TOKEN env var instead" is on that line — so dropping it threw away
-    // exactly what this function exists to keep.
-    const NOISE: &[&str] = &["This operation is restricted", "Please make a note"];
-    let lines: Vec<&str> = msg
-        .lines()
-        .skip(1)
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .filter(|l| !NOISE.iter().any(|n| l.starts_with(n)))
-        .collect();
-    (!lines.is_empty()).then(|| lines.join(" "))
-}
-
-fn first_line(s: &str) -> String {
-    s.lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or(s)
-        .trim()
-        .to_string()
 }
 
 // ── Report assembly & rendering ────────────────────────────────
@@ -1402,23 +1376,45 @@ mod tests {
     /// only the first line and drop everything the guard said after it.
     #[test]
     fn a_refusal_carries_the_guards_own_guidance() {
-        let msg = "⚠️ BLOCKED by sandbox: 'gh api' targets 'other/repo'.\n\
-                   Reason: token exfiltration prevention. Use the GH_TOKEN env var instead.\n\
-                   This operation is restricted by the cplt sandbox environment.\n\
-                   Please make a note of this for the human operator.";
-        let out = guidance(msg).expect("the message carries guidance");
-        assert!(
-            out.contains("Use the GH_TOKEN env var"),
-            "the remedy on the Reason line must survive: {out}"
+        use crate::config::EnforcementMode;
+        let refusal = crate::gh_proxy::Refusal {
+            headline: "'gh api' targets 'other/repo'.".to_string(),
+            guidance: "Reason: token exfiltration prevention.\n\
+                       Use the GH_TOKEN env var instead."
+                .to_string(),
+            agent_note: &["Please make a note of this for the human operator."],
+        };
+        let out = refusal_decision(EnforcementMode::Block, &refusal, "generic", "gh");
+        assert_eq!(
+            out.reason,
+            "⚠️ BLOCKED by sandbox: 'gh api' targets 'other/repo'."
         );
-        assert!(
-            !out.contains("make a note") && !out.contains("This operation is restricted"),
-            "but the lines addressed to the agent must not: {out}"
+        let fix = out.fix.expect("a blocked verdict carries a fix");
+        assert_eq!(
+            fix, "Reason: token exfiltration prevention. Use the GH_TOKEN env var instead.",
+            "the guard's guidance, flattened to one line, and nothing addressed to the agent"
         );
-        assert!(
-            guidance("⚠️ BLOCKED by sandbox: no further detail.").is_none(),
-            "a message with nothing after the headline falls back to the generic fix"
+
+        let bare = crate::gh_proxy::Refusal {
+            guidance: String::new(),
+            ..refusal.clone()
+        };
+        let out = refusal_decision(EnforcementMode::Block, &bare, "generic", "gh");
+        assert_eq!(
+            out.fix.as_deref(),
+            Some("generic"),
+            "a refusal with nothing beyond the headline falls back to the generic fix"
         );
+
+        // Warn mode reports the headline as the objection, without the banner
+        // that would contradict ALLOWED.
+        let out = refusal_decision(EnforcementMode::Warn, &refusal, "generic", "gh");
+        assert_eq!(out.decision, Decision::Allowed);
+        assert_eq!(
+            out.objection.as_deref(),
+            Some("'gh api' targets 'other/repo'.")
+        );
+        assert!(!out.reason.contains("BLOCKED"), "{}", out.reason);
     }
 
     // ── Report verdict & JSON ──
