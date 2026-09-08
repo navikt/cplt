@@ -206,7 +206,17 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
         ("sandbox", "inherit_env") => {
             "too dangerous for repo config, it would affect all team members"
         }
-        ("sandbox", "pass_env") => "environment variables are machine-specific, not project policy",
+        // Not "environment variables are machine-specific" — plenty are the
+        // application's (NODE_ENV, TZ, SPRING_PROFILES_ACTIVE) and are not
+        // sensitive at all, so that premise loses an argument it should win
+        // (#443). The hazard is the direction of the read: `pass_env` names a
+        // variable in the *parent's* environment, so a committed entry pulls
+        // whatever this machine happens to have under that name.
+        ("sandbox", "pass_env") => {
+            "names a variable to copy from whoever launched the agent, so a committed entry \
+             would pull whatever each machine happens to have under that name — including a \
+             credential a repo must not be able to ask for by spelling"
+        }
         ("sandbox", "repo_dirs") => {
             "naming other trees as project-grade roots is a path grant, and repo config \
              cannot grant paths. It is a per-checkout user setting: \

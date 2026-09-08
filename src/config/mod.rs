@@ -37,7 +37,8 @@ pub use path::{
     default_config_contents, expand_tilde,
 };
 pub use registry::{
-    BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key, lookup_key,
+    BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key,
+    layer_only_flag, lookup_key,
 };
 pub use repo::{
     PROPOSE_BOOLS, ProposeBoolRow, RepoKeyTarget, repo_key_rejection_reason, repo_key_target,

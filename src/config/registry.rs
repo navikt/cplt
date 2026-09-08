@@ -548,6 +548,25 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
 ];
 
+/// The only layer that can set this key, when it is not settable everywhere.
+///
+/// One rule, two readers: `config set` refuses the wrong layer with it, and
+/// `config explain` builds its `Set:` line from it. They disagreed — `explain`
+/// printed `cplt config set sandbox.repo_dirs <value>` for a key whose only
+/// outcome globally is a refusal, contradicting its own description two lines
+/// above (#438). Generated from the key rather than special-cased, so a new
+/// layer-restricted key cannot print advice that cannot work.
+#[must_use]
+pub fn layer_only_flag(key_info: &ConfigKeyInfo) -> Option<&'static str> {
+    match (key_info.section, key_info.key) {
+        // A repository list in the global config would attach to every session.
+        ("sandbox", "repo_dirs") => Some("--local"),
+        // Not in the global file's schema at all; it lives in `.cplt.toml`.
+        ("deny", "env") => Some("--repo"),
+        _ => None,
+    }
+}
+
 /// Sections removed from the registry, with the message shown when one is
 /// still named — by `cplt config set/get` or by a config file left on disk.
 ///
@@ -1057,6 +1076,33 @@ pub(super) const BOOL_KEYS_EXEMPT: &[(&str, &str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+    /// #438: `explain` printed a `Set:` line the key would refuse, so the
+    /// advice and the description two lines above contradicted each other.
+    /// Both readers take the flag from here now, so they cannot disagree.
+    #[test]
+    fn layer_only_keys_are_the_ones_config_set_refuses_globally() {
+        let repo_dirs = lookup_key("sandbox.repo_dirs").expect("key should exist");
+        assert_eq!(layer_only_flag(repo_dirs), Some("--local"));
+
+        let deny_env = lookup_key("deny.env").expect("key should exist");
+        assert_eq!(layer_only_flag(deny_env), Some("--repo"));
+
+        // Everything else is settable globally, which is what the plain
+        // `cplt config set <key>` form in `explain` promises.
+        for key in all_config_keys() {
+            let dotted = format!("{}.{}", key.section, key.key);
+            if dotted == "sandbox.repo_dirs" || dotted == "deny.env" {
+                continue;
+            }
+            assert_eq!(
+                layer_only_flag(key),
+                None,
+                "{dotted} is restricted to a layer but `explain` would still print the \
+                 plain form; add it here so both readers agree"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -1027,11 +1027,25 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                         safe.join(" or ")
                     )
                 };
+                // The consequence is Landlock's, not Seatbelt's: on macOS
+                // `process-exec` is granted profile-wide, so the wrapper
+                // re-enters whether or not this rule was emitted, and nothing
+                // fails. This function still runs there — `cplt check` builds
+                // its explanation from it — so the unconditional claim told
+                // macOS users their guards were about to break, and then
+                // nothing broke. A guard that cries wolf about itself teaches
+                // people to ignore it (#400).
+                let consequence = if cfg!(target_os = "linux") {
+                    "so the gh and git guard wrappers cannot re-execute cplt — every guarded \
+                     command will fail with \"Permission denied\""
+                } else {
+                    "so the rule is skipped. On this platform the wrappers still re-enter, \
+                     because the profile grants process-exec generally — but the binary staying \
+                     agent-writable is the hazard on its own"
+                };
                 crate::ui::warn(&format!(
                     "the cplt binary at {} sits under {}, which the sandbox makes writable. \
-                     Granting it execute would let the agent overwrite cplt and run it, so the \
-                     grant is skipped and the gh and git guard wrappers cannot re-execute cplt \
-                     — every guarded command will fail with \"Permission denied\". {advice}",
+                     Granting it execute would let the agent overwrite cplt and run it, {consequence}. {advice}",
                     cplt_bin.display(),
                     tree.path.display()
                 ));
