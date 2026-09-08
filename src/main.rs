@@ -4734,7 +4734,11 @@ fn tracked_sensitive_files(project_dir: &Path) -> Vec<String> {
         return Vec::new();
     };
     let Ok(out) = std::process::Command::new(git)
-        .args(["-C", &project_dir.to_string_lossy(), "ls-files", "-z"])
+        .arg("-C")
+        // The path itself, not a lossy string: a non-UTF-8 byte would be
+        // replaced and point git at a different directory, or none.
+        .arg(project_dir)
+        .args(["ls-files", "-z"])
         .output()
     else {
         return Vec::new();
