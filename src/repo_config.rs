@@ -437,16 +437,22 @@ fn validate_repo_config(config: &RepoConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Collect all proposed key names from a ProposeSection.
+/// Collect the proposed key names a ProposeSection puts up for approval.
 ///
-/// Returns the list of keys that would relax the sandbox if approved.
-/// Used to show the user what a repo is requesting and to intersect
-/// with the trust store's accepted list.
+/// Returns the keys that would RELAX the sandbox if approved. Tighten-only
+/// rows (`gh_guard`, `git_push_prevention`) are deliberately absent: they turn
+/// a guard on, apply without approval and are removed by no layer, so every
+/// surface that reads this list — the untrusted-repo "wants to relax" warning,
+/// `cplt trust show`/`accept`/`revoke`, the working-tree note and the
+/// unapproved-proposal list — would otherwise describe an already-applied
+/// tightening as a pending relaxation. Filtering here fixes all of them at
+/// once. A consumer that wants "every boolean this file sets", such as
+/// `cplt init --merge`, must walk `PROPOSE_BOOLS` itself.
 pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     let mut keys = Vec::new();
 
     for row in crate::config::PROPOSE_BOOLS {
-        if (row.propose)(propose) == Some(true) {
+        if !row.tighten_only && (row.propose)(propose) == Some(true) {
             keys.push(row.key);
         }
     }
@@ -637,6 +643,28 @@ allow_network = true
         assert!(keys.contains(&"allow_jvm_attach"));
         assert!(keys.contains(&"allow.ports"));
         assert!(!keys.contains(&"allow_docker"));
+    }
+
+    /// A guard-on proposal is not a request to relax anything: it applies
+    /// without approval and no layer removes it, so every surface driven by
+    /// this list — "wants to relax", `trust show`'s pending rows, the
+    /// `trust accept <key>` hint — must not mention it. #427.
+    #[test]
+    fn proposed_keys_omits_the_tighten_only_rows() {
+        let propose = ProposeSection {
+            gh_guard: Some(true),
+            git_push_prevention: Some(true),
+            allow_docker: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(proposed_keys(&propose), vec!["allow_docker"]);
+
+        // A file proposing ONLY guards puts nothing up for approval at all.
+        let guards_only = ProposeSection {
+            gh_guard: Some(true),
+            ..Default::default()
+        };
+        assert!(proposed_keys(&guards_only).is_empty());
     }
 
     #[test]

@@ -36,8 +36,9 @@ struct LocalHeader {
     /// The canonical project dir, in the clear, for listing and diagnostics.
     /// The filename is its hash; this is what makes an orphan file readable.
     /// Declared (rather than ignored) so `deny_unknown_fields` can catch a
-    /// misspelled `remote` instead of silently disarming the tripwire.
-    #[allow(dead_code)]
+    /// misspelled `remote` instead of silently disarming the tripwire, and
+    /// checked against the directory the file is keyed under in [`parse_local`]
+    /// so it is documentation rather than decoration.
     path: String,
     /// The `origin` remote as it was when the file was written. A staleness
     /// tripwire, NOT an identity — see [`remote_mismatch`].
@@ -107,15 +108,22 @@ pub fn load_local(project_dir: &Path) -> Result<Option<Config>, ConfigError> {
         path: path.clone(),
         source: e,
     })?;
-    parse_local(&raw, &path, crate::trust::canonical_remote(project_dir))
+    parse_local(
+        &raw,
+        &path,
+        crate::trust::canonical_remote(project_dir),
+        Some(&canonical_key(project_dir)),
+    )
 }
 
-/// Parse a local config file. Split out from [`load_local`] so the remote is
-/// injected rather than shelled out for: no git, no filesystem, testable.
+/// Parse a local config file. Split out from [`load_local`] so the remote and
+/// the canonical project dir are injected rather than shelled out for: no git,
+/// no filesystem, testable.
 pub(super) fn parse_local(
     raw: &str,
     path: &Path,
     current_remote: Option<String>,
+    project_key: Option<&str>,
 ) -> Result<Option<Config>, ConfigError> {
     let display = path.display().to_string();
     let mut root = raw
@@ -133,6 +141,20 @@ pub(super) fn parse_local(
         })?,
         None => LocalHeader::default(),
     };
+    // The filename is a hash of the canonical project dir, so a `[local] path`
+    // that names a different directory means the header was hand-edited or the
+    // file was copied. It is not authority — the hash already decided which
+    // checkout this file belongs to — but leaving it unchecked is what makes
+    // the field decorative. Warn and carry on.
+    if let (Some(expected), false) = (project_key, header.path.is_empty())
+        && header.path != expected
+    {
+        ui::warn(&format!(
+            "{display} is keyed to {expected}, but its [local] path says {}. \
+             The filename decides; fix the header or re-write the file.",
+            header.path
+        ));
+    }
     if let Some(recorded) = remote_mismatch(&header.remote, current_remote.as_deref()) {
         // Not `ui::info`: this warning is deliberately NOT suppressible by
         // --quiet, following #284. A grant the user cannot see is the thing the
@@ -194,8 +216,19 @@ pub(super) fn parse_local(
 ///
 /// An empty recorded remote means the file never claimed one (a repo with no
 /// origin), so there is nothing to trip.
+///
+/// Both sides are normalized before comparing. `current` already is (it comes
+/// from [`crate::trust::canonical_remote`]), but the recorded side is whatever
+/// is in the file: a hand-written `https://github.com/x/y.git` is the same
+/// remote and must not trip the wire. Normalizing at READ also means a future
+/// change to `normalize_remote_url` cannot silently disarm every file already
+/// on disk — which it would if the writer were the only normalizer.
 fn remote_mismatch<'a>(recorded: &'a str, current: Option<&str>) -> Option<&'a str> {
-    if recorded.is_empty() || current == Some(recorded) {
+    if recorded.is_empty() {
+        return None;
+    }
+    let normalized = crate::trust::normalize_remote_url(recorded);
+    if current.map(crate::trust::normalize_remote_url) == Some(normalized) {
         None
     } else {
         Some(recorded)
@@ -207,6 +240,17 @@ impl Config {
     ///
     /// `Option` fields: local when `Some`, so an unset local key falls through to
     /// global. List fields: union, as config and CLI already are.
+    ///
+    /// Two list-shaped keys are the stated exception to the union rule:
+    /// `proxy.allow_private_domains` and `proxy.upstream_no_proxy` are
+    /// `Option<Vec<String>>`, and they REPLACE. `None` (key absent) and
+    /// `Some(vec![])` (key present and empty) are distinguishable there and
+    /// mean different things, and replacing is the only semantics that lets a
+    /// local file *narrow* either list. Both narrow in the tightening
+    /// direction — fewer domains reachable without the proxy, more traffic
+    /// forced through the corporate proxy — so a union would remove the one
+    /// safe edit a per-repo file can make to them. #340's "lists union" holds
+    /// for every `Vec<T>` key; these two are `Option<Vec<T>>` and do not.
     ///
     /// Booleans do NOT get their answer from here — they run the registry ladder in
     /// `registry.rs`, which sees local and global as separate layers so it can name
@@ -227,6 +271,95 @@ impl Config {
                 } )+
             };
         }
+
+        // Anti-drift guard. Every struct `overlay` merges is destructured here
+        // without `..`, so adding a field to any of them fails to COMPILE until
+        // this function says what to do with it. A field silently dropped from
+        // the overlay would fall back to global — for a tightening key, a
+        // silent grant. The bindings are all `_`: this exists for the compiler.
+        let Config {
+            config_version: _,
+            proxy:
+                super::types::ProxyConfig {
+                    enabled: _,
+                    forced: _,
+                    port: _,
+                    blocked_domains: _,
+                    allowed_domains: _,
+                    default_allowlist: _,
+                    log_file: _,
+                    log_level: _,
+                    allow_private_domains: _,
+                    timeout: _,
+                    upstream: _,
+                    upstream_no_proxy: _,
+                    subscriptions:
+                        super::types::SubscriptionsConfig {
+                            refresh: _,
+                            blocklists: _,
+                        },
+                },
+            allow:
+                super::types::AllowConfig {
+                    read: _,
+                    write: _,
+                    exec: _,
+                    socket: _,
+                    ports: _,
+                    localhost: _,
+                },
+            deny: super::types::DenyConfig { paths: _ },
+            sandbox:
+                super::types::SandboxConfig {
+                    agent: _,
+                    preset: _,
+                    validate: _,
+                    brief: _,
+                    agents_md: _,
+                    allow_env_files: _,
+                    allow_localhost_any: _,
+                    pass_env: _,
+                    inherit_env: _,
+                    allow_lifecycle_scripts: _,
+                    allow_gpg_signing: _,
+                    deny_clipboard: _,
+                    allow_jvm_attach: _,
+                    allow_msbuild: _,
+                    gradle_init: _,
+                    allow_docker: _,
+                    allow_tmp_exec: _,
+                    allow_cache_exec: _,
+                    allow_cache_exec_any: _,
+                    allow_browser: _,
+                    keychain_substitute: _,
+                    scratch_dir: _,
+                    audit: _,
+                    use_bubblewrap: _,
+                    quiet: _,
+                    yes: _,
+                    gh_proxy: _,
+                    git_push_prevention: _,
+                },
+            gh_guard:
+                super::types::GhGuardConfig {
+                    enabled: _,
+                    mode: _,
+                    scope_check: _,
+                    block_auth_token: _,
+                    inject_token: _,
+                    unknown_command: _,
+                    allow_api_write: _,
+                },
+            git_guard:
+                super::types::GitGuardConfig {
+                    enabled: _,
+                    mode: _,
+                    prevent_push: _,
+                    prevent_force_push: _,
+                    protect_default_branch_only: _,
+                    allow_push: _,
+                },
+        } = local;
 
         let mut out = self.clone();
         take_set!(out, local, config_version);
@@ -324,7 +457,7 @@ mod tests {
     use super::*;
 
     fn parse(raw: &str) -> Result<Option<Config>, ConfigError> {
-        parse_local(raw, Path::new("/tmp/local.toml"), None)
+        parse_local(raw, Path::new("/tmp/local.toml"), None, None)
     }
 
     #[test]
@@ -389,9 +522,27 @@ mod tests {
             "[local]\nremote = \"github.com/navikt/a\"\n[sandbox]\nallow_docker = true\n",
             Path::new("/tmp/local.toml"),
             Some("github.com/navikt/b".to_string()),
+            None,
         )
         .unwrap();
         assert!(applied.is_none(), "a stale remote must apply nothing");
+    }
+
+    /// The recorded remote is normalized at READ, not trusted to have been
+    /// normalized at write: a hand-written `.git`-suffixed HTTPS URL is the
+    /// same remote and must not trip the wire.
+    #[test]
+    fn a_denormalized_recorded_remote_still_matches() {
+        let cfg = parse_local(
+            "[local]\nremote = \"https://GitHub.com/navikt/a.git\"\n\
+             [sandbox]\nallow_docker = true\n",
+            Path::new("/tmp/local.toml"),
+            Some("github.com/navikt/a".to_string()),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.sandbox.allow_docker, Some(true));
     }
 
     #[test]
@@ -400,6 +551,7 @@ mod tests {
             "[local]\nremote = \"github.com/navikt/a\"\n[sandbox]\nallow_docker = true\n",
             Path::new("/tmp/local.toml"),
             Some("github.com/navikt/a".to_string()),
+            None,
         )
         .unwrap()
         .unwrap();

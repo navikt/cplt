@@ -1401,16 +1401,35 @@ impl Resolved {
             if (row.propose)(&repo_config.propose) != Some(true) {
                 continue;
             }
+            let (section, key) = row.ladder_key;
+            // Already on: the row changes nothing, so it must not stamp its
+            // provenance either. Attributing an unchanged value to the repo is
+            // how `config show` comes to name the wrong file.
+            if super::registry::bool_key(section, key).is_some_and(|r| (r.resolved)(self)) {
+                continue;
+            }
             if row.tighten_only {
+                // Deliberate, but never silent: `--no-gh-guard` (or an explicit
+                // `false` in global/local config) loses to a repo turning the
+                // guard on, and the user has to be able to see that happen.
+                if let Some(layer) = self
+                    .bool_layer(section, key)
+                    .filter(|l| *l != ConfigLayer::Baseline)
+                {
+                    ui::warn(&format!(
+                        ".cplt.toml proposes {} = true, which turns a guard ON. \
+                         That overrides your explicit {section}.{key} = false from the \
+                         {layer} layer — a repo may always make the sandbox stricter.",
+                        row.key
+                    ));
+                }
                 (row.apply)(self);
-                let (section, key) = row.ladder_key;
                 self.set_bool_layer(section, key, ConfigLayer::Repo);
                 continue;
             }
             if !is_approved(row.key) {
                 continue;
             }
-            let (section, key) = row.ladder_key;
             if self
                 .bool_layer(section, key)
                 .is_some_and(|l| l != ConfigLayer::Baseline)
@@ -1500,17 +1519,12 @@ impl Resolved {
             self.repo_private_domains.dedup();
         }
 
-        // Return unapproved keys for display. Tighten-only rows are excluded:
-        // they applied without an approval, so listing them as pending would ask
-        // the user to approve something already in force.
-        let tighten_only: Vec<&str> = super::repo::PROPOSE_BOOLS
-            .iter()
-            .filter(|row| row.tighten_only)
-            .map(|row| row.key)
-            .collect();
+        // Return unapproved keys for display. `proposed_keys` already omits the
+        // tighten-only rows, which applied without an approval — listing them as
+        // pending would ask the user to approve something already in force.
         all_proposed
             .into_iter()
-            .filter(|key| !is_approved(key) && !tighten_only.contains(key))
+            .filter(|key| !is_approved(key))
             .map(std::string::ToString::to_string)
             .collect()
     }
@@ -4209,6 +4223,63 @@ mod precedence {
                 expect: (false, ConfigLayer::Local),
             },
             Case {
+                // The headline change of the local-config branch: acceptance
+                // means "this repo may ask", not "this repo overrides me".
+                name: "an explicit CLI off beats an accepted repo true",
+                key: "sandbox.allow_docker",
+                global: "",
+                local: "",
+                repo: Some((|p| p.allow_docker = Some(true), &["allow_docker"])),
+                cli: Some(|c| c.allow_docker = FeatureToggle::ForceOff),
+                expect: (false, ConfigLayer::Cli),
+            },
+            Case {
+                // Same value from two layers: the higher one must own it, or
+                // `config show` credits the repo for the user's own setting.
+                name: "an explicit local true keeps its layer over an accepted repo true",
+                key: "sandbox.allow_docker",
+                global: "",
+                local: "[sandbox]\nallow_docker = true\n",
+                repo: Some((|p| p.allow_docker = Some(true), &["allow_docker"])),
+                cli: None,
+                expect: (true, ConfigLayer::Local),
+            },
+            Case {
+                name: "an explicit global true keeps its layer over an accepted repo true",
+                key: "sandbox.allow_docker",
+                global: "[sandbox]\nallow_docker = true\n",
+                local: "",
+                repo: Some((|p| p.allow_docker = Some(true), &["allow_docker"])),
+                cli: None,
+                expect: (true, ConfigLayer::Global),
+            },
+            Case {
+                // `agents_md` is the one bool the merge gates again after the
+                // ladder (on `brief`), so the local layer has to reach BOTH or
+                // the block never renders. That second gate is why the
+                // every-key drift test skips this row.
+                name: "agents_md comes through the local layer",
+                key: "sandbox.agents_md",
+                global: "",
+                local: "[sandbox]\nbrief = true\nagents_md = true\n",
+                repo: None,
+                cli: None,
+                expect: (true, ConfigLayer::Local),
+            },
+            Case {
+                // The legacy spelling folds into `gh_guard.enabled` in the
+                // `config` accessor, which IS the local accessor. If that fold
+                // were ever copied into a separate local column, this is the
+                // case that would catch the copy going stale.
+                name: "the legacy sandbox.gh_proxy spelling works from a local file",
+                key: "gh_guard.enabled",
+                global: "",
+                local: "[sandbox]\ngh_proxy = true\n",
+                repo: None,
+                cli: None,
+                expect: (true, ConfigLayer::Local),
+            },
+            Case {
                 name: "an unapproved repo proposal still does nothing",
                 key: "sandbox.allow_docker",
                 global: "",
@@ -4271,10 +4342,14 @@ mod precedence {
         }
     }
 
-    /// Anti-drift for `Config::overlay`: a boolean key the overlay forgets to
-    /// carry would silently fall back to global, which for a tightening key is
-    /// a silent grant. Every row on the ladder is exercised from the local file
-    /// alone, both ways.
+    /// Anti-drift for the ladder's LOCAL column, not for `Config::overlay` —
+    /// booleans never get their answer from the overlay, they get it from
+    /// `resolve_bool`'s `local` argument. (`overlay`'s own guard is the
+    /// exhaustive destructure at the top of that function, which is a compile
+    /// error rather than a test.) A key whose `config` accessor does not in
+    /// fact read the local struct would silently fall back to global, which for
+    /// a tightening key is a silent grant. Every row on the ladder is exercised
+    /// from the local file alone, both ways.
     #[test]
     fn every_boolean_key_reads_from_the_local_layer() {
         for row in BOOL_KEYS {

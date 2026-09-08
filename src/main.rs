@@ -1575,22 +1575,40 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
             &project_dir,
         ) {
             config::CustomConfigVerdict::UserConfigDir => {}
-            // Only warn for a file that is actually there: a CPLT_CONFIG naming
-            // a path that does not exist selects no config, so nothing was
-            // substituted and there is nothing to flag. (`cplt exec` promises a
-            // clean stderr, and tests point the var at a deliberate dead end to
-            // ignore the developer's real config.) The refusal below is not
-            // gated the same way — a path the repo controls is worth refusing
-            // whether or not the file exists yet.
-            config::CustomConfigVerdict::Outside(p) if p.exists() => {
-                ui::warn("CPLT_CONFIG replaces your whole cplt config, sandbox settings included:");
-                eprintln!("  {}", p.display());
-                eprintln!("  It is not under {}.", user_dir.display());
-                eprintln!(
-                    "  If you did not set it yourself, your shell did (direnv, mise, .envrc)."
-                );
+            // Only warn for a relocation that actually selects something: a
+            // CPLT_CONFIG naming a path with no file AND no sibling `local/`
+            // substitutes nothing, so there is nothing to flag. (`cplt exec`
+            // promises a clean stderr, and tests point the var at a deliberate
+            // dead end to ignore the developer's real config.) The refusal
+            // below is not gated the same way — a path the repo controls is
+            // worth refusing whether or not the file exists yet.
+            //
+            // `local/` is checked separately because it moves with the config
+            // dir, not with the file: a CPLT_CONFIG whose config.toml does not
+            // exist yet still reads per-repo grants from `<parent>/local/`, and
+            // #340 §8 requires that relocation to be named.
+            config::CustomConfigVerdict::Outside(p) => {
+                let local_dir = p.parent().map(|d| d.join("local")).filter(|d| d.is_dir());
+                if p.exists() || local_dir.is_some() {
+                    ui::warn(
+                        "CPLT_CONFIG replaces your whole cplt config, sandbox settings included:",
+                    );
+                    eprintln!("  {}", p.display());
+                    if !p.exists() {
+                        eprintln!("  (no file there yet)");
+                    }
+                    if let Some(dir) = &local_dir {
+                        eprintln!(
+                            "  Per-repo local config is being read from {}.",
+                            dir.display()
+                        );
+                    }
+                    eprintln!("  It is not under {}.", user_dir.display());
+                    eprintln!(
+                        "  If you did not set it yourself, your shell did (direnv, mise, .envrc)."
+                    );
+                }
             }
-            config::CustomConfigVerdict::Outside(_) => {}
             config::CustomConfigVerdict::InsideProject(p) => bail!(
                 "CPLT_CONFIG points inside the project directory:\n  \
                  {}\n  \
@@ -1900,6 +1918,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         ui::info(&format!("Home:     {}", home_dir.display()));
         if let Some(ref cp) = config_path {
             ui::info(&format!("Config:   {}", cp.display()));
+        }
+        // Only when a local file was actually APPLIED. A missing one, or one
+        // whose recorded remote no longer matches, leaves `local_cfg` None and
+        // must not claim a layer that did nothing.
+        if local_cfg.is_some()
+            && let Some(lp) = config::local_path(&project_dir)
+        {
+            ui::info(&format!("Local:    {}", lp.display()));
         }
     }
 

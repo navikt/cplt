@@ -26,8 +26,8 @@ pub use editing::{
 };
 pub use error::ConfigError;
 pub use loading::exec_tool_dir_warning;
-pub(crate) use path::canonicalize_deepest;
 pub use local::{load_local, local_dir, local_path};
+pub(crate) use path::canonicalize_deepest;
 pub(crate) use path::lexically_normalized;
 pub use path::{
     CustomConfigVerdict, classify_custom_config, collapse_tilde, config_dir, config_path,
