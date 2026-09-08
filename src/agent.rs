@@ -3305,6 +3305,8 @@ mod tests {
             "static.crates.io",
             "pypi.org",
             "files.pythonhosted.org",
+            "packages.confluent.io",
+            "jitpack.io",
         ] {
             assert!(domains.contains(&d), "copilot list must include {d}");
         }
