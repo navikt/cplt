@@ -328,7 +328,7 @@ pub fn linux_docker_socket_paths(
 /// These often contain secrets (API keys, database passwords, private keys).
 /// A rogue agent could read and exfiltrate these via HTTPS.
 /// Override with `--allow-env-files` if Copilot genuinely needs them.
-pub(super) const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
+pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     // .env files — the #1 source of leaked secrets in project dirs
     r"\.env$",
     r"\.env\..*",
