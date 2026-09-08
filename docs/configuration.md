@@ -11,6 +11,8 @@ cplt resolves each setting in this order, highest first:
 
 Per-repo config (`.cplt.toml`) sits outside that hierarchy, as a separate layer with its own rules. See [Per-repo configuration](#per-repo-configuration-cplttoml).
 
+Sessions that span several repositories are configured separately again — see [Working across several repositories](#working-across-several-repositories---repo-dir).
+
 List values merge instead of replacing, so repeated `cplt config set` commands accumulate for `allow.read`, `allow.write`, `allow.ports`, `allow.localhost`, and `deny.paths`.
 
 Point `CPLT_CONFIG` at another file to use it instead of the default location:
@@ -63,6 +65,127 @@ Two rules are specific to this layer:
   warns (not suppressed by `--quiet`) and applies nothing. Re-adopt it by
   setting any key with `--local` again. A checkout that moved leaves an orphan
   file, which `cplt config local list` marks as "path no longer exists".
+
+## Working across several repositories (`--repo-dir`)
+
+A session often spans more than one repository: a service and the library it
+pulls in, an app and its schema, a Gradle build with an included build beside
+it. By default only the launch repository has an identity — `gh` write commands
+are scoped to it, and a `gh pr create` aimed at the other one is refused.
+
+Name the other repository and it becomes a first-class repository of the
+session:
+
+```bash
+# For one run
+cplt --repo-dir libs/sykepenger-model exec -- ./gradlew build
+
+# Persisted for this checkout, so every later launch picks it up with no flag
+cplt config set --local sandbox.repo_dirs ~/src/spleis/libs/sykepenger-model
+```
+
+The startup summary then lists what is in scope, and where each entry came
+from:
+
+```
+ Repositories:
+   navikt/spleis            ~/src/spleis                        launch repository
+   navikt/sykepenger-model  ~/src/spleis/libs/sykepenger-model   local config
+```
+
+A flag *adds to* the persisted set rather than replacing it, so a one-off
+`--repo-dir` on top of a saved list is the union of both.
+
+### What naming a repository does, and what it does not
+
+**It declares identity, not access.** A nested repository already sits inside
+the project directory, so the agent could always read and write those files —
+the project directory is granted as one subtree. What `--repo-dir` adds is that
+`gh` may target it: `gh pr create -R navikt/sykepenger-model` is allowed, the
+gh scope set includes it, and `GH_REPO` pinning accounts for it.
+
+The consequence is the rule that surprises people most:
+
+**Only repositories nested inside the project directory can be named.** A
+sibling checkout — `~/src/spleis` and `~/src/sykepenger-model` side by side —
+is refused, because naming it would be a real path grant and not just an
+identity. Two ways forward:
+
+```bash
+# Edit-only access to the sibling: files yes, gh identity no
+cplt --allow-write ~/src/sykepenger-model exec -- ./gradlew build
+```
+
+The agent can then build against and edit the sibling, but `gh` still refuses to
+target it — which is usually what you want, since the pull request belongs to the
+repository you launched in.
+
+Launching from the parent (`--project-dir ~/src`) grants the whole tree and is a
+much wider grant than one repository. It also does **not** let you name the two
+checkouts: `--repo-dir` requires the launch directory to be a git repository
+toplevel, and a plain directory holding repositories is not one, so the
+combination is refused rather than quietly granting identity to everything under
+it.
+
+Sibling support proper is [#344](https://github.com/navikt/cplt/issues/344).
+
+### Which layer it can be set in
+
+`sandbox.repo_dirs` is settable **only** in the per-repo local config
+(`config set --local`), and this is deliberate:
+
+| Layer | Accepted | Why |
+| --- | --- | --- |
+| `--local` (`~/.config/cplt/local/<hash>.toml`) | **yes** | Outside the repository and unwritable from inside the sandbox, so it can name roots the way `config.toml` can widen the sandbox. Scoped to one checkout. |
+| Global (`~/.config/cplt/config.toml`) | no | A repository list in your global config would attach to every session, including repositories where those paths mean something else. |
+| `.cplt.toml` (`config set --repo`) | no | It is committed, so it would hand every cloner's agent a new project-grade root. Repo config can tighten, never grant paths. |
+
+Each refusal names the layer that does work, so you do not have to remember the
+table.
+
+### Rules that apply on every launch, not only when written
+
+A persisted entry is re-validated at each launch, because the file may be weeks
+old and the tree it names is agent-writable. An entry is refused — the launch
+stops, it is not silently dropped — when it:
+
+- is not a git repository toplevel (a subdirectory of one is not a repository),
+- is not nested inside the project directory,
+- has a symlink as its **final** component (a symlink planted there last session
+  would redirect the identity this launch pins; a symlinked *ancestor* is fine,
+  it is just the path you took to get there),
+- contains a `..` component, which hides which directory is actually named,
+- is your home directory or another unsafe root.
+
+The launch repository itself is refused too: it is always in scope, and naming
+it again is a sign the entry means something else.
+
+Refusals name the source, so a persisted root says which file to fix rather
+than blaming a flag nobody passed:
+
+```
+[cplt] sandbox.repo_dirs entry ~/src/spleis/libs/model in
+       ~/.config/cplt/local/3291….toml is outside the project directory
+```
+
+### Everyday recipes
+
+```bash
+# What is in scope right now, without launching an agent
+cplt config get sandbox.repo_dirs
+cplt config show | grep repo_dirs      # shown with its (local) label
+
+# Stop naming one, or clear the list
+cplt config set --local sandbox.repo_dirs ~/src/spleis/libs/sykepenger-model --unset
+cplt config set --local sandbox.repo_dirs --unset
+
+# Which checkouts have a local config at all
+cplt config local list
+```
+
+For a monorepo of many small repositories, name only the ones the agent will
+open pull requests against. Every named root widens what `gh` may write to, and
+the gh guard is the thing standing between an agent and the wrong repository.
 
 ## Quick setup
 
