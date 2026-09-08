@@ -1592,9 +1592,9 @@ fn merge_tool_path_env_overrides(resolved: &mut config::Resolved, home: &Path) -
 ///
 /// `owner/name` comes from the trusted git in the unsandboxed parent, the same
 /// source and the same moment the gh scope set is captured from. A root whose
-/// origin is not a GitHub URL has no `owner/name`; it is still in the set for
-/// files, `[deny]` and the audit, so it is shown by its directory name with the
-/// gh consequence spelled out rather than dropped from the block.
+/// origin is not a GitHub URL has no `owner/name`; it is still a named root for
+/// every other purpose, so it is shown by its directory name with the gh
+/// consequence spelled out rather than dropped from the block.
 fn repo_summary_rows(project_dir: &Path, roots: &[RepoRoot]) -> Vec<config::RepoSummaryRow> {
     if roots.is_empty() {
         return Vec::new();
@@ -3248,21 +3248,27 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // baseline is captured just before exec and the report printed just after,
     // both in the parent (outside the sandbox) — see audit::run.
     let audit_enabled = resolved.audit && !resolved.quiet;
-    let exit_code = audit::run(&project_dir, &resolved.allow_write, audit_enabled, || {
-        sandbox::exec_sandboxed(
-            &prepared,
-            &agent_bin,
-            &copilot_args,
-            &repo_paths,
-            &resolved.pass_env,
-            resolved.inherit_env,
-            &disabled_categories,
-            &resolved.deny_env,
-            &resolved.gh_guard,
-            &resolved.git_guard,
-            resolved.quiet,
-        )
-    });
+    let exit_code = audit::run(
+        &project_dir,
+        &resolved.allow_write,
+        &repo_paths,
+        audit_enabled,
+        || {
+            sandbox::exec_sandboxed(
+                &prepared,
+                &agent_bin,
+                &copilot_args,
+                &repo_paths,
+                &resolved.pass_env,
+                resolved.inherit_env,
+                &disabled_categories,
+                &resolved.deny_env,
+                &resolved.gh_guard,
+                &resolved.git_guard,
+                resolved.quiet,
+            )
+        },
+    );
 
     // Cleanup
     if let Some(handle) = proxy_handle {
@@ -4290,21 +4296,27 @@ fn run_exec_command(
     // In exec mode quiet defaults on (scripting UX), so the audit is off unless
     // the user passes --no-quiet.
     let audit_enabled = resolved.audit && !resolved.quiet;
-    let exit_code = audit::run(&project_dir, &resolved.allow_write, audit_enabled, || {
-        sandbox::exec_sandboxed(
-            &prepared,
-            &exec_bin,
-            &exec_args,
-            &repo_paths,
-            &resolved.pass_env,
-            resolved.inherit_env,
-            &disabled_categories,
-            &resolved.deny_env,
-            &resolved.gh_guard,
-            &resolved.git_guard,
-            resolved.quiet,
-        )
-    });
+    let exit_code = audit::run(
+        &project_dir,
+        &resolved.allow_write,
+        &repo_paths,
+        audit_enabled,
+        || {
+            sandbox::exec_sandboxed(
+                &prepared,
+                &exec_bin,
+                &exec_args,
+                &repo_paths,
+                &resolved.pass_env,
+                resolved.inherit_env,
+                &disabled_categories,
+                &resolved.deny_env,
+                &resolved.gh_guard,
+                &resolved.git_guard,
+                resolved.quiet,
+            )
+        },
+    );
 
     if let Some(handle) = proxy_handle {
         // --observe-domains also works for `cplt exec -- <cmd>`: emit the

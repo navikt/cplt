@@ -1505,6 +1505,67 @@ fi
         );
     }
 
+    /// The same #214 shape one level down, and the one `--repo-dir` creates:
+    /// a named repository is nested inside the project, so the project's own
+    /// `git status` reports it as one untracked entry or — gitignored, as here
+    /// — as nothing at all. Every edit inside it was invisible, and the session
+    /// still printed "no project file changes".
+    #[test]
+    fn audit_names_a_nested_named_repository_it_did_not_audit() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        // Gitignored BEFORE the outer commit, so the outer status is genuinely
+        // clean and the report cannot be clean for any other reason.
+        project.write_file(".gitignore", "lib/\n");
+        project.write_file("lib/README.md", "# lib\n");
+        project.git_init();
+        let lib = project.canonical_path().join("lib");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["add", "."],
+            vec!["commit", "-m", "lib", "--allow-empty"],
+        ] {
+            git_cmd(&lib)
+                .args(&args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command");
+        }
+        let lib_path = lib.to_string_lossy().to_string();
+
+        // The agent touches ONLY the named repository.
+        let script = r#"
+if echo tampered > lib/README.md 2>/dev/null; then
+    echo "RESULT:named_write:OK"
+else
+    echo "RESULT:named_write:FAIL"
+fi
+"#;
+        let fake_dir = create_fake_copilot(&project, script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--repo-dir", &lib_path]);
+
+        assert!(
+            success,
+            "cplt should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "named_write");
+        assert!(
+            stderr.contains("no project file changes"),
+            "test premise: the project must be reported clean.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("NOT audited") && stderr.contains(&lib_path),
+            "the named repository must be named as unaudited.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("its own git history"),
+            "a nested root reads as a contradiction without its reason.\nstderr: {stderr}"
+        );
+    }
+
     // ============================================================
     // Mode combination tests
     // ============================================================
