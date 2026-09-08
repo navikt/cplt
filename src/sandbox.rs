@@ -718,6 +718,25 @@ fn pin_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf>
     pins
 }
 
+/// Whether the bubblewrap read-only overlay is available on this host.
+///
+/// Availability, not configuration: `use_bubblewrap` says what the operator
+/// asked for, and auto-detect falls back to Landlock-only when bwrap is not
+/// installed. The difference decides what is actually enforced, because several
+/// protections exist only under the mount overlay — Landlock cannot deny a path
+/// inside a tree it has granted.
+#[must_use]
+pub fn bwrap_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        bubblewrap::check_availability().is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf> {
     // Finding 1: Landlock cannot deny subpaths inside the writable project tree,

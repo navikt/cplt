@@ -5176,7 +5176,56 @@ fn run_doctor() -> ExitCode {
     println!();
 
     let discovery = discover::discover_all(&home_dir, &project_dir);
+
     let ok = discovery.print_report();
+
+    // The agent's own grants. A report of "the agent cannot write X" is
+    // unanswerable without them, and #449 was exactly that: `~/.pi/agent` is
+    // granted read-only with write carved back per subdirectory, which explains
+    // the failure in one line and was visible nowhere.
+    //
+    // The agent a launch here would pick, so the grants shown are the ones that
+    // would apply — falling back the way the launch path does when nothing is
+    // installed.
+    let agent = agent::Agent::auto_detect().unwrap_or(agent::Agent::Copilot);
+    let dirs = agent.config_dirs(&home_dir);
+    if !dirs.is_empty() {
+        println!();
+        println!(
+            "{}{}[doctor]{} {}Agent grants{} ({})",
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::BLUE),
+            ui::stdout_color(ui::RESET),
+            ui::stdout_color(ui::BOLD),
+            ui::stdout_color(ui::RESET),
+            agent.display_name()
+        );
+        for dir in &dirs {
+            let access = if dir.write { "read/write" } else { "read-only" };
+            let exec = if dir.process_exec { ", execute" } else { "" };
+            println!(
+                "  {}{}{} {access}{exec}  {}",
+                ui::stdout_color(if dir.path.exists() {
+                    ui::GREEN
+                } else {
+                    ui::DIM
+                }),
+                if dir.path.exists() { "✓" } else { "·" },
+                ui::stdout_color(ui::RESET),
+                dir.path.display()
+            );
+        }
+        // Linux-only caveat: on macOS the profile denies by path and does not
+        // care whether it exists, so a missing path is not a missing rule.
+        if cfg!(target_os = "linux") {
+            println!(
+                "  {}·{} a path that does not exist is not bound by bubblewrap, so a \
+                 read-only re-bind over it is skipped",
+                ui::stdout_color(ui::DIM),
+                ui::stdout_color(ui::RESET)
+            );
+        }
+    }
 
     // Show project ecosystem detection summary
     let report = cplt::detect::detect_project_recursive(&project_dir);

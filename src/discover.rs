@@ -1016,6 +1016,30 @@ fn print_sandbox_mechanism_status() -> bool {
             ui::stdout_color(ui::GREEN),
             ui::stdout_color(ui::RESET)
         );
+        // Whether bubblewrap is available decides what is actually enforced on
+        // this host, and nothing reported it. Several protections exist ONLY
+        // under bwrap — `.git/hooks`, the agent host-persistence files, mise's
+        // shims, Copilot's package dirs — because Landlock cannot subtract a
+        // deny from inside an allowed tree. Without this line an operator
+        // cannot tell which regime they are in, and neither can a bug report:
+        // #449 was diagnosed from a Node errno because this fact was missing.
+        if crate::sandbox::bwrap_available() {
+            println!(
+                "  {}✓{} Bubblewrap: available — mount-level protections active",
+                ui::stdout_color(ui::GREEN),
+                ui::stdout_color(ui::RESET)
+            );
+        } else {
+            println!(
+                "  {}⚠{} Bubblewrap: not found (looked on PATH)",
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET)
+            );
+            println!("      Landlock-only. It cannot deny a path inside a tree it has granted,");
+            println!("      so these are NOT enforced: .git/hooks, the agent config files that");
+            println!("      auto-execute on the host, mise shims, and package dirs. Install");
+            println!("      bubblewrap (apt install bubblewrap) to close them.");
+        }
         ok
     }
 }
