@@ -299,7 +299,7 @@ fn worktree_scope_content_filter_is_detected() {
 // refused, not extended on the strength of a name.
 
 use cplt::config::ResolvedPushRule;
-use cplt::gh_proxy::{RepoFacts, capture_repo_facts, gate_git};
+use cplt::gh_proxy::{Refusal, RepoFacts, capture_repo_facts, gate_git};
 
 /// [`gate_git`] with the launch-time [`RepoFacts`] of the repository the
 /// invocation targets, as `sandbox_exec` captures them before the sandbox
@@ -311,7 +311,7 @@ fn gate_git_t(
     protect_default_branch_only: bool,
     allow_push_rules: &[ResolvedPushRule],
     real_git: Option<&std::path::Path>,
-) -> Result<(), String> {
+) -> Result<(), Refusal> {
     let dir = args
         .iter()
         .position(|a| *a == "-C")
@@ -422,7 +422,8 @@ fn an_unpinned_allow_push_rule_authorizes_no_repository() {
             std::slice::from_ref(&unpinned),
             Some(&git),
         )
-        .expect_err("an unpinned rule must authorize nothing");
+        .expect_err("an unpinned rule must authorize nothing")
+        .to_string();
         assert!(
             err.contains("pinned to a repository URL"),
             "the block must say the rule could not be pinned, got: {err}"
@@ -540,7 +541,8 @@ fn the_default_branch_is_resolved_in_the_repo_the_command_targets() {
         "develop is the default branch of the repository these facts describe"
     );
     let err = gate(mainline.path())
-        .expect_err("another repository has no launch-time default branch here");
+        .expect_err("another repository has no launch-time default branch here")
+        .to_string();
     assert!(
         err.contains("redirects git elsewhere"),
         "the refusal must say why the facts do not apply, got: {err}"
@@ -565,7 +567,8 @@ fn protect_default_branch_only_grants_nothing_when_the_default_is_unknown() {
         &[],
         Some(&git),
     )
-    .expect_err("no resolved default branch means no push is proven safe");
+    .expect_err("no resolved default branch means no push is proven safe")
+    .to_string();
     assert!(
         err.contains("git remote set-head"),
         "the block must say how to record the default branch, got: {err}"
@@ -633,7 +636,8 @@ fn writing_the_remote_head_symref_is_blocked_on_both_ref_backends() {
             ][..],
         ] {
             let err = gate_git_t(args, true, true, true, &[], Some(&git))
-                .expect_err("writing the remote HEAD symref must be blocked on any backend");
+                .expect_err("writing the remote HEAD symref must be blocked on any backend")
+                .to_string();
             assert!(
                 err.contains("refs/remotes/<remote>/HEAD"),
                 "{format}: got {err}"
