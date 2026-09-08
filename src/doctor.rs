@@ -108,12 +108,20 @@ pub fn tracked_env_finding(files: &[String], allow_env_files: bool) -> Option<Fi
 // ── Rule: Pi's trust lock vs. the read-only agent root ─────────
 
 /// Whether the resolved policy grants `dir` itself read-only.
+/// Read-only *and* unable to create entries.
+///
+/// `!write` alone is not the question any more. A create-only grant is
+/// `write: false` with named entries it may `mkdir`, which is exactly what
+/// lets Pi take its lock — so keying on `write` would report "Pi will not
+/// start" on a host where it now starts fine. Adding a dimension to the access
+/// model makes every existing `!write` check potentially incomplete; this is
+/// one of them.
 fn dir_is_read_only(policy: &LandlockPolicy, dir: &Path) -> bool {
     policy
         .fs_rules
         .iter()
         .find(|r| r.path == dir)
-        .is_some_and(|r| !r.access.write)
+        .is_some_and(|r| !r.access.write && !r.access.create_dirs)
 }
 
 /// Pi creates a lock *directory* in `~/.pi/agent` to read `trust.json`
@@ -333,6 +341,7 @@ mod tests {
                         write,
                         execute,
                         ioctl: false,
+                        create_dirs: false,
                     },
                 })
                 .collect(),
