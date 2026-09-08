@@ -206,15 +206,15 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
         ("sandbox", "use_bubblewrap") => {
             "depends on bwrap being installed locally, not project policy"
         }
+        // The contrast with `pass_env`, which IS proposable (#443), is
+        // reviewability rather than anything about environment variables:
+        // `pass_env` names them one at a time so a reviewer can read the list,
+        // this passes everything so there is nothing to review.
         ("sandbox", "inherit_env") => {
-            "too dangerous for repo config, it would affect all team members"
+            "passes the whole environment, so a repo cannot enumerate what it is asking for \
+             and a reviewer cannot see it. `sandbox.pass_env` names variables one at a time \
+             and can be proposed"
         }
-        // Not "environment variables are machine-specific" — plenty are the
-        // application's (NODE_ENV, TZ, SPRING_PROFILES_ACTIVE) and are not
-        // sensitive at all, so that premise loses an argument it should win
-        // (#443). The hazard is the direction of the read: `pass_env` names a
-        // variable in the *parent's* environment, so a committed entry pulls
-        // whatever this machine happens to have under that name.
         ("sandbox", "repo_dirs") => {
             "naming other trees as project-grade roots is a path grant, and repo config \
              cannot grant paths. It is a per-checkout user setting: \

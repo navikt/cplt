@@ -1560,6 +1560,11 @@ impl Resolved {
                     self.pass_env.push(name.clone());
                 }
             }
+            // The list is sorted and deduped when config and CLI are merged;
+            // appending here would leave it neither, and every other proposal
+            // that extends a list restores the invariant.
+            self.pass_env.sort();
+            self.pass_env.dedup();
         }
 
         // Port proposals
