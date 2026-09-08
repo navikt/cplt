@@ -112,13 +112,29 @@ pub fn load_local(project_dir: &Path) -> Result<Option<LoadedConfig>, ConfigErro
         path: path.clone(),
         source: e,
     })?;
-    let config = parse_local(
-        &raw,
-        &path,
+    let config = parse_local_doc(&raw, &path, project_dir)?;
+    Ok(config.map(|config| LoadedConfig { config, path, raw }))
+}
+
+/// Parse local config text the way [`load_local`] parses the file on disk:
+/// `[local]` header stripped, staleness tripwire applied, relative paths
+/// refused.
+///
+/// Exists so a caller holding the text rather than the path — `cplt settings`,
+/// which must show what the launch would apply, including its staged edits —
+/// cannot accidentally use a plain `Config::parse` and disagree with the
+/// launch about what is in force.
+pub fn parse_local_doc(
+    raw: &str,
+    path: &Path,
+    project_dir: &Path,
+) -> Result<Option<Config>, ConfigError> {
+    parse_local(
+        raw,
+        path,
         crate::trust::canonical_remote(project_dir),
         Some(&canonical_key(project_dir)),
-    )?;
-    Ok(config.map(|config| LoadedConfig { config, path, raw }))
+    )
 }
 
 /// Parse a local config file. Split out from [`load_local`] so the remote and

@@ -183,16 +183,15 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
     // returning the layer — a private ladder here is what #410 was. Everything
     // else is not on the ladder, so the local file's own document answers
     // "did local set this key", and the caller passes the global answer in.
+    // The baseline comes off the overlay, not a hand-rolled `or_else` ladder:
+    // local beats global for every scalar, `preset` included, and the ladder
+    // here had it backwards. `guard_lines` reads `c.sandbox.preset` for the
+    // same reason — one merge decides, in both places.
     let bools = ResolvedBools::resolve(
         &CliFlags::default(),
         local_config,
         &global,
-        global
-            .sandbox
-            .preset
-            .or_else(|| local_config.and_then(|l| l.sandbox.preset))
-            .unwrap_or(Preset::Standard)
-            .baseline(),
+        c.sandbox.preset.unwrap_or(Preset::Standard).baseline(),
     );
     let local_doc = local.and_then(|l| l.raw.parse::<toml::Table>().ok());
     let local_sets = |section: &str, key: &str| {
@@ -378,6 +377,19 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
         ),
         None => println!("{blue}[cplt]{nc}    preset                = {dim}standard (default){nc}"),
     }
+    // The local layer is the only one that can set this — the global loader
+    // drops it — and it is the one key whose whole job is to name a repository
+    // the user has stopped thinking about. Leaving it off this screen made the
+    // effective config silent about exactly that.
+    if c.sandbox.repo_dirs.is_empty() {
+        println!("{blue}[cplt]{nc}    repo_dirs             = {dim}[]{nc}");
+    } else {
+        println!(
+            "{blue}[cplt]{nc}    repo_dirs             = {:?}{}",
+            c.sandbox.repo_dirs,
+            src("sandbox", "repo_dirs", false)
+        );
+    }
     let validate = c.sandbox.validate.unwrap_or(true);
     println!(
         "{blue}[cplt]{nc}    validate              = {}{}",
@@ -413,7 +425,10 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
     let inherit_env = c.sandbox.inherit_env.unwrap_or(false);
     if inherit_env {
         let red = ui::stdout_color(ui::RED);
-        println!("{blue}[cplt]{nc}    inherit_env           = {red}true{nc} ⚠ DANGEROUS");
+        println!(
+            "{blue}[cplt]{nc}    inherit_env           = {red}true{nc} ⚠ DANGEROUS{}",
+            src("sandbox", "inherit_env", c.sandbox.inherit_env.is_some())
+        );
     } else {
         println!(
             "{blue}[cplt]{nc}    inherit_env           = false{}",
@@ -433,7 +448,14 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
     let allow_gpg = c.sandbox.allow_gpg_signing.unwrap_or(false);
     if allow_gpg {
         let red = ui::stdout_color(ui::RED);
-        println!("{blue}[cplt]{nc}    allow_gpg_signing     = {red}true{nc} ⚠ DANGEROUS");
+        println!(
+            "{blue}[cplt]{nc}    allow_gpg_signing     = {red}true{nc} ⚠ DANGEROUS{}",
+            src(
+                "sandbox",
+                "allow_gpg_signing",
+                c.sandbox.allow_gpg_signing.is_some()
+            )
+        );
     } else {
         println!(
             "{blue}[cplt]{nc}    allow_gpg_signing     = false{}",
@@ -447,7 +469,10 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
     let allow_docker = c.sandbox.allow_docker.unwrap_or(false);
     if allow_docker {
         let red = ui::stdout_color(ui::RED);
-        println!("{blue}[cplt]{nc}    allow_docker          = {red}true{nc} ⚠ DANGEROUS");
+        println!(
+            "{blue}[cplt]{nc}    allow_docker          = {red}true{nc} ⚠ DANGEROUS{}",
+            src("sandbox", "allow_docker", c.sandbox.allow_docker.is_some())
+        );
     } else {
         println!(
             "{blue}[cplt]{nc}    allow_docker          = false{}",
@@ -457,7 +482,14 @@ pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig
     let allow_tmp = c.sandbox.allow_tmp_exec.unwrap_or(false);
     if allow_tmp {
         let red = ui::stdout_color(ui::RED);
-        println!("{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS");
+        println!(
+            "{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS{}",
+            src(
+                "sandbox",
+                "allow_tmp_exec",
+                c.sandbox.allow_tmp_exec.is_some()
+            )
+        );
     } else {
         println!(
             "{blue}[cplt]{nc}    allow_tmp_exec        = false{}",

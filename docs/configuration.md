@@ -50,7 +50,9 @@ path>.toml`, **outside** the repository — which is what lets it widen the
 sandbox the way `config.toml` does. Write access to `~/.config/cplt/` is denied
 inside the sandbox, so the agent cannot write its own grants there; a file in
 the working tree could make no such claim. Dangerous keys still need `--force`,
-and `config show` labels every value it supplies `(local)`.
+and `config show` labels every scalar it supplies `(local)`, dangerous ones
+included. List keys union with the global layer, so they are shown merged and
+unattributed — except `sandbox.repo_dirs`, which only this layer can set.
 
 Two rules are specific to this layer:
 

@@ -2638,6 +2638,130 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
+    /// The #306 shape: a write that exits 0 and then fails every launch. The
+    /// launch validates the set on every launch and fails closed, which is
+    /// right, but a set that is invalid at write time must not reach the file —
+    /// the refusal belongs where the user can still fix it.
+    #[test]
+    fn e2e_local_repo_dirs_write_refuses_what_the_launch_would_refuse() {
+        let fake_home = make_config_home("repo-dirs-write-validate");
+        let launch = temp_repo("navikt/unleash");
+
+        let output = cplt_local(&fake_home, launch.path())
+            .args([
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                "/nonexistent/dir",
+            ])
+            .output()
+            .expect("should run");
+
+        assert!(
+            !output.status.success(),
+            "a set the launch would refuse must be refused here"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("sandbox.repo_dirs entry") && stderr.contains("/nonexistent/dir"),
+            "the refusal must be the launch's own message: {stderr}"
+        );
+        assert!(
+            local_file(&fake_home)
+                .is_none_or(|file| !std::fs::read_to_string(file).unwrap().contains("repo_dirs")),
+            "a refused set must not write the entry"
+        );
+
+        // A plain directory inside the launch repo is refused for the same
+        // reason at launch: it is not a repository of its own.
+        std::fs::create_dir(launch.path().join("docs")).unwrap();
+        let output = cplt_local(&fake_home, launch.path())
+            .args([
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                launch.path().join("docs").to_str().unwrap(),
+            ])
+            .output()
+            .expect("should run");
+        assert!(
+            !output.status.success(),
+            "a plain directory must be refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// Every value `config show` takes from the local file must say so. The
+    /// dangerous-true booleans printed no marker at all, and `repo_dirs` — the
+    /// one key whose whole job is naming a repository the user has forgotten —
+    /// was not on the screen.
+    #[test]
+    fn e2e_config_show_marks_repo_dirs_and_dangerous_local_booleans() {
+        let fake_home = make_config_home("show-local-repo-dirs");
+        let launch = temp_repo("navikt/unleash");
+        let inner = launch.path().join("bifrost");
+        std::fs::create_dir(&inner).unwrap();
+        assert!(git_ok(&inner, &["init", "--quiet"]));
+        let inner = std::fs::canonicalize(&inner).unwrap();
+
+        for args in [
+            vec![
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                inner.to_str().unwrap(),
+            ],
+            vec![
+                "config",
+                "set",
+                "--local",
+                "sandbox.allow_docker",
+                "true",
+                "--force",
+            ],
+        ] {
+            let output = cplt_local(&fake_home, launch.path())
+                .args(&args)
+                .output()
+                .expect("should run");
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let output = cplt_local(&fake_home, launch.path())
+            .args(["config", "show"])
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = |name: &str| {
+            stdout
+                .lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("{name} missing from: {stdout}"))
+                .to_string()
+        };
+
+        let repo_dirs = line("repo_dirs ");
+        assert!(
+            repo_dirs.contains("bifrost") && repo_dirs.contains("(local)"),
+            "the persisted repository set must be shown and attributed: {repo_dirs}"
+        );
+        let docker = line("allow_docker ");
+        assert!(
+            docker.contains("DANGEROUS") && docker.contains("(local)"),
+            "a dangerous-true value must still say which file set it: {docker}"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     // ── config set --repo e2e tests ──────────────────────────────
 
     fn make_repo_dir(label: &str) -> PathBuf {

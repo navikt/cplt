@@ -107,7 +107,8 @@ impl SettingsApp {
             Some(path) => load_doc(path)?,
             None => toml_edit::DocumentMut::new(),
         };
-        let effective = effective_snapshot(&global_doc, &local_doc, &project_dir)?;
+        let effective =
+            effective_snapshot(&global_doc, &local_doc, local_path.as_deref(), &project_dir)?;
         Ok(Self {
             scope: Scope::Effective,
             selected: 0,
@@ -169,6 +170,15 @@ impl SettingsApp {
     }
 
     fn stage(&mut self, key: &'static ConfigKeyInfo, value: Option<String>) {
+        // The same refusal `cplt config set` gives: a machine-wide repository
+        // list attaches to every session, so the loader drops it with a warning
+        // on the next launch. Staging it here would write a file cplt itself
+        // ignores.
+        if self.scope == Scope::Global && key.section == "sandbox" && key.key == "repo_dirs" {
+            self.status =
+                "sandbox.repo_dirs is per-project, not machine-wide. Switch to Local.".to_string();
+            return;
+        }
         if self.scope == Scope::Local && self.local_path.is_none() {
             self.status =
                 "Local settings need a git repository. Switch to Global or Repository.".to_string();
@@ -399,7 +409,12 @@ impl SettingsApp {
                 .map_err(|error| error.to_string())?;
             self.repo_doc = repo;
         }
-        self.effective = effective_snapshot(&self.global_doc, &self.local_doc, &self.project_dir)?;
+        self.effective = effective_snapshot(
+            &self.global_doc,
+            &self.local_doc,
+            self.local_path.as_deref(),
+            &self.project_dir,
+        )?;
         let count = self.pending.len();
         self.pending.clear();
         self.status = format!("Saved {count} change(s) atomically.");
@@ -502,12 +517,22 @@ fn load_doc(path: &std::path::Path) -> Result<toml_edit::DocumentMut, String> {
 fn effective_snapshot(
     global_doc: &toml_edit::DocumentMut,
     local_doc: &toml_edit::DocumentMut,
+    local_path: Option<&Path>,
     project_dir: &Path,
 ) -> Result<HashMap<(&'static str, &'static str), EffectiveSetting>, String> {
     let config =
         config::Config::parse(&global_doc.to_string()).map_err(|error| error.to_string())?;
-    let local = config::Config::parse(&local_doc.to_string()).map_err(|error| error.to_string())?;
-    let local = (!local_doc.is_empty()).then_some(local);
+    // Through the launch's own loader, not a bare `Config::parse`: that skipped
+    // the `[local]` header strip and the staleness tripwire, so a file the
+    // launch refuses to apply still showed as in force here. The Effective view
+    // and the launch must not disagree about what is in force.
+    let local = match local_path {
+        Some(path) if !local_doc.is_empty() => {
+            config::parse_local_doc(&local_doc.to_string(), path, project_dir)
+                .map_err(|error| error.to_string())?
+        }
+        _ => None,
+    };
 
     let merge = |local: Option<&config::Config>| {
         config
@@ -517,11 +542,11 @@ fn effective_snapshot(
 
     let mut base = merge(None)?;
     let _ = base.reconcile_proxy_forced();
-    let base_values = resolved_values(&base, global_doc);
+    let base_values = resolved_values(&base, global_doc, None);
 
     let mut with_local = merge(local.as_ref())?;
     let _ = with_local.reconcile_proxy_forced();
-    let local_values = resolved_values(&with_local, global_doc);
+    let local_values = resolved_values(&with_local, global_doc, local.as_ref());
 
     let mut effective = merge(local.as_ref())?;
     if let Ok(Some(loaded)) = repo_config::load_repo_config(project_dir) {
@@ -530,7 +555,7 @@ fn effective_snapshot(
         effective.apply_repo_config(&loaded.config, &loaded.dir, &approved_refs);
     }
     let _ = effective.reconcile_proxy_forced();
-    let effective_values = resolved_values(&effective, global_doc);
+    let effective_values = resolved_values(&effective, global_doc, local.as_ref());
 
     Ok(all_config_keys()
         .iter()
@@ -582,6 +607,7 @@ fn approved_repo_keys(project_dir: &Path, repo: &repo_config::RepoConfig) -> Vec
 fn resolved_values(
     resolved: &Resolved,
     global_doc: &toml_edit::DocumentMut,
+    local: Option<&config::Config>,
 ) -> HashMap<(&'static str, &'static str), String> {
     all_config_keys()
         .iter()
@@ -627,6 +653,13 @@ fn resolved_values(
                     .preset
                     .map_or_else(|| "standard".to_string(), |preset| preset.to_string()),
                 ("sandbox", "pass_env") => format_strings(&resolved.pass_env),
+                // Local-layer only, and not on `Resolved` at all: the launch
+                // reads it straight off the local config. Falling through to
+                // the global document showed `[]` while the local file named
+                // repositories the session really would put in scope.
+                ("sandbox", "repo_dirs") => {
+                    format_strings(local.map_or(&[][..], |l| &l.sandbox.repo_dirs))
+                }
                 ("sandbox", "use_bubblewrap") => resolved
                     .use_bubblewrap
                     .map_or_else(|| "auto-detect".to_string(), |value| value.to_string()),
@@ -1207,7 +1240,7 @@ mod tests {
             .unwrap();
 
         let snapshot =
-            effective_snapshot(&doc, &toml_edit::DocumentMut::new(), project.path()).unwrap();
+            effective_snapshot(&doc, &toml_edit::DocumentMut::new(), None, project.path()).unwrap();
 
         assert_eq!(snapshot.get(&("proxy", "forced")).unwrap().value, "true");
         assert_eq!(
@@ -1222,6 +1255,76 @@ mod tests {
         // default; the guards are default-on since #122, so under `strict` they
         // agree with the default and are attributed to it.
         assert_eq!(snapshot.get(&("proxy", "forced")).unwrap().source, "preset");
+    }
+
+    /// The Effective view and the launch must agree. A local file whose
+    /// recorded remote no longer matches `origin` is not applied at launch, so
+    /// showing its values here as if they were in force is the TUI lying about
+    /// what the next session will do.
+    #[test]
+    fn effective_snapshot_drops_a_stale_local_file() {
+        let project = tempfile::tempdir().unwrap();
+        let global = toml_edit::DocumentMut::new();
+        let local_path = project.path().join("local.toml");
+
+        // No `[local]` header: nothing recorded, nothing to trip.
+        let fresh = "[sandbox]\nquiet = true\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let snapshot =
+            effective_snapshot(&global, &fresh, Some(local_path.as_path()), project.path())
+                .unwrap();
+        assert_eq!(snapshot.get(&("sandbox", "quiet")).unwrap().value, "true");
+
+        // A recorded remote the directory does not have: the tripwire fires and
+        // the launch ignores the whole file, so this view must too.
+        let stale = "[local]\npath = \"\"\nremote = \"github.com/navikt/gone\"\nwritten_at = \"\"\n\n[sandbox]\nquiet = true\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let snapshot =
+            effective_snapshot(&global, &stale, Some(local_path.as_path()), project.path())
+                .unwrap();
+        assert_eq!(snapshot.get(&("sandbox", "quiet")).unwrap().value, "false");
+    }
+
+    /// `sandbox.repo_dirs` is not on `Resolved`, so the value fell through to
+    /// the global document and showed `[]` while the local file named
+    /// repositories the session really would put in scope.
+    #[test]
+    fn effective_snapshot_shows_local_repo_dirs() {
+        let project = tempfile::tempdir().unwrap();
+        let local = "[sandbox]\nrepo_dirs = [\"/repo/inner\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+
+        let snapshot = effective_snapshot(
+            &toml_edit::DocumentMut::new(),
+            &local,
+            Some(std::path::Path::new("local.toml")),
+            project.path(),
+        )
+        .unwrap();
+
+        let row = snapshot.get(&("sandbox", "repo_dirs")).unwrap();
+        assert_eq!(row.value, "[/repo/inner]");
+        assert_eq!(row.source, "local");
+    }
+
+    /// The CLI refuses `sandbox.repo_dirs` outside `--local`; the TUI must too,
+    /// or it writes a global file the next launch warns about and clears.
+    #[test]
+    fn global_scope_refuses_repo_dirs() {
+        let mut app = test_app("");
+        app.scope = Scope::Global;
+        let key = all_config_keys()
+            .iter()
+            .find(|key| key.section == "sandbox" && key.key == "repo_dirs")
+            .unwrap();
+
+        app.stage(key, Some("/repo/inner".to_string()));
+
+        assert!(app.pending.is_empty(), "nothing may be staged globally");
+        assert!(app.status.contains("Local"), "{}", app.status);
     }
 
     #[test]

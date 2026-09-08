@@ -5592,14 +5592,18 @@ fn run_config_set(
     // ── Local mode ──────────────────────────────────────────────────
     // Same op, same validation, same --force gate; only the target file and
     // the `[local]` header differ.
-    let op = if local {
+    let local_project = if local {
         let Some(project_dir) = detect_project_root() else {
             ui::error(NOT_A_REPOSITORY);
             return ExitCode::FAILURE;
         };
-        config::ConfigSetOp::new_local(key, &project_dir)
+        Some(project_dir)
     } else {
-        config::ConfigSetOp::new(key)
+        None
+    };
+    let op = match &local_project {
+        Some(project_dir) => config::ConfigSetOp::new_local(key, project_dir),
+        None => config::ConfigSetOp::new(key),
     };
     let op = match op {
         Ok(op) => op,
@@ -5654,6 +5658,35 @@ fn run_config_set(
     if let Err(e) = result {
         ui::error(&e.to_string());
         return ExitCode::FAILURE;
+    }
+
+    // A repository set that is already invalid must not reach the file. The
+    // launch validates it on every launch and fails closed there — correct,
+    // since the tree can change under a file that was valid when written — but
+    // a write that is invalid *now* would exit 0 here and then fail every
+    // launch and every `cplt check` in this repo until the user works out that
+    // `--unset` is the way back. Same function, same message, hours earlier,
+    // while the user is still standing in the directory they can fix.
+    if let Some(project_dir) = &local_project
+        && !unset
+        && op.key_info.section == "sandbox"
+        && op.key_info.key == "repo_dirs"
+    {
+        let home_dir = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+        let merged = match config::parse_local_doc(&doc.to_string(), &op.path, project_dir) {
+            Ok(Some(config)) => config.sandbox.repo_dirs,
+            // `None` is the staleness tripwire, which `stamp_header` above just
+            // rearmed with the current remote, so it cannot fire here.
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                ui::error(&e.to_string());
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = validate_repo_dirs(&[], &merged, Some(&op.path), project_dir, &home_dir) {
+            ui::error(&format!("{e}\n  Nothing was written."));
+            return ExitCode::FAILURE;
+        }
     }
 
     // Skip writing when nothing changed (unset element that wasn't present)
