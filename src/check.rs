@@ -1316,10 +1316,15 @@ mod tests {
 
         let e = explain_exec(&["gh".into(), "auth".into(), "token".into()], &ctx);
         assert_eq!(e.decision, Decision::Allowed);
+        // The message does not interpolate `e.reason`: CodeQL traces this
+        // branch's string back through the guard plumbing and reports it as
+        // cleartext logging of sensitive information. It is a fixed
+        // explanation, not a token, so the alert is wrong — but the assertion
+        // reads fine without it, and arguing with the scanner is worth less
+        // than the two words of diagnostic it costs.
         assert!(
             e.reason.contains("served from the token file"),
-            "and says where it comes from: {}",
-            e.reason
+            "the explanation must say where the token comes from"
         );
 
         // Another `gh auth` subcommand is not the intercepted one.
