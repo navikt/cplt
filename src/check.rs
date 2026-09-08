@@ -1056,6 +1056,7 @@ mod tests {
                 write,
                 execute,
                 ioctl: false,
+                create_dirs: false,
             },
         }
     }

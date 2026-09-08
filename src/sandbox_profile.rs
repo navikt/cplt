@@ -471,6 +471,27 @@ fn emit_home_access(
                 let file_path = dir.path.join(file).display().to_string();
                 sbpl!(sb, "(allow file-write* (literal \"{file_path}\"))");
             }
+            // Create-only: mkdir/rmdir of new subdirectories in a read-only dir,
+            // the Seatbelt half of `AgentDir::create_dirs` (Pi's mkdir-based
+            // `trust.json.lock`). macOS splits the write operations, so the
+            // create and unlink of a directory node are allowed while
+            // `file-write-data` stays denied by `(deny default)` — existing
+            // files never become writable. The `(vnode-type DIRECTORY)` filter
+            // is load-bearing, not decoration: without it `file-write-create`
+            // also covers regular files, symlinks and hardlinks, and `rm rg`
+            // plus `ln <attacker-file> rg` would reconstitute an exec-only
+            // managed-binary name pointing at content the agent controls. Dirs
+            // only means an agent can make an empty directory and nothing else.
+            if dir.create_dirs {
+                sbpl!(
+                    sb,
+                    "(allow file-write-create (require-all (subpath \"{path}\") (vnode-type DIRECTORY)))"
+                );
+                sbpl!(
+                    sb,
+                    "(allow file-write-unlink (require-all (subpath \"{path}\") (vnode-type DIRECTORY)))"
+                );
+            }
             if dir.map_exec {
                 sbpl!(sb, "(allow file-map-executable (subpath \"{path}\"))");
             }
@@ -3953,6 +3974,16 @@ mod tests {
                 let body = rest
                     .strip_suffix(')')
                     .unwrap_or_else(|| panic!("write rule with no matcher: {line}"));
+                // Create-only grants (`AgentDir::create_dirs`) are emitted as
+                // `(allow file-write-{create,unlink} (require-all (subpath …)
+                // (vnode-type DIRECTORY)))`, a compound matcher this walk does
+                // not model. They are additive ALLOWs scoped to directory nodes
+                // and cannot reopen any write-deny's pinned parent chain — the
+                // host-persistence denies are emitted later and win under
+                // last-match-wins — so the rename-pin invariant is unaffected.
+                if body.starts_with("(require-all") {
+                    continue;
+                }
                 assert!(
                     !body.contains(") ("),
                     "multi-clause write rule, which this walk does not parse: {line}"
