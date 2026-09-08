@@ -459,7 +459,7 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
 fn guard_lines(c: &Config) -> Vec<String> {
     let src = |has_file_value: bool| if has_file_value { "" } else { " (default)" };
     let baseline = c.sandbox.preset.unwrap_or(Preset::Standard).baseline();
-    let b = ResolvedBools::resolve(&CliFlags::default(), c, baseline);
+    let b = ResolvedBools::resolve(&CliFlags::default(), None, c, baseline);
 
     vec![
         String::new(),

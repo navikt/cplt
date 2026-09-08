@@ -1618,7 +1618,14 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         Ok(None) => (config::Config::default(), None),
         Err(e) => bail!("{e}"),
     };
-    let mut resolved = match cfg.merge(config::CliFlags {
+    // Per-repo user config (#340), the layer between global config and the CLI.
+    // A malformed or relative-path file fails the launch here rather than
+    // silently falling back to global — see `config::load_local`.
+    let local_cfg = match config::load_local(&project_dir) {
+        Ok(local) => local,
+        Err(e) => bail!("{e}"),
+    };
+    let cli_flags = config::CliFlags {
         preset: cli.preset,
         proxy: config::FeatureToggle::from_pair(cli.with_proxy, cli.no_proxy),
         proxy_forced: config::FeatureToggle::from_pair(cli.proxy_forced, cli.no_proxy_forced),
@@ -1684,7 +1691,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         yes: config::FeatureToggle::from_pair(cli.yes, cli.no_yes),
         gh_guard: config::FeatureToggle::from_pair(cli.gh_guard, cli.no_gh_guard),
         git_push_prevention: config::FeatureToggle::from_pair(cli.git_guard, cli.no_git_guard),
-    }) {
+    };
+    let mut resolved = match cfg.merge_with_local(local_cfg.as_ref(), cli_flags) {
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };

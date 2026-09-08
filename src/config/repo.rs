@@ -34,10 +34,25 @@ pub enum RepoKeyTarget {
 pub struct ProposeBoolRow {
     /// Name used in `[propose]` and in the trust store.
     pub key: &'static str,
-    /// The global config key this proposal corresponds to.
+    /// The global config key this proposal corresponds to. This is what
+    /// `config set --repo` writes, so for the two guard rows it stays the
+    /// legacy `sandbox.*` spelling a `.cplt.toml` already uses.
     pub config_key: (&'static str, &'static str),
+    /// The key this proposal resolves as on the boolean ladder — the same as
+    /// `config_key` except for the two legacy spellings, which fold into
+    /// `gh_guard.enabled` / `git_guard.enabled`. Provenance is stamped here.
+    pub ladder_key: (&'static str, &'static str),
     pub propose: fn(&crate::repo_config::ProposeSection) -> Option<bool>,
     pub apply: fn(&mut super::types::Resolved),
+    /// This proposal turns a GUARD ON, so it is tighten-only.
+    ///
+    /// The other rows widen the sandbox, which is why they need an approval and
+    /// why an explicit `false` from the user's own config or CLI beats them.
+    /// These two do the opposite: a repository asking for `gh_guard` or
+    /// `git_push_prevention` is asking for *less* permission, which is
+    /// `[deny]`-shaped. So they need no acceptance and no layer removes them —
+    /// including `--no-gh-guard`. See #427, finding 1.
+    pub tighten_only: bool,
 }
 
 /// Every boolean a `.cplt.toml` may propose.
@@ -45,62 +60,82 @@ pub static PROPOSE_BOOLS: &[ProposeBoolRow] = &[
     ProposeBoolRow {
         key: "allow_localhost_any",
         config_key: ("sandbox", "allow_localhost_any"),
+        ladder_key: ("sandbox", "allow_localhost_any"),
         propose: |p| p.allow_localhost_any,
         apply: |r| r.allow_localhost_any = true,
+        tighten_only: false,
     },
     ProposeBoolRow {
         key: "allow_jvm_attach",
         config_key: ("sandbox", "allow_jvm_attach"),
+        ladder_key: ("sandbox", "allow_jvm_attach"),
         propose: |p| p.allow_jvm_attach,
         apply: |r| r.allow_jvm_attach = true,
+        tighten_only: false,
     },
     ProposeBoolRow {
         key: "allow_msbuild",
         config_key: ("sandbox", "allow_msbuild"),
+        ladder_key: ("sandbox", "allow_msbuild"),
         propose: |p| p.allow_msbuild,
         apply: |r| r.allow_msbuild = true,
+        tighten_only: false,
     },
     ProposeBoolRow {
         key: "gradle_init",
         config_key: ("sandbox", "gradle_init"),
+        ladder_key: ("sandbox", "gradle_init"),
         propose: |p| p.gradle_init,
         apply: |r| r.gradle_init = true,
+        tighten_only: false,
     },
     ProposeBoolRow {
         key: "allow_docker",
         config_key: ("sandbox", "allow_docker"),
+        ladder_key: ("sandbox", "allow_docker"),
         propose: |p| p.allow_docker,
         apply: |r| r.allow_docker = true,
+        tighten_only: false,
     },
     ProposeBoolRow {
         key: "allow_tmp_exec",
         config_key: ("sandbox", "allow_tmp_exec"),
+        ladder_key: ("sandbox", "allow_tmp_exec"),
         propose: |p| p.allow_tmp_exec,
         apply: |r| r.allow_tmp_exec = true,
+        tighten_only: false,
     },
     ProposeBoolRow {
         key: "allow_gpg_signing",
         config_key: ("sandbox", "allow_gpg_signing"),
+        ladder_key: ("sandbox", "allow_gpg_signing"),
         propose: |p| p.allow_gpg_signing,
         apply: |r| r.allow_gpg_signing = true,
+        tighten_only: false,
     },
     ProposeBoolRow {
         key: "allow_lifecycle_scripts",
         config_key: ("sandbox", "allow_lifecycle_scripts"),
+        ladder_key: ("sandbox", "allow_lifecycle_scripts"),
         propose: |p| p.allow_lifecycle_scripts,
         apply: |r| r.allow_lifecycle_scripts = true,
+        tighten_only: false,
     },
     ProposeBoolRow {
         key: "allow_browser",
         config_key: ("sandbox", "allow_browser"),
+        ladder_key: ("sandbox", "allow_browser"),
         propose: |p| p.allow_browser,
         apply: |r| r.allow_browser = true,
+        tighten_only: false,
     },
     ProposeBoolRow {
         key: "allow_env_files",
         config_key: ("sandbox", "allow_env_files"),
+        ladder_key: ("sandbox", "allow_env_files"),
         propose: |p| p.allow_env_files,
         apply: |r| r.allow_env_files = true,
+        tighten_only: false,
     },
     // `.cplt.toml` spells these two with the legacy `sandbox.*` config keys, so
     // `config set --repo sandbox.gh_proxy` keeps writing the name a repo file
@@ -108,14 +143,18 @@ pub static PROPOSE_BOOLS: &[ProposeBoolRow] = &[
     ProposeBoolRow {
         key: "gh_guard",
         config_key: ("sandbox", "gh_proxy"),
+        ladder_key: ("gh_guard", "enabled"),
         propose: |p| p.gh_guard,
         apply: |r| r.gh_guard.enabled = true,
+        tighten_only: true,
     },
     ProposeBoolRow {
         key: "git_push_prevention",
         config_key: ("sandbox", "git_push_prevention"),
+        ladder_key: ("git_guard", "enabled"),
         propose: |p| p.git_push_prevention,
         apply: |r| r.git_guard.enabled = true,
+        tighten_only: true,
     },
 ];
 

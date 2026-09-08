@@ -430,7 +430,7 @@ pub struct GitGuardConfig {
 /// security allow-rule the safe failure is to reject the key at parse. The
 /// forward-compat cost (an older binary refusing a config written for a newer
 /// one) fails *closed*, which is the correct direction for a grant.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct GitPushRule {
     /// Remote name to allow pushing to (e.g. `"fork"`, `"origin"`).
@@ -777,6 +777,9 @@ pub struct ResolvedPushRule {
 /// All paths are expanded and canonicalized.
 #[derive(Debug)]
 pub struct Resolved {
+    /// Which layer of the ladder supplied each boolean, in `BOOL_KEYS` order.
+    /// Read it with [`Resolved::bool_layer`] rather than by index.
+    pub bool_layers: Vec<crate::config::registry::ConfigLayer>,
     pub with_proxy: bool,
     /// Force all egress through the proxy (proxy mandatory, kernel egress
     /// restricted to the proxy port, fail-closed). See #53.

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::error::ConfigError;
 use super::path::{config_dir, config_path, expand_tilde, resolve_config_path, resolve_repo_path};
+use super::registry::ConfigLayer;
 use super::types::{
     CliFlags, Config, EnforcementMode, GhGuardPolicy, GitGuardPolicy, LoadedConfig, Preset,
     Resolved, ResolvedPushRule, UnknownCommandPolicy,
@@ -76,6 +77,27 @@ impl Config {
         self.merge_with_no_proxy_env(cli, no_proxy_env_value())
     }
 
+    /// Merge with the per-repo user config (#340) as a layer above this one.
+    ///
+    /// The ladder is `Default/Preset < Global < Repo < Local < CLI`. Booleans
+    /// see local and global as separate layers, so the resolver can name which
+    /// one a value came from (`Resolved::bool_layer`). Scalars and lists are
+    /// overlaid first — local `Some` wins, lists union — and the rest of
+    /// `merge` reads the overlaid struct, so nothing below has to learn about
+    /// the new layer.
+    pub fn merge_with_local(
+        &self,
+        local: Option<&Config>,
+        cli: CliFlags,
+    ) -> Result<Resolved, ConfigError> {
+        match local {
+            None => self.merge_with_no_proxy_env(cli, no_proxy_env_value()),
+            Some(local) => self
+                .overlay(local)
+                .merge_inner(Some(local), cli, no_proxy_env_value()),
+        }
+    }
+
     /// Same as [`merge`](Self::merge) but with the ambient `NO_PROXY`/`no_proxy`
     /// value injected explicitly rather than read from the process environment.
     ///
@@ -89,6 +111,18 @@ impl Config {
         cli: CliFlags,
         no_proxy_env: Option<String>,
     ) -> Result<Resolved, ConfigError> {
+        self.merge_inner(None, cli, no_proxy_env)
+    }
+
+    /// The merge itself. `self` is the config to read scalars and lists from —
+    /// already overlaid with `local` when there is one — and `local` is passed
+    /// separately only so the boolean ladder can tell the two layers apart.
+    fn merge_inner(
+        &self,
+        local: Option<&Config>,
+        cli: CliFlags,
+        no_proxy_env: Option<String>,
+    ) -> Result<Resolved, ConfigError> {
         // Policy preset: sets a BASELINE spanning two axes — the five sandbox
         // toggles below AND the three safety features (gh_guard, git_guard,
         // proxy.forced). Precedence for the preset itself: CLI (--preset) wins
@@ -97,7 +131,10 @@ impl Config {
         // config values still override it (see each
         // `*.to_option().or(config).unwrap_or(baseline)` for toggles and the
         // `.resolve(config.or(...).unwrap_or(baseline))` for the guards/proxy).
-        let preset = cli.preset.or(self.sandbox.preset);
+        let preset = cli
+            .preset
+            .or_else(|| local.and_then(|l| l.sandbox.preset))
+            .or(self.sandbox.preset);
         // No preset == "standard" == cplt's hardcoded defaults (all five
         // toggles off, no guards, no forced proxy). Only `strict` turns the
         // safety features on.
@@ -106,7 +143,7 @@ impl Config {
         // Every boolean setting, resolved by the registry-driven ladder in
         // `registry.rs` (CLI flag > config > preset baseline > default). The
         // ladder is written once, there; nothing below re-implements it.
-        let bools = super::registry::ResolvedBools::resolve(&cli, self, baseline);
+        let bools = super::registry::ResolvedBools::resolve(&cli, local, self, baseline);
 
         let with_proxy = bools.with_proxy;
 
@@ -521,6 +558,7 @@ impl Config {
 
         Ok(Resolved {
             with_proxy,
+            bool_layers: bools.layers.clone(),
             repo_private_domains: Vec::new(),
             proxy_forced,
             proxy_port,
@@ -744,6 +782,29 @@ fn no_proxy_env_value() -> Option<String> {
 }
 
 impl Resolved {
+    /// Which layer supplied the resolved value of a boolean config key.
+    ///
+    /// `None` for a key that is not on the boolean ladder. This is the single
+    /// provenance source for booleans: `config show`, `cplt settings` and the
+    /// repo-proposal gate below all read it, so none of them needs a second
+    /// resolution path that can disagree with the first.
+    pub fn bool_layer(&self, section: &str, key: &str) -> Option<ConfigLayer> {
+        let index = super::registry::BOOL_KEYS
+            .iter()
+            .position(|row| row.section == section && row.key == key)?;
+        self.bool_layers.get(index).copied()
+    }
+
+    fn set_bool_layer(&mut self, section: &str, key: &str, layer: ConfigLayer) {
+        if let Some(index) = super::registry::BOOL_KEYS
+            .iter()
+            .position(|row| row.section == section && row.key == key)
+            && let Some(slot) = self.bool_layers.get_mut(index)
+        {
+            *slot = layer;
+        }
+    }
+
     /// Returns the hardening categories that are disabled by user configuration.
     pub fn disabled_hardening_categories(&self) -> Vec<HardeningCategory> {
         let mut disabled = Vec::new();
@@ -1325,10 +1386,39 @@ impl Resolved {
         let all_proposed = crate::repo_config::proposed_keys(&repo_config.propose);
 
         // Boolean proposals, driven by `PROPOSE_BOOLS` (additive: false→true only).
+        //
+        // Two gates, and they pull in opposite directions:
+        //
+        // - A tighten-only row turns a guard ON. It is `[deny]`-shaped, so it
+        //   needs no approval and no layer takes it back off — an accepted (or
+        //   merely proposed) `gh_guard = true` survives `--no-gh-guard`.
+        // - Every other row widens. It needs an approval, AND it must not
+        //   quietly undo a decision the user made themselves: a repo `true`
+        //   applies only where nothing explicit said otherwise. An explicit
+        //   `false` in global config, in the local file, or on the CLI wins,
+        //   which is what `bool_layer` is consulted for. #427, finding 6.
         for row in super::repo::PROPOSE_BOOLS {
-            if (row.propose)(&repo_config.propose) == Some(true) && is_approved(row.key) {
-                (row.apply)(self);
+            if (row.propose)(&repo_config.propose) != Some(true) {
+                continue;
             }
+            if row.tighten_only {
+                (row.apply)(self);
+                let (section, key) = row.ladder_key;
+                self.set_bool_layer(section, key, ConfigLayer::Repo);
+                continue;
+            }
+            if !is_approved(row.key) {
+                continue;
+            }
+            let (section, key) = row.ladder_key;
+            if self
+                .bool_layer(section, key)
+                .is_some_and(|l| l != ConfigLayer::Baseline)
+            {
+                continue;
+            }
+            (row.apply)(self);
+            self.set_bool_layer(section, key, ConfigLayer::Repo);
         }
 
         // Path proposals
@@ -1410,10 +1500,17 @@ impl Resolved {
             self.repo_private_domains.dedup();
         }
 
-        // Return unapproved keys for display
+        // Return unapproved keys for display. Tighten-only rows are excluded:
+        // they applied without an approval, so listing them as pending would ask
+        // the user to approve something already in force.
+        let tighten_only: Vec<&str> = super::repo::PROPOSE_BOOLS
+            .iter()
+            .filter(|row| row.tighten_only)
+            .map(|row| row.key)
+            .collect();
         all_proposed
             .into_iter()
-            .filter(|key| !is_approved(key))
+            .filter(|key| !is_approved(key) && !tighten_only.contains(key))
             .map(std::string::ToString::to_string)
             .collect()
     }
@@ -3458,7 +3555,7 @@ validate = false
 /// ladder for that key actually changed, not that a mirror of it drifted.
 #[cfg(test)]
 mod precedence {
-    use super::super::registry::{BOOL_KEYS, BOOL_KEYS_EXEMPT};
+    use super::super::registry::{BOOL_KEYS, BOOL_KEYS_EXEMPT, ConfigLayer};
     use super::super::types::{CliFlags, Config, FeatureToggle, Preset, Resolved};
     use super::super::{ConfigValueType, all_config_keys};
 
@@ -3999,6 +4096,251 @@ mod precedence {
                 info.key
             );
         }
+    }
+
+    // ── The Local column (#340) ──────────────────────────────────────
+    //
+    // A case is (global toml, local toml, repo proposal + accepted keys, CLI)
+    // → the expected value AND the expected layer. The layer is half the point:
+    // a value that comes out right from the wrong rung is a `config show` that
+    // lies about where a grant came from.
+
+    /// A `[propose]` entry to write, and the keys `cplt trust accept` approved.
+    type RepoCase = (
+        fn(&mut crate::repo_config::ProposeSection),
+        &'static [&'static str],
+    );
+
+    struct Case {
+        name: &'static str,
+        key: &'static str,
+        global: &'static str,
+        local: &'static str,
+        /// A `.cplt.toml` `[propose]` entry plus the keys the user accepted.
+        repo: Option<RepoCase>,
+        cli: Option<fn(&mut CliFlags)>,
+        expect: (bool, ConfigLayer),
+    }
+
+    fn parse_layer(toml: &str) -> Option<Config> {
+        (!toml.is_empty()).then(|| toml::from_str::<Config>(toml).expect("test config parses"))
+    }
+
+    fn run(case: &Case) -> Resolved {
+        let global = toml::from_str::<Config>(case.global).expect("global parses");
+        let local = parse_layer(case.local);
+        let mut cli = CliFlags::default();
+        if let Some(set) = case.cli {
+            set(&mut cli);
+        }
+        let mut resolved = global
+            .merge_with_local(local.as_ref(), cli)
+            .expect("test config merges");
+        if let Some((propose, accepted)) = case.repo {
+            let mut section = crate::repo_config::ProposeSection::default();
+            propose(&mut section);
+            let repo_config = crate::repo_config::RepoConfig {
+                propose: section,
+                ..Default::default()
+            };
+            resolved.apply_repo_config(
+                &repo_config,
+                std::path::Path::new("/nonexistent-repo"),
+                accepted,
+            );
+        }
+        resolved
+    }
+
+    fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                name: "local beats global",
+                key: "sandbox.allow_docker",
+                global: "[sandbox]\nallow_docker = false\n",
+                local: "[sandbox]\nallow_docker = true\n",
+                repo: None,
+                cli: None,
+                expect: (true, ConfigLayer::Local),
+            },
+            Case {
+                name: "CLI beats local",
+                key: "sandbox.allow_docker",
+                global: "",
+                local: "[sandbox]\nallow_docker = true\n",
+                repo: None,
+                cli: Some(|c| c.allow_docker = FeatureToggle::ForceOff),
+                expect: (false, ConfigLayer::Cli),
+            },
+            Case {
+                name: "a missing local file changes nothing",
+                key: "sandbox.allow_docker",
+                global: "[sandbox]\nallow_docker = true\n",
+                local: "",
+                repo: None,
+                cli: None,
+                expect: (true, ConfigLayer::Global),
+            },
+            Case {
+                name: "an accepted repo proposal applies where nothing explicit said otherwise",
+                key: "sandbox.allow_docker",
+                global: "",
+                local: "",
+                repo: Some((|p| p.allow_docker = Some(true), &["allow_docker"])),
+                cli: None,
+                expect: (true, ConfigLayer::Repo),
+            },
+            Case {
+                name: "an explicit global false beats an accepted repo true",
+                key: "sandbox.allow_docker",
+                global: "[sandbox]\nallow_docker = false\n",
+                local: "",
+                repo: Some((|p| p.allow_docker = Some(true), &["allow_docker"])),
+                cli: None,
+                expect: (false, ConfigLayer::Global),
+            },
+            Case {
+                name: "an explicit local false beats an accepted repo true",
+                key: "sandbox.allow_docker",
+                global: "",
+                local: "[sandbox]\nallow_docker = false\n",
+                repo: Some((|p| p.allow_docker = Some(true), &["allow_docker"])),
+                cli: None,
+                expect: (false, ConfigLayer::Local),
+            },
+            Case {
+                name: "an unapproved repo proposal still does nothing",
+                key: "sandbox.allow_docker",
+                global: "",
+                local: "",
+                repo: Some((|p| p.allow_docker = Some(true), &[])),
+                cli: None,
+                expect: (false, ConfigLayer::Baseline),
+            },
+            Case {
+                // Tighten-only: the repo is asking for LESS permission, so no
+                // layer takes it back off. #427, finding 1.
+                name: "an accepted repo gh_guard survives --no-gh-guard",
+                key: "gh_guard.enabled",
+                global: "",
+                local: "",
+                repo: Some((|p| p.gh_guard = Some(true), &["gh_guard"])),
+                cli: Some(|c| c.gh_guard = FeatureToggle::ForceOff),
+                expect: (true, ConfigLayer::Repo),
+            },
+            Case {
+                name: "a repo gh_guard needs no acceptance",
+                key: "gh_guard.enabled",
+                global: "[gh_guard]\nenabled = false\n",
+                local: "",
+                repo: Some((|p| p.gh_guard = Some(true), &[])),
+                cli: None,
+                expect: (true, ConfigLayer::Repo),
+            },
+            Case {
+                name: "a repo git_push_prevention survives --no-git-guard",
+                key: "git_guard.enabled",
+                global: "",
+                local: "[git_guard]\nenabled = false\n",
+                repo: Some((|p| p.git_push_prevention = Some(true), &[])),
+                cli: Some(|c| c.git_push_prevention = FeatureToggle::ForceOff),
+                expect: (true, ConfigLayer::Repo),
+            },
+        ]
+    }
+
+    #[test]
+    fn the_local_layer_resolves_by_the_table() {
+        for case in cases() {
+            let resolved = run(&case);
+            let (section, key) = case.key.split_once('.').unwrap();
+            let row = super::super::registry::bool_key(section, key).expect("registry row");
+            let (want_value, want_layer) = case.expect;
+            assert_eq!(
+                (row.resolved)(&resolved),
+                want_value,
+                "value: {}",
+                case.name
+            );
+            assert_eq!(
+                resolved.bool_layer(section, key),
+                Some(want_layer),
+                "layer: {}",
+                case.name
+            );
+        }
+    }
+
+    /// Anti-drift for `Config::overlay`: a boolean key the overlay forgets to
+    /// carry would silently fall back to global, which for a tightening key is
+    /// a silent grant. Every row on the ladder is exercised from the local file
+    /// alone, both ways.
+    #[test]
+    fn every_boolean_key_reads_from_the_local_layer() {
+        for row in BOOL_KEYS {
+            if (row.section, row.key) == ("sandbox", "agents_md") {
+                // Gated on `brief` after the ladder; exercised separately.
+                continue;
+            }
+            for value in [false, true] {
+                let local: Config =
+                    toml::from_str(&toml_for(&format!("{}.{}", row.section, row.key), value))
+                        .expect("local config parses");
+                let resolved = Config::default()
+                    .merge_with_local(Some(&local), CliFlags::default())
+                    .expect("merges");
+                assert_eq!(
+                    (row.resolved)(&resolved),
+                    value,
+                    "{}.{} = {value} in the local file",
+                    row.section,
+                    row.key
+                );
+                assert_eq!(
+                    resolved.bool_layer(row.section, row.key),
+                    Some(ConfigLayer::Local),
+                    "{}.{} must report the local layer",
+                    row.section,
+                    row.key
+                );
+            }
+        }
+    }
+
+    /// Every propose row must be able to stamp its provenance, or the
+    /// explicit-false gate above silently stops gating that key.
+    #[test]
+    fn every_propose_row_names_a_ladder_key() {
+        for row in super::super::repo::PROPOSE_BOOLS {
+            let (section, key) = row.ladder_key;
+            assert!(
+                super::super::registry::bool_key(section, key).is_some(),
+                "propose {} has no ladder row for {section}.{key}",
+                row.key
+            );
+        }
+    }
+
+    /// The local file may also choose the preset, above global and below CLI.
+    #[test]
+    fn local_preset_beats_global_and_loses_to_cli() {
+        let global: Config = toml::from_str("[sandbox]\npreset = \"standard\"\n").unwrap();
+        let local: Config = toml::from_str("[sandbox]\npreset = \"strict\"\n").unwrap();
+        let r = global
+            .merge_with_local(Some(&local), CliFlags::default())
+            .unwrap();
+        assert!(r.proxy_forced, "the local preset must apply");
+
+        let r = global
+            .merge_with_local(
+                Some(&local),
+                CliFlags {
+                    preset: Some(Preset::Permissive),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!r.proxy_forced, "--preset must beat the local preset");
     }
 
     #[test]
