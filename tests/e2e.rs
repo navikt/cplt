@@ -23,7 +23,7 @@ mod e2e_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use crate::common::{binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd};
+    use crate::common::{binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd, temp_repo};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static FAKE_COPILOT_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -2319,6 +2319,190 @@ mod e2e_tests {
         let stdout = String::from_utf8_lossy(&get_out.stdout);
         assert!(stdout.contains("8080"), "should have 8080: {stdout}");
         assert!(stdout.contains("9090"), "should have 9090: {stdout}");
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    // ── config set --local e2e tests (#340) ──────────────────────
+
+    /// The single local file under a fake HOME, or `None` if none was written.
+    fn local_file(home: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(home.join(".config/cplt/local"))
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "toml"))
+    }
+
+    fn cplt_local(home: &Path, repo: &Path) -> Command {
+        let mut cmd = cplt_cmd();
+        cmd.current_dir(repo)
+            .env("HOME", home.to_str().unwrap())
+            .env_remove("CPLT_CONFIG");
+        cmd
+    }
+
+    /// The round trip: write a local value, read it back labelled `(local)`,
+    /// and see it in the effective config.
+    #[test]
+    fn e2e_config_set_local_round_trip() {
+        let fake_home = make_config_home("set-local");
+        let repo = temp_repo("navikt/spleis");
+
+        let output = cplt_local(&fake_home, repo.path())
+            .args(["config", "set", "--local", "proxy.port", "8443"])
+            .output()
+            .expect("should run");
+        assert!(
+            output.status.success(),
+            "set --local should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let file = local_file(&fake_home).expect("a local file should have been written");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("[local]"), "header missing: {content}");
+        assert!(
+            content.contains("remote = \"github.com/navikt/spleis\""),
+            "the header must record the normalized remote: {content}"
+        );
+        assert!(content.contains("port = 8443"), "value missing: {content}");
+
+        // Read back: the value, and the layer it came from.
+        let output = cplt_local(&fake_home, repo.path())
+            .args(["config", "get", "proxy.port"])
+            .output()
+            .expect("should run");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "8443");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("local"),
+            "config get should name the layer: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// `config show` must say which file each value came from — a local value
+    /// reads `(local)`, a global one does not, and the local file is named.
+    #[test]
+    fn e2e_config_show_labels_local_and_global() {
+        let fake_home = make_config_home("show-local");
+        let repo = temp_repo("navikt/spleis");
+
+        assert!(
+            cplt_local(&fake_home, repo.path())
+                .args(["config", "set", "proxy.timeout", "30"])
+                .output()
+                .expect("should run")
+                .status
+                .success()
+        );
+        assert!(
+            cplt_local(&fake_home, repo.path())
+                .args(["config", "set", "--local", "sandbox.quiet", "true"])
+                .output()
+                .expect("should run")
+                .status
+                .success()
+        );
+
+        let output = cplt_local(&fake_home, repo.path())
+            .args(["config", "show"])
+            .output()
+            .expect("should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Local:"),
+            "the local file should be named: {stdout}"
+        );
+        let line = |name: &str| {
+            stdout
+                .lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("{name} missing from: {stdout}"))
+        };
+        assert!(
+            line("quiet ").contains("(local)"),
+            "a local value must be labelled: {}",
+            line("quiet ")
+        );
+        assert!(
+            !line("timeout ").contains("(local)"),
+            "a global value must not be: {}",
+            line("timeout ")
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// Outside a repository the file would be keyed on whatever directory the
+    /// user happened to stand in. Refuse, and name the alternative.
+    #[test]
+    fn e2e_config_set_local_outside_a_repository_refuses() {
+        let fake_home = make_config_home("local-no-repo");
+        let outside = make_config_home("local-no-repo-cwd");
+
+        let output = cplt_local(&fake_home, &outside)
+            .args(["config", "set", "--local", "sandbox.quiet", "true"])
+            .output()
+            .expect("should run");
+
+        assert!(!output.status.success(), "must refuse outside a repository");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("git repository") && stderr.contains("cplt config set"),
+            "should name the alternative: {stderr}"
+        );
+        assert!(
+            local_file(&fake_home).is_none(),
+            "nothing may be written outside a repository"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The `--force` gate is the same one the global path has: local config
+    /// widens the sandbox, so a dangerous key is no less dangerous here.
+    #[test]
+    fn e2e_config_set_local_dangerous_key_needs_force() {
+        let fake_home = make_config_home("local-force");
+        let repo = temp_repo("navikt/spleis");
+
+        let output = cplt_local(&fake_home, repo.path())
+            .args(["config", "set", "--local", "sandbox.allow_tmp_exec", "true"])
+            .output()
+            .expect("should run");
+        assert!(!output.status.success(), "dangerous key must need --force");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--local"),
+            "the suggested command must keep --local: {stderr}"
+        );
+        assert!(
+            local_file(&fake_home).is_none(),
+            "a refused set must not write"
+        );
+
+        assert!(
+            cplt_local(&fake_home, repo.path())
+                .args([
+                    "config",
+                    "set",
+                    "--local",
+                    "sandbox.allow_tmp_exec",
+                    "true",
+                    "--force",
+                ])
+                .output()
+                .expect("should run")
+                .status
+                .success(),
+            "--force should allow it"
+        );
+        let content = std::fs::read_to_string(local_file(&fake_home).unwrap()).unwrap();
+        assert!(content.contains("allow_tmp_exec = true"), "{content}");
 
         let _ = std::fs::remove_dir_all(&fake_home);
     }

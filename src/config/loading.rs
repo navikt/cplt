@@ -111,7 +111,23 @@ impl Config {
         cli: CliFlags,
         no_proxy_env: Option<String>,
     ) -> Result<Resolved, ConfigError> {
-        self.merge_inner(None, cli, no_proxy_env)
+        self.merge_local_with_no_proxy_env(None, cli, no_proxy_env)
+    }
+
+    /// [`merge_with_local`](Self::merge_with_local) with the ambient
+    /// `NO_PROXY` injected, for the same reason the variant above exists.
+    pub fn merge_local_with_no_proxy_env(
+        &self,
+        local: Option<&Config>,
+        cli: CliFlags,
+        no_proxy_env: Option<String>,
+    ) -> Result<Resolved, ConfigError> {
+        match local {
+            None => self.merge_inner(None, cli, no_proxy_env),
+            Some(local) => self
+                .overlay(local)
+                .merge_inner(Some(local), cli, no_proxy_env),
+        }
     }
 
     /// The merge itself. `self` is the config to read scalars and lists from —

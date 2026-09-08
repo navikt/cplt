@@ -1004,7 +1004,12 @@ enum ConfigAction {
     /// Print config file path.
     ///
     /// Useful for scripting: $EDITOR $(cplt config path)
-    Path,
+    Path {
+        /// Print the per-repo user config path for this project instead,
+        /// whether or not the file exists.
+        #[arg(long)]
+        local: bool,
+    },
 
     /// Create a starter config file with documented defaults.
     ///
@@ -1056,7 +1061,17 @@ enum ConfigAction {
         /// This is the default behavior.
         #[arg(long, conflicts_with = "repo")]
         global: bool,
+
+        /// Write to this project's per-repo user config, outside the
+        /// repository, at ~/.config/cplt/local/<hash>.toml. Requires a git
+        /// repository: the file is keyed on the checkout's canonical path.
+        #[arg(long, conflicts_with_all = ["repo", "global"])]
+        local: bool,
     },
+
+    /// Inspect the per-repo user configs under ~/.config/cplt/local/.
+    #[command(subcommand)]
+    Local(LocalAction),
 
     /// Explain what config keys do.
     ///
@@ -1081,6 +1096,16 @@ EXAMPLES:
         /// Config key to explain (omit to list all)
         key: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum LocalAction {
+    /// List every per-repo user config, with the project each belongs to.
+    ///
+    /// The files are named by a hash of the project path, so this is the only
+    /// way to find the ones left behind by a checkout that moved or was
+    /// deleted.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1117,6 +1142,14 @@ enum TrustAction {
         all: bool,
     },
 }
+
+/// Why `--local` refuses outside a git repository.
+///
+/// The file is keyed on the canonical project directory, so falling back to
+/// the current directory would write a file keyed on wherever the user
+/// happened to stand — one they would never find again.
+const NOT_A_REPOSITORY: &str = "--local needs a git repository: the file is keyed on the checkout's \
+     canonical path.\n  For a setting that applies everywhere, use: cplt config set <KEY> <VALUE>";
 
 // ── Display labels (single source of truth for consistent CLI output) ──
 const SOURCE_GIT_HEAD: &str = "git HEAD (tamper-proof)";
@@ -1710,7 +1743,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         gh_guard: config::FeatureToggle::from_pair(cli.gh_guard, cli.no_gh_guard),
         git_push_prevention: config::FeatureToggle::from_pair(cli.git_guard, cli.no_git_guard),
     };
-    let mut resolved = match cfg.merge_with_local(local_cfg.as_ref(), cli_flags) {
+    let mut resolved = match cfg.merge_with_local(local_cfg.as_ref().map(|l| &l.config), cli_flags)
+    {
         Ok(r) => r,
         Err(e) => bail!("{e}"),
     };
@@ -5057,7 +5091,7 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
     match action {
         ConfigAction::Validate => run_config_validate(),
         ConfigAction::Show => run_config_show(),
-        ConfigAction::Path => run_config_path(),
+        ConfigAction::Path { local } => run_config_path(local),
         ConfigAction::Init => init_config(),
         ConfigAction::Get { key } => run_config_get(&key),
         ConfigAction::Set {
@@ -5068,8 +5102,26 @@ fn run_config_command(action: ConfigAction) -> ExitCode {
             force,
             repo,
             global: _,
-        } => run_config_set(&key, value.as_deref(), append, unset, force, repo),
+            local,
+        } => run_config_set(&key, value.as_deref(), append, unset, force, repo, local),
         ConfigAction::Explain { key } => run_config_explain(key.as_deref()),
+        ConfigAction::Local(LocalAction::List) => run_config_local_list(),
+    }
+}
+
+/// The project's local config, for the read-only display commands.
+///
+/// `None` outside a repository, when there is no file, or when the loader
+/// refused to apply one (a stale remote) — in which case it has already said
+/// so, and showing its keys as if they were in force would be a lie.
+fn local_for_display() -> Option<config::LoadedConfig> {
+    let project_dir = detect_project_root()?;
+    match config::load_local(&project_dir) {
+        Ok(local) => local,
+        Err(e) => {
+            ui::warn(&e.to_string());
+            None
+        }
     }
 }
 
@@ -5132,7 +5184,8 @@ fn run_config_show() -> ExitCode {
         }
     };
 
-    config::display_config(loaded.as_ref());
+    let local = local_for_display();
+    config::display_config(loaded.as_ref(), local.as_ref());
 
     // Show repo config if present
     let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
@@ -5277,7 +5330,19 @@ fn display_repo_config(loaded: &repo_config::LoadedRepoConfig, project_dir: &std
     println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
 }
 
-fn run_config_path() -> ExitCode {
+fn run_config_path(local: bool) -> ExitCode {
+    if local {
+        let Some(project_dir) = detect_project_root() else {
+            ui::error(NOT_A_REPOSITORY);
+            return ExitCode::FAILURE;
+        };
+        let Some(p) = config::local_path(&project_dir) else {
+            ui::error("Cannot determine config path ($HOME not set)");
+            return ExitCode::FAILURE;
+        };
+        println!("{}", p.display());
+        return ExitCode::SUCCESS;
+    }
     if let Some(p) = config::config_path() {
         println!("{}", p.display());
         ExitCode::SUCCESS
@@ -5304,14 +5369,21 @@ fn run_config_get(key: &str) -> ExitCode {
         }
     };
 
-    let (value, from_file) = config::get_config_value(key_info, loaded.as_ref());
+    let local = local_for_display();
+    let (value, layer) = config::get_config_value(key_info, loaded.as_ref(), local.as_ref());
     println!("{value}");
-    if !from_file {
-        eprintln!(
+    match layer {
+        config::ConfigLayer::Baseline => eprintln!(
             "{}[cplt]{} (default, not set in config file)",
             ui::color(ui::BLUE),
             ui::color(ui::RESET)
-        );
+        ),
+        config::ConfigLayer::Local => eprintln!(
+            "{}[cplt]{} (local, this project only)",
+            ui::color(ui::BLUE),
+            ui::color(ui::RESET)
+        ),
+        _ => {}
     }
     ExitCode::SUCCESS
 }
@@ -5323,6 +5395,7 @@ fn run_config_set(
     unset: bool,
     force: bool,
     repo: bool,
+    local: bool,
 ) -> ExitCode {
     let key_info = match config::lookup_key(key) {
         Ok(info) => info,
@@ -5363,7 +5436,19 @@ fn run_config_set(
         return ExitCode::FAILURE;
     }
 
-    let op = match config::ConfigSetOp::new(key) {
+    // ── Local mode ──────────────────────────────────────────────────
+    // Same op, same validation, same --force gate; only the target file and
+    // the `[local]` header differ.
+    let op = if local {
+        let Some(project_dir) = detect_project_root() else {
+            ui::error(NOT_A_REPOSITORY);
+            return ExitCode::FAILURE;
+        };
+        config::ConfigSetOp::new_local(key, &project_dir)
+    } else {
+        config::ConfigSetOp::new(key)
+    };
+    let op = match op {
         Ok(op) => op,
         Err(e) => {
             ui::error(&e.to_string());
@@ -5376,8 +5461,10 @@ fn run_config_set(
         && let Some(val) = value
         && let Some(reason) = config::security_confirmation(op.key_info, val, false)
     {
+        let scope = if local { "--local " } else { "" };
         ui::error(&format!(
-            "{key} = {val} {reason}.\n  Add --force to confirm: cplt config set {key} {val} --force"
+            "{key} = {val} {reason}.\n  \
+             Add --force to confirm: cplt config set {scope}{key} {val} --force"
         ));
         return ExitCode::FAILURE;
     }
@@ -5390,6 +5477,8 @@ fn run_config_set(
             return ExitCode::FAILURE;
         }
     };
+    // Refresh the `[local]` header (path, remote, written_at). No-op globally.
+    op.stamp_header(&mut doc);
 
     // Apply modification
     let mut element_removed = false;
@@ -5452,7 +5541,8 @@ fn run_config_set(
 
     // Hint about repo config if .cplt.toml exists
     let project_dir = detect_project_root().or_else(|| std::env::current_dir().ok());
-    if let Some(ref dir) = project_dir
+    if !local
+        && let Some(ref dir) = project_dir
         && dir.join(".cplt.toml").exists()
     {
         let dim = ui::color(ui::DIM);
@@ -5589,6 +5679,37 @@ fn run_config_set_repo(
     ExitCode::SUCCESS
 }
 
+/// `cplt config local list` — every per-repo user config, with its project.
+///
+/// The filename is a hash, so a checkout that moved or was deleted leaves a
+/// file nothing can point back at. The recorded `[local] path` is what makes
+/// it readable, and the marker is what makes it actionable.
+fn run_config_local_list() -> ExitCode {
+    let entries = config::list_local();
+    if entries.is_empty() {
+        let where_ = config::local_dir()
+            .map(|d| format!(" ({})", d.display()))
+            .unwrap_or_default();
+        ui::info(&format!("No per-repo user configs{where_}"));
+        ui::info("Create one with: cplt config set --local <KEY> <VALUE>");
+        return ExitCode::SUCCESS;
+    }
+    let dim = ui::stdout_color(ui::DIM);
+    let yellow = ui::stdout_color(ui::YELLOW);
+    let nc = ui::stdout_color(ui::RESET);
+    for (file, recorded) in entries {
+        let name = file.file_name().unwrap_or_default().to_string_lossy();
+        if recorded.is_empty() {
+            println!("{name}  {yellow}(no [local] path recorded){nc}");
+        } else if Path::new(&recorded).exists() {
+            println!("{recorded}  {dim}{name}{nc}");
+        } else {
+            println!("{recorded}  {yellow}(path no longer exists){nc}  {dim}{name}{nc}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn run_config_explain(key: Option<&str>) -> ExitCode {
     // Load config best-effort: no file → defaults only; parse error → warn and show defaults.
     let loaded = match config::Config::load_file() {
@@ -5606,7 +5727,7 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
     if let Some(k) = key {
         match config::lookup_key(k) {
             Ok(info) => {
-                config::explain_key(info, loaded.as_ref());
+                config::explain_key(info, loaded.as_ref(), local_for_display().as_ref());
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -5615,7 +5736,7 @@ fn run_config_explain(key: Option<&str>) -> ExitCode {
             }
         }
     } else {
-        config::explain_all(loaded.as_ref());
+        config::explain_all(loaded.as_ref(), local_for_display().as_ref());
         ExitCode::SUCCESS
     }
 }
@@ -6827,6 +6948,35 @@ mod tests {
                 "fix tests"
             ]
         );
+    }
+
+    /// The three write targets are mutually exclusive. Declared once, on
+    /// `--local`, plus the pre-existing `--repo`/`--global` pair — so every
+    /// pair is rejected by clap rather than by a hand-written check that only
+    /// covers the combinations someone thought of.
+    #[test]
+    fn config_set_write_targets_are_mutually_exclusive() {
+        for pair in [
+            ["--local", "--repo"],
+            ["--local", "--global"],
+            ["--repo", "--global"],
+        ] {
+            let result = Cli::try_parse_from([
+                "cplt",
+                "config",
+                "set",
+                pair[0],
+                pair[1],
+                "sandbox.quiet",
+                "true",
+            ]);
+            assert!(
+                result.is_err(),
+                "{} and {} must not be accepted together",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]
