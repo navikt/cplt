@@ -548,27 +548,33 @@ fn refusal_decision(
         // The command runs. Saying "allowed" alone would hide that the policy
         // objected, so the reason carries the objection and the fix says how to
         // make it bite.
-        EnforcementMode::Warn | EnforcementMode::Audit => ExecExplain {
-            decision: Decision::Allowed,
-            reason: format!(
-                "the {guard} guard objects, but it runs in {} mode, so the command runs. {}",
-                match mode {
-                    EnforcementMode::Warn => "warn",
-                    _ => "audit",
-                },
-                // The policy message is written for block mode and leads with
-                // "BLOCKED by sandbox"; stacking that inside a line that says
-                // ALLOWED is the contradiction this fix exists to remove. The
-                // launch strips the same prefix for the same reason.
-                first_line(msg)
-                    .strip_prefix("⚠️ BLOCKED by sandbox:")
-                    .unwrap_or(&first_line(msg))
-                    .trim()
-            ),
-            fix: Some(format!(
-                "set {guard}_guard.mode = \"block\" to enforce this."
-            )),
-        },
+        EnforcementMode::Warn | EnforcementMode::Audit => {
+            // The policy message is written for block mode and leads with
+            // "BLOCKED by sandbox"; stacking that inside a line that says
+            // ALLOWED is the contradiction this fix exists to remove. The
+            // launch strips the same prefix for the same reason. Bound once:
+            // `first_line` allocates, and calling it inside the format to
+            // strip a prefix off its own temporary reads as a puzzle.
+            let line = first_line(msg);
+            let objection = line
+                .strip_prefix("⚠️ BLOCKED by sandbox:")
+                .unwrap_or(&line)
+                .trim();
+            let mode_name = match mode {
+                EnforcementMode::Warn => "warn",
+                _ => "audit",
+            };
+            ExecExplain {
+                decision: Decision::Allowed,
+                reason: format!(
+                    "the {guard} guard objects, but it runs in {mode_name} mode, so the \
+                 command runs. {objection}"
+                ),
+                fix: Some(format!(
+                    "set {guard}_guard.mode = \"block\" to enforce this."
+                )),
+            }
+        }
     }
 }
 
