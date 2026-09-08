@@ -565,6 +565,17 @@ pub struct ExecExplain {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    /// Set when the command runs *despite* a guard objecting — warn and audit
+    /// mode.
+    ///
+    /// Three states exist and `decision` can express two: blocked, allowed and
+    /// uncontested, allowed over an objection. The third is what a team running
+    /// warn mode before switching to block wants to count, and it was
+    /// recoverable only by parsing English out of `reason`, which is not a
+    /// contract worth relying on (#441). It reaches `--json` through
+    /// `CheckItem.note`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objection: Option<String>,
 }
 
 /// The file-name (last component) of a command word, lowercased.
@@ -603,6 +614,7 @@ fn refusal_decision(
             // the reader less than the launch would have. It is the surface
             // someone consults deliberately; it should not be the poorer one.
             fix: Some(guidance(msg).unwrap_or_else(|| blocked_fix.to_string())),
+            objection: None,
         },
         // The command runs. Saying "allowed" alone would hide that the policy
         // objected, so the reason carries the objection and the fix says how to
@@ -632,6 +644,11 @@ fn refusal_decision(
                 fix: Some(format!(
                     "set {guard}_guard.mode = \"block\" to enforce this."
                 )),
+                // The structured half of the same fact. `decision` says the
+                // command runs; this says the policy objected, so a consumer
+                // counting what block mode would stop does not have to parse
+                // the prose above (#441).
+                objection: Some(objection.to_string()),
             }
         }
     }
@@ -651,6 +668,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             decision: Decision::Inconclusive,
             reason: "no command given.".to_string(),
             fix: None,
+            objection: None,
         };
     };
     let base = command_basename(first);
@@ -666,6 +684,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "Docker access is enabled (allow_docker=on).".to_string(),
                 fix: None,
+                objection: None,
             }
         } else {
             ExecExplain {
@@ -678,6 +697,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                     "--allow-docker, or [sandbox] allow_docker = true (or --preset full-trust)."
                         .to_string(),
                 ),
+                objection: None,
             }
         };
     }
@@ -689,6 +709,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "git runs; push prevention is not enabled for this run.".to_string(),
                 fix: None,
+                objection: None,
             };
         }
         if !ctx.scratch_dir {
@@ -699,6 +720,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                          however it is configured."
                     .to_string(),
                 fix: Some("remove `sandbox.scratch_dir = false` to let the guard run.".to_string()),
+                objection: None,
             };
         }
         return match crate::gh_proxy::gate_git(
@@ -717,6 +739,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "allowed by the git guard.".to_string(),
                 fix: None,
+                objection: None,
             },
             Err(msg) => refusal_decision(
                 ctx.git_guard.mode,
@@ -735,6 +758,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "gh runs; the gh guard is not enabled for this run.".to_string(),
                 fix: None,
+                objection: None,
             };
         }
         // The launch serves this from the cached token file rather than
@@ -748,6 +772,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                          being an environment variable every child process can read."
                     .to_string(),
                 fix: None,
+                objection: None,
             };
         }
         if !ctx.scratch_dir {
@@ -758,6 +783,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                          however it is configured."
                     .to_string(),
                 fix: Some("remove `sandbox.scratch_dir = false` to let the guard run.".to_string()),
+                objection: None,
             };
         }
         let policy = crate::gh_proxy::GatePolicy {
@@ -792,6 +818,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "allowed by the gh guard.".to_string(),
                 fix: None,
+                objection: None,
             },
             Err(msg) => refusal_decision(
                 ctx.gh_guard.mode,
@@ -814,6 +841,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
             fix: Some(
                 "--allow-tmp-exec, or [sandbox] allow_tmp_exec = true (dangerous).".to_string(),
             ),
+            objection: None,
         };
     }
 
@@ -823,6 +851,7 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                  filesystem, network, and env policy."
             .to_string(),
         fix: None,
+        objection: None,
     }
 }
 
@@ -1333,6 +1362,36 @@ mod tests {
             other.reason, e.reason,
             "only `auth token` is served from the file"
         );
+    }
+
+    /// Three states, and `decision` can express two. A consumer counting what
+    /// block mode would stop needs the third without parsing prose (#441).
+    #[test]
+    fn warn_mode_marks_the_objection_structurally() {
+        let gh = GhGuardPolicy::default();
+        let git = GitGuardPolicy {
+            enabled: true,
+            mode: crate::config::EnforcementMode::Warn,
+            ..GitGuardPolicy::default()
+        };
+        let ctx = exec_ctx(&gh, &git, false);
+
+        let objected = explain_exec(
+            &["git".into(), "push".into(), "origin".into(), "main".into()],
+            &ctx,
+        );
+        assert_eq!(objected.decision, Decision::Allowed, "warn mode runs it");
+        assert!(
+            objected.objection.is_some(),
+            "but the policy objected, and that must be recoverable without \
+             reading the reason text"
+        );
+
+        // A command nothing objects to must not carry one, or the field says
+        // nothing.
+        let clean = explain_exec(&["node".into(), "app.js".into()], &ctx);
+        assert_eq!(clean.decision, Decision::Allowed);
+        assert!(clean.objection.is_none());
     }
 
     /// A guard that writes its own remedy must have it reach the reader. The

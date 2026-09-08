@@ -5226,6 +5226,12 @@ fn build_exec_check(
     // assembled field by field any more (#447).
     let ctx = check::ExecContext::for_launch(resolved, project_dir, named_roots);
     let expl = check::explain_exec(cmd, &ctx);
+    // `note` is the serialized field, so the objection reaches `--json` there
+    // rather than only inside the prose reason (#441).
+    let note = expl
+        .objection
+        .as_ref()
+        .map(|o| format!("the guard objected and was not enforcing: {o}"));
     let item = check::CheckItem {
         name: "exec".to_string(),
         category: "exec".to_string(),
@@ -5234,7 +5240,7 @@ fn build_exec_check(
         expected: None,
         reason: expl.reason,
         fix: expl.fix,
-        note: None,
+        note,
     };
     check::Report::new(agent_name, preset_name, false, vec![item])
 }
@@ -6206,6 +6212,25 @@ fn run_config_set(
         ui::ok(&format!("{key} = {current}"));
     } else {
         ui::ok(&format!("{key} = {}", value.unwrap()));
+    }
+
+    // Config is read once, at launch. A session already running keeps the
+    // values it resolved then — deliberately for the ones it bakes, since the
+    // agent can rewrite the tree a re-read would consult (GHSA-cm6f). Nothing
+    // said so, and the surfaces that describe the file agreed with the person
+    // while the running session disagreed: `config show` listed the new value,
+    // `check exec` answered for a hypothetical new launch and said allowed,
+    // and the agent kept refusing. All three were right about different
+    // questions (#458).
+    if !unset {
+        let dim = ui::color(ui::DIM);
+        eprintln!(
+            "{}[cplt]{} {dim}Applies to the next launch. A session started before now keeps \
+             the settings it read at startup.{}",
+            ui::color(ui::BLUE),
+            ui::color(ui::RESET),
+            ui::color(ui::RESET)
+        );
     }
 
     // Hint about repo config if .cplt.toml exists
