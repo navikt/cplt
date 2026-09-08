@@ -490,6 +490,19 @@ pub struct ExecContext<'a> {
     pub gh_guard: &'a crate::config::GhGuardPolicy,
     pub git_guard: &'a crate::config::GitGuardPolicy,
     pub project_dir: &'a Path,
+    /// The repository facts the launch bakes in, captured the same way and from
+    /// the same trusted git.
+    ///
+    /// Without them `protect_default_branch_only` has no default branch to
+    /// compare against, so `gate_git` fails closed and every push reads as
+    /// blocked — including a feature-branch push the launch allows. That is
+    /// the most common push there is, so the surface built to answer "what
+    /// will happen" was wrong about the ordinary case.
+    pub repo_facts: &'a crate::gh_proxy::RepoFacts,
+    /// Both guards install themselves through a PATH shim in the scratch dir.
+    /// Without one there is no shim, so the guards do not run whatever the
+    /// config says — which is what the launch summary reports as `inactive`.
+    pub scratch_dir: bool,
 }
 
 /// Static explanation of whether a command would run under the resolved policy.
@@ -507,6 +520,62 @@ fn command_basename(cmd: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default()
+}
+
+/// What a guard refusal means for `check exec`, given the mode that guard runs in.
+///
+/// `gate_git` and `gate` answer one question — does the policy object? — and
+/// return `Err` when it does. Whether that objection *stops* the command is a
+/// separate decision the launch makes from the enforcement mode, and
+/// `check exec` used to skip it: every refusal was reported `BLOCKED`, so a
+/// developer in warn mode was told a push would be blocked while the launch
+/// printed a warning and pushed. `check exec` exists to answer "what will
+/// happen", which makes it the one surface where that drift is the whole
+/// defect (#431).
+fn refusal_decision(
+    mode: crate::config::EnforcementMode,
+    msg: &str,
+    blocked_fix: &str,
+    guard: &str,
+) -> ExecExplain {
+    use crate::config::EnforcementMode;
+    match mode {
+        EnforcementMode::Block => ExecExplain {
+            decision: Decision::Blocked,
+            reason: first_line(msg),
+            fix: Some(blocked_fix.to_string()),
+        },
+        // The command runs. Saying "allowed" alone would hide that the policy
+        // objected, so the reason carries the objection and the fix says how to
+        // make it bite.
+        EnforcementMode::Warn | EnforcementMode::Audit => {
+            // The policy message is written for block mode and leads with
+            // "BLOCKED by sandbox"; stacking that inside a line that says
+            // ALLOWED is the contradiction this fix exists to remove. The
+            // launch strips the same prefix for the same reason. Bound once:
+            // `first_line` allocates, and calling it inside the format to
+            // strip a prefix off its own temporary reads as a puzzle.
+            let line = first_line(msg);
+            let objection = line
+                .strip_prefix("⚠️ BLOCKED by sandbox:")
+                .unwrap_or(&line)
+                .trim();
+            let mode_name = match mode {
+                EnforcementMode::Warn => "warn",
+                _ => "audit",
+            };
+            ExecExplain {
+                decision: Decision::Allowed,
+                reason: format!(
+                    "the {guard} guard objects, but it runs in {mode_name} mode, so the \
+                 command runs. {objection}"
+                ),
+                fix: Some(format!(
+                    "set {guard}_guard.mode = \"block\" to enforce this."
+                )),
+            }
+        }
+    }
 }
 
 /// Explain whether `argv` would run, is guard-blocked, or needs an `allow_*`.
@@ -563,32 +632,40 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 fix: None,
             };
         }
+        if !ctx.scratch_dir {
+            return ExecExplain {
+                decision: Decision::Allowed,
+                reason: "git runs unguarded: the git guard needs a scratch dir for its \
+                         PATH shim, and this run has none, so the guard is inactive \
+                         however it is configured."
+                    .to_string(),
+                fix: Some("remove `sandbox.scratch_dir = false` to let the guard run.".to_string()),
+            };
+        }
         return match crate::gh_proxy::gate_git(
             &rest,
             ctx.git_guard.prevent_push,
             ctx.git_guard.prevent_force_push,
             ctx.git_guard.protect_default_branch_only,
             &ctx.git_guard.allow_push,
-            None,
-            // `cplt check exec` explains policy without a repository probe; with
-            // no baked facts the default-branch arm fails closed, matching what
-            // a launch that captured nothing would do.
-            &crate::gh_proxy::RepoFacts::default(),
+            // The launch hands the gate a real git so it can resolve which
+            // branches a push actually targets; without one no push is ever
+            // provably feature-only and the default-branch arm fails closed.
+            crate::git::trusted_git(),
+            ctx.repo_facts,
         ) {
             Ok(()) => ExecExplain {
                 decision: Decision::Allowed,
                 reason: "allowed by the git guard.".to_string(),
                 fix: None,
             },
-            Err(msg) => ExecExplain {
-                decision: Decision::Blocked,
-                reason: first_line(&msg),
-                fix: Some(
-                    "push to an allowed branch/remote, configure [git] allow_push, \
-                     or disable with git_push_prevention = false."
-                        .to_string(),
-                ),
-            },
+            Err(msg) => refusal_decision(
+                ctx.git_guard.mode,
+                &msg,
+                "push to an allowed branch/remote, configure [git] allow_push, \
+                 or disable with git_push_prevention = false.",
+                "git",
+            ),
         };
     }
 
@@ -599,6 +676,16 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "gh runs; the gh guard is not enabled for this run.".to_string(),
                 fix: None,
+            };
+        }
+        if !ctx.scratch_dir {
+            return ExecExplain {
+                decision: Decision::Allowed,
+                reason: "gh runs unguarded: the gh guard needs a scratch dir for its \
+                         PATH shim, and this run has none, so the guard is inactive \
+                         however it is configured."
+                    .to_string(),
+                fix: Some("remove `sandbox.scratch_dir = false` to let the guard run.".to_string()),
             };
         }
         let policy = crate::gh_proxy::GatePolicy {
@@ -621,16 +708,14 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 reason: "allowed by the gh guard.".to_string(),
                 fix: None,
             },
-            Err(msg) => ExecExplain {
-                decision: Decision::Blocked,
-                reason: first_line(&msg),
-                fix: Some(
-                    "use a read-only / in-scope gh command, run it from the startup \
-                     repository's checkout, or relax the gh guard (e.g. [sandbox] \
-                     gh_proxy settings)."
-                        .to_string(),
-                ),
-            },
+            Err(msg) => refusal_decision(
+                ctx.gh_guard.mode,
+                &msg,
+                "use a read-only / in-scope gh command, run it from the startup \
+                 repository's checkout, or relax the gh guard (e.g. [sandbox] \
+                 gh_proxy settings).",
+                "gh",
+            ),
         };
     }
 
@@ -1028,6 +1113,15 @@ mod tests {
 
     // ── explain_exec ──
 
+    /// Facts for the unit tests: a scratch dir, and no captured repository.
+    ///
+    /// Empty facts is the honest default here — these tests assert on policy
+    /// shape, not on a checkout — and it is also the case the guard fails
+    /// closed on, so `git push` reads as blocked exactly as it did before
+    /// `ExecContext` grew these fields.
+    static NO_FACTS: std::sync::LazyLock<crate::gh_proxy::RepoFacts> =
+        std::sync::LazyLock::new(crate::gh_proxy::RepoFacts::default);
+
     fn exec_ctx<'a>(
         gh: &'a GhGuardPolicy,
         git: &'a GitGuardPolicy,
@@ -1039,6 +1133,8 @@ mod tests {
             gh_guard: gh,
             git_guard: git,
             project_dir: Path::new("/home/u/proj"),
+            repo_facts: &NO_FACTS,
+            scratch_dir: true,
         }
     }
 

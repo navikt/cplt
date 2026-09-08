@@ -104,7 +104,7 @@ Proxy clients are not authenticated by process identity. The report cannot estab
 
 The explicit `--observe-domains` diagnostic uses the same snapshot. Its terminal list displays at most 20 entries and discloses omitted entries.
 
-`--observe-domains-out` writes retained allowed hosts, including when collection is incomplete. Leading `# incomplete:` comments disclose collection failures, pending clients, and omitted observations. Invalid host entries, including escaped control characters, are omitted and counted in a comment. The allowlist parser ignores these comments.
+`--observe-domains-out` writes retained allowed hosts, including when collection is incomplete. Leading `# incomplete:` comments disclose collection failures, pending clients, and omitted observations. Invalid host entries, including escaped control characters, are omitted and counted in a comment. The allowlist parser ignores these comments. The parent opens the output destination before the session without following a destination symlink, then writes through that pinned handle. Replacing the path during the session cannot redirect the parent write.
 
 ## Proxy-forced mode
 

@@ -9,7 +9,7 @@ use cplt::{
     scratch, subscriptions, trust, update,
 };
 use std::collections::BTreeSet;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Seek, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -2231,6 +2231,40 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     })
 }
 
+/// An output file pinned before the sandboxed process can replace its path.
+struct PinnedObserveDomainsOutput {
+    shown_path: String,
+    file: io::Result<std::fs::File>,
+}
+
+impl PinnedObserveDomainsOutput {
+    /// Pin the output inode before the sandboxed process can replace its path.
+    fn open(path: &Path) -> Self {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .and_then(|file| {
+                if file.metadata()?.file_type().is_file() {
+                    Ok(file)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "output target is not a regular file",
+                    ))
+                }
+            });
+        Self {
+            shown_path: path.display().to_string().escape_debug().to_string(),
+            file,
+        }
+    }
+}
+
 /// Print the proxy-observed retained CONNECT hosts and optionally write the
 /// permitted retained hosts to `out_file`.
 ///
@@ -2241,14 +2275,17 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 /// (public-suffix) heuristic that would risk over-broadening the allowlist, so
 /// the raw observed hosts are emitted and the note points out that the matcher
 /// is exact-or-subdomain and a parent can be substituted by hand.
-fn emit_observed_domains(snapshot: &proxy::ProxySnapshot, out_file: Option<&Path>) {
+fn emit_observed_domains(
+    snapshot: &proxy::ProxySnapshot,
+    out_file: Option<&mut PinnedObserveDomainsOutput>,
+) {
     write_observed_domains(&mut io::stderr().lock(), snapshot, out_file);
 }
 
 fn write_observed_domains(
     stderr: &mut impl Write,
     snapshot: &proxy::ProxySnapshot,
-    out_file: Option<&Path>,
+    out_file: Option<&mut PinnedObserveDomainsOutput>,
 ) {
     let observed = &snapshot.domains;
     let complete = snapshot.availability == proxy::SnapshotAvailability::Available
@@ -2307,8 +2344,7 @@ fn write_observed_domains(
         );
     }
 
-    if let Some(path) = out_file {
-        let shown_path = path.display().to_string().escape_debug().to_string();
+    if let Some(output) = out_file {
         // Escaping happens before collection. Backslashes therefore also
         // identify escaped controls, which must not become allowlist entries.
         let valid_host = |host: &str| !host.contains('\\') && !host.chars().any(char::is_control);
@@ -2335,17 +2371,26 @@ fn write_observed_domains(
             let _ = writeln!(body, "{}", entry.host);
             written += 1;
         }
-        match std::fs::write(path, body) {
+        let result = match &mut output.file {
+            Ok(file) => file
+                .set_len(0)
+                .and_then(|()| file.seek(io::SeekFrom::Start(0)).map(|_| ()))
+                .and_then(|()| file.write_all(&body)),
+            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+        };
+        match result {
             Ok(()) => {
                 let _ = writeln!(
                     stderr,
-                    "[cplt] observe-domains: wrote {written} domains to {shown_path}"
+                    "[cplt] observe-domains: wrote {written} domains to pinned output {}",
+                    output.shown_path
                 );
             }
             Err(e) => {
                 let _ = writeln!(
                     stderr,
-                    "[cplt] observe-domains: cannot write {shown_path}: {e}"
+                    "[cplt] observe-domains: cannot write {}: {e}",
+                    output.shown_path
                 );
             }
         }
@@ -3325,6 +3370,13 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     let audit_enabled = resolved.audit && !resolved.quiet;
     let routing = network_routing_fact(&resolved);
     let needs_snapshot = audit_enabled || cli.observe_domains;
+    let mut observe_domains_output = if cli.observe_domains {
+        cli.observe_domains_out
+            .as_deref()
+            .map(PinnedObserveDomainsOutput::open)
+    } else {
+        None
+    };
     let mut proxy_handle = proxy_handle;
     let (exit_code, snapshot) = audit::run(
         &project_dir,
@@ -3362,7 +3414,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     if cli.observe_domains
         && let Some(snapshot) = snapshot.as_ref()
     {
-        emit_observed_domains(snapshot, cli.observe_domains_out.as_deref());
+        emit_observed_domains(snapshot, observe_domains_output.as_mut());
     }
     if let Some(mut child) = denial_proc {
         let _ = child.kill();
@@ -4258,6 +4310,22 @@ fn run_exec_command(
     // Always use the Shell sandbox policy
     let active_agent = agent::Agent::Shell;
 
+    // ...but say so when the operator asked for something else. The profiles
+    // genuinely differ — Shell has no Keychain grant, so `gh` finds no token,
+    // while copilot, claude, antigravity and goose do — so someone running
+    // `--agent copilot exec` to find out what Copilot may do gets a truthful
+    // answer about a different sandbox. Dropping the flag in silence cost a
+    // real debugging session (#411).
+    if let Some(requested) = cli.agent.as_deref()
+        && !requested.eq_ignore_ascii_case("shell")
+    {
+        ui::warn(&format!(
+            "exec: --agent {requested} is ignored. `cplt exec` always builds the Shell \
+             profile, which grants less (no Keychain, so `gh` finds no token here). To \
+             probe what {requested} may do, run `cplt --agent {requested} check`."
+        ));
+    }
+
     // Shell, not the agent `resolve_context` detected: exec builds the Shell
     // profile, so a warning about another agent's directories would name an
     // effect this session cannot have (#343).
@@ -4343,6 +4411,13 @@ fn run_exec_command(
     let audit_enabled = resolved.audit && !resolved.quiet;
     let routing = network_routing_fact(&resolved);
     let needs_snapshot = audit_enabled || cli.observe_domains;
+    let mut observe_domains_output = if cli.observe_domains {
+        cli.observe_domains_out
+            .as_deref()
+            .map(PinnedObserveDomainsOutput::open)
+    } else {
+        None
+    };
     let mut proxy_handle = proxy_handle;
     let (exit_code, snapshot) = audit::run(
         &project_dir,
@@ -4379,7 +4454,7 @@ fn run_exec_command(
     if cli.observe_domains
         && let Some(snapshot) = snapshot.as_ref()
     {
-        emit_observed_domains(snapshot, cli.observe_domains_out.as_deref());
+        emit_observed_domains(snapshot, observe_domains_output.as_mut());
     }
 
     Ok(ExitCode::from(exit_code))
@@ -5170,12 +5245,20 @@ fn build_exec_check(
     agent_name: String,
     preset_name: Option<String>,
 ) -> check::Report {
+    // The same capture the launch does, from the same trusted git (see
+    // `sandbox_exec.rs`, "baked at launch"): without it every push reads as
+    // blocked, feature branches included.
+    let repo_facts = crate::git::trusted_git()
+        .map(|git| gh_proxy::capture_repo_facts(git, project_dir))
+        .unwrap_or_default();
     let ctx = check::ExecContext {
         allow_docker: resolved.allow_docker,
         allow_tmp_exec: resolved.allow_tmp_exec,
         gh_guard: &resolved.gh_guard,
         git_guard: &resolved.git_guard,
         project_dir,
+        repo_facts: &repo_facts,
+        scratch_dir: resolved.scratch_dir,
     };
     let expl = check::explain_exec(cmd, &ctx);
     let item = check::CheckItem {
@@ -7158,7 +7241,8 @@ mod tests {
             host_key_byte_limit: 1024,
         };
         let mut terminal = Vec::new();
-        write_observed_domains(&mut terminal, &snapshot, Some(&out));
+        let mut output = PinnedObserveDomainsOutput::open(&out);
+        write_observed_domains(&mut terminal, &snapshot, Some(&mut output));
         let terminal = String::from_utf8(terminal).unwrap();
         assert!(terminal.contains("terminal display omitted 5 retained entries"));
         let displayed = snapshot
@@ -7231,7 +7315,8 @@ mod tests {
         }
         for case in cases {
             let mut terminal = Vec::new();
-            write_observed_domains(&mut terminal, &case, Some(&out));
+            let mut output = PinnedObserveDomainsOutput::open(&out);
+            write_observed_domains(&mut terminal, &case, Some(&mut output));
             let terminal = String::from_utf8(terminal).unwrap();
 
             assert!(!terminal.contains('\u{1b}'));
@@ -7242,6 +7327,94 @@ mod tests {
             assert!(!body.contains("stale.example"), "{body}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn one_observed_domain() -> proxy::ProxySnapshot {
+        let now = std::time::Instant::now();
+        proxy::ProxySnapshot {
+            availability: proxy::SnapshotAvailability::Available,
+            collection_started_at: now,
+            admission_closed_at: Some(now),
+            cutoff_at: now,
+            completion: proxy::SnapshotCompletion::Settled,
+            recorded_attempts: 1,
+            unretained_observations: 0,
+            domains: vec![proxy::ObservedDomain {
+                host: "safe.example".into(),
+                verdict: proxy::DomainVerdict::Allowed,
+                count: 1,
+            }],
+            integrity: proxy::SnapshotIntegrity::default(),
+            retained_host_limit: 1024,
+            host_key_byte_limit: 1024,
+        }
+    }
+
+    #[test]
+    fn observed_domains_output_keeps_pinned_leaf_after_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let selected = dir.path().join("domains.txt");
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&selected, "old\n").unwrap();
+        std::fs::write(&outside, "outside\n").unwrap();
+        let mut output = PinnedObserveDomainsOutput::open(&selected);
+
+        std::fs::remove_file(&selected).unwrap();
+        symlink(&outside, &selected).unwrap();
+        write_observed_domains(&mut Vec::new(), &one_observed_domain(), Some(&mut output));
+
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
+    }
+
+    #[test]
+    fn observed_domains_output_keeps_pinned_file_after_parent_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let selected_dir = dir.path().join("selected");
+        let pinned_dir = dir.path().join("pinned");
+        let outside_dir = dir.path().join("outside");
+        std::fs::create_dir(&selected_dir).unwrap();
+        std::fs::create_dir(&outside_dir).unwrap();
+        let selected = selected_dir.join("domains.txt");
+        let outside = outside_dir.join("domains.txt");
+        std::fs::write(&selected, "old\n").unwrap();
+        std::fs::write(&outside, "outside\n").unwrap();
+        let mut output = PinnedObserveDomainsOutput::open(&selected);
+
+        std::fs::rename(&selected_dir, &pinned_dir).unwrap();
+        symlink(&outside_dir, &selected_dir).unwrap();
+        write_observed_domains(&mut Vec::new(), &one_observed_domain(), Some(&mut output));
+
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
+        assert_eq!(
+            std::fs::read_to_string(pinned_dir.join("domains.txt")).unwrap(),
+            "safe.example\n"
+        );
+    }
+
+    #[test]
+    fn observed_domains_output_rejects_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let selected = dir.path().join("domains.txt");
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "outside\n").unwrap();
+        symlink(&outside, &selected).unwrap();
+        let mut output = PinnedObserveDomainsOutput::open(&selected);
+        let mut terminal = Vec::new();
+
+        write_observed_domains(&mut terminal, &one_observed_domain(), Some(&mut output));
+
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
+        assert!(
+            String::from_utf8(terminal)
+                .unwrap()
+                .contains("cannot write")
+        );
     }
 
     /// No-leak invariant: the observe-mode allow-all override is flag-gated and
