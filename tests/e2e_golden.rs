@@ -820,3 +820,314 @@ fn golden_env_denial_names_the_nais_bootstrap_it_detected() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&plain_home);
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Path 5 — `check exec` answers the question the launch answers
+// ════════════════════════════════════════════════════════════════════
+
+/// `cplt check exec <cmd>` exists so a developer can ask what will happen
+/// without launching an agent. It is therefore the one surface where telling
+/// the truth about the guards *is* the feature.
+///
+/// It got warn mode wrong: `gate_git` and `gate` answer "does the policy
+/// object", and `check exec` mapped every objection to BLOCKED — while the
+/// launch consults the enforcement mode, prints a warning and runs the command.
+/// A developer in warn mode was told a push would be blocked; the push went
+/// through and the remote moved.
+#[test]
+fn golden_check_exec_agrees_with_the_launch_in_both_modes() {
+    require_launch!();
+    let home = make_config_home("golden-check");
+    let (_tmp, work, origin) = bare_origin_repo(Path::new(env!("CARGO_MANIFEST_DIR")));
+
+    let run = |args: &[&str]| {
+        let out = common::git_cmd(&work)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {args:?} should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["push", "--quiet", "origin", "main"]);
+    run(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    run(&["commit", "--quiet", "--allow-empty", "-m", "work"]);
+
+    let allow = origin.to_string_lossy().into_owned();
+    let push = || {
+        let args = vec![
+            "--yes",
+            "--no-validate",
+            "--allow-write",
+            &allow,
+            "exec",
+            "--",
+            "git",
+            "push",
+            "origin",
+            "main",
+        ];
+        launch(&home, &work, &args)
+    };
+    let head = || {
+        String::from_utf8_lossy(
+            &common::git_cmd(&origin)
+                .args(["rev-parse", "refs/heads/main"])
+                .output()
+                .expect("git should run")
+                .stdout,
+        )
+        .trim()
+        .to_string()
+    };
+
+    // ── block mode: check says BLOCKED, and the push really is blocked ──
+    let (check_out, check_err, status) = launch(
+        &home,
+        &work,
+        &["check", "exec", "git", "push", "origin", "main"],
+    );
+    let check = format!("{check_out}{check_err}");
+    assert!(status.success(), "check exec should run:\n{check}");
+    assert!(
+        check.contains("BLOCKED"),
+        "in block mode `check exec` must say the push is blocked:\n{check}"
+    );
+
+    let before = head();
+    let (_, stderr, push_status) = push();
+    assert!(
+        !push_status.success(),
+        "the launch must agree with `check exec` and refuse:\n{stderr}"
+    );
+    assert_eq!(before, head(), "a blocked push must not move the remote");
+
+    // ── warn mode: the launch runs the push, so check must not say BLOCKED ──
+    let (_, stderr, status) = launch(
+        &home,
+        &work,
+        &["config", "set", "git_guard.mode", "warn", "--force"],
+    );
+    assert!(
+        status.success(),
+        "setting warn mode should succeed:\n{stderr}"
+    );
+
+    let (check_out, check_err, status) = launch(
+        &home,
+        &work,
+        &["check", "exec", "git", "push", "origin", "main"],
+    );
+    let check = format!("{check_out}{check_err}");
+    assert!(
+        status.success(),
+        "check exec should run in warn mode:\n{check}"
+    );
+    assert!(
+        check.contains("ALLOWED"),
+        "warn mode lets the command run, so `check exec` must not report it \
+         blocked — this is the drift the surface exists to prevent:\n{check}"
+    );
+    // Allowed, but not silently: the objection is still the operator's business.
+    assert!(
+        check.contains("warn mode"),
+        "`check exec` must say why a command the guard objects to is allowed:\n{check}"
+    );
+
+    let before = head();
+    let (_, stderr, push_status) = push();
+    assert!(
+        push_status.success(),
+        "warn mode must let the push through, matching what `check exec` said:\n{stderr}"
+    );
+    assert_ne!(
+        before,
+        head(),
+        "warn mode does not enforce, so the push must have reached the remote — \
+         if it did not, `check exec` is now wrong in the other direction:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Path 6 — an untrusted `.cplt.toml` is announced, inert, then in force
+// ════════════════════════════════════════════════════════════════════
+
+/// The repo layer's whole security model is that `[propose]` does nothing until
+/// a human approves it on this machine. Two failures are equally bad: a
+/// proposal that applies before approval, and a summary that stays silent about
+/// one waiting. Both are invisible to every test that only asserts on the
+/// agent's view.
+#[test]
+fn golden_untrusted_repo_config_is_announced_inert_then_applied() {
+    require_launch!();
+    let home = make_config_home("golden-trust");
+    let repo = temp_repo("navikt/spleis");
+
+    // From git HEAD, not the working tree — so it has to be committed.
+    std::fs::write(
+        repo.path().join(".cplt.toml"),
+        "[propose]\nallow_localhost_any = true\n",
+    )
+    .expect("write .cplt.toml");
+    for args in [
+        &["add", ".cplt.toml"][..],
+        &["commit", "--quiet", "-m", "add cplt config"][..],
+    ] {
+        let out = common::git_cmd(repo.path())
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(out.status.success(), "git {args:?} should succeed");
+    }
+
+    // 1. Announced, and not yet in force.
+    let (_, stderr, ok) = launch_agent(&home, repo.path());
+    assert!(
+        ok,
+        "an unapproved proposal must not stop the launch:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Untrusted .cplt.toml"),
+        "the summary must say a repo config is waiting for approval:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("cplt trust"),
+        "and must name the command that shows it:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Localhost:     blocked"),
+        "an unapproved proposal must not be in force — this is the whole trust \
+         model:\n{stderr}"
+    );
+
+    // 2. `cplt trust` shows it as pending rather than applied.
+    let (stdout, stderr, status) = launch(&home, repo.path(), &["trust"]);
+    let trust = format!("{stdout}{stderr}");
+    assert!(status.success(), "cplt trust should succeed:\n{trust}");
+    assert!(
+        trust.contains("allow_localhost_any") && trust.contains("pending"),
+        "`cplt trust` must list the proposal as pending:\n{trust}"
+    );
+
+    // 3. Approved, and now in force.
+    let (stdout, stderr, status) = launch(&home, repo.path(), &["trust", "accept", "--all"]);
+    assert!(
+        status.success(),
+        "trust accept should succeed:\n{stdout}{stderr}"
+    );
+
+    let (_, stderr, ok) = launch_agent(&home, repo.path());
+    assert!(ok, "an approved launch must succeed:\n{stderr}");
+    assert!(
+        !stderr.contains("Untrusted .cplt.toml"),
+        "an approved config must stop being announced as untrusted:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Localhost:     all ports"),
+        "after approval the proposal must actually apply:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Path 7 — the awkward repository states still launch, and say something true
+// ════════════════════════════════════════════════════════════════════
+
+/// A repository with no remote, a detached HEAD, or uncommitted changes is an
+/// ordinary Tuesday, and none of the three was covered anywhere. The guards
+/// read the remote's default branch, so "there isn't one" is a real input, and
+/// the failure mode to avoid is a launch that dies on it or reports guards it
+/// is not running.
+#[test]
+fn golden_awkward_repository_states_still_launch() {
+    require_launch!();
+
+    let commit = |dir: &Path, args: &[&str]| {
+        let out = common::git_cmd(dir)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {args:?} should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // ── no remote at all ──
+    let bare = tempfile::tempdir().expect("tempdir");
+    commit(bare.path(), &["init", "--quiet", "-b", "main"]);
+    commit(
+        bare.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "init"],
+    );
+
+    let home = make_config_home("golden-noremote");
+    let (_, stderr, ok) = launch_agent(&home, bare.path());
+    assert!(
+        ok,
+        "a repository with no remote must still launch — the guards read the \
+         remote's default branch, and not having one is not an error:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("git guard:     on"),
+        "the guards still run with no remote, so the summary must still say so:\n{stderr}"
+    );
+
+    // ── detached HEAD ──
+    let detached = temp_repo("navikt/spleis");
+    commit(
+        detached.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "one"],
+    );
+    commit(
+        detached.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "two"],
+    );
+    commit(
+        detached.path(),
+        &["checkout", "--quiet", "--detach", "HEAD"],
+    );
+
+    let detached_home = make_config_home("golden-detached");
+    let (_, stderr, ok) = launch_agent(&detached_home, detached.path());
+    assert!(
+        ok,
+        "a detached HEAD must still launch — there is no current branch to \
+         compare against the protected one:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("git guard:     on"),
+        "the git guard must still be reported on a detached HEAD:\n{stderr}"
+    );
+
+    // ── uncommitted changes ──
+    let dirty = temp_repo("navikt/spleis");
+    commit(
+        dirty.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "init"],
+    );
+    std::fs::write(dirty.path().join("notes.txt"), "work in progress\n")
+        .expect("write a dirty file");
+
+    let dirty_home = make_config_home("golden-dirty");
+    let (_, stderr, ok) = launch_agent(&dirty_home, dirty.path());
+    assert!(
+        ok,
+        "uncommitted changes must not stop a launch — that is the state an \
+         agent is usually asked to work in:\n{stderr}"
+    );
+
+    for h in [&home, &detached_home, &dirty_home] {
+        let _ = std::fs::remove_dir_all(h);
+    }
+}

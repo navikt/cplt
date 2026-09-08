@@ -517,6 +517,56 @@ fn command_basename(cmd: &str) -> String {
 /// other high-frequency cases. Unrecognized commands get an honest generic
 /// answer (they run, subject to the fs/net policy).
 #[must_use]
+/// What a guard refusal means for `check exec`, given the mode that guard runs in.
+///
+/// `gate_git` and `gate` answer one question — does the policy object? — and
+/// return `Err` when it does. Whether that objection *stops* the command is a
+/// separate decision the launch makes from the enforcement mode, and
+/// `check exec` used to skip it: every refusal was reported `BLOCKED`, so a
+/// developer in warn mode was told a push would be blocked while the launch
+/// printed a warning and pushed. `check exec` exists to answer "what will
+/// happen", which makes it the one surface where that drift is the whole
+/// defect (#431).
+fn refusal_decision(
+    mode: crate::config::EnforcementMode,
+    msg: &str,
+    blocked_fix: &str,
+    guard: &str,
+) -> ExecExplain {
+    use crate::config::EnforcementMode;
+    match mode {
+        EnforcementMode::Block => ExecExplain {
+            decision: Decision::Blocked,
+            reason: first_line(msg),
+            fix: Some(blocked_fix.to_string()),
+        },
+        // The command runs. Saying "allowed" alone would hide that the policy
+        // objected, so the reason carries the objection and the fix says how to
+        // make it bite.
+        EnforcementMode::Warn | EnforcementMode::Audit => ExecExplain {
+            decision: Decision::Allowed,
+            reason: format!(
+                "the {guard} guard objects, but it runs in {} mode, so the command runs. {}",
+                match mode {
+                    EnforcementMode::Warn => "warn",
+                    _ => "audit",
+                },
+                // The policy message is written for block mode and leads with
+                // "BLOCKED by sandbox"; stacking that inside a line that says
+                // ALLOWED is the contradiction this fix exists to remove. The
+                // launch strips the same prefix for the same reason.
+                first_line(msg)
+                    .strip_prefix("⚠️ BLOCKED by sandbox:")
+                    .unwrap_or(&first_line(msg))
+                    .trim()
+            ),
+            fix: Some(format!(
+                "set {guard}_guard.mode = \"block\" to enforce this."
+            )),
+        },
+    }
+}
+
 pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
     let Some(first) = argv.first() else {
         return ExecExplain {
@@ -580,15 +630,13 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 reason: "allowed by the git guard.".to_string(),
                 fix: None,
             },
-            Err(msg) => ExecExplain {
-                decision: Decision::Blocked,
-                reason: first_line(&msg),
-                fix: Some(
-                    "push to an allowed branch/remote, configure [git] allow_push, \
-                     or disable with git_push_prevention = false."
-                        .to_string(),
-                ),
-            },
+            Err(msg) => refusal_decision(
+                ctx.git_guard.mode,
+                &msg,
+                "push to an allowed branch/remote, configure [git] allow_push, \
+                 or disable with git_push_prevention = false.",
+                "git",
+            ),
         };
     }
 
@@ -621,16 +669,14 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 reason: "allowed by the gh guard.".to_string(),
                 fix: None,
             },
-            Err(msg) => ExecExplain {
-                decision: Decision::Blocked,
-                reason: first_line(&msg),
-                fix: Some(
-                    "use a read-only / in-scope gh command, run it from the startup \
-                     repository's checkout, or relax the gh guard (e.g. [sandbox] \
-                     gh_proxy settings)."
-                        .to_string(),
-                ),
-            },
+            Err(msg) => refusal_decision(
+                ctx.gh_guard.mode,
+                &msg,
+                "use a read-only / in-scope gh command, run it from the startup \
+                 repository's checkout, or relax the gh guard (e.g. [sandbox] \
+                 gh_proxy settings).",
+                "gh",
+            ),
         };
     }
 
