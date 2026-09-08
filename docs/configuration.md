@@ -283,7 +283,6 @@ The settings below are machine-specific or local CLI preferences, so `.cplt.toml
 | `sandbox.brief` | local agent-context preference |
 | `sandbox.agents_md` | a repo must not be able to make cplt write into its own `AGENTS.md` |
 | `sandbox.use_bubblewrap` | depends on bwrap being installed on the machine |
-| `sandbox.pass_env` | machine-specific env passthrough |
 | `sandbox.audit` | local output preference, not project sandbox policy |
 | `sandbox.gradle_init` | writes to the machine's Gradle user home, not project policy |
 | `sandbox.inherit_env` | too dangerous for repo config, it would affect every team member |
