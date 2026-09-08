@@ -25,6 +25,39 @@ cplt config set sandbox.allow_env_files true
 
 Or for a single run: `cplt --allow-env-files -- -p "start the dev server"`
 
+### A tracked protected file breaks git
+
+The table above lists reading. There is a second effect that looks like a git
+bug rather than a sandbox decision: if one of these files is **tracked by git**
+and has been modified, git commands that hash the worktree fail outright.
+
+```
+error: open(".env.local"): Operation not permitted
+fatal: cannot hash .env.local
+```
+
+`git diff`, `git add`, `git stash` and `git commit -a` all abort — not skip the
+file, abort — because git hashes worktree files and the read is denied.
+`git status` still works, since it only stats. An **untracked** file affects
+only `git add -A`, and a **gitignored** one affects nothing, because git never
+hashes it.
+
+The fix is to stop tracking it, which is worth doing on its own — a file
+matching these patterns is secret-shaped, and it is in the repository:
+
+```bash
+git rm --cached .env.local
+echo ".env.local" >> .gitignore
+```
+
+`--allow-env-files` also works, but it unblocks every `.env*`, `.pem`, `.key`,
+`.p12`, `.pfx` and `.jks` in the project rather than the one file. A targeted
+`allow.read` on the path does **not** lift the deny; there is no per-file
+exemption.
+
+`cplt check` reports any tracked file matching these patterns, so you can find
+out before an agent session does.
+
 ## Relative paths in `.cplt.toml` now bite (behaviour change)
 
 A relative path in a repo `.cplt.toml`, say `deny.paths = ["target"]` or `propose.allow.read = ["vendor"]`, used to be **silently unenforced**. macOS compiled it into the profile as a rule that matched nothing, and Linux dropped it. It is now resolved against the repository root and enforced for real.
@@ -348,7 +381,7 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 
 | Operation                          | Impact      | Why                                                               |
 | ---------------------------------- | ----------- | ----------------------------------------------------------------- |
-| `git add/commit/status/diff/log`   | ✅ Works     | Local operations, no writes to protected paths                    |
+| `git add/commit/status/diff/log`   | ✅ Works, unless a protected file is tracked | Local operations, no writes to protected paths — but git hashes worktree files, so a **tracked** `.env*`/`.pem`/`.key` that has been modified aborts `add`, `diff`, `stash` and `commit -a`. See [A tracked protected file breaks git](#a-tracked-protected-file-breaks-git) |
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works, except a default-branch push | Port 443 allowed, `gh auth git-credential` provides credentials. The git guard refuses pushes to `main`/`master` and every force push, see [Git workflow](#git-workflow-commit--push) |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked on macOS | SSH agent socket denied, use HTTPS. On Linux only `SSH_AUTH_SOCK` is withheld |

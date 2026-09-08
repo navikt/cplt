@@ -4718,6 +4718,57 @@ fn run_check_command(
     }
 }
 
+/// Files git tracks in `project_dir` that the sandbox denies reading.
+///
+/// Asks git rather than walking the tree: an ignored or untracked `.env` is
+/// harmless here — git never hashes it — so the tracked set is exactly the one
+/// that breaks commands, and it is also exactly the set that represents a
+/// secret committed to the repository.
+///
+/// Silent on any git failure: this is an advisory check, and a repository
+/// without a commit yet, or no git at all, is not something to report as a
+/// finding.
+#[allow(clippy::disallowed_methods)] // `git` is a git::trusted_git() path, resolved immediately above
+fn tracked_sensitive_files(project_dir: &Path) -> Vec<String> {
+    let Some(git) = cplt::git::trusted_git() else {
+        return Vec::new();
+    };
+    let Ok(out) = std::process::Command::new(git)
+        .arg("-C")
+        // The path itself, not a lossy string: a non-UTF-8 byte would be
+        // replaced and point git at a different directory, or none.
+        .arg(project_dir)
+        .args(["ls-files", "-z"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .filter(|name| is_sensitive_basename(name.rsplit('/').next().unwrap_or(name)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a file name matches [`sandbox::SENSITIVE_PROJECT_PATTERNS`].
+///
+/// Hand-matched rather than compiled: those patterns are SBPL regex source for
+/// the macOS profile, and cplt has no regex engine linked. The list is seven
+/// fixed shapes, so a `ends_with` each is the whole implementation — and
+/// `sensitive_basename_matches_the_profile_patterns` fails if the constant
+/// grows, so a new pattern cannot be silently unmatched here.
+fn is_sensitive_basename(base: &str) -> bool {
+    base == ".env"
+        || base.starts_with(".env.")
+        || [".pem", ".key", ".p12", ".pfx", ".jks"]
+            .iter()
+            .any(|ext| base.ends_with(ext))
+}
+
 /// Resolve a user-supplied check path to an absolute path without requiring it
 /// to exist (canonicalize the existing ancestor, then re-append the tail).
 fn canonicalize_check_path(path: &Path) -> PathBuf {
@@ -4749,6 +4800,48 @@ fn build_battery(
     preset_name: Option<String>,
 ) -> check::Report {
     let mut items = Vec::new();
+
+    // A tracked file the sandbox denies breaks git itself, and the failure
+    // names the sandbox rather than the cause: `fatal: cannot hash .env.local`
+    // from `git diff`, `git add`, `git stash` and `git commit -a`, because git
+    // hashes worktree files and the read deny aborts it. Worth checking for
+    // two reasons at once — it is a git-hostile configuration *and* a secret
+    // committed to the repository (#401).
+    for tracked in tracked_sensitive_files(project_dir) {
+        items.push(check::CheckItem {
+            name: "tracked secret-shaped file".to_string(),
+            category: "filesystem".to_string(),
+            target: tracked.clone(),
+            decision: if resolved.allow_env_files {
+                check::Decision::Allowed
+            } else {
+                check::Decision::Blocked
+            },
+            expected: None,
+            reason: if resolved.allow_env_files {
+                format!(
+                    "{tracked} is tracked by git and matches the protected patterns, but \
+                     allow_env_files is on, so git can read it. It is still a secret-shaped \
+                     file committed to the repository."
+                )
+            } else {
+                format!(
+                    "{tracked} is tracked by git and the sandbox denies reading it, so \
+                     `git add`, `git diff`, `git stash` and `git commit -a` fail with \
+                     \"cannot hash\" whenever it is modified. git hashes worktree files, and \
+                     the read deny aborts the whole command rather than skipping the file."
+                )
+            },
+            fix: Some(
+                "Untrack it (`git rm --cached <FILE>`) and add it to .gitignore — an ignored \
+                 file is never hashed, and a secret-shaped file does not belong in the \
+                 repository. `--allow-env-files` also works but unblocks every .env, .pem, \
+                 .key, .p12, .pfx and .jks in the project."
+                    .to_string(),
+            ),
+            note: None,
+        });
+    }
 
     // ── Filesystem ──
     // Sanity: reading & writing the project dir must be ALLOWED.
@@ -6926,6 +7019,44 @@ fn start_denial_stream() -> Option<std::process::Child> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// The hand-written matcher must cover every pattern the profile denies.
+    /// It cannot be derived from them — they are SBPL regex source and there is
+    /// no regex engine linked — so this is the thing that stops the two
+    /// drifting when someone adds a pattern (#401).
+    #[test]
+    fn sensitive_basename_matches_the_profile_patterns() {
+        assert_eq!(
+            sandbox::SENSITIVE_PROJECT_PATTERNS.len(),
+            7,
+            "a pattern was added or removed; teach `is_sensitive_basename` about it \
+             and update this count"
+        );
+        for name in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "server.pem",
+            "id.key",
+            "cert.p12",
+            "cert.pfx",
+            "keystore.jks",
+        ] {
+            assert!(is_sensitive_basename(name), "{name} should be sensitive");
+        }
+        for name in [
+            "env",
+            "environment.md",
+            ".envrc",
+            "README.md",
+            "monkey.jks.bak",
+        ] {
+            assert!(
+                !is_sensitive_basename(name),
+                "{name} should not be treated as sensitive"
+            );
+        }
+    }
+
     use super::*;
     use clap::Parser;
 
