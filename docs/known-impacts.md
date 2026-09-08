@@ -616,6 +616,21 @@ Or for a single run: `cplt --allow-read ~/.m2/settings.xml`
 
 You do not need to allow `~/.npmrc` just to stop yarn 1 crashing on it — cplt redirects `NPM_CONFIG_USERCONFIG` for that, see [yarn 1 and unreadable home rc files](#yarn-1-and-unreadable-home-rc-files) below. If you would rather not hand `~/.npmrc` to the agent at all but do need a private registry, use a project-level `.npmrc`, which is readable as part of the project directory and can take its token from an environment variable.
 
+### NAV: the GitHub Packages mirror and the internal Nexus
+
+Two NAV-run hosts show up in most `navikt` JVM builds, and they need different answers.
+
+`github-package-registry-mirror.gc.nav.no` is an unauthenticated, GCS-backed mirror of public GitHub Packages. Teams point Gradle at it precisely so they do not need a PAT — which is what makes `~/.gradle/gradle.properties` necessary in the first place, so allowing the mirror removes a credential grant rather than adding one. It is deliberately **not** in cplt's default allowlist: that base list stays vendor-neutral, and an organisation-specific host does not belong in it. Add it yourself:
+
+```bash
+echo github-package-registry-mirror.gc.nav.no >> ~/.config/cplt/allowed-domains.txt
+cplt config set proxy.allowed_domains "~/.config/cplt/allowed-domains.txt"
+```
+
+(`proxy.allowed_domains` is a path to a domain list file, one host per line, not an inline array. Under `proxy.default_allowlist` the file is merged with the agent's built-in list, so you add the mirror without re-listing the registry base.)
+
+`repo.adeo.no` is NAV's internal Nexus and resolves into private address space, so `allowed_domains` is not enough — it is exactly the case [`proxy.allow_private_domains`](#internal-mavengradle-repositories-on-private-ips) exists for. `navikt/pensjonsbrev/.cplt.toml` is a working example of a team configuring it.
+
 > **Linux limitation:** the denials for files *inside an allowed tool dir* are only enforced on macOS, via SBPL literal deny rules. On Linux, Landlock cannot deny individual files within an allowed directory, so the parent dirs (`.m2`, `.gradle`, `.cargo`) stay fully readable for dependency resolution. `~/.npmrc` is the exception: it sits at the top of `$HOME`, which is never granted, so it is withheld on both platforms.
 
 ## Repo-local git content filters (LFS, git-crypt)

@@ -5174,8 +5174,23 @@ fn run_doctor() -> ExitCode {
             }
         }
 
+        // Detector diagnostics carry the remedy; the ecosystem name alone does
+        // not. `cplt doctor` is what a developer runs after a refusal, so the
+        // explanation has to reach this surface and not only `cplt init`.
+        for diag in &report.diagnostics {
+            println!();
+            println!(
+                "  {}!{} [{}] {}",
+                ui::stdout_color(ui::YELLOW),
+                ui::stdout_color(ui::RESET),
+                diag.detector,
+                diag.message
+            );
+        }
+
         let has_repo_config = project_dir.join(".cplt.toml").exists();
         if !has_repo_config {
+            println!();
             println!(
                 "  {}→{} Run `cplt init` to generate .cplt.toml",
                 ui::stdout_color(ui::BLUE),
