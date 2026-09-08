@@ -10,6 +10,7 @@ mod display;
 mod editing;
 mod error;
 mod loading;
+mod local;
 mod path;
 mod registry;
 mod repo;
@@ -25,6 +26,7 @@ pub use editing::{
 };
 pub use error::ConfigError;
 pub use loading::exec_tool_dir_warning;
+pub use local::{load_local, local_dir, local_path};
 pub(crate) use path::canonicalize_deepest;
 pub(crate) use path::lexically_normalized;
 pub use path::{
@@ -32,7 +34,7 @@ pub use path::{
     default_config_contents, expand_tilde,
 };
 pub use registry::{
-    BoolKeyRow, ConfigKeyInfo, ConfigValueType, all_config_keys, bool_key, lookup_key,
+    BoolKeyRow, ConfigKeyInfo, ConfigLayer, ConfigValueType, all_config_keys, bool_key, lookup_key,
 };
 pub use repo::{
     PROPOSE_BOOLS, ProposeBoolRow, RepoKeyTarget, repo_key_rejection_reason, repo_key_target,

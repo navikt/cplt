@@ -437,11 +437,12 @@ fn merge_toml(existing_content: &str, report: &DetectionReport) -> String {
     for p in &existing.deny.paths {
         deny_paths.insert(p.as_str());
     }
-    let existing_flags = repo_config::proposed_keys(&existing.propose);
-    for key in &existing_flags {
-        // Only include boolean flags, not compound keys (allow.ports, etc.)
-        if !key.contains('.') {
-            propose_flags.insert(key);
+    // Walk `PROPOSE_BOOLS` rather than `proposed_keys`: --merge must preserve
+    // every boolean the file already sets, and `proposed_keys` deliberately
+    // omits the tighten-only rows (gh_guard, git_push_prevention).
+    for row in crate::config::PROPOSE_BOOLS {
+        if (row.propose)(&existing.propose) == Some(true) {
+            propose_flags.insert(row.key);
         }
     }
     for p in &existing.propose.allow.read {
@@ -1482,6 +1483,38 @@ allow_jvm_attach = true
         // Existing flag preserved
         assert_eq!(parsed.propose.allow_jvm_attach, Some(true));
         // New flag added
+        assert_eq!(parsed.propose.allow_docker, Some(true));
+    }
+
+    /// `proposed_keys` omits the tighten-only guard rows on purpose (they need
+    /// no approval), so --merge must NOT be driven by it — walking that list
+    /// would drop an existing `gh_guard = true` out of the regenerated file.
+    #[test]
+    fn merge_preserves_the_tighten_only_guard_flags() {
+        let existing = r"
+[propose]
+gh_guard = true
+git_push_prevention = true
+";
+        let report = DetectionReport {
+            detections: vec![],
+            suggestions: [Suggestion::Propose(SandboxFlag::AllowDocker)]
+                .into_iter()
+                .collect(),
+            diagnostics: vec![],
+            workspace_members: vec![],
+            provenance: std::collections::BTreeMap::new(),
+        };
+
+        let merged = merge_toml(existing, &report);
+        let parsed: crate::repo_config::RepoConfig =
+            toml::from_str(&merged).expect("merged TOML should be valid");
+        assert_eq!(parsed.propose.gh_guard, Some(true), "got: {merged}");
+        assert_eq!(
+            parsed.propose.git_push_prevention,
+            Some(true),
+            "got: {merged}"
+        );
         assert_eq!(parsed.propose.allow_docker, Some(true));
     }
 

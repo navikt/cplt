@@ -82,7 +82,7 @@ pub fn repo_fingerprint(project_dir: &Path) -> String {
 /// Get the canonical remote URL for the git repo at `project_dir`.
 ///
 /// Normalizes: strips `.git` suffix, lowercases host, converts SSH to HTTPS style.
-fn canonical_remote(project_dir: &Path) -> Option<String> {
+pub(crate) fn canonical_remote(project_dir: &Path) -> Option<String> {
     let output = crate::git::command(project_dir, &["remote", "get-url", "origin"])?
         .output()
         .ok()?;

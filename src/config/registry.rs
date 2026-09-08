@@ -628,8 +628,65 @@ pub(super) fn type_label(vt: ConfigValueType) -> &'static str {
 ///
 /// Keys with no preset baseline pass their hardcoded default as `baseline` —
 /// the bottom layer is always supplied, never omitted.
-fn resolve_bool(cli: FeatureToggle, config: Option<bool>, baseline: bool) -> bool {
-    cli.to_option().or(config).unwrap_or(baseline)
+///
+/// Returns the layer the value came from as well as the value. That is not
+/// decoration: `config show` and `cplt settings` have to say *which* file a
+/// setting came from, and a second resolution path built to answer that
+/// question is exactly the drift this table exists to prevent.
+fn resolve_bool(
+    cli: FeatureToggle,
+    local: Option<bool>,
+    config: Option<bool>,
+    baseline: bool,
+) -> (bool, ConfigLayer) {
+    if let Some(v) = cli.to_option() {
+        (v, ConfigLayer::Cli)
+    } else if let Some(v) = local {
+        (v, ConfigLayer::Local)
+    } else if let Some(v) = config {
+        (v, ConfigLayer::Global)
+    } else {
+        (baseline, ConfigLayer::Baseline)
+    }
+}
+
+/// Which layer of the precedence ladder supplied a resolved boolean.
+///
+/// Low to high: `Baseline` < `Global` < `Repo` < `Local` < `Cli`.
+///
+/// There is deliberately no `Preset` variant. A preset is not a layer — its
+/// content is chosen by another key's resolved value and it only ever moves the
+/// *baseline*, so naming it here would claim a rung the resolution does not
+/// have. `Baseline` means "nothing explicit said otherwise", preset or
+/// hardcoded default alike.
+///
+/// `Repo` is not produced by [`resolve_bool`]: an approved `.cplt.toml`
+/// proposal is applied after the merge, in `Resolved::apply_repo_config`, which
+/// stamps it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLayer {
+    /// Hardcoded default, or the preset baseline that moved it.
+    Baseline,
+    /// `~/.config/cplt/config.toml`.
+    Global,
+    /// An approved `[propose]` key from the repository's `.cplt.toml`.
+    Repo,
+    /// The per-repo user file under `~/.config/cplt/local/` (#340).
+    Local,
+    /// An explicit CLI flag.
+    Cli,
+}
+
+impl std::fmt::Display for ConfigLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Baseline => "default",
+            Self::Global => "global",
+            Self::Repo => "repo",
+            Self::Local => "local",
+            Self::Cli => "cli",
+        })
+    }
 }
 
 /// A registry row for a boolean config key: which key it is, and how to read
@@ -667,9 +724,11 @@ macro_rules! bool_keys {
         /// Built once per run by [`ResolvedBools::resolve`]; `Config::merge`
         /// copies the fields into [`Resolved`]. Nothing here is resolved by
         /// hand.
-        #[derive(Debug, Clone, Copy)]
+        #[derive(Debug, Clone)]
         pub struct ResolvedBools {
             $( $(#[$meta])* pub $field: bool, )*
+            /// The layer each key resolved from, in `BOOL_KEYS` order.
+            pub layers: Vec<ConfigLayer>,
         }
 
         /// Registry rows for every boolean key, in declaration order.
@@ -685,15 +744,19 @@ macro_rules! bool_keys {
             /// Resolve every boolean key through [`resolve_bool`].
             pub(super) fn resolve(
                 cli: &CliFlags,
+                local: Option<&Config>,
                 config: &Config,
                 baseline: PresetBaseline,
             ) -> Self {
+                $( let $field = resolve_bool(
+                    ($cli)(cli),
+                    local.and_then($config),
+                    ($config)(config),
+                    ($baseline)(baseline),
+                ); )*
                 Self {
-                    $( $field: resolve_bool(
-                        ($cli)(cli),
-                        ($config)(config),
-                        ($baseline)(baseline),
-                    ), )*
+                    layers: vec![ $( $field.1, )* ],
+                    $( $field: $field.0, )*
                 }
             }
         }
@@ -717,6 +780,13 @@ macro_rules! bool_keys {
 // `baseline` is `|b| b.<field>` for the nine preset-controlled keys and a
 // literal for the rest. It is a required column: a key cannot be declared
 // without stating its bottom layer.
+//
+// The LOCAL layer (#340) has no column of its own on purpose. It reads the same
+// key out of a second `Config` — the per-repo user file — so the `config`
+// accessor IS the local accessor, applied to a different struct. A duplicate
+// column would be 32 copied closures that can only ever drift; the one place it
+// would matter, `gh_guard.enabled`'s legacy `sandbox.gh_proxy` fold, is exactly
+// where a copy going stale would be a silent grant.
 bool_keys! {
     with_proxy, "proxy", "enabled",
         cli = |c: &CliFlags| c.proxy,

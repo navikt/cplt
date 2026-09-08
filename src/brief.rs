@@ -567,6 +567,7 @@ mod tests {
 
     fn base_resolved() -> Resolved {
         Resolved {
+            bool_layers: Vec::new(),
             with_proxy: true,
             proxy_forced: false,
             proxy_port: 0,
