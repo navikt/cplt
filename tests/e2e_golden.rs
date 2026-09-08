@@ -896,17 +896,43 @@ fn golden_check_exec_agrees_with_the_launch_in_both_modes() {
     let check = format!("{check_out}{check_err}");
     assert!(status.success(), "check exec should run:\n{check}");
     assert!(
-        check.contains("BLOCKED"),
-        "in block mode `check exec` must say the push is blocked:\n{check}"
+        check.contains("origin main: BLOCKED"),
+        "in block mode `check exec` must say the push is blocked. Asserted on the \
+         verdict line, not on the word: the reason quotes the guard's own message, \
+         which carries `BLOCKED by sandbox` whatever the verdict says:\n{check}"
     );
 
     let before = head();
     let (_, stderr, push_status) = push();
-    assert!(
-        !push_status.success(),
-        "the launch must agree with `check exec` and refuse:\n{stderr}"
-    );
+    common::assert_refused(&stderr, push_status.success(), "Push prevention is enabled");
     assert_eq!(before, head(), "a blocked push must not move the remote");
+
+    // ── a feature-branch push: allowed by the default policy, and `check exec`
+    //    has to know that. It did not: with no baked repository facts and no
+    //    real git to resolve push targets, `protect_default_branch_only` could
+    //    not tell a feature branch from the protected one, so every push read
+    //    as blocked — the most common push there is, on the default config.
+    run(&["checkout", "--quiet", "-b", "feature/golden-check"]);
+    let (check_out, check_err, status) = launch(
+        &home,
+        &work,
+        &[
+            "check",
+            "exec",
+            "git",
+            "push",
+            "origin",
+            "feature/golden-check",
+        ],
+    );
+    let check = format!("{check_out}{check_err}");
+    assert!(status.success(), "check exec should run:\n{check}");
+    assert!(
+        check.contains("feature/golden-check: ALLOWED"),
+        "the default policy protects the default branch only, so `check exec` must \
+         say a feature-branch push is allowed:\n{check}"
+    );
+    run(&["checkout", "--quiet", "main"]);
 
     // ── warn mode: the launch runs the push, so check must not say BLOCKED ──
     let (_, stderr, status) = launch(
@@ -946,12 +972,74 @@ fn golden_check_exec_agrees_with_the_launch_in_both_modes() {
         push_status.success(),
         "warn mode must let the push through, matching what `check exec` said:\n{stderr}"
     );
+    // Running it is not the same as running it silently. Warn mode's whole
+    // value is the notice; without this a mutation that drops it passes.
+    assert!(
+        stderr.contains("would block"),
+        "warn mode must still tell the operator what it declined to enforce:\n{stderr}"
+    );
     assert_ne!(
         before,
         head(),
         "warn mode does not enforce, so the push must have reached the remote — \
          if it did not, `check exec` is now wrong in the other direction:\n{stderr}"
     );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Both guards install themselves through a PATH shim in the scratch dir, so
+/// `sandbox.scratch_dir = false` turns them off however they are configured —
+/// which the launch summary reports as `inactive`. `check exec` read only
+/// `enabled` and answered BLOCKED for a command that would run unguarded: the
+/// most dangerous direction for this surface to be wrong in, because it tells
+/// an operator they are protected when they are not.
+#[test]
+fn golden_check_exec_knows_the_guards_need_a_scratch_dir() {
+    require_launch!();
+    let home = make_config_home("golden-noscratch");
+    let repo = temp_repo("navikt/spleis");
+
+    let (_, stderr, status) = launch(
+        &home,
+        repo.path(),
+        &["config", "set", "sandbox.scratch_dir", "false", "--force"],
+    );
+    assert!(
+        status.success(),
+        "setting scratch_dir should succeed:\n{stderr}"
+    );
+
+    // What the launch says.
+    let (_, stderr, ok) = launch_agent(&home, repo.path());
+    assert!(
+        ok,
+        "a launch without a scratch dir must still work:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("git guard:     inactive") && stderr.contains("gh guard:      inactive"),
+        "without a scratch dir there is no shim, so the summary must say inactive:\n{stderr}"
+    );
+
+    // What `check exec` must say about the same run.
+    for cmd in [
+        &["check", "exec", "git", "push", "origin", "main"][..],
+        &["check", "exec", "gh", "pr", "merge", "1"][..],
+    ] {
+        let (out, err, status) = launch(&home, repo.path(), cmd);
+        let check = format!("{out}{err}");
+        assert!(status.success(), "check exec should run:\n{check}");
+        assert!(
+            check.contains("ALLOWED"),
+            "the guard cannot run without a scratch dir, so `check exec` must not \
+             claim it blocks anything — telling an operator they are protected when \
+             they are not is the worst way for this surface to be wrong:\n{check}"
+        );
+        assert!(
+            check.contains("scratch dir"),
+            "and must say why, so the operator can put the guard back:\n{check}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&home);
 }

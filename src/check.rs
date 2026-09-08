@@ -490,6 +490,19 @@ pub struct ExecContext<'a> {
     pub gh_guard: &'a crate::config::GhGuardPolicy,
     pub git_guard: &'a crate::config::GitGuardPolicy,
     pub project_dir: &'a Path,
+    /// The repository facts the launch bakes in, captured the same way and from
+    /// the same trusted git.
+    ///
+    /// Without them `protect_default_branch_only` has no default branch to
+    /// compare against, so `gate_git` fails closed and every push reads as
+    /// blocked — including a feature-branch push the launch allows. That is
+    /// the most common push there is, so the surface built to answer "what
+    /// will happen" was wrong about the ordinary case.
+    pub repo_facts: &'a crate::gh_proxy::RepoFacts,
+    /// Both guards install themselves through a PATH shim in the scratch dir.
+    /// Without one there is no shim, so the guards do not run whatever the
+    /// config says — which is what the launch summary reports as `inactive`.
+    pub scratch_dir: bool,
 }
 
 /// Static explanation of whether a command would run under the resolved policy.
@@ -509,14 +522,6 @@ fn command_basename(cmd: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Explain whether `argv` would run, is guard-blocked, or needs an `allow_*`.
-///
-/// Reuses the gh/git guard classifiers ([`crate::gh_proxy::gate`],
-/// [`crate::gh_proxy::gate_git`]) so the verdict matches what the in-sandbox
-/// wrappers enforce, and the `allow_docker` / `allow_tmp_exec` gates for the
-/// other high-frequency cases. Unrecognized commands get an honest generic
-/// answer (they run, subject to the fs/net policy).
-#[must_use]
 /// What a guard refusal means for `check exec`, given the mode that guard runs in.
 ///
 /// `gate_git` and `gate` answer one question — does the policy object? — and
@@ -567,6 +572,14 @@ fn refusal_decision(
     }
 }
 
+/// Explain whether `argv` would run, is guard-blocked, or needs an `allow_*`.
+///
+/// Reuses the gh/git guard classifiers ([`crate::gh_proxy::gate`],
+/// [`crate::gh_proxy::gate_git`]) so the verdict matches what the in-sandbox
+/// wrappers enforce, and the `allow_docker` / `allow_tmp_exec` gates for the
+/// other high-frequency cases. Unrecognized commands get an honest generic
+/// answer (they run, subject to the fs/net policy).
+#[must_use]
 pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
     let Some(first) = argv.first() else {
         return ExecExplain {
@@ -613,17 +626,27 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 fix: None,
             };
         }
+        if !ctx.scratch_dir {
+            return ExecExplain {
+                decision: Decision::Allowed,
+                reason: "git runs unguarded: the git guard needs a scratch dir for its \
+                         PATH shim, and this run has none, so the guard is inactive \
+                         however it is configured."
+                    .to_string(),
+                fix: Some("remove `sandbox.scratch_dir = false` to let the guard run.".to_string()),
+            };
+        }
         return match crate::gh_proxy::gate_git(
             &rest,
             ctx.git_guard.prevent_push,
             ctx.git_guard.prevent_force_push,
             ctx.git_guard.protect_default_branch_only,
             &ctx.git_guard.allow_push,
-            None,
-            // `cplt check exec` explains policy without a repository probe; with
-            // no baked facts the default-branch arm fails closed, matching what
-            // a launch that captured nothing would do.
-            &crate::gh_proxy::RepoFacts::default(),
+            // The launch hands the gate a real git so it can resolve which
+            // branches a push actually targets; without one no push is ever
+            // provably feature-only and the default-branch arm fails closed.
+            crate::git::trusted_git(),
+            ctx.repo_facts,
         ) {
             Ok(()) => ExecExplain {
                 decision: Decision::Allowed,
@@ -647,6 +670,16 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 decision: Decision::Allowed,
                 reason: "gh runs; the gh guard is not enabled for this run.".to_string(),
                 fix: None,
+            };
+        }
+        if !ctx.scratch_dir {
+            return ExecExplain {
+                decision: Decision::Allowed,
+                reason: "gh runs unguarded: the gh guard needs a scratch dir for its \
+                         PATH shim, and this run has none, so the guard is inactive \
+                         however it is configured."
+                    .to_string(),
+                fix: Some("remove `sandbox.scratch_dir = false` to let the guard run.".to_string()),
             };
         }
         let policy = crate::gh_proxy::GatePolicy {
@@ -1074,6 +1107,15 @@ mod tests {
 
     // ── explain_exec ──
 
+    /// Facts for the unit tests: a scratch dir, and no captured repository.
+    ///
+    /// Empty facts is the honest default here — these tests assert on policy
+    /// shape, not on a checkout — and it is also the case the guard fails
+    /// closed on, so `git push` reads as blocked exactly as it did before
+    /// `ExecContext` grew these fields.
+    static NO_FACTS: std::sync::LazyLock<crate::gh_proxy::RepoFacts> =
+        std::sync::LazyLock::new(crate::gh_proxy::RepoFacts::default);
+
     fn exec_ctx<'a>(
         gh: &'a GhGuardPolicy,
         git: &'a GitGuardPolicy,
@@ -1085,6 +1127,8 @@ mod tests {
             gh_guard: gh,
             git_guard: git,
             project_dir: Path::new("/home/u/proj"),
+            repo_facts: &NO_FACTS,
+            scratch_dir: true,
         }
     }
 
