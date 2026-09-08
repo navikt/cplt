@@ -837,11 +837,11 @@ fn looks_like_tmp_path(cmd: &str) -> bool {
 /// the human operator") and the escape hatch, neither of which belongs in a
 /// `Fix:` line an operator reads — so this takes the guidance and leaves those.
 fn guidance(msg: &str) -> Option<String> {
-    const NOISE: &[&str] = &[
-        "This operation is restricted",
-        "Please make a note",
-        "Reason:",
-    ];
+    // `Reason:` stays. It looked like boilerplate, but some guards put the
+    // remedy there and nowhere else — the token-exfiltration refusal's "Use the
+    // GH_TOKEN env var instead" is on that line — so dropping it threw away
+    // exactly what this function exists to keep.
+    const NOISE: &[&str] = &["This operation is restricted", "Please make a note"];
     let lines: Vec<&str> = msg
         .lines()
         .skip(1)
@@ -1294,6 +1294,64 @@ mod tests {
         let ctx = exec_ctx(&gh, &git, false);
         let e = explain_exec(&["node".into(), "app.js".into()], &ctx);
         assert_eq!(e.decision, Decision::Allowed);
+    }
+
+    /// The launch serves `gh auth token` from the file cplt wrote at startup
+    /// rather than running the real `gh`, so reporting the block the policy
+    /// would otherwise imply is wrong (#440).
+    #[test]
+    fn gh_auth_token_is_served_not_blocked() {
+        // The interception only exists when the guard runs: with it off there
+        // is no shim, and the real `gh` handles the command.
+        let gh = GhGuardPolicy {
+            enabled: true,
+            ..GhGuardPolicy::default()
+        };
+        let git = GitGuardPolicy::default();
+        assert!(
+            gh.block_auth_token,
+            "the interception is on by default; this test means nothing otherwise"
+        );
+        let ctx = exec_ctx(&gh, &git, false);
+
+        let e = explain_exec(&["gh".into(), "auth".into(), "token".into()], &ctx);
+        assert_eq!(e.decision, Decision::Allowed);
+        assert!(
+            e.reason.contains("served from the token file"),
+            "and says where it comes from: {}",
+            e.reason
+        );
+
+        // Another `gh auth` subcommand is not the intercepted one.
+        let other = explain_exec(&["gh".into(), "auth".into(), "status".into()], &ctx);
+        assert_ne!(
+            other.reason, e.reason,
+            "only `auth token` is served from the file"
+        );
+    }
+
+    /// A guard that writes its own remedy must have it reach the reader. The
+    /// generic fix is the fallback, not the default — `check exec` used to show
+    /// only the first line and drop everything the guard said after it.
+    #[test]
+    fn a_refusal_carries_the_guards_own_guidance() {
+        let msg = "⚠️ BLOCKED by sandbox: 'gh api' targets 'other/repo'.\n\
+                   Reason: token exfiltration prevention. Use the GH_TOKEN env var instead.\n\
+                   This operation is restricted by the cplt sandbox environment.\n\
+                   Please make a note of this for the human operator.";
+        let out = guidance(msg).expect("the message carries guidance");
+        assert!(
+            out.contains("Use the GH_TOKEN env var"),
+            "the remedy on the Reason line must survive: {out}"
+        );
+        assert!(
+            !out.contains("make a note") && !out.contains("This operation is restricted"),
+            "but the lines addressed to the agent must not: {out}"
+        );
+        assert!(
+            guidance("⚠️ BLOCKED by sandbox: no further detail.").is_none(),
+            "a message with nothing after the headline falls back to the generic fix"
+        );
     }
 
     // ── Report verdict & JSON ──

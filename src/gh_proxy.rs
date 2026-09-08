@@ -1310,6 +1310,11 @@ fn scope_label(scope: &[String]) -> String {
 
 /// Two `owner/name` spellings naming the same repository: GitHub is
 /// case-insensitive and an origin URL may carry a `.git` suffix.
+pub fn repos_match(left: &str, right: &str) -> bool {
+    left.trim_end_matches(".git")
+        .eq_ignore_ascii_case(right.trim_end_matches(".git"))
+}
+
 /// Whether this argv is `gh auth token`.
 ///
 /// One rule, two readers: the gate serves the cached token for it instead of
@@ -1321,11 +1326,6 @@ fn scope_label(scope: &[String]) -> String {
 pub fn is_auth_token_request(args: &[&str]) -> bool {
     let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
     positional.next() == Some("auth") && positional.next() == Some("token")
-}
-
-pub fn repos_match(left: &str, right: &str) -> bool {
-    left.trim_end_matches(".git")
-        .eq_ignore_ascii_case(right.trim_end_matches(".git"))
 }
 
 fn requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
