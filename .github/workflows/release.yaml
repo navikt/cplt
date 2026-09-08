@@ -20,9 +20,23 @@ env:
 jobs:
   version:
     name: Determine version
+    # `branches: [main]` on `workflow_run` filters the TRIGGERING run's head
+    # branch, not the base. CI runs on `pull_request`, so a fork PR opened from
+    # a branch named `main` produces a CI run this filter matches — and the jobs
+    # below check out `workflow_run.head_sha`, which is the fork's commit, then
+    # build it, attest it (`id-token: write`) and publish a release
+    # (`contents: write`) that the Homebrew tap serves to users.
+    #
+    # The only gate was `conclusion == 'success'`, and a fork PR's CI needs a
+    # maintainer to approve the run — a routine click while reviewing a
+    # contribution, not a security decision anyone would weigh. Require the
+    # triggering run to be a push to this repository instead: releases come
+    # from main, never from a pull request (#357).
     if: >
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
