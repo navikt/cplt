@@ -1270,6 +1270,31 @@ fn detect_nais_bootstrap(ctx: &DetectContext) -> DetectorOutput {
     }
 }
 
+/// The script that drives the NAIS local-bootstrap flow in `dir`, when that
+/// detector fires there.
+///
+/// The launch summary asks this instead of re-deriving the shape. The `.env`
+/// denial is one of the three refusals the detector exists to connect (#434),
+/// and a second spelling of "is this that project" is exactly how two surfaces
+/// drift apart (#431) — so there is one detector and one answer.
+///
+/// Cheap by construction: it reads the root `.sh`/`README.md` files and a
+/// handful of named ones, and the caller only asks when it is about to print a
+/// summary.
+#[must_use]
+pub fn nais_bootstrap_driver(dir: &Path) -> Option<String> {
+    let detection = detect_nais_bootstrap(&DetectContext::new(dir)).detection?;
+    detection
+        .signals
+        .into_iter()
+        .find_map(|signal| match signal {
+            Signal::FileContains { path, reason } if reason.starts_with("drives the nais CLI") => {
+                Some(path)
+            }
+            _ => None,
+        })
+}
+
 /// Extract a port number from package.json scripts (best-effort).
 /// Looks for patterns like `--port 3000`, `--port=3000`, `-p 8080`.
 fn detect_port_in_scripts(package_json: &str) -> Option<u16> {
@@ -2170,16 +2195,32 @@ fn detect_global_gradle_credentials(home: &Path) -> Option<GlobalDetection> {
     }
     // Check if it actually contains credential-like entries
     let content = std::fs::read_to_string(&props_path).ok()?;
+    // `githubUser`/`githubPassword` is the spelling GitHub Packages uses, and
+    // it is what 94 `build.gradle.kts` files across `navikt` read out of this
+    // file — none of which say "repository", "nexus" or "artifactory" anywhere.
+    // Missing it meant those projects got no proposal at all and the developer
+    // saw only a build failure (#432). `gpr.*` is the other common spelling.
+    const CREDENTIAL_MARKERS: &[&str] = &[
+        "repository",
+        "nexus",
+        "artifactory",
+        "githubuser",
+        "githubpassword",
+        "gpr.user",
+        "gpr.key",
+        "gpr.token",
+    ];
     let has_registry = content.lines().any(|line| {
         let lower = line.to_lowercase();
-        lower.contains("repository") || lower.contains("nexus") || lower.contains("artifactory")
+        CREDENTIAL_MARKERS.iter().any(|m| lower.contains(m))
     });
     if !has_registry {
         return None;
     }
     Some(GlobalDetection {
         name: "Gradle registry credentials",
-        reason: "~/.gradle/gradle.properties contains repository configuration".to_string(),
+        reason: "~/.gradle/gradle.properties contains repository or registry credentials"
+            .to_string(),
         suggestions: vec![GlobalSuggestion::AllowRead(
             "~/.gradle/gradle.properties".to_string(),
         )],
@@ -3288,6 +3329,31 @@ services:
         assert!(report.detections.iter().flat_map(|d| &d.suggestions).any(
             |s| matches!(s, GlobalSuggestion::AllowRead(p) if p.contains("gradle.properties"))
         ));
+    }
+
+    /// The spelling GitHub Packages actually uses, and the one 94 `navikt`
+    /// `build.gradle.kts` files read: no "repository", no "nexus", no
+    /// "artifactory" anywhere in the file (#432).
+    #[test]
+    fn global_detect_gradle_github_packages_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let props = home.path().join(".gradle/gradle.properties");
+        std::fs::create_dir_all(props.parent().unwrap()).unwrap();
+        std::fs::write(
+            &props,
+            "githubUser=x-access-token\ngithubPassword=ghp_secret\n",
+        )
+        .unwrap();
+
+        let report = detect_global(home.path());
+        assert!(
+            report
+                .detections
+                .iter()
+                .any(|d| d.name == "Gradle registry credentials"),
+            "githubUser/githubPassword is a registry credential: {:?}",
+            report.detections.iter().map(|d| d.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
