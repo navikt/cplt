@@ -2706,4 +2706,136 @@ print('CONNECTED')
             "expected to read back the project-local file under --proxy-forced — stdout: {stdout}"
         );
     }
+
+    // ── AgentDir::create_dirs — Pi's trust lock (#449) ────────────────────
+
+    /// A fake HOME with Pi's layout and a stand-in `pi` on `~/.local/bin` that
+    /// hands the trailing `-- -c <script>` to `/bin/sh`, so `--agent pi` runs a
+    /// probe under Pi's real grants (`cplt exec` always uses the Shell policy).
+    ///
+    /// Under the real home, NOT a tempdir: `/tmp` is a read+write Landlock grant
+    /// and a fresh tmpfs under bwrap, so a fake home there is writable by that
+    /// rule (or invisible) and every probe passes vacuously.
+    fn pi_probe_home() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_dir().join(format!(".cplt-it-pi-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let pi = bin.join("pi");
+        fs::write(&pi, "#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = home.join(".pi/agent");
+        for d in ["bin", "tmp", "sessions", "extensions"] {
+            fs::create_dir_all(agent.join(d)).unwrap();
+        }
+        fs::write(agent.join("bin/rg"), "old").unwrap();
+        fs::write(agent.join("tmp/rg"), "payload").unwrap();
+        fs::write(agent.join("sessions/evil.js"), "ext").unwrap();
+        fs::write(agent.join("trust.json"), "{}").unwrap();
+        home
+    }
+
+    fn run_pi(home: &Path, project: &Path, flags: &[&str], script: &str) -> (i32, String, String) {
+        let dir_str = project.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec![
+            "--yes",
+            "--no-validate",
+            "--quiet",
+            "--agent",
+            "pi",
+            "--project-dir",
+            &dir_str,
+        ];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--", "-c", script]);
+        let path = format!(
+            "{}:{}",
+            home.join(".local/bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = cplt_cmd()
+            .args(&args)
+            .env("HOME", home)
+            .env("PATH", path)
+            .output()
+            .expect("Failed to execute cplt");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
+    /// Under bubblewrap the lock grant is live: Pi can `mkdir`/`utimes`/`rmdir`
+    /// `trust.json.lock`, while the exec-only `bin/` and the host-persistence
+    /// dirs cannot be renamed (every one is a mountpoint — EBUSY) and the managed
+    /// binary cannot be written. Decided by the kernel, not by a string match:
+    /// Landlock's `MakeDir|RemoveDir` on the root is sufficient for a
+    /// same-directory rename, so only the mount topology stops `mv bin bin.old`.
+    #[test]
+    fn pi_trust_lock_works_under_bwrap_and_bin_cannot_be_renamed() {
+        require_bwrap!();
+        let home = pi_probe_home();
+        let project = create_test_project();
+        let a = home.join(".pi/agent");
+        let a = a.display();
+        let script = format!(
+            "mkdir {a}/trust.json.lock && touch -m {a}/trust.json.lock && \
+             rmdir {a}/trust.json.lock && echo LOCK_OK; \
+             mv {a}/bin {a}/bin.old 2>/dev/null || echo MV_BIN_DENIED; \
+             mv {a}/sessions {a}/extensions 2>/dev/null || echo MV_EXT_DENIED; \
+             (echo evil > {a}/bin/rg) 2>/dev/null || echo WRITE_BIN_DENIED"
+        );
+        let (_, stdout, stderr) = run_pi(&home, project.path(), &["--use-bubblewrap"], &script);
+        for marker in [
+            "LOCK_OK",
+            "MV_BIN_DENIED",
+            "MV_EXT_DENIED",
+            "WRITE_BIN_DENIED",
+        ] {
+            assert!(
+                stdout.contains(marker),
+                "missing {marker}\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(home.join(".pi/agent/bin/rg")).unwrap(),
+            "old",
+            "the managed binary must be untouched"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Without bubblewrap the grant is withheld and the root stays read-only,
+    /// because Landlock cannot scope creation to a name and the parent-wide
+    /// rights it would need are exactly a same-directory rename grant. Pi's
+    /// lock `mkdir` must therefore FAIL here — trading H-13 for Pi startup is
+    /// not a default — and cplt must say why.
+    #[test]
+    fn pi_trust_lock_is_withheld_without_bwrap() {
+        require_landlock!();
+        let home = pi_probe_home();
+        let project = create_test_project();
+        let a = home.join(".pi/agent");
+        let a = a.display();
+        let script = format!(
+            "mkdir {a}/trust.json.lock 2>/dev/null && echo LOCK_CREATED || echo LOCK_DENIED; \
+             mv {a}/bin {a}/bin.old 2>/dev/null || echo MV_BIN_DENIED"
+        );
+        let (_, stdout, stderr) = run_pi(&home, project.path(), &["--no-bubblewrap"], &script);
+        assert!(
+            stdout.contains("LOCK_DENIED") && !stdout.contains("LOCK_CREATED"),
+            "without bwrap the root must stay read-only\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("MV_BIN_DENIED"),
+            "bin/ must not be renameable\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("NOT applied without Bubblewrap"),
+            "cplt must say the grant was withheld and why\nstderr: {stderr}"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
 }

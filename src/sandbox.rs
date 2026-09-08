@@ -878,7 +878,7 @@ fn prepare_impl(
         );
     }
 
-    let policy = landlock_mod::generate_policy(config);
+    let mut policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);
 
     let ro_protect = ro_protect_paths(config, extra_git_dirs);
@@ -923,6 +923,36 @@ fn prepare_impl(
         },
         &deny_masks,
     )?;
+
+    // `AgentDir::create_dirs` (Pi's mkdir-based trust lock) needs
+    // MakeDir|RemoveDir on the parent, and Landlock cannot scope those to a
+    // name. Same-directory rename needs exactly those two rights and nothing
+    // else (`current_check_refer_path` in security/landlock/fs.c: REFER is only
+    // consulted when the parents differ), so on a plain-Landlock host the grant
+    // would let the agent `mv bin bin.old; mv tmp bin` — the H-13/H-05 escape
+    // the read-only root exists to close. Under bubblewrap it holds: every
+    // exec-only child and writable sibling is a mountpoint (`ro_protect`,
+    // `pins`, the writable binds), and rename/rmdir of a mountpoint is EBUSY.
+    // So the grant is kept only when bubblewrap actually resolved; otherwise
+    // the root stays read-only and Pi does not start, which `cplt doctor`
+    // explains. Cleared here, after `resolve` consumed the rules, so the
+    // writable bind it needs is still emitted when bwrap IS active.
+    if bwrap_wrapper.is_none() {
+        let mut cleared = Vec::new();
+        for rule in policy.fs_rules.iter_mut().filter(|r| r.access.create_dirs) {
+            rule.access.create_dirs = false;
+            cleared.push(rule.path.display().to_string());
+        }
+        if !cleared.is_empty() {
+            ui::warn(&format!(
+                "Create-only grant on {} is NOT applied without Bubblewrap: Landlock \
+                 cannot stop a same-directory rename, so it would make the exec-only \
+                 child replaceable. The directory stays read-only; the agent may fail \
+                 to start. Install bubblewrap to enable it.",
+                cleared.join(", ")
+            ));
+        }
+    }
 
     // UNIX-socket reachability has three distinct regimes and they are not
     // interchangeable, so say which one this run is in rather than implying the
@@ -1210,7 +1240,7 @@ mod tests {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
-            create_dirs: false,
+            create_dirs: vec![],
         }];
         let exec = [home.join(".local")];
         let mut config = test_config(home, &[]);
@@ -1322,7 +1352,7 @@ mod tests {
             map_exec: false,
             process_exec: false,
             write_files: vec!["auth.json"],
-            create_dirs: false,
+            create_dirs: vec![],
         }];
         let exec = [home.join(".config/opencode")];
         let mut config = test_config(home, &[]);

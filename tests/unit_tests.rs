@@ -1095,7 +1095,7 @@ fn create_dirs_grants_keep_existing_files_unwritable_on_both_backends() {
             &[],
         );
 
-        for dir in agent_dirs.iter().filter(|d| d.create_dirs) {
+        for dir in agent_dirs.iter().filter(|d| !d.create_dirs.is_empty()) {
             checked += 1;
             assert!(
                 !dir.write,
@@ -1126,18 +1126,28 @@ fn create_dirs_grants_keep_existing_files_unwritable_on_both_backends() {
                 dir.path.display()
             );
 
-            // Seatbelt: create-only allows present, dir-wide write allow absent.
+            // Seatbelt: one literal per named entry, never a dir-wide or
+            // subpath-wide write grant (a subpath-wide directory create/unlink
+            // grant is a rename grant — see the emitter).
             let p = dir.path.display();
-            assert!(
-                profile.contains(&format!(
-                    "(allow file-write-create (require-all (subpath \"{p}\") (vnode-type DIRECTORY)))"
-                )),
-                "{agent:?}: {p} must get the vnode-type DIRECTORY create allow:\n{profile}"
-            );
+            for name in &dir.create_dirs {
+                let entry = dir.path.join(name).display().to_string();
+                assert!(
+                    profile.contains(&format!(
+                        "(allow file-write* (require-all (literal \"{entry}\") (vnode-type DIRECTORY)))"
+                    )),
+                    "{agent:?}: {entry} must get the literal DIRECTORY grant:\n{profile}"
+                );
+            }
             assert!(
                 !profile.contains(&format!("(allow file-write* (subpath \"{p}\"))")),
                 "{agent:?}: {p} must NOT get a dir-wide write allow — that would \
                  make existing files writable:\n{profile}"
+            );
+            assert!(
+                !profile.contains(&format!("(require-all (subpath \"{p}\")")),
+                "{agent:?}: {p} must NOT get a subpath-wide require-all grant — \
+                 that is a rename grant over the whole dir:\n{profile}"
             );
         }
     }
@@ -1204,9 +1214,9 @@ fn pi_can_create_the_trust_lock_but_not_write_bin_or_trust_json() {
     );
     assert!(
         profile.contains(
-            "(allow file-write-create (require-all (subpath \"/Users/test/.pi/agent\") (vnode-type DIRECTORY)))"
+            "(allow file-write* (require-all (literal \"/Users/test/.pi/agent/trust.json.lock\") (vnode-type DIRECTORY)))"
         ),
-        "Pi must be allowed to mkdir under ~/.pi/agent:\n{profile}"
+        "Pi must be allowed to mkdir/utimes/rmdir its trust lock:\n{profile}"
     );
     assert!(
         profile.contains("(deny file-write* (subpath \"/Users/test/.pi/agent/trust.json\"))"),
@@ -1332,7 +1342,7 @@ fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
-            create_dirs: false,
+            create_dirs: vec![],
         }
     });
     let conf = std::path::PathBuf::from("/Users/test/.config/fish");
@@ -7171,7 +7181,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: false,
             write_files: vec!["auth.json"],
-            create_dirs: false,
+            create_dirs: vec![],
         },
         AgentDir {
             path: data_dir.clone(),
@@ -7179,7 +7189,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
-            create_dirs: false,
+            create_dirs: vec![],
         },
         AgentDir {
             path: state_dir.clone(),
@@ -7187,7 +7197,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
-            create_dirs: false,
+            create_dirs: vec![],
         },
         AgentDir {
             path: cache_dir.clone(),
@@ -7195,7 +7205,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
-            create_dirs: false,
+            create_dirs: vec![],
         },
         AgentDir {
             path: cache_dir.join("bin"),
@@ -7203,7 +7213,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: true,
             write_files: vec![],
-            create_dirs: false,
+            create_dirs: vec![],
         },
     ];
 

@@ -63,29 +63,29 @@ pub struct FsAccess {
     /// For non-device files and directories `IoctlDev` is a no-op; set it
     /// only on device paths to keep the policy least-privilege.
     pub ioctl: bool,
-    /// Grant creation and removal of **subdirectories** (`MakeDir | RemoveDir`)
-    /// without granting `write` — the directory's existing files stay
-    /// unwritable and no regular files, symlinks or hardlinks can be created.
-    ///
-    /// This is the sibling of `write` for the narrow case of an app that takes
-    /// a `mkdir`-based lock (`proper-lockfile` and friends) inside a config dir
-    /// that must otherwise stay read-only. `write` cannot express it: on Linux
-    /// a writable parent unions into an exec-only child and hands the agent
-    /// write-plus-execute over managed binaries (H-13/H-05).
+    /// Grant `MakeDir | RemoveDir` on this directory without granting `write`:
+    /// existing files stay unwritable, no regular file, symlink or hardlink can
+    /// be created. The Landlock half of `AgentDir::create_dirs` (an app's
+    /// `mkdir`-based lock in an otherwise read-only config dir).
     ///
     /// # Limit — read this before granting it
     ///
-    /// Landlock cannot scope creation to a *name*. This grants `mkdir` of ANY
-    /// new subdirectory name in the tree, not just the one lock the app wants.
-    /// The bound is exactly "existing files stay unwritable and no new file can
-    /// be given attacker-chosen bytes" — NOT "only `<x>.lock`". A new empty
-    /// subdirectory can appear anywhere under the grant. It is safe because
-    /// `WriteFile`/`Truncate`/`MakeReg`/`MakeSym`/`Refer` are all withheld: an
-    /// agent can make an empty directory but cannot put content into the tree,
-    /// so it cannot stage a binary. Where the tree also holds an exec-only
-    /// child, that child's name must already exist at launch (cplt pre-creates
-    /// every agent dir) so the agent cannot re-create it as a directory of its
-    /// own — and even if it could, it could not write a file into it.
+    /// Landlock cannot scope creation to a *name*: this is `mkdir` of ANY new
+    /// subdirectory under the path and `rmdir` of any *empty* one. And that pair
+    /// is a **rename** grant: `current_check_refer_path` (security/landlock/
+    /// fs.c) checks only the MAKE and REMOVE rights on the parent when source
+    /// and destination share a directory — `Refer` is consulted only across
+    /// directories. So on a plain-Landlock host `mv bin bin.old; mv tmp bin`
+    /// swaps a writable sibling into an exec-only child's place: the H-13/H-05
+    /// escape the read-only parent exists to close.
+    ///
+    /// Therefore `prepare_impl` keeps this flag **only when bubblewrap resolved
+    /// active**, where every exec-only child and writable sibling is a
+    /// mountpoint (`ro_protect`, `pins`, the writable binds) and rename/rmdir of
+    /// a mountpoint is `EBUSY`; the bwrap layer also binds the dir writable so
+    /// `mkdir` is not `EROFS`. Without bubblewrap the flag is cleared and the
+    /// directory stays read-only. Withheld either way: `WriteFile`, `Truncate`,
+    /// `MakeReg`, `MakeSym`, `Refer` — nothing here can put bytes in the tree.
     pub create_dirs: bool,
 }
 
@@ -919,7 +919,10 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 // addons load here without it.
                 execute: dir.process_exec,
                 ioctl: false,
-                create_dirs: dir.create_dirs,
+                // Landlock cannot scope creation to a name, so this is the
+                // parent-wide MakeDir|RemoveDir — and `prepare_impl` clears it
+                // again unless bubblewrap resolved active (see the field doc).
+                create_dirs: !dir.create_dirs.is_empty(),
             },
         });
         // File-level write grants within a read-only dir
@@ -2134,17 +2137,13 @@ fn access_to_flags(access: &FsAccess) -> landlock::BitFlags<landlock::AccessFs> 
     }
 
     if access.create_dirs {
-        // Create-only: `mkdir` of any new subdirectory name, and `rmdir` of
-        // any *empty* subdirectory — removal is not limited to entries created
-        // this session, which is worth saying because "new" reads as if it
-        // were. A non-empty directory cannot be removed, and nothing here can
-        // empty one, so `bin/` with the managed binaries in it is safe. No
-        // WriteFile/Truncate (existing files stay unwritable), no MakeReg/
-        // MakeSym (no regular file or symlink to point exec at content the
-        // agent controls), no Refer (no rename/hardlink to reconstitute a
-        // managed binary name over attacker bytes). This is why create-only is
-        // NOT `write` and cannot union an exec-only child into write+execute:
-        // the pair the H-13/H-05 guard tests forbid never forms.
+        // `mkdir` of any new subdirectory name and `rmdir` of any *empty* one.
+        // No WriteFile/Truncate (existing files stay unwritable), no MakeReg/
+        // MakeSym (no file or symlink to point exec at agent-controlled
+        // content). Withholding Refer does NOT stop same-directory rename —
+        // MakeDir|RemoveDir alone suffice for that — which is why this flag
+        // only survives `prepare_impl` under bubblewrap, where the mountpoints
+        // make the rename EBUSY. See `FsAccess::create_dirs`.
         access_flags |= AccessFs::MakeDir | AccessFs::RemoveDir;
     }
 
@@ -2248,10 +2247,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     /// `create_dirs` maps to `MakeDir | RemoveDir` and to NOTHING that could
-    /// write file content or reconstitute a managed binary: no WriteFile,
-    /// Truncate, MakeReg, MakeSym or Refer. This is what lets Pi `mkdir` its
-    /// trust lock while `bin/` stays effectively immutable. Linux-only because
-    /// `AccessFs` and the mapping exist only there.
+    /// write file content: no WriteFile, Truncate, MakeReg or MakeSym. Refer is
+    /// also withheld, but note what that does and does not buy: it blocks
+    /// cross-directory rename/link, not same-directory rename — the two rights
+    /// granted here are sufficient for that, which is why the flag is
+    /// bubblewrap-gated in `prepare_impl` (mountpoints make the rename EBUSY).
+    /// Linux-only because `AccessFs` and the mapping exist only there.
     #[cfg(target_os = "linux")]
     #[test]
     fn create_dirs_maps_to_mkdir_rmdir_only() {
@@ -4005,7 +4006,7 @@ mod tests {
                 map_exec: false,
                 process_exec: false,
                 write_files: vec!["auth.json"],
-                create_dirs: false,
+                create_dirs: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".local/share/opencode"),
@@ -4013,7 +4014,7 @@ mod tests {
                 map_exec: false,
                 process_exec: false,
                 write_files: vec![],
-                create_dirs: false,
+                create_dirs: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".local/state/opencode"),
@@ -4021,7 +4022,7 @@ mod tests {
                 map_exec: false,
                 process_exec: false,
                 write_files: vec![],
-                create_dirs: false,
+                create_dirs: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".cache/opencode"),
@@ -4029,7 +4030,7 @@ mod tests {
                 map_exec: false,
                 process_exec: false,
                 write_files: vec![],
-                create_dirs: false,
+                create_dirs: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".cache/opencode/bin"),
@@ -4037,7 +4038,7 @@ mod tests {
                 map_exec: false,
                 process_exec: true,
                 write_files: vec![],
-                create_dirs: false,
+                create_dirs: vec![],
             },
         ];
         let mut config = test_config(&project, &home);
