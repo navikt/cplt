@@ -109,7 +109,7 @@ The consequence is the rule that surprises people most:
 **Only repositories nested inside the project directory can be named.** A
 sibling checkout — `~/src/spleis` and `~/src/sykepenger-model` side by side —
 is refused, because naming it would be a real path grant and not just an
-identity. Two ways forward:
+identity. What works today:
 
 ```bash
 # Edit-only access to the sibling: files yes, gh identity no
