@@ -1131,3 +1131,55 @@ fn golden_awkward_repository_states_still_launch() {
         let _ = std::fs::remove_dir_all(h);
     }
 }
+
+/// `cplt exec` always builds the Shell profile, whatever `--agent` says. That
+/// is deliberate (#343) — but the flag was accepted and dropped in silence, so
+/// `--agent copilot exec` answered questions about a different sandbox than the
+/// operator believed they were probing. The profiles differ where it matters:
+/// Shell has no Keychain grant, so `gh` finds no token.
+///
+/// The two sibling warnings beside this one (`--allow-docker`, `--allow-tmp-exec`)
+/// have no test either; this is the shape of that gap, not just one message.
+#[test]
+fn golden_exec_says_when_it_ignores_the_requested_agent() {
+    require_launch!();
+    let home = make_config_home("golden-agent");
+    let repo = temp_repo("navikt/spleis");
+
+    let exec_with = |args: &[&str]| {
+        let mut all = args.to_vec();
+        all.extend_from_slice(&["--yes", "--no-validate", "exec", "--", TRUE_BIN]);
+        launch(&home, repo.path(), &all)
+    };
+
+    let (_, stderr, status) = exec_with(&["--agent", "copilot"]);
+    assert!(status.success(), "exec should still run:\n{stderr}");
+    assert!(
+        stderr.contains("--agent copilot is ignored"),
+        "exec must say it is not building the profile that was asked for:\n{stderr}"
+    );
+    // A warning that only says "ignored" leaves the operator where they were.
+    assert!(
+        stderr.contains("check"),
+        "and must name the command that does answer the question:\n{stderr}"
+    );
+
+    // Not suppressed by --quiet: the whole failure is the operator believing
+    // something untrue about the sandbox they are looking at.
+    let (_, stderr, _) = exec_with(&["--agent", "copilot", "--quiet"]);
+    assert!(
+        stderr.contains("--agent copilot is ignored"),
+        "--quiet must not hide it:\n{stderr}"
+    );
+
+    // No flag, and the flag that matches what exec actually builds, stay quiet.
+    for args in [&[][..], &["--agent", "shell"][..]] {
+        let (_, stderr, _) = exec_with(args);
+        assert!(
+            !stderr.contains("is ignored"),
+            "no warning is owed for {args:?}:\n{stderr}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
