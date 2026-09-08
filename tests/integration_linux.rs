@@ -2716,14 +2716,25 @@ print('CONNECTED')
     /// Under the real home, NOT a tempdir: `/tmp` is a read+write Landlock grant
     /// and a fresh tmpfs under bwrap, so a fake home there is writable by that
     /// rule (or invisible) and every probe passes vacuously.
-    fn pi_probe_home() -> PathBuf {
+    fn pi_probe_home(tag: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let home = home_dir().join(format!(".cplt-it-pi-lock-{}", std::process::id()));
+        // Per-test, not per-process: both probes share one test binary (one
+        // pid), and run in parallel one would `remove_dir_all` the other's
+        // home mid-launch — the stand-in vanishes, `execv` fails silently and
+        // stdout comes back empty.
+        let home = home_dir().join(format!(".cplt-it-pi-lock-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         let bin = home.join(".local/bin");
         fs::create_dir_all(&bin).unwrap();
         let pi = bin.join("pi");
-        fs::write(&pi, "#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+        // Echoes argc and the first arg so a run with no probe output still
+        // says whether the stand-in ran and what cplt handed it. Not the whole
+        // script: that text contains the very markers the probes assert on.
+        fs::write(
+            &pi,
+            "#!/bin/sh\necho \"FAKE_PI_ARGV: $#:$1\"\nexec /bin/sh \"$@\"\n",
+        )
+        .unwrap();
         fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
         let agent = home.join(".pi/agent");
         for d in ["bin", "tmp", "sessions", "extensions"] {
@@ -2776,7 +2787,7 @@ print('CONNECTED')
     #[test]
     fn pi_trust_lock_works_under_bwrap_and_bin_cannot_be_renamed() {
         require_bwrap!();
-        let home = pi_probe_home();
+        let home = pi_probe_home("bwrap");
         let project = create_test_project();
         let a = home.join(".pi/agent");
         let a = a.display();
@@ -2787,7 +2798,12 @@ print('CONNECTED')
              mv {a}/sessions {a}/extensions 2>/dev/null || echo MV_EXT_DENIED; \
              (echo evil > {a}/bin/rg) 2>/dev/null || echo WRITE_BIN_DENIED"
         );
-        let (_, stdout, stderr) = run_pi(&home, project.path(), &["--use-bubblewrap"], &script);
+        let (code, stdout, stderr) = run_pi(&home, project.path(), &["--use-bubblewrap"], &script);
+        assert!(
+            stdout.contains("FAKE_PI_ARGV: 2:-c"),
+            "the stand-in pi did not run, so this proves nothing (exit {code})\n\
+             stdout: {stdout}\nstderr: {stderr}"
+        );
         for marker in [
             "LOCK_OK",
             "MV_BIN_DENIED",
@@ -2796,7 +2812,7 @@ print('CONNECTED')
         ] {
             assert!(
                 stdout.contains(marker),
-                "missing {marker}\nstdout: {stdout}\nstderr: {stderr}"
+                "missing {marker} (exit {code})\nstdout: {stdout}\nstderr: {stderr}"
             );
         }
         assert_eq!(
@@ -2815,7 +2831,7 @@ print('CONNECTED')
     #[test]
     fn pi_trust_lock_is_withheld_without_bwrap() {
         require_landlock!();
-        let home = pi_probe_home();
+        let home = pi_probe_home("nobwrap");
         let project = create_test_project();
         let a = home.join(".pi/agent");
         let a = a.display();
@@ -2823,10 +2839,16 @@ print('CONNECTED')
             "mkdir {a}/trust.json.lock 2>/dev/null && echo LOCK_CREATED || echo LOCK_DENIED; \
              mv {a}/bin {a}/bin.old 2>/dev/null || echo MV_BIN_DENIED"
         );
-        let (_, stdout, stderr) = run_pi(&home, project.path(), &["--no-bubblewrap"], &script);
+        let (code, stdout, stderr) = run_pi(&home, project.path(), &["--no-bubblewrap"], &script);
+        assert!(
+            stdout.contains("FAKE_PI_ARGV: 2:-c"),
+            "the stand-in pi did not run, so this proves nothing (exit {code})\n\
+             stdout: {stdout}\nstderr: {stderr}"
+        );
         assert!(
             stdout.contains("LOCK_DENIED") && !stdout.contains("LOCK_CREATED"),
-            "without bwrap the root must stay read-only\nstdout: {stdout}\nstderr: {stderr}"
+            "without bwrap the root must stay read-only (exit {code})\n\
+             stdout: {stdout}\nstderr: {stderr}"
         );
         assert!(
             stdout.contains("MV_BIN_DENIED"),
