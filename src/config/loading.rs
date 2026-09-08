@@ -1375,8 +1375,17 @@ impl Resolved {
                         EnforcementMode::Warn => " [WARN MODE]",
                         EnforcementMode::Audit => " [AUDIT MODE]",
                     };
+                    // #431: the line read "blocks git push" whatever
+                    // `protect_default_branch_only` said, so an operator whose
+                    // feature-branch pushes go through read the summary as
+                    // wrong about the tool rather than as imprecise.
+                    let scope_note = if self.git_guard.protect_default_branch_only {
+                        "blocks git push to the default branch"
+                    } else {
+                        "blocks git push"
+                    };
                     eprintln!(
-                        "{blue}[cplt]{nc}    git guard:     {green}on{nc}          {dim}blocks git push{mode_note}{nc}"
+                        "{blue}[cplt]{nc}    git guard:     {green}on{nc}          {dim}{scope_note}{mode_note}{nc}"
                     );
                 } else {
                     let yellow = ui::color(ui::YELLOW);

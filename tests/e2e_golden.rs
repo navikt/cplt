@@ -214,9 +214,72 @@ fn golden_permissive_preset_launch_and_show_agree_the_guards_are_off() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The negative assertion in the default test — "no degraded-mode marker" —
+/// protects nothing on its own: delete the marker from the summary and it
+/// still passes, and the gate would then be pinning the absence of a string
+/// that no longer exists. This is the positive half. It is also the surface
+/// the git-guard drift lived on: a guard in warn mode stops nothing, and this
+/// line is the only place the operator is told.
+#[test]
+fn golden_warn_mode_is_marked_on_the_summary() {
+    require_launch!();
+    let home = make_config_home("golden-warn");
+    let repo = temp_repo("navikt/spleis");
+
+    for guard in ["gh_guard", "git_guard"] {
+        let (_, stderr, status) = launch(
+            &home,
+            repo.path(),
+            &["config", "set", &format!("{guard}.mode"), "warn", "--force"],
+        );
+        assert!(
+            status.success(),
+            "setting {guard}.mode should succeed:\n{stderr}"
+        );
+    }
+
+    let (_, stderr, ok) = launch_agent(&home, repo.path());
+    assert!(ok, "a warn-mode launch must succeed:\n{stderr}");
+    assert_eq!(
+        stderr.matches("[WARN MODE]").count(),
+        2,
+        "both guards are in warn mode, so both summary rows must say so:\n{stderr}"
+    );
+
+    let show = config_show(&home, repo.path());
+    for guard in ["gh_guard", "git_guard"] {
+        // Bare `warn`, no source suffix: a value read from the global config
+        // file prints unlabelled, because the header names that file. The
+        // suffix marks the layers the header does not — `(default)`,
+        // `(preset)`, `(local)`.
+        assert_eq!(
+            shown(&show, guard, "mode"),
+            "warn",
+            "`config show` must agree with the launch about {guard}.mode:\n{show}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Path 2 — the local layer is visible everywhere it is in force
 // ════════════════════════════════════════════════════════════════════
+
+/// A port nothing is listening on, from the kernel rather than from a guess.
+///
+/// The proxy binds before the summary prints, so a launch in a test that hard
+/// codes 8080 or 8443 fails with `Address already in use` on the developer
+/// machines most likely to have something on them. Racy in principle — the
+/// port is free when asked for and bound a moment later — and still strictly
+/// better than the two most-occupied ports in the industry.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("the loopback should be bindable")
+        .local_addr()
+        .expect("a bound listener should have an address")
+        .port()
+}
 
 /// The single `.toml` under the scratch HOME's `local/` directory.
 fn local_file(home: &Path) -> PathBuf {
@@ -238,10 +301,11 @@ fn golden_local_layer_is_named_by_launch_show_and_get() {
     let home = make_config_home("golden-local");
     let repo = temp_repo("navikt/spleis");
 
+    let port = free_port().to_string();
     let (_, stderr, status) = launch(
         &home,
         repo.path(),
-        &["config", "set", "--local", "proxy.port", "8443"],
+        &["config", "set", "--local", "proxy.port", &port],
     );
     assert!(status.success(), "set --local should succeed:\n{stderr}");
     let local = local_file(&home);
@@ -251,12 +315,14 @@ fn golden_local_layer_is_named_by_launch_show_and_get() {
     let (_, stderr, ok) = launch_agent(&home, repo.path());
     assert!(ok, "a launch with a local layer must succeed:\n{stderr}");
     assert!(
-        stderr.contains(&local_str),
-        "the launch must name the local config file it applied:\n{stderr}"
+        stderr.contains(&format!("Local:    {local_str}")),
+        "the launch must name the local config file on its own summary row — \
+         the path appearing in some other line (a warning that it was ignored, \
+         say) is the defect, not the fix:\n{stderr}"
     );
     // ...and the value is in force, not merely mentioned.
     assert!(
-        stderr.contains("localhost:8443"),
+        stderr.contains(&format!("localhost:{port}")),
         "the local proxy.port must actually be the port the proxy binds:\n{stderr}"
     );
 
@@ -268,17 +334,139 @@ fn golden_local_layer_is_named_by_launch_show_and_get() {
     );
     assert_eq!(
         shown(&show, "proxy", "port"),
-        "8443 (local)",
+        format!("{port} (local)"),
         "`config show` must label the value as coming from the local layer:\n{show}"
     );
 
     // 3. `config get` says which layer answered.
     let (stdout, stderr, status) = launch(&home, repo.path(), &["config", "get", "proxy.port"]);
     assert!(status.success(), "config get should succeed:\n{stderr}");
-    assert_eq!(stdout.trim(), "8443", "config get must return the value");
+    assert_eq!(stdout.trim(), port, "config get must return the value");
     assert!(
-        stderr.contains("local"),
+        stderr.contains("(local, this project only)"),
         "`config get` must say the answer came from the local layer:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Path 4 — the summary's claim about push matches what push does
+// ════════════════════════════════════════════════════════════════════
+
+/// Paths 1 and 2 assert that two of cplt's own surfaces agree with each other.
+/// That is the shape of #410, but it is not enforcement: both could read a
+/// correct `Resolved` while the PATH shim was never installed, and both tests
+/// would pass. This one closes the loop — the summary line and the ref in the
+/// remote have to tell the same story.
+///
+/// Both halves matter. The negative half exists elsewhere in the suite; the
+/// positive half — that under the default policy a feature-branch push
+/// actually *works* through a real launch — did not, and a guard that blocks
+/// everything would have passed every test in the tree.
+#[test]
+fn golden_default_policy_pushes_a_feature_branch_and_refuses_the_default_one() {
+    require_launch!();
+    let home = make_config_home("golden-push");
+    // Inside the checkout: the sandbox denies process-exec under /private/tmp,
+    // so the git that runs in the sandbox cannot live there.
+    let (_tmp, work, origin) = bare_origin_repo(Path::new(env!("CARGO_MANIFEST_DIR")));
+
+    // What `protect_default_branch_only` protects is the *remote's* default
+    // branch, which the guard reads from this ref — a repo built by `git init`
+    // has none.
+    let run = |args: &[&str]| {
+        let out = common::git_cmd(&work)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {args:?} should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["push", "--quiet", "origin", "main"]);
+    run(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    run(&["checkout", "--quiet", "-b", "feature/golden"]);
+    run(&["commit", "--quiet", "--allow-empty", "-m", "work"]);
+
+    // The bare origin is outside the project dir, so the sandbox would deny the
+    // write on its own. Grant it: otherwise the refused half would be refused
+    // by the sandbox rather than by the guard, and the allowed half could not
+    // succeed at all — the test would pass for entirely the wrong reasons.
+    let allow = origin.to_string_lossy().into_owned();
+    let push = |branch: &str| {
+        let mut args = vec![
+            "--no-quiet",
+            "--yes",
+            "--no-validate",
+            "--allow-write",
+            &allow,
+        ];
+        args.extend_from_slice(&["exec", "--", "git", "push", "origin", branch]);
+        launch(&home, &work, &args)
+    };
+
+    // The summary must say what it is about to do, precisely: the default
+    // preset protects the default branch only, and a line reading "blocks git
+    // push" while feature-branch pushes go through is the #410 shape again.
+    let (_, stderr, status) = push("feature/golden");
+    assert!(
+        stderr.contains("git guard:     on"),
+        "the guard must be on for this test to mean anything:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("blocks git push to the default branch"),
+        "the summary must scope its claim to what the policy actually blocks:\n{stderr}"
+    );
+    assert!(
+        status.success(),
+        "a feature-branch push must succeed under the default policy:\n{stderr}"
+    );
+    assert!(
+        common::git_ok(
+            &origin,
+            &["rev-parse", "--verify", "refs/heads/feature/golden"]
+        ),
+        "the feature branch must have reached the remote — a summary that says the push \
+         was allowed and a remote with no ref is the same lie as #410, told the other \
+         way round:\n{stderr}"
+    );
+
+    // And the half the summary claims to block.
+    let (_, stderr, status) = push("main");
+    assert!(
+        !status.success(),
+        "a push to the default branch must fail:\n{stderr}"
+    );
+    common::assert_refused(&stderr, status.success(), "default branch");
+    // The refusal has to leave the operator somewhere. A block with no way
+    // forward is how an agent session ends in a support request.
+    assert!(
+        stderr.contains("branch") && (stderr.contains("feature") || stderr.contains("allow_push")),
+        "the refusal must name a way forward, not only the rule:\n{stderr}"
+    );
+
+    let head_before = common::git_cmd(&origin)
+        .args(["rev-parse", "refs/heads/main"])
+        .output()
+        .expect("git should run");
+    assert_eq!(
+        String::from_utf8_lossy(&head_before.stdout).trim(),
+        String::from_utf8_lossy(
+            &common::git_cmd(&work)
+                .args(["rev-parse", "origin/main"])
+                .output()
+                .expect("git should run")
+                .stdout
+        )
+        .trim(),
+        "the refused push must not have moved the remote's default branch"
     );
 
     let _ = std::fs::remove_dir_all(&home);
@@ -293,12 +481,15 @@ fn golden_local_layer_is_named_by_launch_show_and_get() {
 struct Scratch {
     dir: String,
     file: String,
-    repo: String,
 }
 
 /// Candidate values for one key: everything `cplt config set` might plausibly
 /// be handed for it. The contract is per value, not per key — a `set` that
 /// refuses is a pass.
+/// Stand-in for "a git repository inside the launch repo", swapped for a real
+/// path once the iteration has one.
+const NESTED_REPO: &str = "<nested-repo>";
+
 fn candidates(dotted: &str, ty: cplt::config::ConfigValueType, s: &Scratch) -> Vec<String> {
     use cplt::config::ConfigValueType as T;
     // Paths get two candidates. The bug this path generalises was a value that
@@ -316,14 +507,26 @@ fn candidates(dotted: &str, ty: cplt::config::ConfigValueType, s: &Scratch) -> V
         "proxy.blocked_domains" | "proxy.allowed_domains" | "proxy.log_file" => {
             vec![s.file.clone(), missing.into()]
         }
-        "sandbox.repo_dirs" => vec![s.repo.clone(), missing.into()],
+        // Inside the launch repository, not beside it: `config set --local`
+        // refuses a sibling today ("sibling repositories are not yet
+        // supported"), so a scratch repo in the temp dir never reaches a
+        // launch — and this is the key the bricking defect was found on.
+        "sandbox.repo_dirs" => vec![NESTED_REPO.into(), missing.into()],
         "allow.read" | "allow.write" | "allow.exec" | "allow.socket" | "deny.paths" => {
             vec![s.dir.clone(), missing.into()]
         }
         "allow.localhost" => vec!["3000".into()],
+        // An environment variable name, not the generic string: `deny.env`
+        // validates the spelling, and the fallback candidate's hyphen is not
+        // in `[A-Za-z0-9_]`.
+        "deny.env" => vec!["CPLT_GOLDEN".into()],
         _ => match ty {
-            T::Bool => vec!["true".into()],
-            T::U16 | T::U16Array => vec!["8080".into()],
+            // Both sides. `sandbox.scratch_dir = false` takes both guards to
+            // `inactive` and `proxy.enabled = false` removes the proxy — the
+            // "set accepts it, the launch never starts" shape is at least as
+            // likely there as on the `true` side.
+            T::Bool => vec!["true".into(), "false".into()],
+            T::U16 | T::U16Array => vec![free_port().to_string()],
             T::U64 => vec!["30".into()],
             // A string key with no representative value of its own, and every
             // array of tables: `set` has no spelling for these, so the only
@@ -337,16 +540,45 @@ fn candidates(dotted: &str, ty: cplt::config::ConfigValueType, s: &Scratch) -> V
     }
 }
 
+/// A git repository inside `parent`, returned as a string path.
+fn nested_repo(parent: &Path) -> String {
+    let nested = parent.join("vendored-lib");
+    std::fs::create_dir_all(&nested).expect("nested repo dir should be creatable");
+    for args in [
+        &["init", "-b", "main"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/navikt/vendored-lib.git",
+        ][..],
+    ] {
+        let out = common::git_cmd(&nested)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(out.status.success(), "git {args:?} should succeed");
+    }
+    nested.to_string_lossy().into_owned()
+}
+
 /// Keys no launch in a test can exercise, with the reason. Kept explicit and
 /// printed by the test, so a skip is a stated exception rather than a silent
 /// hole.
-const SKIPPED: &[(&str, &str)] = &[(
-    "allow.exec",
-    "every directory a test can create is under the system temp dir or the \
+const SKIPPED: &[(&str, &str)] = &[
+    (
+        "git_guard.allow_push",
+        "an array of tables, which `config set` has no spelling for at all — it \
+         is edited by hand. The refusal is asserted below instead of a launch.",
+    ),
+    (
+        "allow.exec",
+        "every directory a test can create is under the system temp dir or the \
      project dir, both of which the sandbox makes writable, and cplt refuses a \
      tree that is both writable and executable. A value that would launch \
      cannot be constructed here; `e2e.rs` covers the grant itself.",
-)];
+    ),
+];
 
 /// Keys where a value `config set` accepts can still stop the launch, and that
 /// is the deliberate behaviour: an allowlist file that is not there fails
@@ -380,15 +612,19 @@ fn golden_every_config_set_leaves_a_launchable_config() {
 
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let chunk = keys.len().div_ceil(threads);
-    let failures: Vec<String> = std::thread::scope(|scope| {
+    let (failures, launched): (Vec<String>, Vec<String>) = std::thread::scope(|scope| {
         let handles: Vec<_> = keys
             .chunks(chunk)
             .map(|chunk| scope.spawn(move || check_keys(chunk)))
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("worker should not panic"))
-            .collect()
+        let mut failures = Vec::new();
+        let mut launched = Vec::new();
+        for handle in handles {
+            let (f, l) = handle.join().expect("worker should not panic");
+            failures.extend(f);
+            launched.extend(l);
+        }
+        (failures, launched)
     });
 
     assert!(
@@ -396,10 +632,41 @@ fn golden_every_config_set_leaves_a_launchable_config() {
         "a `config set` that succeeded left a config no launch can start from:\n{}",
         failures.join("\n")
     );
+
+    // The claim this test makes is "a key added tomorrow is covered". It is
+    // only true if every key reached a launch: a key whose every candidate
+    // `set` refuses is tested for nothing, and passes in silence. A new
+    // validated string key gets `"cplt-golden"`, which `set` rejects — so
+    // without this assertion the key would be added, the gate would stay green,
+    // and no launch would ever have run with it.
+    let uncovered: Vec<String> = keys
+        .iter()
+        .map(|info| format!("{}.{}", info.section, info.key))
+        .filter(|dotted| !launched.contains(dotted) && !SKIPPED.iter().any(|(k, _)| k == dotted))
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "no candidate value was accepted for these keys, so no launch ever ran with one \
+         set. Give each a representative value in `candidates`, or add it to `SKIPPED` \
+         with the reason:\n  {}",
+        uncovered.join("\n  ")
+    );
+
+    // A skip naming a key that no longer exists is a hole that reads as a
+    // decision.
+    for (key, _) in SKIPPED {
+        assert!(
+            keys.iter()
+                .any(|info| format!("{}.{}", info.section, info.key) == *key),
+            "SKIPPED names `{key}`, which is not in the registry — renamed or removed?"
+        );
+    }
 }
 
-fn check_keys(keys: &[cplt::config::ConfigKeyInfo]) -> Vec<String> {
+/// `(failures, keys that reached a launch)`.
+fn check_keys(keys: &[cplt::config::ConfigKeyInfo]) -> (Vec<String>, Vec<String>) {
     let mut failures = Vec::new();
+    let mut launched = Vec::new();
     for info in keys {
         let dotted = format!("{}.{}", info.section, info.key);
         if SKIPPED.iter().any(|(k, _)| *k == dotted) {
@@ -408,25 +675,39 @@ fn check_keys(keys: &[cplt::config::ConfigKeyInfo]) -> Vec<String> {
         for value in candidates(&dotted, info.value_type, &scratch()) {
             let home = make_config_home("golden-set");
             let repo = temp_repo("navikt/spleis");
+            // Resolved here rather than in `candidates`: the value has to name
+            // a repository inside *this* iteration's launch repo, which does
+            // not exist until now.
+            let value = if value == NESTED_REPO {
+                nested_repo(repo.path())
+            } else {
+                value
+            };
             let (_, mut set_err, mut set_status) = launch(
                 &home,
                 repo.path(),
                 &["config", "set", &dotted, &value, "--force"],
             );
-            // Some keys exist only in the per-repo layer — `sandbox.repo_dirs`
-            // is one, and it is the key the bricking defect was found on, so a
-            // test that only ever set keys globally would skip the very case it
-            // generalises. Take the refusal's own advice and set it there.
-            if !set_status.success() && set_err.contains("--local") {
+            // Some keys exist only in a narrower layer — `sandbox.repo_dirs`
+            // in the per-repo local file, `deny.env` in the repo's own
+            // `.cplt.toml` — and both refusals say which. Take the refusal's
+            // own advice: a test that only ever set keys globally would skip
+            // the very key the bricking defect was found on, and would call
+            // "cannot be set here" coverage.
+            for layer in ["--local", "--repo"] {
+                if set_status.success() || !set_err.contains(layer) {
+                    continue;
+                }
                 let (_, err, status) = launch(
                     &home,
                     repo.path(),
-                    &["config", "set", "--local", &dotted, &value, "--force"],
+                    &["config", "set", layer, &dotted, &value, "--force"],
                 );
                 set_err = err;
                 set_status = status;
             }
             if set_status.success() {
+                launched.push(dotted.clone());
                 let (_, stderr, ok) = launch_agent(&home, repo.path());
                 // Excused: the operator was told about this value at the
                 // moment it was set, or the refusal is the documented
@@ -457,32 +738,29 @@ fn check_keys(keys: &[cplt::config::ConfigKeyInfo]) -> Vec<String> {
             let _ = std::fs::remove_dir_all(&home);
         }
     }
-    failures
+    (failures, launched)
 }
 
 /// Real paths for the keys that take one. Per worker thread, not per key: the
 /// directory is only ever read.
 fn scratch() -> Scratch {
     thread_local! {
-        static SCRATCH: (tempfile::TempDir, tempfile::TempDir, Scratch) = build_scratch();
+        static SCRATCH: (tempfile::TempDir, Scratch) = build_scratch();
     }
-    SCRATCH.with(|(_, _, s)| s.clone())
+    SCRATCH.with(|(_, s)| s.clone())
 }
 
-fn build_scratch() -> (tempfile::TempDir, tempfile::TempDir, Scratch) {
+fn build_scratch() -> (tempfile::TempDir, Scratch) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().join("dir");
     std::fs::create_dir_all(&dir).expect("create dir");
     let file = tmp.path().join("list.txt");
     std::fs::write(&file, "example.invalid\n").expect("write file");
-    // `sandbox.repo_dirs` names repositories, not directories.
-    let (repo_tmp, work, _origin) = bare_origin_repo(tmp.path());
     let s = Scratch {
         dir: dir.to_string_lossy().into_owned(),
         file: file.to_string_lossy().into_owned(),
-        repo: work.to_string_lossy().into_owned(),
     };
-    (tmp, repo_tmp, s)
+    (tmp, s)
 }
 
 fn indent(text: &str) -> String {

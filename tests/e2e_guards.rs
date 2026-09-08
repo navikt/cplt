@@ -622,9 +622,9 @@ fn cplt_check_matches_the_gate_when_cwd_differs_from_project_dir() {
     // `cplt check exec gh …` must report what the runtime gate enforces: the
     // startup scope comes from --project-dir, the implicit target from the cwd.
     //
-    // The guard is off by default, so `--gh-guard` turns it on explicitly and
-    // CPLT_CONFIG points away from the host's config — otherwise the verdict
-    // depends on whether the machine running the tests happens to enable it.
+    // `--gh-guard` turns the guard on explicitly and CPLT_CONFIG points away
+    // from the host's config, so the verdict does not depend on the resolved
+    // default or on what the machine running the tests happens to configure.
     let startup = temp_repo("navikt/cplt");
     let sibling = temp_repo("evil-org/other-repo");
     let output = cplt_cmd()

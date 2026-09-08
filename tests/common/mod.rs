@@ -50,6 +50,10 @@ pub fn cplt_cmd() -> Command {
     // summary did. NO_COLOR is a documented cplt input (see `ui::no_color`),
     // not a test-only backdoor.
     cmd.env("NO_COLOR", "1");
+    // `FORCE_COLOR` outranks `NO_COLOR` in `ui::no_color`, and npm and a good
+    // many CI jobs export it — so without this, colour codes land between
+    // `gh guard:` and `on` on exactly the machines least likely to be watched.
+    cmd.env_remove("FORCE_COLOR");
     cmd
 }
 
@@ -193,8 +197,13 @@ static SCRATCH_HOME_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// If the directory cannot be created.
 #[must_use]
 pub fn make_config_home(label: &str) -> PathBuf {
+    // The pid is in the name because the counter is not: it is per process, so
+    // two concurrent runs of the same test binary — one in a terminal, one in
+    // an editor — would otherwise pick the same directory, and the
+    // `remove_dir_all` below would delete the other run's HOME mid-launch.
     let home = std::env::temp_dir().join(format!(
-        ".cplt-e2e-{label}-{}",
+        ".cplt-e2e-{label}-{}-{}",
+        std::process::id(),
         SCRATCH_HOME_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&home);

@@ -110,6 +110,15 @@ fn parse_element_for_key(
                 .into_value()
                 .unwrap())
         }
+        // `is_array()` is true for `ArrayOfTables`, so `--append` routes here
+        // — and telling the operator to drop `--append` sends them to a `set`
+        // that has no spelling for a table array either. Say what is actually
+        // true: this key is edited by hand.
+        ConfigValueType::ArrayOfTables => Err(ConfigError::Validation(format!(
+            "{}.{} is an array of tables, which `config set` cannot write. Edit the config \
+             file and add a `[[{}.{}]]` block.",
+            key_info.section, key_info.key, key_info.section, key_info.key
+        ))),
         _ => Err(ConfigError::Validation(format!(
             "{}.{} is not an array key. Use 'set' without --append",
             key_info.section, key_info.key
