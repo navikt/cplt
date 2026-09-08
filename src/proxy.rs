@@ -756,6 +756,7 @@ impl ProxyHandle {
             .checked_add(budget)
             .unwrap_or_else(Instant::now);
         let mut known_admission_closed_at = None;
+        let mut accept_thread_panicked = false;
 
         let accept_outcome = if budget.is_zero() {
             self.accept_done_rx.try_recv().ok()
@@ -767,6 +768,7 @@ impl ProxyHandle {
             Some(AcceptLoopOutcome::Closed(at)) => known_admission_closed_at = Some(at),
             Some(AcceptLoopOutcome::Panicked(at)) => {
                 known_admission_closed_at = Some(at);
+                accept_thread_panicked = true;
             }
             None => {}
         }
@@ -798,6 +800,7 @@ impl ProxyHandle {
                             known_admission_closed_at,
                             cutoff_at,
                             self.domain_collector.state.is_poisoned(),
+                            accept_thread_panicked,
                         );
                     }
                 }
@@ -921,14 +924,25 @@ fn lock_timeout_snapshot(
     admission_closed_at: Option<Instant>,
     cutoff_at: Instant,
     collector_poisoned: bool,
+    accept_thread_panicked: bool,
 ) -> ProxySnapshot {
+    let failure = if collector_poisoned {
+        SnapshotFailure::CollectorPoisoned
+    } else if accept_thread_panicked {
+        SnapshotFailure::AcceptThreadPanicked
+    } else {
+        SnapshotFailure::CollectorLockTimeout
+    };
     if let Some(mut snapshot) = fallback {
-        snapshot.availability = SnapshotAvailability::Failed(SnapshotFailure::CollectorLockTimeout);
+        // Retain failures already established at the evidence cutoff.
+        if snapshot.availability == SnapshotAvailability::Available {
+            snapshot.availability = SnapshotAvailability::Failed(failure);
+        }
         snapshot.integrity.collector_poisoned |= collector_poisoned;
         return snapshot;
     }
     ProxySnapshot {
-        availability: SnapshotAvailability::Failed(SnapshotFailure::CollectorLockTimeout),
+        availability: SnapshotAvailability::Failed(failure),
         collection_started_at,
         admission_closed_at,
         cutoff_at,
@@ -3352,6 +3366,82 @@ mod tests {
         );
         release_tx.send(()).unwrap();
         holder.join().unwrap();
+    }
+
+    #[test]
+    fn finalizer_preserves_accept_panic_under_collector_contention() {
+        let (collector, wake_rx) = DomainCollector::new();
+        let mut handle = closed_test_handle(collector.clone(), wake_rx);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let closed_at = Instant::now();
+        collector.close_admission(closed_at, true);
+        done_tx
+            .send(AcceptLoopOutcome::Panicked(closed_at))
+            .unwrap();
+        handle.accept_done_rx = done_rx;
+        let _locked = collector.state.lock().unwrap();
+
+        let snapshot = handle.finalize_snapshot(Duration::ZERO);
+        assert_eq!(
+            snapshot.availability,
+            SnapshotAvailability::Failed(SnapshotFailure::AcceptThreadPanicked)
+        );
+        assert_eq!(snapshot.admission_closed_at, Some(closed_at));
+        assert_eq!(snapshot.recorded_attempts, None);
+    }
+
+    #[test]
+    fn lock_timeout_discloses_failure_without_changing_evidence_cutoff() {
+        let (collector, _) = DomainCollector::new();
+        let started_at = Instant::now();
+        for (poisoned, panicked, failure) in [
+            (false, false, SnapshotFailure::CollectorLockTimeout),
+            (false, true, SnapshotFailure::AcceptThreadPanicked),
+            (true, true, SnapshotFailure::CollectorPoisoned),
+        ] {
+            for retained in [false, true] {
+                let fallback = retained.then(|| {
+                    copy_snapshot(&collector.state.lock().unwrap(), started_at, started_at)
+                });
+                let snapshot = lock_timeout_snapshot(
+                    fallback,
+                    started_at,
+                    None,
+                    Instant::now(),
+                    poisoned,
+                    panicked,
+                );
+                assert_eq!(snapshot.availability, SnapshotAvailability::Failed(failure));
+                assert_eq!(snapshot.integrity.collector_poisoned, poisoned);
+                if retained {
+                    assert_eq!(snapshot.cutoff_at, started_at);
+                    assert_eq!(snapshot.recorded_attempts.unwrap().value, 0);
+                } else {
+                    assert_eq!(snapshot.recorded_attempts, None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lock_timeout_preserves_failures_and_retained_evidence() {
+        for failure in [
+            SnapshotFailure::AcceptThreadPanicked,
+            SnapshotFailure::CollectorPoisoned,
+            SnapshotFailure::HandlerAccountingFailed,
+        ] {
+            let (collector, _) = DomainCollector::new();
+            collector.record_without_admission("retained.example", DomainVerdict::Allowed);
+            let started_at = Instant::now();
+            let mut prior = copy_snapshot(&collector.state.lock().unwrap(), started_at, started_at);
+            prior.availability = SnapshotAvailability::Failed(failure);
+            let snapshot =
+                lock_timeout_snapshot(Some(prior), started_at, None, Instant::now(), false, false);
+            assert_eq!(snapshot.availability, SnapshotAvailability::Failed(failure));
+            assert_eq!(snapshot.cutoff_at, started_at);
+            assert_eq!(snapshot.recorded_attempts.unwrap().value, 1);
+            assert_eq!(snapshot.domains[0].host, "retained.example");
+        }
     }
 
     #[test]
