@@ -702,7 +702,7 @@ mod e2e_tests {
             "a tracked .env under the deny is a finding.\nstdout: {stdout}"
         );
         assert!(
-            stdout.contains("git rm --cached .env.local"),
+            stdout.contains("git rm --cached -- '.env.local'"),
             "the finding carries its fix.\nstdout: {stdout}"
         );
 

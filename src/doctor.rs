@@ -62,6 +62,21 @@ pub fn tilde(path: &Path, home: &Path) -> String {
     }
 }
 
+/// The same, for free-form text that may quote a path.
+///
+/// `tilde` needs a `Path`; an error string built elsewhere — `cplt refuses to
+/// sandbox '/Users/hans'`, a WSL tool at `/mnt/c/Users/<name>/…` — carries the
+/// username in the middle of a sentence. The default view is meant to be
+/// pasted into a public issue, so the substitution has to reach those too.
+#[must_use]
+pub fn tilde_in_text(text: &str, home: &Path) -> String {
+    let home = home.to_string_lossy();
+    if home.is_empty() || home == "/" {
+        return text.to_string();
+    }
+    text.replace(home.as_ref(), "~")
+}
+
 // ── Rule: tracked secrets vs. the .env deny ────────────────────
 
 /// A tracked secret under the `.env` deny breaks every git command that hashes
@@ -81,7 +96,11 @@ pub fn tracked_env_finding(files: &[String], allow_env_files: bool) -> Option<Fi
             if files.len() == 1 { "is" } else { "are" }
         ),
         Some(format!(
-            "git rm --cached {first} && echo {first} >> .gitignore  (or sandbox.allow_env_files = true)"
+            // `--` and quoting: a tracked path can contain spaces, and one
+            // beginning with a dash would be read as a flag. The fix line is
+            // meant to be pasted.
+            "git rm --cached -- '{first}' && echo '{first}' >> .gitignore  \
+             (or sandbox.allow_env_files = true)"
         )),
     ))
 }
@@ -354,7 +373,7 @@ mod tests {
             f.fix
                 .as_deref()
                 .unwrap()
-                .contains("git rm --cached config/.env.local")
+                .contains("git rm --cached -- 'config/.env.local'")
         );
     }
 

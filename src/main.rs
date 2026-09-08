@@ -5290,7 +5290,16 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             println!();
             let findings = [Finding {
                 level: Level::Blocking,
-                message: format!("cplt cannot resolve this launch: {e}"),
+                // The error text can quote an absolute path — "cplt refuses
+                // to sandbox '/Users/hans'" — and this view gets pasted into
+                // public issues.
+                message: doctor::tilde_in_text(
+                    &format!("cplt cannot resolve this launch: {e}"),
+                    &std::env::var("HOME").map_or_else(
+                        |_| std::path::PathBuf::from("/nonexistent"),
+                        std::path::PathBuf::from,
+                    ),
+                ),
                 fix: None,
             }];
             print!("{}", doctor::render(&findings, &[], false));

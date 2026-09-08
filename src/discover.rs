@@ -241,6 +241,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// exactly the hang this function exists to remove. A detached reader blocked
 /// on a pipe costs one thread in a process that exits moments later.
 #[allow(clippy::disallowed_methods)] // runs an already-resolved discovered path; trusting it is #248, not resolution
+/// `pub`, not `pub(crate)`: the binary is a separate crate from the library,
+/// so a crate-private item here is unreachable from `main.rs`, which uses this
+/// to print agent versions.
 pub fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
     let Ok(mut child) = std::process::Command::new(path)
         .args(args)
