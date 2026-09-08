@@ -362,25 +362,6 @@ impl DomainVerdict {
     }
 }
 
-/// A bounded counter with explicit saturation state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ObservationCount {
-    /// The exact count unless `saturated` is true. A saturated value is a lower bound.
-    pub value: u64,
-    /// Whether one or more increments exceeded `u64::MAX`.
-    pub saturated: bool,
-}
-
-impl ObservationCount {
-    fn increment(&mut self) {
-        if self.value == u64::MAX {
-            self.saturated = true;
-        } else {
-            self.value += 1;
-        }
-    }
-}
-
 /// One host the proxy observed a CONNECT for, with its verdict and how many
 /// CONNECTs targeted it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,13 +371,13 @@ pub struct ObservedDomain {
     /// Whether the connection was allowed or blocked by policy.
     pub verdict: DomainVerdict,
     /// Number of CONNECTs seen for this host this session.
-    pub count: ObservationCount,
+    pub count: u64,
 }
 
 /// Internal per-host accumulator behind the collector's `BTreeMap`.
 struct DomainObservation {
     verdict: DomainVerdict,
-    count: ObservationCount,
+    count: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,16 +393,11 @@ pub enum SnapshotCompletion {
         pending_clients: usize,
         admission: AdmissionStatus,
     },
-    Unavailable {
-        pending_clients: Option<usize>,
-        admission: AdmissionStatus,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotFailure {
     CollectorPoisoned,
-    CollectorLockTimeout,
     AcceptThreadPanicked,
     HandlerAccountingFailed,
 }
@@ -448,10 +424,8 @@ pub struct ProxySnapshot {
     pub admission_closed_at: Option<Instant>,
     pub cutoff_at: Instant,
     pub completion: SnapshotCompletion,
-    /// `None` means the value was not captured. It never means zero.
-    pub recorded_attempts: Option<ObservationCount>,
-    /// `None` means the value was not captured. It never means zero.
-    pub unretained_observations: Option<ObservationCount>,
+    pub recorded_attempts: u64,
+    pub unretained_observations: u64,
     pub domains: Vec<ObservedDomain>,
     pub integrity: SnapshotIntegrity,
     pub retained_host_limit: usize,
@@ -460,8 +434,8 @@ pub struct ProxySnapshot {
 
 struct CollectorState {
     domains: BTreeMap<String, DomainObservation>,
-    recorded_attempts: ObservationCount,
-    unretained_observations: ObservationCount,
+    recorded_attempts: u64,
+    unretained_observations: u64,
     pending_clients: usize,
     admission_closed_at: Option<Instant>,
     frozen: bool,
@@ -474,8 +448,8 @@ impl CollectorState {
     fn new() -> Self {
         Self {
             domains: BTreeMap::new(),
-            recorded_attempts: ObservationCount::default(),
-            unretained_observations: ObservationCount::default(),
+            recorded_attempts: 0,
+            unretained_observations: 0,
             pending_clients: 0,
             admission_closed_at: None,
             frozen: false,
@@ -490,14 +464,14 @@ impl CollectorState {
             return;
         }
 
-        self.recorded_attempts.increment();
+        self.recorded_attempts = self.recorded_attempts.saturating_add(1);
         if host.contains('@') {
-            self.unretained_observations.increment();
+            self.unretained_observations = self.unretained_observations.saturating_add(1);
             return;
         }
         let key = normalize_hostname(host);
         if let Some(entry) = self.domains.get_mut(&key) {
-            entry.count.increment();
+            entry.count = entry.count.saturating_add(1);
             if verdict == DomainVerdict::Blocked {
                 entry.verdict = DomainVerdict::Blocked;
             }
@@ -508,20 +482,12 @@ impl CollectorState {
             || key.len() > OBSERVED_HOST_KEY_BYTE_LIMIT
             || self.domains.len() >= OBSERVED_HOST_LIMIT
         {
-            self.unretained_observations.increment();
+            self.unretained_observations = self.unretained_observations.saturating_add(1);
             return;
         }
 
-        self.domains.insert(
-            key,
-            DomainObservation {
-                verdict,
-                count: ObservationCount {
-                    value: 1,
-                    saturated: false,
-                },
-            },
-        );
+        self.domains
+            .insert(key, DomainObservation { verdict, count: 1 });
     }
 }
 
@@ -612,6 +578,10 @@ impl ClassificationGuard {
         observation: Option<(&str, DomainVerdict)>,
         handler_accounting_failed: bool,
     ) {
+        debug_assert!(
+            !self.completed,
+            "CONNECT classification guard completed more than once"
+        );
         if self.completed {
             return;
         }
@@ -636,7 +606,9 @@ impl Drop for ClassificationGuard {
     fn drop(&mut self) {
         // Every successful handler path explicitly completes classification.
         // An unfinished guard indicates lost evidence, even without a panic.
-        self.complete_with_integrity(None, true);
+        if !self.completed {
+            self.complete_with_integrity(None, true);
+        }
     }
 }
 
@@ -755,8 +727,6 @@ impl ProxyHandle {
         let deadline = Instant::now()
             .checked_add(budget)
             .unwrap_or_else(Instant::now);
-        let mut known_admission_closed_at = None;
-        let mut accept_thread_panicked = false;
 
         let accept_outcome = if budget.is_zero() {
             self.accept_done_rx.try_recv().ok()
@@ -765,46 +735,24 @@ impl ProxyHandle {
             self.accept_done_rx.recv_timeout(remaining).ok()
         };
         match accept_outcome {
-            Some(AcceptLoopOutcome::Closed(at)) => known_admission_closed_at = Some(at),
+            Some(AcceptLoopOutcome::Closed(at)) => {
+                self.domain_collector.close_admission(at, false);
+            }
             Some(AcceptLoopOutcome::Panicked(at)) => {
-                known_admission_closed_at = Some(at);
-                accept_thread_panicked = true;
+                self.domain_collector.close_admission(at, true);
             }
             None => {}
         }
 
-        let mut fallback = None;
         loop {
-            match self.domain_collector.state.try_lock() {
-                Ok(mut state) => {
-                    let cutoff_at = Instant::now();
-                    let deadline_reached = cutoff_at >= deadline;
-                    let settled = state.admission_closed_at.is_some() && state.pending_clients == 0;
-                    if settled || deadline_reached {
-                        return freeze_snapshot(&mut state, self.collection_started_at, cutoff_at);
-                    }
-                    fallback = Some(copy_snapshot(&state, self.collection_started_at, cutoff_at));
-                }
-                Err(std::sync::TryLockError::Poisoned(error)) => {
-                    let mut state = error.into_inner();
-                    state.collector_poisoned = true;
-                    let cutoff_at = Instant::now();
-                    return freeze_snapshot(&mut state, self.collection_started_at, cutoff_at);
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    let cutoff_at = Instant::now();
-                    if cutoff_at >= deadline {
-                        return lock_timeout_snapshot(
-                            fallback,
-                            self.collection_started_at,
-                            known_admission_closed_at,
-                            cutoff_at,
-                            self.domain_collector.state.is_poisoned(),
-                            accept_thread_panicked,
-                        );
-                    }
-                }
+            let mut state = self.domain_collector.lock_recovering();
+            let cutoff_at = Instant::now();
+            let deadline_reached = cutoff_at >= deadline;
+            let settled = state.admission_closed_at.is_some() && state.pending_clients == 0;
+            if settled || deadline_reached {
+                return freeze_snapshot(&mut state, self.collection_started_at, cutoff_at);
             }
+            drop(state);
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -842,44 +790,6 @@ fn snapshot_completion(state: &CollectorState) -> SnapshotCompletion {
     }
 }
 
-fn copied_domains(state: &CollectorState) -> Vec<ObservedDomain> {
-    state
-        .domains
-        .iter()
-        .map(|(host, observation)| ObservedDomain {
-            host: host.clone(),
-            verdict: observation.verdict,
-            count: observation.count,
-        })
-        .collect()
-}
-
-fn copy_snapshot(
-    state: &CollectorState,
-    collection_started_at: Instant,
-    cutoff_at: Instant,
-) -> ProxySnapshot {
-    ProxySnapshot {
-        availability: snapshot_failure(state).map_or(
-            SnapshotAvailability::Available,
-            SnapshotAvailability::Failed,
-        ),
-        collection_started_at,
-        admission_closed_at: state.admission_closed_at,
-        cutoff_at,
-        completion: snapshot_completion(state),
-        recorded_attempts: Some(state.recorded_attempts),
-        unretained_observations: Some(state.unretained_observations),
-        domains: copied_domains(state),
-        integrity: SnapshotIntegrity {
-            collector_poisoned: state.collector_poisoned,
-            handler_accounting_failed: state.handler_accounting_failed,
-        },
-        retained_host_limit: OBSERVED_HOST_LIMIT,
-        host_key_byte_limit: OBSERVED_HOST_KEY_BYTE_LIMIT,
-    }
-}
-
 fn freeze_snapshot(
     state: &mut CollectorState,
     collection_started_at: Instant,
@@ -909,58 +819,10 @@ fn freeze_snapshot(
         admission_closed_at: state.admission_closed_at,
         cutoff_at,
         completion,
-        recorded_attempts: Some(state.recorded_attempts),
-        unretained_observations: Some(state.unretained_observations),
+        recorded_attempts: state.recorded_attempts,
+        unretained_observations: state.unretained_observations,
         domains,
         integrity,
-        retained_host_limit: OBSERVED_HOST_LIMIT,
-        host_key_byte_limit: OBSERVED_HOST_KEY_BYTE_LIMIT,
-    }
-}
-
-fn lock_timeout_snapshot(
-    fallback: Option<ProxySnapshot>,
-    collection_started_at: Instant,
-    admission_closed_at: Option<Instant>,
-    cutoff_at: Instant,
-    collector_poisoned: bool,
-    accept_thread_panicked: bool,
-) -> ProxySnapshot {
-    let failure = if collector_poisoned {
-        SnapshotFailure::CollectorPoisoned
-    } else if accept_thread_panicked {
-        SnapshotFailure::AcceptThreadPanicked
-    } else {
-        SnapshotFailure::CollectorLockTimeout
-    };
-    if let Some(mut snapshot) = fallback {
-        // Retain failures already established at the evidence cutoff.
-        if snapshot.availability == SnapshotAvailability::Available {
-            snapshot.availability = SnapshotAvailability::Failed(failure);
-        }
-        snapshot.integrity.collector_poisoned |= collector_poisoned;
-        return snapshot;
-    }
-    ProxySnapshot {
-        availability: SnapshotAvailability::Failed(failure),
-        collection_started_at,
-        admission_closed_at,
-        cutoff_at,
-        completion: SnapshotCompletion::Unavailable {
-            pending_clients: None,
-            admission: if admission_closed_at.is_some() {
-                AdmissionStatus::Closed
-            } else {
-                AdmissionStatus::Open
-            },
-        },
-        recorded_attempts: None,
-        unretained_observations: None,
-        domains: Vec::new(),
-        integrity: SnapshotIntegrity {
-            collector_poisoned,
-            handler_accounting_failed: false,
-        },
         retained_host_limit: OBSERVED_HOST_LIMIT,
         host_key_byte_limit: OBSERVED_HOST_KEY_BYTE_LIMIT,
     }
@@ -2905,10 +2767,7 @@ mod tests {
             .get("api.github.com")
             .expect("host recorded normalized");
         assert_eq!(gh.verdict, DomainVerdict::Allowed);
-        assert_eq!(
-            gh.count.value, 2,
-            "repeat CONNECTs must increment the count"
-        );
+        assert_eq!(gh.count, 2, "repeat CONNECTs must increment the count");
         assert_eq!(
             map.domains
                 .get("evil.example")
@@ -2935,7 +2794,7 @@ mod tests {
             DomainVerdict::Blocked,
             "blocked verdict must be sticky"
         );
-        assert_eq!(entry.count.value, 3);
+        assert_eq!(entry.count, 3);
     }
 
     #[test]
@@ -2960,8 +2819,8 @@ mod tests {
             closed_test_handle(collector, wake_rx).finalize_snapshot(Duration::from_millis(100));
         assert_eq!(snapshot.availability, SnapshotAvailability::Available);
         assert_eq!(snapshot.domains.len(), OBSERVED_HOST_LIMIT);
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 1_027);
-        assert_eq!(snapshot.unretained_observations.unwrap().value, 2);
+        assert_eq!(snapshot.recorded_attempts, 1_027);
+        assert_eq!(snapshot.unretained_observations, 2);
         assert_eq!(snapshot.domains[0].verdict, DomainVerdict::Blocked);
         assert!(
             snapshot
@@ -2969,43 +2828,8 @@ mod tests {
                 .iter()
                 .any(|domain| domain.host.len() == OBSERVED_HOST_KEY_BYTE_LIMIT)
         );
-        let retained: u64 = snapshot
-            .domains
-            .iter()
-            .map(|domain| domain.count.value)
-            .sum();
+        let retained: u64 = snapshot.domains.iter().map(|domain| domain.count).sum();
         assert_eq!(retained + 2, 1_027);
-    }
-
-    #[test]
-    fn collector_discloses_each_saturated_counter() {
-        let (collector, wake_rx) = DomainCollector::new();
-        {
-            let mut state = collector.state.lock().unwrap();
-            state.recorded_attempts.value = u64::MAX;
-            state.unretained_observations.value = u64::MAX;
-            state.domains.insert(
-                "kept.example".to_string(),
-                DomainObservation {
-                    verdict: DomainVerdict::Allowed,
-                    count: ObservationCount {
-                        value: u64::MAX,
-                        saturated: false,
-                    },
-                },
-            );
-        }
-        collector.record_without_admission("kept.example", DomainVerdict::Allowed);
-        collector.record_without_admission(
-            &"x".repeat(OBSERVED_HOST_KEY_BYTE_LIMIT + 1),
-            DomainVerdict::Allowed,
-        );
-
-        let snapshot =
-            closed_test_handle(collector, wake_rx).finalize_snapshot(Duration::from_millis(100));
-        assert!(snapshot.recorded_attempts.unwrap().saturated);
-        assert!(snapshot.unretained_observations.unwrap().saturated);
-        assert!(snapshot.domains[0].count.saturated);
     }
 
     #[test]
@@ -3024,7 +2848,7 @@ mod tests {
         let snapshot = handle.finalize_snapshot(Duration::from_millis(500));
         worker.join().unwrap();
         assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 1);
+        assert_eq!(snapshot.recorded_attempts, 1);
         assert_eq!(snapshot.domains[0].host, "pending.example");
     }
 
@@ -3092,7 +2916,7 @@ mod tests {
         finalizer.join().unwrap();
         client.join().unwrap();
         assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 1);
+        assert_eq!(snapshot.recorded_attempts, 1);
         assert_eq!(snapshot.domains[0].host, "gated.example");
     }
 
@@ -3137,11 +2961,11 @@ mod tests {
                 admission: AdmissionStatus::Closed,
             }
         );
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 0);
+        assert_eq!(snapshot.recorded_attempts, 0);
 
         resolver_release_tx.send(()).unwrap();
         client.join().unwrap();
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 0);
+        assert_eq!(snapshot.recorded_attempts, 0);
         assert!(snapshot.domains.is_empty());
     }
 
@@ -3152,27 +2976,34 @@ mod tests {
 
         let origin = TcpListener::bind("127.0.0.1:0").unwrap();
         origin.set_nonblocking(true).unwrap();
-        let origin_port = origin.local_addr().unwrap().port();
-        let (origin_connected_tx, origin_connected_rx) = mpsc::sync_channel(0);
-        let (origin_release_tx, origin_release_rx) = mpsc::sync_channel(0);
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_port = origin_addr.port();
+        let (origin_connected_tx, origin_connected_rx) = mpsc::channel();
+        let (origin_release_tx, origin_release_rx) = mpsc::channel();
         let origin_worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(2);
             let _stream = loop {
                 match origin.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "proxy did not connect to origin");
+                        if Instant::now() >= deadline {
+                            return Err("proxy did not connect to origin".to_string());
+                        }
                         std::thread::yield_now();
                     }
-                    Err(error) => panic!("origin accept failed: {error}"),
+                    Err(error) => return Err(format!("origin accept failed: {error}")),
                 }
             };
-            origin_connected_tx.send(()).unwrap();
+            origin_connected_tx
+                .send(())
+                .map_err(|error| format!("origin connect signal failed: {error}"))?;
             origin_release_rx
                 .recv_timeout(Duration::from_secs(2))
-                .unwrap();
+                .map_err(|error| format!("origin release signal failed: {error}"))?;
+            Ok::<(), String>(())
         });
-        let proxy = make_proxy(vec![origin_port], false);
+        let resolver: ResolverFn = Arc::new(move |_host: &str, _port: u16| Some(origin_addr));
+        let proxy = make_proxy_with_resolver(vec![origin_port], false, Some(resolver));
         let mut client = TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -3186,19 +3017,21 @@ mod tests {
         BufReader::new(client.try_clone().unwrap())
             .read_line(&mut status)
             .unwrap();
-        assert!(status.contains("200"));
-        origin_connected_rx
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
+        let origin_connected = origin_connected_rx.recv_timeout(Duration::from_secs(2));
 
         let snapshot = proxy.finalize_snapshot(Duration::from_millis(500));
-        assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 1);
-        assert_eq!(snapshot.domains[0].host, "localhost");
-
         drop(client);
-        origin_release_tx.send(()).unwrap();
-        origin_worker.join().unwrap();
+        let _ = origin_release_tx.send(());
+        let origin_result = origin_worker.join();
+
+        assert_eq!(status, "HTTP/1.1 200 Connection Established\r\n");
+        origin_connected.expect("proxy did not signal an origin connection");
+        origin_result
+            .expect("origin worker panicked")
+            .expect("origin worker failed");
+        assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
+        assert_eq!(snapshot.recorded_attempts, 1);
+        assert_eq!(snapshot.domains[0].host, "localhost");
     }
 
     #[test]
@@ -3217,7 +3050,7 @@ mod tests {
 
         let snapshot = handle.finalize_snapshot(Duration::from_millis(100));
         assert_eq!(snapshot.completion, SnapshotCompletion::Settled);
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 1);
+        assert_eq!(snapshot.recorded_attempts, 1);
         relay_close_tx.send(()).unwrap();
         worker.join().unwrap();
     }
@@ -3236,9 +3069,9 @@ mod tests {
                 admission: AdmissionStatus::Closed,
             }
         );
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 0);
+        assert_eq!(snapshot.recorded_attempts, 0);
         classification.complete(Some(("late.example", DomainVerdict::Blocked)));
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 0);
+        assert_eq!(snapshot.recorded_attempts, 0);
         assert!(snapshot.domains.is_empty());
     }
 
@@ -3255,7 +3088,7 @@ mod tests {
             snapshot.availability,
             SnapshotAvailability::Failed(SnapshotFailure::HandlerAccountingFailed)
         );
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 0);
+        assert_eq!(snapshot.recorded_attempts, 0);
     }
 
     #[test]
@@ -3333,115 +3166,8 @@ mod tests {
             SnapshotAvailability::Failed(SnapshotFailure::CollectorPoisoned)
         );
         assert!(snapshot.integrity.collector_poisoned);
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 1);
+        assert_eq!(snapshot.recorded_attempts, 1);
         assert_eq!(snapshot.domains[0].host, "before-poison.example");
-    }
-
-    #[test]
-    fn finalizer_reports_lock_timeout_without_fabricated_counts() {
-        let (collector, wake_rx) = DomainCollector::new();
-        let handle = closed_test_handle(collector.clone(), wake_rx);
-        let (locked_tx, locked_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            let _state = collector.state.lock().unwrap();
-            locked_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-        });
-        locked_rx.recv().unwrap();
-
-        let snapshot = handle.finalize_snapshot(Duration::ZERO);
-        assert_eq!(
-            snapshot.availability,
-            SnapshotAvailability::Failed(SnapshotFailure::CollectorLockTimeout)
-        );
-        assert_eq!(snapshot.recorded_attempts, None);
-        assert_eq!(snapshot.unretained_observations, None);
-        assert_eq!(
-            snapshot.completion,
-            SnapshotCompletion::Unavailable {
-                pending_clients: None,
-                admission: AdmissionStatus::Closed,
-            }
-        );
-        release_tx.send(()).unwrap();
-        holder.join().unwrap();
-    }
-
-    #[test]
-    fn finalizer_preserves_accept_panic_under_collector_contention() {
-        let (collector, wake_rx) = DomainCollector::new();
-        let mut handle = closed_test_handle(collector.clone(), wake_rx);
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let closed_at = Instant::now();
-        collector.close_admission(closed_at, true);
-        done_tx
-            .send(AcceptLoopOutcome::Panicked(closed_at))
-            .unwrap();
-        handle.accept_done_rx = done_rx;
-        let _locked = collector.state.lock().unwrap();
-
-        let snapshot = handle.finalize_snapshot(Duration::ZERO);
-        assert_eq!(
-            snapshot.availability,
-            SnapshotAvailability::Failed(SnapshotFailure::AcceptThreadPanicked)
-        );
-        assert_eq!(snapshot.admission_closed_at, Some(closed_at));
-        assert_eq!(snapshot.recorded_attempts, None);
-    }
-
-    #[test]
-    fn lock_timeout_discloses_failure_without_changing_evidence_cutoff() {
-        let (collector, _) = DomainCollector::new();
-        let started_at = Instant::now();
-        for (poisoned, panicked, failure) in [
-            (false, false, SnapshotFailure::CollectorLockTimeout),
-            (false, true, SnapshotFailure::AcceptThreadPanicked),
-            (true, true, SnapshotFailure::CollectorPoisoned),
-        ] {
-            for retained in [false, true] {
-                let fallback = retained.then(|| {
-                    copy_snapshot(&collector.state.lock().unwrap(), started_at, started_at)
-                });
-                let snapshot = lock_timeout_snapshot(
-                    fallback,
-                    started_at,
-                    None,
-                    Instant::now(),
-                    poisoned,
-                    panicked,
-                );
-                assert_eq!(snapshot.availability, SnapshotAvailability::Failed(failure));
-                assert_eq!(snapshot.integrity.collector_poisoned, poisoned);
-                if retained {
-                    assert_eq!(snapshot.cutoff_at, started_at);
-                    assert_eq!(snapshot.recorded_attempts.unwrap().value, 0);
-                } else {
-                    assert_eq!(snapshot.recorded_attempts, None);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn lock_timeout_preserves_failures_and_retained_evidence() {
-        for failure in [
-            SnapshotFailure::AcceptThreadPanicked,
-            SnapshotFailure::CollectorPoisoned,
-            SnapshotFailure::HandlerAccountingFailed,
-        ] {
-            let (collector, _) = DomainCollector::new();
-            collector.record_without_admission("retained.example", DomainVerdict::Allowed);
-            let started_at = Instant::now();
-            let mut prior = copy_snapshot(&collector.state.lock().unwrap(), started_at, started_at);
-            prior.availability = SnapshotAvailability::Failed(failure);
-            let snapshot =
-                lock_timeout_snapshot(Some(prior), started_at, None, Instant::now(), false, false);
-            assert_eq!(snapshot.availability, SnapshotAvailability::Failed(failure));
-            assert_eq!(snapshot.cutoff_at, started_at);
-            assert_eq!(snapshot.recorded_attempts.unwrap().value, 1);
-            assert_eq!(snapshot.domains[0].host, "retained.example");
-        }
     }
 
     #[test]
@@ -3468,20 +3194,14 @@ mod tests {
                 "b.example".to_string(),
                 DomainObservation {
                     verdict: DomainVerdict::Allowed,
-                    count: ObservationCount {
-                        value: 3,
-                        saturated: false,
-                    },
+                    count: 3,
                 },
             );
             state.domains.insert(
                 "a.example".to_string(),
                 DomainObservation {
                     verdict: DomainVerdict::Blocked,
-                    count: ObservationCount {
-                        value: 1,
-                        saturated: false,
-                    },
+                    count: 1,
                 },
             );
         }
@@ -3498,7 +3218,7 @@ mod tests {
         let hosts: Vec<&str> = observed.iter().map(|o| o.host.as_str()).collect();
         assert_eq!(hosts, vec!["a.example", "b.example"], "must be sorted");
         assert_eq!(observed[0].verdict, DomainVerdict::Blocked);
-        assert_eq!(observed[1].count.value, 3);
+        assert_eq!(observed[1].count, 3);
     }
 
     /// Start a proxy with a default allowlist for end-to-end CONNECT tests.
@@ -3586,7 +3306,7 @@ mod tests {
             p.observed_domains()
                 .into_iter()
                 .find(|o| o.host == key)
-                .map_or(0, |o| o.count.value)
+                .map_or(0, |o| o.count)
         };
 
         // Sample only once the count has stopped moving. A record from the
@@ -3623,7 +3343,7 @@ mod tests {
                 if let Some(rec) = proxy
                     .observed_domains()
                     .into_iter()
-                    .find(|o| o.host == key && o.count.value > before)
+                    .find(|o| o.host == key && o.count > before)
                 {
                     return (status, rec);
                 }
@@ -3893,8 +3613,8 @@ mod tests {
         let snapshot = proxy.finalize_snapshot(Duration::from_millis(500));
         let logged = std::fs::read_to_string(log).unwrap();
 
-        assert_eq!(snapshot.recorded_attempts.unwrap().value, 3);
-        assert_eq!(snapshot.unretained_observations.unwrap().value, 3);
+        assert_eq!(snapshot.recorded_attempts, 3);
+        assert_eq!(snapshot.unretained_observations, 3);
         assert!(snapshot.domains.is_empty());
         assert!(!logged.contains("secret"));
         assert!(!logged.contains("s3cret"));

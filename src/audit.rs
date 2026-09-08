@@ -581,21 +581,11 @@ impl AuditReport {
     }
 }
 
-/// Render one immutable proxy snapshot as a bounded, conservative report.
-///
-/// The report describes policy-permitted CONNECT records. It does not infer
-/// DNS success, transport success, application requests, or exclusive agent
-/// attribution from those records.
-pub fn render_network_report(snapshot: Option<&proxy::ProxySnapshot>, routing: &str) -> String {
-    let mut out = Vec::new();
-    // Writing to a Vec cannot fail. Keep the fallible writer as the single
-    // implementation so stderr and test writers use identical text.
-    write_network_report(&mut out, snapshot, routing)
-        .expect("writing a network report to memory cannot fail");
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// Write the network report to a caller-owned writer.
+///
+/// The report describes proxy-observed CONNECT verdicts, including blocked
+/// requests. It does not infer DNS success, transport success, application
+/// requests, or exclusive agent attribution from those records.
 ///
 /// The caller must ignore a write error when preserving the child exit status
 /// is required. A report failure is independent from the child result.
@@ -604,7 +594,6 @@ pub fn write_network_report<W: Write>(
     snapshot: Option<&proxy::ProxySnapshot>,
     routing: &str,
 ) -> io::Result<()> {
-    let routing = escape_path(routing);
     let Some(snapshot) = snapshot else {
         writeln!(
             writer,
@@ -615,29 +604,16 @@ pub fn write_network_report<W: Write>(
         return Ok(());
     };
 
+    write_snapshot_status(writer, snapshot, "[cplt]")?;
+
     match &snapshot.availability {
         proxy::SnapshotAvailability::Available => {
-            writeln!(writer, "[cplt] Collection: available.")?;
-            match snapshot.recorded_attempts {
-                Some(count) if count.saturated => writeln!(
-                    writer,
-                    "[cplt] Proxy-observed CONNECT attempts recorded: at least {}.",
-                    count.value
-                )?,
-                Some(count) => writeln!(
-                    writer,
-                    "[cplt] Proxy-observed CONNECT attempts recorded: {}.",
-                    count.value
-                )?,
-                None => writeln!(
-                    writer,
-                    "[cplt] Proxy-observed CONNECT attempts recorded: unavailable."
-                )?,
-            }
-            if snapshot
-                .recorded_attempts
-                .is_some_and(|count| count.value == 0 && !count.saturated)
-            {
+            writeln!(
+                writer,
+                "[cplt] Proxy-observed CONNECT attempts recorded: {}.",
+                snapshot.recorded_attempts
+            )?;
+            if snapshot.recorded_attempts == 0 {
                 writeln!(
                     writer,
                     "[cplt] A result of zero recorded CONNECT attempts does not prove that no networking occurred."
@@ -655,17 +631,11 @@ pub fn write_network_report<W: Write>(
                 "[cplt] Hosts retained: {retained_hosts}. Hosts with blocked activity: {blocked_hosts}."
             )?;
 
-            if let Some(omitted) = snapshot.unretained_observations
-                && (omitted.value > 0 || omitted.saturated)
-            {
-                let omitted_text = if omitted.saturated {
-                    format!("at least {}", omitted.value)
-                } else {
-                    omitted.value.to_string()
-                };
+            if snapshot.unretained_observations > 0 {
                 writeln!(
                     writer,
-                    "[cplt] Observations omitted from host breakdown: {omitted_text}."
+                    "[cplt] Observations omitted from host breakdown: {}.",
+                    snapshot.unretained_observations
                 )?;
                 writeln!(
                     writer,
@@ -678,23 +648,12 @@ pub fn write_network_report<W: Write>(
                 )?;
             }
         }
-        proxy::SnapshotAvailability::Failed(reason) => {
+        proxy::SnapshotAvailability::Failed(_) => {
             writeln!(
                 writer,
-                "[cplt] Collection: failed ({}). Any retained evidence is partial.",
-                snapshot_failure_text(reason)
+                "[cplt] CONNECT records retained before collection failure: {}.",
+                snapshot.recorded_attempts
             )?;
-            if let Some(count) = snapshot.recorded_attempts {
-                let count_text = if count.saturated {
-                    format!("at least {}", count.value)
-                } else {
-                    count.value.to_string()
-                };
-                writeln!(
-                    writer,
-                    "[cplt] CONNECT records retained before collection failure: {count_text}."
-                )?;
-            }
             if !snapshot.domains.is_empty() {
                 writeln!(
                     writer,
@@ -703,61 +662,6 @@ pub fn write_network_report<W: Write>(
                 )?;
             }
         }
-    }
-
-    match snapshot.completion {
-        proxy::SnapshotCompletion::Settled => {
-            writeln!(writer, "[cplt] Classification: settled.")?;
-        }
-        proxy::SnapshotCompletion::DeadlineExceeded {
-            pending_clients,
-            admission,
-        } => {
-            writeln!(
-                writer,
-                "[cplt] Classification deadline reached. Pending proxy clients: {pending_clients}."
-            )?;
-            writeln!(
-                writer,
-                "[cplt] Admission at snapshot: {}.",
-                admission_status_text(admission)
-            )?;
-            writeln!(
-                writer,
-                "[cplt] Pending clients may not contain CONNECT requests. Later records are outside this snapshot."
-            )?;
-        }
-        proxy::SnapshotCompletion::Unavailable {
-            pending_clients,
-            admission,
-        } => {
-            writeln!(
-                writer,
-                "[cplt] Classification unavailable: the snapshot could not establish completion."
-            )?;
-            writeln!(
-                writer,
-                "[cplt] Admission at snapshot: {}.",
-                admission_status_text(admission)
-            )?;
-            match pending_clients {
-                Some(count) => writeln!(writer, "[cplt] Pending proxy clients: {count}.")?,
-                None => writeln!(writer, "[cplt] Pending proxy clients: unavailable.")?,
-            }
-        }
-    }
-
-    if snapshot.integrity.collector_poisoned {
-        writeln!(
-            writer,
-            "[cplt] Collection integrity: collector state was poisoned. Counts are partial."
-        )?;
-    }
-    if snapshot.integrity.handler_accounting_failed {
-        writeln!(
-            writer,
-            "[cplt] Collection integrity: handler accounting failed. Counts are partial."
-        )?;
     }
 
     writeln!(writer, "[cplt] Network visibility: partial.")?;
@@ -782,10 +686,67 @@ pub fn write_network_report<W: Write>(
     Ok(())
 }
 
+/// Write collection, completion, and integrity status for one proxy snapshot.
+pub fn write_snapshot_status<W: Write>(
+    writer: &mut W,
+    snapshot: &proxy::ProxySnapshot,
+    prefix: &str,
+) -> io::Result<()> {
+    match &snapshot.availability {
+        proxy::SnapshotAvailability::Available => {
+            writeln!(writer, "{prefix} Collection: available.")?;
+        }
+        proxy::SnapshotAvailability::Failed(reason) => {
+            writeln!(
+                writer,
+                "{prefix} Collection: failed ({}). Any retained evidence is partial.",
+                snapshot_failure_text(reason)
+            )?;
+        }
+    }
+
+    match snapshot.completion {
+        proxy::SnapshotCompletion::Settled => {
+            writeln!(writer, "{prefix} Classification: settled.")?;
+        }
+        proxy::SnapshotCompletion::DeadlineExceeded {
+            pending_clients,
+            admission,
+        } => {
+            writeln!(
+                writer,
+                "{prefix} Classification deadline reached. Pending proxy clients: {pending_clients}."
+            )?;
+            writeln!(
+                writer,
+                "{prefix} Admission at snapshot: {}.",
+                admission_status_text(admission)
+            )?;
+            writeln!(
+                writer,
+                "{prefix} Pending clients may not contain CONNECT requests. Later records are outside this snapshot."
+            )?;
+        }
+    }
+
+    if snapshot.integrity.collector_poisoned {
+        writeln!(
+            writer,
+            "{prefix} Collection integrity: collector state was poisoned. Counts are partial."
+        )?;
+    }
+    if snapshot.integrity.handler_accounting_failed {
+        writeln!(
+            writer,
+            "{prefix} Collection integrity: handler accounting failed. Counts are partial."
+        )?;
+    }
+    Ok(())
+}
+
 pub fn snapshot_failure_text(reason: &proxy::SnapshotFailure) -> &'static str {
     match reason {
         proxy::SnapshotFailure::CollectorPoisoned => "collector state was poisoned",
-        proxy::SnapshotFailure::CollectorLockTimeout => "collector lock acquisition timed out",
         proxy::SnapshotFailure::AcceptThreadPanicked => "proxy accept thread panicked",
         proxy::SnapshotFailure::HandlerAccountingFailed => "handler accounting failed",
     }
@@ -1168,9 +1129,8 @@ pub fn run<F: FnOnce() -> u8, C: FnOnce() -> Option<proxy::ProxySnapshot>>(
         }
     }
     if mode != AuditMode::Disabled && !settled {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "[cplt] the session left processes running — anything they change from here on is NOT audited; network activity after the cutoff is excluded"
+        ui::warn(
+            "the session left processes running — anything they change from here on is NOT audited; network activity after the cutoff is excluded",
         );
     }
     (exit_code, snapshot)
@@ -1975,23 +1935,24 @@ mod tests {
             admission_closed_at: Some(now),
             cutoff_at: now,
             completion,
-            recorded_attempts: Some(proxy::ObservationCount {
-                value: 3,
-                saturated: false,
-            }),
-            unretained_observations: Some(proxy::ObservationCount::default()),
+            recorded_attempts: 3,
+            unretained_observations: 0,
             domains: vec![proxy::ObservedDomain {
                 host: "safe.example".to_string(),
                 verdict: proxy::DomainVerdict::Blocked,
-                count: proxy::ObservationCount {
-                    value: 3,
-                    saturated: false,
-                },
+                count: 3,
             }],
             integrity: proxy::SnapshotIntegrity::default(),
             retained_host_limit: 1024,
             host_key_byte_limit: 1024,
         }
+    }
+
+    fn render_network_report(snapshot: Option<&proxy::ProxySnapshot>, routing: &str) -> String {
+        let mut out = Vec::new();
+        write_network_report(&mut out, snapshot, routing)
+            .expect("writing a network report to memory cannot fail");
+        String::from_utf8(out).expect("network report must be UTF-8")
     }
 
     #[test]
@@ -2011,21 +1972,15 @@ mod tests {
     }
 
     #[test]
-    fn network_report_discloses_retention_loss_and_saturated_totals() {
+    fn network_report_discloses_retention_loss() {
         let mut snapshot = test_snapshot(
             proxy::SnapshotAvailability::Available,
             proxy::SnapshotCompletion::Settled,
         );
-        snapshot.recorded_attempts = Some(proxy::ObservationCount {
-            value: u64::MAX,
-            saturated: true,
-        });
-        snapshot.unretained_observations = Some(proxy::ObservationCount {
-            value: 7,
-            saturated: false,
-        });
+        snapshot.recorded_attempts = u64::MAX;
+        snapshot.unretained_observations = 7;
         let report = render_network_report(Some(&snapshot), "proxy enabled");
-        assert!(report.contains(&format!("attempts recorded: at least {}.", u64::MAX)));
+        assert!(report.contains(&format!("attempts recorded: {}.", u64::MAX)));
         assert!(report.contains("Observations omitted from host breakdown: 7."));
         assert!(report.contains("blocked-host counts are lower bounds."));
         assert!(report.contains("1024 entries and 1024 bytes per host key."));
@@ -2035,14 +1990,16 @@ mod tests {
     #[test]
     fn network_report_marks_deadline_and_failed_collection_independently() {
         let snapshot = test_snapshot(
-            proxy::SnapshotAvailability::Failed(proxy::SnapshotFailure::CollectorLockTimeout),
+            proxy::SnapshotAvailability::Failed(proxy::SnapshotFailure::CollectorPoisoned),
             proxy::SnapshotCompletion::DeadlineExceeded {
                 pending_clients: 2,
                 admission: proxy::AdmissionStatus::Closed,
             },
         );
         let report = render_network_report(Some(&snapshot), "proxy enabled");
-        assert!(report.contains("Collection: failed (collector lock acquisition timed out). Any retained evidence is partial."));
+        assert!(report.contains(
+            "Collection: failed (collector state was poisoned). Any retained evidence is partial."
+        ));
         assert!(report.contains("CONNECT records retained before collection failure: 3."));
         assert!(report.contains("Classification deadline reached. Pending proxy clients: 2."));
         assert!(report.contains("Admission at snapshot: closed."));
@@ -2067,25 +2024,25 @@ mod tests {
     }
 
     #[test]
-    fn network_report_marks_unknown_completion_without_inventing_zero() {
-        let snapshot = test_snapshot(
-            proxy::SnapshotAvailability::Failed(proxy::SnapshotFailure::CollectorLockTimeout),
-            proxy::SnapshotCompletion::Unavailable {
-                pending_clients: None,
-                admission: proxy::AdmissionStatus::Open,
-            },
+    fn network_report_distinguishes_healthy_empty_from_failed_empty() {
+        let mut healthy = test_snapshot(
+            proxy::SnapshotAvailability::Available,
+            proxy::SnapshotCompletion::Settled,
         );
-        let report = render_network_report(Some(&snapshot), "proxy enabled");
-        assert!(report.contains("Classification unavailable"));
-        assert!(report.contains("Pending proxy clients: unavailable."));
-        assert!(!report.contains("Pending proxy clients: 0."));
-    }
+        healthy.recorded_attempts = 0;
+        healthy.domains.clear();
+        let healthy_report = render_network_report(Some(&healthy), "proxy enabled");
+        assert!(healthy_report.contains("Collection: available."));
+        assert!(healthy_report.contains("CONNECT attempts recorded: 0."));
+        assert!(healthy_report.contains("does not prove that no networking occurred"));
 
-    #[test]
-    fn network_report_escapes_malicious_routing_values() {
-        let report = render_network_report(None, "proxy\u{1b}[2J\rforged");
-        assert!(!report.contains('\u{1b}'));
-        assert!(report.contains("\\u{1b}[2J\\rforged"));
+        let mut failed = healthy;
+        failed.availability =
+            proxy::SnapshotAvailability::Failed(proxy::SnapshotFailure::CollectorPoisoned);
+        let failed_report = render_network_report(Some(&failed), "proxy enabled");
+        assert!(failed_report.contains("Collection: failed"));
+        assert!(failed_report.contains("CONNECT records retained before collection failure: 0."));
+        assert!(!failed_report.contains("does not prove that no networking occurred"));
     }
 
     #[test]

@@ -1105,6 +1105,19 @@ impl Resolved {
             );
         } else {
             eprintln!("{blue}[cplt]{nc}    .env/.pem/.key blocked     {dim}secrets protected{nc}");
+            // The NAV bootstrap shape meets three separate refusals at three
+            // separate moments, and this is the first one the operator hits.
+            // #434 taught `init` and `doctor` to say all three at once; saying
+            // nothing here left the connection to be made by the reader. The
+            // detector is asked, never re-implemented.
+            if let Some(driver) = crate::detect::nais_bootstrap_driver(project_dir) {
+                eprintln!(
+                    "{blue}[cplt]{nc}                   {yellow}{driver}{nc} {dim}bootstraps this repo with the nais CLI: run it outside cplt, then{nc}"
+                );
+                eprintln!(
+                    "{blue}[cplt]{nc}                   {dim}sandbox.allow_env_files = true to read the .env it wrote (`cplt doctor` has all three refusals){nc}"
+                );
+            }
         }
         if self.allow_lifecycle_scripts {
             eprintln!(
@@ -1362,8 +1375,17 @@ impl Resolved {
                         EnforcementMode::Warn => " [WARN MODE]",
                         EnforcementMode::Audit => " [AUDIT MODE]",
                     };
+                    // #431: the line read "blocks git push" whatever
+                    // `protect_default_branch_only` said, so an operator whose
+                    // feature-branch pushes go through read the summary as
+                    // wrong about the tool rather than as imprecise.
+                    let scope_note = if self.git_guard.protect_default_branch_only {
+                        "blocks git push to the default branch"
+                    } else {
+                        "blocks git push"
+                    };
                     eprintln!(
-                        "{blue}[cplt]{nc}    git guard:     {green}on{nc}          {dim}blocks git push{mode_note}{nc}"
+                        "{blue}[cplt]{nc}    git guard:     {green}on{nc}          {dim}{scope_note}{mode_note}{nc}"
                     );
                 } else {
                     let yellow = ui::color(ui::YELLOW);

@@ -509,7 +509,7 @@ Run `cplt doctor` to see what cplt detected on your machine.
 | `-y, --yes` | Skip the interactive confirmation prompt. The configuration summary still prints, for auditability. Required when stdin is not a TTY, so CI and scripts need it |
 | `-q, --quiet` | Suppress the startup banner and non-essential messages. Errors and warnings still print. Also `sandbox.quiet = true` in config |
 | `--no-quiet` | Override `sandbox.quiet = true` and show the startup summary anyway |
-| `--no-audit` | Skip the post-session project-change and network reports. The network report summarizes proxy-observed CONNECT records with explicit coverage limits. `-q` suppresses both reports. See [Network snapshot](docs/proxy.md#network-snapshot). |
+| `--no-audit` | Skip the post-session change report. cplt normally diffs the working tree against a baseline commit pinned before the run and lists what the session touched, flagging sensitive paths. `-q` suppresses it too |
 | `--init-config` | Create a starter config file at `~/.config/cplt/config.toml` and exit |
 
 ### Session flags
@@ -820,19 +820,19 @@ More: [docs/security.md](docs/security.md) · [SECURITY.md](SECURITY.md)
 
 ## Network and proxy
 
-The proxy is **on by default**. cplt directs proxy-aware tools through a localhost CONNECT proxy with `HTTP_PROXY`/`HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1`. It listens on an OS-assigned ephemeral port. It provides domain filtering, connection logging, and a [post-session network snapshot](docs/proxy.md#network-snapshot). Direct traffic can bypass this observation. Forced mode restricts direct routing, subject to the documented platform limits.
+The proxy is **on by default**. All outbound traffic from Copilot CLI, `gh`, and `curl` goes through a localhost CONNECT proxy via `HTTP_PROXY`/`HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1`. It listens on an OS-assigned ephemeral port, so nothing collides. You get connection logging in real time, domain blocking, domain allowlisting, a persistent audit log, and the same port policy the sandbox enforces (443 plus anything in `allow.ports`).
 
 ```bash
-cplt --proxy-forced -- -p "fix tests"                 # require proxy with platform routing limits
+cplt --proxy-forced -- -p "fix tests"                 # force all egress through the proxy
 cplt --no-proxy -- -p "fix tests"                     # disable for one run
 cplt --blocked-domains blocked-domains.txt -- -p "x"  # block known-bad domains
 cplt --allowed-domains allowed-domains.txt -- -p "x"  # allowlist mode
 cplt --default-allowlist -- -p "x"                    # fail-closed: only the agent's own domains
-cplt --observe-domains -- -p "x"                      # collect bounded proxy CONNECT evidence
+cplt --observe-domains -- -p "x"                      # record what the agent contacts, block nothing
 cplt --proxy-upstream http://proxy.corp:8080 -- -p "x" # chain through a corporate proxy
 ```
 
-`--observe-domains-out <FILE>` writes retained allowed hosts only when the snapshot is complete within its collection limits, and
+`--observe-domains-out <FILE>` writes the observed set one domain per line, and
 `--proxy-upstream-no-proxy <HOST>` lists hosts to reach directly instead of through
 the upstream.
 

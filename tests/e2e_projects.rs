@@ -1925,12 +1925,13 @@ rm -f push-err.txt
         // "does not appear to be a git repository". Only the guard's own
         // refusal text proves the wrapper ran and decided.
         //
-        // Either verdict counts. `--git-guard` sets `enabled`, not `mode`, and
-        // the mode default is `warn` (#122 Stage 2) — so the guard announces
-        // "would block" and lets the push run. Both strings are written by the
+        // Either verdict counts. `--git-guard` sets `enabled`, not `mode`, so
+        // the mode comes from whatever config resolution decides — `block`
+        // today (#335), `warn` before it. Both strings are written by the
         // guard and appear in neither git's output nor the shell's, so either
         // one proves the wrapper ran and decided. Asserting only on `block`
-        // would tie this test to a default it does not care about.
+        // would tie this test to a default it does not care about; the
+        // default itself is pinned by the golden-path gate instead.
         let verdict =
             stdout.contains("BLOCKED by sandbox") || stdout.contains("WARNING (would block)");
         assert!(

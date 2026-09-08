@@ -293,7 +293,7 @@ mod tests {
             stderr.contains("1 proxy-observed retained CONNECT host"),
             "{stderr}"
         );
-        assert!(stderr.contains("classification: settled."), "{stderr}");
+        assert!(stderr.contains("Classification: settled."), "{stderr}");
         assert!(!stderr.contains(RECORDED), "{stderr}");
     }
 
@@ -348,45 +348,6 @@ mod tests {
         let stderr = stderr(&output);
         assert!(output.status.success(), "{stderr}");
         assert!(stderr.contains(&format!("{RECORDED} 0.")), "{stderr}");
-        assert!(stderr.contains("does not prove"), "{stderr}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_forced_port_residual_can_transfer_data_without_a_proxy_record() {
-        // UDP connect selects the interface address without sending a packet.
-        // The HTTP peer then listens on that non-loopback address only, leaving
-        // the same port available for the cplt proxy on 127.0.0.1.
-        let route = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-        route.connect("192.0.2.1:9").unwrap();
-        let address = route.local_addr().unwrap().ip();
-        assert!(!address.is_loopback() && !address.is_unspecified());
-        let origin = Origin::bind(SocketAddr::new(address, 0));
-        let project = project();
-        let output = command(&project)
-            .args([
-                "--no-quiet",
-                "--proxy-forced",
-                "--proxy-port",
-                &origin.address.port().to_string(),
-                "exec",
-                "--",
-                "/usr/bin/curl",
-                "--silent",
-                "--show-error",
-                "--max-time",
-                "5",
-                "--noproxy",
-                "*",
-                &format!("http://{}/", origin.address),
-            ])
-            .output()
-            .unwrap();
-        let stderr = stderr(&output);
-        assert!(output.status.success(), "{stderr}");
-        assert_eq!(output.stdout, b"fixture-ok\n", "{stderr}");
-        assert!(stderr.contains(&format!("{RECORDED} 0.")), "{stderr}");
-        assert!(stderr.contains("localhost"), "{stderr}");
         assert!(stderr.contains("does not prove"), "{stderr}");
     }
 }

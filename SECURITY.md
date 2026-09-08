@@ -156,7 +156,7 @@ cplt assumes the sandboxed agent is **untrusted**, because it executes arbitrary
 | .git/info/exclude write in project | ✅ Kernel deny | ❌ Writable (Landlock can't sub-deny) | ✅ Re-bound read-only if present |
 | Network: outbound port filtering | ✅ Kernel (all versions) | ✅ Kernel (6.7+) / ⚠️ Proxy only (<6.7) | ✅ Same as Landlock (no net namespace) |
 | Network: localhost isolation | ✅ Kernel deny | ⚠️ Proxy domain filtering | ⚠️ Proxy domain filtering (no net namespace) |
-| Network: restrict direct routing through proxy (`proxy.forced`, opt-in) | ✅ Kernel pins to `localhost:<proxy_port>` (full) | ⚠️ Kernel blocks direct `:443`; port-based residual `evil.com:<proxy_port>` until [#114](https://github.com/navikt/cplt/issues/114) | ⚠️ Same as Landlock (no net namespace) |
+| Network: force all egress through proxy (`proxy.forced`, opt-in) | ✅ Kernel pins to `localhost:<proxy_port>` (full) | ⚠️ Kernel blocks direct `:443`; port-based residual `evil.com:<proxy_port>` until [#114](https://github.com/navikt/cplt/issues/114) | ⚠️ Same as Landlock (no net namespace) |
 | Exec from /tmp | ✅ Kernel deny | ✅ Landlock deny | ✅ Landlock deny |
 | Dangerous syscalls | N/A (Seatbelt covers) | ✅ seccomp-BPF | ✅ seccomp-BPF |
 | PID namespace isolation | N/A (not applicable) | ❌ Not available | ✅ Kernel namespace |
@@ -355,9 +355,9 @@ A curated blocklist of these domains ships in [`blocked-domains.txt`](blocked-do
 - A compromised agent CANNOT connect on non-standard ports such as 8080 or 3000 unless `--allow-port` is used
 - A compromised agent CANNOT exfiltrate SSH keys, cloud credentials, or npm tokens (kernel-blocked from reading them)
 - A compromised agent CAN request GPG signatures but CANNOT exfiltrate private keys. On macOS this needs `--allow-gpg-signing`; on Linux the agent socket is reachable whether or not the flag is set, so the capability is there by default (see [Linux-specific limitations](#linux-specific-limitations))
-- The default proxy filters CONNECT requests that reach it, including proxy-aware Copilot CLI traffic (via `NODE_USE_ENV_PROXY=1`). Its port policy applies to those requests. Use `--no-proxy` to disable.
+- The proxy logs and filters all outbound connections by default, including Copilot CLI traffic (via `NODE_USE_ENV_PROXY=1`), and enforces port restrictions matching the sandbox policy. Use `--no-proxy` to disable.
 
-*Mitigation:* `--allowed-domains allowed-domains.txt` restricts proxy targets to the configured domains. `--blocked-domains blocked-domains.txt` blocks listed targets. `--proxy-log proxy.log` records activity that reaches the proxy. The parent also reports a bounded [network snapshot](docs/proxy.md#network-snapshot). Default proxy routing is advisory. The snapshot states partial visibility, collection failures, and retention limits independently from forced routing. It cannot establish exclusive process attribution or describe application payloads.
+*Mitigation:* `--allowed-domains allowed-domains.txt` restricts traffic to known Copilot endpoints, `--blocked-domains blocked-domains.txt` blocks known exfiltration infrastructure, and `--proxy-log proxy.log` gives a post-session audit trail. All traffic, Copilot's own Node.js connections included, routes through the proxy.
 
 **JVM IPv4 stack forcing.** macOS SBPL `"localhost"` filters do not match Java NIO's IPv4-mapped addresses (`::ffff:127.0.0.1`), because SBPL accepts only `*` or `localhost` as the host part and rejects literal IPs. cplt injects `-Djava.net.preferIPv4Stack=true` via `JAVA_TOOL_OPTIONS`, forcing the JVM onto pure AF_INET4 sockets, so connections to `127.0.0.1` stay IPv4 and `"localhost:PORT"` rules match. `--allow-localhost <PORT>` therefore works for Java, and the old `"*:*"` nuclear option is gone. Overriding `JAVA_TOOL_OPTIONS` via `--pass-env` loses this protection; fall back to `--allow-localhost-any`. On Linux (Landlock) the flag is not injected, as the kernel handles addresses differently.
 

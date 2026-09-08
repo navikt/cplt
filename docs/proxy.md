@@ -78,7 +78,7 @@ The report does not derive blocked-attempt or successful-connection totals from 
 
 Collection starts with the proxy, before child execution. The proxy remains available during the existing bounded descendant wait.
 
-The parent then stops admission and allows up to 500 milliseconds for pending classification. This budget also covers admission shutdown and snapshot acquisition.
+The parent then stops admission and allows up to 500 milliseconds for pending classification. This drain budget also covers admission shutdown. Snapshot acquisition uses a short in-memory lock; scheduling and lock acquisition are not hard real-time guarantees.
 
 The snapshot cutoff freezes one consistent state. Classification can settle while established tunnels remain open. The audit does not wait for tunnel closure or terminate descendants.
 
@@ -86,7 +86,7 @@ The existing descendant wait can add two seconds. Git inspection and scheduling 
 
 The collector retains at most 1,024 hosts, with at most 1,024 bytes per stored key. It continues counting records when host storage reaches a limit.
 
-Host counts become lower bounds when records lack host entries. Counter saturation and collection failures prevent unsupported exact-count claims.
+Host counts become lower bounds when records lack host entries. Collection failures are reported with the retained evidence.
 
 Unavailable collection is not reported as zero activity. Zero recorded attempts do not prove absence of networking.
 
@@ -104,9 +104,7 @@ Proxy clients are not authenticated by process identity. The report cannot estab
 
 The explicit `--observe-domains` diagnostic uses the same snapshot. Its terminal list displays at most 20 entries and discloses omitted entries.
 
-`--observe-domains-out` writes all retained allowed hosts only when collection is settled, healthy, and complete within its host limits.
-
-If that evidence is incomplete, cplt refuses replacement and explains why. Any existing target remains unchanged and is not evidence for that run.
+`--observe-domains-out` writes retained allowed hosts, including when collection is incomplete. Leading `# incomplete:` comments disclose collection failures, pending clients, and omitted observations. Invalid host entries, including escaped control characters, are omitted and counted in a comment. The allowlist parser ignores these comments.
 
 ## Proxy-forced mode
 
@@ -274,8 +272,8 @@ cplt --agent copilot --observe-domains -- -p "add tests for the parser and run t
 
 ```
 [cplt] observe-domains: 14 proxy-observed retained CONNECT hosts
-[cplt] observe-domains: collection: available.
-[cplt] observe-domains: classification: settled.
+[cplt] observe-domains: Collection: available.
+[cplt] observe-domains: Classification: settled.
 [cplt] observe-domains: network visibility: partial.
 # retained host evidence for review before updating allowed_domains:
 # bare hosts, exact-or-subdomain match; collapse subdomains to a parent by hand
@@ -287,7 +285,7 @@ registry.npmjs.org
 ...
 ```
 
-- **`--observe-domains-out <FILE>`** writes all retained allowed hosts to `FILE` when the snapshot is healthy, settled, and free of retention loss. Incomplete snapshots leave an existing file unchanged. See [Network snapshot](#network-snapshot).
+- **`--observe-domains-out <FILE>`** writes retained allowed hosts to `FILE`. Incomplete snapshots include leading `# incomplete:` comments. Invalid host entries are omitted and disclosed. See [Network snapshot](#network-snapshot).
 - **Works for `cplt exec` too:** `cplt --agent claude --observe-domains exec -- npm test`.
 
 To make it representative, exercise the workflows you care about in one session: resume a chat, build, run tests, install a dependency. The emitted hosts are the retained proxy evidence, subject to the stated limits. Subdomains are not auto-collapsed, since that needs a public-suffix heuristic that risks over-broadening. Because the matcher is exact-or-subdomain, fold related subdomains to a parent by hand, turning `api.githubcopilot.com` and `proxy.githubcopilot.com` into `githubcopilot.com`.
