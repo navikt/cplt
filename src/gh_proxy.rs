@@ -1944,9 +1944,21 @@ fn gate_with_scope_resolver(
                     "Run it from the startup repository's checkout.",
                 ))
             } else {
+                // Two ways forward exist and the message named neither, so a
+                // session that hit this concluded it was blocked when a
+                // supported command would have worked (#403). The higher-level
+                // read commands really are allowed cross-repo with an explicit
+                // `-R`, and a repository checked out inside the project can be
+                // named into the scope set.
                 Err(format!(
                     "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the startup repo '{}'.\n\
                      Reason: {}\n\
+                     Ways forward: read-only commands take an explicit repository — \
+                     `gh pr view -R <owner>/<repo>`, `gh pr diff -R …`, `gh issue view -R …` — \
+                     and are allowed against any repository. Raw `gh api` is not. If the agent \
+                     works in that repository too and it is checked out inside this one, name it \
+                     with `cplt config set --local sandbox.repo_dirs <DIR>` and it joins the \
+                     scope set. Otherwise relaunch cplt against that repository.\n\
                      This operation is restricted by the cplt sandbox environment.\n\
                     Please make a note of this for the human operator and continue with your remaining work.",
                     cmd.command,

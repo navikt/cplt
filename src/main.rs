@@ -5646,7 +5646,7 @@ fn run_config_set(
     // `sandbox.repo_dirs` is local-layer only. Writing it globally would produce
     // a file the next launch warns about and ignores; refuse here instead, and
     // name the flag that makes it work.
-    if !local && key_info.section == "sandbox" && key_info.key == "repo_dirs" {
+    if !local && config::layer_only_flag(key_info) == Some("--local") {
         ui::error(&format!(
             "sandbox.repo_dirs is per-project, not machine-wide: a repository list in \
              your global config would attach to every session.\n  \
@@ -5660,7 +5660,7 @@ fn run_config_set(
     // ── Global mode (default) ───────────────────────────────────────
 
     // deny.env is repo-local only (not in global config file schema)
-    if key_info.section == "deny" && key_info.key == "env" {
+    if config::layer_only_flag(key_info) == Some("--repo") {
         ui::error(
             "deny.env is only supported in repo-local config (.cplt.toml).\n  Use: cplt config set --repo deny.env <VALUE>",
         );
