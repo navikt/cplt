@@ -539,6 +539,34 @@ fn detect_node(ctx: &DetectContext) -> DetectorOutput {
         {
             suggestions.push(Suggestion::AllowRead("~/.npmrc".to_string()));
         }
+
+        // A project `.npmrc` that maps a whole scope to an authenticated
+        // registry is the case where the grant is not optional: the install
+        // returns 401 rather than degrading, because every `@scope/...`
+        // dependency resolves from that host. The generic suggestion above
+        // fires for a benign `.npmrc` too, so the operator cannot tell the two
+        // apart — and the workaround the docs used to give (put the token in a
+        // project `.npmrc` and read it from the environment) does not work with
+        // pnpm at all, which is the majority package manager here (#432).
+        if let Some(scope) = ctx
+            .read_text(".npmrc")
+            .as_deref()
+            .and_then(scoped_auth_registry)
+        {
+            signals.push(Signal::FileContains {
+                path: ".npmrc".to_string(),
+                reason: "maps a scope to an authenticated registry",
+            });
+            diagnostics.push(Diagnostic {
+                detector: "node",
+                message: format!(
+                    "{scope} resolves from an authenticated registry, so the token in \
+                     ~/.npmrc is needed to install at all — without the grant the install \
+                     returns 401 rather than falling back. pnpm cannot take the token from \
+                     a project .npmrc, since it does not expand environment variables there."
+                ),
+            });
+        }
     }
 
     DetectorOutput {
@@ -1312,6 +1340,34 @@ pub fn nais_bootstrap_driver(dir: &Path) -> Option<String> {
         .collect();
     names.sort();
     nais_driver_file(&ctx, &names)
+}
+
+/// The first `@scope` a project `.npmrc` maps to an authenticated registry.
+///
+/// "Authenticated" is inferred from the file naming credentials for a host at
+/// all — an `_authToken`/`_auth`/`username` line — rather than from the
+/// registry URL, so a self-hosted Nexus counts the same as GitHub Packages.
+/// A scope line pointing at the public npm registry does not.
+fn scoped_auth_registry(npmrc: &str) -> Option<String> {
+    let lines: Vec<&str> = npmrc
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with(';') && !l.starts_with('#'))
+        .collect();
+    let has_credentials = lines
+        .iter()
+        .any(|l| l.contains("_authToken") || l.contains("_auth=") || l.contains("username="));
+    if !has_credentials {
+        return None;
+    }
+    lines.iter().find_map(|line| {
+        let (scope, url) = line.split_once(":registry=")?;
+        let scope = scope.trim();
+        if !scope.starts_with('@') || url.contains("registry.npmjs.org") {
+            return None;
+        }
+        Some(scope.to_string())
+    })
 }
 
 /// Extract a port number from package.json scripts (best-effort).
@@ -3380,6 +3436,55 @@ services:
             "githubUser/githubPassword is a registry credential: {:?}",
             report.detections.iter().map(|d| d.name).collect::<Vec<_>>()
         );
+    }
+
+    /// The shape that breaks most navikt frontends: a whole scope mapped to
+    /// GitHub Packages, with the token in the file. Without the `~/.npmrc`
+    /// grant the install returns 401 rather than degrading.
+    #[test]
+    fn scoped_auth_registry_finds_the_scope_that_needs_a_token() {
+        assert_eq!(
+            scoped_auth_registry(
+                "@navikt:registry=https://npm.pkg.github.com\n\
+                 //npm.pkg.github.com/:_authToken=${NPM_AUTH_TOKEN}\n"
+            )
+            .as_deref(),
+            Some("@navikt")
+        );
+        // Credentials for a self-hosted registry count the same as GitHub's.
+        assert_eq!(
+            scoped_auth_registry(
+                "@acme:registry=https://nexus.example.internal/repository/npm/\n\
+                 //nexus.example.internal/:username=svc\n"
+            )
+            .as_deref(),
+            Some("@acme")
+        );
+    }
+
+    /// The suggestion already fires for any project `.npmrc`. This signal is
+    /// the one that says the grant is not optional, so it must not fire for a
+    /// file that only sets preferences — an operator who is warned about
+    /// nothing stops reading the warnings.
+    #[test]
+    fn scoped_auth_registry_ignores_npmrc_without_credentials() {
+        for npmrc in [
+            "save-exact=true\nengine-strict=true\n",
+            // A scope, but no token anywhere: nothing to grant.
+            "@navikt:registry=https://npm.pkg.github.com\n",
+            // Credentials, but the scope resolves from public npm.
+            "@acme:registry=https://registry.npmjs.org/\n\
+             //npm.pkg.github.com/:_authToken=x\n",
+            // Commented out.
+            "# @navikt:registry=https://npm.pkg.github.com\n\
+             ; //npm.pkg.github.com/:_authToken=x\n",
+        ] {
+            assert_eq!(
+                scoped_auth_registry(npmrc),
+                None,
+                "must not fire for:\n{npmrc}"
+            );
+        }
     }
 
     /// A commented-out entry is a credential the developer turned off. Raising
