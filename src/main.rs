@@ -4601,11 +4601,10 @@ fn run_check_command(
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(cli, true)?;
-    // The gh scope set the launch would capture: the launch repository plus
-    // every named root with a GitHub origin, built the same way
-    // `sandbox_exec` builds it. `check exec gh …` reported a named repository
-    // as outside the startup scope while the launch allowed it, because this
-    // was discarded (#447).
+    // The named roots, which `ExecContext::for_launch` turns into the gh scope
+    // set. `check exec gh …` reported a named repository as outside the startup
+    // scope while the launch allowed it, because these were discarded here with
+    // `let _ = &repo_roots` (#447).
     let named_roots: Vec<&Path> = repo_roots.iter().map(|r| r.dir.as_path()).collect();
 
     // Shell, not `active_agent`: `check` probes under the Shell profile.
