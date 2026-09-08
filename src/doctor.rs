@@ -64,38 +64,9 @@ pub fn tilde(path: &Path, home: &Path) -> String {
 
 // ── Rule: tracked secrets vs. the .env deny ────────────────────
 
-/// Whether a file *name* is one the `.env` deny covers.
-///
-/// Mirrors `sandbox_policy::SENSITIVE_PROJECT_PATTERNS` (`\.env$`, `\.env\..*`,
-/// and the `.pem/.key/.p12/.pfx/.jks` suffixes) without a regex engine: the
-/// list is seven fixed shapes and a test pins them together.
-#[must_use]
-pub fn is_sensitive_name(name: &str) -> bool {
-    name == ".env"
-        || name.ends_with(".env")
-        || name.contains(".env.")
-        || [".pem", ".key", ".p12", ".pfx", ".jks"]
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
-}
-
-/// The tracked paths the `.env` deny applies to.
-#[must_use]
-pub fn tracked_sensitive_files<'a>(tracked: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    tracked
-        .into_iter()
-        .filter(|p| {
-            Path::new(p)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(is_sensitive_name)
-        })
-        .map(str::to_string)
-        .collect()
-}
-
 /// A tracked secret under the `.env` deny breaks every git command that hashes
-/// the index (`add`, `diff`, `stash`, `commit -a`) with `cannot hash`.
+/// the index (`add`, `diff`, `stash`, `commit -a`) with `cannot hash`. The
+/// file list comes from `cplt check`'s `tracked_sensitive_files` (#451).
 #[must_use]
 pub fn tracked_env_finding(files: &[String], allow_env_files: bool) -> Option<Finding> {
     if allow_env_files || files.is_empty() {
@@ -117,20 +88,6 @@ pub fn tracked_env_finding(files: &[String], allow_env_files: bool) -> Option<Fi
 
 // ── Rule: Pi's trust lock vs. the read-only agent root ─────────
 
-/// Newest Pi release that does not take the trust lock. Pi `main` after
-/// f53ac11 (2026-09-08) does `mkdir ~/.pi/agent/trust.json.lock` before a
-/// session exists (#449).
-const PI_LAST_LOCKLESS: &str = "0.85.1";
-
-fn version_tuple(v: &str) -> Option<Vec<u64>> {
-    v.trim_start_matches('v')
-        .split(['-', '+'])
-        .next()?
-        .split('.')
-        .map(|part| part.parse().ok())
-        .collect()
-}
-
 /// Whether the resolved policy grants `dir` itself read-only.
 fn dir_is_read_only(policy: &LandlockPolicy, dir: &Path) -> bool {
     policy
@@ -140,49 +97,21 @@ fn dir_is_read_only(policy: &LandlockPolicy, dir: &Path) -> bool {
         .is_some_and(|r| !r.access.write)
 }
 
-/// Pi creates a lock *directory* in `~/.pi/agent` to read `trust.json`, and
-/// that root is granted read-only in every regime — Landlock rule and, when
-/// bubblewrap is active, the mount too — so no bubblewrap state changes the
-/// answer. Blocking when the installed Pi is known to take the lock, a warning
-/// when its version could not be read.
+/// Pi creates a lock *directory* in `~/.pi/agent` to read `trust.json`
+/// (`withTrustFileLock` in `dist/core/trust-manager.js`, present in the
+/// released 0.85.1), and that root is granted read-only in every regime —
+/// Landlock rule and, when bubblewrap is active, the mount too. So no Pi
+/// version and no bubblewrap state changes the answer (#449).
 #[must_use]
-pub fn pi_lock_finding(
-    agent: Agent,
-    policy: &LandlockPolicy,
-    home: &Path,
-    pi_version: Option<&str>,
-) -> Option<Finding> {
-    if agent != Agent::Pi {
+pub fn pi_lock_finding(agent: Agent, policy: &LandlockPolicy, home: &Path) -> Option<Finding> {
+    if agent != Agent::Pi || !dir_is_read_only(policy, &home.join(".pi/agent")) {
         return None;
     }
-    let root = home.join(".pi/agent");
-    if !dir_is_read_only(policy, &root) {
-        return None;
-    }
-    let takes_lock = pi_version
-        .and_then(version_tuple)
-        .map(|v| v > version_tuple(PI_LAST_LOCKLESS).unwrap_or_default());
-    let fix = "run pi outside cplt until a cplt release grants the lock, or pin Pi to \
-               0.85.1 (npm i -g @earendil-works/pi-coding-agent@0.85.1)";
-    match takes_lock {
-        Some(false) => None,
-        Some(true) => Some(Finding::blocking(
-            format!(
-                "Pi will not start: ~/.pi/agent is read-only in this run, and Pi {} takes a \
-                 write lock there (trust.json.lock) before a session exists.",
-                pi_version.unwrap_or_default()
-            ),
-            fix,
-        )),
-        None => Some(Finding::warning(
-            format!(
-                "~/.pi/agent is read-only in this run; Pi newer than {PI_LAST_LOCKLESS} takes a \
-                 write lock there (trust.json.lock) and will not start. Could not read the \
-                 installed Pi's version."
-            ),
-            Some(fix.to_string()),
-        )),
-    }
+    Some(Finding::blocking(
+        "Pi will not start: ~/.pi/agent is read-only in this run, and Pi takes a write lock \
+         there (trust.json.lock) before a session exists.",
+        "run pi outside cplt for now; a cplt fix that grants the lock is in progress (#449)",
+    ))
 }
 
 // ── Rule: shims resolving outside a granted root ───────────────
@@ -408,34 +337,8 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_names_track_the_policy_patterns() {
-        for hit in [
-            ".env",
-            ".env.local",
-            "prod.env",
-            "id.pem",
-            "server.key",
-            "k.p12",
-            "k.pfx",
-            "k.jks",
-        ] {
-            assert!(is_sensitive_name(hit), "{hit} should match");
-        }
-        for miss in [
-            ".envrc",
-            "env.ts",
-            "keychain.rs",
-            "README.md",
-            ".environment",
-        ] {
-            assert!(!is_sensitive_name(miss), "{miss} should not match");
-        }
-    }
-
-    #[test]
     fn tracked_env_finding_needs_a_tracked_file_and_the_deny() {
-        let files = tracked_sensitive_files(["src/main.rs", "config/.env.local", ".gitignore"]);
-        assert_eq!(files, vec!["config/.env.local".to_string()]);
+        let files = vec!["config/.env.local".to_string()];
         assert!(
             tracked_env_finding(&files, true).is_none(),
             "deny off: nothing to say"
@@ -456,30 +359,17 @@ mod tests {
     }
 
     #[test]
-    fn pi_lock_rule_is_version_gated_and_pi_only() {
+    fn pi_lock_rule_fires_for_any_pi_on_a_read_only_root() {
         let home = Path::new("/home/u");
         let ro_root = policy(vec![("/home/u/.pi/agent", false, false)]);
-        assert!(pi_lock_finding(Agent::Copilot, &ro_root, home, Some("1.0.0")).is_none());
-        assert!(
-            pi_lock_finding(Agent::Pi, &ro_root, home, Some("0.85.1")).is_none(),
-            "0.85.1 predates the lock"
-        );
-        let blocking = pi_lock_finding(Agent::Pi, &ro_root, home, Some("0.86.0")).unwrap();
+        assert!(pi_lock_finding(Agent::Copilot, &ro_root, home).is_none());
+        let blocking = pi_lock_finding(Agent::Pi, &ro_root, home).unwrap();
         assert_eq!(blocking.level, Level::Blocking);
         assert!(blocking.message.contains("trust.json.lock"));
-        let unknown = pi_lock_finding(Agent::Pi, &ro_root, home, None).unwrap();
-        assert_eq!(unknown.level, Level::Warning);
+        assert!(!blocking.fix.as_deref().unwrap().contains("0.85.1"));
         // A policy that grants the root writable has nothing to warn about.
         let rw_root = policy(vec![("/home/u/.pi/agent", true, false)]);
-        assert!(pi_lock_finding(Agent::Pi, &rw_root, home, Some("0.86.0")).is_none());
-    }
-
-    #[test]
-    fn version_tuple_ignores_prerelease_suffixes() {
-        assert_eq!(version_tuple("v0.86.0-beta.1"), Some(vec![0, 86, 0]));
-        assert!(version_tuple("0.86.0").unwrap() > version_tuple("0.85.1").unwrap());
-        assert!(version_tuple("0.85.10").unwrap() > version_tuple("0.85.1").unwrap());
-        assert_eq!(version_tuple("nope"), None);
+        assert!(pi_lock_finding(Agent::Pi, &rw_root, home).is_none());
     }
 
     #[test]

@@ -5329,7 +5329,6 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     } else {
         None
     };
-    let mut agent_version: Option<String> = None;
     let mut agent_runnable = false;
     match &agent_source {
         None => {
@@ -5344,10 +5343,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
             Ok(bin) => {
                 agent_runnable = true;
                 let shown = match discover::probe_version(&bin, &["--version"]) {
-                    discover::VersionProbe::Version(v) => {
-                        agent_version = Some(v.clone());
-                        v
-                    }
+                    discover::VersionProbe::Version(v) => v,
                     discover::VersionProbe::Unknown => "(version unknown)".to_string(),
                     discover::VersionProbe::TimedOut => {
                         findings.push(Finding::warning(
@@ -5493,23 +5489,12 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     // Only for an agent that can run: "Pi will not start" under "Pi is not
     // installed" is noise.
     if agent_runnable {
-        findings.extend(doctor::pi_lock_finding(
-            active_agent,
-            &policy,
-            &home_dir,
-            agent_version.as_deref(),
-        ));
+        findings.extend(doctor::pi_lock_finding(active_agent, &policy, &home_dir));
     }
 
-    // Tracked secrets under the .env deny. `ls-files` reads the index, not
-    // content; `git::command` still refuses it in a repo that defines a
-    // content filter, and this rule then says nothing rather than guessing.
-    let tracked = cplt::git::command(&project_dir, &["ls-files", "-z"])
-        .and_then(|mut c| c.output().ok())
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    let sensitive = doctor::tracked_sensitive_files(tracked.split('\0').filter(|p| !p.is_empty()));
+    // Tracked secrets under the .env deny — the same set `cplt check` reports
+    // (#451), from the same function.
+    let sensitive = tracked_sensitive_files(&project_dir);
     findings.extend(doctor::tracked_env_finding(
         &sensitive,
         resolved.allow_env_files,
