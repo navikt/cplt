@@ -207,6 +207,11 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
             "too dangerous for repo config, it would affect all team members"
         }
         ("sandbox", "pass_env") => "environment variables are machine-specific, not project policy",
+        ("sandbox", "repo_dirs") => {
+            "naming other trees as project-grade roots is a path grant, and repo config \
+             cannot grant paths. It is a per-checkout user setting: \
+             cplt config set --local sandbox.repo_dirs <DIR>"
+        }
         ("allow", "exec") => {
             "exec grants are machine-specific paths, and a repo must not be able to make \
              one of its own trees executable"

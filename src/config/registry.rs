@@ -271,6 +271,14 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
     },
     ConfigKeyInfo {
         section: "sandbox",
+        key: "repo_dirs",
+        value_type: ConfigValueType::StrArray,
+        dangerous: false,
+        default_display: "[]",
+        description: "Additional repositories this project spans (local config only: cplt config set --local). Absolute or ~/ paths, re-validated on every launch.",
+    },
+    ConfigKeyInfo {
+        section: "sandbox",
         key: "inherit_env",
         value_type: ConfigValueType::Bool,
         dangerous: true,
@@ -708,6 +716,22 @@ pub fn bool_key(section: &str, key: &str) -> Option<&'static BoolKeyRow> {
     BOOL_KEYS
         .iter()
         .find(|row| row.section == section && row.key == key)
+}
+
+impl ResolvedBools {
+    /// Which layer supplied `section.key`, or `None` for a key that is not a
+    /// boolean on the ladder.
+    ///
+    /// The same answer `Resolved::bool_layer` gives after the merge, available
+    /// to a caller that only resolved the booleans — `config show`, which
+    /// renders the config files rather than a full merge, and must still name
+    /// the layer each value came from.
+    pub fn layer(&self, section: &str, key: &str) -> Option<ConfigLayer> {
+        let index = BOOL_KEYS
+            .iter()
+            .position(|row| row.section == section && row.key == key)?;
+        self.layers.get(index).copied()
+    }
 }
 
 macro_rules! bool_keys {

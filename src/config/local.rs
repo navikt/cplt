@@ -14,8 +14,11 @@
 //! `~/.config/cplt/config.toml` too, and leaving it in place would make
 //! `deserialize_collecting_unknowns` warn "unknown key" on every launch.
 //!
-//! This module is the loader only. Writing the file (`config set --local`) and
-//! the `config show` / `settings` display are separate stages.
+//! This module owns both ends of the file: the loader, and the `[local]`
+//! header `cplt config set --local` stamps on it. Keeping them together is
+//! deliberate — the recorded `remote` is compared after normalization at load
+//! (see [`remote_mismatch`]), so the writer must record the same normalized
+//! value or the tripwire fires on every subsequent launch.
 
 use std::path::{Path, PathBuf};
 
@@ -23,7 +26,7 @@ use serde::Deserialize;
 
 use super::error::ConfigError;
 use super::path::config_dir;
-use super::types::Config;
+use super::types::{Config, LoadedConfig};
 use crate::ui;
 
 /// Subdirectory within the cplt config dir for local (per-repo user) configs.
@@ -54,13 +57,14 @@ struct LocalHeader {
 /// Deliberately not "every string in the file": `sandbox.allow_cache_exec`
 /// entries are directory *names* under `~/Library/Caches` and `proxy.upstream`
 /// is a URL, so a blanket "must start with `/` or `~`" rule would reject both.
-fn path_valued(config: &Config) -> [(&'static str, &[String]); 5] {
+fn path_valued(config: &Config) -> [(&'static str, &[String]); 6] {
     [
         ("allow.read", &config.allow.read),
         ("allow.write", &config.allow.write),
         ("allow.exec", &config.allow.exec),
         ("allow.socket", &config.allow.socket),
         ("deny.paths", &config.deny.paths),
+        ("sandbox.repo_dirs", &config.sandbox.repo_dirs),
     ]
 }
 
@@ -97,7 +101,7 @@ pub fn local_path(project_dir: &Path) -> Option<PathBuf> {
 /// - Malformed TOML, an unreadable file, or a relative path: `Err` — the launch
 ///   fails. Skipping a bad file would silently revert a local `deny.paths` to
 ///   whatever global says, which is a silent grant.
-pub fn load_local(project_dir: &Path) -> Result<Option<Config>, ConfigError> {
+pub fn load_local(project_dir: &Path) -> Result<Option<LoadedConfig>, ConfigError> {
     let Some(path) = local_path(project_dir) else {
         return Ok(None);
     };
@@ -108,9 +112,26 @@ pub fn load_local(project_dir: &Path) -> Result<Option<Config>, ConfigError> {
         path: path.clone(),
         source: e,
     })?;
+    let config = parse_local_doc(&raw, &path, project_dir)?;
+    Ok(config.map(|config| LoadedConfig { config, path, raw }))
+}
+
+/// Parse local config text the way [`load_local`] parses the file on disk:
+/// `[local]` header stripped, staleness tripwire applied, relative paths
+/// refused.
+///
+/// Exists so a caller holding the text rather than the path — `cplt settings`,
+/// which must show what the launch would apply, including its staged edits —
+/// cannot accidentally use a plain `Config::parse` and disagree with the
+/// launch about what is in force.
+pub fn parse_local_doc(
+    raw: &str,
+    path: &Path,
+    project_dir: &Path,
+) -> Result<Option<Config>, ConfigError> {
     parse_local(
-        &raw,
-        &path,
+        raw,
+        path,
         crate::trust::canonical_remote(project_dir),
         Some(&canonical_key(project_dir)),
     )
@@ -186,12 +207,19 @@ pub(super) fn parse_local(
         ));
     }
 
-    // Relative paths are refused before anything merges. In `config.toml` a
-    // relative path anchors to `~/.config/cplt/`, which is meaningless here;
-    // anchoring to the repo instead would reintroduce the symlink-repointing
-    // hazard `resolve_repo_allow_path` exists to close, this time repointable
-    // by the agent between sessions rather than only by a commit.
-    for (key, values) in path_valued(&config) {
+    reject_relative_paths(&config, &display)?;
+
+    Ok(Some(config))
+}
+
+/// Refuse relative path entries, at `config set --local` and again at load.
+///
+/// In `config.toml` a relative path anchors to `~/.config/cplt/`, which is
+/// meaningless here; anchoring to the repo instead would reintroduce the
+/// symlink-repointing hazard `resolve_repo_allow_path` exists to close, this
+/// time repointable by the agent between sessions rather than only by a commit.
+fn reject_relative_paths(config: &Config, display: &str) -> Result<(), ConfigError> {
+    for (key, values) in path_valued(config) {
         for value in values {
             if !(value.starts_with('/') || value.starts_with('~')) {
                 return Err(ConfigError::Validation(format!(
@@ -201,8 +229,71 @@ pub(super) fn parse_local(
             }
         }
     }
+    Ok(())
+}
 
-    Ok(Some(config))
+/// Validate a local config document: everything `config.toml` must satisfy,
+/// plus the absolute-paths-only rule. The `[local]` header needs no stripping —
+/// [`Config`] ignores unknown tables, and the loader strips it for real.
+pub fn validate_local_document(doc: &toml_edit::DocumentMut) -> Result<(), ConfigError> {
+    super::editing::validate_global_document(doc)?;
+    reject_relative_paths(&Config::parse(&doc.to_string())?, "local config")
+}
+
+/// Stamp the `[local]` header onto a document about to be written.
+///
+/// `remote` is written through [`crate::trust::canonical_remote`], the exact
+/// function the loader compares against, so a freshly written file never trips
+/// its own staleness wire. `written_at` and `path` are refreshed on every
+/// write; a `config set --local` in a checkout whose origin has changed is
+/// therefore also how the user re-adopts a file the tripwire stopped.
+pub fn stamp_local_header(doc: &mut toml_edit::DocumentMut, project_dir: &Path) {
+    // A hand-edited `local = "..."` is not a table. Replace it rather than
+    // returning: the header is what tells the loader which project and remote
+    // this file belongs to, so leaving a malformed one in place would stamp
+    // nothing and make the file unadoptable — the very case where the user
+    // most needs the write to repair it.
+    if !doc.get("local").is_some_and(toml_edit::Item::is_table) {
+        doc.insert("local", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let table = doc["local"]
+        .as_table_mut()
+        .expect("just inserted a table above");
+    table.insert("path", toml_edit::value(canonical_key(project_dir)));
+    table.insert(
+        "remote",
+        toml_edit::value(crate::trust::canonical_remote(project_dir).unwrap_or_default()),
+    );
+    table.insert("written_at", toml_edit::value(crate::trust::now_iso8601()));
+}
+
+/// Every file under `local/`, as `(file, recorded [local] path)`.
+///
+/// The recorded path is empty when the file has no header or cannot be read —
+/// `config local list` still shows the file, since an unreadable orphan is
+/// exactly what a user needs to be told about.
+pub fn list_local() -> Vec<(PathBuf, String)> {
+    let Some(dir) = local_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(PathBuf, String)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .map(|path| {
+            let recorded = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| raw.parse::<toml::Table>().ok())
+                .and_then(|root| Some(root.get("local")?.get("path")?.as_str()?.to_string()))
+                .unwrap_or_default();
+            (path, recorded)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// Whether the recorded remote disagrees with the current `origin`; returns the
@@ -319,6 +410,7 @@ impl Config {
                     allow_env_files: _,
                     allow_localhost_any: _,
                     pass_env: _,
+                    repo_dirs: _,
                     inherit_env: _,
                     allow_lifecycle_scripts: _,
                     allow_gpg_signing: _,
@@ -426,7 +518,17 @@ impl Config {
             gh_proxy,
             git_push_prevention,
         );
-        union_lists!(out.sandbox, local.sandbox, pass_env, allow_cache_exec);
+        // `repo_dirs` unions like every other list, but only local ever holds
+        // one: `Config::load_file` clears a global list with a warning, so the
+        // union is always `[] ∪ local`. It is spelled as a union anyway so a
+        // future layer does not silently drop entries.
+        union_lists!(
+            out.sandbox,
+            local.sandbox,
+            pass_env,
+            allow_cache_exec,
+            repo_dirs
+        );
         take_set!(
             out.gh_guard,
             local.gh_guard,
@@ -453,6 +555,7 @@ impl Config {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
     use super::*;
 
@@ -570,6 +673,91 @@ mod tests {
         assert_eq!(merged.proxy.port, Some(9090));
         assert_eq!(merged.allow.read, ["/a", "/b"]);
         assert_eq!(merged.sandbox.agent.as_deref(), Some("claude"));
+    }
+
+    /// The sharpest coupling in the layer: the writer records the remote, the
+    /// loader compares it after normalization. A file cplt just wrote must
+    /// apply on the next launch, and a denormalized `origin` must survive the
+    /// trip — otherwise the tripwire fires on every launch of a repo whose
+    /// remote is spelled `https://GitHub.com/x/y.git`.
+    #[test]
+    fn a_written_file_loads_back_with_its_remote_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .expect("git should run")
+                .status
+                .success()
+        };
+        assert!(git(&["init", "--quiet"]));
+        assert!(git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://GitHub.com/navikt/spleis.git",
+        ]));
+
+        let mut doc = toml_edit::DocumentMut::new();
+        stamp_local_header(&mut doc, repo);
+        let key = crate::config::lookup_key("sandbox.allow_docker").unwrap();
+        super::super::editing::set_value_in_doc(&mut doc, key, "true").unwrap();
+        validate_local_document(&doc).unwrap();
+
+        let raw = doc.to_string();
+        assert!(
+            raw.contains("remote = \"github.com/navikt/spleis\""),
+            "the header must record the NORMALIZED remote: {raw}"
+        );
+
+        let loaded = parse_local(
+            &raw,
+            Path::new("/tmp/local.toml"),
+            crate::trust::canonical_remote(repo),
+            Some(&canonical_key(repo)),
+        )
+        .unwrap()
+        .expect("a file cplt just wrote must apply on the next launch");
+        assert_eq!(loaded.sandbox.allow_docker, Some(true));
+    }
+
+    /// Relative paths are refused at write time, not only at load: a file that
+    /// would fail the next launch must not be written in the first place.
+    #[test]
+    fn a_relative_path_is_refused_before_it_is_written() {
+        let doc = "[allow]\nread = [\"scratch\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let err = validate_local_document(&doc).unwrap_err();
+        assert!(err.to_string().contains("relative"), "{err}");
+    }
+
+    /// `sandbox.repo_dirs` is a path list, so the local layer's absolute-or-`~`
+    /// rule must reach it: a relative entry has no anchor a repository root
+    /// could live at (`~/.config/cplt/../inner` is not a checkout).
+    #[test]
+    fn repo_dirs_entries_are_path_checked() {
+        let err = parse("[sandbox]\nrepo_dirs = [\"../sibling\"]\n").unwrap_err();
+        assert!(err.to_string().contains("relative"), "{err}");
+
+        let cfg = parse("[sandbox]\nrepo_dirs = [\"/repo/inner\", \"~/code/other\"]\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.sandbox.repo_dirs.len(), 2);
+    }
+
+    /// The overlay must carry the list, or the launch would validate an empty
+    /// set and the persisted repositories would silently drop out of scope.
+    #[test]
+    fn overlay_carries_repo_dirs() {
+        let global = Config::default();
+        let local: Config = toml::from_str("[sandbox]\nrepo_dirs = [\"/repo/inner\"]\n").unwrap();
+        assert_eq!(global.overlay(&local).sandbox.repo_dirs, ["/repo/inner"]);
     }
 
     #[test]

@@ -1,12 +1,16 @@
 //! Human-readable config display and `cplt config explain`.
 
 use super::path::config_path;
-use super::registry::{ConfigKeyInfo, ResolvedBools, type_label};
+use super::registry::{ConfigKeyInfo, ConfigLayer, ResolvedBools, type_label};
 use super::types::{CliFlags, Config, EnforcementMode, LoadedConfig, Preset, UnknownCommandPolicy};
 use crate::ui;
 
 /// Print explanation of a single config key, showing type and current value inline.
-pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
+pub fn explain_key(
+    key_info: &ConfigKeyInfo,
+    loaded: Option<&LoadedConfig>,
+    local: Option<&LoadedConfig>,
+) {
     let blue = ui::stdout_color(ui::BLUE);
     let bold = ui::stdout_color(ui::BOLD);
     let dim = ui::stdout_color(ui::DIM);
@@ -19,7 +23,8 @@ pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
         key_info.default_display
     };
 
-    let (current_value, from_file) = get_config_value(key_info, loaded);
+    let (current_value, layer) = get_config_value(key_info, loaded, local);
+    let from_file = layer != ConfigLayer::Baseline;
     let current_value = redact_sensitive_value(key_info, current_value);
     let type_str = type_label(key_info.value_type);
 
@@ -35,7 +40,7 @@ pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
             bold
         };
         println!(
-            "  {dim}{type_str}{nc}  {value_color}{current_value}{nc}  {dim}(default: {default_display}){nc}"
+            "  {dim}{type_str}{nc}  {value_color}{current_value}{nc}  {dim}({layer}, default: {default_display}){nc}"
         );
     } else {
         println!("  {dim}{type_str}  {current_value}{nc}");
@@ -52,7 +57,7 @@ pub fn explain_key(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) {
 
 /// Print explanation of all config keys, grouped by section.
 /// Shows the effective value inline: dim for default, bold for config-file override.
-pub fn explain_all(loaded: Option<&LoadedConfig>) {
+pub fn explain_all(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig>) {
     use super::registry::CONFIG_KEYS;
 
     let blue = ui::stdout_color(ui::BLUE);
@@ -75,7 +80,8 @@ pub fn explain_all(loaded: Option<&LoadedConfig>) {
         } else {
             String::new()
         };
-        let (current_value, from_file) = get_config_value(key, loaded);
+        let (current_value, layer) = get_config_value(key, loaded, local);
+        let from_file = layer != ConfigLayer::Baseline;
         let current_value = redact_sensitive_value(key, current_value);
         // Dim for default value, bold for override; yellow if dangerous key is enabled.
         let value_color = if !from_file {
@@ -100,21 +106,31 @@ pub fn explain_all(loaded: Option<&LoadedConfig>) {
     }
 }
 
-/// Get the effective value of a config key.
-/// Returns `(value_string, is_from_file)`.
-#[allow(clippy::collapsible_if)]
-pub fn get_config_value(key_info: &ConfigKeyInfo, loaded: Option<&LoadedConfig>) -> (String, bool) {
-    if let Some(loaded) = loaded {
-        if let Ok(root) = loaded.raw.parse::<toml::Table>() {
-            if let Some(section) = root.get(key_info.section) {
-                if let Some(val) = section.get(key_info.key) {
-                    return (format_toml_value(val), true);
-                }
-            }
+/// Get the effective value of a config key, and the layer it came from.
+///
+/// A bool cannot say which of two files a value came from, which is why this
+/// returns the layer: local, global, or `Baseline` for "no file set it".
+/// The order is the resolver's own — local above global — read off the raw
+/// documents, because this reports what the FILES say and there is no merge to
+/// consult. `ConfigLayer::Baseline` here means "not in any file"; it does not
+/// distinguish a preset baseline from a hardcoded default.
+pub fn get_config_value(
+    key_info: &ConfigKeyInfo,
+    loaded: Option<&LoadedConfig>,
+    local: Option<&LoadedConfig>,
+) -> (String, ConfigLayer) {
+    for (file, layer) in [(local, ConfigLayer::Local), (loaded, ConfigLayer::Global)] {
+        if let Some(file) = file
+            && let Ok(root) = file.raw.parse::<toml::Table>()
+            && let Some(val) = root
+                .get(key_info.section)
+                .and_then(|section| section.get(key_info.key))
+        {
+            return (format_toml_value(val), layer);
         }
     }
 
-    (key_info.default_display.to_string(), false)
+    (key_info.default_display.to_string(), ConfigLayer::Baseline)
 }
 
 fn format_toml_value(val: &toml::Value) -> String {
@@ -147,19 +163,52 @@ fn redact_sensitive_value(key_info: &ConfigKeyInfo, value: String) -> String {
 
 /// Display the effective configuration from a config file merged with defaults.
 /// Shows what cplt would use at runtime (without CLI flag overrides).
-pub fn display_config(loaded: Option<&LoadedConfig>) {
+pub fn display_config(loaded: Option<&LoadedConfig>, local: Option<&LoadedConfig>) {
     let blue = ui::stdout_color(ui::BLUE);
     let dim = ui::stdout_color(ui::DIM);
     let green = ui::stdout_color(ui::GREEN);
     let yellow = ui::stdout_color(ui::YELLOW);
     let nc = ui::stdout_color(ui::RESET);
 
-    let config = loaded.map(|l| &l.config);
-    let c = config.cloned().unwrap_or_default();
-
-    // Source label helper
-    let src =
-        |has_file_value: bool| -> &'static str { if has_file_value { "" } else { " (default)" } };
+    let global = loaded.map(|l| l.config.clone()).unwrap_or_default();
+    let local_config = local.map(|l| &l.config);
+    // Values come from the same overlay the launch uses, not a second ladder
+    // written here: a local `Some` wins, lists union.
+    let c = match local_config {
+        Some(l) => global.overlay(l),
+        None => global.clone(),
+    };
+    // Which layer each key came from. Booleans get the answer from the
+    // resolver itself (`ResolvedBools::layer`), which is the whole point of it
+    // returning the layer — a private ladder here is what #410 was. Everything
+    // else is not on the ladder, so the local file's own document answers
+    // "did local set this key", and the caller passes the global answer in.
+    // The baseline comes off the overlay, not a hand-rolled `or_else` ladder:
+    // local beats global for every scalar, `preset` included, and the ladder
+    // here had it backwards. `guard_lines` reads `c.sandbox.preset` for the
+    // same reason — one merge decides, in both places.
+    let bools = ResolvedBools::resolve(
+        &CliFlags::default(),
+        local_config,
+        &global,
+        c.sandbox.preset.unwrap_or(Preset::Standard).baseline(),
+    );
+    let local_doc = local.and_then(|l| l.raw.parse::<toml::Table>().ok());
+    let local_sets = |section: &str, key: &str| {
+        local_doc
+            .as_ref()
+            .is_some_and(|root| root.get(section).and_then(|table| table.get(key)).is_some())
+    };
+    let src = |section: &str, key: &str, has_file_value: bool| -> &'static str {
+        match bools.layer(section, key) {
+            Some(ConfigLayer::Local) => " (local)",
+            Some(ConfigLayer::Baseline) => " (default)",
+            Some(_) => "",
+            None if local_sets(section, key) => " (local)",
+            None if has_file_value => "",
+            None => " (default)",
+        }
+    };
 
     println!("{blue}[cplt]{nc} ── Effective Configuration ──────────────────────");
     println!();
@@ -175,6 +224,12 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     } else {
         println!("{blue}[cplt]{nc}  {dim}File:{nc}  {dim}(no config path, $HOME not set){nc}");
     }
+    // Only when a local file was actually APPLIED — a missing one, or one the
+    // remote tripwire stopped, leaves `local` None and must not claim a layer
+    // that did nothing. `cplt config path --local` prints the path either way.
+    if let Some(l) = local {
+        println!("{blue}[cplt]{nc}  {dim}Local:{nc} {}", l.path.display());
+    }
     println!();
 
     // [proxy]
@@ -184,19 +239,19 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         "{blue}[cplt]{nc}    enabled          = {}{}{nc}{}",
         if proxy_enabled { green } else { yellow },
         proxy_enabled,
-        src(c.proxy.enabled.is_some())
+        src("proxy", "enabled", c.proxy.enabled.is_some())
     );
     let proxy_forced = c.proxy.forced.unwrap_or(false);
     println!(
         "{blue}[cplt]{nc}    forced           = {}{}{nc}{}",
         if proxy_forced { yellow } else { green },
         proxy_forced,
-        src(c.proxy.forced.is_some())
+        src("proxy", "forced", c.proxy.forced.is_some())
     );
     println!(
         "{blue}[cplt]{nc}    port             = {}{}",
         c.proxy.port.unwrap_or(0),
-        src(c.proxy.port.is_some())
+        src("proxy", "port", c.proxy.port.is_some())
     );
     if let Some(ref bd) = c.proxy.blocked_domains {
         println!("{blue}[cplt]{nc}    blocked_domains  = \"{bd}\"");
@@ -209,7 +264,11 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
         "{blue}[cplt]{nc}    default_allowlist = {}{}{nc}{}",
         if default_allowlist { green } else { yellow },
         default_allowlist,
-        src(c.proxy.default_allowlist.is_some())
+        src(
+            "proxy",
+            "default_allowlist",
+            c.proxy.default_allowlist.is_some()
+        )
     );
     if let Some(ref lf) = c.proxy.log_file {
         println!("{blue}[cplt]{nc}    log_file         = \"{lf}\"");
@@ -232,12 +291,12 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     println!(
         "{blue}[cplt]{nc}    log_level        = \"{}\"{}",
         c.proxy.log_level.as_deref().unwrap_or("none"),
-        src(c.proxy.log_level.is_some())
+        src("proxy", "log_level", c.proxy.log_level.is_some())
     );
     println!(
         "{blue}[cplt]{nc}    timeout          = {}{}",
         c.proxy.timeout.unwrap_or(60),
-        src(c.proxy.timeout.is_some())
+        src("proxy", "timeout", c.proxy.timeout.is_some())
     );
     // [proxy.subscriptions] — blocklist subscriptions (issue #144, Phase 1).
     // Global-only, tighten-only. Shown only when configured.
@@ -314,27 +373,48 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     match c.sandbox.preset {
         Some(preset) => println!(
             "{blue}[cplt]{nc}    preset                = {preset}{}",
-            src(true)
+            src("sandbox", "preset", true)
         ),
         None => println!("{blue}[cplt]{nc}    preset                = {dim}standard (default){nc}"),
+    }
+    // The local layer is the only one that can set this — the global loader
+    // drops it — and it is the one key whose whole job is to name a repository
+    // the user has stopped thinking about. Leaving it off this screen made the
+    // effective config silent about exactly that.
+    if c.sandbox.repo_dirs.is_empty() {
+        println!("{blue}[cplt]{nc}    repo_dirs             = {dim}[]{nc}");
+    } else {
+        println!(
+            "{blue}[cplt]{nc}    repo_dirs             = {:?}{}",
+            c.sandbox.repo_dirs,
+            src("sandbox", "repo_dirs", false)
+        );
     }
     let validate = c.sandbox.validate.unwrap_or(true);
     println!(
         "{blue}[cplt]{nc}    validate              = {}{}",
         validate,
-        src(c.sandbox.validate.is_some())
+        src("sandbox", "validate", c.sandbox.validate.is_some())
     );
     let allow_env_files = c.sandbox.allow_env_files.unwrap_or(false);
     println!(
         "{blue}[cplt]{nc}    allow_env_files       = {}{}",
         allow_env_files,
-        src(c.sandbox.allow_env_files.is_some())
+        src(
+            "sandbox",
+            "allow_env_files",
+            c.sandbox.allow_env_files.is_some()
+        )
     );
     let allow_localhost_any = c.sandbox.allow_localhost_any.unwrap_or(false);
     println!(
         "{blue}[cplt]{nc}    allow_localhost_any    = {}{}",
         allow_localhost_any,
-        src(c.sandbox.allow_localhost_any.is_some())
+        src(
+            "sandbox",
+            "allow_localhost_any",
+            c.sandbox.allow_localhost_any.is_some()
+        )
     );
     if !c.sandbox.pass_env.is_empty() {
         println!(
@@ -345,77 +425,117 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     let inherit_env = c.sandbox.inherit_env.unwrap_or(false);
     if inherit_env {
         let red = ui::stdout_color(ui::RED);
-        println!("{blue}[cplt]{nc}    inherit_env           = {red}true{nc} ⚠ DANGEROUS");
+        println!(
+            "{blue}[cplt]{nc}    inherit_env           = {red}true{nc} ⚠ DANGEROUS{}",
+            src("sandbox", "inherit_env", c.sandbox.inherit_env.is_some())
+        );
     } else {
         println!(
             "{blue}[cplt]{nc}    inherit_env           = false{}",
-            src(c.sandbox.inherit_env.is_some())
+            src("sandbox", "inherit_env", c.sandbox.inherit_env.is_some())
         );
     }
     let allow_lifecycle = c.sandbox.allow_lifecycle_scripts.unwrap_or(false);
     println!(
         "{blue}[cplt]{nc}    allow_lifecycle_scripts = {}{}",
         allow_lifecycle,
-        src(c.sandbox.allow_lifecycle_scripts.is_some())
+        src(
+            "sandbox",
+            "allow_lifecycle_scripts",
+            c.sandbox.allow_lifecycle_scripts.is_some()
+        )
     );
     let allow_gpg = c.sandbox.allow_gpg_signing.unwrap_or(false);
     if allow_gpg {
         let red = ui::stdout_color(ui::RED);
-        println!("{blue}[cplt]{nc}    allow_gpg_signing     = {red}true{nc} ⚠ DANGEROUS");
+        println!(
+            "{blue}[cplt]{nc}    allow_gpg_signing     = {red}true{nc} ⚠ DANGEROUS{}",
+            src(
+                "sandbox",
+                "allow_gpg_signing",
+                c.sandbox.allow_gpg_signing.is_some()
+            )
+        );
     } else {
         println!(
             "{blue}[cplt]{nc}    allow_gpg_signing     = false{}",
-            src(c.sandbox.allow_gpg_signing.is_some())
+            src(
+                "sandbox",
+                "allow_gpg_signing",
+                c.sandbox.allow_gpg_signing.is_some()
+            )
         );
     }
     let allow_docker = c.sandbox.allow_docker.unwrap_or(false);
     if allow_docker {
         let red = ui::stdout_color(ui::RED);
-        println!("{blue}[cplt]{nc}    allow_docker          = {red}true{nc} ⚠ DANGEROUS");
+        println!(
+            "{blue}[cplt]{nc}    allow_docker          = {red}true{nc} ⚠ DANGEROUS{}",
+            src("sandbox", "allow_docker", c.sandbox.allow_docker.is_some())
+        );
     } else {
         println!(
             "{blue}[cplt]{nc}    allow_docker          = false{}",
-            src(c.sandbox.allow_docker.is_some())
+            src("sandbox", "allow_docker", c.sandbox.allow_docker.is_some())
         );
     }
     let allow_tmp = c.sandbox.allow_tmp_exec.unwrap_or(false);
     if allow_tmp {
         let red = ui::stdout_color(ui::RED);
-        println!("{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS");
+        println!(
+            "{blue}[cplt]{nc}    allow_tmp_exec        = {red}true{nc} ⚠ DANGEROUS{}",
+            src(
+                "sandbox",
+                "allow_tmp_exec",
+                c.sandbox.allow_tmp_exec.is_some()
+            )
+        );
     } else {
         println!(
             "{blue}[cplt]{nc}    allow_tmp_exec        = false{}",
-            src(c.sandbox.allow_tmp_exec.is_some())
+            src(
+                "sandbox",
+                "allow_tmp_exec",
+                c.sandbox.allow_tmp_exec.is_some()
+            )
         );
     }
     let allow_browser = c.sandbox.allow_browser.unwrap_or(false);
     println!(
         "{blue}[cplt]{nc}    allow_browser         = {}{}",
         allow_browser,
-        src(c.sandbox.allow_browser.is_some())
+        src(
+            "sandbox",
+            "allow_browser",
+            c.sandbox.allow_browser.is_some()
+        )
     );
     let keychain_substitute = c.sandbox.keychain_substitute.unwrap_or(false);
     println!(
         "{blue}[cplt]{nc}    keychain_substitute   = {}{} {dim}(experimental){nc}",
         keychain_substitute,
-        src(c.sandbox.keychain_substitute.is_some())
+        src(
+            "sandbox",
+            "keychain_substitute",
+            c.sandbox.keychain_substitute.is_some()
+        )
     );
     let scratch = c.sandbox.scratch_dir.unwrap_or(true);
     println!(
         "{blue}[cplt]{nc}    scratch_dir           = {}{}",
         scratch,
-        src(c.sandbox.scratch_dir.is_some())
+        src("sandbox", "scratch_dir", c.sandbox.scratch_dir.is_some())
     );
     let audit = c.sandbox.audit.unwrap_or(true);
     println!(
         "{blue}[cplt]{nc}    audit                 = {}{}",
         audit,
-        src(c.sandbox.audit.is_some())
+        src("sandbox", "audit", c.sandbox.audit.is_some())
     );
     match c.sandbox.use_bubblewrap {
         Some(v) => println!(
             "{blue}[cplt]{nc}    use_bubblewrap        = {v}{}",
-            src(true)
+            src("sandbox", "use_bubblewrap", true)
         ),
         None => println!("{blue}[cplt]{nc}    use_bubblewrap        = auto-detect"),
     }
@@ -423,26 +543,41 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
     println!(
         "{blue}[cplt]{nc}    quiet                 = {}{}",
         quiet,
-        src(c.sandbox.quiet.is_some())
+        src("sandbox", "quiet", c.sandbox.quiet.is_some())
     );
     let gh_proxy_deprecated = c.sandbox.gh_proxy.unwrap_or(false);
     println!(
         "{blue}[cplt]{nc}    gh_proxy              = {}{} {dim}(deprecated, use [gh_guard]){nc}",
         gh_proxy_deprecated,
-        src(c.sandbox.gh_proxy.is_some())
+        src("sandbox", "gh_proxy", c.sandbox.gh_proxy.is_some())
     );
     let git_push_prevention = c.sandbox.git_push_prevention.unwrap_or(false);
     println!(
         "{blue}[cplt]{nc}    git_push_prevention   = {}{} {dim}(deprecated, use [git_guard]){nc}",
         git_push_prevention,
-        src(c.sandbox.git_push_prevention.is_some())
+        src(
+            "sandbox",
+            "git_push_prevention",
+            c.sandbox.git_push_prevention.is_some()
+        )
     );
 
-    for line in guard_lines(&c) {
+    for line in guard_lines(&global, local_config) {
         println!("{blue}[cplt]{nc}{line}");
     }
 
     println!("{blue}[cplt]{nc} ──────────────────────────────────────────────────────");
+}
+
+/// Whether a local config sets one of the two enum-valued guard keys that the
+/// boolean ladder does not cover.
+fn local_mode_is_set(local: &Config, section: &str, key: &str) -> bool {
+    match (section, key) {
+        ("gh_guard", "mode") => local.gh_guard.mode.is_some(),
+        ("gh_guard", "unknown_command") => local.gh_guard.unknown_command.is_some(),
+        ("git_guard", "mode") => local.git_guard.mode.is_some(),
+        _ => false,
+    }
 }
 
 /// The `[gh_guard]` / `[git_guard]` block of `config show`, without the
@@ -456,10 +591,27 @@ pub fn display_config(loaded: Option<&LoadedConfig>) {
 /// `false`. Reusing the table makes that class of bug unrepresentable, and
 /// picks up the deprecated `sandbox.gh_proxy` / `sandbox.git_push_prevention`
 /// spellings for free, since the registry folds them in at the config layer.
-fn guard_lines(c: &Config) -> Vec<String> {
-    let src = |has_file_value: bool| if has_file_value { "" } else { " (default)" };
+fn guard_lines(global: &Config, local: Option<&Config>) -> Vec<String> {
+    let c = match local {
+        Some(l) => global.overlay(l),
+        None => global.clone(),
+    };
+    let c = &c;
     let baseline = c.sandbox.preset.unwrap_or(Preset::Standard).baseline();
-    let b = ResolvedBools::resolve(&CliFlags::default(), None, c, baseline);
+    let b = ResolvedBools::resolve(&CliFlags::default(), local, global, baseline);
+    // Booleans read their layer straight off the resolver. The two enum-valued
+    // keys here (`mode`) are not on the ladder, so they ask the local config
+    // directly — one `is_some()`, not a fallback chain.
+    let src = |section: &str, key: &str, has_file_value: bool| -> &'static str {
+        match b.layer(section, key) {
+            Some(ConfigLayer::Local) => " (local)",
+            Some(ConfigLayer::Baseline) => " (default)",
+            Some(_) => "",
+            None if local.is_some_and(|l| local_mode_is_set(l, section, key)) => " (local)",
+            None if has_file_value => "",
+            None => " (default)",
+        }
+    };
 
     vec![
         String::new(),
@@ -469,7 +621,11 @@ fn guard_lines(c: &Config) -> Vec<String> {
             b.gh_guard_enabled,
             // The deprecated spelling is a file value too: the registry reads
             // `enabled.or(sandbox.gh_proxy)`, so "(default)" must follow it.
-            src(c.gh_guard.enabled.is_some() || c.sandbox.gh_proxy.is_some())
+            src(
+                "gh_guard",
+                "enabled",
+                c.gh_guard.enabled.is_some() || c.sandbox.gh_proxy.is_some(),
+            )
         ),
         format!(
             // Literal, not a baseline: no preset varies the gh guard's mode, so
@@ -479,61 +635,93 @@ fn guard_lines(c: &Config) -> Vec<String> {
             // resolver does for each key.
             "    mode                  = {}{}",
             c.gh_guard.mode.unwrap_or(EnforcementMode::Block),
-            src(c.gh_guard.mode.is_some())
+            src("gh_guard", "mode", c.gh_guard.mode.is_some())
         ),
         format!(
             "    scope_check           = {}{}",
             b.gh_scope_check,
-            src(c.gh_guard.scope_check.is_some())
+            src("gh_guard", "scope_check", c.gh_guard.scope_check.is_some())
         ),
         format!(
             "    block_auth_token      = {}{}",
             b.gh_block_auth_token,
-            src(c.gh_guard.block_auth_token.is_some())
+            src(
+                "gh_guard",
+                "block_auth_token",
+                c.gh_guard.block_auth_token.is_some()
+            )
         ),
         format!(
             "    inject_token          = {}{}",
             b.gh_inject_token,
-            src(c.gh_guard.inject_token.is_some())
+            src(
+                "gh_guard",
+                "inject_token",
+                c.gh_guard.inject_token.is_some()
+            )
         ),
         format!(
             "    unknown_command       = {}{}",
             c.gh_guard
                 .unknown_command
                 .unwrap_or(UnknownCommandPolicy::Block),
-            src(c.gh_guard.unknown_command.is_some())
+            src(
+                "gh_guard",
+                "unknown_command",
+                c.gh_guard.unknown_command.is_some()
+            )
         ),
         format!(
             "    allow_api_write       = {}{}",
             b.gh_allow_api_write,
-            src(c.gh_guard.allow_api_write.is_some())
+            src(
+                "gh_guard",
+                "allow_api_write",
+                c.gh_guard.allow_api_write.is_some()
+            )
         ),
         String::new(),
         "  [git_guard]".to_string(),
         format!(
             "    enabled               = {}{}",
             b.git_guard_enabled,
-            src(c.git_guard.enabled.is_some() || c.sandbox.git_push_prevention.is_some())
+            src(
+                "git_guard",
+                "enabled",
+                c.git_guard.enabled.is_some() || c.sandbox.git_push_prevention.is_some(),
+            )
         ),
         format!(
             "    mode                  = {}{}",
             c.git_guard.mode.unwrap_or(baseline.git_guard_mode),
-            src(c.git_guard.mode.is_some())
+            src("git_guard", "mode", c.git_guard.mode.is_some())
         ),
         format!(
             "    prevent_push          = {}{}",
             b.git_prevent_push,
-            src(c.git_guard.prevent_push.is_some())
+            src(
+                "git_guard",
+                "prevent_push",
+                c.git_guard.prevent_push.is_some()
+            )
         ),
         format!(
             "    prevent_force_push    = {}{}",
             b.git_prevent_force_push,
-            src(c.git_guard.prevent_force_push.is_some())
+            src(
+                "git_guard",
+                "prevent_force_push",
+                c.git_guard.prevent_force_push.is_some()
+            )
         ),
         format!(
             "    protect_default_branch_only = {}{}",
             b.git_protect_default_branch_only,
-            src(c.git_guard.protect_default_branch_only.is_some())
+            src(
+                "git_guard",
+                "protect_default_branch_only",
+                c.git_guard.protect_default_branch_only.is_some()
+            )
         ),
     ]
     .into_iter()
@@ -553,9 +741,9 @@ mod tests {
     #[test]
     fn get_config_value_returns_default_when_no_file() {
         let info = crate::config::lookup_key("sandbox.quiet").unwrap();
-        let (val, from_file) = get_config_value(info, None);
+        let (val, layer) = get_config_value(info, None, None);
         assert_eq!(val, "false");
-        assert!(!from_file);
+        assert_eq!(layer, ConfigLayer::Baseline);
     }
 
     #[test]
@@ -566,9 +754,9 @@ mod tests {
             raw: "[sandbox]\nquiet = true\n".to_string(),
             path: std::path::PathBuf::from("/tmp/fake"),
         };
-        let (val, from_file) = get_config_value(info, Some(&loaded));
+        let (val, layer) = get_config_value(info, Some(&loaded), None);
         assert_eq!(val, "true");
-        assert!(from_file);
+        assert_eq!(layer, ConfigLayer::Global);
     }
 
     #[test]
@@ -580,8 +768,8 @@ mod tests {
             raw: raw.to_string(),
             path: std::path::PathBuf::from("/tmp/fake"),
         };
-        let (val, from_file) = get_config_value(info, Some(&loaded));
-        assert!(from_file);
+        let (val, layer) = get_config_value(info, Some(&loaded), None);
+        assert_eq!(layer, ConfigLayer::Global);
         assert!(val.contains("8080"));
         assert!(val.contains("9090"));
     }
@@ -597,8 +785,8 @@ mod tests {
             raw: raw.to_string(),
             path: std::path::PathBuf::from("/tmp/fake"),
         };
-        let (val, from_file) = get_config_value(info, Some(&loaded));
-        assert!(from_file);
+        let (val, layer) = get_config_value(info, Some(&loaded), None);
+        assert_eq!(layer, ConfigLayer::Global);
         assert!(val.contains("internal.example.com"), "got: {val}");
         assert!(val.contains("corp.example"), "got: {val}");
     }
@@ -624,7 +812,7 @@ mod tests {
         ] {
             let c = Config::parse(toml).unwrap();
             let r = c.merge(CliFlags::default()).unwrap();
-            let lines = guard_lines(&c);
+            let lines = guard_lines(&c, None);
             let gh = section(&lines, "[gh_guard]");
             let git = section(&lines, "[git_guard]");
 
@@ -695,7 +883,7 @@ mod tests {
     /// guards, so the screen must say `true`, marked as coming from the default.
     #[test]
     fn empty_config_shows_both_guards_enabled_by_default() {
-        let lines = guard_lines(&Config::default());
+        let lines = guard_lines(&Config::default(), None);
         assert!(
             lines.contains(&"    enabled               = true (default)".to_string()),
             "expected an enabled=true (default) line in {lines:#?}"
@@ -715,7 +903,7 @@ mod tests {
     #[test]
     fn deprecated_spellings_are_not_labelled_default() {
         let c = Config::parse("[sandbox]\ngh_proxy = true\ngit_push_prevention = true\n").unwrap();
-        let lines = guard_lines(&c);
+        let lines = guard_lines(&c, None);
         for l in lines
             .iter()
             .filter(|l| l.trim_start().starts_with("enabled "))
