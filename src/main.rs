@@ -4149,6 +4149,22 @@ fn run_exec_command(
     // Always use the Shell sandbox policy
     let active_agent = agent::Agent::Shell;
 
+    // ...but say so when the operator asked for something else. The profiles
+    // genuinely differ — Shell has no Keychain grant, so `gh` finds no token,
+    // while copilot, claude, antigravity and goose do — so someone running
+    // `--agent copilot exec` to find out what Copilot may do gets a truthful
+    // answer about a different sandbox. Dropping the flag in silence cost a
+    // real debugging session (#411).
+    if let Some(requested) = cli.agent.as_deref()
+        && !requested.eq_ignore_ascii_case("shell")
+    {
+        ui::warn(&format!(
+            "exec: --agent {requested} is ignored. `cplt exec` always builds the Shell \
+             profile, which grants less (no Keychain, so `gh` finds no token here). To \
+             probe what {requested} may do, run `cplt --agent {requested} check`."
+        ));
+    }
+
     // Shell, not the agent `resolve_context` detected: exec builds the Shell
     // profile, so a warning about another agent's directories would name an
     // effect this session cannot have (#343).
@@ -5049,12 +5065,20 @@ fn build_exec_check(
     agent_name: String,
     preset_name: Option<String>,
 ) -> check::Report {
+    // The same capture the launch does, from the same trusted git (see
+    // `sandbox_exec.rs`, "baked at launch"): without it every push reads as
+    // blocked, feature branches included.
+    let repo_facts = crate::git::trusted_git()
+        .map(|git| gh_proxy::capture_repo_facts(git, project_dir))
+        .unwrap_or_default();
     let ctx = check::ExecContext {
         allow_docker: resolved.allow_docker,
         allow_tmp_exec: resolved.allow_tmp_exec,
         gh_guard: &resolved.gh_guard,
         git_guard: &resolved.git_guard,
         project_dir,
+        repo_facts: &repo_facts,
+        scratch_dir: resolved.scratch_dir,
     };
     let expl = check::explain_exec(cmd, &ctx);
     let item = check::CheckItem {
