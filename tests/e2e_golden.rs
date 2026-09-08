@@ -1271,3 +1271,81 @@ fn golden_exec_says_when_it_ignores_the_requested_agent() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A named repository is in the gh scope set, and `check exec` has to know it.
+///
+/// `--repo-dir`'s entire purpose is that `gh` may target the named repository —
+/// the flag's own help says so. The launch implements that. `check exec` did
+/// not: its gh arm was handed only the project directory, so it reported a
+/// repository the launch allows as outside the startup scope. Third instance of
+/// the same shape as #439, found by testing the workaround of putting two real
+/// repositories inside one umbrella repository and launching from it.
+#[test]
+fn golden_check_exec_knows_about_named_repositories() {
+    require_launch!();
+    let home = make_config_home("golden-scope");
+    let umbrella = temp_repo("navikt/min-arbeidsflate");
+
+    // Two real repositories inside the launch repository — the shape a
+    // developer uses today to work across repositories in one session.
+    for (dir, remote) in [("bar", "navikt/bar"), ("baz", "navikt/baz")] {
+        let nested = umbrella.path().join(dir);
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        for args in [
+            &["init", "--quiet", "-b", "main"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{remote}.git"),
+            ][..],
+        ] {
+            let out = common::git_cmd(&nested)
+                .args(args)
+                .output()
+                .expect("git should run");
+            assert!(out.status.success(), "git {args:?} should succeed");
+        }
+        let (_, stderr, status) = launch(
+            &home,
+            umbrella.path(),
+            &[
+                "config",
+                "set",
+                "--local",
+                "sandbox.repo_dirs",
+                nested.to_str().expect("path should be UTF-8"),
+            ],
+        );
+        assert!(
+            status.success(),
+            "naming {remote} should succeed:\n{stderr}"
+        );
+    }
+
+    let check = |target: &str| {
+        let (out, err, status) = launch(
+            &home,
+            umbrella.path(),
+            &["check", "exec", "gh", "pr", "create", "-R", target],
+        );
+        assert!(status.success(), "check exec should run:\n{out}{err}");
+        format!("{out}{err}")
+    };
+
+    let named = check("navikt/bar");
+    assert!(
+        named.contains("navikt/bar: ALLOWED"),
+        "a named repository is in the gh scope set, so `check exec` must not \
+         report it out of scope — the launch allows this:\n{named}"
+    );
+
+    // The other half: naming repositories must not turn the scope check off.
+    let unrelated = check("navikt/other");
+    assert!(
+        unrelated.contains("navikt/other: BLOCKED"),
+        "a repository that was never named must still be refused:\n{unrelated}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
