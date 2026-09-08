@@ -4,6 +4,7 @@
 //! path validation, tool directory permissions, and hardening env vars.
 
 use crate::agent::Agent;
+use crate::config;
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
 
@@ -26,8 +27,13 @@ pub const DENIED_DOTFILES: &[&str] = &[
     // cplt's own state: the trust store, blocklist caches, and the self-update
     // staging area. An agent that can write here can tamper with the sandbox
     // that contains it, or swap the binary `cplt update` is about to install.
-    ".config/cplt",
+    // Unlike every other entry, no per-file override is allowed either — see
+    // [`cplt_state_dir_grant`].
+    CPLT_STATE_DIR,
 ];
+
+/// cplt's own state directory, relative to `$HOME`.
+pub const CPLT_STATE_DIR: &str = ".config/cplt";
 
 /// Sensitive files under $HOME that are always denied.
 pub const DENIED_FILES: &[&str] = &[".netrc", ".pypirc", ".gem/credentials", ".vault-token"];
@@ -76,6 +82,34 @@ pub fn denied_dotfile_dir(home: &Path, path: &Path) -> Option<&'static str> {
     denied_entry(DENIED_DOTFILES, home, path)
 }
 
+/// The cplt state directory containing `path`, if a grant names anything
+/// inside it.
+///
+/// A *subtree* test, unlike [`denied_dotfile_dir`]: for every other
+/// [`DENIED_DOTFILES`] entry a per-file grant is a supported and useful
+/// override (`~/.ssh/known_hosts`), but nothing inside cplt's own state
+/// directory is ever a legitimate grant. It holds the config, the trust store,
+/// the blocklist subscription cache and the per-repo local files — an agent
+/// that can write any of them approves its own next launch, and the widening
+/// perpetuates itself.
+///
+/// Both locations are checked: `$HOME/.config/cplt` and whatever `CPLT_CONFIG`
+/// relocates the directory to, since the override moves the real files.
+/// The grant is resolved with [`config::canonicalize_deepest`] so a path that
+/// does not exist yet still matches — otherwise the check is sidestepped by
+/// naming a file before creating it — and the lexical form is compared too, so
+/// a symlink out of the directory is refused as well.
+#[must_use]
+pub fn cplt_state_dir_grant(home: &Path, path: &Path) -> Option<PathBuf> {
+    let resolved = config::canonicalize_deepest(path);
+    [config::config_dir(), Some(home.join(CPLT_STATE_DIR))]
+        .into_iter()
+        .flatten()
+        .find(|dir| {
+            resolved.starts_with(config::canonicalize_deepest(dir)) || path.starts_with(dir)
+        })
+}
+
 /// Whether a grant on `path` must never reach a backend ruleset.
 ///
 /// `sandbox::prepare` refuses both classes before a run starts; the backends
@@ -83,7 +117,12 @@ pub fn denied_dotfile_dir(home: &Path, path: &Path) -> Option<&'static str> {
 /// `generate_policy` and not only the ones that went through `prepare`.
 #[must_use]
 pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
-    hard_denied_file(home, path).is_some() || denied_dotfile_dir(home, path).is_some()
+    hard_denied_file(home, path).is_some()
+        || denied_dotfile_dir(home, path).is_some()
+        // Subtree, unlike the two above: nothing inside cplt's own state
+        // directory may be granted, so a backend reached without going through
+        // `sandbox::prepare` refuses the same paths that `prepare` does.
+        || cplt_state_dir_grant(home, path).is_some()
 }
 
 /// Exact-path membership of `path` in a `$HOME`-relative deny list, comparing
