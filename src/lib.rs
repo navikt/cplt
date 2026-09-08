@@ -11,6 +11,7 @@ pub mod check;
 pub mod config;
 pub mod detect;
 pub mod discover;
+pub mod doctor;
 pub mod gh_proxy;
 pub mod git;
 pub mod gradle_init;

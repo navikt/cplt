@@ -36,6 +36,23 @@ use crate::ui;
 mod bubblewrap;
 #[path = "sandbox_env.rs"]
 mod env;
+
+/// The two bubblewrap probes `cplt doctor` reports from — the same trusted
+/// lookup and the same `bwrap … /bin/true` the launch runs, against an empty
+/// rule set, so "installed" and "usable" stay two different answers.
+#[cfg(target_os = "linux")]
+pub(crate) mod bubblewrap_probe {
+    pub(crate) use super::bubblewrap::check_availability;
+
+    pub(crate) fn test_empty(bwrap: &std::path::Path) -> Result<(), String> {
+        super::bubblewrap::test_functionality(
+            bwrap,
+            &[],
+            super::bubblewrap::Overlays::default(),
+            &super::bubblewrap::DenyMasks::default(),
+        )
+    }
+}
 #[path = "sandbox_exec.rs"]
 mod exec;
 #[path = "sandbox_landlock.rs"]

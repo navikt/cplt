@@ -241,7 +241,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// exactly the hang this function exists to remove. A detached reader blocked
 /// on a pipe costs one thread in a process that exits moments later.
 #[allow(clippy::disallowed_methods)] // runs an already-resolved discovered path; trusting it is #248, not resolution
-fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
+/// `pub`, not `pub(crate)`: the binary is a separate crate from the library,
+/// so a crate-private item here is unreachable from `main.rs`, which uses this
+/// to print agent versions.
+pub fn probe_version(path: &Path, args: &[&str]) -> VersionProbe {
     let Ok(mut child) = std::process::Command::new(path)
         .args(args)
         .stdin(Stdio::null())
@@ -322,7 +325,7 @@ pub fn discover_agents() -> Vec<AgentInfo> {
 
 // ── Tool discovery ──────────────────────────────────────────────
 
-const TOOLS_TO_CHECK: &[&str] = &[
+pub const TOOLS_TO_CHECK: &[&str] = &[
     "gh", "git", "node", "npm", "cargo", "python3", "java", "go", "gradle", "yarn",
 ];
 
@@ -335,7 +338,7 @@ const TOOLS_TO_CHECK: &[&str] = &[
 /// rest — build tools, language runtimes, the `app_dirs()` applications — are
 /// only warned about: running one starts a Windows process outside the sandbox,
 /// which is worth saying but is not a broken install.
-const WSL_CRITICAL_TOOLS: &[&str] = &["gh", "git", "node", "npm"];
+pub const WSL_CRITICAL_TOOLS: &[&str] = &["gh", "git", "node", "npm"];
 
 use crate::sandbox::app_dirs;
 use crate::sandbox::home_tool_dirs;
@@ -508,7 +511,8 @@ fn tool_lines(tools: &[ToolInfo], wsl: bool) -> (Vec<String>, bool) {
 }
 
 impl Discovery {
-    /// Print a human-readable diagnostic report. Returns true if all critical checks pass.
+    /// Print the full inventory (`cplt doctor --verbose`). Returns true if
+    /// nothing it prints is a hard failure; the verdict itself is doctor's.
     pub fn print_report(&self) -> bool {
         let mut critical_ok = true;
 
@@ -825,21 +829,6 @@ impl Discovery {
             critical_ok = false;
         }
         println!();
-
-        // Summary
-        if critical_ok {
-            println!(
-                "{}[doctor]{} All critical checks passed ✓",
-                ui::stdout_color(ui::GREEN),
-                ui::stdout_color(ui::RESET)
-            );
-        } else {
-            println!(
-                "{}[doctor]{} Critical issues found, the sandbox may not work correctly",
-                ui::stdout_color(ui::RED),
-                ui::stdout_color(ui::RESET)
-            );
-        }
 
         critical_ok
     }
@@ -1492,6 +1481,12 @@ fn find_app_contents(path: &Path) -> Option<PathBuf> {
 /// only ever *reported* or turned into a sandbox grant, never executed — except
 /// by `discover_agents`/`discover_copilot`, which run version probes for
 /// `cplt doctor` only.
+/// The PATH entry for `name` as found — a shim stays a shim. Canonicalize it
+/// yourself when you want the target.
+pub fn which_on_path(name: &str) -> Option<PathBuf> {
+    crate::sandbox::which_binary(name)
+}
+
 fn which_resolved(name: &str) -> Option<PathBuf> {
     let path = crate::sandbox::which_binary(name)?;
     Some(std::fs::canonicalize(&path).unwrap_or(path))

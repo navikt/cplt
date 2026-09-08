@@ -514,6 +514,10 @@ mod e2e_tests {
     // ============================================================
     // Doctor command tests
     // ============================================================
+    //
+    // Doctor is findings-first: a header a maintainer can trust (version, OS,
+    // agent and where the choice came from, config layers, enforcement), then
+    // only what will fail, then the verdict. The inventory is `--verbose`.
 
     #[test]
     fn e2e_doctor_exits_successfully() {
@@ -533,46 +537,95 @@ mod e2e_tests {
     }
 
     #[test]
-    fn e2e_doctor_reports_auth_section() {
-        // No require_copilot!: doctor always prints the Auth section header
-        // regardless of whether Copilot is installed, so this runs in CI.
+    fn e2e_doctor_header_names_agent_config_and_enforcement() {
+        // No require_copilot!: the header prints whatever is installed, and
+        // `--agent shell` needs no agent binary at all.
         let output = cplt_cmd()
-            .args(["--doctor"])
+            .args(["--agent", "shell", "doctor"])
             .current_dir(project_dir())
             .output()
             .expect("binary should run");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let first = stdout.lines().next().unwrap_or_default();
 
         assert!(
-            stdout.contains("[doctor]") && stdout.contains("Auth"),
-            "--doctor should print Auth section.\nstdout: {stdout}"
+            first.starts_with("cplt ") && first.contains("kernel"),
+            "first line is version · os · kernel.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("agent:       Shell") && stdout.contains("(--agent)"),
+            "the agent line names the resolved agent and where the choice came from.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("config:      user") && stdout.contains("preset:"),
+            "the config line lists the layers loaded.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("enforcement: "),
+            "the enforcement line names the regime.\nstdout: {stdout}"
         );
     }
 
     #[test]
-    fn e2e_doctor_reports_copilot_section() {
-        require_copilot!();
+    fn e2e_doctor_default_view_is_short_and_ends_with_the_verdict() {
         let output = cplt_cmd()
-            .args(["--doctor"])
+            .args(["--agent", "shell", "doctor"])
             .current_dir(project_dir())
             .output()
             .expect("binary should run");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let last = stdout.lines().last().unwrap_or_default();
 
         assert!(
-            stdout.contains("Agents") && stdout.contains("Copilot"),
-            "--doctor should show Agents section with Copilot.\nstdout: {stdout}"
+            last.contains("blocking") || last.contains("No problems found"),
+            "the verdict is the last line.\nstdout: {stdout}"
+        );
+        assert!(
+            last.contains("`cplt check`"),
+            "the verdict points at the enforcement probe.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.lines().count() <= 25,
+            "default view stays short (the inventory is --verbose).\nstdout: {stdout}"
+        );
+        // Inventory sections stay out of the default view.
+        for cut in [
+            "Tool dirs",
+            "Not found (skippable)",
+            "Protected (",
+            "Project ecosystems",
+        ] {
+            assert!(
+                !stdout.contains(cut),
+                "{cut:?} is inventory and belongs to --verbose.\nstdout: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_doctor_hides_the_home_directory() {
+        let output = cplt_cmd()
+            .args(["--agent", "shell", "doctor"])
+            .current_dir(project_dir())
+            .output()
+            .expect("binary should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let home = std::env::var("HOME").expect("HOME");
+        // Paths under HOME print as ~/… so the output can be pasted publicly.
+        // Findings may legitimately name absolute paths outside HOME.
+        assert!(
+            !stdout.contains(&home),
+            "default view must not print the home directory.\nstdout: {stdout}"
         );
     }
 
     #[test]
-    fn e2e_doctor_reports_tools_section() {
-        // No require_copilot!: doctor always prints the Tools section (git is
-        // present on the runner) regardless of Copilot, so this runs in CI.
+    fn e2e_doctor_verbose_prints_the_inventory() {
         let output = cplt_cmd()
-            .args(["--doctor"])
+            .args(["--agent", "shell", "doctor", "--verbose"])
             .current_dir(project_dir())
             .output()
             .expect("binary should run");
@@ -580,16 +633,28 @@ mod e2e_tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stdout.contains("Tools") && stdout.contains("git"),
-            "--doctor should show Tools section with git.\nstdout: {stdout}"
+            stdout.contains("── inventory ──")
+                && stdout.contains("[doctor]")
+                && stdout.contains("Tools")
+                && stdout.contains("git"),
+            "--verbose appends the old inventory (Tools section with git).\nstdout: {stdout}"
         );
     }
 
     #[test]
-    fn e2e_doctor_reports_sandbox_paths() {
-        require_copilot!();
+    fn e2e_doctor_reports_a_missing_agent_as_blocking() {
+        // `--agent pi` on a host without pi: the header still prints, the
+        // missing binary is the one blocking finding, and exit is non-zero.
+        if Command::new("which")
+            .arg("pi")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("SKIPPED: pi is installed here");
+            return;
+        }
         let output = cplt_cmd()
-            .args(["--doctor"])
+            .args(["--agent", "pi", "doctor"])
             .current_dir(project_dir())
             .output()
             .expect("binary should run");
@@ -597,8 +662,60 @@ mod e2e_tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stdout.contains("Sandbox paths") && stdout.contains("Protected"),
-            "--doctor should show Sandbox paths with protected dirs.\nstdout: {stdout}"
+            !output.status.success(),
+            "a blocking finding exits non-zero"
+        );
+        assert!(
+            stdout.contains("agent:       Pi") && stdout.contains("not runnable"),
+            "the agent line says Pi could not be resolved.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("✗ Pi not found in PATH"),
+            "the finding names the cause and the install command.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("1 blocking"),
+            "the verdict counts it.\nstdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn e2e_doctor_flags_a_tracked_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(git_ok(repo, &["init", "-q", "."]));
+        assert!(git_ok(repo, &["config", "user.email", "t@t"]));
+        assert!(git_ok(repo, &["config", "user.name", "t"]));
+        std::fs::write(repo.join(".env.local"), "SECRET=x\n").unwrap();
+        std::fs::write(repo.join("README.md"), "ok\n").unwrap();
+        assert!(git_ok(repo, &["add", "-A"]));
+        assert!(git_ok(repo, &["commit", "-q", "-m", "init"]));
+
+        let output = cplt_cmd()
+            .args(["--agent", "shell", "doctor"])
+            .current_dir(repo)
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(".env.local is tracked in git") && stdout.contains("cannot hash"),
+            "a tracked .env under the deny is a finding.\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("git rm --cached -- '.env.local'"),
+            "the finding carries its fix.\nstdout: {stdout}"
+        );
+
+        // With the deny lifted there is nothing to say.
+        let output = cplt_cmd()
+            .args(["--agent", "shell", "--allow-env-files", "doctor"])
+            .current_dir(repo)
+            .output()
+            .expect("binary should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("cannot hash"),
+            "allow_env_files on: no finding.\nstdout: {stdout}"
         );
     }
 
@@ -619,8 +736,8 @@ mod e2e_tests {
             "cplt doctor should exit 0.\nstderr: {stderr}"
         );
         assert!(
-            stdout.contains("[doctor]"),
-            "should have doctor output.\nstdout: {stdout}"
+            stdout.contains("agent:       Copilot"),
+            "should name the auto-detected agent.\nstdout: {stdout}"
         );
         // No deprecation warning for subcommand form
         assert!(
@@ -651,7 +768,7 @@ mod e2e_tests {
     }
 
     #[test]
-    fn e2e_doctor_shows_project_ecosystems() {
+    fn e2e_doctor_verbose_shows_project_ecosystems() {
         // Create a project with a Cargo.toml so ecosystems are detected
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -661,15 +778,15 @@ mod e2e_tests {
         .unwrap();
 
         let output = cplt_cmd()
-            .args(["doctor"])
+            .args(["doctor", "--verbose"])
             .current_dir(dir.path())
             .output()
             .expect("binary should run");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Doctor may exit non-zero if no agent/auth is found (CI), but it
-        // should still print ecosystem detection results regardless.
+        // Doctor may exit non-zero if no agent is found (CI), but the
+        // inventory prints regardless.
         assert!(
             stdout.contains("Project ecosystems") && stdout.contains("Rust"),
             "should detect Rust ecosystem.\nstdout: {stdout}"
@@ -4817,8 +4934,9 @@ paths = [
         )
         .unwrap();
 
+        // Workspace members are inventory, so they live under --verbose.
         let output = cplt_cmd()
-            .args(["doctor"])
+            .args(["doctor", "--verbose"])
             .current_dir(dir.path())
             .output()
             .expect("should run");
@@ -4829,7 +4947,7 @@ paths = [
         let combined = format!("{stdout}{stderr}");
         assert!(
             combined.contains("apps/web"),
-            "doctor should show workspace member: {combined}"
+            "doctor --verbose should show workspace member: {combined}"
         );
     }
 
