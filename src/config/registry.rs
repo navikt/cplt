@@ -315,7 +315,7 @@ pub(super) const CONFIG_KEYS: &[ConfigKeyInfo] = &[
         value_type: ConfigValueType::Bool,
         dangerous: false,
         default_display: "true",
-        description: "Print the post-session project-change audit report (net file changes vs a pinned baseline commit). Suppressed by quiet.",
+        description: "Print the post-session project-change and network audit reports (net file changes vs a pinned baseline commit). Suppressed by quiet.",
     },
     ConfigKeyInfo {
         section: "sandbox",

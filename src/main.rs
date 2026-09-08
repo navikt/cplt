@@ -9,7 +9,7 @@ use cplt::{
     scratch, subscriptions, trust, update,
 };
 use std::collections::BTreeSet;
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -190,17 +190,17 @@ struct Cli {
     #[arg(long)]
     allow_all_domains: bool,
 
-    /// Run the proxy in ALLOW-ALL mode, block nothing, record every domain the
-    /// agent contacts, then print the observed set as a ready-to-paste
-    /// allowlist. Use it to build or verify an agent's default allowlist. This
-    /// run does NOT enforce domain filtering. It overrides --preset strict,
+    /// Disable domain allowlisting and display retained proxy CONNECT hosts.
+    /// Blocklists, port policy, and private-address checks still apply.
+    /// Observation is bounded and cannot cover direct traffic.
+    /// This overrides --preset strict,
     /// --default-allowlist, and any configured allowlist for the session.
     /// See docs/proxy.md.
     #[arg(long)]
     observe_domains: bool,
 
-    /// With --observe-domains, also write the bare observed domain list (one per
-    /// line) to this file, in addition to printing it to stderr.
+    /// With --observe-domains, write retained allowed hosts, one per line.
+    /// Incomplete snapshots leave an existing file unchanged.
     #[arg(long, value_name = "FILE")]
     observe_domains_out: Option<PathBuf>,
 
@@ -623,7 +623,7 @@ actually on screen, then turn it back off."
     #[arg(long)]
     no_quiet: bool,
 
-    /// Suppress the post-session project-change audit report.
+    /// Suppress the post-session project-change and network audit reports.
     /// After the sandboxed agent exits, cplt prints the net file changes from
     /// the session, measured from outside the sandbox against a pinned baseline
     /// commit. Can also be set in config: sandbox.audit = false.
@@ -2072,10 +2072,8 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
     })
 }
 
-/// Start the CONNECT proxy if enabled, returning the handle for RAII ownership.
-/// Updates `resolved.proxy_port` with the actual bound port.
-/// Print the observed domain set (from `--observe-domains`) to stderr as a
-/// ready-to-paste allowlist, and optionally write the bare list to `out_file`.
+/// Print the proxy-observed retained CONNECT hosts and optionally write the
+/// permitted retained hosts to `out_file`.
 ///
 /// Always prints regardless of `--quiet`: observe-domains is an explicit
 /// diagnostic whose result is the entire purpose of the run. Subdomains are NOT
@@ -2084,30 +2082,139 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
 /// (public-suffix) heuristic that would risk over-broadening the allowlist, so
 /// the raw observed hosts are emitted and the note points out that the matcher
 /// is exact-or-subdomain and a parent can be substituted by hand.
-fn emit_observed_domains(
-    agent_label: &str,
-    observed: &[proxy::ObservedDomain],
+fn emit_observed_domains(snapshot: &proxy::ProxySnapshot, out_file: Option<&Path>) {
+    write_observed_domains(&mut io::stderr().lock(), snapshot, out_file);
+}
+
+fn write_observed_domains(
+    stderr: &mut impl Write,
+    snapshot: &proxy::ProxySnapshot,
     out_file: Option<&Path>,
 ) {
+    let observed = &snapshot.domains;
+    let complete = matches!(
+        snapshot.availability,
+        proxy::SnapshotAvailability::Available
+    ) && matches!(snapshot.completion, proxy::SnapshotCompletion::Settled)
+        && !snapshot.integrity.collector_poisoned
+        && !snapshot.integrity.handler_accounting_failed
+        && snapshot
+            .recorded_attempts
+            .is_some_and(|count| !count.saturated)
+        && snapshot
+            .unretained_observations
+            .is_some_and(|count| count.value == 0 && !count.saturated)
+        && observed.iter().all(|entry| !entry.count.saturated);
     let count = observed.len();
-    eprintln!(
-        "[cplt] observe-domains: {count} domain{} contacted by {agent_label} this session",
+    let _ = writeln!(
+        stderr,
+        "[cplt] observe-domains: {count} proxy-observed retained CONNECT host{}",
         if count == 1 { "" } else { "s" }
     );
-    eprintln!("# add to allowed_domains (or src/agent.rs default_allowed_domains):");
-    eprintln!("# bare hosts, exact-or-subdomain match; collapse subdomains to a parent by hand");
-    eprintln!("# e.g. api.githubcopilot.com + proxy.githubcopilot.com -> githubcopilot.com");
-    for o in observed {
+    let availability = match snapshot.availability {
+        proxy::SnapshotAvailability::Available => "available",
+        proxy::SnapshotAvailability::Failed(_) => "failed",
+    };
+    let completion = match snapshot.completion {
+        proxy::SnapshotCompletion::Settled => "settled",
+        proxy::SnapshotCompletion::DeadlineExceeded { .. } => "deadline exceeded",
+        proxy::SnapshotCompletion::Unavailable { .. } => "unavailable",
+    };
+    let _ = writeln!(
+        stderr,
+        "[cplt] observe-domains: collection: {availability}."
+    );
+    let _ = writeln!(
+        stderr,
+        "[cplt] observe-domains: classification: {completion}."
+    );
+    let _ = writeln!(
+        stderr,
+        "[cplt] observe-domains: network visibility: partial."
+    );
+    let _ = writeln!(
+        stderr,
+        "# retained host evidence for review before updating allowed_domains:"
+    );
+    let _ = writeln!(
+        stderr,
+        "# bare hosts, exact-or-subdomain match; collapse subdomains to a parent by hand"
+    );
+    let _ = writeln!(
+        stderr,
+        "# e.g. api.githubcopilot.com + proxy.githubcopilot.com -> githubcopilot.com"
+    );
+    if !complete {
+        let _ = writeln!(
+            stderr,
+            "[cplt] observe-domains: incomplete host list; do not treat it as a complete allowlist."
+        );
+    }
+    if let proxy::SnapshotAvailability::Failed(reason) = &snapshot.availability {
+        let _ = writeln!(
+            stderr,
+            "[cplt] observe-domains: collection failure: {}.",
+            audit::snapshot_failure_text(reason)
+        );
+    }
+    match snapshot.completion {
+        proxy::SnapshotCompletion::Settled => {}
+        proxy::SnapshotCompletion::DeadlineExceeded {
+            pending_clients,
+            admission,
+        } => {
+            let _ = writeln!(
+                stderr,
+                "[cplt] observe-domains: pending proxy clients: {pending_clients}; admission: {}.",
+                audit::admission_status_text(admission)
+            );
+        }
+        proxy::SnapshotCompletion::Unavailable {
+            pending_clients,
+            admission,
+        } => {
+            let pending = pending_clients
+                .map_or_else(|| "unavailable".to_string(), |count| count.to_string());
+            let _ = writeln!(
+                stderr,
+                "[cplt] observe-domains: pending proxy clients: {pending}; admission: {}.",
+                audit::admission_status_text(admission)
+            );
+        }
+    }
+    if let Some(omitted) = snapshot.unretained_observations
+        && (omitted.value > 0 || omitted.saturated)
+    {
+        let bound = if omitted.saturated { "at least " } else { "" };
+        let _ = writeln!(
+            stderr,
+            "[cplt] observe-domains: observations omitted from host breakdown: {bound}{}; limits: {} hosts, {} bytes per key.",
+            omitted.value, snapshot.retained_host_limit, snapshot.host_key_byte_limit
+        );
+    }
+    for o in observed.iter().take(audit::DOMAIN_DISPLAY_LIMIT) {
         // In pure observe (allow-all) mode every entry is Allowed and prints
         // bare. A Blocked entry can only appear if an allowlist was somehow
         // active; flag it so it is not pasted blindly.
         match o.verdict {
-            proxy::DomainVerdict::Allowed => eprintln!("{}", o.host),
-            proxy::DomainVerdict::Blocked => eprintln!("{}  # BLOCKED this run", o.host),
+            proxy::DomainVerdict::Allowed => {
+                let _ = writeln!(stderr, "{}", o.host.escape_debug());
+            }
+            proxy::DomainVerdict::Blocked => {
+                let _ = writeln!(stderr, "{}  # BLOCKED this run", o.host.escape_debug());
+            }
         }
+    }
+    if count > audit::DOMAIN_DISPLAY_LIMIT {
+        let _ = writeln!(
+            stderr,
+            "[cplt] observe-domains: terminal display omitted {} retained entries",
+            count - audit::DOMAIN_DISPLAY_LIMIT
+        );
     }
 
     if let Some(path) = out_file {
+        let shown_path = path.display().to_string().escape_debug().to_string();
         // The out-file is meant to be a ready-to-use allowlist, so it must
         // contain ONLY hosts that were actually PERMITTED. In observe mode
         // domain filtering is off, but port policy / blocklist / private-IP
@@ -2117,6 +2224,23 @@ fn emit_observed_domains(
         // output above still lists Blocked hosts annotated '# BLOCKED this run'.)
         // If every entry was Blocked the out-file is written empty, which is a
         // valid allowlist.
+        if !complete {
+            let _ = writeln!(
+                stderr,
+                "[cplt] observe-domains: refused to replace {shown_path} because this snapshot is incomplete; the existing target remains unchanged and is not evidence for this run"
+            );
+            return;
+        }
+        if observed
+            .iter()
+            .any(|entry| entry.host.chars().any(char::is_control))
+        {
+            let _ = writeln!(
+                stderr,
+                "[cplt] observe-domains: refused to replace {shown_path} because a retained host contains terminal control characters; the existing target remains unchanged and is not evidence for this run"
+            );
+            return;
+        }
         let allowed: Vec<&str> = observed
             .iter()
             .filter(|o| o.verdict == proxy::DomainVerdict::Allowed)
@@ -2125,15 +2249,60 @@ fn emit_observed_domains(
         let written = allowed.len();
         let body: String = allowed.iter().map(|h| format!("{h}\n")).collect();
         match std::fs::write(path, body) {
-            Ok(()) => eprintln!(
-                "[cplt] observe-domains: wrote {written} domains to {}",
-                path.display()
-            ),
-            Err(e) => ui::warn(&format!(
-                "observe-domains: cannot write {}: {e}",
-                path.display()
-            )),
+            Ok(()) => {
+                let _ = writeln!(
+                    stderr,
+                    "[cplt] observe-domains: wrote {written} domains to {shown_path}"
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    stderr,
+                    "[cplt] observe-domains: cannot write {shown_path}: {e}"
+                );
+            }
         }
+    }
+}
+
+/// Describe the effective routing policy used by this run.
+///
+/// The proxy records CONNECT policy decisions. It does not prove that all
+/// network activity used the proxy, so every route is reported as partial.
+fn network_routing_fact(resolved: &config::Resolved) -> String {
+    if !resolved.with_proxy {
+        return "proxy disabled; direct traffic can bypass observation".to_string();
+    }
+    if !resolved.proxy_forced {
+        return "proxy enabled without forced routing; direct traffic can bypass observation"
+            .to_string();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        "forced proxy on macOS; the profile restricts direct remote routing through the local proxy"
+            .to_string()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_forced_routing_fact(sandbox::available_abi_version())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "forced proxy; platform routing capability unknown".to_string()
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_forced_routing_fact(abi: Option<u32>) -> String {
+    match abi {
+        Some(version) if version < 4 => format!(
+            "forced proxy on Linux (Landlock ABI v{version}); TCP restriction is unavailable, so direct networking is not verified"
+        ),
+        Some(version) => format!(
+            "forced proxy on Linux (Landlock ABI v{version}); the proxy port and configured localhost service ports also permit non-loopback destinations; --allow-port adds only proxy CONNECT permissions"
+        ),
+        None => "forced proxy on Linux (Landlock ABI capability unknown); the proxy port and configured localhost service ports may permit non-loopback destinations; TCP restriction is unverified".to_string(),
     }
 }
 
@@ -2184,8 +2353,8 @@ fn proxy_log_level(
 /// and whether the agent default allowlist is enabled.
 ///
 /// `--observe-domains` forces allow-all exactly like `--allow-all-domains`
-/// (drops both the configured file and the agent defaults so the FULL contacted
-/// set is observed) and additionally forces the proxy on. Both overrides are
+/// (drops the configured file and agent defaults) and forces the proxy on
+/// to collect bounded CONNECT evidence. Both overrides are
 /// flag-gated: with neither flag set the configured / default allowlist stands.
 fn resolve_domain_allowlist_decision(
     observe_domains: bool,
@@ -2342,9 +2511,11 @@ fn start_proxy_if_enabled(
     // domain filtering.
     if allowlist_decision.force_proxy_on {
         resolved.with_proxy = true;
-        ui::warn("observe-domains: proxy in allow-all mode; all traffic permitted and recorded");
         ui::warn(
-            "observe-domains: this run does NOT enforce domain filtering \
+            "observe-domains: domain allowlisting disabled; proxy CONNECT evidence has limited coverage",
+        );
+        ui::warn(
+            "observe-domains: blocklists, port policy, and private-address checks still apply \
              (overrides --preset strict / --default-allowlist / configured allowlist)",
         );
     }
@@ -2378,8 +2549,8 @@ fn start_proxy_if_enabled(
     // allowed_domains file. `resolved.default_allowlist` was already forced off
     // in the config merge when --allow-all-domains is set.
     // --observe-domains forces allow-all exactly like --allow-all-domains: no
-    // allowlist file and (below) no agent default allowlist, so nothing is
-    // blocked and the FULL contacted set is observed. This must override any
+    // allowlist file and (below) no agent default allowlist. Other policy checks
+    // still apply, and only bounded proxy CONNECT evidence is retained. This must override any
     // configured allowlist, not combine with it (fail-closed would hide domains).
     let allowed_domains_file = if allowlist_decision.use_allowed_file {
         resolved.allowed_domains.clone()
@@ -3060,34 +3231,46 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // baseline is captured just before exec and the report printed just after,
     // both in the parent (outside the sandbox) — see audit::run.
     let audit_enabled = resolved.audit && !resolved.quiet;
-    let exit_code = audit::run(&project_dir, &resolved.allow_write, audit_enabled, || {
-        sandbox::exec_sandboxed(
-            &prepared,
-            &agent_bin,
-            &copilot_args,
-            &repo_dirs,
-            &resolved.pass_env,
-            resolved.inherit_env,
-            &disabled_categories,
-            &resolved.deny_env,
-            &resolved.gh_guard,
-            &resolved.git_guard,
-            resolved.quiet,
-        )
-    });
+    let routing = network_routing_fact(&resolved);
+    let needs_snapshot = audit_enabled || cli.observe_domains;
+    let mut proxy_handle = proxy_handle;
+    let (exit_code, snapshot) = audit::run(
+        &project_dir,
+        &resolved.allow_write,
+        audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
+        &routing,
+        || {
+            sandbox::exec_sandboxed(
+                &prepared,
+                &agent_bin,
+                &copilot_args,
+                &repo_dirs,
+                &resolved.pass_env,
+                resolved.inherit_env,
+                &disabled_categories,
+                &resolved.deny_env,
+                &resolved.gh_guard,
+                &resolved.git_guard,
+                resolved.quiet,
+            )
+        },
+        || {
+            proxy_handle.take().and_then(|handle| {
+                if needs_snapshot {
+                    Some(handle.finalize_snapshot(audit::SNAPSHOT_DRAIN_BUDGET))
+                } else {
+                    handle.shutdown();
+                    None
+                }
+            })
+        },
+    );
 
     // Cleanup
-    if let Some(handle) = proxy_handle {
-        // --observe-domains: read the collected set BEFORE shutdown and emit the
-        // ready-to-paste allowlist (always, even under --quiet).
-        if cli.observe_domains {
-            emit_observed_domains(
-                active_agent.display_name(),
-                &handle.observed_domains(),
-                cli.observe_domains_out.as_deref(),
-            );
-        }
-        handle.shutdown();
+    if cli.observe_domains
+        && let Some(snapshot) = snapshot.as_ref()
+    {
+        emit_observed_domains(snapshot, cli.observe_domains_out.as_deref());
     }
     if let Some(mut child) = denial_proc {
         let _ = child.kill();
@@ -4059,33 +4242,45 @@ fn run_exec_command(
     // In exec mode quiet defaults on (scripting UX), so the audit is off unless
     // the user passes --no-quiet.
     let audit_enabled = resolved.audit && !resolved.quiet;
-    let exit_code = audit::run(&project_dir, &resolved.allow_write, audit_enabled, || {
-        sandbox::exec_sandboxed(
-            &prepared,
-            &exec_bin,
-            &exec_args,
-            &repo_dirs,
-            &resolved.pass_env,
-            resolved.inherit_env,
-            &disabled_categories,
-            &resolved.deny_env,
-            &resolved.gh_guard,
-            &resolved.git_guard,
-            resolved.quiet,
-        )
-    });
+    let routing = network_routing_fact(&resolved);
+    let needs_snapshot = audit_enabled || cli.observe_domains;
+    let mut proxy_handle = proxy_handle;
+    let (exit_code, snapshot) = audit::run(
+        &project_dir,
+        &resolved.allow_write,
+        audit::AuditMode::for_run(audit_enabled, cli.observe_domains),
+        &routing,
+        || {
+            sandbox::exec_sandboxed(
+                &prepared,
+                &exec_bin,
+                &exec_args,
+                &repo_dirs,
+                &resolved.pass_env,
+                resolved.inherit_env,
+                &disabled_categories,
+                &resolved.deny_env,
+                &resolved.gh_guard,
+                &resolved.git_guard,
+                resolved.quiet,
+            )
+        },
+        || {
+            proxy_handle.take().and_then(|handle| {
+                if needs_snapshot {
+                    Some(handle.finalize_snapshot(audit::SNAPSHOT_DRAIN_BUDGET))
+                } else {
+                    handle.shutdown();
+                    None
+                }
+            })
+        },
+    );
 
-    if let Some(handle) = proxy_handle {
-        // --observe-domains also works for `cplt exec -- <cmd>`: emit the
-        // observed set before shutdown (always, even under exec's default quiet).
-        if cli.observe_domains {
-            emit_observed_domains(
-                active_agent.display_name(),
-                &handle.observed_domains(),
-                cli.observe_domains_out.as_deref(),
-            );
-        }
-        handle.shutdown();
+    if cli.observe_domains
+        && let Some(snapshot) = snapshot.as_ref()
+    {
+        emit_observed_domains(snapshot, cli.observe_domains_out.as_deref());
     }
 
     Ok(ExitCode::from(exit_code))
@@ -6646,40 +6841,170 @@ mod tests {
     }
 
     #[test]
+    fn linux_routing_text_distinguishes_capability_and_direct_port_grants() {
+        let supported = linux_forced_routing_fact(Some(4));
+        assert!(supported.contains("proxy port and configured localhost service ports"));
+        assert!(supported.contains("non-loopback destinations"));
+        assert!(supported.contains("--allow-port adds only proxy CONNECT permissions"));
+        assert!(linux_forced_routing_fact(Some(3)).contains("TCP restriction is unavailable"));
+        assert!(linux_forced_routing_fact(None).contains("TCP restriction is unverified"));
+    }
+
+    #[test]
     fn emit_observed_domains_writes_sorted_unique_out_file() {
-        use crate::proxy::{DomainVerdict, ObservedDomain};
+        use crate::proxy::{
+            DomainVerdict, ObservationCount, ObservedDomain, ProxySnapshot, SnapshotAvailability,
+            SnapshotCompletion, SnapshotIntegrity,
+        };
         let dir = std::env::temp_dir().join(format!("cplt-observe-emit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("domains.txt");
-        // The list is already sorted+unique (as ProxyHandle::observed_domains
+        // The list is already sorted+unique (as the final snapshot
         // guarantees). The out-file is a ready-to-use allowlist, so it must
         // contain ONLY the Allowed (permitted) hosts, bare, one per line — the
         // Blocked host must be excluded so it is never pasted into an allowlist.
-        let observed = vec![
+        let mut observed = vec![
             ObservedDomain {
                 host: "a.example".into(),
                 verdict: DomainVerdict::Allowed,
-                count: 2,
+                count: ObservationCount {
+                    value: 2,
+                    saturated: false,
+                },
             },
             ObservedDomain {
                 host: "b.example".into(),
                 verdict: DomainVerdict::Blocked,
-                count: 1,
+                count: ObservationCount {
+                    value: 1,
+                    saturated: false,
+                },
             },
             ObservedDomain {
                 host: "c.example".into(),
                 verdict: DomainVerdict::Allowed,
-                count: 1,
+                count: ObservationCount {
+                    value: 1,
+                    saturated: false,
+                },
             },
         ];
-        emit_observed_domains("Copilot", &observed, Some(&out));
+        for index in 0..22 {
+            observed.push(ObservedDomain {
+                host: format!("d{index:02}.example"),
+                verdict: DomainVerdict::Allowed,
+                count: ObservationCount {
+                    value: 1,
+                    saturated: false,
+                },
+            });
+        }
+        let now = std::time::Instant::now();
+        let snapshot = ProxySnapshot {
+            availability: SnapshotAvailability::Available,
+            collection_started_at: now,
+            admission_closed_at: Some(now),
+            cutoff_at: now,
+            completion: SnapshotCompletion::Settled,
+            recorded_attempts: Some(ObservationCount {
+                value: 26,
+                saturated: false,
+            }),
+            unretained_observations: Some(ObservationCount::default()),
+            domains: observed,
+            integrity: SnapshotIntegrity::default(),
+            retained_host_limit: 1024,
+            host_key_byte_limit: 1024,
+        };
+        let mut terminal = Vec::new();
+        write_observed_domains(&mut terminal, &snapshot, Some(&out));
+        let terminal = String::from_utf8(terminal).unwrap();
+        assert!(terminal.contains("terminal display omitted 5 retained entries"));
+        let displayed = snapshot
+            .domains
+            .iter()
+            .filter(|host| terminal.lines().any(|line| line.starts_with(&host.host)))
+            .count();
+        assert_eq!(displayed, audit::DOMAIN_DISPLAY_LIMIT);
         let body = std::fs::read_to_string(&out).unwrap();
         // Allowed hosts are present, in order; the Blocked host is absent.
-        assert_eq!(body, "a.example\nc.example\n");
+        assert!(body.starts_with("a.example\nc.example\nd00.example\n"));
+        assert_eq!(body.lines().count(), 24);
+        assert!(body.ends_with("d21.example\n"));
         assert!(
             !body.contains("b.example"),
             "Blocked host must not appear in the out-file allowlist"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emit_observed_domains_refuses_incomplete_replacement() {
+        use crate::proxy::{
+            AdmissionStatus, DomainVerdict, ObservationCount, ObservedDomain, ProxySnapshot,
+            SnapshotAvailability, SnapshotCompletion, SnapshotIntegrity,
+        };
+        let dir = std::env::temp_dir().join(format!("cplt-observe-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("domains.txt");
+        std::fs::write(&out, "stale.example\n").unwrap();
+        let now = std::time::Instant::now();
+        let snapshot = ProxySnapshot {
+            availability: SnapshotAvailability::Available,
+            collection_started_at: now,
+            admission_closed_at: Some(now),
+            cutoff_at: now,
+            completion: SnapshotCompletion::DeadlineExceeded {
+                pending_clients: 1,
+                admission: AdmissionStatus::Closed,
+            },
+            recorded_attempts: Some(ObservationCount {
+                value: 1,
+                saturated: false,
+            }),
+            unretained_observations: Some(ObservationCount::default()),
+            domains: vec![ObservedDomain {
+                host: "fresh.example".into(),
+                verdict: DomainVerdict::Allowed,
+                count: ObservationCount {
+                    value: 1,
+                    saturated: false,
+                },
+            }],
+            integrity: SnapshotIntegrity::default(),
+            retained_host_limit: 1024,
+            host_key_byte_limit: 1024,
+        };
+        let mut cases = vec![snapshot.clone()];
+        let mut settled = snapshot;
+        settled.completion = SnapshotCompletion::Settled;
+        let mut failed = settled.clone();
+        failed.availability =
+            SnapshotAvailability::Failed(proxy::SnapshotFailure::CollectorPoisoned);
+        cases.push(failed);
+        let mut omitted = settled.clone();
+        omitted.unretained_observations = Some(ObservationCount {
+            value: 1,
+            saturated: false,
+        });
+        cases.push(omitted);
+        let mut saturated = settled.clone();
+        saturated.recorded_attempts = Some(ObservationCount {
+            value: u64::MAX,
+            saturated: true,
+        });
+        cases.push(saturated);
+        let mut hostile = settled;
+        hostile.domains[0].host = "bad\u{1b}[2J.example".to_string();
+        cases.push(hostile);
+        for case in cases {
+            let mut terminal = Vec::new();
+            write_observed_domains(&mut terminal, &case, Some(&out));
+            let terminal = String::from_utf8(terminal).unwrap();
+            assert!(terminal.contains("refused to replace"), "{terminal}");
+            assert!(!terminal.contains('\u{1b}'));
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "stale.example\n");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
