@@ -534,6 +534,11 @@ fn effective_snapshot(
         _ => None,
     };
 
+    // Only feed the raw local document to the value renderer when the loader
+    // actually accepted it — a stale file parses fine but applies nothing, and
+    // rendering from it would put the two views back out of step.
+    let local_doc_for_values = local.as_ref().map(|_| local_doc);
+
     let merge = |local: Option<&config::Config>| {
         config
             .merge_local_with_no_proxy_env(local, config::CliFlags::default(), None)
@@ -542,11 +547,16 @@ fn effective_snapshot(
 
     let mut base = merge(None)?;
     let _ = base.reconcile_proxy_forced();
-    let base_values = resolved_values(&base, global_doc, None);
+    let base_values = resolved_values(&base, global_doc, None, None);
 
     let mut with_local = merge(local.as_ref())?;
     let _ = with_local.reconcile_proxy_forced();
-    let local_values = resolved_values(&with_local, global_doc, local.as_ref());
+    let local_values = resolved_values(
+        &with_local,
+        global_doc,
+        local_doc_for_values,
+        local.as_ref(),
+    );
 
     let mut effective = merge(local.as_ref())?;
     if let Ok(Some(loaded)) = repo_config::load_repo_config(project_dir) {
@@ -555,7 +565,8 @@ fn effective_snapshot(
         effective.apply_repo_config(&loaded.config, &loaded.dir, &approved_refs);
     }
     let _ = effective.reconcile_proxy_forced();
-    let effective_values = resolved_values(&effective, global_doc, local.as_ref());
+    let effective_values =
+        resolved_values(&effective, global_doc, local_doc_for_values, local.as_ref());
 
     Ok(all_config_keys()
         .iter()
@@ -607,13 +618,20 @@ fn approved_repo_keys(project_dir: &Path, repo: &repo_config::RepoConfig) -> Vec
 fn resolved_values(
     resolved: &Resolved,
     global_doc: &toml_edit::DocumentMut,
+    local_doc: Option<&toml_edit::DocumentMut>,
     local: Option<&config::Config>,
 ) -> HashMap<(&'static str, &'static str), String> {
     all_config_keys()
         .iter()
         .map(|key| {
+            // The local document wins, matching the merge. Without this a key
+            // that has no explicit arm below — most scalars — reads only the
+            // global file, so a local-only value renders as global or default
+            // while the launch resolves it from local.
             let fallback = || {
-                get_value_from_doc(global_doc, key)
+                local_doc
+                    .and_then(|doc| get_value_from_doc(doc, key))
+                    .or_else(|| get_value_from_doc(global_doc, key))
                     .unwrap_or_else(|| key.default_display.to_string())
             };
             // A boolean on the precedence ladder reads its effective value

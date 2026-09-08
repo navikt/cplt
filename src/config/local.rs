@@ -248,12 +248,17 @@ pub fn validate_local_document(doc: &toml_edit::DocumentMut) -> Result<(), Confi
 /// write; a `config set --local` in a checkout whose origin has changed is
 /// therefore also how the user re-adopts a file the tripwire stopped.
 pub fn stamp_local_header(doc: &mut toml_edit::DocumentMut, project_dir: &Path) {
-    let table = doc
-        .entry("local")
-        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
-    let Some(table) = table.as_table_mut() else {
-        return;
-    };
+    // A hand-edited `local = "..."` is not a table. Replace it rather than
+    // returning: the header is what tells the loader which project and remote
+    // this file belongs to, so leaving a malformed one in place would stamp
+    // nothing and make the file unadoptable — the very case where the user
+    // most needs the write to repair it.
+    if !doc.get("local").is_some_and(toml_edit::Item::is_table) {
+        doc.insert("local", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let table = doc["local"]
+        .as_table_mut()
+        .expect("just inserted a table above");
     table.insert("path", toml_edit::value(canonical_key(project_dir)));
     table.insert(
         "remote",
