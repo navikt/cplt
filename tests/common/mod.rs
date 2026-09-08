@@ -96,7 +96,16 @@ pub fn git_cmd(dir: &Path) -> Command {
     let mut cmd = Command::new(binary_in_path("git"));
     cmd.current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // The same isolation takes the identity with it, and `git commit` then
+        // fails with "Author identity unknown" — on a bare CI runner, never on
+        // a developer machine that has a global `user.email`. Callers that set
+        // these themselves still win; the point is that forgetting to is no
+        // longer a Linux-only failure discovered in the merge queue.
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com");
     cmd
 }
 
@@ -275,14 +284,7 @@ pub fn bare_origin_repo(dir_in: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) 
     std::fs::create_dir_all(&work).expect("create work dir");
 
     let run = |dir: &Path, args: &[&str]| {
-        let out = git_cmd(dir)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@test.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@test.com")
-            .output()
-            .expect("git should run");
+        let out = git_cmd(dir).args(args).output().expect("git should run");
         assert!(
             out.status.success(),
             "git {args:?} should succeed: {}",
