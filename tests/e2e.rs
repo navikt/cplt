@@ -24,7 +24,8 @@ mod e2e_tests {
     use std::process::Command;
 
     use crate::common::{
-        binary_path, cplt_cmd, cplt_cmd_with_ambient_config, git_cmd, git_ok, temp_repo,
+        bare_origin_repo, binary_path, cplt_cmd, cplt_cmd_with_ambient_config, cplt_local, git_cmd,
+        git_ok, make_config_home, temp_repo,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1950,16 +1951,6 @@ mod e2e_tests {
 
     // ── config set / get e2e tests ────────────────────────────
 
-    fn make_config_home(label: &str) -> PathBuf {
-        let home = std::env::temp_dir().join(format!(
-            ".cplt-e2e-{label}-{}",
-            FAKE_COPILOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-        home
-    }
-
     #[test]
     fn e2e_settings_requires_interactive_terminal() {
         let output = cplt_cmd()
@@ -2334,14 +2325,6 @@ mod e2e_tests {
             .flatten()
             .map(|entry| entry.path())
             .find(|path| path.extension().is_some_and(|ext| ext == "toml"))
-    }
-
-    fn cplt_local(home: &Path, repo: &Path) -> Command {
-        let mut cmd = cplt_cmd();
-        cmd.current_dir(repo)
-            .env("HOME", home.to_str().unwrap())
-            .env_remove("CPLT_CONFIG");
-        cmd
     }
 
     /// The round trip: write a local value, read it back labelled `(local)`,
@@ -5488,39 +5471,7 @@ paths = [
         // Inside the checkout, not /tmp: the sandbox denies process-exec under
         // /private/tmp, so the git this pushes with must live in an
         // exec-allowed location — same reasoning as the guard e2e fixtures.
-        let tmp = tempfile::Builder::new()
-            .prefix(".cplt-e2e-exec-git-guard-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .expect("create temp dir");
-        let origin = tmp.path().join("origin.git");
-        let work = tmp.path().join("work");
-        std::fs::create_dir_all(&work).expect("create work dir");
-
-        let run_git = |dir: &Path, args: &[&str]| {
-            let out = git_cmd(dir)
-                .args(args)
-                .env("GIT_AUTHOR_NAME", "Test")
-                .env("GIT_AUTHOR_EMAIL", "test@test.com")
-                .env("GIT_COMMITTER_NAME", "Test")
-                .env("GIT_COMMITTER_EMAIL", "test@test.com")
-                .output()
-                .expect("git should run");
-            assert!(
-                out.status.success(),
-                "git {args:?} should succeed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run_git(
-            tmp.path(),
-            &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
-        );
-        run_git(&work, &["init", "-b", "main"]);
-        run_git(&work, &["commit", "--allow-empty", "-m", "init"]);
-        run_git(
-            &work,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
+        let (_tmp, work, origin) = bare_origin_repo(Path::new(env!("CARGO_MANIFEST_DIR")));
 
         // The bare origin is outside the project dir, so grant write on it:
         // without the grant a fail-open push would be stopped by the sandbox

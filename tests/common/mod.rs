@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A `CPLT_CONFIG` value that can never name a real file: `/dev/null` is a
 /// character device, so nothing can exist beneath it. Config resolution falls
@@ -43,6 +44,16 @@ pub fn binary_path() -> PathBuf {
 pub fn cplt_cmd() -> Command {
     let mut cmd = Command::new(binary_path());
     cmd.env("CPLT_CONFIG", NO_CONFIG);
+    // Greppable stderr. The summary pads its columns and colours them, so a
+    // test that reads it either matches the escape codes or settles for a
+    // case-insensitive substring — which is what the one test reading the
+    // summary did. NO_COLOR is a documented cplt input (see `ui::no_color`),
+    // not a test-only backdoor.
+    cmd.env("NO_COLOR", "1");
+    // `FORCE_COLOR` outranks `NO_COLOR` in `ui::no_color`, and npm and a good
+    // many CI jobs export it — so without this, colour codes land between
+    // `gh guard:` and `on` on exactly the machines least likely to be watched.
+    cmd.env_remove("FORCE_COLOR");
     cmd
 }
 
@@ -85,7 +96,16 @@ pub fn git_cmd(dir: &Path) -> Command {
     let mut cmd = Command::new(binary_in_path("git"));
     cmd.current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // The same isolation takes the identity with it, and `git commit` then
+        // fails with "Author identity unknown" — on a bare CI runner, never on
+        // a developer machine that has a global `user.email`. Callers that set
+        // these themselves still win; the point is that forgetting to is no
+        // longer a Linux-only failure discovered in the merge queue.
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com");
     cmd
 }
 
@@ -163,4 +183,123 @@ pub fn assert_refused(stderr: &str, ok: bool, reason: &str) {
         stderr.contains(reason),
         "refusal must name {reason:?}.\nstderr: {stderr}"
     );
+}
+
+// ── Golden-path harness (#431) ───────────────────────────────────────
+//
+// The e2e suite asserted on the agent's view of the sandbox and almost never
+// on the operator's view of cplt, because reaching the operator's surfaces
+// cost 40–60 lines of boilerplate per test. These helpers make a golden-path
+// test a few lines: a scratch HOME, a launch, and the two strings it produced.
+
+static SCRATCH_HOME_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// A scratch `HOME` with no cplt config in it.
+///
+/// Every operator-surface assertion needs one: `config set` writes under
+/// `$HOME/.config/cplt`, and the launch reads it back from there, so the two
+/// only agree about the same file if both see the same HOME.
+///
+/// The caller owns the directory; `std::fs::remove_dir_all` it when done.
+///
+/// # Panics
+/// If the directory cannot be created.
+#[must_use]
+pub fn make_config_home(label: &str) -> PathBuf {
+    // The pid is in the name because the counter is not: it is per process, so
+    // two concurrent runs of the same test binary — one in a terminal, one in
+    // an editor — would otherwise pick the same directory, and the
+    // `remove_dir_all` below would delete the other run's HOME mid-launch.
+    let home = std::env::temp_dir().join(format!(
+        ".cplt-e2e-{label}-{}-{}",
+        std::process::id(),
+        SCRATCH_HOME_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("scratch HOME should be creatable");
+    home
+}
+
+/// A `cplt` `Command` that reads `home`'s config from inside `repo`.
+///
+/// `CPLT_CONFIG` is removed, not repointed: the per-repo local layer lives
+/// beside the config file, and the whole point is to exercise the paths
+/// `$HOME/.config/cplt/{config.toml,local/}` that a real run uses.
+#[must_use]
+pub fn cplt_local(home: &Path, repo: &Path) -> Command {
+    let mut cmd = cplt_cmd();
+    cmd.current_dir(repo)
+        .env("HOME", home.to_str().expect("HOME path should be UTF-8"))
+        .env_remove("CPLT_CONFIG");
+    cmd
+}
+
+/// Run `cplt <args>` against `home` from inside `repo`, returning
+/// `(stdout, stderr, status)`.
+///
+/// stderr is where the launch summary, the `(local)` labels and the guard
+/// lines live — the surfaces five defects hid on — so it is returned as a
+/// `String` ready to grep rather than left in the `Output`.
+///
+/// # Panics
+/// If the binary cannot be spawned.
+#[must_use]
+pub fn launch(
+    home: &Path,
+    repo: &Path,
+    args: &[&str],
+) -> (String, String, std::process::ExitStatus) {
+    let output = cplt_local(home, repo)
+        .args(args)
+        .output()
+        .expect("cplt should run");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status,
+    )
+}
+
+/// A work tree with one commit and an `origin` pointing at a bare repository
+/// beside it: `(tempdir, work, origin)`.
+///
+/// The bare origin is what makes a push observable — a push that reaches it
+/// leaves a ref behind, so "the guard refused it" can be told apart from "the
+/// push failed on the way to the guard".
+///
+/// Built inside `dir_in` rather than `/tmp` when the caller passes the
+/// checkout: the macOS sandbox denies process-exec under `/private/tmp`, so a
+/// git that must run inside the sandbox cannot live there.
+///
+/// # Panics
+/// If any git command fails.
+#[must_use]
+pub fn bare_origin_repo(dir_in: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(".cplt-e2e-origin-")
+        .tempdir_in(dir_in)
+        .expect("create temp dir");
+    let origin = tmp.path().join("origin.git");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).expect("create work dir");
+
+    let run = |dir: &Path, args: &[&str]| {
+        let out = git_cmd(dir).args(args).output().expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {args:?} should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(
+        tmp.path(),
+        &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
+    );
+    run(&work, &["init", "-b", "main"]);
+    run(&work, &["commit", "--allow-empty", "-m", "init"]);
+    run(
+        &work,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    (tmp, work, origin)
 }
