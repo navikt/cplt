@@ -5,8 +5,9 @@
 cplt resolves each setting in this order, highest first:
 
 1. CLI flags for the current run (`--with-proxy`, `--no-proxy`, `--proxy-port`, and so on)
-2. The config file, `~/.config/cplt/config.toml`, or whatever `CPLT_CONFIG` points at
-3. Built-in defaults
+2. This project's per-repo user config, `~/.config/cplt/local/<hash>.toml` (see [Per-repo user config](#per-repo-user-config-config-set---local))
+3. The config file, `~/.config/cplt/config.toml`, or whatever `CPLT_CONFIG` points at
+4. Built-in defaults
 
 Per-repo config (`.cplt.toml`) sits outside that hierarchy, as a separate layer with its own rules. See [Per-repo configuration](#per-repo-configuration-cplttoml).
 
@@ -32,6 +33,36 @@ entering a directory, cplt keeps the substitution visible:
   `.envrc` and mise config) to run.
 
 Paths in `[allow]` and `[deny]` support `~/` expansion and resolve relative to the config file's directory. `proxy.blocked_domains` supports `~/` expansion only.
+
+## Per-repo user config (`config set --local`)
+
+Your own settings for one checkout, kept out of the repository:
+
+```bash
+cplt config set --local proxy.port 8443
+cplt config set --local allow.read ~/scratch/spleis
+cplt config path --local       # where this project's file lives
+cplt config local list         # every project with one, and the orphans
+```
+
+The file lives at `~/.config/cplt/local/<sha256 of the checkout's canonical
+path>.toml`, **outside** the repository — which is what lets it widen the
+sandbox the way `config.toml` does. Write access to `~/.config/cplt/` is denied
+inside the sandbox, so the agent cannot write its own grants there; a file in
+the working tree could make no such claim. Dangerous keys still need `--force`,
+and `config show` labels every scalar it supplies `(local)`, dangerous ones
+included. List keys union with the global layer, so they are shown merged and
+unattributed — except `sandbox.repo_dirs`, which only this layer can set.
+
+Two rules are specific to this layer:
+
+- **Absolute paths only.** A relative entry is refused at `config set --local`
+  and again at load: there is no sensible directory for it to anchor to.
+- **A moved or replaced checkout stops applying.** The file records the `origin`
+  it was written for; if a different repository now sits at that path, cplt
+  warns (not suppressed by `--quiet`) and applies nothing. Re-adopt it by
+  setting any key with `--local` again. A checkout that moved leaves an orphan
+  file, which `cplt config local list` marks as "path no longer exists".
 
 ## Quick setup
 

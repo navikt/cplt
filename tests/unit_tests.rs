@@ -5779,6 +5779,7 @@ validate = true
 allow_env_files = false
 allow_localhost_any = false
 pass_env = []
+repo_dirs = []
 inherit_env = false
 allow_lifecycle_scripts = false
 allow_gpg_signing = false
@@ -7169,10 +7170,11 @@ fn config_show_covers_all_registry_keys() {
             result.is_ok(),
             "registry key '{dotted}' cannot be looked up — lookup_key is broken"
         );
-        let (_default_val, from_file) = cplt::config::get_config_value(result.unwrap(), None);
-        assert!(
-            !from_file,
-            "registry key '{dotted}' reports from_file=true without a config file"
+        let (_default_val, layer) = cplt::config::get_config_value(result.unwrap(), None, None);
+        assert_eq!(
+            layer,
+            cplt::config::ConfigLayer::Baseline,
+            "registry key '{dotted}' claims a config layer without a config file"
         );
     }
 }
@@ -7226,6 +7228,7 @@ agents_md = false
 allow_env_files = false
 allow_localhost_any = false
 pass_env = []
+repo_dirs = []
 inherit_env = false
 allow_lifecycle_scripts = false
 allow_gpg_signing = false

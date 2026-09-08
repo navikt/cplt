@@ -23,7 +23,7 @@ use ratatui::{
 };
 
 use crate::config::{
-    self, ConfigKeyInfo, ConfigValueType, RepoKeyTarget, Resolved, all_config_keys,
+    self, ConfigKeyInfo, ConfigLayer, ConfigValueType, RepoKeyTarget, Resolved, all_config_keys,
     append_value_in_doc, get_value_from_doc, repo_key_target, security_confirmation,
     set_repo_value_in_doc, set_value_in_doc, unset_value_in_doc, validate_global_document,
     write_document_atomically, write_repo_document_atomically,
@@ -34,18 +34,27 @@ use crate::{repo_config, trust};
 enum Scope {
     Effective,
     Global,
+    Local,
     Repository,
 }
 
 impl Scope {
-    const ALL: [Self; 3] = [Self::Effective, Self::Global, Self::Repository];
+    const ALL: [Self; 4] = [Self::Effective, Self::Global, Self::Local, Self::Repository];
 
     fn label(self) -> &'static str {
         match self {
             Self::Effective => "Effective",
             Self::Global => "Global",
+            Self::Local => "Local",
             Self::Repository => "Repository",
         }
+    }
+
+    /// Scopes backed by a plain `config.toml`-schema document: global and the
+    /// per-repo user file. They stage, preview and apply identically; only the
+    /// document and the file written differ.
+    fn is_file_scope(self) -> bool {
+        matches!(self, Self::Global | Self::Local)
     }
 }
 
@@ -75,6 +84,10 @@ struct SettingsApp {
     global_path: PathBuf,
     repo_doc: toml_edit::DocumentMut,
     repo_path: PathBuf,
+    local_doc: toml_edit::DocumentMut,
+    /// `None` outside a git repository: the per-repo user file is keyed on the
+    /// checkout's canonical path, so there is nothing to key it on.
+    local_path: Option<PathBuf>,
     project_dir: PathBuf,
     effective: HashMap<(&'static str, &'static str), EffectiveSetting>,
     dangerous_confirmation: Option<String>,
@@ -89,7 +102,13 @@ impl SettingsApp {
             .ok_or("cannot determine project directory")?;
         let repo_path = project_dir.join(repo_config::REPO_CONFIG_FILE);
         let repo_doc = load_doc(&repo_path)?;
-        let effective = effective_snapshot(&global_doc, &project_dir)?;
+        let local_path = detect_project_root().and_then(|dir| config::local_path(&dir));
+        let local_doc = match &local_path {
+            Some(path) => load_doc(path)?,
+            None => toml_edit::DocumentMut::new(),
+        };
+        let effective =
+            effective_snapshot(&global_doc, &local_doc, local_path.as_deref(), &project_dir)?;
         Ok(Self {
             scope: Scope::Effective,
             selected: 0,
@@ -104,6 +123,8 @@ impl SettingsApp {
             global_path,
             repo_doc,
             repo_path,
+            local_doc,
+            local_path,
             project_dir,
             effective,
             dangerous_confirmation: None,
@@ -134,6 +155,12 @@ impl SettingsApp {
         self.scope = scope;
         self.selected = 0;
         self.status = match scope {
+            Scope::Local if self.local_path.is_none() => {
+                "Local settings need a git repository: the file is keyed on the checkout's path."
+                    .to_string()
+            }
+            Scope::Local => "Local settings apply to this checkout only (~/.config/cplt/local/)."
+                .to_string(),
             Scope::Repository => {
                 "Repository edits update the working tree. Commit .cplt.toml, then review with `cplt trust`."
                     .to_string()
@@ -143,21 +170,38 @@ impl SettingsApp {
     }
 
     fn stage(&mut self, key: &'static ConfigKeyInfo, value: Option<String>) {
+        // The same refusal `cplt config set` gives: a machine-wide repository
+        // list attaches to every session, so the loader drops it with a warning
+        // on the next launch. Staging it here would write a file cplt itself
+        // ignores.
+        if self.scope == Scope::Global && key.section == "sandbox" && key.key == "repo_dirs" {
+            self.status =
+                "sandbox.repo_dirs is per-project, not machine-wide. Switch to Local.".to_string();
+            return;
+        }
+        if self.scope == Scope::Local && self.local_path.is_none() {
+            self.status =
+                "Local settings need a git repository. Switch to Global or Repository.".to_string();
+            return;
+        }
         self.pending.retain(|change| {
             !(change.key.section == key.section
                 && change.key.key == key.key
                 && change.scope == self.scope)
         });
         let is_original = match self.scope {
-            Scope::Global => match value.as_deref() {
-                Some(value) if !key.value_type.is_array() => {
-                    get_value_from_doc(&self.global_doc, key)
-                        .unwrap_or_else(|| key.default_display.to_string())
-                        == value
+            scope if scope.is_file_scope() => {
+                let doc = self.file_doc();
+                match value.as_deref() {
+                    Some(value) if !key.value_type.is_array() => {
+                        get_value_from_doc(doc, key)
+                            .unwrap_or_else(|| key.default_display.to_string())
+                            == value
+                    }
+                    None => get_value_from_doc(doc, key).is_none(),
+                    _ => false,
                 }
-                None => get_value_from_doc(&self.global_doc, key).is_none(),
-                _ => false,
-            },
+            }
             Scope::Repository => match value.as_deref() {
                 Some("true")
                     if matches!(repo_key_target(key), Some(RepoKeyTarget::ProposeBool)) =>
@@ -167,7 +211,7 @@ impl SettingsApp {
                 None => repo_value_is_unset(&self.repo_doc, key),
                 _ => false,
             },
-            Scope::Effective => true,
+            _ => true,
         };
         if !is_original {
             self.pending.push(PendingChange {
@@ -196,8 +240,8 @@ impl SettingsApp {
             return;
         }
         if self.scope == Scope::Effective {
-            self.status =
-                "Effective values are read-only. Switch to Global or Repository.".to_string();
+            self.status = "Effective values are read-only. Switch to Global, Local or Repository."
+                .to_string();
             return;
         }
         if self.scope == Scope::Repository {
@@ -212,7 +256,7 @@ impl SettingsApp {
                 self.stage(key, Some("true".to_string()));
             }
         } else {
-            let preview = self.preview_global_doc();
+            let preview = self.preview_file_doc();
             let value = get_value_from_doc(&preview, key)
                 .unwrap_or_else(|| key.default_display.to_string());
             self.stage(
@@ -227,8 +271,8 @@ impl SettingsApp {
             return;
         };
         if self.scope == Scope::Effective {
-            self.status =
-                "Effective values are read-only. Switch to Global or Repository.".to_string();
+            self.status = "Effective values are read-only. Switch to Global, Local or Repository."
+                .to_string();
             return;
         }
         if key.value_type == ConfigValueType::ArrayOfTables {
@@ -244,8 +288,8 @@ impl SettingsApp {
                 key.section, key.key
             );
             String::new()
-        } else if self.scope == Scope::Global && !key.value_type.is_array() {
-            get_value_from_doc(&self.preview_global_doc(), key).unwrap_or_default()
+        } else if self.scope.is_file_scope() && !key.value_type.is_array() {
+            get_value_from_doc(&self.preview_file_doc(), key).unwrap_or_default()
         } else {
             String::new()
         };
@@ -306,13 +350,19 @@ impl SettingsApp {
         }
         let mut global = self.global_doc.clone();
         let mut repo = self.repo_doc.clone();
+        let mut local = self.local_doc.clone();
         let mut write_global = false;
         let mut write_repo = false;
+        let mut write_local = false;
         for change in &self.pending {
             match change.scope {
                 Scope::Global => {
                     apply_global_change(&mut global, change)?;
                     write_global = true;
+                }
+                Scope::Local => {
+                    apply_global_change(&mut local, change)?;
+                    write_local = true;
                 }
                 Scope::Repository => {
                     apply_repo_change(&mut repo, change)?;
@@ -333,6 +383,22 @@ impl SettingsApp {
             validate_global_document(&global)
                 .map_err(|error| format!("refusing to write invalid global config: {error}"))?;
         }
+        if write_local {
+            let path = self
+                .local_path
+                .clone()
+                .ok_or("local settings need a git repository")?;
+            let project_dir =
+                detect_project_root().ok_or("local settings need a git repository")?;
+            // Same header the writer stamps at `config set --local`: the
+            // recorded remote must be the normalized one the loader compares
+            // against, or the next launch trips the staleness wire.
+            config::stamp_local_header(&mut local, &project_dir);
+            config::validate_local_document(&local)
+                .map_err(|error| format!("refusing to write invalid local config: {error}"))?;
+            write_document_atomically(&path, &local).map_err(|error| error.to_string())?;
+            self.local_doc = local;
+        }
         if write_global {
             write_document_atomically(&self.global_path, &global)
                 .map_err(|error| error.to_string())?;
@@ -343,20 +409,39 @@ impl SettingsApp {
                 .map_err(|error| error.to_string())?;
             self.repo_doc = repo;
         }
-        self.effective = effective_snapshot(&self.global_doc, &self.project_dir)?;
+        self.effective = effective_snapshot(
+            &self.global_doc,
+            &self.local_doc,
+            self.local_path.as_deref(),
+            &self.project_dir,
+        )?;
         let count = self.pending.len();
         self.pending.clear();
         self.status = format!("Saved {count} change(s) atomically.");
         Ok(())
     }
 
-    fn preview_global_doc(&self) -> toml_edit::DocumentMut {
-        let mut doc = self.global_doc.clone();
-        for change in self
-            .pending
-            .iter()
-            .filter(|change| change.scope == Scope::Global)
-        {
+    /// The document behind the current file scope.
+    fn file_doc(&self) -> &toml_edit::DocumentMut {
+        if self.scope == Scope::Local {
+            &self.local_doc
+        } else {
+            &self.global_doc
+        }
+    }
+
+    /// The current file scope's document with its staged changes applied.
+    fn preview_file_doc(&self) -> toml_edit::DocumentMut {
+        self.preview_doc(self.scope)
+    }
+
+    fn preview_doc(&self, scope: Scope) -> toml_edit::DocumentMut {
+        let mut doc = if scope == Scope::Local {
+            self.local_doc.clone()
+        } else {
+            self.global_doc.clone()
+        };
+        for change in self.pending.iter().filter(|change| change.scope == scope) {
             let _ = apply_global_change(&mut doc, change);
         }
         doc
@@ -421,28 +506,67 @@ fn load_doc(path: &std::path::Path) -> Result<toml_edit::DocumentMut, String> {
         .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))
 }
 
+/// The effective value and source of every key.
+///
+/// Booleans get their source from the resolver, which returns the layer it
+/// resolved from — no diffing, no second ladder. Everything else is not on
+/// that ladder and is still attributed by diffing merges: global only, then
+/// +local, then +repo, and the first merge that changes a value names the
+/// layer. Deleting the diff entirely needs a layer for scalars and lists too,
+/// which the resolver does not have yet.
 fn effective_snapshot(
     global_doc: &toml_edit::DocumentMut,
+    local_doc: &toml_edit::DocumentMut,
+    local_path: Option<&Path>,
     project_dir: &Path,
 ) -> Result<HashMap<(&'static str, &'static str), EffectiveSetting>, String> {
     let config =
         config::Config::parse(&global_doc.to_string()).map_err(|error| error.to_string())?;
-    let mut base = config
-        .merge_with_no_proxy_env(config::CliFlags::default(), None)
-        .map_err(|error| error.to_string())?;
-    let _ = base.reconcile_proxy_forced();
-    let base_values = resolved_values(&base, global_doc);
+    // Through the launch's own loader, not a bare `Config::parse`: that skipped
+    // the `[local]` header strip and the staleness tripwire, so a file the
+    // launch refuses to apply still showed as in force here. The Effective view
+    // and the launch must not disagree about what is in force.
+    let local = match local_path {
+        Some(path) if !local_doc.is_empty() => {
+            config::parse_local_doc(&local_doc.to_string(), path, project_dir)
+                .map_err(|error| error.to_string())?
+        }
+        _ => None,
+    };
 
-    let mut effective = config
-        .merge_with_no_proxy_env(config::CliFlags::default(), None)
-        .map_err(|error| error.to_string())?;
+    // Only feed the raw local document to the value renderer when the loader
+    // actually accepted it — a stale file parses fine but applies nothing, and
+    // rendering from it would put the two views back out of step.
+    let local_doc_for_values = local.as_ref().map(|_| local_doc);
+
+    let merge = |local: Option<&config::Config>| {
+        config
+            .merge_local_with_no_proxy_env(local, config::CliFlags::default(), None)
+            .map_err(|error| error.to_string())
+    };
+
+    let mut base = merge(None)?;
+    let _ = base.reconcile_proxy_forced();
+    let base_values = resolved_values(&base, global_doc, None, None);
+
+    let mut with_local = merge(local.as_ref())?;
+    let _ = with_local.reconcile_proxy_forced();
+    let local_values = resolved_values(
+        &with_local,
+        global_doc,
+        local_doc_for_values,
+        local.as_ref(),
+    );
+
+    let mut effective = merge(local.as_ref())?;
     if let Ok(Some(loaded)) = repo_config::load_repo_config(project_dir) {
         let approved = approved_repo_keys(project_dir, &loaded.config);
         let approved_refs: Vec<&str> = approved.iter().map(String::as_str).collect();
         effective.apply_repo_config(&loaded.config, &loaded.dir, &approved_refs);
     }
     let _ = effective.reconcile_proxy_forced();
-    let effective_values = resolved_values(&effective, global_doc);
+    let effective_values =
+        resolved_values(&effective, global_doc, local_doc_for_values, local.as_ref());
 
     Ok(all_config_keys()
         .iter()
@@ -452,14 +576,26 @@ fn effective_snapshot(
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| key.default_display.to_string());
-            let source = if base_values.get(&id) != Some(&value) {
-                "repository"
-            } else if get_value_from_doc(global_doc, key).is_some() {
-                "global"
-            } else if value != key.default_display {
-                "preset"
-            } else {
-                "default"
+            let source = match effective.bool_layer(key.section, key.key) {
+                Some(ConfigLayer::Local) => "local",
+                Some(ConfigLayer::Repo) => "repository",
+                Some(ConfigLayer::Global) => "global",
+                Some(ConfigLayer::Cli) => "cli",
+                // `Baseline` is "no file said otherwise" — preset or hardcoded
+                // default, which the ladder does not distinguish. Fall through.
+                Some(ConfigLayer::Baseline) | None => {
+                    if local_values.get(&id) != Some(&value) {
+                        "repository"
+                    } else if base_values.get(&id) != Some(&value) {
+                        "local"
+                    } else if get_value_from_doc(global_doc, key).is_some() {
+                        "global"
+                    } else if value != key.default_display {
+                        "preset"
+                    } else {
+                        "default"
+                    }
+                }
             };
             (id, EffectiveSetting { value, source })
         })
@@ -482,12 +618,20 @@ fn approved_repo_keys(project_dir: &Path, repo: &repo_config::RepoConfig) -> Vec
 fn resolved_values(
     resolved: &Resolved,
     global_doc: &toml_edit::DocumentMut,
+    local_doc: Option<&toml_edit::DocumentMut>,
+    local: Option<&config::Config>,
 ) -> HashMap<(&'static str, &'static str), String> {
     all_config_keys()
         .iter()
         .map(|key| {
+            // The local document wins, matching the merge. Without this a key
+            // that has no explicit arm below — most scalars — reads only the
+            // global file, so a local-only value renders as global or default
+            // while the launch resolves it from local.
             let fallback = || {
-                get_value_from_doc(global_doc, key)
+                local_doc
+                    .and_then(|doc| get_value_from_doc(doc, key))
+                    .or_else(|| get_value_from_doc(global_doc, key))
                     .unwrap_or_else(|| key.default_display.to_string())
             };
             // A boolean on the precedence ladder reads its effective value
@@ -527,6 +671,13 @@ fn resolved_values(
                     .preset
                     .map_or_else(|| "standard".to_string(), |preset| preset.to_string()),
                 ("sandbox", "pass_env") => format_strings(&resolved.pass_env),
+                // Local-layer only, and not on `Resolved` at all: the launch
+                // reads it straight off the local config. Falling through to
+                // the global document showed `[]` while the local file named
+                // repositories the session really would put in scope.
+                ("sandbox", "repo_dirs") => {
+                    format_strings(local.map_or(&[][..], |l| &l.sandbox.repo_dirs))
+                }
                 ("sandbox", "use_bubblewrap") => resolved
                     .use_bubblewrap
                     .map_or_else(|| "auto-detect".to_string(), |value| value.to_string()),
@@ -819,7 +970,8 @@ fn render(frame: &mut ratatui::Frame, app: &mut SettingsApp) {
         layout[0],
     );
     let keys = app.visible_keys();
-    let global_preview = app.preview_global_doc();
+    let global_preview = app.preview_doc(Scope::Global);
+    let local_preview = app.preview_doc(Scope::Local);
     let repo_preview = app.preview_repo_doc();
     let rows = keys.iter().map(|key| {
         let setting = app.effective.get(&(key.section, key.key));
@@ -829,6 +981,8 @@ fn render(frame: &mut ratatui::Frame, app: &mut SettingsApp) {
                 |setting| setting.value.clone(),
             ),
             Scope::Global => get_value_from_doc(&global_preview, key)
+                .unwrap_or_else(|| key.default_display.to_string()),
+            Scope::Local => get_value_from_doc(&local_preview, key)
                 .unwrap_or_else(|| key.default_display.to_string()),
             Scope::Repository => repo_value_label(&repo_preview, key),
         };
@@ -843,6 +997,15 @@ fn render(frame: &mut ratatui::Frame, app: &mut SettingsApp) {
             Scope::Global if staged => "staged",
             Scope::Global => {
                 if get_value_from_doc(&app.global_doc, key).is_some() {
+                    "set"
+                } else {
+                    "inherited"
+                }
+            }
+            Scope::Local if staged => "staged",
+            Scope::Local if app.local_path.is_none() => "no repository",
+            Scope::Local => {
+                if get_value_from_doc(&app.local_doc, key).is_some() {
                     "set"
                 } else {
                     "inherited"
@@ -984,6 +1147,8 @@ mod tests {
         SettingsApp {
             scope: Scope::Global,
             selected: 0,
+            local_doc: toml_edit::DocumentMut::new(),
+            local_path: None,
             filter: String::new(),
             editing_filter: false,
             editing_value: false,
@@ -1050,6 +1215,8 @@ mod tests {
         let app = SettingsApp {
             scope: Scope::Repository,
             selected: 0,
+            local_doc: toml_edit::DocumentMut::new(),
+            local_path: None,
             filter: String::new(),
             editing_filter: false,
             editing_value: false,
@@ -1090,7 +1257,8 @@ mod tests {
             .parse::<toml_edit::DocumentMut>()
             .unwrap();
 
-        let snapshot = effective_snapshot(&doc, project.path()).unwrap();
+        let snapshot =
+            effective_snapshot(&doc, &toml_edit::DocumentMut::new(), None, project.path()).unwrap();
 
         assert_eq!(snapshot.get(&("proxy", "forced")).unwrap().value, "true");
         assert_eq!(
@@ -1105,6 +1273,76 @@ mod tests {
         // default; the guards are default-on since #122, so under `strict` they
         // agree with the default and are attributed to it.
         assert_eq!(snapshot.get(&("proxy", "forced")).unwrap().source, "preset");
+    }
+
+    /// The Effective view and the launch must agree. A local file whose
+    /// recorded remote no longer matches `origin` is not applied at launch, so
+    /// showing its values here as if they were in force is the TUI lying about
+    /// what the next session will do.
+    #[test]
+    fn effective_snapshot_drops_a_stale_local_file() {
+        let project = tempfile::tempdir().unwrap();
+        let global = toml_edit::DocumentMut::new();
+        let local_path = project.path().join("local.toml");
+
+        // No `[local]` header: nothing recorded, nothing to trip.
+        let fresh = "[sandbox]\nquiet = true\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let snapshot =
+            effective_snapshot(&global, &fresh, Some(local_path.as_path()), project.path())
+                .unwrap();
+        assert_eq!(snapshot.get(&("sandbox", "quiet")).unwrap().value, "true");
+
+        // A recorded remote the directory does not have: the tripwire fires and
+        // the launch ignores the whole file, so this view must too.
+        let stale = "[local]\npath = \"\"\nremote = \"github.com/navikt/gone\"\nwritten_at = \"\"\n\n[sandbox]\nquiet = true\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let snapshot =
+            effective_snapshot(&global, &stale, Some(local_path.as_path()), project.path())
+                .unwrap();
+        assert_eq!(snapshot.get(&("sandbox", "quiet")).unwrap().value, "false");
+    }
+
+    /// `sandbox.repo_dirs` is not on `Resolved`, so the value fell through to
+    /// the global document and showed `[]` while the local file named
+    /// repositories the session really would put in scope.
+    #[test]
+    fn effective_snapshot_shows_local_repo_dirs() {
+        let project = tempfile::tempdir().unwrap();
+        let local = "[sandbox]\nrepo_dirs = [\"/repo/inner\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+
+        let snapshot = effective_snapshot(
+            &toml_edit::DocumentMut::new(),
+            &local,
+            Some(std::path::Path::new("local.toml")),
+            project.path(),
+        )
+        .unwrap();
+
+        let row = snapshot.get(&("sandbox", "repo_dirs")).unwrap();
+        assert_eq!(row.value, "[/repo/inner]");
+        assert_eq!(row.source, "local");
+    }
+
+    /// The CLI refuses `sandbox.repo_dirs` outside `--local`; the TUI must too,
+    /// or it writes a global file the next launch warns about and clears.
+    #[test]
+    fn global_scope_refuses_repo_dirs() {
+        let mut app = test_app("");
+        app.scope = Scope::Global;
+        let key = all_config_keys()
+            .iter()
+            .find(|key| key.section == "sandbox" && key.key == "repo_dirs")
+            .unwrap();
+
+        app.stage(key, Some("/repo/inner".to_string()));
+
+        assert!(app.pending.is_empty(), "nothing may be staged globally");
+        assert!(app.status.contains("Local"), "{}", app.status);
     }
 
     #[test]

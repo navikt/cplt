@@ -208,6 +208,9 @@ pub struct DetectContext {
 /// Max file size to read for content scanning (256 KB).
 const MAX_READ_SIZE: u64 = 256 * 1024;
 
+/// Max root directory entries considered by [`DetectContext::root_file_names`].
+const MAX_ROOT_ENTRIES: usize = 500;
+
 impl DetectContext {
     pub fn new(root: &Path) -> Self {
         Self {
@@ -257,6 +260,24 @@ impl DetectContext {
             return None;
         }
         std::fs::read_to_string(&path).ok()
+    }
+
+    /// Root-level file names, best-effort and unordered.
+    ///
+    /// For detectors that must scan files whose *names* vary between projects
+    /// — a bootstrap script is `hentEnv.sh` in one repo and `get-secret.sh` in
+    /// the next — so an `exists()` probe cannot find them. Capped so a
+    /// pathological directory cannot stall detection.
+    pub fn root_file_names(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .take(MAX_ROOT_ENTRIES)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect()
     }
 
     /// Project root path.
@@ -359,6 +380,10 @@ pub const DETECTORS: &[DetectorSpec] = &[
     DetectorSpec {
         id: "cypress",
         detect: detect_cypress,
+    },
+    DetectorSpec {
+        id: "nais_bootstrap",
+        detect: detect_nais_bootstrap,
     },
 ];
 
@@ -1057,6 +1082,193 @@ fn detect_cypress(ctx: &DetectContext) -> DetectorOutput {
 }
 
 // ── Helper functions ─────────────────────────────────────────────────
+
+// ── NAIS local bootstrap ─────────────────────────────────────────────
+
+/// `nais` CLI invocations that mean "this repo bootstraps local development by
+/// pulling secrets out of the cluster", as opposed to merely deploying to NAIS.
+/// The deploy manifests alone are not this shape and must not fire the
+/// detector — the `.nais/` directory is evidence, never a trigger.
+const NAIS_CLI_MARKERS: &[&str] = &[
+    "nais device",
+    "naisdevice",
+    "nais login",
+    "nais auth login",
+    "nais secret get",
+    "nais app env",
+];
+
+/// NAV-internal DNS suffixes. These resolve into private address space, so the
+/// proxy's SSRF guard refuses them unless `proxy.allow_private_domains` lists
+/// them — suffix-matched, so one entry covers every host underneath.
+const NAV_PRIVATE_SUFFIXES: &[&str] = &[
+    "intern.nav.no",
+    "intern.dev.nav.no",
+    "adeo.no",
+    "nav.cloud.nais.io",
+];
+
+const COMPOSE_FILES: &[&str] = &[
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+];
+
+fn collect_nav_private(content: &str, out: &mut BTreeSet<String>) {
+    for suffix in NAV_PRIVATE_SUFFIXES {
+        if content.contains(suffix) {
+            out.insert((*suffix).to_string());
+        }
+    }
+}
+
+/// Detect the documented NAV bootstrap flow: a script that checks
+/// `nais device status`, pulls secrets with `nais secret get` / `nais app env`,
+/// writes a `.env`, and hands it to docker-compose or the app.
+///
+/// That flow meets three *separate* refusals under cplt — the `.env` read, the
+/// private internal hosts, and the cloud CLIs that cannot execute in the
+/// sandbox — at three different moments. None of the three defaults is wrong,
+/// so this detector does not weaken them: it exists so the developer is told
+/// about all three at once, before collecting them one refusal at a time.
+fn detect_nais_bootstrap(ctx: &DetectContext) -> DetectorOutput {
+    let mut names: Vec<String> = ctx
+        .root_file_names()
+        .into_iter()
+        .filter(|n| n.ends_with(".sh") || n.eq_ignore_ascii_case("README.md"))
+        .collect();
+    names.sort();
+
+    let mut signals = Vec::new();
+    let mut private_domains: BTreeSet<String> = BTreeSet::new();
+    let mut driver: Option<String> = None;
+    let mut env_evidence = false;
+
+    for name in &names {
+        let Some(content) = ctx.read_text(name) else {
+            continue;
+        };
+        if !NAIS_CLI_MARKERS.iter().any(|m| content.contains(m)) {
+            continue;
+        }
+        collect_nav_private(&content, &mut private_domains);
+        if driver.is_none() {
+            driver = Some(name.clone());
+            signals.push(Signal::FileContains {
+                path: name.clone(),
+                reason: "drives the nais CLI (device status / app env / secret get)",
+            });
+        }
+        if content.contains(".env") {
+            env_evidence = true;
+            signals.push(Signal::FileContains {
+                path: name.clone(),
+                reason: "writes a .env the app then reads back",
+            });
+        }
+    }
+
+    let Some(driver) = driver else {
+        return DetectorOutput::none();
+    };
+
+    for file in [".env.template", ".env.example", ".env.sample"] {
+        if ctx.exists(file) {
+            env_evidence = true;
+            signals.push(Signal::FileExists {
+                path: file.to_string(),
+            });
+        }
+    }
+
+    if ctx
+        .read_text(".gitignore")
+        .is_some_and(|c| c.lines().any(|l| l.trim_start().contains(".env")))
+    {
+        env_evidence = true;
+        signals.push(Signal::FileContains {
+            path: ".gitignore".to_string(),
+            reason: "ignores .env, so it is generated locally",
+        });
+    }
+
+    for file in COMPOSE_FILES {
+        let Some(content) = ctx.read_text(file) else {
+            continue;
+        };
+        collect_nav_private(&content, &mut private_domains);
+        if content.contains("env_file") || content.contains(".env") {
+            env_evidence = true;
+            signals.push(Signal::FileContains {
+                path: (*file).to_string(),
+                reason: "loads the generated .env",
+            });
+        }
+    }
+
+    // The nais CLI without a generated .env is just a deploy workflow; the
+    // combined proposal only applies when both halves are present.
+    if !env_evidence {
+        return DetectorOutput::none();
+    }
+
+    for dir in [".nais", "nais"] {
+        if ctx.dir_exists(dir) {
+            signals.push(Signal::DirExists {
+                path: dir.to_string(),
+            });
+        }
+    }
+    for file in ["nais.yaml", "nais.yml"] {
+        if ctx.exists(file) {
+            signals.push(Signal::FileExists {
+                path: file.to_string(),
+            });
+        }
+    }
+
+    let mut suggestions = vec![Suggestion::Propose(SandboxFlag::AllowEnvFiles)];
+    suggestions.extend(
+        private_domains
+            .iter()
+            .map(|d| Suggestion::AllowPrivateDomain(d.clone())),
+    );
+
+    let domains_clause = if private_domains.is_empty() {
+        "add whichever internal hosts the app reaches to proxy.allow_private_domains".to_string()
+    } else {
+        format!(
+            "proxy.allow_private_domains = [{}]",
+            private_domains
+                .iter()
+                .map(|d| format!("\"{d}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let message = format!(
+        "{driver} bootstraps local development by pulling secrets with the nais CLI into a .env. \
+         Three defaults stand in the way, at three different moments, and all three are deliberate: \
+         (1) reading .env* is denied — set sandbox.allow_env_files = true (or pass --allow-env-files); \
+         (2) NAV-internal hosts resolve into private address space and the proxy refuses them — {domains_clause}; \
+         (3) gcloud/aws/az cannot execute inside the sandbox, and that stays so — run {driver} \
+         outside cplt first, then start the agent on the .env it produced."
+    );
+
+    DetectorOutput {
+        detection: Some(Detection {
+            name: "NAIS local bootstrap",
+            signals,
+            suggestions,
+        }),
+        diagnostics: vec![Diagnostic {
+            detector: "nais_bootstrap",
+            message,
+        }],
+    }
+}
 
 /// Extract a port number from package.json scripts (best-effort).
 /// Looks for patterns like `--port 3000`, `--port=3000`, `-p 8080`.
@@ -2064,6 +2276,134 @@ mod tests {
 
     fn setup_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// Shaped like `navikt/familie-ba-sak`: a bash script that gates on
+    /// `nais device status`, pulls a secret, writes `.env`, and a compose file
+    /// that reads it back.
+    fn write_nais_bootstrap_repo(root: &Path) {
+        fs::write(
+            root.join("hentEnv.sh"),
+            "#!/bin/bash\n\
+             if [[ \"$(nais device status)\" != *\"Connected\"* ]]; then exit 1; fi\n\
+             APP_ENV=$(nais app env myapp -e dev-gcp -t teamfamilie -o json)\n\
+             nais secret get azure-myapp --with-values -o json > /dev/null\n\
+             printf '%s' \"$UTDATA\" > .env\n",
+        )
+        .unwrap();
+        fs::write(root.join(".gitignore"), "/target\n/.env\n").unwrap();
+        fs::write(
+            root.join("docker-compose.yaml"),
+            "services:\n  texas:\n    env_file: .env\n    environment:\n      URL: https://myapp.intern.dev.nav.no\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".nais")).unwrap();
+        fs::write(root.join("pom.xml"), "<project/>").unwrap();
+    }
+
+    fn nais_detection(report: &DetectionReport) -> Option<&Detection> {
+        report
+            .detections
+            .iter()
+            .find(|d| d.name == "NAIS local bootstrap")
+    }
+
+    #[test]
+    fn nais_bootstrap_fires_on_a_navikt_shaped_repo() {
+        let dir = setup_dir();
+        write_nais_bootstrap_repo(dir.path());
+        let report = detect_project(dir.path());
+        let d = nais_detection(&report).expect("NAIS bootstrap must be detected");
+
+        // Every piece of evidence is named, not just the first one.
+        let signals: Vec<String> = d.signals.iter().map(ToString::to_string).collect();
+        let joined = signals.join(" | ");
+        for expected in ["hentEnv.sh", ".gitignore", "docker-compose.yaml", ".nais"] {
+            assert!(
+                joined.contains(expected),
+                "missing signal {expected} in {joined}"
+            );
+        }
+
+        // One proposal covering every applicable remedy.
+        assert!(
+            d.suggestions
+                .contains(&Suggestion::Propose(SandboxFlag::AllowEnvFiles))
+        );
+        assert!(
+            d.suggestions.contains(&Suggestion::AllowPrivateDomain(
+                "intern.dev.nav.no".to_string()
+            )),
+            "the internal host seen in compose must be proposed"
+        );
+
+        // ...and one message naming all three refusals, including the one that
+        // has no config remedy at all.
+        let diag = report
+            .diagnostics
+            .iter()
+            .find(|d| d.detector == "nais_bootstrap")
+            .expect("the combined explanation must be emitted once");
+        for piece in [
+            "allow_env_files",
+            "allow_private_domains",
+            "gcloud",
+            "hentEnv.sh",
+        ] {
+            assert!(
+                diag.message.contains(piece),
+                "diagnostic must mention {piece}: {}",
+                diag.message
+            );
+        }
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|d| d.detector == "nais_bootstrap")
+                .count(),
+            1,
+            "say it once, not three times"
+        );
+    }
+
+    #[test]
+    fn nais_bootstrap_ignores_ordinary_projects() {
+        let dir = setup_dir();
+        fs::write(dir.path().join("package.json"), "{\"name\":\"app\"}").unwrap();
+        fs::write(dir.path().join(".gitignore"), ".env\n").unwrap();
+        fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  db:\n    env_file: .env\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("setup.sh"),
+            "#!/bin/sh\ncp .env.example .env\n",
+        )
+        .unwrap();
+        let report = detect_project(dir.path());
+        assert!(
+            nais_detection(&report).is_none(),
+            "a .env-using project without the nais CLI is not this flow"
+        );
+    }
+
+    #[test]
+    fn nais_deploy_only_repo_does_not_fire() {
+        let dir = setup_dir();
+        fs::create_dir_all(dir.path().join(".nais")).unwrap();
+        fs::write(
+            dir.path().join("README.md"),
+            "Deployed to NAIS. Run `nais login` to inspect the cluster.\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "plugins {}").unwrap();
+        let report = detect_project(dir.path());
+        assert!(
+            nais_detection(&report).is_none(),
+            "nais CLI without a generated .env is a deploy workflow, not a bootstrap"
+        );
     }
 
     // ── DetectContext tests ──────────────────────────────────────────

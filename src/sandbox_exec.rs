@@ -570,9 +570,19 @@ fn install_command_wrappers(
                     Some(_) => {}
                     None => {
                         if !quiet {
+                            // "--repo-dir" would be a lie for a root that came
+                            // from `sandbox.repo_dirs` in the local config —
+                            // the source is not carried this far — so name the
+                            // root, which is true either way. The reason comes
+                            // from the capture itself, so "no origin at all"
+                            // and "an origin cplt cannot parse as a GitHub
+                            // repository" do not read the same.
+                            let reason = crate::gh_proxy::detect_current_repo(real_git, dir)
+                                .err()
+                                .unwrap_or_else(|| "no GitHub origin".to_string());
                             ui::warn(&format!(
-                                "--repo-dir {} has no GitHub origin, so it is not in the gh \
-                                 scope. gh commands targeting it are refused.",
+                                "named repository {} is not in the gh scope: {reason}. \
+                                 gh commands targeting it are refused.",
                                 dir.display()
                             ));
                         }

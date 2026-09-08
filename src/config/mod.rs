@@ -26,7 +26,10 @@ pub use editing::{
 };
 pub use error::ConfigError;
 pub use loading::exec_tool_dir_warning;
-pub use local::{load_local, local_dir, local_path};
+pub use local::{
+    list_local, load_local, local_dir, local_path, parse_local_doc, stamp_local_header,
+    validate_local_document,
+};
 pub(crate) use path::canonicalize_deepest;
 pub(crate) use path::lexically_normalized;
 pub use path::{
@@ -43,7 +46,7 @@ pub use repo::{
 pub use types::{
     AllowConfig, BlocklistSource, CliFlags, Config, DenyConfig, EnforcementMode, FeatureToggle,
     GhGuardConfig, GhGuardPolicy, GitGuardConfig, GitGuardPolicy, GitPushRule, LoadedConfig,
-    Preset, ProxyConfig, Resolved, ResolvedPushRule, SandboxConfig, SubscriptionsConfig,
-    UnknownCommandPolicy,
+    Preset, ProxyConfig, RepoSummaryRow, Resolved, ResolvedPushRule, SandboxConfig,
+    SubscriptionsConfig, UnknownCommandPolicy,
 };
 pub use validation::{ConfigDiagnostic, DiagnosticLevel, validate_config};

@@ -44,6 +44,12 @@ const PACKAGE_REGISTRY_DOMAINS: &[&str] = &[
     "static.crates.io",
     "pypi.org",
     "files.pythonhosted.org",
+    // Confluent's Maven repository: Kafka clients and Avro serdes resolve from
+    // here, not Maven Central, so a Kafka-shaped JVM build fails without it.
+    "packages.confluent.io",
+    // JitPack builds Maven/Gradle artifacts straight from git tags — the usual
+    // home for forks and libraries that were never published to Central.
+    "jitpack.io",
 ];
 
 /// GitHub Copilot infrastructure domains (issue #52). These are the endpoints
@@ -3276,8 +3282,8 @@ mod tests {
     #[test]
     fn copilot_default_allowed_domains_matches_issue_52() {
         let domains = Agent::Copilot.default_allowed_domains();
-        // 6 GitHub Copilot infra domains + 8 package registries = 14.
-        assert_eq!(domains.len(), 14, "copilot list: infra + registries");
+        // 6 GitHub Copilot infra domains + 10 package registries = 16.
+        assert_eq!(domains.len(), 16, "copilot list: infra + registries");
         // GitHub Copilot infrastructure (bare forms of the issue's wildcards).
         for d in [
             "githubcopilot.com",
@@ -3299,6 +3305,8 @@ mod tests {
             "static.crates.io",
             "pypi.org",
             "files.pythonhosted.org",
+            "packages.confluent.io",
+            "jitpack.io",
         ] {
             assert!(domains.contains(&d), "copilot list must include {d}");
         }
@@ -3374,6 +3382,50 @@ mod tests {
         );
     }
 
+    /// The two registries added for JVM builds must be on every agent's base
+    /// list AND survive the proxy's own gate order, not merely appear in a Vec.
+    #[test]
+    fn confluent_and_jitpack_reach_the_proxy_decision() {
+        for agent in [Agent::Copilot, Agent::Claude, Agent::Goose] {
+            let domains = agent.default_allowed_domains();
+            let policy = crate::proxy::NetPolicy {
+                allowed_ports: vec![443],
+                allowed_domains: domains.iter().map(|d| (*d).to_string()).collect(),
+                allowlist_active: true,
+                ..Default::default()
+            };
+            for host in [
+                "packages.confluent.io",
+                "jitpack.io",
+                "repo.maven.apache.org",
+            ] {
+                assert!(
+                    domains.contains(&host),
+                    "{agent:?} default allowlist must contain {host}"
+                );
+                assert_eq!(
+                    crate::proxy::classify_connect(&policy, host, 443),
+                    crate::proxy::NetVerdict::Allowed,
+                    "{agent:?}: {host} must be allowed under --default-allowlist"
+                );
+            }
+            assert_eq!(
+                crate::proxy::classify_connect(&policy, "repo.adeo.no", 443),
+                crate::proxy::NetVerdict::BlockedAllowlist,
+                "NAV's internal Nexus must stay off the shared base list"
+            );
+            assert_eq!(
+                crate::proxy::classify_connect(
+                    &policy,
+                    "github-package-registry-mirror.gc.nav.no",
+                    443
+                ),
+                crate::proxy::NetVerdict::BlockedAllowlist,
+                "the NAV mirror is documented configuration, not a default"
+            );
+        }
+    }
+
     #[test]
     fn goose_gets_registry_base_only() {
         // Observed with goose 1.48.0 on 2026-09-03 via `--observe-domains`: a
@@ -3399,10 +3451,10 @@ mod tests {
     #[test]
     fn pi_and_shell_get_registry_base_only() {
         // Pi's infra is not yet documented; Shell is not an AI agent. Both get
-        // only the shared package-registry base (8 domains).
+        // only the shared package-registry base (10 domains).
         for agent in [Agent::Pi, Agent::Shell] {
             let domains = agent.default_allowed_domains();
-            assert_eq!(domains.len(), 8, "{agent:?} gets registry base only");
+            assert_eq!(domains.len(), 10, "{agent:?} gets registry base only");
             assert!(domains.contains(&"registry.npmjs.org"));
             assert!(
                 !domains.contains(&"githubcopilot.com"),

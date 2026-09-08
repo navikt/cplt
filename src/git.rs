@@ -291,7 +291,7 @@ pub(crate) fn trusted_binary(name: &str) -> Option<PathBuf> {
 /// untracked set, and the report is `AuditReport::Unavailable` ("change audit
 /// unavailable"). Never a clean bill of health — but note it is `Unavailable`,
 /// not `Incomplete`, because both capture queries fail together.
-pub(crate) fn trusted_git() -> Option<&'static Path> {
+pub fn trusted_git() -> Option<&'static Path> {
     static GIT: OnceLock<Option<PathBuf>> = OnceLock::new();
     GIT.get_or_init(|| {
         let found = trusted_binary("git");

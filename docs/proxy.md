@@ -229,6 +229,8 @@ default.exp2.cds.s9ch.io
 # Package registries (shared by all agents)
 registry.npmjs.org  registry.yarnpkg.com  repo.maven.apache.org
 plugins.gradle.org  crates.io  static.crates.io  pypi.org  files.pythonhosted.org
+packages.confluent.io                # Kafka clients, Avro serdes
+jitpack.io                           # Maven artifacts built from git tags
 ```
 
 Each agent adds its own endpoints on top of that shared registry base:

@@ -429,13 +429,39 @@ fn format_edit_value(item: &toml_edit::Item) -> String {
 pub struct ConfigSetOp {
     pub key_info: &'static ConfigKeyInfo,
     pub path: PathBuf,
+    /// The project this file is the per-repo user config for (#340), or `None`
+    /// for the global `config.toml`. Only the target path and the extra
+    /// `[local]` header differ; every check below is the same one.
+    project_dir: Option<PathBuf>,
 }
 
 impl ConfigSetOp {
     pub fn new(dotted_key: &str) -> Result<Self, ConfigError> {
         let key_info = lookup_key(dotted_key)?;
         let path = config_path().ok_or(ConfigError::NoHome)?;
-        Ok(Self { key_info, path })
+        Ok(Self {
+            key_info,
+            path,
+            project_dir: None,
+        })
+    }
+
+    /// The same operation against `~/.config/cplt/local/<hash>.toml` (#340).
+    pub fn new_local(dotted_key: &str, project_dir: &Path) -> Result<Self, ConfigError> {
+        let key_info = lookup_key(dotted_key)?;
+        let path = super::local::local_path(project_dir).ok_or(ConfigError::NoHome)?;
+        Ok(Self {
+            key_info,
+            path,
+            project_dir: Some(project_dir.to_path_buf()),
+        })
+    }
+
+    /// Refresh the `[local]` header before a write. A no-op for the global file.
+    pub fn stamp_header(&self, doc: &mut toml_edit::DocumentMut) {
+        if let Some(dir) = &self.project_dir {
+            super::local::stamp_local_header(doc, dir);
+        }
     }
 
     /// Load the existing TOML document, or create an empty one.
@@ -457,7 +483,11 @@ impl ConfigSetOp {
 
     /// Validate and write the document back, creating parent dirs if needed.
     pub fn write_document(&self, doc: &toml_edit::DocumentMut) -> Result<(), ConfigError> {
-        validate_global_document(doc)?;
+        if self.project_dir.is_some() {
+            super::local::validate_local_document(doc)?;
+        } else {
+            validate_global_document(doc)?;
+        }
         write_document_atomically(&self.path, doc)
     }
 }
