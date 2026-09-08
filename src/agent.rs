@@ -1063,6 +1063,50 @@ impl Agent {
                 // downloads fd/rg into bin/ when they are not on PATH) have to
                 // happen outside cplt. See docs/known-impacts.md.
                 let agent = home.join(".pi/agent");
+                // #449: the narrowing below made Pi unstartable on Linux. Pi
+                // takes a *write* lock to READ its trust store —
+                // `mkdir ~/.pi/agent/trust.json.lock` — so a read-only root
+                // fails before the session begins, for a user who trusted the
+                // repository correctly outside cplt. The documented cost
+                // ("cannot create a NEW top-level entry mid-session") turned
+                // out to be fatal rather than inconvenient.
+                //
+                // Where bubblewrap is available the narrowing is not the
+                // control any more: `bin/` is re-bound read-only inside the
+                // writable tree (`ro_protect`, via the exec-only filter), and
+                // so are `trust.json`, `settings.json`, `extensions`, `npm` and
+                // `git` (via `host_persistence_paths`). So grant the root and
+                // let the overlay hold it — which is what that overlay is for,
+                // and what macOS already does with profile-tail write denies.
+                //
+                // Without bubblewrap there is no mechanism to take the write
+                // back, so the read-only root stays and Pi still cannot start.
+                // That is the honest state of Landlock-only Linux, recorded in
+                // known-impacts rather than papered over by widening blindly.
+                if cfg!(target_os = "linux") && crate::sandbox::bwrap_available() {
+                    return vec![
+                        AgentDir {
+                            path: agent.clone(),
+                            write: true,
+                            map_exec: false,
+                            process_exec: false,
+                            write_files: vec![],
+                        },
+                        // Still listed, and still exec-only. `ro_protect_paths`
+                        // selects `!write && process_exec` to decide what to
+                        // re-bind read-only, so dropping this entry would grant
+                        // the writable root and take nothing back — reopening
+                        // H-13/H-05 through the fix for #449. The entry is what
+                        // makes the widening safe, not a leftover.
+                        AgentDir {
+                            path: agent.join("bin"),
+                            write: false,
+                            map_exec: false,
+                            process_exec: true,
+                            write_files: vec![],
+                        },
+                    ];
+                }
                 let writable = |path: PathBuf| AgentDir {
                     path,
                     write: true,
@@ -2735,21 +2779,44 @@ mod tests {
         assert!(!bin.write);
         assert!(bin.process_exec, "managed fd/rg must still execute");
 
-        // The property, not the list: nothing writable may contain bin/.
-        for dir in dirs.iter().filter(|d| d.write) {
+        // The property, not the list: nothing writable may contain bin/ —
+        // Landlock unions a path with its ancestors and cannot subtract, so a
+        // writable parent makes the exec-only child write+execute.
+        //
+        // With bubblewrap that union is not the last word: `ro_protect` re-binds
+        // bin/ read-only over the writable root, which is what makes the #449
+        // fix safe. So the invariant is asserted against the regime this build
+        // is actually in, and the bwrap regime asserts the thing that replaces
+        // it — bin/ still listed exec-only, which is what puts it in the
+        // overlay.
+        if crate::sandbox::bwrap_available() {
             assert!(
-                !bin.path.starts_with(&dir.path),
-                "{} is writable and contains the exec-only bin/ — Landlock \
-                 unions the two into write+execute",
-                dir.path.display()
+                dirs.iter()
+                    .any(|d| d.write && d.path == home.join(".pi/agent")),
+                "under bubblewrap the root is granted writable so Pi can take its \
+                 trust lock (#449): {dirs:?}"
+            );
+            assert!(
+                !bin.write && bin.process_exec,
+                "and bin/ must stay exec-only, or `ro_protect` will not re-bind it"
+            );
+        } else {
+            for dir in dirs.iter().filter(|d| d.write) {
+                assert!(
+                    !bin.path.starts_with(&dir.path),
+                    "{} is writable and contains the exec-only bin/ — Landlock \
+                     unions the two into write+execute, and without bubblewrap \
+                     nothing takes it back",
+                    dir.path.display()
+                );
+            }
+            // Sessions still writable, or Pi cannot record a conversation.
+            assert!(
+                dirs.iter()
+                    .any(|d| d.write && d.path == home.join(".pi/agent/sessions")),
+                "{dirs:?}"
             );
         }
-        // Sessions still writable, or Pi cannot record a conversation.
-        assert!(
-            dirs.iter()
-                .any(|d| d.write && d.path == home.join(".pi/agent/sessions")),
-            "{dirs:?}"
-        );
     }
 
     #[test]

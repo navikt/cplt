@@ -718,6 +718,27 @@ fn pin_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf>
     pins
 }
 
+/// Whether the bubblewrap read-only overlay will be available this run.
+///
+/// Asked before the agent grants are chosen, because one of them depends on the
+/// answer: Pi's config root can only be granted writable if `bin/` and the
+/// host-persistence files can be re-bound read-only on top of it (#449).
+///
+/// Availability, not configuration — `use_bubblewrap` says what the operator
+/// asked for, and widening a grant on the strength of a request that then falls
+/// back to Landlock-only would remove the protection instead of relocating it.
+#[must_use]
+pub fn bwrap_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        bubblewrap::check_availability().is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<PathBuf> {
     // Finding 1: Landlock cannot deny subpaths inside the writable project tree,
