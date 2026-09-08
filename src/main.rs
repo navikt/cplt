@@ -6354,7 +6354,8 @@ fn run_config_set_repo(
         let section_name = match target {
             config::RepoKeyTarget::ProposeBool
             | config::RepoKeyTarget::ProposeAllow(_)
-            | config::RepoKeyTarget::ProposeProxy(_) => "propose",
+            | config::RepoKeyTarget::ProposeProxy(_)
+            | config::RepoKeyTarget::ProposeStrArray(_) => "propose",
             config::RepoKeyTarget::Deny(_) => "deny",
             _ => "unknown",
         };

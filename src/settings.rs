@@ -737,6 +737,7 @@ fn repo_value_is_unset(doc: &toml_edit::DocumentMut, key: &ConfigKeyInfo) -> boo
         Some(RepoKeyTarget::ProposeBool) => !repo_proposal_enabled(doc, key),
         Some(RepoKeyTarget::ProposeAllow(name)) => nested_repo_value(doc, "propose", "allow", name),
         Some(RepoKeyTarget::ProposeProxy(name)) => nested_repo_value(doc, "propose", "proxy", name),
+        Some(RepoKeyTarget::ProposeStrArray(name)) => direct_repo_value(doc, "propose", name),
         Some(RepoKeyTarget::Deny(name)) => direct_repo_value(doc, "deny", name),
         None => true,
     }

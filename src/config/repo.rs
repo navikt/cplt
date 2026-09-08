@@ -16,6 +16,8 @@ pub enum RepoKeyTarget {
     ProposeAllow(&'static str),
     /// Goes under [propose.proxy] as an array.
     ProposeProxy(&'static str),
+    /// Goes under [propose] as a top-level string array.
+    ProposeStrArray(&'static str),
     /// Goes under [deny] directly.
     Deny(&'static str),
 }
@@ -169,6 +171,7 @@ pub fn repo_key_target(key_info: &ConfigKeyInfo) -> Option<RepoKeyTarget> {
     }
     match (key_info.section, key_info.key) {
         // Propose arrays
+        ("sandbox", "pass_env") => Some(RepoKeyTarget::ProposeStrArray("pass_env")),
         ("allow", "read") => Some(RepoKeyTarget::ProposeAllow("read")),
         ("allow", "write") => Some(RepoKeyTarget::ProposeAllow("write")),
         ("allow", "ports") => Some(RepoKeyTarget::ProposeAllow("ports")),
@@ -212,11 +215,6 @@ pub fn repo_key_rejection_reason(key_info: &ConfigKeyInfo) -> &'static str {
         // (#443). The hazard is the direction of the read: `pass_env` names a
         // variable in the *parent's* environment, so a committed entry pulls
         // whatever this machine happens to have under that name.
-        ("sandbox", "pass_env") => {
-            "names a variable to copy from whoever launched the agent, so a committed entry \
-             would pull whatever each machine happens to have under that name — including a \
-             credential a repo must not be able to ask for by spelling"
-        }
         ("sandbox", "repo_dirs") => {
             "naming other trees as project-grade roots is a path grant, and repo config \
              cannot grant paths. It is a per-checkout user setting: \
@@ -296,6 +294,38 @@ pub fn set_repo_value_in_doc(
                     )));
                 }
                 section[key_info.key] = toml_edit::value(b);
+            }
+        }
+        // A top-level `[propose]` array — the same shape as `ProposeAllow`
+        // without the nested table, since `pass_env` is a sandbox key rather
+        // than a path or port grant.
+        RepoKeyTarget::ProposeStrArray(array_key) => {
+            let propose = doc
+                .entry("propose")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| ConfigError::Validation("invalid [propose] section".to_string()))?;
+            if unset {
+                if value.is_empty() {
+                    propose.remove(array_key);
+                } else if let Some(arr) = propose.get_mut(array_key).and_then(|v| v.as_array_mut())
+                {
+                    arr.retain(|v| v.as_str().unwrap_or_default() != value);
+                    if arr.is_empty() {
+                        propose.remove(array_key);
+                    }
+                } else {
+                    propose.remove(array_key);
+                }
+            } else {
+                let arr = propose
+                    .entry(array_key)
+                    .or_insert(Item::Value(Value::Array(Array::new())))
+                    .as_array_mut()
+                    .ok_or_else(|| ConfigError::Validation("expected array".to_string()))?;
+                if !arr.iter().any(|v| v.as_str() == Some(value)) {
+                    arr.push(value);
+                }
             }
         }
         RepoKeyTarget::ProposeAllow(array_key) => {

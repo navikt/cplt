@@ -64,6 +64,21 @@ pub struct ProposeSection {
     pub gh_guard: Option<bool>,
     pub git_push_prevention: Option<bool>,
 
+    /// Environment variables the project needs passed through.
+    ///
+    /// `pass_env` names a variable in the *parent's* environment, so a
+    /// committed entry pulls whatever the machine running the agent happens to
+    /// have under that name. That is why it is a proposal rather than a `deny`:
+    /// the repository states what the build needs, a reviewer sees the list in
+    /// the diff, and each developer accepts it on their own machine — where an
+    /// edit changes the file's hash and de-activates the approval (#443).
+    ///
+    /// Plenty of these are the application's rather than the machine's —
+    /// `NODE_ENV`, `TZ`, `SPRING_PROFILES_ACTIVE` — and none of those is
+    /// sensitive. The refusal used to claim otherwise.
+    #[serde(default)]
+    pub pass_env: Vec<String>,
+
     /// Proposed path/port expansions.
     #[serde(default)]
     pub allow: ProposeAllowSection,
@@ -465,6 +480,9 @@ pub fn proposed_keys(propose: &ProposeSection) -> Vec<&'static str> {
     }
     if !propose.allow.socket.is_empty() {
         keys.push("allow.socket");
+    }
+    if !propose.pass_env.is_empty() {
+        keys.push("sandbox.pass_env");
     }
     if !propose.allow.ports.is_empty() {
         keys.push("allow.ports");
