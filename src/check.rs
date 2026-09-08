@@ -596,7 +596,13 @@ fn refusal_decision(
         EnforcementMode::Block => ExecExplain {
             decision: Decision::Blocked,
             reason: first_line(msg),
-            fix: Some(blocked_fix.to_string()),
+            // The guard's own guidance when it carries some, the generic line
+            // otherwise. The guards write remedies specific to the command that
+            // was refused — which repository to name, which spelling is allowed
+            // — and `first_line` was dropping all of it, so `check exec` told
+            // the reader less than the launch would have. It is the surface
+            // someone consults deliberately; it should not be the poorer one.
+            fix: Some(guidance(msg).unwrap_or_else(|| blocked_fix.to_string())),
         },
         // The command runs. Saying "allowed" alone would hide that the policy
         // objected, so the reason carries the objection and the fix says how to
@@ -731,6 +737,19 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
                 fix: None,
             };
         }
+        // The launch serves this from the cached token file rather than
+        // running the real `gh`, so reporting the policy's block would be
+        // wrong (#440).
+        if ctx.gh_guard.block_auth_token && crate::gh_proxy::is_auth_token_request(&rest) {
+            return ExecExplain {
+                decision: Decision::Allowed,
+                reason: "gh auth token is served from the token file cplt wrote at startup, \
+                         not by running gh — so the agent can authenticate without the token \
+                         being an environment variable every child process can read."
+                    .to_string(),
+                fix: None,
+            };
+        }
         if !ctx.scratch_dir {
             return ExecExplain {
                 decision: Decision::Allowed,
@@ -809,6 +828,28 @@ pub fn explain_exec(argv: &[String], ctx: &ExecContext) -> ExecExplain {
 
 fn looks_like_tmp_path(cmd: &str) -> bool {
     cmd.starts_with("/tmp/") || cmd.starts_with("/private/tmp/") || cmd.starts_with("/var/tmp/")
+}
+
+/// The guard's own "way forward" lines, if its message carries any.
+///
+/// Both guards put the headline on the first line and the remedy below it. The
+/// tail also holds boilerplate addressed to the agent ("make a note of this for
+/// the human operator") and the escape hatch, neither of which belongs in a
+/// `Fix:` line an operator reads — so this takes the guidance and leaves those.
+fn guidance(msg: &str) -> Option<String> {
+    // `Reason:` stays. It looked like boilerplate, but some guards put the
+    // remedy there and nowhere else — the token-exfiltration refusal's "Use the
+    // GH_TOKEN env var instead" is on that line — so dropping it threw away
+    // exactly what this function exists to keep.
+    const NOISE: &[&str] = &["This operation is restricted", "Please make a note"];
+    let lines: Vec<&str> = msg
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| !NOISE.iter().any(|n| l.starts_with(n)))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join(" "))
 }
 
 fn first_line(s: &str) -> String {
@@ -1253,6 +1294,69 @@ mod tests {
         let ctx = exec_ctx(&gh, &git, false);
         let e = explain_exec(&["node".into(), "app.js".into()], &ctx);
         assert_eq!(e.decision, Decision::Allowed);
+    }
+
+    /// The launch serves `gh auth token` from the file cplt wrote at startup
+    /// rather than running the real `gh`, so reporting the block the policy
+    /// would otherwise imply is wrong (#440).
+    #[test]
+    fn gh_auth_token_is_served_not_blocked() {
+        // The interception only exists when the guard runs: with it off there
+        // is no shim, and the real `gh` handles the command.
+        let gh = GhGuardPolicy {
+            enabled: true,
+            ..GhGuardPolicy::default()
+        };
+        let git = GitGuardPolicy::default();
+        assert!(
+            gh.block_auth_token,
+            "the interception is on by default; this test means nothing otherwise"
+        );
+        let ctx = exec_ctx(&gh, &git, false);
+
+        let e = explain_exec(&["gh".into(), "auth".into(), "token".into()], &ctx);
+        assert_eq!(e.decision, Decision::Allowed);
+        // The message does not interpolate `e.reason`: CodeQL traces this
+        // branch's string back through the guard plumbing and reports it as
+        // cleartext logging of sensitive information. It is a fixed
+        // explanation, not a token, so the alert is wrong — but the assertion
+        // reads fine without it, and arguing with the scanner is worth less
+        // than the two words of diagnostic it costs.
+        assert!(
+            e.reason.contains("served from the token file"),
+            "the explanation must say where the token comes from"
+        );
+
+        // Another `gh auth` subcommand is not the intercepted one.
+        let other = explain_exec(&["gh".into(), "auth".into(), "status".into()], &ctx);
+        assert_ne!(
+            other.reason, e.reason,
+            "only `auth token` is served from the file"
+        );
+    }
+
+    /// A guard that writes its own remedy must have it reach the reader. The
+    /// generic fix is the fallback, not the default — `check exec` used to show
+    /// only the first line and drop everything the guard said after it.
+    #[test]
+    fn a_refusal_carries_the_guards_own_guidance() {
+        let msg = "⚠️ BLOCKED by sandbox: 'gh api' targets 'other/repo'.\n\
+                   Reason: token exfiltration prevention. Use the GH_TOKEN env var instead.\n\
+                   This operation is restricted by the cplt sandbox environment.\n\
+                   Please make a note of this for the human operator.";
+        let out = guidance(msg).expect("the message carries guidance");
+        assert!(
+            out.contains("Use the GH_TOKEN env var"),
+            "the remedy on the Reason line must survive: {out}"
+        );
+        assert!(
+            !out.contains("make a note") && !out.contains("This operation is restricted"),
+            "but the lines addressed to the agent must not: {out}"
+        );
+        assert!(
+            guidance("⚠️ BLOCKED by sandbox: no further detail.").is_none(),
+            "a message with nothing after the headline falls back to the generic fix"
+        );
     }
 
     // ── Report verdict & JSON ──

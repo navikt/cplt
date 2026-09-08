@@ -3513,13 +3513,12 @@ fn exec_real(
 }
 
 /// Check if args represent a `gh auth token` invocation.
+///
+/// Delegates so the gate and `cplt check exec` cannot disagree about what
+/// counts (#440).
 fn is_gh_auth_token_request(args: &[String]) -> bool {
-    // args are the arguments after `--` in `cplt gh-gate ... -- auth token`
-    let mut iter = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'));
-    iter.next() == Some("auth") && iter.next() == Some("token")
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    gh_proxy::is_auth_token_request(&refs)
 }
 
 /// Serve the cached GitHub token from the scratch dir's `.gh-token` file.

@@ -1315,6 +1315,19 @@ pub fn repos_match(left: &str, right: &str) -> bool {
         .eq_ignore_ascii_case(right.trim_end_matches(".git"))
 }
 
+/// Whether this argv is `gh auth token`.
+///
+/// One rule, two readers: the gate serves the cached token for it instead of
+/// running the real `gh`, and `check exec` has to report that rather than the
+/// block the policy would otherwise imply (#440). It lived only in `main.rs`,
+/// so the library surface could not see it — the same shape as the other four
+/// cases where `check exec` answered from fewer inputs than the launch has.
+#[must_use]
+pub fn is_auth_token_request(args: &[&str]) -> bool {
+    let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
+    positional.next() == Some("auth") && positional.next() == Some("token")
+}
+
 fn requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
     if cmd.repo_flag.is_some() {
         return false;
