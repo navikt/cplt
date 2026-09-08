@@ -22,7 +22,7 @@ cplt gives you kernel-level enforcement with team-configurable policy:
 
 - Per-repo policy in `.cplt.toml`, committed to version control, so it is tamper-proof and auditable
 - Deny by default for credentials, secrets, and sensitive files
-- Command-level git and gh interception that blocks pushes, merges, and releases
+- Command-level git and gh interception: pushes to the default branch, force pushes, merges, and releases are blocked, feature branches stay open
 - Outbound network filtering with an audit log
 - No Docker, no VMs. One binary that runs on a locked-down laptop
 - Zero-config start for developers, with escape hatches when a build genuinely needs one
@@ -496,7 +496,7 @@ cplt auto-discovers installed tools and writes sandbox rules to match. Generally
 | Corepack | none | `COREPACK_*` | none |
 | mise | `.local/share/mise`, `.mise` | `MISE_*` | `mise` |
 
-Run `cplt doctor` to see what cplt detected on your machine.
+Run `cplt doctor` to see whether cplt will work here for your agent, and `cplt doctor --verbose` for everything it detected on your machine.
 
 ### Debugging
 
@@ -777,7 +777,7 @@ Full details, including the trust model, path expansion rules, and the complete 
 └──────────────────────────────────┘
 ```
 
-The security model is a deny-by-default filesystem with kernel enforcement. On macOS, and on Linux with kernel 6.7+ (Landlock ABI v4), the network is restricted to port 443 by default, with `--allow-port` for extras. On older Linux kernels the CONNECT proxy provides that restriction instead, which is why it is enabled by default. SSH agent access and localhost outbound are blocked in the kernel on macOS. On Linux neither is: port-based Landlock rules cannot tell localhost from a remote host, and unix socket `connect()` is not gated by Landlock below kernel 7.1, so apart from the sockets bubblewrap masks the withheld `SSH_AUTH_SOCK` is the only thing standing between the agent and your loaded keys. The profile generator discovers your environment (`cplt doctor` shows the same probe results) and emits rules only for tool directories that actually exist on disk. Fewer rules, tighter sandbox.
+The security model is a deny-by-default filesystem with kernel enforcement. On macOS, and on Linux with kernel 6.7+ (Landlock ABI v4), the network is restricted to port 443 by default, with `--allow-port` for extras. On older Linux kernels the CONNECT proxy provides that restriction instead, which is why it is enabled by default. SSH agent access and localhost outbound are blocked in the kernel on macOS. On Linux neither is: port-based Landlock rules cannot tell localhost from a remote host, and unix socket `connect()` is not gated by Landlock below kernel 7.1, so apart from the sockets bubblewrap masks the withheld `SSH_AUTH_SOCK` is the only thing standing between the agent and your loaded keys. The profile generator discovers your environment (`cplt doctor --verbose` shows the same probe results) and emits rules only for tool directories that actually exist on disk. Fewer rules, tighter sandbox.
 
 - **macOS**: a Seatbelt/SBPL profile is generated and handed to `sandbox-exec`
 - **Linux**: Landlock LSM rules plus a seccomp-BPF filter, applied via `pre_exec` (kernel 5.13+, TCP port filtering on 6.7+)

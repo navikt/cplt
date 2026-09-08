@@ -49,9 +49,16 @@ pub fn explain_key(
     if key_info.dangerous {
         println!("  {yellow}Requires --force to enable{nc}");
     }
+    // The layer this key actually accepts, not a generic invocation: for a
+    // local- or repo-only key the plain form is refused, so printing it sent
+    // the reader to a dead end (#438).
     println!(
-        "  {blue}Set:{nc}  cplt config set {}.{} <value>",
-        key_info.section, key_info.key
+        "  {blue}Set:{nc}  cplt config set {}{}.{} <value>",
+        super::registry::layer_only_flag(key_info)
+            .map(|flag| format!("{flag} "))
+            .unwrap_or_default(),
+        key_info.section,
+        key_info.key
     );
 }
 

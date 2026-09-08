@@ -36,6 +36,23 @@ use crate::ui;
 mod bubblewrap;
 #[path = "sandbox_env.rs"]
 mod env;
+
+/// The two bubblewrap probes `cplt doctor` reports from — the same trusted
+/// lookup and the same `bwrap … /bin/true` the launch runs, against an empty
+/// rule set, so "installed" and "usable" stay two different answers.
+#[cfg(target_os = "linux")]
+pub(crate) mod bubblewrap_probe {
+    pub(crate) use super::bubblewrap::check_availability;
+
+    pub(crate) fn test_empty(bwrap: &std::path::Path) -> Result<(), String> {
+        super::bubblewrap::test_functionality(
+            bwrap,
+            &[],
+            super::bubblewrap::Overlays::default(),
+            &super::bubblewrap::DenyMasks::default(),
+        )
+    }
+}
 #[path = "sandbox_exec.rs"]
 mod exec;
 #[path = "sandbox_landlock.rs"]
@@ -55,12 +72,13 @@ pub use policy::{
     HardeningCategory, HardeningEnvVar, HomeToolDir, LinuxCoverage,
     PLAYWRIGHT_SOCKET_BASE_MAX_BYTES, PLAYWRIGHT_SOCKET_DIR_PREFIX, PLAYWRIGHT_SOCKET_PATH_LIMIT,
     PLAYWRIGHT_SOCKET_ROOT, PLAYWRIGHT_SOCKET_WORST_CASE_SUFFIX, PROTECTED_IN_GITDIR,
-    PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, TOOL_PATH_ENV_VARS, ToolPathEnvVar,
-    ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs, copilot_ro_protect_paths, current_uid,
-    home_tool_dirs, linux_docker_socket_paths, linux_runtime_dirs, mise_ro_protect_paths,
-    nested_alternation, path_bin_dirs, playwright_runtime_intent, relocatable_tool_prefix,
-    socket_mask_paths, tool_override_path_is_safe, tool_path_env_overrides,
-    validate_playwright_socket_dir, validate_sbpl_path, xdg_runtime_dir_env,
+    PROTECTED_IN_ROOT, PathBinDir, Protected, ResolvedToolDir, SENSITIVE_PROJECT_PATTERNS,
+    TOOL_PATH_ENV_VARS, ToolPathEnvVar, ToolPathOverride, ToolRoot, active_tool_dirs, app_dirs,
+    copilot_ro_protect_paths, current_uid, home_tool_dirs, linux_docker_socket_paths,
+    linux_runtime_dirs, mise_ro_protect_paths, nested_alternation, path_bin_dirs,
+    playwright_runtime_intent, relocatable_tool_prefix, socket_mask_paths,
+    tool_override_path_is_safe, tool_path_env_overrides, validate_playwright_socket_dir,
+    validate_sbpl_path, xdg_runtime_dir_env,
 };
 
 // SBPL profile generation — kept public for unit tests.
@@ -761,10 +779,20 @@ fn ro_protect_paths(config: &SandboxConfig, extra_git_dirs: &[PathBuf]) -> Vec<P
     // OpenCode's `~/.cache/opencode/bin` is the entry that needs it: the
     // writable ancestor is `~/.cache` from HOME_TOOL_DIRS, granted to every
     // agent, so narrowing OpenCode's own cache grant would take nothing away —
-    // the same shape as `~/.cache/copilot/pkg` below. Pi's
-    // `~/.pi/agent/bin` no longer has a writable ancestor at all (its root
-    // grant is read-only, see `Agent::config_dirs`), so for Pi this bind is
-    // belt-and-braces rather than the control.
+    // the same shape as `~/.cache/copilot/pkg` below.
+    //
+    // For Pi this bind IS the control, not belt-and-braces — the comment here
+    // said the opposite until #449. Pi's root carries a create-only grant so it
+    // can take its trust lock, and `MakeDir | RemoveDir` on a parent is
+    // sufficient for a *same-directory* rename (Landlock does not require
+    // `Refer` for one). So `mv bin bin.old; mv tmp bin` is permitted by the
+    // ruleset alone; what stops it is that this bind makes `bin/` a mountpoint,
+    // and rename of a mountpoint is `EBUSY`. Measured, not argued: removing
+    // this extend makes `pi_trust_lock_works_under_bwrap_and_bin_cannot_be_renamed`
+    // fail with the rename succeeding.
+    //
+    // Which is also why the create-only grant is withheld on Linux when
+    // bubblewrap is unavailable: without this bind there is nothing left.
     ro_protect.extend(
         config
             .agent_dirs
@@ -860,7 +888,7 @@ fn prepare_impl(
         );
     }
 
-    let policy = landlock_mod::generate_policy(config);
+    let mut policy = landlock_mod::generate_policy(config);
     let profile_text = landlock_mod::describe_policy(&policy);
 
     let ro_protect = ro_protect_paths(config, extra_git_dirs);
@@ -905,6 +933,36 @@ fn prepare_impl(
         },
         &deny_masks,
     )?;
+
+    // `AgentDir::create_dirs` (Pi's mkdir-based trust lock) needs
+    // MakeDir|RemoveDir on the parent, and Landlock cannot scope those to a
+    // name. Same-directory rename needs exactly those two rights and nothing
+    // else (`current_check_refer_path` in security/landlock/fs.c: REFER is only
+    // consulted when the parents differ), so on a plain-Landlock host the grant
+    // would let the agent `mv bin bin.old; mv tmp bin` — the H-13/H-05 escape
+    // the read-only root exists to close. Under bubblewrap it holds: every
+    // exec-only child and writable sibling is a mountpoint (`ro_protect`,
+    // `pins`, the writable binds), and rename/rmdir of a mountpoint is EBUSY.
+    // So the grant is kept only when bubblewrap actually resolved; otherwise
+    // the root stays read-only and Pi does not start, which `cplt doctor`
+    // explains. Cleared here, after `resolve` consumed the rules, so the
+    // writable bind it needs is still emitted when bwrap IS active.
+    if bwrap_wrapper.is_none() {
+        let mut cleared = Vec::new();
+        for rule in policy.fs_rules.iter_mut().filter(|r| r.access.create_dirs) {
+            rule.access.create_dirs = false;
+            cleared.push(rule.path.display().to_string());
+        }
+        if !cleared.is_empty() {
+            ui::warn(&format!(
+                "Create-only grant on {} is NOT applied without Bubblewrap: Landlock \
+                 cannot stop a same-directory rename, so it would make the exec-only \
+                 child replaceable. The directory stays read-only; the agent may fail \
+                 to start. Install bubblewrap to enable it.",
+                cleared.join(", ")
+            ));
+        }
+    }
 
     // UNIX-socket reachability has three distinct regimes and they are not
     // interchangeable, so say which one this run is in rather than implying the
@@ -1192,6 +1250,7 @@ mod tests {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
+            create_dirs: vec![],
         }];
         let exec = [home.join(".local")];
         let mut config = test_config(home, &[]);
@@ -1303,6 +1362,7 @@ mod tests {
             map_exec: false,
             process_exec: false,
             write_files: vec!["auth.json"],
+            create_dirs: vec![],
         }];
         let exec = [home.join(".config/opencode")];
         let mut config = test_config(home, &[]);

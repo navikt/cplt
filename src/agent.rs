@@ -873,6 +873,7 @@ impl Agent {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
+            create_dirs: vec![],
         };
         match shell_name {
             // Config dir: `fish_variables` (universal variables) is rewritten by
@@ -918,6 +919,7 @@ impl Agent {
                     map_exec: true,
                     process_exec: true,
                     write_files: vec![],
+                    create_dirs: vec![],
                 }]
             }
             Agent::Shell => {
@@ -978,6 +980,7 @@ impl Agent {
                         process_exec: false,
                         // Legacy auth.json (newer versions use account.json in data dir)
                         write_files: vec!["auth.json"],
+                        create_dirs: vec![],
                     },
                     AgentDir {
                         path: data_dir,
@@ -985,6 +988,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                     AgentDir {
                         path: state_dir,
@@ -992,6 +996,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                     AgentDir {
                         path: cache_dir.clone(),
@@ -999,6 +1004,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                     AgentDir {
                         // OpenCode downloads managed tool binaries (rg, fd, etc.) here
@@ -1007,6 +1013,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: true,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                 ]
             }
@@ -1020,6 +1027,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                     AgentDir {
                         path: home.join(".gemini/antigravity-cli"),
@@ -1027,6 +1035,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                 ]
             }
@@ -1057,11 +1066,14 @@ impl Agent {
                 // the whole point of the narrowing.
                 //
                 // Cost: Pi can no longer create a NEW top-level entry under
-                // ~/.pi/agent mid-session. The files it rewrites in place are
-                // carved back open below; a first-ever `pi auth login` (which
-                // creates auth.json) and the managed-binary bootstrap (Pi
-                // downloads fd/rg into bin/ when they are not on PATH) have to
-                // happen outside cplt. See docs/known-impacts.md.
+                // ~/.pi/agent mid-session, except the one named lock directory
+                // `create_dirs` grants below (and on Linux only under
+                // bubblewrap — see `AgentDir::create_dirs`). The
+                // files it rewrites in place are carved back open below; a
+                // first-ever `pi auth login` (which creates auth.json) and the
+                // managed-binary bootstrap (Pi downloads fd/rg into bin/ when
+                // they are not on PATH) have to happen outside cplt. See
+                // docs/known-impacts.md.
                 let agent = home.join(".pi/agent");
                 let writable = |path: PathBuf| AgentDir {
                     path,
@@ -1069,6 +1081,7 @@ impl Agent {
                     map_exec: false,
                     process_exec: false,
                     write_files: vec![],
+                    create_dirs: vec![],
                 };
                 vec![
                     AgentDir {
@@ -1091,6 +1104,22 @@ impl Agent {
                             "keybindings.json",
                             "pi-debug.log",
                         ],
+                        // Pi reads its trust store through `proper-lockfile`
+                        // 4.1.2, which takes the lock by `mkdir`ing
+                        // `trust.json.lock/`, then `utimes` it (an mtime-
+                        // precision probe — on error it `rmdir`s and fails the
+                        // lock), and `rmdir`s it to release. A NEW top-level
+                        // directory under the read-only root, which
+                        // `write_files` cannot express (that grants write on a
+                        // path that already exists; a lock is a fresh name).
+                        // Without this Pi cannot start: `EACCES: mkdir
+                        // '.../trust.json.lock'` (#449). Named, not "any new
+                        // directory": a root-wide create grant lets the agent
+                        // rename `bin/` aside and a writable sibling into its
+                        // place (rename is a directory operation). See
+                        // `AgentDir::create_dirs` for the bound and the Linux
+                        // caveat.
+                        create_dirs: vec!["trust.json.lock"],
                     },
                     writable(agent.join("sessions")),
                     writable(agent.join("prompts")),
@@ -1105,6 +1134,7 @@ impl Agent {
                         // Pi installs managed binaries here (fd, rg)
                         process_exec: true,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                 ]
             }
@@ -1123,6 +1153,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     }];
                 }
                 // Default layout: ~/.claude holds sessions, projects, history,
@@ -1137,6 +1168,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                     AgentDir {
                         path: home.join(".claude.json"),
@@ -1144,6 +1176,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                 ]
             }
@@ -1203,6 +1236,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                     AgentDir {
                         path: data_base.join("goose"),
@@ -1210,6 +1244,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                     AgentDir {
                         path: state_base.join("goose"),
@@ -1217,6 +1252,7 @@ impl Agent {
                         map_exec: false,
                         process_exec: false,
                         write_files: vec![],
+                        create_dirs: vec![],
                     },
                 ]
             }
@@ -1708,6 +1744,41 @@ pub struct AgentDir {
     /// Specific files within this dir that get file-write* (literal) access
     /// even when `write` is false. Paths are relative to `self.path`.
     pub write_files: Vec<&'static str>,
+    /// Named **directory** entries the agent may create and remove in this dir
+    /// while everything else in it stays read-only (`write` is `false`). Names
+    /// are relative to `self.path`, like `write_files`.
+    ///
+    /// `write_files` is the carve-out for a file that already exists; this is
+    /// the one for a directory that does not exist yet: an app that takes a
+    /// `mkdir`-based lock (Pi's `proper-lockfile` creates `trust.json.lock/` to
+    /// read its trust store, `utimes` it, and `rmdir`s it to release) in a
+    /// config dir that must otherwise stay read-only so an exec-only `bin/`
+    /// child never lands in a writable tree (H-13/H-05).
+    ///
+    /// **Why a name and not the directory.** Rename is a directory operation:
+    /// unlink of the source entry plus create of the destination entry. A
+    /// dir-wide "may create/remove subdirectories" grant is therefore a rename
+    /// grant over the dir, and `mv bin bin.old; mv tmp bin` swaps a writable
+    /// sibling into the exec-only child's place. Scoping to a literal name
+    /// leaves nothing else in the dir creatable, removable or renameable.
+    ///
+    /// Bounds, per backend — stated because a security boundary that overstates
+    /// is worse than none:
+    ///
+    /// - **macOS.** Exactly the named entry, as a directory: `mkdir`, `utimes`,
+    ///   `rmdir` of it. No regular file, symlink or hardlink may take the name,
+    ///   nothing may be created inside it. Residual: a writable sibling can be
+    ///   renamed *onto* the name (`mv tmp trust.json.lock`). That breaks the
+    ///   app's own lock — self-DoS — and plants nothing the host later runs.
+    /// - **Linux.** Landlock cannot scope creation to a name; the grant is
+    ///   `MakeDir | RemoveDir` on the whole dir, and same-directory rename needs
+    ///   exactly those two rights. So it is applied **only when bubblewrap is
+    ///   active**, where every exec-only child and writable sibling is a
+    ///   mountpoint and rename/rmdir of it is `EBUSY`. Without bubblewrap the
+    ///   dir stays read-only and the app may not start; `cplt doctor` says so.
+    ///   Under bubblewrap any *new* subdirectory name can be made and any
+    ///   *empty* one removed, never file content (no `WriteFile`/`MakeReg`).
+    pub create_dirs: Vec<&'static str>,
 }
 
 /// Resolve each agent dir to its real path, in place.
@@ -1999,6 +2070,7 @@ mod tests {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
+            create_dirs: vec![],
         }
     }
 
@@ -2749,6 +2821,63 @@ mod tests {
             dirs.iter()
                 .any(|d| d.write && d.path == home.join(".pi/agent/sessions")),
             "{dirs:?}"
+        );
+    }
+
+    /// The load-bearing precondition for `create_dirs`: it grants `mkdir` of any
+    /// new name, so where a create_dirs tree also holds an exec-only child, that
+    /// child's name must already exist at launch — otherwise the agent could
+    /// `mkdir` the name itself and turn it into an exec-only dir it controls.
+    ///
+    /// This runs `main.rs`'s exact pre-creation loop (`create_dir_all` over
+    /// every `config_dirs` entry) against a temp home and asserts the exec-only
+    /// child then exists on disk — its name is taken before the agent starts.
+    /// Driven from the agent table so a future agent that pairs create_dirs with
+    /// an exec-only child is covered. If this fails, pre-creation does NOT cover
+    /// the child and the create_dirs design has a hole — do not relax the test.
+    #[test]
+    fn create_dirs_exec_only_children_are_pre_created() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let mut checked = 0;
+        for agent in ALL_AGENTS {
+            let dirs = agent.config_dirs(home);
+            let create_roots: Vec<&AgentDir> =
+                dirs.iter().filter(|d| !d.create_dirs.is_empty()).collect();
+            let exec_children: Vec<&AgentDir> = dirs
+                .iter()
+                .filter(|d| d.process_exec && !d.write)
+                .filter(|d| {
+                    create_roots
+                        .iter()
+                        .any(|r| d.path != r.path && d.path.starts_with(&r.path))
+                })
+                .collect();
+            if exec_children.is_empty() {
+                continue;
+            }
+            // main.rs's pre-creation loop, verbatim.
+            for dir in &dirs {
+                if !dir.path.exists() {
+                    let _ = std::fs::create_dir_all(&dir.path);
+                }
+            }
+            for child in exec_children {
+                checked += 1;
+                assert!(
+                    child.path.is_dir(),
+                    "{agent:?}: pre-creation did not create the exec-only child {} \
+                     inside a create_dirs tree — the agent could mkdir the name \
+                     itself",
+                    child.path.display()
+                );
+            }
+        }
+        // Pi is the current case; guard against the filter silently matching none.
+        assert!(
+            checked > 0,
+            "expected at least Pi's ~/.pi/agent/bin to be an exec-only child of a \
+             create_dirs tree"
         );
     }
 

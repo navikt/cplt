@@ -1310,9 +1310,22 @@ fn scope_label(scope: &[String]) -> String {
 
 /// Two `owner/name` spellings naming the same repository: GitHub is
 /// case-insensitive and an origin URL may carry a `.git` suffix.
-pub(crate) fn repos_match(left: &str, right: &str) -> bool {
+pub fn repos_match(left: &str, right: &str) -> bool {
     left.trim_end_matches(".git")
         .eq_ignore_ascii_case(right.trim_end_matches(".git"))
+}
+
+/// Whether this argv is `gh auth token`.
+///
+/// One rule, two readers: the gate serves the cached token for it instead of
+/// running the real `gh`, and `check exec` has to report that rather than the
+/// block the policy would otherwise imply (#440). It lived only in `main.rs`,
+/// so the library surface could not see it — the same shape as the other four
+/// cases where `check exec` answered from fewer inputs than the launch has.
+#[must_use]
+pub fn is_auth_token_request(args: &[&str]) -> bool {
+    let mut positional = args.iter().copied().filter(|a| !a.starts_with('-'));
+    positional.next() == Some("auth") && positional.next() == Some("token")
 }
 
 fn requires_invocation_repo_check(cmd: &ParsedCommand) -> bool {
@@ -1944,9 +1957,22 @@ fn gate_with_scope_resolver(
                     "Run it from the startup repository's checkout.",
                 ))
             } else {
+                // Two ways forward exist and the message named neither, so a
+                // session that hit this concluded it was blocked when a
+                // supported command would have worked (#403). The higher-level
+                // read commands really are allowed cross-repo with an explicit
+                // `-R`, and a repository checked out inside the project can be
+                // named into the scope set.
                 Err(format!(
                     "⚠️ BLOCKED by sandbox: 'gh {}{}' targets '{}' which is outside the startup repo '{}'.\n\
                      Reason: {}\n\
+                     Ways forward: read-only commands take an explicit repository — \
+                     `gh pr view -R <owner>/<repo> <number>`, `gh pr diff -R <owner>/<repo> \
+                     <number>`, `gh issue view -R <owner>/<repo> <number>` — and are allowed \
+                     against any repository. Raw `gh api` is not. If the agent \
+                     works in that repository too and it is checked out inside this one, name it \
+                     with `cplt config set --local sandbox.repo_dirs <DIR>` and it joins the \
+                     scope set. Otherwise relaunch cplt against that repository.\n\
                      This operation is restricted by the cplt sandbox environment.\n\
                     Please make a note of this for the human operator and continue with your remaining work.",
                     cmd.command,

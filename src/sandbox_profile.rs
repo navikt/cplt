@@ -471,6 +471,38 @@ fn emit_home_access(
                 let file_path = dir.path.join(file).display().to_string();
                 sbpl!(sb, "(allow file-write* (literal \"{file_path}\"))");
             }
+            // Named directory entries the agent may create and remove in an
+            // otherwise read-only dir — the Seatbelt half of
+            // `AgentDir::create_dirs` (Pi's mkdir-based `trust.json.lock`).
+            //
+            // `literal`, never `subpath`: a subpath-wide directory create/unlink
+            // grant is a rename grant, because rename is exactly unlink on the
+            // source plus create on the destination, both directory nodes. A
+            // root-wide rule let `mv bin bin.old; mv tmp bin` swap attacker
+            // bytes into the exec-only managed-binary dir, and `mv sessions
+            // extensions` plant auto-loading extensions — and empirically a
+            // `require-all` allow beats the plain `subpath` denies at the tail
+            // of the profile, so those denies did not save it. A literal names
+            // one entry; nothing else in the dir can be created, removed or
+            // renamed.
+            //
+            // `file-write*` rather than create+unlink alone because
+            // proper-lockfile probes mtime precision with `utimes` right after
+            // the `mkdir` and fails the lock if that errors. `(vnode-type
+            // DIRECTORY)` keeps it a directory: no regular file, symlink or
+            // hardlink can take the name, and `touch <lock>/f` still needs a
+            // create right inside it, which nothing grants.
+            //
+            // Residual: `mv tmp trust.json.lock` (a writable sibling onto the
+            // lock name) is allowed. It breaks Pi's own lock — self-DoS, no
+            // persistence, nothing the host later executes or loads.
+            for name in &dir.create_dirs {
+                let entry = dir.path.join(name).display().to_string();
+                sbpl!(
+                    sb,
+                    "(allow file-write* (require-all (literal \"{entry}\") (vnode-type DIRECTORY)))"
+                );
+            }
             if dir.map_exec {
                 sbpl!(sb, "(allow file-map-executable (subpath \"{path}\"))");
             }
@@ -3953,6 +3985,22 @@ mod tests {
                 let body = rest
                     .strip_suffix(')')
                     .unwrap_or_else(|| panic!("write rule with no matcher: {line}"));
+                // `AgentDir::create_dirs` entries are emitted as `(allow
+                // file-write* (require-all (literal <dir>/<name>) (vnode-type
+                // DIRECTORY)))`, a compound matcher this walk does not model.
+                // Skipping them is sound only because each names exactly ONE
+                // entry that no write-deny covers, so no deny's pinned parent
+                // chain is reachable through it. (Not because later denies
+                // win: empirically a `require-all` allow beats a plain
+                // `subpath` deny, which is why the grant is a literal at all.)
+                if body.starts_with("(require-all") {
+                    assert!(
+                        body.contains("(literal "),
+                        "a require-all write grant must be a literal — a subpath \
+                         one is a rename grant over the whole tree: {line}"
+                    );
+                    continue;
+                }
                 assert!(
                     !body.contains(") ("),
                     "multi-clause write rule, which this walk does not parse: {line}"

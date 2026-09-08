@@ -61,7 +61,9 @@ src/
   sandbox_exec.rs      Process execution, signal forwarding.
   sandbox_landlock.rs  Landlock LSM + seccomp-BPF (Linux).
   sandbox_bubblewrap.rs Optional Bubblewrap namespace layer + in-namespace re-entry helper (Linux).
-  discover.rs          Runtime probing (`cplt doctor`), tool/auth discovery.
+  discover.rs          Runtime probing (`cplt doctor --verbose` inventory), tool/auth discovery.
+  doctor.rs            `cplt doctor` finding rules (Pi trust lock, tracked .env, shims,
+                       bubblewrap state) and rendering; main.rs feeds it the launch's resolution.
   detect.rs            Project and machine ecosystem detectors behind `cplt init`.
   proxy.rs             CONNECT proxy, domain blocking, audit log.
   gh_proxy.rs          gh and git command guards: policy tables, gates, wrapper scripts.

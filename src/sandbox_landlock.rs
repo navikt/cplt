@@ -63,6 +63,30 @@ pub struct FsAccess {
     /// For non-device files and directories `IoctlDev` is a no-op; set it
     /// only on device paths to keep the policy least-privilege.
     pub ioctl: bool,
+    /// Grant `MakeDir | RemoveDir` on this directory without granting `write`:
+    /// existing files stay unwritable, no regular file, symlink or hardlink can
+    /// be created. The Landlock half of `AgentDir::create_dirs` (an app's
+    /// `mkdir`-based lock in an otherwise read-only config dir).
+    ///
+    /// # Limit — read this before granting it
+    ///
+    /// Landlock cannot scope creation to a *name*: this is `mkdir` of ANY new
+    /// subdirectory under the path and `rmdir` of any *empty* one. And that pair
+    /// is a **rename** grant: `current_check_refer_path` (security/landlock/
+    /// fs.c) checks only the MAKE and REMOVE rights on the parent when source
+    /// and destination share a directory — `Refer` is consulted only across
+    /// directories. So on a plain-Landlock host `mv bin bin.old; mv tmp bin`
+    /// swaps a writable sibling into an exec-only child's place: the H-13/H-05
+    /// escape the read-only parent exists to close.
+    ///
+    /// Therefore `prepare_impl` keeps this flag **only when bubblewrap resolved
+    /// active**, where every exec-only child and writable sibling is a
+    /// mountpoint (`ro_protect`, `pins`, the writable binds) and rename/rmdir of
+    /// a mountpoint is `EBUSY`; the bwrap layer also binds the dir writable so
+    /// `mkdir` is not `EROFS`. Without bubblewrap the flag is cleared and the
+    /// directory stays read-only. Withheld either way: `WriteFile`, `Truncate`,
+    /// `MakeReg`, `MakeSym`, `Refer` — nothing here can put bytes in the tree.
+    pub create_dirs: bool,
 }
 
 /// A filesystem access rule: allow `access` on `path` and its subtree.
@@ -386,6 +410,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             write: true,
             execute: true,
             ioctl: false,
+            create_dirs: false,
         },
     });
 
@@ -398,6 +423,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -411,6 +437,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -447,6 +474,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                         write: writable,
                         execute,
                         ioctl: false,
+                        create_dirs: false,
                     },
                 });
             }
@@ -471,6 +499,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 // on Linux and nowhere else (#243).
                 execute: dir.process_exec,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -486,6 +515,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -514,6 +544,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: true,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     } else {
@@ -526,6 +557,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                         write: true,
                         execute: true,
                         ioctl: false,
+                        create_dirs: false,
                     },
                 });
             }
@@ -541,6 +573,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -554,6 +587,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -567,6 +601,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: true,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -583,6 +618,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: true,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -597,6 +633,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             write: true,
             execute: config.allow_tmp_exec || config.allow_jvm_attach,
             ioctl: false,
+            create_dirs: false,
         },
     });
 
@@ -612,6 +649,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: true,
                 execute: false,
                 ioctl: true,
+                create_dirs: false,
             },
         });
     }
@@ -626,6 +664,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
             write: false,
             execute: false,
             ioctl: false,
+            create_dirs: false,
         },
     });
 
@@ -641,6 +680,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -664,6 +704,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -680,6 +721,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: true,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -701,6 +743,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -717,6 +760,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: true,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -731,6 +775,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     write: false,
                     execute: false,
                     ioctl: false,
+                    create_dirs: false,
                 },
             });
         }
@@ -743,6 +788,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     write: true,
                     execute: false,
                     ioctl: false,
+                    create_dirs: false,
                 },
             });
         }
@@ -764,6 +810,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     write: true,
                     execute: false,
                     ioctl: false,
+                    create_dirs: false,
                 },
             });
         }
@@ -803,6 +850,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     write: true,
                     execute: false,
                     ioctl: false,
+                    create_dirs: false,
                 },
             });
         }
@@ -813,6 +861,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -829,6 +878,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -850,6 +900,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 write: false,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         });
     }
@@ -868,6 +919,10 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                 // addons load here without it.
                 execute: dir.process_exec,
                 ioctl: false,
+                // Landlock cannot scope creation to a name, so this is the
+                // parent-wide MakeDir|RemoveDir — and `prepare_impl` clears it
+                // again unless bubblewrap resolved active (see the field doc).
+                create_dirs: !dir.create_dirs.is_empty(),
             },
         });
         // File-level write grants within a read-only dir
@@ -879,6 +934,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     write: true,
                     execute: false,
                     ioctl: false,
+                    create_dirs: false,
                 },
             });
         }
@@ -1027,11 +1083,25 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                         safe.join(" or ")
                     )
                 };
+                // The consequence is Landlock's, not Seatbelt's: on macOS
+                // `process-exec` is granted profile-wide, so the wrapper
+                // re-enters whether or not this rule was emitted, and nothing
+                // fails. This function still runs there — `cplt check` builds
+                // its explanation from it — so the unconditional claim told
+                // macOS users their guards were about to break, and then
+                // nothing broke. A guard that cries wolf about itself teaches
+                // people to ignore it (#400).
+                let consequence = if cfg!(target_os = "linux") {
+                    "so the gh and git guard wrappers cannot re-execute cplt — every guarded \
+                     command will fail with \"Permission denied\""
+                } else {
+                    "so the rule is skipped. On this platform the wrappers still re-enter, \
+                     because the profile grants process-exec generally — but the binary staying \
+                     agent-writable is the hazard on its own"
+                };
                 crate::ui::warn(&format!(
                     "the cplt binary at {} sits under {}, which the sandbox makes writable. \
-                     Granting it execute would let the agent overwrite cplt and run it, so the \
-                     grant is skipped and the gh and git guard wrappers cannot re-execute cplt \
-                     — every guarded command will fail with \"Permission denied\". {advice}",
+                     Granting it execute would let the agent overwrite cplt and run it, {consequence}. {advice}",
                     cplt_bin.display(),
                     tree.path.display()
                 ));
@@ -1043,6 +1113,7 @@ pub fn generate_policy(config: &super::SandboxConfig) -> LandlockPolicy {
                     write: false,
                     execute: true,
                     ioctl: false,
+                    create_dirs: false,
                 },
             }),
         },
@@ -1986,7 +2057,24 @@ fn create_path_beneath_rule<'fd>(
 ) -> PathBeneath<BorrowedFd<'fd>> {
     use std::os::fd::BorrowedFd;
 
-    use landlock::{AccessFs, PathBeneath};
+    use landlock::PathBeneath;
+
+    let access_flags = access_to_flags(access);
+    // Safety: raw_fd was opened in precompute() and is still valid
+    // (O_CLOEXEC keeps it alive until exec, fork inherits it).
+    let fd = unsafe { BorrowedFd::borrow_raw(*raw_fd) };
+    PathBeneath::new(fd, access_flags)
+}
+
+/// Map an [`FsAccess`] to the concrete Landlock rights it grants.
+///
+/// Extracted from [`create_path_beneath_rule`] so the flag mapping — which the
+/// kernel otherwise hides inside an opaque `PathBeneath` — can be asserted
+/// directly. That is where `create_dirs` becomes `MakeDir | RemoveDir` and
+/// nothing else, the guarantee `create_dirs_maps_to_mkdir_rmdir_only` pins.
+#[cfg(target_os = "linux")]
+fn access_to_flags(access: &FsAccess) -> landlock::BitFlags<landlock::AccessFs> {
+    use landlock::AccessFs;
 
     let mut access_flags = if access.read {
         AccessFs::ReadFile | AccessFs::ReadDir
@@ -2048,6 +2136,17 @@ fn create_path_beneath_rule<'fd>(
             | AccessFs::ResolveUnix;
     }
 
+    if access.create_dirs {
+        // `mkdir` of any new subdirectory name and `rmdir` of any *empty* one.
+        // No WriteFile/Truncate (existing files stay unwritable), no MakeReg/
+        // MakeSym (no file or symlink to point exec at agent-controlled
+        // content). Withholding Refer does NOT stop same-directory rename —
+        // MakeDir|RemoveDir alone suffice for that — which is why this flag
+        // only survives `prepare_impl` under bubblewrap, where the mountpoints
+        // make the rename EBUSY. See `FsAccess::create_dirs`.
+        access_flags |= AccessFs::MakeDir | AccessFs::RemoveDir;
+    }
+
     if access.execute {
         access_flags |= AccessFs::Execute;
     }
@@ -2061,10 +2160,7 @@ fn create_path_beneath_rule<'fd>(
         access_flags |= AccessFs::IoctlDev;
     }
 
-    // Safety: raw_fd was opened in precompute() and is still valid
-    // (O_CLOEXEC keeps it alive until exec, fork inherits it).
-    let fd = unsafe { BorrowedFd::borrow_raw(*raw_fd) };
-    PathBeneath::new(fd, access_flags)
+    access_flags
 }
 
 /// Apply a pre-built seccomp BPF filter via prctl.
@@ -2149,6 +2245,49 @@ pub fn blocked_syscall_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// `create_dirs` maps to `MakeDir | RemoveDir` and to NOTHING that could
+    /// write file content: no WriteFile, Truncate, MakeReg or MakeSym. Refer is
+    /// also withheld, but note what that does and does not buy: it blocks
+    /// cross-directory rename/link, not same-directory rename — the two rights
+    /// granted here are sufficient for that, which is why the flag is
+    /// bubblewrap-gated in `prepare_impl` (mountpoints make the rename EBUSY).
+    /// Linux-only because `AccessFs` and the mapping exist only there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_dirs_maps_to_mkdir_rmdir_only() {
+        use landlock::AccessFs;
+
+        let flags = access_to_flags(&FsAccess {
+            read: true,
+            write: false,
+            execute: false,
+            ioctl: false,
+            create_dirs: true,
+        });
+
+        assert!(flags.contains(AccessFs::MakeDir), "mkdir must be permitted");
+        assert!(
+            flags.contains(AccessFs::RemoveDir),
+            "rmdir must be permitted (proper-lockfile releases the lock)"
+        );
+        for forbidden in [
+            AccessFs::WriteFile,
+            AccessFs::Truncate,
+            AccessFs::MakeReg,
+            AccessFs::MakeSym,
+            AccessFs::MakeFifo,
+            AccessFs::MakeSock,
+            AccessFs::RemoveFile,
+            AccessFs::Refer,
+        ] {
+            assert!(
+                !flags.contains(forbidden),
+                "create_dirs must not grant {forbidden:?} — existing files and \
+                 the exec-only child must stay safe"
+            );
+        }
+    }
 
     /// Build a minimal SandboxConfig for testing.
     fn test_config<'a>(
@@ -2973,6 +3112,7 @@ mod tests {
                 write,
                 execute,
                 ioctl: false,
+                create_dirs: false,
             },
         }
     }
@@ -3866,6 +4006,7 @@ mod tests {
                 map_exec: false,
                 process_exec: false,
                 write_files: vec!["auth.json"],
+                create_dirs: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".local/share/opencode"),
@@ -3873,6 +4014,7 @@ mod tests {
                 map_exec: false,
                 process_exec: false,
                 write_files: vec![],
+                create_dirs: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".local/state/opencode"),
@@ -3880,6 +4022,7 @@ mod tests {
                 map_exec: false,
                 process_exec: false,
                 write_files: vec![],
+                create_dirs: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".cache/opencode"),
@@ -3887,6 +4030,7 @@ mod tests {
                 map_exec: false,
                 process_exec: false,
                 write_files: vec![],
+                create_dirs: vec![],
             },
             crate::agent::AgentDir {
                 path: home.join(".cache/opencode/bin"),
@@ -3894,6 +4038,7 @@ mod tests {
                 map_exec: false,
                 process_exec: true,
                 write_files: vec![],
+                create_dirs: vec![],
             },
         ];
         let mut config = test_config(&project, &home);
@@ -4169,6 +4314,7 @@ mod tests {
                         write: false,
                         execute: false,
                         ioctl: false,
+                        create_dirs: false,
                     },
                 },
                 FsRule {
@@ -4178,6 +4324,7 @@ mod tests {
                         write: false,
                         execute: false,
                         ioctl: false,
+                        create_dirs: false,
                     },
                 },
             ],

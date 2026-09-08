@@ -1060,6 +1060,170 @@ fn pi_managed_binaries_are_not_inside_a_writable_linux_grant() {
     );
 }
 
+/// `AgentDir::create_dirs` lets an agent `mkdir` a new entry (Pi's trust-store
+/// lock) in a dir whose existing files stay read-only. This proves the "stay
+/// read-only" half generically, driven from the agent table so a future agent
+/// that adopts the capability is covered without anyone remembering to add a
+/// test. The bound is enforced on BOTH backends:
+///   - Landlock: the rule for the dir carries `create_dirs` but not `write`,
+///     so `writable_tree_over` (which keys on write grants) finds nothing over
+///     a file in it — and the flag builder maps `create_dirs` to
+///     MakeDir|RemoveDir only, never WriteFile.
+///   - Seatbelt: the profile grants `file-write-create`/`-unlink` scoped to
+///     `(vnode-type DIRECTORY)` but never a dir-wide `file-write*` allow, so
+///     `(deny default)` keeps `file-write-data` denied for existing files.
+#[test]
+fn create_dirs_grants_keep_existing_files_unwritable_on_both_backends() {
+    use cplt::agent::Agent;
+    let home = std::path::Path::new("/Users/test");
+
+    let mut checked = 0;
+    for agent in Agent::ALL {
+        let agent_dirs = agent.config_dirs(home);
+        let policy = generate_policy(&SandboxConfig {
+            agent: *agent,
+            agent_dirs: &agent_dirs,
+            existing_home_tool_dirs: Some(&[]),
+            ..base_profile_options()
+        });
+        let profile = generate_profile(
+            &SandboxConfig {
+                agent: *agent,
+                agent_dirs: &agent_dirs,
+                ..base_profile_options()
+            },
+            &[],
+        );
+
+        for dir in agent_dirs.iter().filter(|d| !d.create_dirs.is_empty()) {
+            checked += 1;
+            assert!(
+                !dir.write,
+                "{agent:?}: create_dirs and write on the same grant defeats the \
+                 whole point — create-only must not be write ({})",
+                dir.path.display()
+            );
+
+            // Landlock policy: the dir's rule is create-only, not writable.
+            let rule = policy
+                .fs_rules
+                .iter()
+                .find(|r| r.path == dir.path)
+                .unwrap_or_else(|| panic!("{agent:?}: no rule for {}", dir.path.display()));
+            assert!(
+                rule.access.create_dirs && !rule.access.write,
+                "{agent:?}: {} must be create-only in the Landlock policy",
+                dir.path.display()
+            );
+
+            // An existing file that is NOT a write_files carve-out must not be
+            // writable under Landlock.
+            let probe = dir.path.join("zzz-not-a-write-file");
+            assert_eq!(
+                cplt::check::writable_tree_over(&policy, home, &probe),
+                None,
+                "{agent:?}: create_dirs must not make files in {} writable",
+                dir.path.display()
+            );
+
+            // Seatbelt: one literal per named entry, never a dir-wide or
+            // subpath-wide write grant (a subpath-wide directory create/unlink
+            // grant is a rename grant — see the emitter).
+            let p = dir.path.display();
+            for name in &dir.create_dirs {
+                let entry = dir.path.join(name).display().to_string();
+                assert!(
+                    profile.contains(&format!(
+                        "(allow file-write* (require-all (literal \"{entry}\") (vnode-type DIRECTORY)))"
+                    )),
+                    "{agent:?}: {entry} must get the literal DIRECTORY grant:\n{profile}"
+                );
+            }
+            assert!(
+                !profile.contains(&format!("(allow file-write* (subpath \"{p}\"))")),
+                "{agent:?}: {p} must NOT get a dir-wide write allow — that would \
+                 make existing files writable:\n{profile}"
+            );
+            assert!(
+                !profile.contains(&format!("(require-all (subpath \"{p}\")")),
+                "{agent:?}: {p} must NOT get a subpath-wide require-all grant — \
+                 that is a rename grant over the whole dir:\n{profile}"
+            );
+        }
+    }
+    assert!(
+        checked > 0,
+        "no agent declares create_dirs — this test would silently pass forever"
+    );
+}
+
+/// Pi can create its trust-store lock (`mkdir ~/.pi/agent/trust.json.lock`, #449)
+/// while `trust.json` and the exec-only `bin/` stay unwritable.
+///
+/// The Landlock rule set permits MakeDir on the root (asserted here via the
+/// policy's `create_dirs` flag, since Landlock itself only runs on Linux — the
+/// flag builder is what maps it to `AccessFs::MakeDir`, covered by
+/// `create_dirs_maps_to_mkdir_rmdir_only` on Linux).
+#[test]
+fn pi_can_create_the_trust_lock_but_not_write_bin_or_trust_json() {
+    use cplt::agent::Agent;
+    let home = std::path::Path::new("/Users/test");
+    let agent_dirs = Agent::Pi.config_dirs(home);
+    let policy = generate_policy(&SandboxConfig {
+        agent: Agent::Pi,
+        agent_dirs: &agent_dirs,
+        existing_home_tool_dirs: Some(&[]),
+        ..base_profile_options()
+    });
+
+    let root = home.join(".pi/agent");
+    let root_rule = policy
+        .fs_rules
+        .iter()
+        .find(|r| r.path == root)
+        .expect("~/.pi/agent must be in the policy");
+    assert!(
+        root_rule.access.create_dirs,
+        "the root must permit mkdir (create_dirs), or Pi cannot take its lock"
+    );
+    assert!(
+        !root_rule.access.write,
+        "the root must NOT be writable — that would union bin/ into write+exec"
+    );
+
+    // trust.json and bin/ stay unwritable (no write grant covers them).
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &root.join("trust.json")),
+        None,
+        "trust.json must stay unwritable; create_dirs grants mkdir, not file writes"
+    );
+    assert_eq!(
+        cplt::check::writable_tree_over(&policy, home, &root.join("bin")),
+        None,
+        "bin/ must stay unwritable — the H-13/H-05 narrowing must survive create_dirs"
+    );
+
+    // Seatbelt: the lock's mkdir is allowed, trust.json write still denied.
+    let profile = generate_profile(
+        &SandboxConfig {
+            agent: Agent::Pi,
+            agent_dirs: &agent_dirs,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        profile.contains(
+            "(allow file-write* (require-all (literal \"/Users/test/.pi/agent/trust.json.lock\") (vnode-type DIRECTORY)))"
+        ),
+        "Pi must be allowed to mkdir/utimes/rmdir its trust lock:\n{profile}"
+    );
+    assert!(
+        profile.contains("(deny file-write* (subpath \"/Users/test/.pi/agent/trust.json\"))"),
+        "trust.json must still be write-denied:\n{profile}"
+    );
+}
+
 /// A user `allow.write` must NOT reopen the host-persistence denies.
 ///
 /// `allow.write = ["~/.claude"]` is an ordinary thing to write — `is_unsafe_root`
@@ -1178,6 +1342,7 @@ fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
+            create_dirs: vec![],
         }
     });
     let conf = std::path::PathBuf::from("/Users/test/.config/fish");
@@ -7016,6 +7181,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: false,
             write_files: vec!["auth.json"],
+            create_dirs: vec![],
         },
         AgentDir {
             path: data_dir.clone(),
@@ -7023,6 +7189,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
+            create_dirs: vec![],
         },
         AgentDir {
             path: state_dir.clone(),
@@ -7030,6 +7197,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
+            create_dirs: vec![],
         },
         AgentDir {
             path: cache_dir.clone(),
@@ -7037,6 +7205,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: false,
             write_files: vec![],
+            create_dirs: vec![],
         },
         AgentDir {
             path: cache_dir.join("bin"),
@@ -7044,6 +7213,7 @@ fn profile_opencode_config_dir_write_scoped_to_auth_json() {
             map_exec: false,
             process_exec: true,
             write_files: vec![],
+            create_dirs: vec![],
         },
     ];
 

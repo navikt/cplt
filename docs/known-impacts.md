@@ -25,6 +25,39 @@ cplt config set sandbox.allow_env_files true
 
 Or for a single run: `cplt --allow-env-files -- -p "start the dev server"`
 
+### A tracked protected file breaks git
+
+The table above lists reading. There is a second effect that looks like a git
+bug rather than a sandbox decision: if one of these files is **tracked by git**
+and has been modified, git commands that hash the worktree fail outright.
+
+```
+error: open(".env.local"): Operation not permitted
+fatal: cannot hash .env.local
+```
+
+`git diff`, `git add`, `git stash` and `git commit -a` all abort — not skip the
+file, abort — because git hashes worktree files and the read is denied.
+`git status` still works, since it only stats. An **untracked** file affects
+only `git add -A`, and a **gitignored** one affects nothing, because git never
+hashes it.
+
+The fix is to stop tracking it, which is worth doing on its own — a file
+matching these patterns is secret-shaped, and it is in the repository:
+
+```bash
+git rm --cached .env.local
+echo ".env.local" >> .gitignore
+```
+
+`--allow-env-files` also works, but it unblocks every `.env*`, `.pem`, `.key`,
+`.p12`, `.pfx` and `.jks` in the project rather than the one file. A targeted
+`allow.read` on the path does **not** lift the deny; there is no per-file
+exemption.
+
+`cplt check` reports any tracked file matching these patterns, so you can find
+out before an agent session does.
+
 ## Relative paths in `.cplt.toml` now bite (behaviour change)
 
 A relative path in a repo `.cplt.toml`, say `deny.paths = ["target"]` or `propose.allow.read = ["vendor"]`, used to be **silently unenforced**. macOS compiled it into the profile as a rule that matched nothing, and Linux dropped it. It is now resolved against the repository root and enforced for real.
@@ -348,7 +381,7 @@ Some git operations are blocked to prevent persistence attacks that would surviv
 
 | Operation                          | Impact      | Why                                                               |
 | ---------------------------------- | ----------- | ----------------------------------------------------------------- |
-| `git add/commit/status/diff/log`   | ✅ Works     | Local operations, no writes to protected paths                    |
+| `git add/commit/status/diff/log`   | ✅ Works, unless a protected file is tracked | Local operations, no writes to protected paths — but git hashes worktree files, so a **tracked** `.env*`/`.pem`/`.key` that has been modified aborts `add`, `diff`, `stash` and `commit -a`. See [A tracked protected file breaks git](#a-tracked-protected-file-breaks-git) |
 | `git checkout/merge/rebase/branch` | ✅ Works     | Branch operations work normally                                   |
 | `git fetch/pull/push` (HTTPS)      | ✅ Works, except a default-branch push | Port 443 allowed, `gh auth git-credential` provides credentials. The git guard refuses pushes to `main`/`master` and every force push, see [Git workflow](#git-workflow-commit--push) |
 | `git fetch/pull/push` (SSH)        | ❌ Blocked on macOS | SSH agent socket denied, use HTTPS. On Linux only `SSH_AUTH_SOCK` is withheld |
@@ -841,7 +874,7 @@ Each agent's global config dir is mounted read/write, but the files in it that *
 
 | Agent | Denied | What breaks |
 | --- | --- | --- |
-| Pi | Write-denied: `settings.json`, `trust.json`, `extensions/`, `npm/`, `git/`. Separately, `~/.pi/agent` itself is read-only, with write granted per subdirectory (`sessions/`, `prompts/`, `themes/`, `skills/`, `tools/`, `tmp/`) so that `bin/` is not inside a writable tree | ⚠️ `pi install`, `/trust`, and every in-session setting that persists to `settings.json`: `/model` (Ctrl+S), `/thinking`, `/settings`. Also, because the root is read-only, Pi cannot create a **new** top-level file or directory under `~/.pi/agent`: a first-ever `pi auth login` (creates `auth.json`) and the managed-binary bootstrap (Pi downloads `fd`/`rg` into `bin/` when they are not on `PATH`) have to run outside cplt. The root is read-only so that `bin/` is not inside a writable tree — on Linux that union made the managed binaries writable and executable. Do those outside cplt. Auth is unaffected once `auth.json` exists — Pi uses provider API keys via `--pass-env` |
+| Pi | Write-denied: `settings.json`, `trust.json`, `extensions/`, `npm/`, `git/`. Separately, `~/.pi/agent` itself is read-only, with write granted per subdirectory (`sessions/`, `prompts/`, `themes/`, `skills/`, `tools/`, `tmp/`) so that `bin/` is not inside a writable tree, plus one named carve-out: the directory `trust.json.lock/` may be created, `utimes`'d and removed — Pi's `proper-lockfile` takes that lock to *read* the trust store at startup (#449) | ⚠️ `pi install`, `/trust`, and every in-session setting that persists to `settings.json`: `/model` (Ctrl+S), `/thinking`, `/settings`. Because the root is read-only, Pi cannot create any other **new** top-level entry under `~/.pi/agent`: a first-ever `pi auth login` (creates `auth.json`) and the managed-binary bootstrap (Pi downloads `fd`/`rg` into `bin/` when they are not on `PATH`) have to run outside cplt. The lock grant is a single literal name, not "new directories": a directory-wide create/remove grant is a rename grant (`mv bin bin.old; mv tmp bin`), which is exactly the escape the read-only root closes. Residual on macOS: a writable sibling can be renamed onto the lock name (`mv tmp trust.json.lock`), which only breaks Pi's own lock. **Linux: Landlock cannot scope creation to a name and same-directory rename needs only the rights a directory-wide grant carries, so the lock grant applies only when bubblewrap is active** (every sibling and `bin/` is then a mountpoint and rename is `EBUSY`). **Without bubblewrap the root stays read-only and Pi does not start** — `cplt doctor` reports why and what to install. Auth is unaffected once `auth.json` exists — Pi uses provider API keys via `--pass-env` |
 | Claude Code | `~/.claude/settings.json`, `statusline.sh`, `plugins/` | ⚠️ Editing `settings.json` (including `hooks`) from inside a session. `commands/`, `agents/` and `skills/` stay writable — and the model can invoke them too, not just the user, so a file planted there reaches a host shell the next time the model picks it (see SECURITY.md, [#366](https://github.com/navikt/cplt/issues/366)). Auth is unaffected — the OAuth token is in the Keychain or `.credentials.json` |
 | Antigravity | `~/.gemini/config/hooks.json`, `config/mcp_config.json`, `antigravity-cli/bin/` | ⚠️ Editing hooks or MCP server config from inside a session. Auth is unaffected |
 | goose | the whole of `~/.config/goose` is read-only, not just named files | ⚠️ `/mode` and theme changes, the first-run telemetry prompt, and persisted "always allow" tool permissions do not survive a sandboxed session. Run `goose configure` outside cplt. Ordinary sessions are unaffected — goose does not rewrite `config.yaml` while running. Auth is unaffected: secrets come from the keyring or `--pass-env` |

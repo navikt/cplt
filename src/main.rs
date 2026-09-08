@@ -778,11 +778,18 @@ QUICK START:
         global: bool,
     },
 
-    /// Run environment diagnostics.
+    /// Will cplt work on this host for this agent? Offline; builds no sandbox.
     ///
-    /// Checks auth mechanisms, agent install, tool availability,
-    /// and sandbox-critical paths. Exits 0 if all critical checks pass.
-    Doctor,
+    /// Prints the resolved agent, config sources and enforcement regime, then
+    /// only what will fail and how to fix it. Paths are shown as `~/…` so the
+    /// output can be pasted into an issue. Exits 0 unless something blocks the
+    /// launch.
+    Doctor {
+        /// Also print the full inventory: tools, tool dirs, protected paths,
+        /// agents found on PATH, project ecosystems. Absolute paths.
+        #[arg(long)]
+        verbose: bool,
+    },
 
     /// Verify & explain sandbox enforcement.
     ///
@@ -1390,8 +1397,10 @@ fn validate_repo_dirs(
         if !dir.starts_with(project_dir) {
             bail!(
                 "{named_as} is outside the project directory\n  {}\n  \
-                 sibling repositories are not yet supported; use `--allow-write` for \
-                 edit-only.",
+                 Only repositories checked out inside the project directory can be \
+                 named. For one that lives elsewhere, `--allow-write <DIR>` grants \
+                 read and write on its files — but not execute, so a build script \
+                 inside that tree will not run, and `gh` will not target it.",
                 project_dir.display()
             );
         }
@@ -3039,6 +3048,18 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         }
     }
 
+    // `cplt doctor` borrows &cli through resolve_context, like check above.
+    #[allow(clippy::collapsible_if)]
+    if matches!(&cli.command, Some(Command::Doctor { .. })) {
+        if let Some(Command::Doctor { verbose }) = cli.command.take() {
+            // Doctor prints its own header; resolve_context's summary lines
+            // and "no agent" default (see `cli.doctor` there) are for it.
+            cli.quiet = true;
+            cli.doctor = true;
+            return Ok(run_doctor(&cli, verbose));
+        }
+    }
+
     // Handle subcommands (these don't need macOS or sandbox)
     if let Some(command) = cli.command {
         return Ok(match command {
@@ -3066,7 +3087,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
                     run_init_command(write, force, merge, quiet)
                 }
             }
-            Command::Doctor => run_doctor(),
+            Command::Doctor { .. } => unreachable!("Command::Doctor handled before this match"),
             Command::GhGate {
                 real_gh,
                 repo_scope,
@@ -3150,7 +3171,8 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     // DEPRECATED: use `cplt doctor` subcommand instead
     if cli.doctor {
         ui::warn("--doctor is deprecated, use `cplt doctor` instead");
-        return Ok(run_doctor());
+        cli.quiet = true;
+        return Ok(run_doctor(&cli, false));
     }
 
     // Resolve config, paths, and agent
@@ -3652,13 +3674,12 @@ fn exec_real(
 }
 
 /// Check if args represent a `gh auth token` invocation.
+///
+/// Delegates so the gate and `cplt check exec` cannot disagree about what
+/// counts (#440).
 fn is_gh_auth_token_request(args: &[String]) -> bool {
-    // args are the arguments after `--` in `cplt gh-gate ... -- auth token`
-    let mut iter = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'));
-    iter.next() == Some("auth") && iter.next() == Some("token")
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    gh_proxy::is_auth_token_request(&refs)
 }
 
 /// Serve the cached GitHub token from the scratch dir's `.gh-token` file.
@@ -4052,7 +4073,6 @@ fn assemble_sandbox(
     opts: AssemblyOptions<'_>,
 ) -> anyhow::Result<AssembledSandbox> {
     let home_dir = probe.home_dir.as_path();
-    let project_dir = probe.project_dir.as_path();
     let active_agent = opts.agent;
 
     // Create per-session scratch directory if enabled
@@ -4151,48 +4171,21 @@ fn assemble_sandbox(
         resolved.keychain_substitute,
     );
 
-    let sandbox_config = sandbox::SandboxConfig {
-        project_dir,
-        home_dir,
-        extra_read: &resolved.allow_read,
-        extra_write: &resolved.allow_write,
-        extra_exec: &resolved.allow_exec,
-        extra_socket: &resolved.allow_socket,
-        extra_deny: &resolved.deny_paths,
-        existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
-        existing_app_dirs: Some(&probe.existing_app_dirs),
-        extra_ports: &resolved.allow_ports,
-        localhost_ports: &resolved.allow_localhost,
-        proxy_port: proxy_port_for_profile,
-        proxy_forced: resolved.proxy_forced,
-        allow_env_files: resolved.allow_env_files,
-        allow_localhost_any: resolved.allow_localhost_any,
-        scratch_dir: scratch_path,
-        playwright_socket_dir: playwright_socket_path,
-        allow_tmp_exec: resolved.allow_tmp_exec,
-        copilot_install_dir: opts.copilot_install_dir,
-        java_home: probe.java_home.as_deref(),
-        dotnet_root: probe.dotnet_root.as_deref(),
-        git_hooks_path: probe.git_hooks_path.as_deref(),
-        git_common_dir: probe.git_common_dir.as_deref(),
-        allow_gpg_signing: resolved.allow_gpg_signing,
-        deny_clipboard: resolved.deny_clipboard,
-        allow_jvm_attach: resolved.allow_jvm_attach,
-        allow_msbuild: resolved.allow_msbuild,
-        allow_docker: resolved.allow_docker,
-        electron_app_dir: opts.electron_app_dir,
-        agent: active_agent,
-        agent_dirs: &agent_dirs,
-        allow_cache_exec: &resolved.allow_cache_exec,
-        allow_cache_exec_any: resolved.allow_cache_exec_any,
-        allow_browser: resolved.allow_browser,
+    let sandbox_config = build_sandbox_config(
+        resolved,
+        probe,
+        active_agent,
+        &agent_dirs,
+        SessionPaths {
+            proxy_port: proxy_port_for_profile,
+            scratch_dir: scratch_path,
+            playwright_socket_dir: playwright_socket_path,
+            copilot_install_dir: opts.copilot_install_dir,
+            electron_app_dir: opts.electron_app_dir,
+        },
         keychain_substitute,
-        use_bubblewrap: resolved.use_bubblewrap,
-    };
+    );
 
-    // The structured Landlock model of the fs policy — used by the check
-    // explain layer. It faithfully mirrors the enforced allow-list on both
-    // platforms (the live probe remains authoritative where they differ).
     let policy = sandbox::generate_policy(&sandbox_config);
     // Path validation (SBPL injection checks on macOS) is handled internally by
     // prepare(), so callers don't need to know about backend-specific risks.
@@ -4211,6 +4204,68 @@ fn assemble_sandbox(
 /// Build the resolved Shell sandbox, shared by `cplt exec` and `cplt check` so
 /// their probes run under byte-for-byte the same policy as each other — and, via
 /// [`assemble_sandbox`], as the agent launch.
+/// The inputs to a `SandboxConfig` that exist only once a session is being
+/// set up. `cplt doctor` builds the policy with all of them absent.
+#[derive(Default)]
+struct SessionPaths<'a> {
+    proxy_port: Option<u16>,
+    scratch_dir: Option<&'a Path>,
+    playwright_socket_dir: Option<&'a Path>,
+    copilot_install_dir: Option<&'a Path>,
+    electron_app_dir: Option<&'a Path>,
+}
+
+/// The one place a `SandboxConfig` is assembled from the resolved config and
+/// the host probe. The launch, `exec`, `check` and `doctor` all go through it,
+/// so a new input reaches every surface or none (#447).
+fn build_sandbox_config<'a>(
+    resolved: &'a config::Resolved,
+    probe: &'a HostProbe,
+    agent: agent::Agent,
+    agent_dirs: &'a [agent::AgentDir],
+    session: SessionPaths<'a>,
+    keychain_substitute: Option<agent::KeychainSubstitute>,
+) -> sandbox::SandboxConfig<'a> {
+    sandbox::SandboxConfig {
+        project_dir: probe.project_dir.as_path(),
+        home_dir: probe.home_dir.as_path(),
+        extra_read: &resolved.allow_read,
+        extra_write: &resolved.allow_write,
+        extra_exec: &resolved.allow_exec,
+        extra_socket: &resolved.allow_socket,
+        extra_deny: &resolved.deny_paths,
+        existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
+        existing_app_dirs: Some(&probe.existing_app_dirs),
+        extra_ports: &resolved.allow_ports,
+        localhost_ports: &resolved.allow_localhost,
+        proxy_port: session.proxy_port,
+        proxy_forced: resolved.proxy_forced,
+        allow_env_files: resolved.allow_env_files,
+        allow_localhost_any: resolved.allow_localhost_any,
+        scratch_dir: session.scratch_dir,
+        playwright_socket_dir: session.playwright_socket_dir,
+        allow_tmp_exec: resolved.allow_tmp_exec,
+        copilot_install_dir: session.copilot_install_dir,
+        java_home: probe.java_home.as_deref(),
+        dotnet_root: probe.dotnet_root.as_deref(),
+        git_hooks_path: probe.git_hooks_path.as_deref(),
+        git_common_dir: probe.git_common_dir.as_deref(),
+        allow_gpg_signing: resolved.allow_gpg_signing,
+        deny_clipboard: resolved.deny_clipboard,
+        allow_jvm_attach: resolved.allow_jvm_attach,
+        allow_msbuild: resolved.allow_msbuild,
+        allow_docker: resolved.allow_docker,
+        electron_app_dir: session.electron_app_dir,
+        agent,
+        agent_dirs,
+        allow_cache_exec: &resolved.allow_cache_exec,
+        allow_cache_exec_any: resolved.allow_cache_exec_any,
+        allow_browser: resolved.allow_browser,
+        keychain_substitute,
+        use_bubblewrap: resolved.use_bubblewrap,
+    }
+}
+
 fn prepare_shell_sandbox(
     cli: &Cli,
     resolved: &mut config::Resolved,
@@ -4779,9 +4834,11 @@ fn run_check_command(
         active_agent,
         unapproved_proposals: _,
     } = resolve_context(cli, true)?;
-    // `cplt check` does not yet report per named root; the set is still
-    // validated by resolve_context, so a bad entry is refused here too.
-    let _ = &repo_roots;
+    // The named roots, which `ExecContext::for_launch` turns into the gh scope
+    // set. `check exec gh …` reported a named repository as outside the startup
+    // scope while the launch allowed it, because these were discarded here with
+    // `let _ = &repo_roots` (#447).
+    let named_roots: Vec<&Path> = repo_roots.iter().map(|r| r.dir.as_path()).collect();
 
     // Shell, not `active_agent`: `check` probes under the Shell profile.
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
@@ -4867,9 +4924,14 @@ fn run_check_command(
             agent_name,
             preset_name,
         ),
-        Some(CheckTarget::Exec { cmd }) => {
-            build_exec_check(&resolved, &project_dir, &cmd, agent_name, preset_name)
-        }
+        Some(CheckTarget::Exec { cmd }) => build_exec_check(
+            &resolved,
+            &project_dir,
+            &named_roots,
+            &cmd,
+            agent_name,
+            preset_name,
+        ),
     };
 
     if let Some(handle) = proxy_handle {
@@ -4887,6 +4949,57 @@ fn run_check_command(
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// Files git tracks in `project_dir` that the sandbox denies reading.
+///
+/// Asks git rather than walking the tree: an ignored or untracked `.env` is
+/// harmless here — git never hashes it — so the tracked set is exactly the one
+/// that breaks commands, and it is also exactly the set that represents a
+/// secret committed to the repository.
+///
+/// Silent on any git failure: this is an advisory check, and a repository
+/// without a commit yet, or no git at all, is not something to report as a
+/// finding.
+#[allow(clippy::disallowed_methods)] // `git` is a git::trusted_git() path, resolved immediately above
+fn tracked_sensitive_files(project_dir: &Path) -> Vec<String> {
+    let Some(git) = cplt::git::trusted_git() else {
+        return Vec::new();
+    };
+    let Ok(out) = std::process::Command::new(git)
+        .arg("-C")
+        // The path itself, not a lossy string: a non-UTF-8 byte would be
+        // replaced and point git at a different directory, or none.
+        .arg(project_dir)
+        .args(["ls-files", "-z"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .filter(|name| is_sensitive_basename(name.rsplit('/').next().unwrap_or(name)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a file name matches [`sandbox::SENSITIVE_PROJECT_PATTERNS`].
+///
+/// Hand-matched rather than compiled: those patterns are SBPL regex source for
+/// the macOS profile, and cplt has no regex engine linked. The list is seven
+/// fixed shapes, so a `ends_with` each is the whole implementation — and
+/// `sensitive_basename_matches_the_profile_patterns` fails if the constant
+/// grows, so a new pattern cannot be silently unmatched here.
+fn is_sensitive_basename(base: &str) -> bool {
+    base == ".env"
+        || base.starts_with(".env.")
+        || [".pem", ".key", ".p12", ".pfx", ".jks"]
+            .iter()
+            .any(|ext| base.ends_with(ext))
 }
 
 /// Resolve a user-supplied check path to an absolute path without requiring it
@@ -4920,6 +5033,48 @@ fn build_battery(
     preset_name: Option<String>,
 ) -> check::Report {
     let mut items = Vec::new();
+
+    // A tracked file the sandbox denies breaks git itself, and the failure
+    // names the sandbox rather than the cause: `fatal: cannot hash .env.local`
+    // from `git diff`, `git add`, `git stash` and `git commit -a`, because git
+    // hashes worktree files and the read deny aborts it. Worth checking for
+    // two reasons at once — it is a git-hostile configuration *and* a secret
+    // committed to the repository (#401).
+    for tracked in tracked_sensitive_files(project_dir) {
+        items.push(check::CheckItem {
+            name: "tracked secret-shaped file".to_string(),
+            category: "filesystem".to_string(),
+            target: tracked.clone(),
+            decision: if resolved.allow_env_files {
+                check::Decision::Allowed
+            } else {
+                check::Decision::Blocked
+            },
+            expected: None,
+            reason: if resolved.allow_env_files {
+                format!(
+                    "{tracked} is tracked by git and matches the protected patterns, but \
+                     allow_env_files is on, so git can read it. It is still a secret-shaped \
+                     file committed to the repository."
+                )
+            } else {
+                format!(
+                    "{tracked} is tracked by git and the sandbox denies reading it, so \
+                     `git add`, `git diff`, `git stash` and `git commit -a` fail with \
+                     \"cannot hash\" whenever it is modified. git hashes worktree files, and \
+                     the read deny aborts the whole command rather than skipping the file."
+                )
+            },
+            fix: Some(
+                "Untrack it (`git rm --cached <FILE>`) and add it to .gitignore — an ignored \
+                 file is never hashed, and a secret-shaped file does not belong in the \
+                 repository. `--allow-env-files` also works but unblocks every .env, .pem, \
+                 .key, .p12, .pfx and .jks in the project."
+                    .to_string(),
+            ),
+            note: None,
+        });
+    }
 
     // ── Filesystem ──
     // Sanity: reading & writing the project dir must be ALLOWED.
@@ -5241,25 +5396,15 @@ fn build_net_check(
 fn build_exec_check(
     resolved: &config::Resolved,
     project_dir: &Path,
+    named_roots: &[&Path],
     cmd: &[String],
     agent_name: String,
     preset_name: Option<String>,
 ) -> check::Report {
-    // The same capture the launch does, from the same trusted git (see
-    // `sandbox_exec.rs`, "baked at launch"): without it every push reads as
-    // blocked, feature branches included.
-    let repo_facts = crate::git::trusted_git()
-        .map(|git| gh_proxy::capture_repo_facts(git, project_dir))
-        .unwrap_or_default();
-    let ctx = check::ExecContext {
-        allow_docker: resolved.allow_docker,
-        allow_tmp_exec: resolved.allow_tmp_exec,
-        gh_guard: &resolved.gh_guard,
-        git_guard: &resolved.git_guard,
-        project_dir,
-        repo_facts: &repo_facts,
-        scratch_dir: resolved.scratch_dir,
-    };
+    // One constructor, deriving everything from the same values the launch
+    // resolves from. See `ExecContext::for_launch` for why this is not
+    // assembled field by field any more (#447).
+    let ctx = check::ExecContext::for_launch(resolved, project_dir, named_roots);
     let expl = check::explain_exec(cmd, &ctx);
     let item = check::CheckItem {
         name: "exec".to_string(),
@@ -5274,139 +5419,438 @@ fn build_exec_check(
     check::Report::new(agent_name, preset_name, false, vec![item])
 }
 
-fn run_doctor() -> ExitCode {
-    let home_dir = if let Ok(h) = std::env::var("HOME") {
-        match std::fs::canonicalize(&h) {
-            Ok(p) => p,
+/// The kernel release, from `uname(2)`: no spawn, and the same string on
+/// both platforms (`6.6.87.2-microsoft-standard-WSL2`, `25.6.0`).
+fn kernel_release() -> String {
+    // SAFETY: utsname is plain-old-data; uname fills it or fails.
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&raw mut u) } != 0 {
+        return "unknown".to_string();
+    }
+    // SAFETY: uname NUL-terminates every field it fills.
+    unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `cplt doctor`. Findings first; the inventory only under `--verbose`.
+///
+/// Built from the launch's own resolution (`resolve_context`, `HostProbe`,
+/// `build_sandbox_config`, `generate_policy`) rather than a parallel
+/// discovery, so what it reports about the agent, the config layers and the
+/// grants is what a launch would use — the old doctor auto-detected only
+/// Copilot/OpenCode/Antigravity and ignored `--agent` and `sandbox.agent`
+/// entirely, so it could not name the agent that had just failed (#449).
+///
+/// Degrades rather than errors: when the launch cannot even resolve (bad
+/// config, unsafe root), that is the one blocking finding and the header
+/// still prints.
+fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
+    use cplt::doctor::{self, Finding, Level};
+
+    let wsl = cfg!(target_os = "linux") && agent::is_wsl();
+    let mut headline = format!(
+        "cplt {LONG_VERSION} · {} {} · kernel {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        kernel_release()
+    );
+    if wsl {
+        headline.push_str(" (WSL)");
+    }
+    if std::env::var_os("__CPLT_WRAPPED").is_some() {
+        headline.push_str(" · inside a cplt sandbox");
+    }
+    println!("{headline}");
+
+    let ctx = match resolve_context(cli, false) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            println!();
+            let findings = [Finding {
+                level: Level::Blocking,
+                // The error text can quote an absolute path — "cplt refuses
+                // to sandbox '/Users/hans'" — and this view gets pasted into
+                // public issues.
+                message: doctor::tilde_in_text(
+                    &format!("cplt cannot resolve this launch: {e}"),
+                    &std::env::var("HOME").map_or_else(
+                        |_| std::path::PathBuf::from("/nonexistent"),
+                        std::path::PathBuf::from,
+                    ),
+                ),
+                fix: None,
+            }];
+            print!("{}", doctor::render(&findings, &[], false));
+            return ExitCode::FAILURE;
+        }
+    };
+    let ResolvedContext {
+        mut resolved,
+        config_path,
+        home_dir,
+        project_dir,
+        repo_roots: _,
+        active_agent,
+        unapproved_proposals,
+    } = ctx;
+    let tilde = |p: &Path| doctor::tilde(p, &home_dir);
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut ok: Vec<String> = Vec::new();
+
+    // ── agent: which one, and why ──
+    let agent_source = if cli.agent.is_some() {
+        Some("--agent".to_string())
+    } else if resolved.agent.is_some() {
+        let file = config::load_local(&project_dir)
+            .ok()
+            .flatten()
+            .filter(|l| l.config.sandbox.agent.is_some())
+            .map(|l| l.path)
+            .or_else(|| config_path.clone());
+        Some(match file {
+            Some(f) => format!("sandbox.agent in {}", tilde(&f)),
+            None => "sandbox.agent".to_string(),
+        })
+    } else if agent::Agent::auto_detect().is_some() {
+        Some("auto-detected from PATH".to_string())
+    } else {
+        None
+    };
+    let mut agent_runnable = false;
+    match &agent_source {
+        None => {
+            println!("agent:       none (nothing on PATH, no --agent, no sandbox.agent)");
+            findings.push(Finding::blocking(
+                "No supported agent found: cplt will refuse to launch.",
+                "install one (copilot, opencode, antigravity, pi, claude, goose) or pass \
+                 --agent <name> / set sandbox.agent",
+            ));
+        }
+        Some(source) => match active_agent.resolve_binary() {
+            Ok(bin) => {
+                agent_runnable = true;
+                let shown = match discover::probe_version(&bin, &["--version"]) {
+                    discover::VersionProbe::Version(v) => v,
+                    discover::VersionProbe::Unknown => "(version unknown)".to_string(),
+                    discover::VersionProbe::TimedOut => {
+                        findings.push(Finding::warning(
+                            format!(
+                                "{} --version did not answer within 5s and was killed; the \
+                                 binary is installed but may be wedged.",
+                                active_agent.binary_name()
+                            ),
+                            None,
+                        ));
+                        "(version probe timed out)".to_string()
+                    }
+                };
+                println!(
+                    "agent:       {} {shown}  ({source})",
+                    active_agent.display_name()
+                );
+            }
             Err(e) => {
-                ui::error(&format!("Cannot resolve $HOME ({h}): {e}"));
-                return ExitCode::FAILURE;
+                println!(
+                    "agent:       {} — not runnable  ({source})",
+                    active_agent.display_name()
+                );
+                findings.push(Finding {
+                    level: Level::Blocking,
+                    message: e,
+                    fix: None,
+                });
             }
-        }
-    } else {
-        ui::error("$HOME not set");
-        return ExitCode::FAILURE;
-    };
-
-    let project_dir = if let Some(root) = detect_project_root() {
-        std::fs::canonicalize(&root).unwrap_or(root)
-    } else {
-        std::env::current_dir()
-            .and_then(std::fs::canonicalize)
-            .unwrap_or_else(|_| PathBuf::from("."))
-    };
-
-    println!(
-        "{}[cplt]{} cplt:     {}",
-        ui::stdout_color(ui::BLUE),
-        ui::stdout_color(ui::RESET),
-        LONG_VERSION
-    );
-    println!(
-        "{}[cplt]{} Project:  {}",
-        ui::stdout_color(ui::BLUE),
-        ui::stdout_color(ui::RESET),
-        project_dir.display()
-    );
-    println!(
-        "{}[cplt]{} Home:     {}",
-        ui::stdout_color(ui::BLUE),
-        ui::stdout_color(ui::RESET),
-        home_dir.display()
-    );
-    println!();
-
-    let discovery = discover::discover_all(&home_dir, &project_dir);
-    let ok = discovery.print_report();
-
-    // Show project ecosystem detection summary
-    let report = cplt::detect::detect_project_recursive(&project_dir);
-    if !report.detections.is_empty() || !report.workspace_members.is_empty() {
-        println!();
-        println!(
-            "{}{}[doctor]{} {}Project ecosystems{}",
-            ui::stdout_color(ui::BOLD),
-            ui::stdout_color(ui::BLUE),
-            ui::stdout_color(ui::RESET),
-            ui::stdout_color(ui::BOLD),
-            ui::stdout_color(ui::RESET)
-        );
-        for d in &report.detections {
-            println!(
-                "  {}✓{} {}",
-                ui::stdout_color(ui::GREEN),
-                ui::stdout_color(ui::RESET),
-                d.name
-            );
-        }
-
-        // Show workspace member ecosystems
-        if !report.workspace_members.is_empty() {
-            // Collect unique sources for the header
-            let sources: BTreeSet<String> = report
-                .workspace_members
-                .iter()
-                .map(|m| m.source.to_string())
-                .collect();
-            let source_label = sources.into_iter().collect::<Vec<_>>().join(", ");
-
-            println!();
-            println!(
-                "  {}Workspace members ({}){}",
-                ui::stdout_color(ui::BOLD),
-                source_label,
-                ui::stdout_color(ui::RESET),
-            );
-            for member in &report.workspace_members {
-                let ecosystems: Vec<&str> = member.detections.iter().map(|d| d.name).collect();
-                if ecosystems.is_empty() {
-                    println!(
-                        "    {}•{} {}",
-                        ui::stdout_color(ui::DIM),
-                        ui::stdout_color(ui::RESET),
-                        member.relative_path
-                    );
-                } else {
-                    println!(
-                        "    {}✓{} {}: {}",
-                        ui::stdout_color(ui::GREEN),
-                        ui::stdout_color(ui::RESET),
-                        member.relative_path,
-                        ecosystems.join(", ")
-                    );
-                }
-            }
-        }
-
-        // Detector diagnostics carry the remedy; the ecosystem name alone does
-        // not. `cplt doctor` is what a developer runs after a refusal, so the
-        // explanation has to reach this surface and not only `cplt init`.
-        for diag in &report.diagnostics {
-            println!();
-            println!(
-                "  {}!{} [{}] {}",
-                ui::stdout_color(ui::YELLOW),
-                ui::stdout_color(ui::RESET),
-                diag.detector,
-                diag.message
-            );
-        }
-
-        let has_repo_config = project_dir.join(".cplt.toml").exists();
-        if !has_repo_config {
-            println!();
-            println!(
-                "  {}→{} Run `cplt init` to generate .cplt.toml",
-                ui::stdout_color(ui::BLUE),
-                ui::stdout_color(ui::RESET),
-            );
-        }
+        },
     }
 
-    if ok {
-        ExitCode::SUCCESS
-    } else {
+    // ── config: which layers loaded ──
+    let mut layers = vec![match &config_path {
+        Some(p) => format!("user {}", tilde(p)),
+        None => "user: none".to_string(),
+    }];
+    if let Some(lp) = config::local_path(&project_dir).filter(|p| p.exists()) {
+        layers.push(format!("local {}", tilde(&lp)));
+    }
+    match repo_config::load_repo_config(&project_dir) {
+        Ok(Some(loaded)) => layers.push(format!(
+            "repo .cplt.toml ({})",
+            match loaded.source {
+                repo_config::RepoConfigSource::GitHead => "committed",
+                repo_config::RepoConfigSource::WorkingTree => "working tree, not committed",
+                _ => "unknown source",
+            }
+        )),
+        Ok(None) => {}
+        Err(_) => layers.push("repo .cplt.toml (unreadable)".to_string()),
+    }
+    layers.push(format!(
+        "preset: {}",
+        resolved.preset.map_or("none", preset_label)
+    ));
+    println!("config:      {}", layers.join(" · "));
+    if !unapproved_proposals.is_empty() {
+        findings.push(Finding::warning(
+            format!(
+                ".cplt.toml has {} unapproved permission(s) ({}): the launch applies none of them.",
+                unapproved_proposals.len(),
+                unapproved_proposals.join(", ")
+            ),
+            Some("review with `cplt trust`, then `cplt trust accept --all`".to_string()),
+        ));
+    }
+
+    // ── enforcement: the regime, and why ──
+    let bubblewrap = doctor::bubblewrap_state(resolved.use_bubblewrap);
+    #[cfg(target_os = "macos")]
+    {
+        if Path::new("/usr/bin/sandbox-exec").exists() {
+            println!("enforcement: Seatbelt (sandbox-exec)");
+        } else {
+            println!("enforcement: none — /usr/bin/sandbox-exec missing");
+            findings.push(Finding {
+                level: Level::Blocking,
+                message: "Seatbelt is unavailable: /usr/bin/sandbox-exec is missing, so cplt \
+                          cannot sandbox anything on this host."
+                    .to_string(),
+                fix: None,
+            });
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let landlock = match sandbox::available_abi_version() {
+            Some(abi) if abi < 4 => format!("Landlock ABI {abi} (no TCP port rules: proxy only)"),
+            Some(abi) => format!("Landlock ABI {abi}"),
+            None => {
+                findings.push(Finding::blocking(
+                    "Landlock is unavailable: cplt cannot sandbox anything on this kernel.",
+                    "Linux 5.13+ with landlock in the LSM list (cat /sys/kernel/security/lsm); \
+                     on WSL, check .wslconfig for a kernelCommandLine lsm= that omits it",
+                ));
+                "Landlock: unavailable".to_string()
+            }
+        };
+        println!(
+            "enforcement: {landlock} + seccomp · {}",
+            bubblewrap.describe()
+        );
+        if !bubblewrap.active() {
+            println!(
+                "             → mount-level protections OFF (.git/hooks, agent host files, mise \
+                 shims, Pi bin/, unix-socket masks)"
+            );
+        }
+        if resolved.use_bubblewrap == Some(true) && !bubblewrap.active() {
+            findings.push(Finding::blocking(
+                format!(
+                    "use_bubblewrap = true but {}: the launch refuses to start.",
+                    bubblewrap.describe()
+                ),
+                "install bubblewrap into /usr/bin, enable user namespaces \
+                 (sysctl kernel.unprivileged_userns_clone=1), or drop use_bubblewrap",
+            ));
+        }
+    }
+    let _ = &bubblewrap;
+    println!();
+
+    // ── the policy a launch would build, for the rules below ──
+    let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
+    let mut agent_dirs = active_agent.config_dirs(&home_dir);
+    agent::canonicalize_agent_dirs(&mut agent_dirs);
+    let keychain_substitute = active_agent.credential_outside_keychain(
+        &home_dir,
+        &resolved.deny_env,
+        resolved.keychain_substitute,
+    );
+    let sandbox_config = build_sandbox_config(
+        &resolved,
+        &probe,
+        active_agent,
+        &agent_dirs,
+        SessionPaths::default(),
+        keychain_substitute,
+    );
+    let policy = sandbox::generate_policy(&sandbox_config);
+
+    // Only for an agent that can run: "Pi will not start" under "Pi is not
+    // installed" is noise.
+    if agent_runnable {
+        findings.extend(doctor::pi_lock_finding(active_agent, &policy, &home_dir));
+    }
+
+    // Tracked secrets under the .env deny — the same set `cplt check` reports
+    // (#451), from the same function.
+    let sensitive = tracked_sensitive_files(&project_dir);
+    findings.extend(doctor::tracked_env_finding(
+        &sensitive,
+        resolved.allow_env_files,
+    ));
+
+    // Tools as found on PATH — the shim, not its target.
+    let tools: Vec<(&str, PathBuf)> = discover::TOOLS_TO_CHECK
+        .iter()
+        .filter_map(|name| discover::which_on_path(name).map(|p| (*name, p)))
+        .collect();
+    let mut tool_names: Vec<&str> = Vec::new();
+    for (name, path) in &tools {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if agent::is_wsl_interop_binary(&canon, wsl) {
+            let critical = discover::WSL_CRITICAL_TOOLS.contains(name);
+            let msg = format!(
+                "{name} resolves to {}, a Windows install reached through WSL interop{}",
+                canon.display(),
+                if critical {
+                    ", which cannot run in the Linux sandbox."
+                } else {
+                    "; running it starts a Windows process outside the sandbox."
+                }
+            );
+            findings.push(if critical {
+                Finding::blocking(msg, format!("install {name} inside the WSL distro"))
+            } else {
+                Finding::warning(msg, None)
+            });
+            continue;
+        }
+        tool_names.push(name);
+    }
+    // Linux only: the LandlockPolicy IS the enforcement there. On macOS it is
+    // a model of the SBPL profile that lacks the Homebrew exec grants, so a
+    // mise shim into /opt/homebrew/Cellar reads as denied while the real
+    // sandbox runs it (`cplt check path` shows the same model/probe gap).
+    if cfg!(target_os = "linux") {
+        let shim_inputs: Vec<doctor::ToolOnPath<'_>> =
+            tools.iter().map(|(n, p)| (*n, p.as_path())).collect();
+        findings.extend(doctor::shim_findings(&policy, &shim_inputs, &home_dir));
+    }
+    if !tool_names.contains(&"git") {
+        findings.push(Finding::warning(
+            "git not found on PATH: the git guard, the session audit and repo config trust \
+             all need it."
+                .to_string(),
+            None,
+        ));
+    }
+
+    // Detector diagnostics carry their own remedy (#434); they are findings,
+    // the ecosystem list itself is `cplt init`'s business.
+    for diag in cplt::detect::detect_project_recursive(&project_dir).diagnostics {
+        findings.push(Finding::warning(
+            format!("[{}] {}", diag.detector, diag.message),
+            None,
+        ));
+    }
+
+    // Auth matters to Copilot; the others log in on disk or via --pass-env.
+    let auth = discover::discover_auth(&home_dir);
+    if auth.gh_cli_auth {
+        ok.push("auth: gh CLI".to_string());
+    } else if let Some(var) = auth.env_tokens.first() {
+        ok.push(format!("auth: {var}"));
+    } else if active_agent == agent::Agent::Copilot && !auth.any_auth_available() {
+        findings.push(Finding::blocking(
+            "No auth for Copilot: gh is not logged in and none of COPILOT_GITHUB_TOKEN, \
+             GH_TOKEN, GITHUB_TOKEN is set.",
+            "gh auth login",
+        ));
+    }
+    let agents_on_path: Vec<&str> = agent::Agent::ALL
+        .iter()
+        .filter(|a| **a != agent::Agent::Shell)
+        .map(agent::Agent::binary_name)
+        .filter(|b| discover::which_on_path(b).is_some())
+        .collect();
+    if !agents_on_path.is_empty() {
+        ok.push(format!("agents on PATH: {}", agents_on_path.join(", ")));
+    }
+    if !tool_names.is_empty() {
+        ok.push(format!("tools: {}", tool_names.join(" ")));
+    }
+
+    print!("{}", doctor::render(&findings, &ok, !verbose));
+
+    if verbose {
+        println!();
+        println!("── inventory ──");
+        println!("project:  {}", project_dir.display());
+        println!("home:     {}", home_dir.display());
+        println!();
+        discover::discover_all(&home_dir, &project_dir).print_report();
+        print_project_ecosystems(&project_dir);
+    }
+
+    if doctor::exit_nonzero(&findings) {
         ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// The `Project ecosystems` block of `cplt doctor --verbose`.
+fn print_project_ecosystems(project_dir: &Path) {
+    let report = cplt::detect::detect_project_recursive(project_dir);
+    if report.detections.is_empty() && report.workspace_members.is_empty() {
+        return;
+    }
+    println!(
+        "{}{}[doctor]{} {}Project ecosystems{}",
+        ui::stdout_color(ui::BOLD),
+        ui::stdout_color(ui::BLUE),
+        ui::stdout_color(ui::RESET),
+        ui::stdout_color(ui::BOLD),
+        ui::stdout_color(ui::RESET)
+    );
+    for d in &report.detections {
+        println!(
+            "  {}✓{} {}",
+            ui::stdout_color(ui::GREEN),
+            ui::stdout_color(ui::RESET),
+            d.name
+        );
+    }
+    if !report.workspace_members.is_empty() {
+        let sources: BTreeSet<String> = report
+            .workspace_members
+            .iter()
+            .map(|m| m.source.to_string())
+            .collect();
+        let source_label = sources.into_iter().collect::<Vec<_>>().join(", ");
+        println!();
+        println!(
+            "  {}Workspace members ({}){}",
+            ui::stdout_color(ui::BOLD),
+            source_label,
+            ui::stdout_color(ui::RESET),
+        );
+        for member in &report.workspace_members {
+            let ecosystems: Vec<&str> = member.detections.iter().map(|d| d.name).collect();
+            if ecosystems.is_empty() {
+                println!(
+                    "    {}•{} {}",
+                    ui::stdout_color(ui::DIM),
+                    ui::stdout_color(ui::RESET),
+                    member.relative_path
+                );
+            } else {
+                println!(
+                    "    {}✓{} {}: {}",
+                    ui::stdout_color(ui::GREEN),
+                    ui::stdout_color(ui::RESET),
+                    member.relative_path,
+                    ecosystems.join(", ")
+                );
+            }
+        }
+    }
+    if !project_dir.join(".cplt.toml").exists() {
+        println!();
+        println!(
+            "  {}→{} Run `cplt init` to generate .cplt.toml",
+            ui::stdout_color(ui::BLUE),
+            ui::stdout_color(ui::RESET),
+        );
     }
 }
 
@@ -5787,7 +6231,7 @@ fn run_config_set(
     // `sandbox.repo_dirs` is local-layer only. Writing it globally would produce
     // a file the next launch warns about and ignores; refuse here instead, and
     // name the flag that makes it work.
-    if !local && key_info.section == "sandbox" && key_info.key == "repo_dirs" {
+    if !local && config::layer_only_flag(key_info) == Some("--local") {
         ui::error(&format!(
             "sandbox.repo_dirs is per-project, not machine-wide: a repository list in \
              your global config would attach to every session.\n  \
@@ -5801,7 +6245,7 @@ fn run_config_set(
     // ── Global mode (default) ───────────────────────────────────────
 
     // deny.env is repo-local only (not in global config file schema)
-    if key_info.section == "deny" && key_info.key == "env" {
+    if config::layer_only_flag(key_info) == Some("--repo") {
         ui::error(
             "deny.env is only supported in repo-local config (.cplt.toml).\n  Use: cplt config set --repo deny.env <VALUE>",
         );
@@ -7107,6 +7551,44 @@ fn start_denial_stream() -> Option<std::process::Child> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // test code: no unsandboxed parent to protect (#239)
 mod tests {
+    /// The hand-written matcher must cover every pattern the profile denies.
+    /// It cannot be derived from them — they are SBPL regex source and there is
+    /// no regex engine linked — so this is the thing that stops the two
+    /// drifting when someone adds a pattern (#401).
+    #[test]
+    fn sensitive_basename_matches_the_profile_patterns() {
+        assert_eq!(
+            sandbox::SENSITIVE_PROJECT_PATTERNS.len(),
+            7,
+            "a pattern was added or removed; teach `is_sensitive_basename` about it \
+             and update this count"
+        );
+        for name in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "server.pem",
+            "id.key",
+            "cert.p12",
+            "cert.pfx",
+            "keystore.jks",
+        ] {
+            assert!(is_sensitive_basename(name), "{name} should be sensitive");
+        }
+        for name in [
+            "env",
+            "environment.md",
+            ".envrc",
+            "README.md",
+            "monkey.jks.bak",
+        ] {
+            assert!(
+                !is_sensitive_basename(name),
+                "{name} should not be treated as sensitive"
+            );
+        }
+    }
+
     use super::*;
     use clap::Parser;
 
@@ -8290,7 +8772,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("sibling repositories are not yet supported"),
+            err.contains("Only repositories checked out inside the project directory"),
             "{err}"
         );
     }
@@ -8479,7 +8961,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("sibling repositories are not yet supported"),
+            err.contains("Only repositories checked out inside the project directory"),
             "{err}"
         );
         assert!(err.contains("sandbox.repo_dirs entry"), "{err}");

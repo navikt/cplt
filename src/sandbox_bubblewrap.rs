@@ -309,7 +309,16 @@ pub(crate) fn build_bwrap_args(
     //    not exist).
     let mut writable: Vec<PathBuf> = fs_rules
         .iter()
-        .filter(|r| r.access.write)
+        // `create_dirs` needs the mount writable too, or `mkdir` hits EROFS
+        // before Landlock — which is applied *inside* this namespace — is even
+        // consulted. Landlock stays the control: its rule for a create_dirs
+        // path carries only MakeDir|RemoveDir (no WriteFile/MakeReg), so a
+        // writable mount is neutered to create-only, and any exec-only child
+        // (e.g. Pi's `bin/`) is re-bound read-only by `ro_protect` and pinned
+        // by `pin_paths` on top — the same OpenCode-proven machinery, not a
+        // new per-agent exception. `bin/` is thus write-denied by BOTH Landlock
+        // and the overlay, so this is not "the overlay as sole control".
+        .filter(|r| r.access.write || r.access.create_dirs)
         .filter_map(|r| r.path.canonicalize().ok())
         // Skip bwrap-managed subtrees and the /tmp mount point itself.
         .filter(|p| {
@@ -354,7 +363,10 @@ pub(crate) fn build_bwrap_args(
     // writable rule: the `/tmp` rule itself is writable and is deliberately
     // never bound, so testing against the rules would skip every path under it.
     let mut bound_readonly: Vec<&Path> = Vec::new();
-    for rule in fs_rules.iter().filter(|r| !r.access.write) {
+    for rule in fs_rules
+        .iter()
+        .filter(|r| !r.access.write && !r.access.create_dirs)
+    {
         let path = &rule.path;
         if !path.starts_with("/tmp") || path == Path::new("/tmp") {
             continue;
@@ -940,6 +952,11 @@ struct InnerRule {
     w: bool,
     x: bool,
     i: bool,
+    // create-only (mkdir/rmdir). Must survive the policy transfer to the
+    // re-exec'd helper, or the Landlock ruleset applied *inside* the namespace
+    // would silently drop the grant and Pi's trust-store `mkdir` would fail.
+    #[serde(default)]
+    c: bool,
 }
 
 impl InnerRule {
@@ -950,6 +967,7 @@ impl InnerRule {
             w: rule.access.write,
             x: rule.access.execute,
             i: rule.access.ioctl,
+            c: rule.access.create_dirs,
         }
     }
 
@@ -961,6 +979,7 @@ impl InnerRule {
                 write: self.w,
                 execute: self.x,
                 ioctl: self.i,
+                create_dirs: self.c,
             },
         }
     }
@@ -1153,6 +1172,7 @@ mod tests {
                 write: true,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         }
     }
@@ -1191,6 +1211,7 @@ mod tests {
                 write: true,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         }];
         let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
@@ -1252,6 +1273,7 @@ mod tests {
                     write: false,
                     execute: false,
                     ioctl: false,
+                    create_dirs: false,
                 },
             },
         ];
@@ -1287,6 +1309,7 @@ mod tests {
                 write: false,
                 execute: true,
                 ioctl: false,
+                create_dirs: false,
             },
         }];
         let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
@@ -1325,6 +1348,7 @@ mod tests {
                 write: false,
                 execute: false,
                 ioctl: false,
+                create_dirs: false,
             },
         }];
         let args = build_bwrap_args(&rules, Overlays::default(), &DenyMasks::default());
@@ -1351,6 +1375,7 @@ mod tests {
                     write: true,
                     execute: false,
                     ioctl: false,
+                    create_dirs: false,
                 },
             },
             FsRule {
@@ -1360,6 +1385,7 @@ mod tests {
                     write: false,
                     execute: false,
                     ioctl: false,
+                    create_dirs: false,
                 },
             },
         ];
