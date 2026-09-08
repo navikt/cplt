@@ -6309,4 +6309,117 @@ paths = [
             "the agent read a descriptor cplt inherited from its caller.\nstdout: {stdout}"
         );
     }
+
+    /// Live probe for `AgentDir::create_dirs` (Pi's trust lock, #449) against
+    /// the REAL generated Pi profile, decided by the kernel under `sandbox-exec`.
+    ///
+    /// Every other test of this grant is a profile-string match or
+    /// `writable_tree_over`, and all of them passed with a root-wide directory
+    /// grant that let `mv bin bin.old; mv tmp bin` through — rename is unlink
+    /// of a directory plus create of a directory, both of which that grant
+    /// allowed, and a `require-all` allow beats the plain `subpath` denies at
+    /// the tail. A test that cannot see the failure class is not protecting it.
+    ///
+    /// The fake HOME sits under the real home, NOT `temp_dir()`: `/tmp` and
+    /// `/var/folders` are wholesale-writable in the profile, so a fake home
+    /// there is writable by that rule and every probe below passes vacuously.
+    #[test]
+    fn e2e_pi_trust_lock_is_creatable_but_nothing_else_in_the_root_moves() {
+        require_sandbox!();
+        let real_home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let fake_home = real_home.join(format!(".cplt-e2e-pi-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        let agent = fake_home.join(".pi/agent");
+        for d in ["bin", "tmp", "sessions", "extensions"] {
+            std::fs::create_dir_all(agent.join(d)).unwrap();
+        }
+        std::fs::write(agent.join("bin/rg"), "old").unwrap();
+        std::fs::write(agent.join("tmp/rg"), "payload").unwrap();
+        std::fs::write(agent.join("sessions/evil.js"), "ext").unwrap();
+        std::fs::write(agent.join("trust.json"), "{}").unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        let out = cplt_cmd()
+            .args([
+                "--agent",
+                "pi",
+                "--yes",
+                "--no-validate",
+                "--quiet",
+                "--print-profile",
+                "--project-dir",
+                project.path().to_str().unwrap(),
+            ])
+            .env("HOME", &fake_home)
+            .output()
+            .expect("run cplt --print-profile");
+        assert!(
+            out.status.success(),
+            "--print-profile failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let profile_path = project.path().join("pi.sb");
+        std::fs::write(&profile_path, &out.stdout).unwrap();
+
+        let a = agent.to_str().unwrap();
+        let probe = |cmd: String| -> bool {
+            Command::new("sandbox-exec")
+                .args(["-f", profile_path.to_str().unwrap(), "/bin/sh", "-c", &cmd])
+                .status()
+                .expect("spawn sandbox-exec")
+                .success()
+        };
+
+        // proper-lockfile's exact sequence: mkdir, utimes (mtime probe), rmdir.
+        assert!(probe(format!("mkdir {a}/trust.json.lock")), "mkdir lock");
+        assert!(
+            probe(format!("touch -m {a}/trust.json.lock")),
+            "utimes lock"
+        );
+        assert!(
+            !probe(format!("touch {a}/trust.json.lock/f")),
+            "nothing may be created inside the lock"
+        );
+        assert!(probe(format!("rmdir {a}/trust.json.lock")), "rmdir lock");
+
+        // The escapes the root-wide grant allowed, each of which must now fail.
+        for (what, cmd) in [
+            ("mkdir of any other name", format!("mkdir {a}/other")),
+            (
+                "rename the exec-only bin aside",
+                format!("mv {a}/bin {a}/bin.old"),
+            ),
+            (
+                "rename a writable sibling onto bin",
+                format!("mv {a}/tmp {a}/bin"),
+            ),
+            (
+                "rename extensions aside",
+                format!("mv {a}/extensions {a}/ext.old"),
+            ),
+            (
+                "rename a writable sibling onto extensions",
+                format!("mv {a}/sessions {a}/extensions"),
+            ),
+            (
+                "write the managed binary",
+                format!("echo evil > {a}/bin/rg"),
+            ),
+            ("create a top-level file", format!("touch {a}/newfile")),
+            (
+                "symlink at the lock name",
+                format!("ln -s /etc {a}/trust.json.lock"),
+            ),
+        ] {
+            assert!(!probe(cmd), "{what} must be denied");
+        }
+        assert_eq!(
+            std::fs::read_to_string(agent.join("bin/rg")).unwrap(),
+            "old",
+            "the managed binary must be byte-for-byte untouched"
+        );
+        assert!(agent.join("bin").is_dir() && agent.join("extensions").is_dir());
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
 }
