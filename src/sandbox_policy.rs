@@ -117,7 +117,12 @@ pub fn cplt_state_dir_grant(home: &Path, path: &Path) -> Option<PathBuf> {
 /// `generate_policy` and not only the ones that went through `prepare`.
 #[must_use]
 pub fn grant_is_refused(home: &Path, path: &Path) -> bool {
-    hard_denied_file(home, path).is_some() || denied_dotfile_dir(home, path).is_some()
+    hard_denied_file(home, path).is_some()
+        || denied_dotfile_dir(home, path).is_some()
+        // Subtree, unlike the two above: nothing inside cplt's own state
+        // directory may be granted, so a backend reached without going through
+        // `sandbox::prepare` refuses the same paths that `prepare` does.
+        || cplt_state_dir_grant(home, path).is_some()
 }
 
 /// Exact-path membership of `path` in a `$HOME`-relative deny list, comparing

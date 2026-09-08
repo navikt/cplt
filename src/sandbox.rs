@@ -287,9 +287,10 @@ fn validate_hard_denied_grants(config: &SandboxConfig) -> Result<(), String> {
                 return Err(format!(
                     "{key} names {} — inside cplt's own state directory ({}). Nothing in there \
                      can be granted, not even a single file: it holds the config, the trust \
-                     store, the blocklist cache and the per-repo local files, so an agent that \
-                     can write there approves its own next launch. Remove it from your config \
-                     or command line.",
+                     store, the blocklist cache and the per-repo local files, which decide what \
+                     the next launch allows. Reading them tells an agent exactly which \
+                     protections to work around; writing them lets it approve its own next \
+                     launch. Remove it from your config or command line.",
                     p.display(),
                     dir.display()
                 ));
