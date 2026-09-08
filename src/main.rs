@@ -6222,7 +6222,10 @@ fn run_config_set(
     // `check exec` answered for a hypothetical new launch and said allowed,
     // and the agent kept refusing. All three were right about different
     // questions (#458).
-    if !unset {
+    // Also on `--unset`: removing a value needs a restart for exactly the same
+    // reason setting one does, and suppressing it there was the inconsistency
+    // this notice exists to remove.
+    {
         let dim = ui::color(ui::DIM);
         eprintln!(
             "{}[cplt]{} {dim}Applies to the next launch. A session started before now keeps \

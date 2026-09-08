@@ -560,6 +560,9 @@ impl<'a> ExecContext<'a> {
 
 /// Static explanation of whether a command would run under the resolved policy.
 #[derive(Debug, Clone, Serialize)]
+// A field added here is a breaking change for anything matching the struct
+// exhaustively; `objection` was the second. Marked so the next one is not.
+#[non_exhaustive]
 pub struct ExecExplain {
     pub decision: Decision,
     pub reason: String,
