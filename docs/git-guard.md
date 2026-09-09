@@ -41,17 +41,29 @@ branches = ["renovate/*", "dependabot/*"]
 force = false
 ```
 
-`remote` names a remote of the repository cplt was launched in. The name alone
-is not a repository identity — every checkout on the machine has an `origin` —
-so at launch the guard resolves the name to that remote's URL and matches on
-the URL from then on. A rule for this repository's `origin` therefore does not
-authorize `git -C ../other-repo push origin main`, even though the other
-checkout also calls its remote `origin`.
+`remote` names a remote of a repository this session has **in scope**: the one
+cplt was launched in, plus every repository named with `--repo-dir` /
+`sandbox.repo_dirs`. The name alone is not a repository identity — every
+checkout on the machine has an `origin` — so at launch the guard resolves the
+name in each repository in scope and pins the rule to the URLs it found. A rule
+for `origin` therefore does not authorize a push to a checkout the session was
+never given, even though that checkout also calls its remote `origin`.
+
+A rule authorizes a push only when **both** halves hold: the destination URL is
+one of the pinned ones, and the push actually runs in a repository in scope
+(#424). Without the second half the two halves of the guard would disagree
+about what a repository is — `protect_default_branch_only` judges the
+repository the push runs in, while a URL-only rule would authorize from
+anywhere, including a clone the agent made underneath the project, whose
+`origin` an operator writing `remote = "origin"` was never thinking about. The
+in-scope half needs the scope to have been captured; when it could not be (no
+trusted git in the parent) the rule falls back to the URL alone and cplt says
+so at launch.
 
 Pinning needs a *trusted* git binary (the same one the gh guard uses to capture
 its repo scope), because it runs unsandboxed in the parent at launch. A rule
-that cannot be pinned — no trusted git, or no such remote in the launch
-repository — authorizes nothing at all, and cplt warns about it at launch. It
+that cannot be pinned — no trusted git, or no such remote in any repository in
+scope — authorizes nothing at all, and cplt warns about it at launch. It
 does not fall back to matching the bare name: that fallback grants exactly the
 cross-repository authorization pinning exists to prevent, in every repository
 the agent can reach. Fix what the warning names — add the remote to the project
@@ -145,7 +157,13 @@ cannot: an unresolvable branch counts as protected and the push is blocked.
 That resolution follows the command. `-C`, `--git-dir` and `--work-tree` are
 forwarded to the guard's own git calls, so `git -C ../other-repo push` is judged
 by *that* repository's branch and *that* repository's default branch, not by the
-repository the session was launched in.
+repository the session was launched in. For a repository in scope that branch is
+judged against a default branch captured for *it* at launch, so a named
+repository whose default is `trunk` protects `trunk` and not the launch
+repository's `main`. For a repository outside the scope there is no captured
+answer, so the guard cannot tell a feature branch from the protected one and
+refuses — the same fail-closed rule as a repository with no recorded default
+branch.
 
 **Security note:** This mode is intentionally permissive about branches. The
 agent can push to any non-default branch, and the human review gate becomes the

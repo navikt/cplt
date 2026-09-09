@@ -124,7 +124,7 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 | Tier | Behavior | Examples |
 |------|----------|----------|
 | **Allow** | Read-only; repo-scoped reads resolve against the startup repo, and an unverifiable cwd is pinned there rather than refused | `pr list`, `issue view`, `run list`, `search` |
-| **ScopeCheck** | Permitted only for the startup repo; implicit targets must resolve there from cwd | `pr create`, `issue comment`, `pr close` |
+| **ScopeCheck** | Permitted only for a repository in the scope set — the startup repo plus every `--repo-dir` root; implicit targets must resolve to one of them from cwd | `pr create`, `issue comment`, `pr close` |
 | **Block** | Never permitted | `repo delete`, `pr merge`, `release create`, `workflow run` |
 | **Unknown** | Not in the policy table, blocked by default | anything GitHub adds to `gh` after the table was last updated |
 
@@ -140,9 +140,9 @@ The policy table classifies `auth status` as a read, so the token flag is
 intercepted separately, in every spelling (`--show-token`, `--show-token=true`,
 `-t`, and bundled clusters such as `-at`).
 
-"Always permitted" in the Allow tier means permitted for the startup repo. A
-repo-scoped read invoked from a *different* repository is blocked rather than
-silently answered from the startup repo (#213). The repo-scoped groups are
+"Always permitted" in the Allow tier means permitted for a repository in the
+scope set. A repo-scoped read invoked from a repository *outside* it is blocked
+rather than silently answered from the startup repo (#213). The repo-scoped groups are
 `pr`, `issue`, `run`, `workflow`, `release`, `label`, `cache`, `secret`,
 `variable`, `repo` and `ruleset`; commands that do not resolve a repository from
 the cwd (`auth`, `search`, `gist`, `org`, `project`, `config`, `extension`,
@@ -164,8 +164,11 @@ targets the repository captured at sandbox startup:
 8. Sets `GH_REPO=github.com/owner/repo` and clears `GH_HOST` before executing `gh`
 
 Repo-scoped `Allow` commands get the same cwd check (step 5) when their target is
-implicit, so a read from a sibling repository is blocked instead of silently
-answered from the startup repo. Unlike `ScopeCheck`, an *unverifiable* cwd is not
+implicit, so a read from a repository outside the scope set is blocked instead of
+silently answered from the startup repo. The scope is a set: the launch
+repository plus every repository named with `--repo-dir` / `sandbox.repo_dirs`
+whose origin is a GitHub URL, and `GH_REPO` is pinned to whichever member
+matched — never to the launch repository when another member was the target. Unlike `ScopeCheck`, an *unverifiable* cwd is not
 fatal for a read: the command stays pinned to the startup repo, which is the safe
 target.
 
