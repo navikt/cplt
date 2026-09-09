@@ -1688,6 +1688,38 @@ fn warn_exec_tool_dir_shadowing(
     }
 }
 
+/// `gh_guard.inject_token` does nothing while the guard is off.
+///
+/// The injection happens inside the `gh_guard.enabled` branch of the wrapper
+/// install, so turning the guard off turns it off too. That is defensible —
+/// the token is extracted for the wrapper's benefit — but it is invisible: the
+/// key reads as true in `cplt config show`, no token reaches the agent, and
+/// nothing connects the two.
+///
+/// It matters most on Linux, where it is the answer to a real problem. The
+/// Secret Service (gnome-keyring, kwallet) is reached over D-Bus, whose socket
+/// the sandbox masks, so an agent that stores its credential in the system
+/// vault cannot reach one and asks the user to log in again every session.
+/// Injecting a token extracted in the parent is the way out, and a user who
+/// sets it while the guard is off gets no token and no explanation.
+fn inject_token_is_inert(gh_guard: &config::GhGuardPolicy) -> bool {
+    gh_guard.inject_token && !gh_guard.enabled
+}
+
+fn warn_inject_token_without_guard(resolved: &config::Resolved) {
+    if inject_token_is_inert(&resolved.gh_guard) {
+        ui::warn(
+            "gh_guard.inject_token is set but gh_guard.enabled is false, so no token is \
+             injected: the injection runs as part of installing the gh wrapper, which the \
+             guard owns. Either turn the guard on to use it, with `cplt config set \
+             gh_guard.enabled true`, or remove the key so the config stops claiming \
+             something that is not happening: `cplt config set gh_guard.inject_token \
+             false`, or `cplt config set gh_guard.inject_token --unset` to drop the line \
+             entirely.",
+        );
+    }
+}
+
 /// Repositories reachable only through an `allow.write` grant, which is
 /// writable and deliberately **not** executable.
 ///
@@ -3268,6 +3300,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
+    warn_inject_token_without_guard(&resolved);
 
     // Probe the host for everything the sandbox profile depends on.
     let probe = HostProbe::probe(&mut resolved, &home_dir, &project_dir);
@@ -4487,6 +4520,7 @@ fn run_exec_command(
     // effect this session cannot have (#343).
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
     warn_write_granted_repos(&resolved, &project_dir, &repo_paths);
+    warn_inject_token_without_guard(&resolved);
 
     // Build the resolved Shell sandbox (discovery → proxy → prepare). Shared
     // with `cplt check`, which runs its probes under the identical policy.
@@ -8716,10 +8750,29 @@ mod tests {
         assert!(err.contains(&inner.display().to_string()), "{err}");
     }
 
-    /// A repository beside the launch repository is the shape most checkouts
-    /// have, and it is now accepted. Every other rule still applies to it —
-    /// git toplevel, no symlinked leaf, not an unsafe root — and those are
-    /// asserted by their own tests; this one is about the location alone.
+    /// A key that reads as true and does nothing is worse than one that is off:
+    /// `config show` says `inject_token = true`, no token reaches the agent,
+    /// and nothing connects the two.
+    ///
+    /// This pins the predicate, not the printing: it fails if the condition
+    /// drifts, and it would NOT catch the warning ceasing to be called, or
+    /// `sandbox_exec` being changed so injection happens with the guard off —
+    /// at which point the warning becomes the false statement. Said plainly
+    /// because a two-line condition invites a test that restates it and proves
+    /// nothing.
+    #[test]
+    fn inject_token_is_inert_only_when_the_guard_is_off() {
+        let policy = |inject: bool, enabled: bool| config::GhGuardPolicy {
+            inject_token: inject,
+            enabled,
+            ..config::GhGuardPolicy::default()
+        };
+        assert!(inject_token_is_inert(&policy(true, false)), "set but inert");
+        assert!(!inject_token_is_inert(&policy(true, true)), "doing its job");
+        assert!(!inject_token_is_inert(&policy(false, false)));
+        assert!(!inject_token_is_inert(&policy(false, true)));
+    }
+
     /// The shape a user hit: two repositories side by side under one
     /// `allow.write`, and the agent `cd ..`s into the other one. The grant
     /// makes it writable and not executable, so `./gradlew` there fails with
@@ -8776,6 +8829,10 @@ mod tests {
         );
     }
 
+    /// A repository beside the launch repository is the shape most checkouts
+    /// have, and it is now accepted. Every other rule still applies to it —
+    /// git toplevel, no symlinked leaf, not an unsafe root — and those are
+    /// asserted by their own tests; this one is about the location alone.
     #[test]
     fn repo_dir_accepts_a_sibling_repository() {
         let (_guard, root) = canonical_tempdir();
