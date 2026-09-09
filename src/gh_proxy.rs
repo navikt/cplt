@@ -2022,7 +2022,7 @@ fn gate_with_scope_resolver(
                 // session that hit this concluded it was blocked when a
                 // supported command would have worked (#403). The higher-level
                 // read commands really are allowed cross-repo with an explicit
-                // `-R`, and a repository checked out inside the project can be
+                // `-R`, and another repository the user works in can be
                 // named into the scope set.
                 Err(Refusal {
                     headline: format!(
@@ -2044,9 +2044,10 @@ fn gate_with_scope_resolver(
                          `gh pr view -R <owner>/<repo> <number>`, `gh pr diff -R <owner>/<repo> \
                          <number>`, `gh issue view -R <owner>/<repo> <number>` — and are allowed \
                          against any repository. Raw `gh api` is not. If the agent \
-                         works in that repository too and it is checked out inside this one, name it \
-                         with `cplt config set --local sandbox.repo_dirs <DIR>` and it joins the \
-                         scope set. Otherwise relaunch cplt against that repository.",
+                         works in that repository too and it is checked out on this machine, \
+                         name it with `cplt config set --local sandbox.repo_dirs <DIR>` and it \
+                         joins the scope set — beside this repository or inside it, either \
+                         works. Otherwise relaunch cplt against that repository.",
                         result.reason,
                     ),
                     agent_note: &[RESTRICTED, NOTE],

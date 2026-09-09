@@ -2465,6 +2465,7 @@ fn write_session_sandbox_brief(
     active_agent: agent::Agent,
     scratch_path: Option<&Path>,
     home_dir: &Path,
+    repos: &[config::RepoSummaryRow],
 ) {
     if !resolved.brief {
         return;
@@ -2482,7 +2483,7 @@ fn write_session_sandbox_brief(
         );
         return;
     };
-    let content = brief::generate_session_brief(resolved, active_agent, home_dir);
+    let content = brief::generate_session_brief(resolved, active_agent, home_dir, repos);
     if let Err(e) = brief::write_session_brief(scratch, &content) {
         ui::warn(&format!("Could not write sandbox brief: {e}"));
     }
@@ -3129,6 +3130,9 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    // Built once: the brief, the startup summary and `doctor` must not each
+    // resolve the identities separately and risk disagreeing.
+    let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
 
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
 
@@ -3181,7 +3185,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &probe,
         AssemblyOptions {
             agent: active_agent,
-            repos: NamedRepos::new(&repo_paths, &repo_git_dirs),
+            repos: NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
             announce_scratch: true,
@@ -3269,12 +3273,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
 
     // Print comprehensive summary and confirm before launching Copilot
     if !resolved.quiet {
-        resolved.print_summary(
-            &project_dir,
-            &home_dir,
-            active_agent,
-            &repo_summary_rows(&project_dir, &repo_roots),
-        );
+        resolved.print_summary(&project_dir, &home_dir, active_agent, &repo_rows);
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -4059,7 +4058,13 @@ fn assemble_sandbox(
     // AGENTS.md layer writes into the user's repo and must not run until the
     // launch is confirmed — see `apply_persistent_sandbox_brief`, which the
     // `exec` and `check` paths deliberately never call.
-    write_session_sandbox_brief(resolved, active_agent, scratch_path, home_dir);
+    write_session_sandbox_brief(
+        resolved,
+        active_agent,
+        scratch_path,
+        home_dir,
+        opts.repos.rows,
+    );
 
     // macOS-only, opt-in (sandbox.gradle_init): install the guarded Gradle
     // init script so sandboxed builds keep the preferIPv4Stack workaround for
@@ -4151,12 +4156,23 @@ struct SessionPaths<'a> {
 struct NamedRepos<'a> {
     dirs: &'a [PathBuf],
     git_dirs: &'a [PathBuf],
+    /// The same set as the startup summary renders it, with each repository's
+    /// `owner/name` and what its grant is. Carried here so the agent-facing
+    /// brief and the operator-facing summary cannot describe different scopes.
+    rows: &'a [config::RepoSummaryRow],
 }
 
 impl<'a> NamedRepos<'a> {
-    /// Resolve the gitdirs for an already-validated set of roots.
-    fn new(dirs: &'a [PathBuf], git_dirs: &'a [PathBuf]) -> Self {
-        Self { dirs, git_dirs }
+    fn new(
+        dirs: &'a [PathBuf],
+        git_dirs: &'a [PathBuf],
+        rows: &'a [config::RepoSummaryRow],
+    ) -> Self {
+        Self {
+            dirs,
+            git_dirs,
+            rows,
+        }
     }
 }
 
@@ -4283,6 +4299,9 @@ fn run_exec_command(
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    // Built once: the brief, the startup summary and `doctor` must not each
+    // resolve the identities separately and risk disagreeing.
+    let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
 
     // exec defaults to quiet+yes (scripting UX). User can override with --no-quiet / --no-yes.
     if !cli.no_quiet {
@@ -4350,7 +4369,7 @@ fn run_exec_command(
         config_path.as_ref(),
         &home_dir,
         &project_dir,
-        NamedRepos::new(&repo_paths, &repo_git_dirs),
+        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
     )?;
 
     // Resolve the binary and args to pass to the sandbox.
@@ -4396,12 +4415,7 @@ fn run_exec_command(
 
     // Summary (only shown with --no-quiet)
     if !resolved.quiet {
-        resolved.print_summary(
-            &project_dir,
-            &home_dir,
-            active_agent,
-            &repo_summary_rows(&project_dir, &repo_roots),
-        );
+        resolved.print_summary(&project_dir, &home_dir, active_agent, &repo_rows);
     }
     if let Err(e) = prompt_confirm(resolved.yes, resolved.quiet) {
         bail!("{e}");
@@ -4779,6 +4793,9 @@ fn run_check_command(
     // against: `check` must build the policy the launch would build.
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    // Built once: the brief, the startup summary and `doctor` must not each
+    // resolve the identities separately and risk disagreeing.
+    let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
 
     // Shell, not `active_agent`: `check` probes under the Shell profile.
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
@@ -4819,7 +4836,7 @@ fn run_check_command(
         config_path.as_ref(),
         &home_dir,
         &project_dir,
-        NamedRepos::new(&repo_paths, &repo_git_dirs),
+        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
     )?;
 
     let proxy_enabled = proxy_handle.is_some();
@@ -5445,6 +5462,9 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
     // same named roots the launch would (#447).
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
     let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
+    // Built once: the brief, the startup summary and `doctor` must not each
+    // resolve the identities separately and risk disagreeing.
+    let repo_rows = repo_summary_rows(&project_dir, &repo_roots);
     let tilde = |p: &Path| doctor::tilde(p, &home_dir);
     let mut findings: Vec<Finding> = Vec::new();
     let mut ok: Vec<String> = Vec::new();
@@ -5620,7 +5640,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         &probe,
         active_agent,
         &agent_dirs,
-        NamedRepos::new(&repo_paths, &repo_git_dirs),
+        NamedRepos::new(&repo_paths, &repo_git_dirs, &repo_rows),
         SessionPaths::default(),
         keychain_substitute,
     );
