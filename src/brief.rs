@@ -65,21 +65,37 @@ pub fn generate_session_brief(
         for row in repos {
             let what = match row.grant {
                 crate::config::RepoGrant::Launch => {
-                    "the launch repository: read, write, execute, and the repository `gh` and \
-                     `git push` target by default"
+                    "the launch repository: read, write, execute, and the repository `git push` \
+                     targets by default"
                 }
                 crate::config::RepoGrant::Inherited => {
                     "named with --repo-dir, inside the launch repository: you already had these \
-                     files; naming it puts it in the `gh` scope, gives it its own audit, and \
-                     lets `git push` be judged by its own default branch"
+                     files; naming it gives it its own audit and lets `git push` be judged by \
+                     its own default branch"
                 }
                 crate::config::RepoGrant::NewTree => {
                     "named with --repo-dir: read, write and execute on a tree outside the launch \
-                     repository, in the `gh` scope, audited, and `git push` judged by its own \
-                     default branch"
+                     repository, audited, and `git push` judged by its own default branch"
                 }
             };
-            let _ = writeln!(out, "- `{}` — {} ({what})", row.name, row.path.display());
+            // Said per row rather than folded into the sentences above: a root
+            // whose origin is not a GitHub URL is a named root for files,
+            // `[deny]`, the audit and the git guard, and is NOT in the gh
+            // scope. Claiming otherwise would tell the agent it can target a
+            // repository `gh` refuses — and would contradict the launch, which
+            // warns about exactly this root.
+            let gh = if row.github {
+                "; `gh` may target it"
+            } else {
+                "; NOT in the `gh` scope, because its origin is not a GitHub URL — `gh` \
+                 commands naming it are refused"
+            };
+            let _ = writeln!(
+                out,
+                "- `{}` — {} ({what}{gh})",
+                row.name,
+                row.path.display()
+            );
         }
         out.push_str(
             "\nThat list is the whole scope. A repository not on it is refused on purpose — \
@@ -685,13 +701,22 @@ mod tests {
         let rows = vec![
             RepoSummaryRow {
                 name: "navikt/spleis".to_string(),
+                github: true,
                 path: std::path::PathBuf::from("/w/spleis"),
                 source: "launch repository",
                 grant: RepoGrant::Launch,
             },
             RepoSummaryRow {
                 name: "navikt/model".to_string(),
+                github: true,
                 path: std::path::PathBuf::from("/w/model"),
+                source: "--repo-dir",
+                grant: RepoGrant::NewTree,
+            },
+            RepoSummaryRow {
+                name: "vendored (no GitHub origin)".to_string(),
+                github: false,
+                path: std::path::PathBuf::from("/w/vendored"),
                 source: "--repo-dir",
                 grant: RepoGrant::NewTree,
             },
@@ -710,6 +735,23 @@ mod tests {
             brief.contains("a refusal there is an answer, not an"),
             "the agent must be told not to route around the scope:\n{brief}"
         );
+        // A root with no GitHub origin is a named root for files, `[deny]`, the
+        // audit and the git guard, and is NOT in the gh scope — the launch
+        // warns about exactly this root, and the brief must not contradict it.
+        let vendored = brief
+            .lines()
+            .find(|l| l.contains("vendored"))
+            .expect("the row is listed");
+        assert!(
+            vendored.contains("NOT in the `gh` scope"),
+            "a non-GitHub origin must not be described as targetable: {vendored}"
+        );
+        for line in brief.lines().filter(|l| l.contains("navikt/")) {
+            assert!(
+                line.contains("`gh` may target it"),
+                "a GitHub origin is in scope: {line}"
+            );
+        }
         // A single-repository session says nothing: the block would restate the
         // one thing the rest of the brief already assumes.
         let plain = generate_session_brief(

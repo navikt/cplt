@@ -797,6 +797,13 @@ pub struct RepoSummaryRow {
     /// Where the root was named: `launch repository`, `--repo-dir`, or
     /// `local config`.
     pub source: &'static str,
+    /// Whether `name` is a real `owner/name` from a GitHub origin.
+    ///
+    /// A root whose origin is not a GitHub URL is a named root for files,
+    /// `[deny]`, the audit and the git guard, and is **not** in the gh scope —
+    /// the launch says so, and anything else describing the root has to agree
+    /// or the agent is told it can target a repository `gh` will refuse.
+    pub github: bool,
     /// What naming the root changed about file access.
     ///
     /// A root nested inside the project directory already inherited the

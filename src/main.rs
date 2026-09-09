@@ -1591,34 +1591,45 @@ fn repo_summary_rows(project_dir: &Path, roots: &[RepoRoot]) -> Vec<config::Repo
         return Vec::new();
     }
     let real_git = cplt::git::trusted_git();
-    let name_of = |dir: &Path| {
-        real_git
-            .and_then(|git| gh_proxy::detect_current_repo(git, dir).ok())
-            .unwrap_or_else(|| {
+    // Returns the name AND whether it is a real `owner/name`: everything that
+    // describes a root downstream has to agree with the launch about whether
+    // `gh` can target it, and the fallback string is not a fact to re-derive by
+    // looking for a parenthesis.
+    let name_of =
+        |dir: &Path| match real_git.and_then(|git| gh_proxy::detect_current_repo(git, dir).ok()) {
+            Some(repo) => (repo, true),
+            None => (
                 format!(
                     "{} (no GitHub origin)",
                     dir.file_name().unwrap_or_default().to_string_lossy()
-                )
-            })
-    };
+                ),
+                false,
+            ),
+        };
+    let (launch_name, launch_github) = name_of(project_dir);
     let mut rows = vec![config::RepoSummaryRow {
-        name: name_of(project_dir),
+        name: launch_name,
+        github: launch_github,
         path: project_dir.to_path_buf(),
         source: "launch repository",
         grant: config::RepoGrant::Launch,
     }];
-    rows.extend(roots.iter().map(|root| config::RepoSummaryRow {
-        name: name_of(&root.dir),
-        path: root.dir.clone(),
-        source: root.source.label(),
-        // A nested root inherits the project grant; a sibling is a tree the
-        // session could not otherwise reach at all. Same row, very different
-        // thing to have agreed to.
-        grant: if root.dir.starts_with(project_dir) {
-            config::RepoGrant::Inherited
-        } else {
-            config::RepoGrant::NewTree
-        },
+    rows.extend(roots.iter().map(|root| {
+        let (name, github) = name_of(&root.dir);
+        config::RepoSummaryRow {
+            name,
+            github,
+            path: root.dir.clone(),
+            source: root.source.label(),
+            // A nested root inherits the project grant; a sibling is a tree the
+            // session could not otherwise reach at all. Same row, very different
+            // thing to have agreed to.
+            grant: if root.dir.starts_with(project_dir) {
+                config::RepoGrant::Inherited
+            } else {
+                config::RepoGrant::NewTree
+            },
+        }
     }));
     rows
 }
