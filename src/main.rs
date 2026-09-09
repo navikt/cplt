@@ -1714,6 +1714,8 @@ fn write_granted_repos_without_exec(
     project_dir: &Path,
     named_roots: &[PathBuf],
 ) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    /// Entries examined per grant.
+    const SCAN_LIMIT: usize = 256;
     let is_repo = |d: &Path| d.join(".git").exists();
     let mut out = Vec::new();
     for grant in allow_write {
@@ -1721,10 +1723,14 @@ fn write_granted_repos_without_exec(
         if is_repo(grant) {
             repos.push(grant.clone());
         } else if let Ok(entries) = std::fs::read_dir(grant) {
-            // One level only. A grant over a directory of checkouts is the
-            // shape that bites; walking deeper would cost a launch-time scan of
-            // an arbitrary tree to find cases nobody has hit.
-            for entry in entries.flatten() {
+            // One level only, and bounded. A grant over a directory of
+            // checkouts is the shape that bites; walking deeper would cost a
+            // launch-time scan of an arbitrary tree to find cases nobody has
+            // hit. The entry cap matters because the grant is arbitrary: it can
+            // name a home directory or a network mount, and a `.git` probe per
+            // entry is a stat per entry. Stopping early can only under-report,
+            // and this is advice, not enforcement.
+            for entry in entries.flatten().take(SCAN_LIMIT) {
                 let path = entry.path();
                 if path.is_dir() && is_repo(&path) {
                     repos.push(path);
@@ -1760,11 +1766,22 @@ fn warn_write_granted_repos(
     for (grant, repos) in
         write_granted_repos_without_exec(&resolved.allow_write, project_dir, named_roots)
     {
-        let names = repos
+        // Bounded: a grant over a directory of many checkouts would otherwise
+        // put every path into one warning line, which is the fastest way to
+        // make a warning unreadable and therefore unread.
+        /// Repositories named in one warning line.
+        const LIST_LIMIT: usize = 5;
+        let shown = repos.len().min(LIST_LIMIT);
+        let mut names = repos
             .iter()
+            .take(shown)
             .map(|r| r.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        if repos.len() > shown {
+            use std::fmt::Write as _;
+            let _ = write!(names, " and {} more", repos.len() - shown);
+        }
         let subject = if repos.len() == 1 && repos[0] == grant {
             format!(
                 "allow.write grants {}, which is a git repository",
@@ -1782,9 +1799,10 @@ fn warn_write_granted_repos(
              tests will not run there: a script fails with `bad interpreter: Operation not \
              permitted`, which names neither cplt nor this grant. To work in it, name it \
              instead — `cplt config set --local sandbox.repo_dirs <DIR>`, or `--repo-dir \
-             <DIR>` for one run — which grants read, write and execute and puts it in the \
-             `gh` and push scope. That is a real widening: a named repository is another \
-             tree the agent can drop a binary into and run."
+             <DIR>` for one run — which grants read, write and execute, and, when its \
+             origin is a GitHub URL, puts it in the `gh` and push scope. That is a real \
+             widening: a named repository is another tree the agent can drop a binary \
+             into and run."
         ));
     }
 }
