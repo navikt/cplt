@@ -3050,7 +3050,18 @@ pub fn gate_git(
             // with a reason the operator cannot act on. That condition is
             // decided parent-side at launch and warned about there; the agent
             // cannot bring it about.
-            let scope_known = !repo_facts.git_common_dir.is_empty() || !repo_facts.named.is_empty();
+            // "Known" means at least one repository was IDENTIFIED, not that a
+            // list was non-empty. A named root whose common dir could not be
+            // read is a member the gate can never match, so counting it as
+            // known left every `allow_push` refused while the launch warning
+            // said the rules fell back to matching by URL alone. The condition
+            // here and the one that warns at launch are now each other's
+            // negation.
+            let scope_known = !repo_facts.git_common_dir.is_empty()
+                || repo_facts
+                    .named
+                    .iter()
+                    .any(|n| !n.git_common_dir.is_empty());
             let in_scope = !scope_known || repo_facts.describes(&repo_args, real_git);
             let authorized = in_scope
                 && match push_target_branches(push_args, real_git, &repo_args) {
@@ -7879,6 +7890,56 @@ mod tests {
             &launch_only,
         )
         .expect_err("without the named root's facts there is no yardstick, so it fails closed");
+    }
+
+    /// A named root the guard could not identify must not make the scope count
+    /// as known.
+    ///
+    /// `scope_known` gated the #424 in-scope requirement, and read
+    /// `!named.is_empty()`. A root whose common dir could not be captured is a
+    /// member nothing can ever match, so a session with only such roots and no
+    /// launch-repository identity refused every `allow_push` while the launch
+    /// warning said the rules had fallen back to matching by URL alone. The
+    /// operator was told one thing and got another.
+    #[test]
+    fn an_unidentifiable_named_root_does_not_count_as_a_known_scope() {
+        let Some((_tmp, repo)) =
+            scratch_repo_with_default("main", "https://github.com/o/o.git", "main")
+        else {
+            return; // no git available
+        };
+        let git = which_git().unwrap();
+        make_branches(&git, &repo, &["agent/x"]);
+        let rules = resolve_push_rule_urls(
+            &git,
+            &[repo.as_path()],
+            &[crate::config::ResolvedPushRule {
+                remote: Some("origin".to_string()),
+                branches: vec!["agent/*".to_string()],
+                force: false,
+                url: None,
+            }],
+        );
+        assert!(rules.iter().any(|r| r.url.is_some()), "the rule must pin");
+
+        // Nothing identified: no launch common dir, and one named member whose
+        // own capture failed. That is the state the launch warns about, and the
+        // gate must agree with the warning.
+        let facts = RepoFacts {
+            named: vec![RepoFacts::default()],
+            ..RepoFacts::default()
+        };
+        let dir = repo.to_string_lossy().into_owned();
+        gate_git(
+            &["-C", dir.as_str(), "push", "origin", "agent/x"],
+            true,
+            true,
+            false,
+            &rules,
+            Some(&git),
+            &facts,
+        )
+        .expect("with nothing identified the rule falls back to URL identity, as the launch says");
     }
 
     /// #424: an allow_push rule carries launch/named-root identity. The
