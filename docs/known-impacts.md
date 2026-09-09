@@ -4,9 +4,13 @@ The sandbox is kernel-enforced, so **all restrictions apply to every process spa
 
 ## Branch tracking is silently dropped
 
-`.git/config` is write-denied (it is a `core.hooksPath` and `url.*.insteadOf`
-vector). The commands that record branch tracking write there, and git treats
-the failure as non-fatal: it prints the error, prints a success line that is
+**macOS only.** `.git/config` is write-denied there (it is a `core.hooksPath`
+and `url.*.insteadOf` vector). Landlock cannot deny a file inside a writable
+directory, so on Linux the file stays writable and branch tracking is recorded
+normally — the whole of this section applies to macOS sessions.
+
+The commands that record branch tracking write to that file, and git treats the
+failure as non-fatal: it prints the error, prints a success line that is
 **false**, and exits 0.
 
 ```
@@ -33,8 +37,8 @@ git push origin HEAD:my-branch
 gh pr create -R <owner>/<repo> --head my-branch
 ```
 
-This applies to every writable root, the launch repository included, not only
-to repositories named with `--repo-dir`. Tracked in
+On macOS this applies to every writable root, the launch repository included,
+not only to repositories named with `--repo-dir`. Tracked in
 [#402](https://github.com/navikt/cplt/issues/402), which also covers whether
 the guard should intercept these forms and fail loudly instead.
 

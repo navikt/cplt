@@ -274,8 +274,9 @@ It falls back gracefully if `gh` is not installed or not authenticated.
 
 If you prefer the token in the environment instead, set `inject_token = true`.
 `cplt config set` refuses it without `--force`, and `cplt config show` marks it
-`⚠ DANGEROUS`, because the token is then visible to every process in the
-sandbox through `/proc/*/environ`:
+`⚠ DANGEROUS`, because the token is then inherited by every process in the
+sandbox — and readable from any of them, through `/proc/<pid>/environ` on Linux
+or `ps -E` on macOS:
 ```toml
 [gh_guard]
 inject_token = true   # injects GH_TOKEN env var (visible to all subprocesses)
