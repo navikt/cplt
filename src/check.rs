@@ -216,9 +216,17 @@ pub fn explain_path(
     } else {
         (
             "not covered by any allow rule, so it is denied by default.".to_string(),
+            // `--repo-dir` is named because the other two do not cover the
+            // case they look like they cover: a write grant is deliberately
+            // non-executable, so following this advice for another repository
+            // makes its files editable and its build still fail. Named without
+            // probing the path — `explain_path` stays pure, and the sentence is
+            // true whether or not this particular path is a repository.
             Some(
                 "grant access with --allow-read <PATH> (read) or --allow-write <PATH> (read+write), \
-                 or add it under [allow] read/write in config."
+                 or add it under [allow] read/write in config. If it is another git repository \
+                 you also need to build, test or push in, name it with --repo-dir <DIR> instead: \
+                 a write grant is not executable, so its build will not run under --allow-write."
                     .to_string(),
             ),
         )
@@ -1167,7 +1175,16 @@ mod tests {
         let e = explain_path(&p, home, proj, Path::new("/opt/other"));
         assert_eq!(e.read_decision(), Decision::Blocked);
         assert!(!e.credential);
-        assert!(e.fix.as_deref().unwrap().contains("--allow-read"));
+        let fix = e.fix.as_deref().unwrap();
+        assert!(fix.contains("--allow-read"));
+        // The two grants named first do not cover the case they look like they
+        // cover: `--allow-write` is deliberately non-executable, so a reader who
+        // follows it for another repository gets editable files and a build that
+        // still will not run. The narrow remedy has to be in the same sentence.
+        assert!(
+            fix.contains("--repo-dir") && fix.contains("not executable"),
+            "the fix must name the remedy that actually works for a repository: {fix}"
+        );
     }
 
     // ── explain_domain ──
