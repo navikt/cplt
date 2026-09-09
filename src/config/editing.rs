@@ -291,7 +291,10 @@ pub fn security_confirmation(key_info: &ConfigKeyInfo, value: &str, unset: bool)
                 "enabled" | "prevent_push" | "prevent_force_push",
                 "false"
             )
-            | ("gh_guard", "inject_token" | "allow_api_write", "true")
+            // `inject_token` and `allow_api_write` are not listed here: they
+            // carry `dangerous: true` in the registry and are caught by the
+            // branch above. Listing them twice is how the two lists came to
+            // disagree about which keys are dangerous in the first place.
             | ("gh_guard", "unknown_command", "allow")
             | ("gh_guard" | "git_guard", "mode", "warn" | "audit")
     );
