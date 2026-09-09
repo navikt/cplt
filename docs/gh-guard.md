@@ -123,8 +123,8 @@ Agent calls gh → wrapper script (in PATH) → cplt gh-gate → policy check
 
 | Tier | Behavior | Examples |
 |------|----------|----------|
-| **Allow** | Read-only; repo-scoped reads resolve against the startup repo, and an unverifiable cwd is pinned there rather than refused | `pr list`, `issue view`, `run list`, `search` |
-| **ScopeCheck** | Permitted only for the startup repo; implicit targets must resolve there from cwd | `pr create`, `issue comment`, `pr close` |
+| **Allow** | Read-only; repo-scoped reads resolve against the scope set, and an unverifiable cwd is pinned to the only member rather than refused (pinned to nothing when the set has several) | `pr list`, `issue view`, `run list`, `search` |
+| **ScopeCheck** | Permitted only for a repository in the scope set: the startup repo plus every `--repo-dir` root with a GitHub origin. Implicit targets must resolve to one of them from cwd | `pr create`, `issue comment`, `pr close` |
 | **Block** | Never permitted | `repo delete`, `pr merge`, `release create`, `workflow run` |
 | **Unknown** | Not in the policy table, blocked by default | anything GitHub adds to `gh` after the table was last updated |
 
@@ -140,9 +140,9 @@ The policy table classifies `auth status` as a read, so the token flag is
 intercepted separately, in every spelling (`--show-token`, `--show-token=true`,
 `-t`, and bundled clusters such as `-at`).
 
-"Always permitted" in the Allow tier means permitted for the startup repo. A
-repo-scoped read invoked from a *different* repository is blocked rather than
-silently answered from the startup repo (#213). The repo-scoped groups are
+"Always permitted" in the Allow tier means permitted for a repository in the
+scope set. A repo-scoped read invoked from a repository *outside* it is blocked
+rather than silently answered from the startup repo (#213). The repo-scoped groups are
 `pr`, `issue`, `run`, `workflow`, `release`, `label`, `cache`, `secret`,
 `variable`, `repo` and `ruleset`; commands that do not resolve a repository from
 the cwd (`auth`, `search`, `gist`, `org`, `project`, `config`, `extension`,
@@ -152,22 +152,32 @@ the cwd (`auth`, `search`, `gist`, `org`, `project`, `config`, `extension`,
 ## Scope checking
 
 When a command is classified as `ScopeCheck`, cplt verifies that the command
-targets the repository captured at sandbox startup:
+targets a repository in the scope captured at sandbox startup:
 
-1. At sandbox startup, reads `remote.origin.url` from the project root using the trusted Git binary
+1. At sandbox startup, reads `remote.origin.url` with the trusted Git binary, from the project root and from every repository named with `--repo-dir` / `sandbox.repo_dirs`. A named root whose origin is not a GitHub URL is warned about and left out of the set
 2. Ignores global/system config, config includes, and inherited `GIT_*` variables
-3. Bakes the verified `owner/repo` and trusted Git path into the wrapper; unavailable scope remains fail-closed
-4. If the command has `-R`/`--repo`, compares it to the startup scope
-5. Otherwise, resolves the invocation cwd with the trusted Git binary and requires that repo to match the startup scope
+3. Bakes the verified `owner/repo` set and trusted Git path into the wrapper; unavailable scope remains fail-closed
+4. If the command has `-R`/`--repo`, checks it for membership in that set
+5. Otherwise, resolves the invocation cwd with the trusted Git binary and requires that repo to be a member
 6. Preserves explicit `/repos/owner/repo/...` API endpoint checks without requiring cwd matching
 7. Rejects a conflicting `--hostname` or fully qualified non-GitHub API endpoint
 8. Sets `GH_REPO=github.com/owner/repo` and clears `GH_HOST` before executing `gh`
 
-Repo-scoped `Allow` commands get the same cwd check (step 5) when their target is
-implicit, so a read from a sibling repository is blocked instead of silently
-answered from the startup repo. Unlike `ScopeCheck`, an *unverifiable* cwd is not
-fatal for a read: the command stays pinned to the startup repo, which is the safe
-target.
+The scope is a set: the launch repository plus every repository named with
+`--repo-dir` / `sandbox.repo_dirs` whose origin is a GitHub URL. `GH_REPO` is
+pinned to whichever member the command matched, never to the launch repository
+when another member was the target.
+
+Repo-scoped `Allow` commands get the same cwd check (step 5) when their target
+is implicit, so a read invoked from a repository outside the set is blocked
+instead of silently answered from a member. Allow-tier commands that resolve no
+repository from the cwd are unaffected and stay usable from any directory.
+
+Unlike `ScopeCheck`, an *unverifiable* cwd is not fatal for a read. What happens
+then depends on the size of the set: with a single repository in scope the
+command is pinned to it, which is the safe target; with more than one there is
+no safe default, so cplt pins nothing and lets `gh` resolve the target itself
+rather than choosing a repository on the command's behalf.
 
 ## Command classifications
 
