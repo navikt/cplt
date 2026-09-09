@@ -63,20 +63,27 @@ pub fn generate_session_brief(
     if !repos.is_empty() {
         out.push_str("## Repositories\n\n");
         for row in repos {
+            // `row.source` rather than a hard-coded `--repo-dir`: a root can
+            // equally come from `sandbox.repo_dirs` in the per-checkout local
+            // config, and naming a flag nobody passed is the same lie the
+            // launch warnings already avoid.
             let what = match row.grant {
                 crate::config::RepoGrant::Launch => {
                     "the launch repository: read, write, execute, and the repository `git push` \
                      targets by default"
+                        .to_string()
                 }
-                crate::config::RepoGrant::Inherited => {
-                    "named with --repo-dir, inside the launch repository: you already had these \
-                     files; naming it gives it its own audit and lets `git push` be judged by \
-                     its own default branch"
-                }
-                crate::config::RepoGrant::NewTree => {
-                    "named with --repo-dir: read, write and execute on a tree outside the launch \
-                     repository, audited, and `git push` judged by its own default branch"
-                }
+                crate::config::RepoGrant::Inherited => format!(
+                    "named for this session ({}), inside the launch repository: you already had \
+                     these files; naming it gives it its own audit and lets `git push` be judged \
+                     by its own default branch",
+                    row.source
+                ),
+                crate::config::RepoGrant::NewTree => format!(
+                    "named for this session ({}): read, write and execute on a tree outside the \
+                     launch repository, audited, and `git push` judged by its own default branch",
+                    row.source
+                ),
             };
             // Said per row rather than folded into the sentences above: a root
             // whose origin is not a GitHub URL is a named root for files,
@@ -720,6 +727,14 @@ mod tests {
                 source: "--repo-dir",
                 grant: RepoGrant::NewTree,
             },
+            // Persisted, not passed on this command line.
+            RepoSummaryRow {
+                name: "navikt/persisted".to_string(),
+                github: true,
+                path: std::path::PathBuf::from("/w/spleis/persisted"),
+                source: "local config",
+                grant: RepoGrant::Inherited,
+            },
         ];
         let brief = generate_session_brief(
             &base_resolved(),
@@ -752,6 +767,18 @@ mod tests {
                 "a GitHub origin is in scope: {line}"
             );
         }
+        // A root from `sandbox.repo_dirs` was named in the per-checkout local
+        // config, not by a flag. Naming a flag nobody passed sends the reader
+        // looking for something that is not there — the same reason the launch
+        // warnings say "named repository <path>" instead.
+        let persisted = brief
+            .lines()
+            .find(|l| l.contains("navikt/persisted"))
+            .expect("the row is listed");
+        assert!(
+            persisted.contains("local config") && !persisted.contains("--repo-dir"),
+            "a persisted root must not be attributed to a flag: {persisted}"
+        );
         // A single-repository session says nothing: the block would restate the
         // one thing the rest of the brief already assumes.
         let plain = generate_session_brief(
