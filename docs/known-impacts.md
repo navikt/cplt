@@ -2,6 +2,46 @@
 
 The sandbox is kernel-enforced, so **all restrictions apply to every process spawned inside it**: dev servers, test runners, build tools, package managers. That is deliberate, since a sandboxed agent could otherwise escape by spawning a child process. It does affect some workflows.
 
+## Branch tracking is silently dropped
+
+**macOS only.** `.git/config` is write-denied there (it is a `core.hooksPath`
+and `url.*.insteadOf` vector). Landlock cannot deny a file inside a writable
+directory, so on Linux the file stays writable and branch tracking is recorded
+normally — the whole of this section applies to macOS sessions.
+
+The commands that record branch tracking write to that file, and git treats the
+failure as non-fatal: it prints the error, prints a success line that is
+**false**, and exits 0.
+
+```
+error: could not write config file .git/config: Operation not permitted
+branch 'feat' set up to track 'origin/main'.
+```
+
+An agent reading the summary line, or checking the exit code, is told the
+tracking was recorded. It was not.
+
+| Command | What happens |
+| --- | --- |
+| `git push -u origin <branch>` | Push succeeds, upstream **not** recorded, exit 0 |
+| `git checkout -b <branch> origin/<base>` | Branch created, tracking **not** recorded, exit 0 |
+| `git branch --set-upstream-to=origin/<base>` | Records nothing, exit 0 |
+| `git config user.name <x>` | Fails loudly, exit 4 |
+| `git switch -c <branch>` (no tracking) | Clean, nothing to record |
+
+**The shape that works**, and what to tell an agent to do: push with an explicit
+refspec and open the PR with an explicit head, so nothing needs local config.
+
+```bash
+git push origin HEAD:my-branch
+gh pr create -R <owner>/<repo> --head my-branch
+```
+
+On macOS this applies to every writable root, the launch repository included,
+not only to repositories named with `--repo-dir`. Tracked in
+[#402](https://github.com/navikt/cplt/issues/402), which also covers whether
+the guard should intercept these forms and fail loudly instead.
+
 ## `.env` file blocking
 
 `.env*`, `.pem`, `.key`, `.p12`, `.pfx`, `.jks` files are **blocked from reading** by default. This stops a rogue agent exfiltrating secrets, but it has side effects.
