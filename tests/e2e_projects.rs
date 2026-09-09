@@ -1509,9 +1509,9 @@ fi
     /// a named repository is nested inside the project, so the project's own
     /// `git status` reports it as one untracked entry or — gitignored, as here
     /// — as nothing at all. Every edit inside it was invisible, and the session
-    /// still printed "no project file changes".
+    /// still printed "no project file changes". It now gets its own report.
     #[test]
-    fn audit_names_a_nested_named_repository_it_did_not_audit() {
+    fn audit_reports_a_nested_named_repository_on_its_own_lines() {
         require_sandbox!();
         let project = TempProject::scaffold_node();
         // Gitignored BEFORE the outer commit, so the outer status is genuinely
@@ -1557,12 +1557,18 @@ fi
             "test premise: the project must be reported clean.\nstderr: {stderr}"
         );
         assert!(
-            stderr.contains("NOT audited") && stderr.contains(&lib_path),
-            "the named repository must be named as unaudited.\nstderr: {stderr}"
+            stderr.contains(&format!("Changes in {lib_path}:")),
+            "the named repository's changes must be reported against it.\nstderr: {stderr}"
         );
         assert!(
-            stderr.contains("its own git history"),
-            "a nested root reads as a contradiction without its reason.\nstderr: {stderr}"
+            stderr.contains("README.md"),
+            "the file the agent actually rewrote must be listed.\nstderr: {stderr}"
+        );
+        // The session line belongs to the session, not to each root.
+        assert_eq!(
+            stderr.matches("Session ended").count(),
+            1,
+            "one session, one session line.\nstderr: {stderr}"
         );
     }
 

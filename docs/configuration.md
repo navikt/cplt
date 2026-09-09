@@ -104,6 +104,23 @@ the project directory is granted as one subtree. What `--repo-dir` adds is that
 `gh` may target it: `gh pr create -R navikt/sykepenger-model` is allowed, the
 gh scope set includes it, and `GH_REPO` pinning accounts for it.
 
+It also decides what the post-session audit measures. Each named repository is
+audited on its own lines, against its own baseline:
+
+```
+[cplt] Session ended (exit 0, 41s)
+[cplt] Project changes: 2 files (+18 -3)
+[cplt]   src/main.rs  +18 -3
+[cplt] Changes in ~/src/spleis/libs/sykepenger-model: 1 file (+4 -0)
+[cplt]   src/Vedtaksperiode.kt  +4 -0
+```
+
+That report is the reason to name a repository even when the agent could
+already write to it. A checkout keeps its own git history, so the launch
+repository's `git status` sees it as a single entry — or, when it is
+gitignored, as nothing at all. Before it had a report of its own, a session
+that edited only the nested repository printed `no project file changes`.
+
 The consequence is the rule that surprises people most:
 
 **Only repositories nested inside the project directory can be named.** A
