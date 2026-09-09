@@ -355,8 +355,14 @@ pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
 ];
 
 /// Dependency trees where [`SENSITIVE_PROJECT_PATTERNS`] is collateral rather
-/// than protection, given as [`HOME_TOOL_DIRS`] paths so a relocated
-/// `CARGO_HOME` / `GOPATH` resolves with the rest.
+/// than protection.
+///
+/// Each entry is a [`HOME_TOOL_DIRS`] path plus the subpath under it that holds
+/// **extracted** sources, because the two do not coincide: `go/pkg` is the tool
+/// dir and the module cache is `go/pkg/mod` beneath it. Naming the tool dir is
+/// what makes a relocated `CARGO_HOME` / `GOPATH` / `GOMODCACHE` resolve with
+/// the rest of the policy — matching on `go/pkg/mod` directly finds no entry
+/// and silently falls back to the default location.
 ///
 /// These are the stores that hold **extracted** package sources: a `.env` under
 /// one of them is a file some library shipped, not a secret of the user's.
@@ -371,7 +377,7 @@ pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
 /// denied — which is why this is a short explicit list and not a heuristic.
 ///
 /// macOS only, like the denies themselves: Landlock cannot express either side.
-pub const DEPENDENCY_SOURCE_TREES: &[&str] = &[".cargo/registry", "go/pkg/mod"];
+pub const DEPENDENCY_SOURCE_TREES: &[(&str, &str)] = &[(".cargo/registry", ""), ("go/pkg", "mod")];
 
 /// Prefixes of ~/Library/Caches/ subdirectories to deny (non-dev caches).
 /// Uses reverse-domain bundle IDs which are stable across app versions.

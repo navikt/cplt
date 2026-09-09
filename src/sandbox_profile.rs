@@ -502,14 +502,19 @@ fn emit_sensitive_project_denies(
 fn dependency_source_trees(home: &str, tool_dirs: Option<&[ResolvedToolDir]>) -> Vec<String> {
     DEPENDENCY_SOURCE_TREES
         .iter()
-        .map(|rel| {
-            tool_dirs
+        .map(|(tool_dir, sub)| {
+            let base = tool_dirs
                 .and_then(|dirs| {
                     dirs.iter()
-                        .find(|d| d.dir.path == *rel)
+                        .find(|d| d.dir.path == *tool_dir)
                         .map(|d| d.path.to_string_lossy().into_owned())
                 })
-                .unwrap_or_else(|| format!("{home}/{rel}"))
+                .unwrap_or_else(|| format!("{home}/{tool_dir}"));
+            if sub.is_empty() {
+                base
+            } else {
+                format!("{base}/{sub}")
+            }
         })
         .collect()
 }
