@@ -168,13 +168,15 @@ struct Cli {
     /// File with domains to block (one per line, e.g. pastebin.com).
     /// Only relevant when --with-proxy is enabled.
     /// The proxy refuses CONNECT requests to these domains.
-    /// The file is re-read on every request, so you can edit it live.
+    /// The file is re-read every ~5 seconds, so you can edit it live.
     #[arg(long, value_name = "FILE")]
     blocked_domains: Option<PathBuf>,
 
     /// File with domains to allow (one per line). When set, the proxy permits
     /// connections to the listed domains and blocks everything else. The
-    /// blocklist still applies on top. Parsed at startup.
+    /// blocklist still applies on top. The file is re-read every ~5 seconds, so
+    /// you can add hosts live; whether the allowlist is enforced at all is
+    /// decided at startup.
     #[arg(long, value_name = "FILE")]
     allowed_domains: Option<PathBuf>,
 

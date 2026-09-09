@@ -96,7 +96,36 @@ forced = true
 
 ## Domain filtering
 
-The proxy supports both blocking (deny known-bad domains) and allowlisting (permit only known-good domains). You can use both lists together; the allowlist is checked first, then the blocklist.
+There are **three** domain lists, and they answer different questions. Reading
+them as three flavours of the same thing is the usual source of confusion,
+because only two of them are about permission at all.
+
+| List | The question it answers | Default | Reload |
+| --- | --- | --- | --- |
+| **Blocklist** (`--blocked-domains`) | "Never connect here." Exfiltration sinks: paste sites, webhook capture, tunnels. | A curated list ships with cplt | Live, ~5s |
+| **Allowlist** (`--allowed-domains`, `--default-allowlist`) | "Connect *only* here." Everything not listed is refused. | Off | Live, ~5s |
+| **Private-domain waiver** (`proxy.allow_private_domains`) | "This name is a trusted internal service." Not about permission: it is the DNS-rebinding guard. | Empty | Live, ~5s |
+
+All three re-read their backing file on the same ~5 second TTL, so editing a
+list adds **and revokes** entries in a running session. One thing does not
+reload: whether the allowlist is *enforced at all* is decided at startup, so
+switching allowlisting on or off needs a new session even though its contents do
+not. Entries that came from the command line, or from a trust-approved
+`[propose.proxy]` block, are read once and survive every refresh.
+
+The third is the one people do not expect. cplt refuses any host that resolves
+to a **private IP**, whatever the lists say, because a public name pointing at
+`10.x` is how an agent reaches your internal network. An intranet service is
+therefore blocked with `403 ... Private target blocked by cplt` even with no
+allowlist in force and nothing on the blocklist — the fix is to name it here,
+not to touch the other two:
+
+```bash
+cplt config set proxy.allow_private_domains dev-nais.cloud.nais.io
+```
+
+The blocklist and the allowlist can be used together; the allowlist is checked
+first, then the blocklist.
 
 ### How a domain entry matches
 
@@ -154,6 +183,34 @@ cplt update-lists
 **Tighten-only, fail-open semantics.** Blocklists can only add blocks, so the worst case of a bad, stale, or unreachable list is that a domain simply is not blocked, which is no worse than today. On a fetch failure cplt keeps and uses the last-good cache, or treats the list as empty if there is none, and never blocks the run on the network. When a subscription pins a `sha256`, a hash mismatch rejects the downloaded copy, keeps the last-good cache, and warns loudly about possible tampering. Pinning is encouraged rather than required, because an unverified blocklist cannot open an exfiltration channel.
 
 > **Allowlist subscriptions are a separate future feature.** An allowlist subscription would define what is permitted and is therefore cplt's security boundary. A tampered or MITM'd allowlist opens an exfiltration channel for every subscriber. That tier must be fail-closed and verification-required, and is deliberately not part of Phase 1. Only blocklist subscriptions exist today.
+
+### Private-domain waiver
+
+Separate from both lists above, and the one most likely to be the cause when an
+internal service is refused. cplt blocks any hostname that resolves to a private
+or otherwise reserved address, because a public DNS name that resolves inward is
+the standard DNS-rebinding path into a corporate network. The set is wider than
+RFC 1918 — see `is_private_ip` for the authority:
+
+- IPv4: loopback `127/8`, private `10/8` `172.16/12` `192.168/16`, link-local
+  `169.254/16` (which covers the cloud metadata endpoint), CGNAT `100.64/10`
+  (Tailscale, VPN), benchmarking `198.18/15`, reserved `240/4`, protocol
+  assignment `192.0.0/24`, unspecified `0.0.0.0`, broadcast `255.255.255.255`
+- IPv6: loopback `::1`, unspecified `::`, ULA `fc00::/7`, link-local `fe80::/10`,
+  and v4-mapped forms of the above
+
+`proxy.allow_private_domains` waives that check for names you trust. Suffix
+matching, like every other list: `nav.cloud.nais.io` covers every subdomain, but
+does **not** cover `dev-nais.cloud.nais.io`, which is a different domain.
+
+```bash
+cplt config set proxy.allow_private_domains intern.nav.no
+cplt --allow-private-domain intern.nav.no          # this run only
+```
+
+An IP literal cannot be waived — give the host a name. A repository may propose
+entries in `[propose.proxy]`, which is the only proxy key `.cplt.toml` can
+propose, and they apply only after `cplt trust accept`.
 
 ### Allowlist
 
