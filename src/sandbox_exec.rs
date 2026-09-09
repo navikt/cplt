@@ -206,6 +206,23 @@ fn configure_command(
     // cplt will see this and bail before launching another sandbox.
     cmd.env("__CPLT_WRAPPED", "1");
 
+    // Point the agent at its own brief, so it does not have to know the
+    // `$TMPDIR/CPLT_BRIEF.md` convention to find it. Gated on the files
+    // actually existing: the brief is opt-in (`sandbox.brief`), and a variable
+    // naming a file that is not there is worse than no variable — it is the one
+    // thing the AGENTS.md block currently has to hedge about in prose.
+    if let Some(scratch) = scratch_dir {
+        for (var, name) in [
+            ("CPLT_BRIEF", crate::brief::BRIEF_MD),
+            ("CPLT_BRIEF_JSON", crate::brief::BRIEF_JSON),
+        ] {
+            let path = scratch.join(name);
+            if path.is_file() {
+                cmd.env(var, &path);
+            }
+        }
+    }
+
     // When proxy is enabled, tell Node.js (bundled in Copilot CLI) to route
     // traffic through our CONNECT proxy. NODE_USE_ENV_PROXY is required for
     // Node.js ≥24.5.0 to honor HTTP_PROXY/HTTPS_PROXY natively.

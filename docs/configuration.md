@@ -408,14 +408,42 @@ For arrays of objects, multi-line values, and other complex configuration, edit 
 An agent inside the sandbox has no way of knowing it is sandboxed: it hits
 `EPERM`, assumes a bug, and retries. cplt can hand it the answer up front, in
 two layers. Both are off by default — cplt writing files that an agent then
-reads is a behaviour change, so you ask for it.
+reads is a behaviour change, so you ask for it. Running `cplt check` from
+outside the sandbox reports the same policy either way, and is what to reach
+for when you have not opted in.
 
-**`sandbox.brief` (default `false`)** — writes `CPLT_BRIEF.md` into the
-per-session scratch directory (the one `$TMPDIR` points at inside the sandbox).
-It is rendered from the resolved policy for *that* launch — network mode,
-`.env` handling, credential denies — and disappears with the scratch dir when
-the session ends. It never touches your project. Turn it on for one run with
-`--brief`, or for good with `cplt config set sandbox.brief true`.
+**`sandbox.brief` (default `false`)** — writes two files into the per-session
+scratch directory (the one `$TMPDIR` points at inside the sandbox):
+
+| File | For | Named by |
+| --- | --- | --- |
+| `CPLT_BRIEF.md` | the agent to read | `$CPLT_BRIEF` |
+| `CPLT_BRIEF.json` | a tool to parse | `$CPLT_BRIEF_JSON` |
+
+Both are rendered from the resolved policy for *that* launch — the repositories
+in scope, network mode, `.env` handling, credential denies — and disappear with
+the scratch dir when the session ends. Neither touches your project.
+
+The two environment variables are set only when the files exist, so an agent can
+test for `$CPLT_BRIEF` rather than guessing a path, and a variable never names a
+file that is not there. That means neither is set with `sandbox.brief = false`,
+and neither is set with `--no-scratch-dir` (or `sandbox.scratch_dir = false`)
+either: the brief lives in the scratch dir and nowhere else, so cplt warns and
+writes nothing.
+
+The JSON carries a little more than the prose: the `allow.read` / `allow.write`
+/ `allow.exec` path lists, the port numbers, and every repository in scope even
+for a single-repository session, where the prose omits the section because it
+would restate what the rest of the brief assumes. Both come from one captured
+set of facts, so they cannot describe different sessions.
+
+Turn it on for one run with `--brief`, or for good with
+`cplt config set sandbox.brief true`.
+
+There is nothing about the brief that only works for some projects, so if you
+want your agents to have it, turn it on in your global config. Turning it on is
+also what makes the `## Repositories` section reach the agent: the list of what
+a multi-repository session actually spans exists only here.
 
 **`sandbox.agents_md` (default `false`)** — additionally injects a managed
 block into `<project>/AGENTS.md`, creating the file if it does not exist. This

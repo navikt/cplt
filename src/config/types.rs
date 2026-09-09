@@ -815,7 +815,8 @@ pub struct RepoSummaryRow {
 }
 
 /// Whether a named root's grant is new, or inherited from the project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RepoGrant {
     /// The launch repository. Its grant is the project grant.
     Launch,
