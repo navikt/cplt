@@ -371,13 +371,102 @@ pub fn parse_lines_file(path: &Path) -> Option<Vec<String>> {
             return None;
         }
     };
-    Some(
-        contents
-            .lines()
-            .map(|l| l.trim().to_lowercase().trim_end_matches('.').to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect(),
-    )
+    let entries: Vec<String> = contents
+        .lines()
+        .map(|l| l.trim().to_lowercase().trim_end_matches('.').to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    warn_wildcard_entries(path, &entries);
+    Some(entries)
+}
+
+/// Warn about `*` in a domain list, which matches nothing.
+///
+/// Domain matching is exact-host-or-subdomain-suffix ([`is_domain_match`]):
+/// `cloud.nais.io` already covers `foo.cloud.nais.io` at any depth. There is no
+/// glob syntax, so `*.cloud.nais.io` is compared literally and matches no host
+/// at all.
+///
+/// That is worth a warning rather than silence because of which direction it
+/// fails in. In an allowlist the file is the whole policy, so an entry that
+/// matches nothing does not merely fail to help — it leaves the hosts the user
+/// meant to permit blocked, with an entry on screen that looks exactly right.
+/// The user writes the glob they would write in any other tool and gets a
+/// fail-closed session with no explanation.
+fn warn_wildcard_entries(path: &Path, entries: &[String]) {
+    let bad: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.contains('*'))
+        .map(String::as_str)
+        .collect();
+    if bad.is_empty() {
+        return;
+    }
+    let suggestion = bad
+        .first()
+        .map(|e| e.trim_start_matches('*').trim_start_matches('.'))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("example.com");
+    eprintln!(
+        "{}[proxy]{} Warning: {} contains wildcard entries ({}) which match no host. Matching is exact host plus subdomains, so write `{suggestion}` to cover `{suggestion}` and everything under it.",
+        crate::ui::color(crate::ui::YELLOW),
+        crate::ui::color(crate::ui::RESET),
+        path.display(),
+        bad.join(", "),
+    );
+}
+
+#[cfg(test)]
+mod wildcard_tests {
+    use super::*;
+
+    /// `*.example.com` matches nothing: matching is exact host or subdomain
+    /// suffix, with no glob syntax. In an allowlist the file IS the policy, so
+    /// the entry does not merely fail to help — it leaves the hosts the user
+    /// meant to permit blocked, looking correct on screen.
+    #[test]
+    fn a_wildcard_entry_matches_nothing_and_the_bare_domain_matches_everything() {
+        let glob = vec!["*.cloud.nais.io".to_string()];
+        for host in ["cloud.nais.io", "foo.cloud.nais.io", "a.b.cloud.nais.io"] {
+            assert!(
+                !crate::proxy::is_domain_match(host, &glob),
+                "the glob must not match {host} — this is what makes it a trap"
+            );
+        }
+        let plain = vec!["cloud.nais.io".to_string()];
+        for host in ["cloud.nais.io", "foo.cloud.nais.io", "a.b.cloud.nais.io"] {
+            assert!(
+                crate::proxy::is_domain_match(host, &plain),
+                "the bare domain must cover {host} at any depth"
+            );
+        }
+        // And it must not over-reach onto a different registrable domain.
+        assert!(!crate::proxy::is_domain_match("evilcloud.nais.io", &plain));
+    }
+
+    #[test]
+    fn parsing_a_file_with_a_wildcard_still_returns_the_entries() {
+        let dir = std::env::temp_dir().join(format!("cplt-wild-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("domains.txt");
+        std::fs::write(
+            &f,
+            "*.cloud.nais.io
+github.com
+",
+        )
+        .unwrap();
+        // Warned about, not dropped: silently discarding a line the user wrote
+        // would be a second surprise on top of the first.
+        assert_eq!(
+            parse_lines_file(&f),
+            Some(vec![
+                "*.cloud.nais.io".to_string(),
+                "github.com".to_string()
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Parse `proxy.allow_private_domains` from a TOML config file.
