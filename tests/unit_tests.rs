@@ -1398,6 +1398,64 @@ fn fish_startup_files_are_write_denied_in_both_granted_dirs() {
     );
 }
 
+/// #477: the `.env` / `.pem` deny is a name pattern applied everywhere, so it
+/// also covers package content in the extracted dependency stores — where the
+/// file is a library's test fixture, not the user's secret. `go mod verify`
+/// hashes every file in the module cache, so one unreadable fixture aborts it.
+///
+/// Read is re-allowed there and nowhere else; write stays denied on both sides.
+#[test]
+fn the_env_deny_is_lifted_for_read_inside_dependency_stores_only() {
+    let profile = generate_profile(&base_profile_options(), &[]);
+    let home = "/Users/test";
+    // Escaped as the emitter escapes it: the leading dot of `.cargo` is a regex
+    // metacharacter, and a test that expected the raw path would fail on the
+    // one tree whose name has one.
+    for tree in ["go/pkg/mod", "\\.cargo/registry"] {
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read* (regex #\"^{home}/{tree}/.*/\\.env$\"))"
+            )),
+            "read must be re-allowed under {tree}\n{profile}"
+        );
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-write* (regex #\"^{home}/{tree}/.*/\\.env$\"))"
+            )),
+            "write must stay denied under {tree}\n{profile}"
+        );
+    }
+    // The deny itself is still there, and the carve-out comes after it —
+    // SBPL is last-match-wins, so the order is the whole mechanism.
+    let deny = profile
+        .find("(deny file-read* (regex #\"/\\.env$\"))")
+        .expect("the deny stands");
+    let allow = profile
+        .find("(allow file-read* (regex #\"^/Users/test/go/pkg/mod/")
+        .expect("the carve-out is emitted");
+    assert!(
+        allow > deny,
+        "last match wins, so the carve-out must be later"
+    );
+}
+
+/// With the deny lifted entirely there is nothing to carve out of, and
+/// emitting allows for a rule that is not there would be noise.
+#[test]
+fn the_dependency_store_carve_out_is_absent_when_env_files_are_allowed() {
+    let profile = generate_profile(
+        &SandboxConfig {
+            allow_env_files: true,
+            ..base_profile_options()
+        },
+        &[],
+    );
+    assert!(
+        !profile.contains("go/pkg/mod/.*/\\.env$"),
+        "nothing to re-allow when nothing is denied\n{profile}"
+    );
+}
+
 // ============================================================
 // Named repositories (--repo-dir): project-grade roots (#344)
 // ============================================================

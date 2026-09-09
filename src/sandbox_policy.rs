@@ -338,10 +338,10 @@ pub fn linux_docker_socket_paths(
 /// content is public, content-addressed and came from a registry rather than
 /// from the user.
 ///
-/// Narrowing it is a security decision rather than a cleanup, so it is tracked
-/// rather than done here: scoping to writable roots would let a broad
-/// `allow.read` expose real `.env` files, and carving out caches means naming
-/// every dependency store. Documented in `docs/known-impacts.md`.
+/// [`DEPENDENCY_SOURCE_TREES`] carves the read side back out for the two
+/// extracted stores, which is as far as this is narrowed: scoping the whole
+/// rule to writable roots would let a broad `allow.read` expose real `.env`
+/// files. Documented in `docs/known-impacts.md`.
 pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     // .env files — the #1 source of leaked secrets in project dirs
     r"\.env$",
@@ -353,6 +353,25 @@ pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     r"\.pfx$",
     r"\.jks$",
 ];
+
+/// Dependency trees where [`SENSITIVE_PROJECT_PATTERNS`] is collateral rather
+/// than protection, given as [`HOME_TOOL_DIRS`] paths so a relocated
+/// `CARGO_HOME` / `GOPATH` resolves with the rest.
+///
+/// These are the stores that hold **extracted** package sources: a `.env` under
+/// one of them is a file some library shipped, not a secret of the user's.
+/// `gotenv` ships one as a test fixture, and `go mod verify` hashes every file
+/// in the module cache, so a read it cannot make aborts the whole command
+/// (#477). The same is true of a `.pem` test fixture in any dependency.
+///
+/// Read is re-allowed here, never write. The properties that make this safe are
+/// the ones these trees have and a user directory does not: the content is
+/// content-addressed, verified against a checksum, and came from a registry
+/// rather than from the person running cplt. Anything without all three stays
+/// denied — which is why this is a short explicit list and not a heuristic.
+///
+/// macOS only, like the denies themselves: Landlock cannot express either side.
+pub const DEPENDENCY_SOURCE_TREES: &[&str] = &[".cargo/registry", "go/pkg/mod"];
 
 /// Prefixes of ~/Library/Caches/ subdirectories to deny (non-dev caches).
 /// Uses reverse-domain bundle IDs which are stable across app versions.
