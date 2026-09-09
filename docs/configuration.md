@@ -98,11 +98,12 @@ A flag *adds to* the persisted set rather than replacing it, so a one-off
 
 ### What naming a repository does, and what it does not
 
-**It declares identity, not access.** A nested repository already sits inside
-the project directory, so the agent could always read and write those files —
-the project directory is granted as one subtree. What `--repo-dir` adds is that
-`gh` may target it: `gh pr create -R navikt/sykepenger-model` is allowed, the
-gh scope set includes it, and `GH_REPO` pinning accounts for it.
+**For a repository nested inside the project, it declares identity, not
+access.** A nested checkout already sits inside the project directory, so the
+agent could always read, write and build there — the project directory is
+granted as one subtree. What `--repo-dir` adds is that `gh` may target it:
+`gh pr create -R navikt/sykepenger-model` is allowed, the gh scope set includes
+it, and `GH_REPO` pinning accounts for it.
 
 It also decides what the post-session audit measures. Each named repository is
 audited on its own lines, against its own baseline:
@@ -121,30 +122,47 @@ repository's `git status` sees it as a single entry — or, when it is
 gitignored, as nothing at all. Before it had a report of its own, a session
 that edited only the nested repository printed `no project file changes`.
 
-The consequence is the rule that surprises people most:
-
-**Only repositories nested inside the project directory can be named.** A
+**For a repository beside the launch one, it declares access as well.** A
 sibling checkout — `~/src/spleis` and `~/src/sykepenger-model` side by side —
-is refused, because naming it would be a real path grant and not just an
-identity. What works today:
+is not reachable at all unless you name it, and naming it grants read, write
+and execute on that tree:
 
 ```bash
-# Edit-only access to the sibling: files yes, gh identity no
-cplt --allow-write ~/src/sykepenger-model exec -- ./gradlew build
+cd ~/src/spleis
+cplt --repo-dir ~/src/sykepenger-model
 ```
 
-The agent can then build against and edit the sibling, but `gh` still refuses to
-target it — which is usually what you want, since the pull request belongs to the
-repository you launched in.
+The startup summary distinguishes the two cases, because they are the same row
+otherwise:
+
+```
+ Repositories:
+   navikt/spleis            ~/src/spleis                 launch repository
+   navikt/sykepenger-model  ~/src/sykepenger-model       --repo-dir   new read/write/exec tree
+```
+
+Execute is the part that needed a feature. `--allow-write` has always given a
+sibling read and write, but a write grant is deliberately **not** executable —
+a tree that is both is where an agent drops a binary and runs it. So this works
+for editing and fails for building:
+
+```bash
+# Edit-only: files yes, build no, gh identity no
+cplt --allow-write ~/src/sykepenger-model exec -- $EDITOR
+```
+
+Use `--allow-write` when the sibling only needs to be edited, and `--repo-dir`
+when its own build, tests or pull requests have to run. A named root is a
+second writable-and-executable tree, with the same protected paths as the
+project: `.git/hooks`, `.git/config`, `.cplt.toml` and the rest stay unwritable
+in it, so a hook cannot be planted to run outside the sandbox later.
 
 Launching from the parent (`--project-dir ~/src`) grants the whole tree and is a
-much wider grant than one repository. It also does **not** let you name the two
-checkouts: `--repo-dir` requires the launch directory to be a git repository
+much wider grant than naming two repositories. It also does **not** let you name
+the checkouts: `--repo-dir` requires the launch directory to be a git repository
 toplevel, and a plain directory holding repositories is not one, so the
 combination is refused rather than quietly granting identity to everything under
 it.
-
-Sibling support proper is [#344](https://github.com/navikt/cplt/issues/344).
 
 ### Which layer it can be set in
 
@@ -167,7 +185,7 @@ old and the tree it names is agent-writable. An entry is refused — the launch
 stops, it is not silently dropped — when it:
 
 - is not a git repository toplevel (a subdirectory of one is not a repository),
-- is not nested inside the project directory,
+- contains the launch repository (launch from it and name the inner one),
 - has a symlink as its **final** component (a symlink planted there last session
   would redirect the identity this launch pins; a symlinked *ancestor* is fine,
   it is just the path you took to get there),
@@ -181,8 +199,9 @@ Refusals name the source, so a persisted root says which file to fix rather
 than blaming a flag nobody passed:
 
 ```
-[cplt] sandbox.repo_dirs entry ~/src/spleis/libs/model in
-       ~/.config/cplt/local/3291….toml is outside the project directory
+[cplt] sandbox.repo_dirs entry ~/src/spleis/libs in
+       ~/.config/cplt/local/3291….toml is not a git repository; for a plain
+       directory use `--allow-write`.
 ```
 
 ### Everyday recipes

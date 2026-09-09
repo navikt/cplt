@@ -126,11 +126,12 @@ struct Cli {
     project_dir: Option<PathBuf>,
 
     /// Name another git repository the agent works in, as a first-class
-    /// repository alongside the launch one: `gh` commands may target it.
-    /// Must be a repository toplevel inside the project directory — a nested
-    /// clone already has the project directory's file access, so this declares
-    /// its identity, not new access. Siblings are not supported yet; for
-    /// edit-only access to one, use --allow-write.
+    /// repository alongside the launch one: `gh` commands may target it, and
+    /// it is granted read, write and execute, so its own build and tests run.
+    /// Must be a repository toplevel. One nested inside the project directory
+    /// already has that file access and gains only identity; one beside it is
+    /// a new read/write/execute tree, which the startup summary says. For
+    /// edit-only access to a tree, --allow-write grants files without execute.
     /// Can be specified multiple times.
     #[arg(long = "repo-dir", value_name = "DIR")]
     repo_dirs: Vec<PathBuf>,
@@ -1394,16 +1395,6 @@ fn validate_repo_dirs(
                  `--allow-write`."
             ),
         }
-        if !dir.starts_with(project_dir) {
-            bail!(
-                "{named_as} is outside the project directory\n  {}\n  \
-                 Only repositories checked out inside the project directory can be \
-                 named. For one that lives elsewhere, `--allow-write <DIR>` grants \
-                 read and write on its files — but not execute, so a build script \
-                 inside that tree will not run, and `gh` will not target it.",
-                project_dir.display()
-            );
-        }
         // Dedup rather than refuse across sources: naming with `--repo-dir` a
         // root the local file already carries is how a user re-states the set,
         // not an error. Two spellings of the same root within one source are
@@ -1614,11 +1605,20 @@ fn repo_summary_rows(project_dir: &Path, roots: &[RepoRoot]) -> Vec<config::Repo
         name: name_of(project_dir),
         path: project_dir.to_path_buf(),
         source: "launch repository",
+        grant: config::RepoGrant::Launch,
     }];
     rows.extend(roots.iter().map(|root| config::RepoSummaryRow {
         name: name_of(&root.dir),
         path: root.dir.clone(),
         source: root.source.label(),
+        // A nested root inherits the project grant; a sibling is a tree the
+        // session could not otherwise reach at all. Same row, very different
+        // thing to have agreed to.
+        grant: if root.dir.starts_with(project_dir) {
+            config::RepoGrant::Inherited
+        } else {
+            config::RepoGrant::NewTree
+        },
     }));
     rows
 }
@@ -1810,6 +1810,37 @@ fn resolve_context(cli: &Cli, check_mode: bool) -> anyhow::Result<ResolvedContex
         &project_dir,
         &home_dir,
     )?;
+
+    // The `CPLT_CONFIG` containment check above ran against the project
+    // directory only, and it had to: it decides which config file to load, and
+    // the named set comes out of the local layer that load produces. A named
+    // root is agent-writable and project-grade, so a config file inside one is
+    // the same confused deputy #261 closed — the agent writing the file that
+    // decides its own sandbox. Applied here, once the set is known.
+    if let Some(custom) = std::env::var("CPLT_CONFIG").ok().filter(|s| !s.is_empty()) {
+        for root in &repo_roots {
+            // `expand_tilde` for the same reason the project-directory check
+            // uses it: `config_path()` expands `~` before opening the file, so
+            // a check on the raw value refuses `/home/me/lib/x.toml` and waves
+            // `~/lib/x.toml` through to the same file.
+            if let config::CustomConfigVerdict::InsideProject(p) =
+                config::classify_custom_config(&config::expand_tilde(&custom), &home_dir, &root.dir)
+            {
+                bail!(
+                    "CPLT_CONFIG points inside a named repository:\n  \
+                     {}\n  \
+                     {} is granted read, write and execute this session, so that file is \
+                     content the agent can rewrite — and it would replace your whole cplt \
+                     config, sandbox settings included. Refusing.\n  \
+                     Unset CPLT_CONFIG (check .envrc / mise config), or drop the repository \
+                     from the named set, and re-run.",
+                    p.display(),
+                    root.dir.display()
+                );
+            }
+        }
+    }
+
     let cli_flags = config::CliFlags {
         preset: cli.preset,
         proxy: config::FeatureToggle::from_pair(cli.with_proxy, cli.no_proxy),
@@ -3045,6 +3076,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
     } = resolve_context(&cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
 
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, active_agent);
 
@@ -3097,6 +3129,7 @@ fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
         &probe,
         AssemblyOptions {
             agent: active_agent,
+            repos: NamedRepos::new(&repo_paths, &repo_git_dirs),
             copilot_install_dir: copilot_install_dir.as_deref(),
             electron_app_dir: electron_app_dir.as_deref(),
             announce_scratch: true,
@@ -3816,6 +3849,8 @@ fn accept_tool_dir(value: Option<String>, home_dir: &Path) -> Option<PathBuf> {
 /// run is identical whether an AI agent or a plain shell is being launched.
 struct AssemblyOptions<'a> {
     agent: agent::Agent,
+    /// The repositories named for this session.
+    repos: NamedRepos<'a>,
     /// The agent's install directory, granted read + map-exec. `None` for the
     /// shell and check paths, which have no agent binary to grant access to.
     copilot_install_dir: Option<&'a Path>,
@@ -4008,6 +4043,7 @@ fn assemble_sandbox(
         probe,
         active_agent,
         &agent_dirs,
+        opts.repos,
         SessionPaths {
             proxy_port: proxy_port_for_profile,
             scratch_dir: scratch_path,
@@ -4050,11 +4086,34 @@ struct SessionPaths<'a> {
 /// The one place a `SandboxConfig` is assembled from the resolved config and
 /// the host probe. The launch, `exec`, `check` and `doctor` all go through it,
 /// so a new input reaches every surface or none (#447).
+/// The repositories named with `--repo-dir` / `sandbox.repo_dirs`, already
+/// validated, together with their resolved gitdirs.
+///
+/// One value rather than two arguments because the halves must never diverge:
+/// a root granted without its gitdir is a linked worktree whose `git` fails
+/// with `not a git repository`. They are project-grade roots in the sandbox
+/// policy, so this has to reach every surface that builds one — the launch,
+/// `exec`, `check` and `doctor` — or a surface answers from fewer inputs than
+/// the launch (#447).
+#[derive(Clone, Copy, Default)]
+struct NamedRepos<'a> {
+    dirs: &'a [PathBuf],
+    git_dirs: &'a [PathBuf],
+}
+
+impl<'a> NamedRepos<'a> {
+    /// Resolve the gitdirs for an already-validated set of roots.
+    fn new(dirs: &'a [PathBuf], git_dirs: &'a [PathBuf]) -> Self {
+        Self { dirs, git_dirs }
+    }
+}
+
 fn build_sandbox_config<'a>(
     resolved: &'a config::Resolved,
     probe: &'a HostProbe,
     agent: agent::Agent,
     agent_dirs: &'a [agent::AgentDir],
+    repos: NamedRepos<'a>,
     session: SessionPaths<'a>,
     keychain_substitute: Option<agent::KeychainSubstitute>,
 ) -> sandbox::SandboxConfig<'a> {
@@ -4066,6 +4125,8 @@ fn build_sandbox_config<'a>(
         extra_exec: &resolved.allow_exec,
         extra_socket: &resolved.allow_socket,
         extra_deny: &resolved.deny_paths,
+        named_roots: repos.dirs,
+        named_root_git_dirs: repos.git_dirs,
         existing_home_tool_dirs: Some(&probe.existing_home_tool_dirs),
         existing_app_dirs: Some(&probe.existing_app_dirs),
         extra_ports: &resolved.allow_ports,
@@ -4104,6 +4165,7 @@ fn prepare_shell_sandbox(
     config_path: Option<&PathBuf>,
     home_dir: &Path,
     project_dir: &Path,
+    repos: NamedRepos<'_>,
 ) -> anyhow::Result<AssembledSandbox> {
     let probe = HostProbe::probe(resolved, home_dir, project_dir);
     assemble_sandbox(
@@ -4113,6 +4175,7 @@ fn prepare_shell_sandbox(
         &probe,
         AssemblyOptions {
             agent: agent::Agent::Shell,
+            repos,
             // shell/check have no agent install dir to grant special access to
             copilot_install_dir: None,
             electron_app_dir: None,
@@ -4167,6 +4230,7 @@ fn run_exec_command(
     } = resolve_context(cli, false)?;
 
     let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
 
     // exec defaults to quiet+yes (scripting UX). User can override with --no-quiet / --no-yes.
     if !cli.no_quiet {
@@ -4234,6 +4298,7 @@ fn run_exec_command(
         config_path.as_ref(),
         &home_dir,
         &project_dir,
+        NamedRepos::new(&repo_paths, &repo_git_dirs),
     )?;
 
     // Resolve the binary and args to pass to the sandbox.
@@ -4658,6 +4723,10 @@ fn run_check_command(
     // scope while the launch allowed it, because these were discarded here with
     // `let _ = &repo_roots` (#447).
     let named_roots: Vec<&Path> = repo_roots.iter().map(|r| r.dir.as_path()).collect();
+    // The same set as owned paths, for the sandbox policy `check` probes
+    // against: `check` must build the policy the launch would build.
+    let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
 
     // Shell, not `active_agent`: `check` probes under the Shell profile.
     warn_exec_tool_dir_shadowing(&resolved, &home_dir, agent::Agent::Shell);
@@ -4698,6 +4767,7 @@ fn run_check_command(
         config_path.as_ref(),
         &home_dir,
         &project_dir,
+        NamedRepos::new(&repo_paths, &repo_git_dirs),
     )?;
 
     let proxy_enabled = proxy_handle.is_some();
@@ -5315,10 +5385,14 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         config_path,
         home_dir,
         project_dir,
-        repo_roots: _,
+        repo_roots,
         active_agent,
         unapproved_proposals,
     } = ctx;
+    // `doctor` reports the policy a launch would build, so it has to carry the
+    // same named roots the launch would (#447).
+    let repo_paths: Vec<PathBuf> = repo_roots.iter().map(|r| r.dir.clone()).collect();
+    let repo_git_dirs = sandbox::named_root_git_dirs(&repo_paths);
     let tilde = |p: &Path| doctor::tilde(p, &home_dir);
     let mut findings: Vec<Finding> = Vec::new();
     let mut ok: Vec<String> = Vec::new();
@@ -5494,6 +5568,7 @@ fn run_doctor(cli: &Cli, verbose: bool) -> ExitCode {
         &probe,
         active_agent,
         &agent_dirs,
+        NamedRepos::new(&repo_paths, &repo_git_dirs),
         SessionPaths::default(),
         keychain_substitute,
     );
@@ -8389,8 +8464,12 @@ mod tests {
         assert!(err.contains(&inner.display().to_string()), "{err}");
     }
 
+    /// A repository beside the launch repository is the shape most checkouts
+    /// have, and it is now accepted. Every other rule still applies to it —
+    /// git toplevel, no symlinked leaf, not an unsafe root — and those are
+    /// asserted by their own tests; this one is about the location alone.
     #[test]
-    fn repo_dir_refuses_a_sibling_repository() {
+    fn repo_dir_accepts_a_sibling_repository() {
         let (_guard, root) = canonical_tempdir();
         let project = root.join("project");
         let sibling = root.join("sibling");
@@ -8399,12 +8478,11 @@ mod tests {
         if !init_repo(&project) || !init_repo(&sibling) {
             return;
         }
-        let err = validate_flags(&[sibling], &project)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("Only repositories checked out inside the project directory"),
-            "{err}"
+        let roots = validate_flags(std::slice::from_ref(&sibling), &project)
+            .expect("a sibling repository is a valid named root");
+        assert_eq!(
+            roots.iter().map(|r| r.dir.clone()).collect::<Vec<_>>(),
+            vec![sibling]
         );
     }
 
@@ -8577,9 +8655,9 @@ mod tests {
         assert!(err.contains("/config/local/abc.toml"), "{err}");
     }
 
-    /// Stage 1 is nested-only for a persisted root exactly as for a flag.
+    /// A persisted root is accepted wherever a flag would be, sibling included.
     #[test]
-    fn a_local_root_outside_the_project_gets_the_sibling_message() {
+    fn a_local_root_outside_the_project_is_accepted() {
         let (_guard, root) = canonical_tempdir();
         let project = root.join("project");
         let sibling = root.join("sibling");
@@ -8588,14 +8666,12 @@ mod tests {
         if !init_repo(&project) || !init_repo(&sibling) {
             return;
         }
-        let err = validate_local(&[&sibling.display().to_string()], &project)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("Only repositories checked out inside the project directory"),
-            "{err}"
+        let roots = validate_local(&[&sibling.display().to_string()], &project)
+            .expect("a sibling repository is a valid persisted root");
+        assert_eq!(
+            roots.iter().map(|r| r.dir.clone()).collect::<Vec<_>>(),
+            vec![sibling]
         );
-        assert!(err.contains("sandbox.repo_dirs entry"), "{err}");
     }
 
     /// `~` is the one non-absolute spelling the local layer accepts, so the

@@ -507,10 +507,10 @@ fn candidates(dotted: &str, ty: cplt::config::ConfigValueType, s: &Scratch) -> V
         "proxy.blocked_domains" | "proxy.allowed_domains" | "proxy.log_file" => {
             vec![s.file.clone(), missing.into()]
         }
-        // Inside the launch repository, not beside it: `config set --local`
-        // refuses a sibling today ("sibling repositories are not yet
-        // supported"), so a scratch repo in the temp dir never reaches a
-        // launch — and this is the key the bricking defect was found on.
+        // A repository inside the launch repository. A sibling is equally
+        // valid since #344's second stage, but this one is created relative to
+        // each iteration's launch repo, so it needs no second scratch tree —
+        // and this is the key the bricking defect was found on.
         "sandbox.repo_dirs" => vec![NESTED_REPO.into(), missing.into()],
         "allow.read" | "allow.write" | "allow.exec" | "allow.socket" | "deny.paths" => {
             vec![s.dir.clone(), missing.into()]

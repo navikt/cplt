@@ -1049,12 +1049,27 @@ impl Resolved {
         // nobody on this command line asked for.
         if !repos.is_empty() {
             let width = repos.iter().map(|r| r.name.len()).max().unwrap_or(0);
+            let path_width = repos
+                .iter()
+                .map(|r| r.path.display().to_string().len())
+                .max()
+                .unwrap_or(0);
             eprintln!("{blue}[cplt]{nc}  {dim}Repositories:{nc}");
             for row in repos {
+                // The grant column is the one an operator has to read before
+                // agreeing: a sibling root is a second writable-and-executable
+                // tree, and it is otherwise indistinguishable from a nested one
+                // that added no access at all.
+                let grant = row.grant.label();
+                let grant = if grant.is_empty() {
+                    String::new()
+                } else {
+                    format!("   {dim}{grant}{nc}")
+                };
                 eprintln!(
-                    "{blue}[cplt]{nc}    {:width$}  {}   {dim}{}{nc}",
+                    "{blue}[cplt]{nc}    {:width$}  {:path_width$}   {dim}{}{nc}{grant}",
                     row.name,
-                    row.path.display(),
+                    row.path.display().to_string(),
                     row.source
                 );
             }
