@@ -2064,7 +2064,25 @@ fn gate_with_scope_resolver(
                     .map(|s| format!(" {s}"))
                     .unwrap_or_default(),
             ),
-            guidance: format!("Reason: {}", result.reason),
+            // A raw API write has a narrow key of its own, and a refusal that
+            // names only the blanket escape hatch is how a session ends up with
+            // the whole guard off: one reached for `gh_guard.mode = "warn"` for
+            // exactly this, which also drops the repository scope check. Say
+            // the small thing that opens this one command.
+            guidance: if result.reason.starts_with("gh api with") {
+                format!(
+                    "Reason: {}. Raw API writes are off by default because they bypass the \
+                     per-command policy the guard rests on; the higher-level commands \
+                     (`gh pr comment`, `gh issue comment`, `gh pr review`) are allowed and \
+                     scope-checked. If the raw call is genuinely needed, \
+                     `cplt config set gh_guard.allow_api_write true` opens writes to \
+                     repositories in scope and nothing else — it is far narrower than \
+                     turning the guard off. `gh api DELETE` stays refused either way.",
+                    result.reason
+                )
+            } else {
+                format!("Reason: {}", result.reason)
+            },
             agent_note: &[
                 "This operation is restricted by the cplt sandbox to prevent unintended changes.",
                 NOTE,
@@ -7954,6 +7972,60 @@ mod tests {
             &facts,
         )
         .expect("with nothing identified the rule falls back to URL identity, as the launch says");
+    }
+
+    /// A raw API write must be told about its own key, not just the blanket
+    /// escape hatch.
+    ///
+    /// A field session hit this and worked around it with
+    /// `gh_guard.mode = "warn"`, which also drops the repository scope check.
+    /// The refusal named only the escape hatch, so that is what the agent
+    /// relayed. `allow_api_write` opens writes to repositories in scope and
+    /// nothing else.
+    #[test]
+    fn a_raw_api_write_refusal_names_allow_api_write() {
+        let policy = GatePolicy {
+            mode: crate::config::EnforcementMode::Block,
+            scope_check: true,
+            block_auth_token: true,
+            unknown_command: UnknownCommandDecision::Block,
+            allow_api_write: false,
+        };
+        let scope = || Ok(vec!["o/r".to_string()]);
+        let err = gate_with_scope_resolver(
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/r/pulls/1/comments",
+                "-f",
+                "body=x",
+            ],
+            &policy,
+            scope,
+            None,
+        )
+        .expect_err("raw API writes are off by default")
+        .to_string();
+        assert!(
+            err.contains("gh_guard.allow_api_write"),
+            "the narrow key must be named: {err}"
+        );
+        assert!(
+            err.contains("gh pr comment"),
+            "the supported route must be named too: {err}"
+        );
+        // A read must not carry the write advice.
+        assert!(
+            gate_with_scope_resolver(
+                &["api", "repos/o/r/pulls/1"],
+                &policy,
+                || Ok(vec!["o/r".to_string()]),
+                None,
+            )
+            .is_ok(),
+            "a GET is scope-checked, not refused"
+        );
     }
 
     /// With several repositories in scope, "not allowed" without a subject

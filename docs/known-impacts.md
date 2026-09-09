@@ -4,7 +4,9 @@ The sandbox is kernel-enforced, so **all restrictions apply to every process spa
 
 ## `.env` file blocking
 
-`.env*`, `.pem`, `.key`, `.p12`, `.pfx`, `.jks` files in the project directory are **blocked from reading** by default. This stops a rogue agent exfiltrating secrets, but it has side effects:
+`.env*`, `.pem`, `.key`, `.p12`, `.pfx`, `.jks` files are **blocked from reading** by default. This stops a rogue agent exfiltrating secrets, but it has side effects.
+
+**The rule is not limited to the project directory.** It is a pattern on the file name, applied everywhere the sandbox can reach, so it also covers files with those names inside dependency caches — where they are usually package content rather than anyone's secret:
 
 | Operation                      | Impact     | Why                                                                   |
 | ------------------------------ | ---------- | --------------------------------------------------------------------- |
@@ -16,6 +18,8 @@ The sandbox is kernel-enforced, so **all restrictions apply to every process spa
 | TLS dev servers (`.pem` certs) | ⚠️ Blocked  | Local HTTPS certs in `.pem`/`.key` files can't be read                |
 | `.env.example`                 | ⚠️ Blocked  | Matches the `.env.*` pattern; use `--allow-env-files` if needed       |
 | Writing `.env` files           | ✅ Works    | Only read is denied; Copilot can create `.env` from templates         |
+| `go mod verify`, `mise run` over it | ⚠️ Fails | Hashes every file in `~/go/pkg/mod`, and modules ship fixtures with these names (`gotenv` has a `.env`, `unleasherator` a `.env.local`). One denied read aborts the whole command |
+| Reading a `.pem` test fixture in any dependency | ⚠️ Blocked | Same reason: the pattern matches the name, not the location |
 
 **Fix:**
 

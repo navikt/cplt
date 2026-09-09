@@ -324,10 +324,24 @@ pub fn linux_docker_socket_paths(
     paths
 }
 
-/// Sensitive file patterns in the project directory that are denied by default.
-/// These often contain secrets (API keys, database passwords, private keys).
-/// A rogue agent could read and exfiltrate these via HTTPS.
-/// Override with `--allow-env-files` if Copilot genuinely needs them.
+/// Sensitive file patterns denied by default. These often contain secrets (API
+/// keys, database passwords, private keys), which a rogue agent could read and
+/// exfiltrate over HTTPS. Override with `--allow-env-files`.
+///
+/// **Emitted as unanchored regexes, so they apply EVERYWHERE the sandbox can
+/// reach, not only in the project directory** — see `emit_sensitive_project_denies`.
+/// The name says "project" because that is the threat these were written for;
+/// the rule is wider, and the difference is not academic. Dependency caches
+/// carry package content matching these patterns: `gotenv` ships a `.env`
+/// fixture, so `go mod verify` — which hashes every file in the module cache —
+/// aborts on a read it cannot make. That is collateral, not protection: the
+/// content is public, content-addressed and came from a registry rather than
+/// from the user.
+///
+/// Narrowing it is a security decision rather than a cleanup, so it is tracked
+/// rather than done here: scoping to writable roots would let a broad
+/// `allow.read` expose real `.env` files, and carving out caches means naming
+/// every dependency store. Documented in `docs/known-impacts.md`.
 pub const SENSITIVE_PROJECT_PATTERNS: &[&str] = &[
     // .env files — the #1 source of leaked secrets in project dirs
     r"\.env$",
