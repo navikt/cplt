@@ -38,7 +38,12 @@ pub const BLOCK_END: &str = "<!-- cplt:sandbox end -->";
 /// Rendered from the live resolved config: if the user allowed `~/.aws`,
 /// this must not claim AWS is blocked. Kept short — a few lines, not a
 /// policy dump (`--verbose` / `cplt config show` cover that).
-pub fn generate_session_brief(resolved: &Resolved, agent: Agent, home: &Path) -> String {
+pub fn generate_session_brief(
+    resolved: &Resolved,
+    agent: Agent,
+    home: &Path,
+    repos: &[crate::config::RepoSummaryRow],
+) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -49,6 +54,41 @@ pub fn generate_session_brief(resolved: &Resolved, agent: Agent, home: &Path) ->
          fresh every launch from the resolved policy — trust it over guesses.\n\n",
         agent.display_name()
     );
+
+    // Which repositories this session covers, and what each one grants. Without
+    // it the agent has to infer the scope from refusals, and a session that did
+    // exactly that produced two recommendations to turn the gh guard off — the
+    // refusal named an escape hatch and nothing narrower, so the model relayed
+    // the only fix it was shown.
+    if !repos.is_empty() {
+        out.push_str("## Repositories\n\n");
+        for row in repos {
+            let what = match row.grant {
+                crate::config::RepoGrant::Launch => {
+                    "the launch repository: read, write, execute, and the repository `gh` and \
+                     `git push` target by default"
+                }
+                crate::config::RepoGrant::Inherited => {
+                    "named with --repo-dir, inside the launch repository: you already had these \
+                     files; naming it puts it in the `gh` scope, gives it its own audit, and \
+                     lets `git push` be judged by its own default branch"
+                }
+                crate::config::RepoGrant::NewTree => {
+                    "named with --repo-dir: read, write and execute on a tree outside the launch \
+                     repository, in the `gh` scope, audited, and `git push` judged by its own \
+                     default branch"
+                }
+            };
+            let _ = writeln!(out, "- `{}` — {} ({what})", row.name, row.path.display());
+        }
+        out.push_str(
+            "\nThat list is the whole scope. A repository not on it is refused on purpose — \
+             the user chose what this session spans, so a refusal there is an answer, not an \
+             obstacle to route around. Report it and carry on; only the user can add one, \
+             with `--repo-dir` or `cplt config set --local sandbox.repo_dirs <DIR>`, and it \
+             takes a new session.\n\n",
+        );
+    }
 
     out.push_str("## Rules\n\n");
     out.push_str(
@@ -373,6 +413,7 @@ mod md_probe {
     ///
     /// Lines inside the leading HTML comment are exempt: Markdown does not
     /// render comment content, and one line there is deliberately indented.
+
     #[test]
     fn managed_block_has_no_markdown_indentation() {
         let b = super::managed_block();
@@ -634,15 +675,61 @@ mod tests {
         Path::new("/home/tester")
     }
 
+    /// The scope has to be in the brief, or the agent infers it from refusals.
+    /// A session that did exactly that produced two recommendations to turn the
+    /// gh guard off: the refusal named an escape hatch and nothing narrower, so
+    /// the model relayed the only fix it was shown.
+    #[test]
+    fn the_brief_lists_the_repositories_and_says_a_refusal_outside_them_is_the_answer() {
+        use crate::config::{RepoGrant, RepoSummaryRow};
+        let rows = vec![
+            RepoSummaryRow {
+                name: "navikt/spleis".to_string(),
+                path: std::path::PathBuf::from("/w/spleis"),
+                source: "launch repository",
+                grant: RepoGrant::Launch,
+            },
+            RepoSummaryRow {
+                name: "navikt/model".to_string(),
+                path: std::path::PathBuf::from("/w/model"),
+                source: "--repo-dir",
+                grant: RepoGrant::NewTree,
+            },
+        ];
+        let brief = generate_session_brief(
+            &base_resolved(),
+            crate::agent::Agent::Copilot,
+            std::path::Path::new("/projects/app"),
+            &rows,
+        );
+        assert!(brief.contains("## Repositories"), "{brief}");
+        for expected in ["navikt/spleis", "navikt/model", "/w/model"] {
+            assert!(brief.contains(expected), "missing {expected}:\n{brief}");
+        }
+        assert!(
+            brief.contains("a refusal there is an answer, not an"),
+            "the agent must be told not to route around the scope:\n{brief}"
+        );
+        // A single-repository session says nothing: the block would restate the
+        // one thing the rest of the brief already assumes.
+        let plain = generate_session_brief(
+            &base_resolved(),
+            crate::agent::Agent::Copilot,
+            std::path::Path::new("/projects/app"),
+            &[],
+        );
+        assert!(!plain.contains("## Repositories"), "{plain}");
+    }
+
     #[test]
     fn brief_flips_env_files_warning_with_config() {
         let mut resolved = base_resolved();
         resolved.allow_env_files = false;
-        let brief = generate_session_brief(&resolved, Agent::Copilot, home());
+        let brief = generate_session_brief(&resolved, Agent::Copilot, home(), &[]);
         assert!(brief.contains("also denied by default"));
 
         resolved.allow_env_files = true;
-        let brief = generate_session_brief(&resolved, Agent::Copilot, home());
+        let brief = generate_session_brief(&resolved, Agent::Copilot, home(), &[]);
         assert!(!brief.contains("also denied"));
         assert!(brief.contains("readable this session"));
     }
@@ -651,11 +738,11 @@ mod tests {
     fn brief_flips_network_line_with_default_allowlist() {
         let mut resolved = base_resolved();
         resolved.default_allowlist = false;
-        let brief = generate_session_brief(&resolved, Agent::OpenCode, home());
+        let brief = generate_session_brief(&resolved, Agent::OpenCode, home(), &[]);
         assert!(!brief.contains("built-in allowlist"));
 
         resolved.default_allowlist = true;
-        let brief = generate_session_brief(&resolved, Agent::OpenCode, home());
+        let brief = generate_session_brief(&resolved, Agent::OpenCode, home(), &[]);
         assert!(brief.contains("built-in allowlist"));
     }
 
@@ -667,7 +754,7 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.default_allowlist = true;
         resolved.proxy_forced = false;
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             !brief.contains("fails closed"),
             "plain proxy mode must not claim fail-closed:\n{brief}"
@@ -675,14 +762,14 @@ mod tests {
         assert!(brief.contains("direct `*:443` connections are still permitted"));
 
         resolved.proxy_forced = true;
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(brief.contains("fails closed"));
     }
 
     #[test]
     fn brief_says_ssh_blocked_but_not_https_git() {
         let resolved = base_resolved();
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(brief.contains("SSH is blocked"));
         // git_guard gates HTTPS push; the sandbox itself does not block
         // HTTPS remotes, and the brief must not claim otherwise.
@@ -698,7 +785,7 @@ mod tests {
         resolved.allow_read = vec![home().join(".ssh/id_ed25519")];
         resolved.pass_env = vec!["SSH_AUTH_SOCK".to_string()];
         resolved.allow_socket = vec![PathBuf::from("/private/tmp/x/Listeners")];
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(brief.contains("SSH is blocked"), "{brief}");
         assert!(brief.contains("outbound TCP is limited to 443"), "{brief}");
     }
@@ -710,7 +797,7 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.allow_read = vec![home().join(".ssh/id_ed25519")];
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(!brief.contains("SSH is blocked"), "{brief}");
         assert!(brief.contains("SSH may work this session"));
         // The blanket credentials claim needs the same treatment.
@@ -728,14 +815,14 @@ mod tests {
         resolved.allow_ports = vec![22];
         resolved.allow_read = vec![home().join(".ssh/id_ed25519")];
 
-        let default_mode = generate_session_brief(&resolved, Agent::Claude, home());
+        let default_mode = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             default_mode.contains("SSH may work this session"),
             "default mode still opens port 22:\n{default_mode}"
         );
 
         resolved.proxy_forced = true;
-        let forced = generate_session_brief(&resolved, Agent::Claude, home());
+        let forced = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             forced.contains("SSH is blocked"),
             "proxy.forced closes the direct path port 22 needs:\n{forced}"
@@ -748,7 +835,7 @@ mod tests {
     fn brief_blames_the_keys_when_the_port_is_open_but_nothing_authenticates() {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             brief.contains("the blocker is the keys, not the port"),
             "{brief}"
@@ -771,7 +858,7 @@ mod tests {
         resolved.pass_env = vec!["SSH_AUTH_SOCK".to_string()];
         resolved.allow_socket = vec![PathBuf::from("/private/tmp/x/Listeners")];
         resolved.inherit_env = true;
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             brief.contains("the blocker is the keys, not the port"),
             "--inherit-env strips SSH_AUTH_SOCK even with --pass-env:\n{brief}"
@@ -779,7 +866,7 @@ mod tests {
 
         // Same config without inherit_env: the socket does arrive.
         resolved.inherit_env = false;
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(brief.contains("SSH may work this session"), "{brief}");
     }
 
@@ -792,7 +879,7 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.allow_read = vec![home().join(".ssh")];
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             brief.contains("the blocker is the keys, not the port"),
             "{brief}"
@@ -813,7 +900,7 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.allow_write = vec![home().join(".ssh/known_hosts")];
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             brief.contains("Also writable this session"),
             "the credentials claim must name the write exception:\n{brief}"
@@ -831,7 +918,7 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_ports = vec![22];
         resolved.allow_read = vec![home().to_path_buf()];
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             brief.contains("SSH may work this session"),
             "Landlock grants $HOME outright:\n{brief}"
@@ -852,7 +939,7 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.allow_localhost_any = true;
         assert!(!resolved.allow_ports.contains(&22), "port 22 not listed");
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             !brief.contains("outbound TCP is limited to 443"),
             "no connect restriction is in the ruleset at all:\n{brief}"
@@ -867,7 +954,7 @@ mod tests {
     /// the sandbox — not "read-only".
     #[test]
     fn brief_does_not_call_the_config_readable() {
-        let brief = generate_session_brief(&base_resolved(), Agent::Claude, home());
+        let brief = generate_session_brief(&base_resolved(), Agent::Claude, home(), &[]);
         assert!(brief.contains("not readable from in here"), "{brief}");
         assert!(!brief.contains("read-only from in here"));
     }
@@ -877,7 +964,7 @@ mod tests {
         let mut resolved = base_resolved();
         resolved.default_allowlist = true;
         resolved.allow_all_domains = true;
-        let brief = generate_session_brief(&resolved, Agent::Claude, home());
+        let brief = generate_session_brief(&resolved, Agent::Claude, home(), &[]);
         assert!(
             !brief.contains("built-in allowlist"),
             "must not claim an allowlist applies under --allow-all-domains"
@@ -1069,6 +1156,7 @@ mod tests {
             &resolved,
             crate::agent::Agent::Copilot,
             std::path::Path::new("/projects/app"),
+            &[],
         );
         assert!(
             !brief.contains("The proxy refuses everything"),
@@ -1085,6 +1173,7 @@ mod tests {
             &resolved,
             crate::agent::Agent::Copilot,
             std::path::Path::new("/projects/app"),
+            &[],
         );
         assert!(brief.contains("The proxy refuses everything"));
     }
