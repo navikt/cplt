@@ -1572,6 +1572,148 @@ fi
         );
     }
 
+    /// The capability siblings needed a feature for (#344). `--allow-write`
+    /// already gave a sibling read and write; it is deliberately
+    /// non-executable (#319), so the sibling's own build could never run.
+    /// `--repo-dir` makes it a project-grade root: read, write AND execute.
+    ///
+    /// Both grants are exercised in one test so the difference is asserted
+    /// rather than assumed — the write-only case is the control.
+    #[test]
+    fn a_named_sibling_repository_is_readable_writable_and_executable() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let sibling = TempProject::new("repo-dir-sibling");
+        sibling.write_file("f.txt", "content\n");
+        sibling.write_file("run.sh", "#!/bin/sh\necho ran\n");
+        sibling.git_init();
+        let sibling_path = sibling.canonical_path().to_string_lossy().to_string();
+        let script_path = format!("{sibling_path}/run.sh");
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod the sibling script");
+
+        let script = format!(
+            r#"
+if cat "{sibling_path}/f.txt" >/dev/null 2>&1; then echo "RESULT:read:OK"; else echo "RESULT:read:FAIL"; fi
+if echo w > "{sibling_path}/w.txt" 2>/dev/null; then echo "RESULT:write:OK"; else echo "RESULT:write:FAIL"; fi
+if "{script_path}" >/dev/null 2>&1; then echo "RESULT:exec:OK"; else echo "RESULT:exec:FAIL"; fi
+if echo h > "{sibling_path}/.git/hooks/pre-commit" 2>/dev/null; then echo "RESULT:hook:OK"; else echo "RESULT:hook:FAIL"; fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--repo-dir", &sibling_path]);
+        assert!(
+            success,
+            "a sibling repository is a valid named root.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_result_ok(&stdout, &stderr, "read");
+        assert_result_ok(&stdout, &stderr, "write");
+        assert_result_ok(&stdout, &stderr, "exec");
+        // The protected-path table follows the grant: hooks run OUTSIDE the
+        // sandbox on the user's next git operation in that repository.
+        assert_result_fail(&stdout, "hook");
+
+        // The control: the same tree under `allow.write` is editable and NOT
+        // executable. If this ever passes, `--repo-dir` grants nothing new and
+        // the assertion above proves nothing.
+        let (stdout, stderr, success) =
+            run_cplt(&project, &fake_dir, &["--allow-write", &sibling_path]);
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_ok(&stdout, &stderr, "write");
+        assert_result_fail(&stdout, "exec");
+    }
+
+    /// A linked worktree keeps its objects and refs in the main checkout's
+    /// gitdir, which is outside the worktree. Granting only the tree leaves
+    /// `git` there failing with `not a git repository` — reachable files, no
+    /// repository. The shared gitdir is granted, and the persistence denies
+    /// still win over that grant.
+    #[test]
+    fn a_named_worktree_can_run_git_and_still_cannot_plant_a_hook() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let main = TempProject::new("repo-dir-worktree-main");
+        main.write_file("f.txt", "content\n");
+        main.git_init();
+        let main_path = main.canonical_path();
+        let worktree = main_path.parent().expect("a parent").join(format!(
+            "{}-wt",
+            main_path.file_name().expect("a name").to_string_lossy()
+        ));
+        let added = git_cmd(&main_path)
+            .args(["worktree", "add", "-b", "wt"])
+            .arg(&worktree)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git worktree add");
+        if !added.status.success() {
+            return; // no usable git here; the other tests already say so
+        }
+        let wt = fs::canonicalize(&worktree).expect("canonicalize the worktree");
+        let wt_path = wt.to_string_lossy().to_string();
+        let hook = main_path.join(".git/hooks/pre-commit");
+
+        let script = format!(
+            r#"
+cd "{wt_path}" || exit 0
+if git status --porcelain >/dev/null 2>&1; then echo "RESULT:git:OK"; else echo "RESULT:git:FAIL"; fi
+if echo h > "{}" 2>/dev/null; then echo "RESULT:hook:OK"; else echo "RESULT:hook:FAIL"; fi
+"#,
+            hook.display()
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &["--repo-dir", &wt_path]);
+
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_ok(&stdout, &stderr, "git");
+        // The gitdir is granted write, and the persistence denies are emitted
+        // after every allow so they still win. If this ever passes, the grant
+        // has opened a hook that runs outside the sandbox.
+        assert_result_fail(&stdout, "hook");
+
+        let _ = std::process::Command::new("git")
+            .current_dir(&main_path)
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt)
+            .output();
+    }
+
+    /// A tree the session was never given stays unreachable. Without this the
+    /// two assertions above could both hold in a sandbox that grants
+    /// everything.
+    #[test]
+    fn an_unnamed_sibling_repository_is_not_reachable_at_all() {
+        require_sandbox!();
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let sibling = TempProject::new("unnamed-sibling");
+        sibling.write_file("f.txt", "content\n");
+        sibling.git_init();
+        let sibling_path = sibling.canonical_path().to_string_lossy().to_string();
+
+        let script = format!(
+            r#"
+if cat "{sibling_path}/f.txt" >/dev/null 2>&1; then echo "RESULT:read:OK"; else echo "RESULT:read:FAIL"; fi
+if echo w > "{sibling_path}/w.txt" 2>/dev/null; then echo "RESULT:write:OK"; else echo "RESULT:write:FAIL"; fi
+"#
+        );
+        let fake_dir = create_fake_copilot(&project, &script);
+        let (stdout, stderr, success) = run_cplt(&project, &fake_dir, &[]);
+        assert!(success, "stdout: {stdout}\nstderr: {stderr}");
+        assert_result_fail(&stdout, "read");
+        assert_result_fail(&stdout, "write");
+    }
+
     // ============================================================
     // Mode combination tests
     // ============================================================
@@ -1721,6 +1863,41 @@ allow_env_files = true
         );
         // Config enables allow_env_files, so .env should be readable
         assert_result_ok(&stdout, &stderr, "_env");
+    }
+
+    /// #261 refused a `CPLT_CONFIG` inside the project directory: repository
+    /// content deciding the sandbox that governs it. A named root is
+    /// project-grade and agent-writable, so the same file one repository over
+    /// is the same confused deputy — and the project check cannot see it,
+    /// because it runs before the local layer the named set comes from.
+    #[test]
+    fn cplt_config_inside_a_named_repository_is_refused() {
+        let project = TempProject::scaffold_node();
+        project.git_init();
+        let named = TempProject::new("cplt-config-named-root");
+        named.write_file("config.toml", "[sandbox]\nallow_env_files = true\n");
+        named.git_init();
+        let named_path = named.canonical_path();
+        let config_path = named_path.join("config.toml");
+
+        let output = cplt_cmd()
+            .args(["--yes", "--no-validate"])
+            .args(["--project-dir", &project.canonical_path().to_string_lossy()])
+            .args(["--repo-dir", &named_path.to_string_lossy()])
+            .args(["--", "--version"])
+            .env("CPLT_CONFIG", config_path.to_string_lossy().as_ref())
+            .output()
+            .expect("cplt should run");
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            !output.status.success(),
+            "the launch must stop.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("CPLT_CONFIG points inside a named repository"),
+            "the refusal must name the reason.\nstderr: {stderr}"
+        );
     }
 
     #[test]
