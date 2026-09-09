@@ -102,9 +102,16 @@ because only two of them are about permission at all.
 
 | List | The question it answers | Default | Reload |
 | --- | --- | --- | --- |
-| **Blocklist** (`--blocked-domains`) | "Never connect here." Exfiltration sinks: paste sites, webhook capture, tunnels. | A curated list ships with cplt | Live, re-read per request |
-| **Allowlist** (`--allowed-domains`, `--default-allowlist`) | "Connect *only* here." Everything not listed is refused. | Off | At startup only — a new host needs a relaunch |
+| **Blocklist** (`--blocked-domains`) | "Never connect here." Exfiltration sinks: paste sites, webhook capture, tunnels. | A curated list ships with cplt | Live, ~5s |
+| **Allowlist** (`--allowed-domains`, `--default-allowlist`) | "Connect *only* here." Everything not listed is refused. | Off | Live, ~5s |
 | **Private-domain waiver** (`proxy.allow_private_domains`) | "This name is a trusted internal service." Not about permission: it is the DNS-rebinding guard. | Empty | Live, ~5s |
+
+All three re-read their backing file on the same ~5 second TTL, so editing a
+list adds **and revokes** entries in a running session. One thing does not
+reload: whether the allowlist is *enforced at all* is decided at startup, so
+switching allowlisting on or off needs a new session even though its contents do
+not. Entries that came from the command line, or from a trust-approved
+`[propose.proxy]` block, are read once and survive every refresh.
 
 The third is the one people do not expect. cplt refuses any host that resolves
 to a **private IP**, whatever the lists say, because a public name pointing at
@@ -183,10 +190,14 @@ Separate from both lists above, and the one most likely to be the cause when an
 internal service is refused. cplt blocks any hostname that resolves to a private
 or otherwise reserved address, because a public DNS name that resolves inward is
 the standard DNS-rebinding path into a corporate network. The set is wider than
-RFC 1918: loopback, `10/8`, `172.16/12`, `192.168/16`, link-local
-(`169.254.0.0/16`, which covers the cloud metadata endpoint), CGNAT
-(`100.64.0.0/10`, so Tailscale and VPN ranges), benchmarking, reserved, and the
-IPv6 equivalents including v4-mapped forms.
+RFC 1918 — see `is_private_ip` for the authority:
+
+- IPv4: loopback `127/8`, private `10/8` `172.16/12` `192.168/16`, link-local
+  `169.254/16` (which covers the cloud metadata endpoint), CGNAT `100.64/10`
+  (Tailscale, VPN), benchmarking `198.18/15`, reserved `240/4`, protocol
+  assignment `192.0.0/24`, unspecified `0.0.0.0`, broadcast `255.255.255.255`
+- IPv6: loopback `::1`, unspecified `::`, ULA `fc00::/7`, link-local `fe80::/10`,
+  and v4-mapped forms of the above
 
 `proxy.allow_private_domains` waives that check for names you trust. Suffix
 matching, like every other list: `nav.cloud.nais.io` covers every subdomain, but
