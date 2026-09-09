@@ -408,14 +408,37 @@ For arrays of objects, multi-line values, and other complex configuration, edit 
 An agent inside the sandbox has no way of knowing it is sandboxed: it hits
 `EPERM`, assumes a bug, and retries. cplt can hand it the answer up front, in
 two layers. Both are off by default — cplt writing files that an agent then
-reads is a behaviour change, so you ask for it.
+reads is a behaviour change, so you ask for it. Running `cplt check` from
+outside the sandbox reports the same policy either way, and is what to reach
+for when you have not opted in.
 
-**`sandbox.brief` (default `false`)** — writes `CPLT_BRIEF.md` into the
-per-session scratch directory (the one `$TMPDIR` points at inside the sandbox).
-It is rendered from the resolved policy for *that* launch — network mode,
-`.env` handling, credential denies — and disappears with the scratch dir when
-the session ends. It never touches your project. Turn it on for one run with
-`--brief`, or for good with `cplt config set sandbox.brief true`.
+**`sandbox.brief` (default `false`)** — writes two files into the per-session
+scratch directory (the one `$TMPDIR` points at inside the sandbox):
+
+| File | For | Named by |
+| --- | --- | --- |
+| `CPLT_BRIEF.md` | the agent to read | `$CPLT_BRIEF` |
+| `CPLT_BRIEF.json` | a tool to parse | `$CPLT_BRIEF_JSON` |
+
+Both are rendered from the resolved policy for *that* launch — the repositories
+in scope, network mode, `.env` handling, credential denies — and disappear with
+the scratch dir when the session ends. Neither touches your project.
+
+The two environment variables are set only when the files exist, so an agent
+can test for `$CPLT_BRIEF` rather than guessing a path, and a variable never
+names a file that is not there. The JSON carries a little more than the prose
+(the grant lists, the port numbers); both come from one captured set of facts,
+so they cannot describe different sessions.
+
+Turn it on for one run with `--brief`, or for good with
+`cplt config set sandbox.brief true`.
+
+**Why it is off by default.** cplt writing files that an agent then reads is a
+behaviour change, and the format is not stable yet — see the note above. If you
+want your agents to have it, turn it on in your global config; there is nothing
+about it that only works for some projects. Note that turning it on is what
+makes the `## Repositories` section — the list of what a multi-repository
+session actually spans — reach the agent at all.
 
 **`sandbox.agents_md` (default `false`)** — additionally injects a managed
 block into `<project>/AGENTS.md`, creating the file if it does not exist. This

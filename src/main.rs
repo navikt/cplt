@@ -2494,8 +2494,8 @@ fn write_session_sandbox_brief(
         );
         return;
     };
-    let content = brief::generate_session_brief(resolved, active_agent, home_dir, repos);
-    if let Err(e) = brief::write_session_brief(scratch, &content) {
+    let facts = brief::BriefFacts::capture(resolved, active_agent, home_dir, repos);
+    if let Err(e) = brief::write_session_brief(scratch, &facts) {
         ui::warn(&format!("Could not write sandbox brief: {e}"));
     }
 }
